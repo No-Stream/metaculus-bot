@@ -71,8 +71,13 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     # Thirteenth term: a question whose close time was too near for the full
     # pipeline, so the optional research stages were dropped (time_budget.py).
     bot._time_budget_fast_path_count = 4096
+    # Fourteenth term: budget-driven research degradation OFF the fast path — a
+    # provider cancelled at the research-window deadline or gap-fill cut/skipped
+    # for budget on a question that never fast-pathed (orchestrator-side,
+    # deduplicated per question).
+    bot._research.research_budget_cut_count = 8192
 
-    assert bot.alertable_count == 8191
+    assert bot.alertable_count == 16383
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):
@@ -131,7 +136,8 @@ async def test_provider_degradation_rides_the_run_summary(mock_general_llm, capl
     # The newest key is the tail, and the tail is where the telemetry parser's optional
     # groups end — appending past it without extending that regex breaks the whole
     # line's harvest, because the pattern is $-anchored.
-    assert degradation.endswith("time_budget_fast_path=0"), degradation
+    assert "time_budget_fast_path=0" in degradation, degradation
+    assert degradation.endswith("research_budget_cuts=0"), degradation
     assert any(line.startswith("PROVIDER_DEGRADATION:") for line in caplog.messages), caplog.messages
 
 

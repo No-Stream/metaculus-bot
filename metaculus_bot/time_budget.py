@@ -97,16 +97,25 @@ class QuestionTimeBudget:
     def research_phase_deadline_s(self) -> float:
         """Seconds the research phase may still consume, from now.
 
-        A share of what is LEFT, not of the original total, so a slow intake
-        cannot hand research more than the forecast can afford. Never negative:
-        an overrun budget yields 0, which cancels the provider phase immediately
-        rather than reporting a nonsense deadline.
+        ONE fixed research window — ``total_s * RESEARCH_PHASE_BUDGET_SHARE``,
+        anchored at the budget's start — minus what has already elapsed. The
+        window is deliberately NOT re-derived as a share of what remains at each
+        call: research consults this at two sequential points (the provider
+        phase, then each gap-fill pass), and taking 50% of the CURRENT remaining
+        at each compounds to ~75% of the budget in the worst case, leaving the
+        forecaster fan-out less than its own soft deadline on exactly the
+        close-limited questions this budget exists to save. With a fixed window
+        the forecast is guaranteed the complementary share whatever research
+        does, and any pre-research spend (a slow intake) comes out of research's
+        half rather than the forecast's. Never negative: an exhausted window
+        yields 0, which cancels the provider phase immediately rather than
+        reporting a nonsense deadline.
 
-        Under the static 3510 s budget this is ~1755 s, comfortably above the
-        research phase's 1155 s configured worst case, so on a roomy question the
-        deadline never fires and behavior is unchanged.
+        Under the static 3510 s budget the window is ~1755 s, comfortably above
+        the research phase's 1155 s configured worst case, so on a roomy question
+        the deadline never fires and behavior is unchanged.
         """
-        return max(0.0, self.remaining_s() * RESEARCH_PHASE_BUDGET_SHARE)
+        return max(0.0, self.total_s * RESEARCH_PHASE_BUDGET_SHARE - self.elapsed_s())
 
 
 def build_question_time_budget(

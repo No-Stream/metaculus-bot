@@ -19,6 +19,7 @@ Network plumbing (FakeSession / FakeResponse) is shared with the Tier-1 suite.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from unittest.mock import MagicMock
@@ -237,10 +238,13 @@ class TestDatawrapperHop:
         assert dataset.status == "stale_data"
         assert dataset.text == ""  # never rendered — stale-as-live is the failure this guards
         assert dataset.data_last_modified is not None
-        # The formatter surfaces the withholding as a clear status, and the
+        # The formatter surfaces the withholding on the datasets' OWN line — a
+        # chart CSV is not a cited resolution source, so it must not ride the
+        # "cited resolution source(s) could not be fetched" wording — and the
         # (fresh) page content still renders.
         out = format_resolution_sections(results, datetime.now(timezone.utc))
-        assert "static.dwcdn.net: stale_data" in out
+        assert "[1 embedded chart dataset(s) not served (stale_data)" in out
+        assert "could not be fetched" not in out
         assert "day-0019" not in out
         assert "updated whenever new qualifying polls" in out
 
@@ -378,7 +382,9 @@ class TestDatawrapperHop:
         assert results[1].text == ""
 
     async def test_long_dataset_keeps_most_recent_rows(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 900)
+        # Datasets truncate against their OWN cap, not the page cap — the dataset
+        # allowance is what keeps a chart's rows from evicting cited page text.
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS", 900)
         session = FakeSession(
             {
                 PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
@@ -438,13 +444,23 @@ class TestDatawrapperHop:
 
     async def test_wall_clock_timeout_drains_a_hanging_dataset_fetch(self, monkeypatch):
         """The F5 teardown guard, now that dataset tasks join the cancel list: when
-        the provider's wall-clock timeout cancels the fetch mid-hop, the in-flight
-        dataset request must settle BEFORE the session closes. Closing the session
-        first is what yanks transports out from under live requests (aiohttp then
-        logs transport-closed tracebacks and can leak connections), so the event
-        ordering — not just the final state — is the invariant."""
+        the hop's budget expires mid-fetch, the in-flight dataset request must settle
+        BEFORE the session closes. Closing the session first is what yanks transports
+        out from under live requests (aiohttp then logs transport-closed tracebacks
+        and can leak connections), so the event ordering — not just the final state —
+        is the invariant.
+
+        Since the hop gained its own wall bound, a hanging dataset no longer takes
+        the whole provider down: the inner timeout fires first and the provider
+        serves the Tier-1 page it already fetched — the pre-bound behavior (`out ==
+        ""`, every fetched page discarded) is exactly the regression the bound
+        removed. The wall/margin/floor are scaled down together, preserving the
+        production relationship (margin > 0 is what makes the inner bound fire
+        before the outer wall) at test speed; the skip branch is tested separately."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.05)
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.4)
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S", 0.3)
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S", 0.0)
         events: list[str] = []
 
         class _HangingResponse(FakeResponse):
@@ -472,11 +488,35 @@ class TestDatawrapperHop:
         q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
 
-        assert out == ""  # provider soft-fails on the wall-clock timeout
+        # The hop's own bound fired, so Tier-1 survives the hanging CDN fetch.
+        assert f"### {PAGE_URL}" in out
+        assert DATASET_URL not in out
         assert DATASET_URL in session.requested  # the hop did start
         assert events == ["dataset-settled", "session-closed"]
         assert session.host_inflight["static.dwcdn.net"] == 0  # the request's context manager exited
         assert session.closed
+
+    async def test_hop_is_skipped_when_the_wall_budget_is_nearly_spent(self, monkeypatch, caplog):
+        """Below the hop floor there is no room for even one typical CDN fetch, so
+        the hop must not start at all — the pages in hand are worth more than an
+        attempt that cannot land and could push the provider past its wall."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.05)
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(5), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        with caplog.at_level(logging.WARNING):
+            q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+            out = await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert f"### {PAGE_URL}" in out
+        assert DATASET_URL not in session.requested  # never started
+        assert any("skipping the datawrapper hop" in message for message in caplog.messages)
 
 
 class TestDatawrapperHopFailureModes:
@@ -613,16 +653,19 @@ class TestProviderEndToEnd:
         assert f"### {DATASET_URL}" in out
         assert "day-0019,38.5,57.9" in out
         assert f"Tracker chart {CHART_ID}" in out
-        # Diagnostics record both the page and the hop outcome.
+        # Diagnostics record both the page and the hop outcome. The dataset is
+        # keyed by chart id, not netloc: every dataset shares one CDN host, so
+        # domain keys would collapse multiple charts into `static.dwcdn.net#N`.
         sources = pop_provider_detail(q.id_of_question, "resolution_source")["sources"]
         assert sources["tracker.example.com"] == "ok"
-        assert sources["static.dwcdn.net"] == "ok"
+        assert sources[f"datawrapper:{CHART_ID}"] == "ok"
 
-    async def test_withheld_stale_dataset_surfaces_in_diagnostics(self, monkeypatch):
-        """A withheld dataset must be a VISIBLE loss, not a silent one: the hop's
-        `stale_data` verdict rides into the per-URL diagnostics map as its own
-        token, so the provider block reads "we found the chart and refused its
-        data" rather than looking fully healthy."""
+    async def test_withheld_stale_dataset_reads_benign_in_diagnostics(self, monkeypatch):
+        """A `stale_data` withhold is the freshness guard WORKING — refusing to serve
+        months-old data as live — not a lost cited source. It maps to the benign
+        `none` token (reached, contributed nothing) under its chart-id key, so the
+        diagnostics `lost=` segment stays reserved for genuine losses; the forecaster
+        still sees the withholding via the rendered dataset note."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession(
             {
@@ -636,9 +679,55 @@ class TestProviderEndToEnd:
         out = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert "day-0019" not in out  # the stale CSV never reaches a forecaster
+        assert "[1 embedded chart dataset(s) not served (stale_data)" in out
         sources = pop_provider_detail(q.id_of_question, "resolution_source")["sources"]
         assert sources["tracker.example.com"] == "ok"
-        assert sources["static.dwcdn.net"] == "stale_data"
+        assert sources[f"datawrapper:{CHART_ID}"] == "none"
+
+    async def test_a_failed_hop_is_still_a_visible_loss_in_diagnostics(self, monkeypatch):
+        """The benign mapping is stale_data-only: a genuinely failed hop (CDN error)
+        keeps its verbatim loss token — that is real signal about the CDN."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: aiohttp.ClientError("boom"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        await resolution_source_provider(is_benchmarking=False)(q)
+
+        sources = pop_provider_detail(q.id_of_question, "resolution_source")["sources"]
+        assert sources[f"datawrapper:{CHART_ID}"] == "error"
+
+    async def test_datasets_cannot_evict_cited_page_text(self, monkeypatch):
+        """The partitioned section budget: datasets draw on their OWN allowance, so
+        even a page-budget squeeze cannot be caused by chart rows — the second page's
+        text renders whole alongside a full-size dataset."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        other_page = "https://mirror.example.com/tracker-two"
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                other_page: FakeResponse(200, body=_tracker_page_html("Zz9Yy"), content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(500), last_modified=_fresh_last_modified()),
+                "https://static.dwcdn.net/data/Zz9Yy.csv": _csv_response(
+                    _csv_body(500), last_modified=_fresh_last_modified()
+                ),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL, other_page])
+        out = format_resolution_sections(results, datetime.now(timezone.utc))
+
+        # Both cited pages render despite two full-size datasets interleaved
+        # before/between them in the walk order.
+        assert f"### {PAGE_URL}" in out
+        assert f"### {other_page}" in out
+        assert "additional source(s) omitted" not in out
 
     async def test_benchmarking_guard_covers_the_hop(self, monkeypatch):
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")

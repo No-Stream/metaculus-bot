@@ -186,11 +186,29 @@ class TestBudgetMath:
         assert _budget(TIME_BUDGET_FAST_PATH_THRESHOLD).fast_path is False
         assert _budget(TIME_BUDGET_FAST_PATH_THRESHOLD - 1).fast_path is True
 
-    def test_research_phase_gets_a_share_of_what_remains(self):
+    def test_research_phase_gets_its_share_at_grant_time(self):
         budget = _budget(1200)
 
-        # Measured from `remaining`, which is ~total at grant time.
         assert budget.research_phase_deadline_s() == pytest.approx(1200 * RESEARCH_PHASE_BUDGET_SHARE, abs=1.0)
+
+    def test_research_phase_is_one_fixed_window_not_a_rolling_share(self):
+        """The discriminating case: research consults the deadline at two sequential
+        points (provider phase, then gap-fill), and a rolling 50%-of-remaining at each
+        compounds to ~75% of the budget — leaving the fan-out under its own soft
+        deadline on exactly the close-limited band. The window is fixed at grant:
+        whatever research already spent comes out of ITS half."""
+        budget = _partly_spent_budget(2000, spent_s=500)
+
+        # Fixed window: 0.5*2000 - 500 = 500. A rolling share would read 0.5*1500 = 750.
+        assert budget.research_phase_deadline_s() == pytest.approx(500, abs=1.0)
+
+    def test_a_spent_research_window_reads_zero_with_budget_still_left(self):
+        """Past the window, research gets nothing MORE even though the question still
+        has budget — that remainder is the forecast's guaranteed half."""
+        budget = _partly_spent_budget(2000, spent_s=1100)
+
+        assert budget.remaining_s() > 0
+        assert budget.research_phase_deadline_s() == 0.0
 
     def test_research_phase_deadline_never_goes_negative(self):
         """An overrun budget must report 0 (cancel now), not a negative timeout that
@@ -227,7 +245,15 @@ class TestBudgetMath:
 
 
 class TestFastPathProviderSelection:
-    """The fast path keeps the primary provider and drops every optional one."""
+    """The fast path drops the two SLOW search providers and keeps everything else.
+
+    Dropping the cheap hard-capped providers (resolution_source 45s,
+    prediction_market 150s, ts_anchor 20s, financial classifier 30s) cannot
+    shorten the phase — the primary itself is the longest configured pole — and
+    would only discard the resolution ground truth. The shed is the measured
+    tail: native_search (slowest provider on 51.5% of questions, up to 292s) and
+    gemini_search.
+    """
 
     def _orchestrator(self) -> ResearchOrchestrator:
         return ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
@@ -255,20 +281,71 @@ class TestFastPathProviderSelection:
         assert "native_search" in names
         assert "prediction_market" in names
 
-    def test_fast_path_selection_keeps_only_the_primary(self):
-        names = [name for _, name in self._orchestrator()._select_research_providers(primary_only=True)]
+    def test_fast_path_selection_drops_the_slow_search_providers_and_keeps_the_cheap_ones(self):
+        names = [name for _, name in self._orchestrator()._select_research_providers(fast_path=True)]
 
-        assert names == ["asknews"]
+        assert names[0] == "asknews"
+        assert "native_search" not in names
+        assert "gemini_search" not in names
+        assert "resolution_source" in names
+        assert "prediction_market" in names
+        assert "timeseries_anchor" in names
+        assert "financial_data" in names
 
-    @pytest.mark.asyncio
-    async def test_fast_path_with_no_primary_falls_back_to_the_empty_stub(self, monkeypatch):
-        """The fast path must not accidentally re-enable the optional providers when the
-        primary is unconfigured — it degrades to the same empty stub full selection uses.
-        """
+    def test_fast_path_with_no_primary_still_runs_the_cheap_providers(self, monkeypatch):
+        """An unconfigured primary must not take the cheap hard-capped providers down
+        with it on the fast path — they are independent and short."""
         for key in ("ASKNEWS_CLIENT_ID", "ASKNEWS_SECRET", "EXA_API_KEY", "PERPLEXITY_API_KEY", "OPENROUTER_API_KEY"):
             monkeypatch.delenv(key, raising=False)
 
-        providers = self._orchestrator()._select_research_providers(primary_only=True)
+        names = [name for _, name in self._orchestrator()._select_research_providers(fast_path=True)]
+
+        assert "native_search" not in names
+        assert "gemini_search" not in names
+        assert "resolution_source" in names
+
+    @pytest.mark.asyncio
+    async def test_run_research_hands_selection_the_budgets_fast_path(self):
+        """The seam the isolation tests above cannot see: ``run_research`` must pass
+        the BUDGET's fast_path into provider selection. A mutation hardcoding it off
+        (re-running the slow search providers on exactly the thin questions whose
+        problem is tail latency) previously left the whole suite green."""
+        orchestrator = self._orchestrator()
+        handed_downstream: list[list[str]] = []
+
+        async def record(question, providers, time_budget=None):
+            handed_downstream.append([name for _, name in providers])
+            return "research " * 300, [], None
+
+        with patch.object(orchestrator, "_run_providers_parallel", side_effect=record):
+            await orchestrator.run_research(
+                make_real_binary_question(qid=7301), time_budget=_budget(TIME_BUDGET_FAST_PATH_THRESHOLD - 1)
+            )
+            await orchestrator.run_research(
+                make_real_binary_question(qid=7302), time_budget=_budget(TIME_BUDGET_FAST_PATH_THRESHOLD + 200)
+            )
+
+        fast_names, roomy_names = handed_downstream
+        assert "native_search" not in fast_names and "gemini_search" not in fast_names
+        assert "native_search" in roomy_names and "gemini_search" in roomy_names
+
+    @pytest.mark.asyncio
+    async def test_fast_path_with_nothing_configured_falls_back_to_the_empty_stub(self, monkeypatch):
+        """With no primary AND every optional flag off, selection degrades to the same
+        empty stub full selection uses rather than returning an empty list."""
+        for key in ("ASKNEWS_CLIENT_ID", "ASKNEWS_SECRET", "EXA_API_KEY", "PERPLEXITY_API_KEY", "OPENROUTER_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+        for flag in (
+            "NATIVE_SEARCH_ENABLED",
+            "GEMINI_SEARCH_ENABLED",
+            "FINANCIAL_DATA_ENABLED",
+            "TS_ANCHOR_ENABLED",
+            "PREDICTION_MARKETS_ENABLED",
+            "RESOLUTION_SOURCE_ENABLED",
+        ):
+            monkeypatch.setenv(flag, "false")
+
+        providers = self._orchestrator()._select_research_providers(fast_path=True)
 
         assert [name for _, name in providers] == ["none"]
         assert await providers[0][0](MagicMock()) == ""
@@ -449,19 +526,20 @@ class TestGapFillCutByTheResearchPhaseBudget:
     @pytest.mark.asyncio
     async def test_both_passes_are_cut_and_neither_counts_as_a_failure(self, caplog):
         """v2's cut must not bump ``gap_fill_v2_error_count``: that counter exists to
-        redden CI on a DEAD v2 feature, and a budget cut is our own decision — already
-        alertable through the fast-path counter. Folding the two together would make a
-        run of thin-window questions look like v2 had broken."""
+        redden CI on a DEAD v2 feature, and a budget cut is our own decision — alertable
+        instead through ``research_budget_cut_count``. Folding the two together would
+        make a run of thin-window questions look like v2 had broken."""
         orchestrator = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
         # Clears the fast-path threshold, so the pre-phase skip cannot be what fires,
-        # but only ~2s of it is left — the wait_for lands mid-pass. The margin is
-        # deliberately seconds rather than milliseconds: this suite runs on shared CI
-        # runners, and a budget that expires before the phase starts would take the
-        # SKIP branch and quietly stop testing the cut.
-        budget = _partly_spent_budget(
-            TIME_BUDGET_FAST_PATH_THRESHOLD + 200, spent_s=TIME_BUDGET_FAST_PATH_THRESHOLD + 198
-        )
+        # but only ~2s of the fixed research WINDOW (total * share, anchored at grant)
+        # is left — the wait_for lands mid-pass. The margin is deliberately seconds
+        # rather than milliseconds: this suite runs on shared CI runners, and a window
+        # that expires before the phase starts would take the SKIP branch and quietly
+        # stop testing the cut.
+        total_s = TIME_BUDGET_FAST_PATH_THRESHOLD + 200
+        budget = _partly_spent_budget(total_s, spent_s=total_s * RESEARCH_PHASE_BUDGET_SHARE - 2)
         assert budget.fast_path is False
+        assert 0.0 < budget.research_phase_deadline_s() < 5.0
 
         with (
             patch.object(
@@ -480,6 +558,10 @@ class TestGapFillCutByTheResearchPhaseBudget:
         assert "Targeted Gap-Fill" not in research
         assert "Agentic Research Findings" not in research
         assert orchestrator.gap_fill_v2_error_count == 0
+        # The cut IS alertable, once: both passes cut on one question dedupe to a
+        # single research_budget_cut_count bump — the off-fast-path counter that
+        # keeps this degradation out of the all-clear census.
+        assert orchestrator.research_budget_cut_count == 1
 
     @pytest.mark.asyncio
     async def test_an_exhausted_research_budget_skips_the_passes_outside_the_fast_path(self, caplog):

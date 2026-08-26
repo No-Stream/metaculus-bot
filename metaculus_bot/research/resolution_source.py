@@ -44,6 +44,7 @@ import ipaddress
 import logging
 import re
 import socket
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -54,8 +55,11 @@ import trafilatura
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot.constants import (
+    RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
+    RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S,
+    RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS,
     RESOLUTION_SOURCE_ENABLED_ENV,
     RESOLUTION_SOURCE_GLOBAL_CONCURRENCY,
     RESOLUTION_SOURCE_HTTP_TIMEOUT,
@@ -464,22 +468,39 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     A fetched URL normalizes to ``"ok"`` (the shared "contributed" token the
     diagnostics formatter recognizes); every other ``FetchStatus``
     (``blocked`` / ``js_wall`` / ``not_found`` / ``error`` / ``unsupported_type`` /
-    ``ssrf_blocked`` / ``stale_data``) is kept verbatim as the loss token so the
-    reason survives into the ``lost=`` segment. Duplicate domains are disambiguated with a ``#N`` suffix
-    so no per-URL outcome is silently overwritten.
+    ``ssrf_blocked``) is kept verbatim as the loss token so the reason survives
+    into the ``lost=`` segment. Duplicate domains are disambiguated with a ``#N``
+    suffix so no per-URL outcome is silently overwritten.
+
+    Tier-2 dataset results are keyed ``datawrapper:<chart_id>`` — they are hop
+    artifacts, not cited sources, and every dataset URL shares one CDN netloc, so
+    domain keys would collapse them into ``static.dwcdn.net#N`` noise. Their
+    ``stale_data`` verdict maps to the benign ``"none"``: that is the freshness
+    guard REFUSING to serve months-old data as live, i.e. the feature working as
+    designed, and reporting it in ``lost=`` would dress a by-design withhold as a
+    lost cited source. A genuinely failed hop (``error``/``blocked``/``not_found``)
+    keeps its verbatim loss token — that is real signal about the CDN.
     """
     sources: dict[str, str] = {}
     for r in results:
-        try:
-            key = urlparse(r.url).netloc or r.url
-        except ValueError:
-            key = r.url
+        if r.chart_id is not None:
+            key = f"datawrapper:{r.chart_id}"
+        else:
+            try:
+                key = urlparse(r.url).netloc or r.url
+            except ValueError:
+                key = r.url
         if key in sources:
             n = 2
             while f"{key}#{n}" in sources:
                 n += 1
             key = f"{key}#{n}"
-        sources[key] = "ok" if r.status == "success" else r.status
+        if r.status == "success":
+            sources[key] = "ok"
+        elif r.chart_id is not None and r.status == "stale_data":
+            sources[key] = "none"
+        else:
+            sources[key] = r.status
     return sources
 
 
@@ -508,31 +529,54 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
     - SOME succeeded → the success sections as before, plus a terse trailing
       note about any that failed.
 
-    Enforces ``RESOLUTION_SOURCE_TOTAL_MAX_CHARS`` across success sections:
-    later sections are trimmed (or dropped) once the budget is spent. Per-URL
-    truncation is the caller's responsibility (already applied in
-    ``_fetch_one``); this cap covers the aggregate section length. When one or
+    Enforces ``RESOLUTION_SOURCE_TOTAL_MAX_CHARS`` across CITED-page success
+    sections: later sections are trimmed (or dropped) once the budget is spent.
+    Tier-2 dataset sections (``chart_id`` set) budget against their OWN allowance
+    (``MAX_CHARTS x PER_DATASET_MAX_CHARS``) — the two classes are partitioned so
+    a chart's rows can never evict the cited page text the section exists to
+    serve, while a dataset still renders adjacent to its parent page. Per-URL
+    truncation is the caller's responsibility (already applied in ``_fetch_one``
+    and the hop); these caps cover the aggregate section length. When one or
     more sections are dropped entirely (budget spent before them), a final line
     names the dropped count so downstream readers can tell the snapshot is partial.
+
+    Failure wording is partitioned the same way: a Datawrapper dataset is not a
+    CITED resolution source, and its most common non-success — ``stale_data``,
+    the freshness guard refusing to serve months-old data as live — is not a
+    fetch failure at all, so datasets never ride the "cited resolution source(s)
+    could not be fetched" notices and get their own withheld line instead.
     """
     if not results:
         return ""
 
     successes = [r for r in results if r.status == "success"]
-    failures = [r for r in results if r.status != "success"]
+    cited_failures = [r for r in results if r.status != "success" and r.chart_id is None]
+    dataset_nonsuccesses = [r for r in results if r.status != "success" and r.chart_id is not None]
+
+    def _dataset_withheld_note() -> str:
+        n = len(dataset_nonsuccesses)
+        statuses = ", ".join(sorted({r.status for r in dataset_nonsuccesses}))
+        return (
+            f"[{n} embedded chart dataset(s) not served ({statuses}) — "
+            f"withheld rather than shown stale; the cited page text is unaffected.]"
+        )
 
     if not successes:
-        n = len(failures)
-        return (
-            f"[{n} resolution source(s) could not be fetched: {_render_fetch_failures(failures)}] — "
+        n = len(cited_failures)
+        notice = (
+            f"[{n} resolution source(s) could not be fetched: {_render_fetch_failures(cited_failures)}] — "
             f"the resolving page was unreachable; weight other evidence accordingly."
         )
+        if dataset_nonsuccesses:
+            notice += "\n\n" + _dataset_withheld_note()
+        return notice
 
     fetched_iso = fetched_at.strftime("%Y-%m-%d")
     caveat = f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence."
 
     sections: list[str] = []
-    remaining = RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+    page_remaining = RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+    dataset_remaining = RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS * RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS
     dropped = 0
     for r in successes:
         # Cheap per-section budget accounting on the text body only. Section
@@ -540,24 +584,31 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
         # the RESOLUTION_SOURCE_TOTAL_MAX_CHARS total budget; if the caller
         # tightens it dramatically for a test, we still cut the text
         # conservatively.
+        is_dataset = r.chart_id is not None
+        remaining = dataset_remaining if is_dataset else page_remaining
         if remaining <= 0:
             dropped += 1
             continue
         body = r.text
         if len(body) > remaining:
             body = body[:remaining].rstrip()
-        remaining -= len(body)
+        if is_dataset:
+            dataset_remaining -= len(body)
+        else:
+            page_remaining -= len(body)
         section = f"### {r.url}\n(fetched {fetched_iso})\n\n{body}"
         sections.append(section)
 
     rendered = caveat + "\n\n" + "\n\n".join(sections)
     if dropped:
         rendered += f"\n\n[{dropped} additional source(s) omitted — section budget]"
-    if failures:
+    if cited_failures:
         rendered += (
-            f"\n\n[Note: {len(failures)} other cited resolution source(s) could not be fetched: "
-            f"{_render_fetch_failures(failures)} — weight accordingly.]"
+            f"\n\n[Note: {len(cited_failures)} other cited resolution source(s) could not be fetched: "
+            f"{_render_fetch_failures(cited_failures)} — weight accordingly.]"
         )
+    if dataset_nonsuccesses:
+        rendered += "\n\n" + _dataset_withheld_note()
     return rendered
 
 
@@ -995,7 +1046,9 @@ async def _fetch_datawrapper_dataset(
                     f'Live "Get the data" dataset for Datawrapper chart {chart.chart_id}{title_part} '
                     f"embedded in {parent_url}. Dataset published {last_modified.isoformat()}."
                 )
-                csv_budget = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+                # The DATASET cap, not the page cap: datasets budget against their own
+                # section allowance so a chart's rows can never evict cited page text.
+                csv_budget = RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS - len(lead) - 2
                 csv_text = _truncate_csv_middle(body.decode("utf-8", errors="replace").strip(), csv_budget, url)
                 logger.info(
                     f"resolution_source datawrapper hop {chart.chart_id} "
@@ -1088,6 +1141,7 @@ async def fetch_resolution_sources(urls: list[str]) -> list[FetchResult]:
     """
     host_sems: dict[str, asyncio.Semaphore] = {}
     tasks: list[asyncio.Task[FetchResult]] = []
+    started = time.monotonic()
 
     session_cm = _get_session()
     async with session_cm as session:
@@ -1099,12 +1153,51 @@ async def fetch_resolution_sources(urls: list[str]) -> list[FetchResult]:
             picks = _select_datawrapper_charts(page_results)
             if not picks:
                 return page_results
+            # The hop is a SECOND network phase inside the provider's single 45s wall,
+            # and its datasets share one CDN host, so the per-host politeness semaphore
+            # serializes them — worst case MAX_CHARTS x the 20s HTTP timeout, on top of
+            # whatever the page phase already spent. Unbounded, a slow CDN tail would
+            # blow the outer wall and cancel the WHOLE provider, discarding Tier-1
+            # pages that already fetched. So the hop gets only the wall budget the
+            # pages left behind (minus a margin so this path returns before the outer
+            # wait_for fires), degrades to the pages on its own timeout, and is skipped
+            # outright when less than one typical CDN fetch's worth remains. Typical
+            # cost is trivial — a poll CSV is tens of KB off a CDN, sub-second-to-~2s
+            # per dataset (the validation receipts' live runs) — so the bound exists
+            # for the tail, which is exactly what a wall cap is for.
+            hop_budget_s = (
+                RESOLUTION_SOURCE_WALL_TIMEOUT
+                - (time.monotonic() - started)
+                - RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S
+            )
+            if hop_budget_s < RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S:
+                logger.warning(
+                    "resolution_source: skipping the datawrapper hop (%d chart(s)) — %.1fs of wall "
+                    "budget left; serving %d Tier-1 page result(s) without datasets",
+                    len(picks),
+                    hop_budget_s,
+                    len(page_results),
+                )
+                return page_results
             dataset_tasks = [
                 asyncio.create_task(_fetch_datawrapper_dataset(session, chart, page_results[idx].url, host_sems))
                 for idx, chart in picks
             ]
             tasks.extend(dataset_tasks)
-            dataset_results = list(await asyncio.gather(*dataset_tasks, return_exceptions=False))
+            try:
+                dataset_results = list(
+                    await asyncio.wait_for(
+                        asyncio.gather(*dataset_tasks, return_exceptions=False), timeout=hop_budget_s
+                    )
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "resolution_source: datawrapper hop timed out after %.1fs; serving %d Tier-1 "
+                    "page result(s) without datasets",
+                    hop_budget_s,
+                    len(page_results),
+                )
+                return page_results
             return _interleave_dataset_results(page_results, picks, dataset_results)
         finally:
             # Whether we exit normally or via cancellation, cancel any still-

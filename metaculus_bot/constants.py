@@ -439,6 +439,25 @@ RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host se
 RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS: int = (
     3  # datasets per question; hero/resolving chart is ~always first in document order (Trump tracker carries 5 embeds)
 )
+# The hop runs as a SECOND network phase after the Tier-1 page gather, inside the same
+# 45s provider wall, and the datasets share one CDN host so the per-host politeness
+# semaphore serializes them (worst case MAX_CHARTS x the 20s HTTP timeout = 60s > the
+# wall). Bounding the hop at whatever wall budget remains — and skipping it below this
+# floor — is what keeps a slow CDN tail from cancelling the whole provider and throwing
+# away Tier-1 pages that already fetched. The floor admits at least one typical dwcdn
+# fetch (a poll CSV is tens of KB off a CDN, sub-second-to-~2s — same probe basis as the
+# HTTP timeout's "0-2s typical"); below it the hop cannot land anything and the pages
+# are worth more than the attempt.
+RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S: float = 3.0
+# Wall margin the hop leaves the outer wait_for, so the inner bound fires first and the
+# provider returns the pages instead of being cancelled mid-render.
+RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S: float = 2.0
+# Per-dataset render cap, deliberately WELL under the 6,000-char page cap: a
+# middle-truncated daily series keeps ~12 rows at each end per 1,000 chars, so 3,000
+# still carries weeks of values around today, and the formatter budgets datasets against
+# their own allowance (MAX_CHARTS x this) so a chart's data can never evict the cited
+# page text the section exists to serve.
+RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS: int = 3000
 RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS: float = 30.0  # freshness bound on the dataset's Last-Modified vs fetch time. Live trackers republish at least daily; the stale-route failure class this guards against served 5-14 MONTH old snapshots as HTTP 200 (2026-08-24 verifications). Older/undatable data is withheld (stale_data), never served as live.
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
@@ -688,12 +707,18 @@ PUBLISH_RESERVE_SECONDS: int = 60
 # to 183s (dropping the provider tail at its observed max).
 TIME_BUDGET_FAST_PATH_THRESHOLD: int = 1800
 
-# Fraction of the REMAINING budget the research phase may consume, enforced as a
-# deadline on the parallel-provider phase and on each gap-fill pass. A share of
-# what is left (not of the original total) so a slow intake cannot hand research
-# time the forecast needs. At the static budget this is ~1755s, well above
-# research's 1155s configured worst case, so it never fires on a roomy question;
-# at a 1200s budget it splits 600 research / 600 forecast-and-publish.
+# Fraction of the TOTAL budget granted to the research phase as ONE fixed window
+# anchored at the budget's start (research_phase_deadline_s = total*share −
+# elapsed), enforced as a deadline on the parallel-provider phase and on each
+# gap-fill pass. Fixed rather than a rolling share of remaining: research
+# consults the deadline at two sequential points, and re-taking 50% of remaining
+# at each compounds to ~75% of the budget — leaving the fan-out under its own
+# soft deadline on the close-limited band this budget exists for. The fixed
+# window guarantees forecast-and-publish the complementary half, and a slow
+# intake spends research's half, not the forecast's. At the static 3510s budget
+# the window is ~1755s, well above research's 1155s configured worst case, so it
+# never fires on a roomy question; at a close-limited 2400s budget it splits
+# 1200 research / 1200 forecast-and-publish.
 RESEARCH_PHASE_BUDGET_SHARE: float = 0.5
 
 # Per-publish-POST timeout (post_binary/numeric/mc + post_question_comment).

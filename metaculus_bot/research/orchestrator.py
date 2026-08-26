@@ -158,6 +158,28 @@ class ResearchOrchestrator:
         # alarm (investigating that beats silently missing a dead feature). See
         # run_research for the three mutually-exclusive bump points.
         self.gap_fill_v2_error_count: int = 0
+        # Per-QUESTION count of research thinned by the time budget OFF the fast
+        # path: a provider cancelled at the research-phase deadline, or gap-fill
+        # cut/skipped for budget, on a question whose window was wide enough that
+        # fast_path never fired. The fast path has its own alertable counter
+        # (_time_budget_fast_path_count, forecaster-side); without this one the
+        # band just above the threshold — where the research window can still sit
+        # under research's configured worst case — degraded silently and the
+        # end-of-run census read all-clear. Deduplicated per question (the seen
+        # set), so a question losing a provider AND both gap-fill passes counts
+        # once, and fast-path questions are excluded so nothing double-charges.
+        self.research_budget_cut_count: int = 0
+        self._research_budget_cut_seen: set[object] = set()
+
+    def _record_research_budget_cut(self, question: MetaculusQuestion, *, fast_path: bool) -> None:
+        """Count one question's budget-driven research degradation, once, off the fast path."""
+        if fast_path:
+            return
+        key: object = getattr(question, "id_of_question", None) or id(question)
+        if key in self._research_budget_cut_seen:
+            return
+        self._research_budget_cut_seen.add(key)
+        self.research_budget_cut_count += 1
 
     @property
     def prediction_market_degraded_count(self) -> int:
@@ -289,13 +311,18 @@ class ResearchOrchestrator:
                 return cached
 
             fast_path = time_budget is not None and time_budget.fast_path
-            providers = self._select_research_providers(primary_only=fast_path)
+            providers = self._select_research_providers(fast_path=fast_path)
             provider_names = [name for _, name in providers]
             logger.info(f"Using research providers: {provider_names}")
 
             research, provider_results, asknews_raw = await self._run_providers_parallel(
                 question, providers, time_budget=time_budget
             )
+            if any(pr.status == "deadline" for pr in provider_results):
+                # A provider cancelled at the research-phase deadline is budget-driven
+                # degradation; off the fast path nothing else counts it (see
+                # _record_research_budget_cut).
+                self._record_research_budget_cut(question, fast_path=fast_path)
 
             # Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
             # CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
@@ -326,6 +353,7 @@ class ResearchOrchestrator:
                     str(fast_path).lower(),
                     "n/a" if gap_fill_budget_s is None else f"{gap_fill_budget_s:.0f}s",
                 )
+                self._record_research_budget_cut(question, fast_path=fast_path)
             gap_fill_v2_payload: dict | None = None
 
             if gap_fill_v1_active or gap_fill_v2_active:
@@ -361,6 +389,7 @@ class ResearchOrchestrator:
                             "GAP_FILL_V1_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
                             getattr(question, "id_of_question", None),
                         )
+                        self._record_research_budget_cut(question, fast_path=fast_path)
                         return ""
                     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
                         logger.exception("Gap-fill v1 stage failed; proceeding without it")
@@ -406,11 +435,13 @@ class ResearchOrchestrator:
                         # NOT a v2 crash: we cut it to protect the prediction POST, so
                         # this must not bump gap_fill_v2_error_count (which exists to
                         # redden CI on a dead v2 feature) — the budget decision is
-                        # already alertable via the fast-path counter.
+                        # alertable via research_budget_cut_count (fast-path questions
+                        # never reach here; gap-fill is skipped upstream for them).
                         logger.warning(
                             "GAP_FILL_V2_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
                             getattr(question, "id_of_question", None),
                         )
+                        self._record_research_budget_cut(question, fast_path=fast_path)
                         return ""
                     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
                         logger.exception("Gap-fill v2 stage failed; proceeding without it")
@@ -595,17 +626,22 @@ class ResearchOrchestrator:
         )
         return provider, provider_name
 
-    def _select_research_providers(self, primary_only: bool = False) -> list[tuple[ResearchCallable, str]]:
+    def _select_research_providers(self, fast_path: bool = False) -> list[tuple[ResearchCallable, str]]:
         """Assemble the enabled providers for one question.
 
-        ``primary_only`` is the time-budget fast path: keep the primary provider
-        (AskNews in prod) and drop every optional one. The optional providers run
-        CONCURRENTLY with the primary, so this is worth less than it looks — measured
-        over 101 triple-era artifact records the parallel phase costs 70 s at p50
-        versus 60 s for the primary alone. It matters in the tail, which is where a
-        thin window actually gets lost: native_search is the phase's slowest provider
-        on 51.5% of questions and reached 292 s, against the primary's 110 s worst
-        case (scratch/residual_2026-08-24/time_budget_design.md).
+        ``fast_path`` is the time-budget thin-window mode: drop the two SLOW search
+        providers (native_search, gemini_search) and keep everything else. The
+        optional providers all run CONCURRENTLY with the primary, whose own worst
+        case (AskNews 300 s + summarizer 300 s, sequential inside one provider) is
+        the phase's longest configured pole — so dropping the cheap hard-capped
+        providers (resolution_source 45 s, prediction_market 150 s, ts_anchor 20 s,
+        financial classifier 30 s) cannot shorten the phase and only discards the
+        resolution ground truth. What the fast path CAN shed is the measured tail:
+        native_search is the phase's slowest provider on 51.5% of questions and
+        reached 292 s against the primary's 110 s measured worst case
+        (scratch/residual_2026-08-24/time_budget_design.md). Anything still
+        straggling past the research window is cancelled by
+        ``_await_providers_within_deadline`` with its partial bundle kept.
         """
         providers: list[tuple[ResearchCallable, str]] = []
 
@@ -613,13 +649,7 @@ class ResearchOrchestrator:
         if primary_name != "none":
             providers.append((primary, primary_name))
 
-        if primary_only:
-            if not providers:
-                logger.warning("Fast-path research requested but no primary provider is configured")
-                providers.append((_empty_provider, "none"))
-            return providers
-
-        if env_flag_enabled(NATIVE_SEARCH_ENABLED_ENV):
+        if not fast_path and env_flag_enabled(NATIVE_SEARCH_ENABLED_ENV):
             model = os.getenv(NATIVE_SEARCH_MODEL_ENV)
             providers.append(
                 (
@@ -628,7 +658,7 @@ class ResearchOrchestrator:
                 )
             )
 
-        if env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
+        if not fast_path and env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
             from metaculus_bot.research.gemini_search import (
                 gemini_search_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
             )
@@ -800,9 +830,12 @@ class ResearchOrchestrator:
         cut providers are named in the diagnostics block and the research archive.
 
         A cancelled provider does NOT bump ``provider_failure_count``: it did not
-        fail, we stopped it, and that decision is already alertable through the
-        forecaster's ``time_budget_fast_path`` counter. Keeping the two apart is what
-        lets ``research_provider_failures`` keep meaning "a provider broke".
+        fail, we stopped it. The budget decision is alertable instead through
+        ``research_budget_cut_count`` (bumped by the caller when any result comes
+        back ``status="deadline"`` off the fast path; fast-path questions are
+        already counted by the forecaster's ``time_budget_fast_path`` counter).
+        Keeping the two apart is what lets ``research_provider_failures`` keep
+        meaning "a provider broke".
 
         With no budget (every caller outside the per-question pipeline) the wait is
         unbounded and behavior is identical to the old gather.
