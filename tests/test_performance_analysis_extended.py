@@ -9,14 +9,19 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
 
+from metaculus_bot import performance_analysis
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.performance_analysis import collector
 from metaculus_bot.performance_analysis.analysis import (
     _interpolate_pit,
+    _single_curve_pit,
     binary_summary,
+    declared_percentile_pit,
     disagreement_predicts_error,
     financial_vs_nonfinancial_pit,
     max_step_clamp_screen,
@@ -28,6 +33,7 @@ from metaculus_bot.performance_analysis.analysis import (
 )
 from metaculus_bot.performance_analysis.collector import (
     _process_post,
+    build_performance_dataset,
     load_dataset,
     rescore_records,
     resolve_numeric_record_to_score_inputs,
@@ -476,6 +482,14 @@ class TestCollectorCommentCreatedAt:
         records = _process_post(post, {5: comment})
         assert records[0]["stacker_skip_reason"] is None
 
+    def test_practice_posts_produce_no_records(self):
+        # Practice questions are not tournament scoring surface; they must never enter
+        # the dataset (they would otherwise land in every calibration cut).
+        post = self._post_data(6, 66)
+        post["title"] = "[PRACTICE] Will this be scored?"
+        comment = {"id": 1003, "text": "*Forecaster 1*: 70%\n", "on_post": 6}
+        assert _process_post(post, {6: comment}) == []
+
 
 # ---------------------------------------------------------------------------
 # collector — stacker_outcome / stacker_outcome_source fields
@@ -760,6 +774,56 @@ class TestInterpolatePitOutOfGrid:
         assert result["pit_values"][0] == pytest.approx(0.10, abs=1e-9)
 
 
+class TestDeclaredPercentileCurveTolerance:
+    """Member curves come out of comment TEXT, so the fallback must tolerate junk.
+
+    Every unusable curve reads as no-curve (dropped from the median) rather than
+    raising or contributing a garbage quantile — the callers then either median the
+    surviving curves or fall back to the grid read.
+    """
+
+    _GOOD = [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]]
+
+    def test_non_numeric_declared_value_drops_only_that_curve(self):
+        # A percentile line that parsed to a non-number: the median is taken over the
+        # surviving curve alone (model-b at 50 reads its P10 = 0.10), not over a
+        # coerced zero that would drag the quantile.
+        curves = cast(
+            "dict[str, list[list[float]]]",
+            {"model-a": [[10.0, "n/a"], [50.0, 90.0], [90.0, 105.0]], "model-b": self._GOOD},
+        )
+        assert declared_percentile_pit(curves, 50.0) == pytest.approx(0.10, abs=1e-9)
+
+    def test_pair_missing_its_value_is_unusable(self):
+        # A truncated line recovered as a bare percentile with no value.
+        assert _single_curve_pit([[10.0], [50.0]], 50.0) is None
+
+    def test_duplicate_declared_values_stay_usable(self):
+        # A flat tail (P10 == P50) is legitimate model output: jitter it into strict
+        # monotonicity rather than discarding the whole curve.
+        flat_tail = [[10.0, 80.0], [50.0, 80.0], [90.0, 105.0]]
+        assert _single_curve_pit(flat_tail, 50.0) == pytest.approx(0.10, abs=1e-9)
+        # Between the duplicated value and P90 the curve still interpolates.
+        mid = _single_curve_pit(flat_tail, 90.0)
+        assert mid is not None
+        assert 0.5 < mid < 0.9
+
+    def test_non_finite_declared_values_are_unusable(self):
+        # Jitter cannot rescue non-finite values; the curve must read as no-curve
+        # instead of returning a nan PIT into the median. errstate only silences the
+        # expected nan arithmetic inside the guard, which is the code under test.
+        with np.errstate(invalid="ignore"):
+            assert _single_curve_pit([[10.0, float("inf")], [90.0, float("inf")]], 50.0) is None
+            assert _single_curve_pit([[10.0, float("nan")], [50.0, 90.0]], 50.0) is None
+
+    def test_all_curves_unusable_reads_as_no_fallback(self):
+        # declared_percentile_pit returning None is what makes _interpolate_pit /
+        # compute_pit_details keep the grid-endpoint read.
+        junk = cast("dict[str, list[list[float]]]", {"model-a": [[50.0, "junk"]]})
+        assert declared_percentile_pit(junk, 50.0) is None
+        assert declared_percentile_pit(None, 50.0) is None
+
+
 class TestMaxStepClampScreen:
     """The q43913 signature: a published bin pinned at the per-bin max-step cap while
     every member's own declared curve wanted materially more mass there. The cap is
@@ -829,6 +893,19 @@ class TestMaxStepClampScreen:
         assert screen["submitted_before_grid_scaled_cap"] is True
         assert screen["max_step_cap"] == pytest.approx(0.2)
 
+    def test_unparseable_timestamp_treated_as_pre_fix(self):
+        # Same rule as a missing one: the undated (and undatable) archive records all
+        # predate the fix, so an unreadable timestamp must not be read as post-fix.
+        screen = max_step_clamp_screen(self._record(submitted="not-a-date"))
+        assert screen["submitted_before_grid_scaled_cap"] is True
+        assert screen["max_step_cap"] == pytest.approx(0.2)
+
+    def test_timestamp_with_an_offset_is_compared_in_utc(self):
+        # A post-fix instant written with a local offset must read as post-fix: a naive
+        # (offset-dropping) comparison shifts it hours across the boundary.
+        screen = max_step_clamp_screen(self._record(submitted="2026-07-21T11:07:37-07:00"))
+        assert screen["submitted_before_grid_scaled_cap"] is False
+
     def test_members_not_materially_more_does_not_fire(self):
         # Members' own curves put ~0.2 on the bin too: the cap coincided with what
         # the ensemble wanted, so nothing was overridden.
@@ -888,6 +965,19 @@ class TestMaxStepClampScreen:
         screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, resolution="below_lower_bound"))
         assert screen["suspected"] is False
         assert screen["reason"] == "non-numeric resolution"
+
+    def test_records_without_a_usable_grid_report_that_reason(self):
+        # The screen needs the question's own value grid to locate the realized bin.
+        # Comment-backfilled records often carry no continuous_range, and a grid whose
+        # length disagrees with the published CDF can't be indexed either — both must
+        # report a reason instead of screening an arbitrary bin.
+        no_grid = self._record(submitted=self._PRE_FIX_TS)
+        no_grid["scaling"] = {"range_min": 0.0, "range_max": 10.0}
+        assert max_step_clamp_screen(no_grid)["reason"] == "no usable grid"
+
+        mismatched = self._record(submitted=self._PRE_FIX_TS, grid=[0.0, 1.0, 2.0])
+        assert max_step_clamp_screen(mismatched)["reason"] == "no usable grid"
+        assert max_step_clamp_screen(mismatched)["suspected"] is False
 
 
 class TestNumericPitAnalysisValueGrid:
@@ -1022,6 +1112,129 @@ class TestRescoreRecords:
         assert loaded[1]["numeric_log_score"] == pytest.approx(
             loaded[1]["metaculus_scores"]["spot_baseline_score"], abs=1e-9
         )
+
+    def test_load_dataset_is_idempotent_on_an_already_healed_file(self, tmp_path: Path):
+        # Re-loading a file whose scores already agree with the scorer must leave every
+        # value byte-identical: healing is a repair, not a rewrite of live data.
+        healed = self._stale_record()
+        rescore_records([healed])
+        path = tmp_path / "healed.json"
+        path.write_text(json.dumps([healed]))
+        (reloaded,) = load_dataset(str(path))
+        assert reloaded["numeric_log_score"] == healed["numeric_log_score"]
+
+    def test_scoring_failure_on_a_record_without_post_id_only_warns(self, caplog):
+        # rescore walks arbitrary cached JSON, so a record can lack post_id entirely.
+        # The scoring-failure log lines must read it defensively — a subscript there
+        # turns one unscoreable record into a KeyError that kills the whole load.
+        unscoreable_numeric = {
+            "type": "numeric",
+            "resolution_parsed": 5.0,
+            "our_forecast_values": [0.5],  # < 2 CDF points -> numeric_log_score raises
+            "open_lower_bound": False,
+            "open_upper_bound": False,
+            "scaling": {"range_min": 0.0, "range_max": 10.0, "zero_point": None},
+            "numeric_log_score": -1.0,
+        }
+        unscoreable_mc = {
+            "type": "multiple_choice",
+            "resolution_parsed": "B",
+            "our_forecast_values": [1.0],  # fewer probabilities than options
+            "options": ["A", "B"],
+            "mc_log_score": -1.0,
+        }
+        with caplog.at_level(logging.WARNING):
+            assert rescore_records([unscoreable_numeric, unscoreable_mc]) == 0
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Failed numeric scoring for post None" in m for m in messages)
+        assert any("Failed MC scoring for post None" in m for m in messages)
+        # The stored values survive: healing never deletes a score it can't recompute.
+        assert unscoreable_numeric["numeric_log_score"] == -1.0
+        assert unscoreable_mc["mc_log_score"] == -1.0
+
+
+class TestBuildPerformanceDatasetResearchTags:
+    """The dataset the analysis reads must arrive with the treatment tags stamped.
+
+    ``attach_research_tags`` is a single call inside ``build_performance_dataset``;
+    unit-testing the tagger alone leaves that pass-through deletable with a green
+    suite, and every treated/untreated calibration cut reads these fields off the
+    built dataset.
+    """
+
+    def _post(self, post_id: int, question_id: int) -> dict:
+        return {
+            "id": post_id,
+            "title": f"Q{post_id}",
+            "question": {
+                "id": question_id,
+                "type": "binary",
+                "resolution": "yes",
+                "my_forecasts": {"latest": {"forecast_values": [0.3, 0.7], "score_data": {}}},
+                "scaling": {},
+                "options": None,
+                "open_lower_bound": False,
+                "open_upper_bound": False,
+                "nr_forecasters": 5,
+                "title": f"Q{post_id}",
+            },
+            "projects": {},
+        }
+
+    def test_records_carry_tags_from_the_archive_dir(self, tmp_path: Path, monkeypatch):
+        (tmp_path / "11.json").write_text(
+            json.dumps(
+                {
+                    "research_text": "## Time Series Anchor\nband\n## Agentic Research Findings\nfindings\n",
+                    "source": "artifact",
+                    "gap_fill_v2": {"steps": 4},
+                }
+            )
+        )
+        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [self._post(1, 11)])
+        monkeypatch.setattr(
+            collector,
+            "fetch_bot_comments",
+            lambda author_id, token: [{"id": 9, "text": "*Forecaster 1*: 70%\n", "on_post": 1}],
+        )
+
+        records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
+
+        assert len(records) == 1
+        assert records[0]["anchor_present"] is True
+        assert records[0]["gfv2_present"] is True
+        assert records[0]["gfv2_loop_ran"] is True
+        assert records[0]["research_source_class"] == "artifact"
+
+    def test_question_without_an_archive_record_gets_none_not_false(self, tmp_path: Path, monkeypatch):
+        # Absence of evidence is not an untreated record: a missing archive file (or a
+        # whole missing archive) must never look like a measured False in the cuts.
+        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [self._post(2, 22)])
+        monkeypatch.setattr(collector, "fetch_bot_comments", lambda author_id, token: [])
+
+        records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
+
+        assert records[0]["anchor_present"] is None
+        assert records[0]["gfv2_present"] is None
+        assert records[0]["anchor_confidence"] is None
+
+
+class TestPackageExports:
+    """The residual rounds' out-of-band scripts import these off the package root, so
+    the re-export list is a contract, not bookkeeping."""
+
+    def test_new_analysis_helpers_are_re_exported(self):
+        for name in (
+            "attach_research_tags",
+            "research_tags_for_qid",
+            "research_tags_for_record",
+            "max_step_clamp_screen",
+            "rescore_records",
+            "parse_stacker_skip_reason_marker",
+        ):
+            assert name in performance_analysis.__all__, name
+            assert getattr(performance_analysis, name) is not None
 
 
 class TestResolveNumericScoreInputsZeroPoint:

@@ -202,6 +202,32 @@ class TestAttachResearchTags:
         assert records[0]["anchor_present"] is None
 
 
+class TestResearchTagsForQid:
+    """The bare-qid entry point (exported, and what a one-off analysis script calls)."""
+
+    def test_reads_the_archive_record_on_disk(self, tmp_path: Path):
+        (tmp_path / "101.json").write_text(
+            json.dumps(
+                {
+                    "research_text": "## Time Series Anchor\nband\n",
+                    "source": "artifact",
+                    "gap_fill_v2": {"steps": 2},
+                }
+            )
+        )
+        tags = research_tags_for_qid(101, tmp_path)
+        assert tags["anchor_present"] is True
+        assert tags["anchor_confidence"] == "header"
+        assert tags["gfv2_present"] is False
+        assert tags["gfv2_loop_ran"] is True
+        assert tags["research_source_class"] == "artifact"
+
+    def test_non_dict_record_yields_all_none(self, tmp_path: Path):
+        # A JSON file holding a list (or any non-object) is not a record.
+        (tmp_path / "102.json").write_text(json.dumps(["not", "a", "record"]))
+        assert research_tags_for_qid(102, tmp_path)["anchor_present"] is None
+
+
 class TestLogBackfillVetoOnQidLookup:
     def test_research_tags_for_qid_rejects_log_backfill(self, tmp_path: Path):
         (tmp_path / "101.json").write_text(

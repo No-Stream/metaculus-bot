@@ -21,6 +21,7 @@ from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from metaculus_bot.performance_analysis import audit
 from metaculus_bot.performance_analysis.audit import (
     EXTERNAL_COMMENTS_DIRNAME,
+    _format_our_prediction,
     _record_cdf_size,
     emit_combined_report,
     emit_external_comment_stub,
@@ -386,6 +387,36 @@ class TestRankNumericOwnGrid:
         assert _record_cdf_size({"scaling": {"inbound_outcome_count": 41}}) == 42
         assert _record_cdf_size({"scaling": {}, "our_forecast_values": [0.0] * 11}) == 11
         assert _record_cdf_size({"scaling": {}}) == PCHIP_CDF_POINTS
+        # A published list too short to be a CDF is not a grid size either.
+        assert _record_cdf_size({"scaling": {}, "our_forecast_values": [0.0, 1.0]}) == PCHIP_CDF_POINTS
+
+
+class TestFormatOurPredictionMultipleChoice:
+    """The MC branch of the audit report's prediction column: the highest-probability
+    options first, truncated to three with an explicit ellipsis so a wide ballot can't
+    silently print as if it were the whole distribution."""
+
+    def test_ballot_wider_than_three_is_truncated_with_an_ellipsis(self):
+        rendered = _format_our_prediction(
+            {
+                "type": "multiple_choice",
+                "options": ["A", "B", "C", "D"],
+                "our_forecast_values": [0.10, 0.50, 0.15, 0.25],
+            }
+        )
+        assert rendered == "B=50.0%, D=25.0%, C=15.0%, ..."
+
+    def test_three_option_ballot_has_no_ellipsis(self):
+        rendered = _format_our_prediction(
+            {"type": "multiple_choice", "options": ["A", "B", "C"], "our_forecast_values": [0.2, 0.5, 0.3]}
+        )
+        assert rendered == "B=50.0%, C=30.0%, A=20.0%"
+
+    def test_option_count_mismatch_falls_back_to_raw_values(self):
+        rendered = _format_our_prediction(
+            {"type": "multiple_choice", "options": ["A", "B", "C"], "our_forecast_values": [0.5, 0.5]}
+        )
+        assert rendered == "[0.5, 0.5]"
 
 
 class TestEmitSynthesisSpreadOrdering:

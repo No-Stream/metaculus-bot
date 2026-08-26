@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, GRID_SCALED_MAX_STEP_MERGED_AT
 from metaculus_bot.performance_analysis.width_monitor import (
     KNOWN_BUG_QIDS,
     TS_ANCHOR_ENABLE,
@@ -228,6 +229,26 @@ class TestEraAssignment:
         assert assign_era({"bot_comment_created_at": None}, default_eras()) == "no_timestamp"
         assert assign_era({}, default_eras()) == "no_timestamp"
 
+    def test_unparseable_timestamp_is_not_attributed_to_an_era(self):
+        # A record whose timestamp can't be parsed must land in no_timestamp rather
+        # than silently defaulting into the first (or last) era — mis-attributing one
+        # record's config era is exactly what the shared parser exists to prevent.
+        for raw in ("not-a-date", "2026-13-45T99:00:00Z", ""):
+            assert assign_era({"bot_comment_created_at": raw}, default_eras()) == "no_timestamp"
+
+    def test_offset_and_naive_timestamps_land_in_the_same_era(self):
+        # The archive carries all three ISO shapes (Z, explicit offset, naive). They
+        # must agree, since a naive read of a -07:00 instant is 7 hours off and can
+        # cross a boundary.
+        eras = default_eras()
+        instant_utc = "2026-07-21T18:07:37Z"
+        same_instant_offset = "2026-07-21T11:07:37-07:00"
+        naive_utc = "2026-07-21T18:07:37"
+        labels = {
+            assign_era({"bot_comment_created_at": raw}, eras) for raw in (instant_utc, same_instant_offset, naive_utc)
+        }
+        assert labels == {"ts_anchor (sharpen)"}
+
 
 class TestEraBoundariesAreMergeDates:
     """Era boundaries must be MERGE-TO-MAIN timestamps, never authoring dates.
@@ -294,6 +315,18 @@ class TestEraBoundariesAreMergeDates:
         and ``b4e9df0``, so every run in the author-to-merge gap used the
         identical pre-anchor config and belongs in ``widening_off``."""
         assert assign_era({"bot_comment_created_at": created_at}, default_eras()) == "widening_off (k_tail=1.0)"
+
+    def test_every_b4e9df0_gate_reads_the_same_instant(self):
+        """The monitor's era boundary and the clamp screen's era gate are the SAME
+        merge, so they are aliases of one constant.
+
+        Both mark ``b4e9df0``: the era split the width rows are bucketed by, and the
+        instant after which a coarse discrete grid's max-step cap stopped being a flat
+        0.2. Two independently-edited copies could drift, which would file one record
+        into the anchor era while screening it under the pre-fix cap.
+        """
+        assert TS_ANCHOR_ENABLE is B4E9DF0_MERGED_AT
+        assert GRID_SCALED_MAX_STEP_MERGED_AT is B4E9DF0_MERGED_AT
 
     @pytest.mark.parametrize(
         "created_at",

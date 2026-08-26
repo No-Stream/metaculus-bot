@@ -10,6 +10,8 @@ shipped 2026-07-17), so the n=0 path is a first-class, tested outcome.
 
 import json
 import math
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -17,7 +19,7 @@ import pytest
 import metaculus_bot.numeric.pchip_cdf as pchip_mod
 from metaculus_bot.numeric.config import grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
-from scripts.score_ghosts import join_and_score, parse_ghost_summary, render_report
+from scripts.score_ghosts import join_and_score, main, parse_ghost_summary, render_report
 
 
 def _legacy_ghost(qid: int, qtype: str, summary: str, run_date: str = "2026-07-17T00:00:00Z") -> dict:
@@ -353,6 +355,62 @@ class TestPreIdentitySplit:
         summary = join_and_score(
             [_json_ghost(1, {"qtype": "binary", "prob": 0.80})], [], [_binary_record(1, True, 0.50)]
         )
+        assert summary["split_by_pre_identity"]["no_pre_marker"]["n"] == 1
+
+
+class TestMainReadsThePreMarkerFromTheArchive:
+    """``main`` must LOAD ``ghost_pre_json`` out of the archive and hand it to the join.
+
+    Unit-testing ``join_and_score(pre_ghosts=...)`` alone leaves that load deletable
+    with a green suite — and dropping it silently collapses every row into
+    ``no_pre_marker``, which is exactly the pooled number the retirement gate must not
+    read. This drives the real CLI (archive dir + ``--perf-json`` + ``--output``) with
+    no network: ``_load_records`` reads the perf JSON off disk.
+    """
+
+    def _write_archive(self, archive_dir: Path, records: list[dict]) -> None:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        by_marker: dict[str, list[dict]] = {}
+        for record in records:
+            by_marker.setdefault(record["marker"], []).append(record)
+        for marker, marker_records in by_marker.items():
+            (archive_dir / f"{marker}.jsonl").write_text(
+                "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in marker_records)
+            )
+
+    def _run_main(self, tmp_path: Path, monkeypatch, ghost_records: list[dict]) -> dict:
+        archive_dir = tmp_path / "telemetry_archive"
+        self._write_archive(archive_dir, ghost_records)
+        perf_json = tmp_path / "perf.json"
+        perf_json.write_text(json.dumps([_binary_record(1, True, 0.50)]))
+        out_path = tmp_path / "summary.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "score_ghosts.py",
+                "--archive-dir",
+                str(archive_dir),
+                "--perf-json",
+                str(perf_json),
+                "--output",
+                str(out_path),
+            ],
+        )
+        main()
+        return json.loads(out_path.read_text())
+
+    def test_identical_pre_marker_is_read_off_disk(self, tmp_path: Path, monkeypatch):
+        payload = {"qtype": "binary", "prob": 0.30}
+        summary = self._run_main(tmp_path, monkeypatch, [_json_ghost(1, payload), _pre_ghost(1, payload)])
+        assert summary["n_scored"] == 1
+        assert summary["split_by_pre_identity"]["pre_identical"]["n"] == 1
+        assert summary["split_by_pre_identity"]["no_pre_marker"]["n"] == 0
+
+    def test_archive_without_the_pre_marker_file_still_scores(self, tmp_path: Path, monkeypatch):
+        # Pre-marker-era archives have no ghost_pre_json.jsonl at all.
+        summary = self._run_main(tmp_path, monkeypatch, [_json_ghost(1, {"qtype": "binary", "prob": 0.80})])
+        assert summary["n_scored"] == 1
         assert summary["split_by_pre_identity"]["no_pre_marker"]["n"] == 1
 
 
