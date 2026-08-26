@@ -656,6 +656,34 @@ class TestKalshiEventDerivations:
             assert spread < venues.kalshi.KALSHI_NO_PRICE_SPREAD
             assert venues.kalshi_strike_price(market) is not None, market["yes_sub_title"]
 
+    def test_the_dollar_conversion_deliberately_does_not_take_the_no_price_rule(self) -> None:
+        """`kalshi_usd_liquidity` still midpoints an empty book, and that is the intended asymmetry.
+
+        The spread guard corrects a PRICE; this function converts a contract COUNT into dollars, so
+        applying the same rule here would delete a real count rather than fix a bad number. A sibling
+        "fix" that swept this function in with the 2026-08-25 change would blank the `total_vol` and `OI`
+        cells on any no-book strike that has traded, which is a strictly worse cell than a stale
+        conversion. The three details its own docstring calls unpinned are pinned here too: the
+        `last_price_dollars` fallback, the `or 1.0` notional default, and the truthiness check that
+        routes a genuine 0.0 midpoint to the last trade.
+        """
+        empty_book = {"volume_fp": "1000", "open_interest_fp": "400", "yes_bid_dollars": "0.0000"}
+        empty_book |= {"yes_ask_dollars": "1.0000", "notional_value_dollars": "1.0000"}
+        no_quotes = {"volume_fp": "1000", "last_price_dollars": "0.3000", "notional_value_dollars": "1.0000"}
+        zero_midpoint = {
+            "volume_fp": "1000",
+            "yes_bid_dollars": "0.0000",
+            "yes_ask_dollars": "0.0000",
+            "last_price_dollars": "0.2000",
+        }
+
+        assert venues.kalshi_strike_price(empty_book) is None, "the PRICE is still refused"
+        assert venues.kalshi_usd_liquidity(empty_book) == (pytest.approx(500.0), pytest.approx(400.0))
+        assert venues.kalshi_usd_liquidity(no_quotes)[0] == pytest.approx(300.0)
+        # No notional field at all: open interest converts at the $1.00 default rather than vanishing.
+        assert venues.kalshi_usd_liquidity({"open_interest_fp": "400"})[1] == pytest.approx(400.0)
+        assert venues.kalshi_usd_liquidity(zero_midpoint)[0] == pytest.approx(200.0)
+
     def test_a_settled_strike_is_never_rendered_as_a_child(self, multi_close_page: dict[str, Any]) -> None:
         """The same scope the money legs use, for the same reason: a settled Kalshi market publishes
         an EMPTY book (bid 0.0000 / ask 1.0000), so its midpoint is a synthetic $0.50 nobody traded
@@ -1024,6 +1052,21 @@ class TestPolymarket:
 
         assert (children[0].implied_prob_yes is not None) is priced
 
+    @pytest.mark.parametrize("price", ["0.49", "0.51", "0.500001"])
+    def test_a_price_beside_the_default_is_a_real_price_however_thin(self, price: str) -> None:
+        """The guard compares to Gamma's default EXACTLY, and that is the whole reason it is safe.
+
+        Any trade moves a leg off `["0.5","0.5"]`, so a price merely NEAR 0.5 is one somebody quoted —
+        and a tolerance here would silently delete real prices from every leg that happens to trade
+        close to even. A no-volume leg is a thin market, which the `signal` column already says.
+        """
+        market = {"groupItemTitle": "close to even", "outcomePrices": json.dumps([price]), "volumeNum": 0.0}
+
+        children = venues.polymarket_event_children([market])
+
+        assert children[0].implied_prob_yes == pytest.approx(float(price))
+        assert children[0].price_withheld is False
+
     def test_a_single_market_events_own_price_takes_the_same_guard(self) -> None:
         """The PARENT-row half. A single-market event quotes its market's price as the row's own, so an
         untouched placeholder reaching the pool through that branch is the same fabrication under a
@@ -1085,6 +1128,21 @@ class TestPolymarket:
 
         assert rows is not None
         assert rows[0].children[0].title == "Will no Fed rate cuts happen in 2026?"
+
+    def test_a_leg_with_no_usable_label_is_dropped_rather_than_rendered_blank(self) -> None:
+        """A nameless leg would spend a sub-row saying nothing, and the ladder row would name it as a
+        bare price. The guard survived the 2026-08-25 rewrite of this loop (a comprehension with a
+        walrus became an explicit loop when the price guard was added), and the surviving legs keep
+        Gamma's order around the hole."""
+        markets = [
+            {"groupItemTitle": "1 cut", "outcomePrices": json.dumps(["0.62"])},
+            {"outcomePrices": json.dumps(["0.20"])},  # no groupItemTitle, question or title
+            {"groupItemTitle": "2 cuts", "outcomePrices": json.dumps(["0.18"])},
+        ]
+
+        children = venues.polymarket_event_children(markets)
+
+        assert [child.title for child in children] == ["1 cut", "2 cuts"]
 
     def test_the_markets_fallback_branch_also_reads_open_interest(self) -> None:
         payload = {
@@ -1445,6 +1503,40 @@ class TestManifoldMultiOutcome:
         assert by_label["no volume field"].implied_prob_yes == pytest.approx(0.5)
         assert by_label["ordinary rung"].implied_prob_yes == pytest.approx(0.27)
         assert [child.price_withheld for child in children] == [True, False, False, False]
+
+    def test_an_answer_the_parser_cannot_read_is_skipped_without_losing_its_siblings(self) -> None:
+        """The two guards inside the answer loop, which the 2026-08-25 price rewrite edited around: an
+        entry that is not a dict and an answer with no text or no probability are both skipped, and the
+        readable rungs keep the array's order across the hole. A skip that fell through would put a
+        blank-titled row into a family whose whole point is that every outcome is named."""
+        detail = {
+            "answers": [
+                {"text": "Below $3.00", "probability": 0.21, "volume": 30.0},
+                "not a dict at all",
+                {"text": "", "probability": 0.4},
+                {"text": "no probability"},
+                {"text": "Above $3.00", "probability": 0.79, "volume": 90.0},
+            ]
+        }
+
+        children = venues.manifold_answer_children(detail)
+
+        assert [child.title for child in children] == ["Below $3.00", "Above $3.00"]
+
+    @pytest.mark.parametrize("probability", [0.49, 0.51, 0.500001])
+    def test_a_probability_beside_the_prior_is_a_real_price_however_thin(self, probability: float) -> None:
+        """Compared to the 0.5 prior EXACTLY, because any bet moves an answer off it.
+
+        The Manifold sibling of the Polymarket guard, and the same reasoning: a tolerance would blank
+        real prices on every answer that happens to trade near even, while the volume column already
+        tells a forecaster how thin the rung is.
+        """
+        detail = {"answers": [{"text": "close to even", "probability": probability, "volume": 0.0}]}
+
+        children = venues.manifold_answer_children(detail)
+
+        assert children[0].implied_prob_yes == pytest.approx(probability)
+        assert children[0].price_withheld is False
 
     def test_an_untouched_answer_is_dropped_from_the_ranker_segment(self) -> None:
         """The two surfaces dispose of a blanked answer differently, and the asymmetry is deliberate.

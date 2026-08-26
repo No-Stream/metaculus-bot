@@ -553,6 +553,14 @@ class TestPredictionMarketFraming:
         for tier in ("same_quantity_same_date", "same_quantity_other_cut", "driver_or_consequence"):
             assert f"`{tier}`" in lowered, tier
         assert "realized outcome rather than a forecast" in lowered
+        # Which label wins when the two axes disagree. A tight relation on a THIN market is the shape
+        # that cost q45189: all three forecasters imported a thin single-strike price at full weight,
+        # because the prompt named both labels and never said the liquidity warning governs the price.
+        # The instruction has to be directional too — widen around the implied value rather than
+        # transplant it — since "discount a thin market" alone is what they thought they were doing.
+        assert "the liquidity warning governs the price" in lowered
+        assert "widening your distribution around its implied value" in lowered
+        assert "rather than transplanting its price exactly" in lowered
         # A multi-outcome market (Kalshi strike family, Polymarket event, PredictIt ballot) has no
         # single price, so the row the forecaster is told to anchor on renders a blank `prob` cell
         # and its outcomes carry the prices on indented sub-rows. Without this the strongest

@@ -31,7 +31,9 @@ from metaculus_bot.research.market_retrieval.rendering import (
     CHILD_ROW_MARKER,
     CHILD_TITLE_MAX_CHARS,
     LADDER_CUMULATIVE_PRICE_SUM,
+    LADDER_HARD_BOUND_STAGE,
     LADDER_MAX_STAGE,
+    LADDER_MIN_ROW_CHARS,
     LADDER_PRICE_FLOORS,
     LADDER_ROW_MAX_CHARS,
     LADDER_SECTION_MAX_CHARS,
@@ -607,6 +609,65 @@ class TestLadderSectionBudget:
         assert stats.collapsed == 0
         assert stats.named == stats.outcomes
 
+    def test_a_slate_no_stage_can_compact_falls_to_the_per_family_hard_bound(self) -> None:
+        """The SECTION-level hard bound, which is the tier that makes the allowance a real ceiling.
+
+        Stage escalation only helps when a family has something cheap to collapse, and a family priced
+        at exactly 0.50 has nothing: every rung sits the maximum distance from certainty, so no floor
+        reaches it and every stage is a no-op. Eight such families exhaust the escalation loop while
+        the section is still over — the shape that rendered 12,951 chars against a committed 10,600
+        budget before this tier existed. Each family then falls to `_ladder_hard_bound` at its equal
+        share of the allowance.
+
+        `max_stage` is the discriminator: the sentinel says a row fell off the end of the ladder rather
+        than stopping at an ordinary stage, and a per-ROW hard bound cannot produce it here because
+        every one of these titles fits `LADDER_ROW_MAX_CHARS` on its own.
+        """
+        matches = self._families(count=RENDER_BUDGET, prices=(0.50,) * 12)
+
+        rendered, stats = render_snapshot_with_stats(MarketSnapshot(matches=matches))
+
+        titles = _ladder_titles(rendered)
+        assert len(titles) == RENDER_BUDGET
+        assert max(len(title) for title in titles) <= LADDER_ROW_MAX_CHARS, (
+            "the fixture must reach the SECTION tier, not the per-row one, or this proves nothing"
+        )
+        assert stats.max_stage == LADDER_HARD_BOUND_STAGE
+        assert stats.ladder_chars <= LADDER_SECTION_MAX_CHARS
+        assert stats.named + stats.collapsed == stats.outcomes
+        for title in titles:
+            assert len(title) <= max(LADDER_SECTION_MAX_CHARS // len(titles), LADDER_MIN_ROW_CHARS)
+            assert _ladder_terms(title), "a hard-bounded row still names its most informative outcome"
+            assert re.search(r"\+\d+ more \(\d+\.\d\d summed\)$", title), title
+
+    def test_an_unquoted_outcome_is_the_first_thing_a_hard_bound_drops(self) -> None:
+        """A hard bound spends its characters on prices, so an outcome carrying none goes first.
+
+        `_forecast_content` reports -1.0 for an unquoted outcome precisely so it sorts behind every
+        priced one at every floor, and the hard bound is the one path that ranks the WHOLE remainder —
+        including the unquoted rungs the stage builders segregate. Getting this backwards would spend a
+        capped row naming outcomes with nothing to say while counting real prices into the remainder.
+        """
+        children = tuple(
+            MarketChild(title=f"rung {index:03d}", implied_prob_yes=0.50)
+            for index in range(200)  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        ) + tuple(MarketChild(title=f"unquoted {index}", price_withheld=True) for index in range(3))
+
+        rendered, stats = render_snapshot_with_stats(
+            MarketSnapshot(matches=[_row(title="pathological", prob=None, children=children)])
+        )
+
+        title = _ladder_titles(rendered)[0]
+        assert stats.max_stage == LADDER_HARD_BOUND_STAGE
+        assert "unquoted" not in title, "an outcome with no price must not evict a priced one from the row"
+        named = _ladder_terms(title)
+        assert named and all(price is not None for _, price, _ in named)
+        # The remainder's summed price counts the dropped PRICED rungs only, so the three unquoted ones
+        # are inside the count and contribute nothing to the sum — which is what makes the figure honest.
+        dropped_priced = stats.collapsed - 3
+        assert f"+{stats.collapsed} more ({dropped_priced * 0.5:.2f} summed)" in title
+        assert stats.named + stats.collapsed == stats.outcomes
+
 
 class TestQuoteRangeCell:
     """``LO-HI``: what a ``prob`` cell says when a venue's book implies no price."""
@@ -672,6 +733,35 @@ class TestQuoteRangeCell:
         rendered = render_snapshot(MarketSnapshot(matches=[_row(prob=None, children=children)]))
 
         assert "untouched leg -" in _ladder_titles(rendered)[0]
+
+    def test_a_refused_family_price_renders_the_parents_own_book_as_a_range(self) -> None:
+        """The PARENT row's half of the same claim, which is a different code path from a sub-row's.
+
+        A single-strike Kalshi family quotes that one strike's price as the ROW's, on a row the ranker
+        stamped with a relation tier — so an empty book there used to put a synthetic $0.50 in the cell
+        a forecaster is told to anchor on. `_row_cells` passes the parent's own `bid`/`ask` through, and
+        the parent and the sub-row must render a refusal identically: a reader cannot be asked to learn
+        two cell shapes for one fact.
+        """
+        parent = _row(title="Kalshi single-strike family", prob=None)
+        parent.bid, parent.ask = 0.0, 1.0
+        parent.price_withheld = True
+        child_side = _row(prob=None, children=(MarketChild(title="no book", quote_low=0.0, quote_high=1.0),))
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[parent, child_side])))
+
+        assert cells[0]["prob"] == "0.00-1.00"
+        assert cells[0]["prob"] == cells[2]["prob"], "the parent and the sub-row must say it the same way"
+
+    def test_a_priced_row_never_shows_its_book_instead_of_its_price(self) -> None:
+        """The control: every Kalshi row carries a two-sided book, so a range that outranked a real
+        price would replace every price in the table with a range."""
+        parent = _row(title="Kalshi binary", prob=0.68)
+        parent.bid, parent.ask = 0.66, 0.70
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[parent])))
+
+        assert cells[0]["prob"] == "0.68"
 
     def test_the_legend_names_both_new_cell_shapes(self) -> None:
         """A legend that omits a shape a cell can hold teaches forecasters to guess at it, and the
