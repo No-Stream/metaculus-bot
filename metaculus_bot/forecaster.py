@@ -768,7 +768,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             self._time_budget_fast_path_count += 1
             logger.warning(
                 "TIME_BUDGET_FAST_PATH: qid=%s budget=%.0fs close_time=%s; "
-                "dropping optional research stages to protect the prediction POST",
+                "dropping the slow search providers and gap-fill to protect the prediction POST",
                 question.id_of_question,
                 time_budget.total_s,
                 time_budget.close_time,

@@ -962,7 +962,6 @@ class TestThinWindowThroughThePipeline:
         """The q45085 class. Today this question would research, run three forecasters,
         and then be refused by the publish gate; the budget check makes it cost nothing
         while producing the same skip and the same alertable counter."""
-        reset_publish_skipped_closed()  # module-global counter; don't inherit other tests' skips
         bot = self._bot()
         question = make_real_binary_question(qid=7403, close_time=datetime.now(timezone.utc) + timedelta(seconds=5))
         research = AsyncMock(return_value="Canned research")

@@ -1027,7 +1027,7 @@ class TestTimeBudgetLoudMarkers:
         line = (
             "2026-08-25 12:00:00,000 - metaculus_bot.forecaster - WARNING - "
             "TIME_BUDGET_FAST_PATH: qid=45085 budget=1140s close_time=2026-08-25 13:00:00+00:00; "
-            "dropping optional research stages to protect the prediction POST"
+            "dropping the slow search providers and gap-fill to protect the prediction POST"
         )
         rec = _parse_one(line)
         assert rec["marker"] == "time_budget_fast_path"
