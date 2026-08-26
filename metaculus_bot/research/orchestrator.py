@@ -763,6 +763,14 @@ class ResearchOrchestrator:
                     fallback_provider=fallback_provider,
                 )
                 return (raw, result)
+            except asyncio.CancelledError:
+                # A deadline-cancelled provider must drain its registry entry too:
+                # CancelledError is a BaseException and would otherwise skip both
+                # drain paths, leaving exactly the stale same-key entry the except
+                # below exists to prevent. Re-raised so the caller still records
+                # the cancellation as status="deadline".
+                pop_provider_detail(qid, name)
+                raise
             except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
                 # Drain-and-discard any partial detail the provider recorded before
                 # raising: an errored result carries the error, not source detail,
