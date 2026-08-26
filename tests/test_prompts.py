@@ -578,6 +578,17 @@ class TestPredictionMarketFraming:
         assert "is a distribution over that market's own question" in lowered
         assert "read the whole ladder" in lowered
         assert "[remaining n]" in lowered, "the prompt must name the row the rest of the ladder lives on"
+        # The ladder sentence must describe what the renderer actually does under
+        # compaction: outcomes are either named with their own price or inside a
+        # counted group with its summed price (rendering.py's collapse stages —
+        # unquoted, then settled, then the cheapest open outcomes).
+        assert "accounts for every outcome not given a row of its own" in lowered
+        assert "inside a counted group with its summed price" in lowered
+        # The pre-fix overstatement must stay gone: from stage 3 up some OPEN
+        # outcomes carry only a count and a summed price, so "prices every
+        # outcome" asserted a render the collapse stages do not always deliver
+        # (verify_market-render.md Issue D).
+        assert "which prices every outcome" not in lowered
         assert "never treat one outcome's price as an equality constraint" in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
