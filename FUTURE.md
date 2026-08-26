@@ -795,6 +795,17 @@ days vs the question's own resolve time; 14/78 rows at +300d or more). Re-read t
 question at ~41 ranked-era resolutions (late September / early October), not ~09-01 (which buys only
 ~7).
 
+5. **Retune `KALSHI_NO_PRICE_SPREAD` from prod telemetry (added 2026-08-25, owner: the next
+   residual round).** The 0.40 book-width threshold that blanks a Kalshi midpoint as
+   manufactured (58175a7) is a reasoned choice, not a measured one: the committed captures hold
+   11 live two-sided books (real spreads 0.01–0.10, so 0.40 sits 4x above the widest observed),
+   but the raw archive stores post-parse children with NO bid/ask, so prod incidence is
+   unmeasurable offline. The `withheld=` field on the `MARKET_CHILD_RENDER` marker exists to
+   turn it into a query — after ~2 weeks of ranked-era runs, read the withheld distribution:
+   near-zero on liquid families and nonzero exactly on empty books means the threshold is
+   right; a material rate on books that later traded near their midpoint means it is blanking
+   real prices and should come down.
+
 ### Deterministic tail-consistency check on the numeric structured block (added 2026-08-24)
 
 From the q44453 dossier (July payrolls, peer −11.24; the whole field missed the −23k print, so the
