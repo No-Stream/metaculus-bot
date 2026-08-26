@@ -774,6 +774,48 @@ class TestFetchResolutionSources:
         assert results[0].status == "success"
         assert results[0].url == "https://a.example.com/final"
 
+    async def test_unexpected_error_cancels_and_drains_an_in_flight_sibling(self, monkeypatch):
+        """The other half of the F5 teardown guard (the wall-clock-cancellation half
+        is pinned in the Datawrapper suite): when one task dies on an exception the
+        fetcher does NOT catch, the gather re-raises immediately and its still-running
+        siblings must be cancelled and drained BEFORE the session closes. Closing
+        first is what yanks transports out from under live requests."""
+        events: list[str] = []
+
+        class _HangingResponse(FakeResponse):
+            async def read(self) -> bytes:
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    events.append("sibling-settled")
+                    raise
+                raise AssertionError("unreachable: the sibling should be cancelled")
+
+        class _EventSession(FakeSession):
+            async def close(self) -> None:
+                events.append("session-closed")
+                await super().close()
+
+        session = _EventSession(
+            {
+                "https://slow.example.com/x": _HangingResponse(200, body=b"", content_type="text/html"),
+                # RuntimeError is outside the (ClientError, TimeoutError) the fetcher
+                # handles, so it propagates out of the gather.
+                "https://broken.example.com/y": RuntimeError("driver blew up mid-fetch"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        with pytest.raises(RuntimeError, match="driver blew up mid-fetch"):
+            await asyncio.wait_for(
+                fetch_resolution_sources(["https://slow.example.com/x", "https://broken.example.com/y"]),
+                timeout=5.0,
+            )
+
+        assert events == ["sibling-settled", "session-closed"]
+        assert session.host_inflight["slow.example.com"] == 0
+        assert session.closed is True
+
 
 # ---------------------------------------------------------------------------
 # 3. Factory + gating

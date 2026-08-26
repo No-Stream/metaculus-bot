@@ -330,6 +330,46 @@ class TestExtractDatawrapperCharts:
         assert charts[0].title is None
         assert charts[1].title == "Chart two title"
 
+    def test_titleless_chart_does_not_steal_a_preceding_iframe_title(self):
+        # Mirror image of the test above, for the BACKWARD half of the scan: the
+        # first embed carries an iframe `title=` attribute, the second (embed.js
+        # form) carries none and sits well inside the 300-char backward window.
+        # The backward scan is clamped at the previous embed's URL, so chart two
+        # stays untitled instead of being labelled with chart one's title — a
+        # mislabelled dataset is worse than an unlabelled one, since the lead
+        # line the forecaster reads names the chart.
+        html = (
+            '<iframe title="First chart" src="https://datawrapper.dwcdn.net/AAAA1/3/"></iframe>'
+            '<script defer src="https://datawrapper.dwcdn.net/BBBB2/embed.js"></script>'
+        )
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["AAAA1", "BBBB2"]
+        assert charts[0].title == "First chart"
+        assert charts[1].title is None
+
+    def test_single_quoted_iframe_title_attribute(self):
+        # The attribute form alternates on quote style; single-quoted markup is
+        # common in hand-written embeds and must resolve to the same title.
+        html = "<iframe title='Weekly jobless claims' src='https://datawrapper.dwcdn.net/Ab9x2/4/'></iframe>"
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["Ab9x2"]
+        assert charts[0].title == "Weekly jobless claims"
+
+    def test_json_title_beyond_the_forward_window_is_not_attached(self):
+        # The forward window brackets the observed Substack layout (~380 chars
+        # of thumbnail URLs between the embed URL and its title). A `"title"`
+        # far past that belongs to some other page structure, so the chart stays
+        # untitled rather than borrowing it.
+        filler = "&quot;description&quot;:&quot;" + ("x" * 800) + "&quot;,"
+        html = (
+            '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/Cccc3/9/&quot;,'
+            f"{filler}"
+            '&quot;title&quot;:&quot;Too far away to be this chart&quot;}"></div>'
+        )
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["Cccc3"]
+        assert charts[0].title is None
+
     def test_no_embeds_returns_empty(self):
         assert extract_datawrapper_charts("<html><body>No charts here.</body></html>") == []
         assert extract_datawrapper_charts("") == []
@@ -362,3 +402,13 @@ class TestParseHttpLastModified:
     def test_malformed_returns_none(self):
         assert parse_http_last_modified("not a date") is None
         assert parse_http_last_modified("") is None
+
+    def test_timezoneless_value_is_stamped_utc(self):
+        # RFC 5322's "-0000" means "no timezone information", and
+        # `parsedate_to_datetime` returns a NAIVE datetime for it. The freshness
+        # guard subtracts this from an aware `now`, which raises TypeError on a
+        # naive operand — so the UTC stamp is what keeps an odd CDN header
+        # producing a `stale_data` verdict instead of a crashed hop.
+        parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 -0000")
+        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
+        assert parsed is not None and parsed.tzinfo is not None
