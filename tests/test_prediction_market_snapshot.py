@@ -162,6 +162,67 @@ class TestFetchMarketSnapshot:
         assert pmp.prediction_market_source_losses() == 1
         assert DEGRADED_RANKING_MARKER in format_snapshot_for_research(snapshot)
 
+    @pytest.mark.asyncio
+    async def test_a_shape_regression_fails_open_and_is_named_in_the_telemetry(
+        self, mock_question, kalshi_events_payload, caplog: pytest.LogCaptureFixture
+    ):
+        """A well-formed array of objects with a RENAMED index key: readable JSON, no usable row.
+
+        This used to render as `ranking: ok(0)` with zero rows — indistinguishable from the
+        model's considered "nothing here bears on the question", and since the deliberate-empty
+        sentence shipped it published that sentence's affirmative claim ("prediction markets were
+        retrieved and reviewed… none was judged to bear on it") over output whose shape we had
+        failed to parse. It now fails open like any other unreadable ranking, and the WARN names
+        `reason=shape_regression` so the archive can tell a broken parser contract from a model
+        that emitted prose.
+        """
+        handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+
+        with caplog.at_level(logging.WARNING):
+            snapshot = await _fetch(mock_question, handlers, ranking='[{"index": 0}, {"index": 1}]')
+
+        assert snapshot.matches, "a fail-open must still render the deterministic slate"
+        assert all(row.relation_tier == "" for row in snapshot.matches)
+        assert snapshot.sources["ranking"] == "error(RankingShapeRegression)"
+        assert pmp.prediction_market_source_losses() == 1
+        rendered = format_snapshot_for_research(snapshot)
+        assert DEGRADED_RANKING_MARKER in rendered
+        assert "No sufficiently relevant market" not in rendered
+        degraded = [m for m in caplog.messages if m.startswith("MARKET_RANKING_DEGRADED:")]
+        assert len(degraded) == 1
+        assert "reason=shape_regression" in degraded[0]
+        assert f"pool={snapshot.pool_size}" in degraded[0]
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_ranking_is_labelled_unreadable_not_a_shape_regression(
+        self, mock_question, kalshi_events_payload, caplog: pytest.LogCaptureFixture
+    ):
+        """The sibling of the case above, and the reason the WARN carries a `reason=` at all: one
+        of these two says the model answered badly, the other says our own prompt/parser contract
+        broke, and only the second is a defect to go fix."""
+        handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+
+        with caplog.at_level(logging.WARNING):
+            await _fetch(mock_question, handlers, ranking="I could not decide.")
+
+        degraded = [m for m in caplog.messages if m.startswith("MARKET_RANKING_DEGRADED:")]
+        assert len(degraded) == 1
+        assert "reason=unreadable" in degraded[0]
+
+    @pytest.mark.asyncio
+    async def test_a_deliberate_empty_ranking_emits_no_degraded_marker(
+        self, mock_question, kalshi_events_payload, caplog: pytest.LogCaptureFixture
+    ):
+        """The control for the marker: `[]` is the mechanism working, so it must not appear in a
+        channel an operator is meant to read as "the ranker is broken"."""
+        handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+
+        with caplog.at_level(logging.WARNING):
+            snapshot = await _fetch(mock_question, handlers, ranking="[]")
+
+        assert snapshot.sources["ranking"] == "ok(0)"
+        assert not [m for m in caplog.messages if m.startswith("MARKET_RANKING_DEGRADED:")]
+
     @pytest.mark.parametrize(
         "exception_factory",
         [

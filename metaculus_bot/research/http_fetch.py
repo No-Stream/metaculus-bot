@@ -11,6 +11,7 @@ deliberately does no retries).
 
 from __future__ import annotations
 
+import codecs
 import html as html_entities
 import ipaddress
 import logging
@@ -165,6 +166,88 @@ async def read_body_capped(resp: Any, *, max_bytes: int, label: str) -> bytes | 
             return None
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Text decoding (raw-body branches: JSON / text/plain / text/csv / CSV datasets)
+# ---------------------------------------------------------------------------
+#
+# A blanket `body.decode("utf-8", errors="replace")` turns a UTF-16 or
+# Windows-1252 body into mojibake that still type-checks as text, and the
+# caller then renders `0�.�4�2�` to a forecaster as grading evidence. The
+# response ALREADY carries the two facts needed to decode it properly — a BOM
+# and/or a declared charset — so both are honored, and whatever survives is
+# scored so a caller can refuse a body it could not decode at all.
+
+_CHARSET_RE = re.compile(r"charset\s*=\s*\"?([\w.:+-]+)\"?", re.IGNORECASE)
+
+# BOM -> codec. UTF-32-LE (`ff fe 00 00`) must be tested BEFORE UTF-16-LE
+# (`ff fe`), which is a prefix of it. The `utf-16` / `utf-32` / `utf-8-sig`
+# codecs consume the BOM themselves, so the decoded text carries no U+FEFF.
+_BOM_CODECS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+# Above this share of undecodable characters, the decode failed rather than the
+# text being slightly dirty, and the caller should refuse the body. The two
+# regimes are far apart (measured on synthetic bodies; the cases are pinned in
+# `tests/test_http_fetch.py`): a body decoded with the wrong codec runs ~0.5 —
+# every second byte of BOM-less UTF-16
+# ASCII is a NUL, and a UTF-16 BOM read as UTF-8 is two U+FFFDs up front — while
+# real text carrying a few mis-encoded punctuation marks runs 0.03 on a 37-char
+# line and far less on a real page. 0.10 sits in the empty gap between them, so
+# it never costs us a page over one bad smart quote.
+MAX_UNDECODABLE_CHAR_RATIO = 0.10
+
+
+def _bom_codec(body: bytes) -> str | None:
+    for bom, codec in _BOM_CODECS:
+        if body.startswith(bom):
+            return codec
+    return None
+
+
+def _declared_charset(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    match = _CHARSET_RE.search(content_type)
+    return match.group(1) if match else None
+
+
+def undecodable_char_ratio(text: str) -> float:
+    """Share of ``text`` that carries no content because the decode failed.
+
+    Counts U+FFFD (the replacement char `errors="replace"` substitutes for bytes
+    the codec rejected) AND NUL. Both are needed: high bytes from an undeclared
+    Windows-1252 body surface as U+FFFD, while BOM-less UTF-16 ASCII decodes as
+    valid-but-meaningless NUL-interleaved text with zero replacement chars.
+    """
+    if not text:
+        return 0.0
+    return (text.count("�") + text.count("\x00")) / len(text)
+
+
+def decode_text_body(body: bytes, content_type: str | None) -> tuple[str, float]:
+    """Decode a raw body to ``(text, undecodable_char_ratio)``.
+
+    Codec precedence: BOM (the body's own self-description, and the shape Excel
+    exports CSV in), then the response's declared ``charset=``, then UTF-8.
+    ``errors="replace"`` throughout — a partly-undecodable body still has to
+    produce text, because the ratio is how the caller decides whether to keep it.
+    An unknown declared charset falls back to UTF-8 rather than raising: a
+    typo'd charset label is not a reason to lose the body.
+    """
+    codec = _bom_codec(body) or _declared_charset(content_type) or "utf-8"
+    try:
+        text = body.decode(codec, errors="replace")
+    except LookupError:
+        logger.info(f"unknown charset {codec!r} declared; decoding as utf-8")
+        text = body.decode("utf-8", errors="replace")
+    return text, undecodable_char_ratio(text)
 
 
 # ---------------------------------------------------------------------------

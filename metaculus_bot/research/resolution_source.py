@@ -23,6 +23,13 @@ A `Last-Modified` freshness guard withholds any dataset older than
 `RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS` (or undatable) as `stale_data`
 rather than serving stale data as live.
 
+Success means CONTENT, on every raw-body branch (Tier-1 JSON/text/CSV and the
+Tier-2 dataset alike): a body that is empty, undecodable, or — for a dataset —
+not row-shaped gets a failure status via `vacuous_body_status`, never
+`success`. An empty 200 body used to render an empty section under the "primary
+grading evidence" caveat, suppress the all-failed notice for its siblings, and
+report `ok` to provider diagnostics.
+
 Design anchors:
 
 - 2026-07-08 feasibility probe found 75% of questions cite an explicit source
@@ -74,11 +81,13 @@ from metaculus_bot.constants import (
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     MAX_REDIRECTS,
+    MAX_UNDECODABLE_CHAR_RATIO,
     REDIRECT_STATUSES,
     DatawrapperChartRef,
     FilteringResolver,
     build_session,
     datawrapper_live_data_url,
+    decode_text_body,
     extract_datawrapper_charts,
     parse_http_last_modified,
     read_body_capped,
@@ -224,8 +233,23 @@ async def is_public_http_url(url: str) -> bool:
 # `stale_data` is Tier-2-only: the Datawrapper hop reached a dataset whose
 # Last-Modified is older than the freshness bound (or missing/unparseable) —
 # withheld rather than served as live.
+#
+# `empty_body` is the 200-with-nothing-in-it case: a body that is empty or
+# whitespace-only carries no information, so calling it `success` published an
+# empty "primary grading evidence" section, suppressed the all-failed notice for
+# every sibling URL, and reported `ok` to provider diagnostics. It is a FAILURE
+# status for the same reason the HTML branch treats an empty extraction as
+# `js_wall`: content is what makes a fetch a success.
 FetchStatus = Literal[
-    "success", "blocked", "not_found", "js_wall", "error", "unsupported_type", "ssrf_blocked", "stale_data"
+    "success",
+    "blocked",
+    "not_found",
+    "js_wall",
+    "error",
+    "unsupported_type",
+    "ssrf_blocked",
+    "stale_data",
+    "empty_body",
 ]
 
 
@@ -244,6 +268,22 @@ class FetchResult:
     chart_title: str | None = None
     parent_url: str | None = None
     data_last_modified: str | None = None  # ISO-8601; None when the header was missing/unparseable
+
+    def __post_init__(self) -> None:
+        """Enforce the ``text`` invariant the field comment states.
+
+        A `success` carrying blank text is the defect this guard exists for: the
+        JSON/text/CSV branch used to ship an empty 200 body as `success`, which
+        rendered an empty section under the "primary grading evidence" caveat,
+        suppressed the all-failed notice, and told provider diagnostics `ok`.
+        Every construction site now decides vacuity BEFORE it picks a status
+        (:func:`vacuous_body_status`), so a blank success can only come from a
+        future edit — and it should crash the provider (the orchestrator turns a
+        provider exception into one `errored` provider result) rather than quietly
+        publish a hole in the grading evidence.
+        """
+        if self.status == "success" and not self.text.strip():
+            raise ValueError(f"FetchResult(status='success') with blank text for {self.url}")
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +429,117 @@ def looks_like_js_wall(text: str) -> bool:
     return len(text.strip()) < RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
 
 
+# Tag names an allow-list, not `[A-Za-z]+`, and the character after the name
+# must be `>`, `/`, or whitespace-then-an-attribute-assignment. Both halves are
+# load-bearing: the naive `</?[A-Za-z][^>]*>` form eats a CSV cell reading
+# `x <a and y > b` (measured on the 2026-08-26 diagnosis), and requiring an `=`
+# in the attribute region is what keeps that same cell out of the allow-listed
+# form — `<a and y >` names no attribute. A real tag either closes immediately
+# (`<br/>`, `</a>`, `<td>`) or assigns something (`href=`, `style=`).
+_HTML_TAG_NAMES: tuple[str, ...] = (
+    "a",
+    "b",
+    "i",
+    "u",
+    "p",
+    "em",
+    "strong",
+    "span",
+    "div",
+    "br",
+    "td",
+    "tr",
+    "th",
+    "table",
+    "font",
+    "small",
+    "sub",
+    "sup",
+)
+_HTML_TAG_RE = re.compile(
+    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s*/?>|\s+[^<>]*=[^<>]*>)",
+    re.IGNORECASE,
+)
+
+# An anchor whose inner text is empty carries its content in the href (a bare
+# link cell), so the href is kept where the inner text would have been.
+_EMPTY_ANCHOR_RE = re.compile(
+    r"<a\s+[^<>]*href\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s<>]+))[^<>]*>\s*</a\s*>",
+    re.IGNORECASE,
+)
+
+# Delimiters a Datawrapper "Get the data" export uses. Checked on the HEADER
+# line only: a dataset's first row names its columns, so a header with no
+# delimiter at all is not the CSV this route is supposed to serve.
+_CSV_DELIMITERS: tuple[str, ...] = (",", ";", "\t", "|")
+
+
+def strip_html_tags(text: str) -> str:
+    """Remove allow-listed HTML tags from ``text``, keeping their inner text.
+
+    For the RAW-body branches only (CSV / plain text) — trafilatura owns real
+    HTML pages. Datawrapper poll tables embed a styled ``<a href=…>`` per
+    pollster row, and 69% of one live tracker's 33k-char CSV was tag markup: at
+    that run's actual 2,853-char budget, 9 rows survived with the tags against 30
+    with them stripped (measured 2026-08-26). The tags carry nothing a forecaster
+    reads — the pollster name inside them is the content — so the budget should
+    buy rows.
+
+    A no-op (byte-identical) on any text with no allow-listed tag in it, which
+    covers every numeric tracker CSV checked (zero ``<`` characters).
+    """
+    if "<" not in text:
+        return text
+    without_bare_links = _EMPTY_ANCHOR_RE.sub(
+        lambda m: m.group(1) or m.group(2) or m.group(3) or "",
+        text,
+    )
+    return _HTML_TAG_RE.sub("", without_bare_links)
+
+
+def looks_like_csv_rows(text: str) -> bool:
+    """True when ``text`` is shaped like a dataset: a delimited header + ≥1 row.
+
+    The precondition for asserting a dataset is LIVE. The Tier-2 lead stamps
+    ``Dataset published <ts>`` off the ``Last-Modified`` header alone, so without
+    this an empty or soft-404 CDN body renders under an authoritative freshness
+    claim — the same shape as a venue's manufactured $0.50 price.
+
+    Markup is rejected outright (a body whose first non-blank character is ``<``
+    is an error page, not a dataset) because an HTML error page can easily carry
+    a comma somewhere and pass the delimiter test.
+    """
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    header = lines[0].lstrip()
+    if header.startswith("<"):
+        return False
+    return any(delimiter in header for delimiter in _CSV_DELIMITERS)
+
+
+def vacuous_body_status(text: str, undecodable_ratio: float, *, require_csv_rows: bool) -> FetchStatus | None:
+    """The failure status a 200 body earns for carrying no usable content, else None.
+
+    The one place "does this body carry information?" is decided, so every
+    ``FetchResult(status="success")`` on a raw-body branch is predicated on
+    content rather than on the status line. Three ways a 200 carries nothing:
+
+    - it could not be DECODED (``undecodable_ratio`` above the bound) — mojibake
+      like ``0�.�4�2�`` type-checks as text and rendered as grading evidence;
+    - it is empty or whitespace-only;
+    - (Tier-2 datasets only) it is not row-shaped, so nothing may claim it is the
+      chart's live series.
+    """
+    if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO:
+        return "unsupported_type"
+    if not text.strip():
+        return "empty_body"
+    if require_csv_rows and not looks_like_csv_rows(text):
+        return "unsupported_type"
+    return None
+
+
 def _truncate_with_marker(text: str, cap: int, url: str) -> str:
     """Return ``text`` bounded at ``cap`` chars; on truncation, append a marker
     line naming the cap and URL so forecasters can tell the snapshot is partial.
@@ -478,8 +629,11 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     ``stale_data`` verdict maps to the benign ``"none"``: that is the freshness
     guard REFUSING to serve months-old data as live, i.e. the feature working as
     designed, and reporting it in ``lost=`` would dress a by-design withhold as a
-    lost cited source. A genuinely failed hop (``error``/``blocked``/``not_found``)
-    keeps its verbatim loss token — that is real signal about the CDN.
+    lost cited source. A genuinely failed hop (``error``/``blocked``/``not_found``/
+    ``empty_body``/``unsupported_type``) keeps its verbatim loss token — that is
+    real signal about the CDN, and it is the reason the content check runs BEFORE
+    the freshness guard: an empty CDN body must not borrow ``stale_data``'s
+    by-design amnesty.
     """
     sources: dict[str, str] = {}
     for r in results:
@@ -556,9 +710,12 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
     def _dataset_withheld_note() -> str:
         n = len(dataset_nonsuccesses)
         statuses = ", ".join(sorted({r.status for r in dataset_nonsuccesses}))
+        # Wording covers every non-success a dataset can carry, not just
+        # `stale_data`: a body that is empty or not row-shaped is withheld under
+        # the same rule (nothing may be passed off as the chart's live series).
         return (
-            f"[{n} embedded chart dataset(s) not served ({statuses}) — "
-            f"withheld rather than shown stale; the cited page text is unaffected.]"
+            f"[{n} embedded chart dataset(s) not served ({statuses}) — withheld rather than "
+            f"passed off as the live series; the cited page text is unaffected.]"
         )
 
     if not successes:
@@ -829,9 +986,13 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                             )
                         # Datawrapper embeds are only visible in the RAW HTML —
                         # trafilatura drops iframes and embed scripts at every
-                        # setting — so the scan runs on the undecoded body,
-                        # before (and regardless of) main-text extraction.
-                        charts = extract_datawrapper_charts(body.decode("utf-8", errors="replace"))
+                        # setting — so the scan runs on the raw body, before
+                        # (and regardless of) main-text extraction. Decoded
+                        # through the shared helper so a BOM'd / non-UTF-8 page's
+                        # embeds are still findable; the page's main text is
+                        # trafilatura's to decode, which is why no vacuity check
+                        # runs on this branch (an empty extraction is `js_wall`).
+                        charts = extract_datawrapper_charts(decode_text_body(body, content_type)[0])
                         extracted = await asyncio.to_thread(_extract_main_text, body, current_url)
                         # An empty extraction on a 200 OK is a JS-wall (SPA that
                         # rendered client-side, cookie/consent gate, etc.) —
@@ -879,7 +1040,29 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                                 http_status=status,
                                 content_type=content_type or None,
                             )
-                        raw = body.decode("utf-8", errors="replace")
+                        raw, undecodable_ratio = decode_text_body(body, content_type)
+                        # Markup stripping on the text branches only: a CSV or
+                        # plain-text body carrying `<a href=…>` per row spends the
+                        # per-URL budget on tags (see `strip_html_tags`), while a
+                        # JSON body's angle brackets sit inside string values that
+                        # are the data. Both text types get it because the labels
+                        # are demonstrably unreliable here — Datawrapper's own
+                        # versioned route serves CSV as application/octet-stream.
+                        if any(ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES):
+                            raw = strip_html_tags(raw)
+                        vacuous = vacuous_body_status(raw, undecodable_ratio, require_csv_rows=False)
+                        if vacuous is not None:
+                            logger.info(
+                                f"resolution_source fetched {netloc} ({vacuous}: 200 with no usable content, "
+                                f"{len(body)} bytes, undecodable={undecodable_ratio:.2f})"
+                            )
+                            return FetchResult(
+                                url=current_url,
+                                status=vacuous,
+                                text="",
+                                http_status=status,
+                                content_type=content_type or None,
+                            )
                         truncated = _truncate_with_marker(
                             raw,
                             RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
@@ -1013,6 +1196,30 @@ async def _fetch_datawrapper_dataset(
                         parent_url=parent_url,
                     )
 
+                # Content BEFORE freshness, deliberately: an empty or non-CSV CDN
+                # body is a failed hop whatever its Last-Modified says, and
+                # `stale_data` is reported to diagnostics as the benign `none`
+                # (the freshness guard working as designed), which would hide it.
+                dataset_text, undecodable_ratio = decode_text_body(body, content_type)
+                dataset_text = strip_html_tags(dataset_text).strip()
+                vacuous = vacuous_body_status(dataset_text, undecodable_ratio, require_csv_rows=True)
+                if vacuous is not None:
+                    logger.warning(
+                        f"resolution_source datawrapper hop {chart.chart_id}: dataset body is not a usable "
+                        f"dataset ({vacuous}: {len(body)} bytes, undecodable={undecodable_ratio:.2f}) — "
+                        f"withheld rather than stamped live"
+                    )
+                    return FetchResult(
+                        url=url,
+                        status=vacuous,
+                        text="",
+                        http_status=status,
+                        content_type=content_type or None,
+                        chart_id=chart.chart_id,
+                        chart_title=chart.title,
+                        parent_url=parent_url,
+                    )
+
                 last_modified_raw = resp.headers.get("Last-Modified") if resp.headers else None
                 last_modified = parse_http_last_modified(last_modified_raw) if last_modified_raw else None
                 now = datetime.now(timezone.utc)
@@ -1041,6 +1248,10 @@ async def _fetch_datawrapper_dataset(
                         data_last_modified=last_modified.isoformat() if last_modified else None,
                     )
 
+                # Every claim in this lead is now checked: the timestamp by the
+                # freshness guard above, and "dataset" itself by the row-shape
+                # check — an authoritative `published <ts>` stamp over an empty or
+                # soft-404 body was the same defect class as a manufactured price.
                 title_part = f" ({chart.title!r})" if chart.title else ""
                 lead = (
                     f'Live "Get the data" dataset for Datawrapper chart {chart.chart_id}{title_part} '
@@ -1048,8 +1259,9 @@ async def _fetch_datawrapper_dataset(
                 )
                 # The DATASET cap, not the page cap: datasets budget against their own
                 # section allowance so a chart's rows can never evict cited page text.
+                # Tags are stripped BEFORE truncation so the budget buys rows, not markup.
                 csv_budget = RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS - len(lead) - 2
-                csv_text = _truncate_csv_middle(body.decode("utf-8", errors="replace").strip(), csv_budget, url)
+                csv_text = _truncate_csv_middle(dataset_text, csv_budget, url)
                 logger.info(
                     f"resolution_source datawrapper hop {chart.chart_id} "
                     f"(success, published {last_modified.isoformat()})"
@@ -1251,11 +1463,18 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
             logger.warning(f"resolution_source: wall-clock timeout after {RESOLUTION_SOURCE_WALL_TIMEOUT}s")
             return ""  # noqa: ASYNC910
 
-        n_fail = sum(1 for r in results if r.status != "success")
-        if n_fail:
+        # CITED pages only. A withheld Tier-2 dataset is a hop artifact, not an
+        # unfetched cited URL, and counting it here inflated the ratio with
+        # by-design withholds (`stale_data`) on exactly the tracker questions the
+        # hop serves. Datasets get their own count so both stay readable.
+        cited = [r for r in results if r.chart_id is None]
+        n_fail = sum(1 for r in cited if r.status != "success")
+        n_datasets_withheld = sum(1 for r in results if r.chart_id is not None and r.status != "success")
+        if n_fail or n_datasets_withheld:
             logger.info(
-                f"resolution_source: {n_fail}/{len(results)} urls unfetched "
-                f"(js_wall/blocked — candidates for a future Tier-2 LLM fetch)",
+                f"resolution_source: {n_fail}/{len(cited)} cited urls unfetched "
+                f"(js_wall/blocked — candidates for a future Tier-2 LLM fetch); "
+                f"{n_datasets_withheld} embedded dataset(s) withheld",
             )
         qid = getattr(question, "id_of_question", None)
         record_raw_research(qid=qid, provider="resolution_source", payload=results)

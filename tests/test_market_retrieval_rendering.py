@@ -914,6 +914,25 @@ class TestMultiOutcomeRows:
         assert cells[1]["signal"] == "decent"
         assert cells[1]["total_vol"] == "417", "the child's own volume, not its parent's"
 
+    def test_a_sub_row_with_zero_own_volume_reads_thin_beside_its_traded_sibling(self) -> None:
+        """The inherited bettor count is the WEAKER half of the label. An answer at its untouched
+        prior — the same zero-volume shape `_priced_or_none` refuses a price for — was rendering the
+        parent's `decent`/`high` next to its own blank price and `total_vol 0`, a self-contradicting
+        row that told the forecaster a crowd stood behind a rung nobody had bet on."""
+        answers = (
+            MarketChild(title="Over $4.60", implied_prob_yes=0.4992, total_volume=417.0, num_bettors=47),
+            MarketChild(
+                title="Over $9.99", implied_prob_yes=None, total_volume=0.0, num_bettors=47, price_withheld=True
+            ),
+        )
+
+        cells = _table_rows(
+            render_snapshot(MarketSnapshot(matches=[self._parent(platform="manifold", children=answers, bettors=47)]))
+        )
+
+        assert cells[1]["signal"] == "decent"
+        assert (cells[2]["signal"], cells[2]["total_vol"], cells[2]["prob"]) == ("thin", "0", "-")
+
     def test_the_bullet_carries_rules_text_alone(self) -> None:
         """A multi-outcome bullet used to LEAD with `answers: Over $4.60 (50%), ...` because the
         table had nowhere to put a price. It does now, with a real column for each outcome's volume

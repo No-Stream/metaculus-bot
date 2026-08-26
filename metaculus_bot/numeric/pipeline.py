@@ -21,6 +21,7 @@ from metaculus_bot.numeric.cluster_processing import (
     compute_cluster_parameters,
     detect_count_like_pattern,
     ensure_strictly_increasing_bounded,
+    is_degenerate_cluster,
 )
 from metaculus_bot.numeric.config import (
     PCHIP_CDF_POINTS,
@@ -51,13 +52,21 @@ logger = logging.getLogger(__name__)
 def sanitize_percentiles(
     percentile_list: list[Percentile],
     question: NumericQuestion,
+    *,
+    model_name: str = "",
 ) -> tuple[list[Percentile], float | None]:
-    """Filter, validate, sort, jitter, and optionally widen percentile declarations."""
+    """Filter, validate, sort, jitter, and optionally widen percentile declarations.
+
+    ``model_name`` only labels the ``NUMERIC_DEGENERATE_DECLARATION`` marker (the
+    forecaster whose declaration collapsed); callers that don't know which model
+    produced the percentiles leave it empty and the marker reads
+    ``model=unknown``.
+    """
 
     filtered = filter_to_standard_percentiles(percentile_list)
     validate_percentile_count_and_values(filtered)
     ordered = sort_percentiles_by_value(filtered)
-    adjusted = _apply_jitter_and_clamp(ordered, question)
+    adjusted = _apply_jitter_and_clamp(ordered, question, model_name=model_name)
     widened = _maybe_widen_tails(adjusted, question)
 
     _, should_force_zero_point_none = check_discrete_question_properties(question, PCHIP_CDF_POINTS)
@@ -122,7 +131,12 @@ def build_numeric_distribution(
     return prediction
 
 
-def _apply_jitter_and_clamp(percentile_list: list[Percentile], question: NumericQuestion) -> list[Percentile]:
+def _apply_jitter_and_clamp(
+    percentile_list: list[Percentile],
+    question: NumericQuestion,
+    *,
+    model_name: str = "",
+) -> list[Percentile]:
     range_size = question.upper_bound - question.lower_bound
     buffer = calculate_bounds_buffer(question)
 
@@ -132,6 +146,23 @@ def _apply_jitter_and_clamp(percentile_list: list[Percentile], question: Numeric
     count_like = detect_count_like_pattern(values)
     span = (max(values) - min(values)) if values else 0.0
     value_eps, base_delta, spread_delta = compute_cluster_parameters(range_size, count_like, span)
+
+    if is_degenerate_cluster(values, value_eps):
+        # A point mass: the model put (near-)identical values at every percentile,
+        # declaring no width at all. We add only the minimum separation the CDF
+        # format needs (the jitter / strict-ordering epsilon below), never the
+        # cluster spread — so the span the unit-mismatch guard judges is the
+        # model's own, and the degenerate declaration is withheld instead of
+        # publishing as a distribution the forecaster never stated.
+        logger.warning(
+            "NUMERIC_DEGENERATE_DECLARATION: question=%s model=%s n_unique=%d span=%.6g value_eps=%.6g "
+            "spread_applied=false",
+            getattr(question, "id_of_question", None),
+            model_name or "unknown",
+            len({float(v) for v in values}),
+            span,
+            value_eps,
+        )
 
     modified_values, clusters_applied = apply_cluster_spreading(
         modified_values,

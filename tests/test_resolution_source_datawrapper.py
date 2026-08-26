@@ -609,6 +609,87 @@ class TestDatawrapperHopFailureModes:
         assert result.status == "error"
         assert result.http_status is None
 
+    @pytest.mark.parametrize("body", ["", "   \n\n", "﻿"])
+    async def test_an_empty_dataset_body_is_withheld_rather_than_stamped_live(self, body: str):
+        """The lead asserts `Live "Get the data" dataset … Dataset published <ts>` off the
+        Last-Modified header alone. With no content check, an empty CDN body rendered that
+        authoritative freshness claim over nothing at all — structurally the same defect as a venue
+        quoting a manufactured price for an empty book."""
+        session = FakeSession({DATASET_URL: _csv_response(body, last_modified=_fresh_last_modified())})
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        assert result.status == "empty_body"
+        assert result.text == ""
+        assert result.chart_id == CHART_ID  # provenance survives, so the loss is attributable
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "<!DOCTYPE html>\n<html><head><title>404, not found</title></head>\n<body>gone</body>\n",
+            "modeldate,approve,disapprove\n",
+            "no delimiters here\njust prose\n",
+        ],
+    )
+    async def test_a_body_that_is_not_row_shaped_is_withheld(self, body: str):
+        """A soft-404 page, a header with no rows, and prose. None of them is the chart's live
+        series, so none may be served under the liveness lead. The HTML case is why markup is
+        rejected outright: an error page carries a comma easily enough to pass a delimiter test."""
+        session = FakeSession({DATASET_URL: _csv_response(body, last_modified=_fresh_last_modified())})
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        assert result.status == "unsupported_type"
+        assert result.text == ""
+
+    async def test_the_content_check_outranks_the_freshness_verdict(self):
+        """Order matters for the DIAGNOSTICS, not just the render: `stale_data` maps to the benign
+        `none` token (the freshness guard working as designed), so an empty body reported under it
+        would borrow that amnesty and hide a real CDN failure."""
+        session = FakeSession({DATASET_URL: _csv_response("", last_modified=_stale_last_modified())})
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        assert result.status == "empty_body"
+
+    async def test_a_bomless_utf16_dataset_is_refused_rather_than_served_as_mojibake(self):
+        """`errors="replace"` turned an oddly-encoded CSV into `0<?>.<?>4<?>2<?>` and served it as
+        the live resolving series. Excel-exported poll tables are exactly the UTF-16 shape."""
+        body = "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
+        session = FakeSession(
+            {
+                DATASET_URL: FakeResponse(
+                    200,
+                    body=body,
+                    content_type="text/csv",
+                    headers={"Last-Modified": _fresh_last_modified()},
+                )
+            }
+        )
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        assert result.status == "unsupported_type"
+
+    async def test_a_bomd_utf16_dataset_decodes_and_is_served(self):
+        """The other half: honouring the BOM means the same body is USABLE rather than lost."""
+        body = "date,value\n2026-08-01,0.42\n"
+        session = FakeSession(
+            {
+                DATASET_URL: FakeResponse(
+                    200,
+                    body=body.encode("utf-16"),
+                    content_type="text/csv",
+                    headers={"Last-Modified": _fresh_last_modified()},
+                )
+            }
+        )
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        assert result.status == "success"
+        assert "2026-08-01,0.42" in result.text
+
     async def test_octet_stream_content_type_is_still_served(self):
         """Content-Type is deliberately not gated: the CDN labels the same CSV
         bytes `application/octet-stream` on some routes, and gating on it would
@@ -623,6 +704,81 @@ class TestDatawrapperHopFailureModes:
         result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
         assert result.status == "success"
         assert "day-0004,38.5,57.9" in result.text
+
+
+def _poll_table_csv(n_rows: int, *, tagged: bool) -> str:
+    """A poll-input table shaped like the live VUUVz dataset (2026-08-26 receipts).
+
+    Each pollster cell is a styled anchor whose inner text is the pollster name — the shape that
+    made 69% of that CSV's 33k chars tag markup. ``tagged=False`` is the same table with the
+    markup already gone, i.e. what the strip should leave behind.
+    """
+    lines = ["Dates,Pollster,Sample,Approve,Disapprove"]
+    for i in range(n_rows):
+        name = f"Pollster {i:03d}"
+        cell = (
+            f"<a href='https://pollster{i:03d}.example.com/august-2026-national-poll/'"
+            f"style='color:#000000; text-decoration: underline;'target='_blank' "
+            f"rel='nofollow noopener'>{name}</a>"
+            if tagged
+            else name
+        )
+        lines.append(f'"8/{(i % 28) + 1}, 2026",{cell},"1,000 LV",36.4,49.2')
+    return "\n".join(lines) + "\n"
+
+
+class TestDatasetMarkupStripping:
+    """The Tier-2 budget fix: strip markup BEFORE truncation so the char budget buys poll rows.
+
+    On exactly the poll-tracker questions the hop was built for, two-thirds of the visible
+    evidence was being spent on `<a href=… style=…>` wrappers around the pollster names.
+    """
+
+    @staticmethod
+    def _chart() -> DatawrapperChartRef:
+        return DatawrapperChartRef(chart_id=CHART_ID, title="Polls included in our average")
+
+    @staticmethod
+    def _kept_rows(text: str) -> int:
+        return sum(1 for line in text.split("\n") if line.startswith('"8/'))
+
+    async def test_the_pollster_names_survive_and_the_markup_does_not(self):
+        session = FakeSession(
+            {DATASET_URL: _csv_response(_poll_table_csv(5, tagged=True), last_modified=_fresh_last_modified())}
+        )
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        assert result.status == "success"
+        assert "Pollster 000" in result.text and "Pollster 004" in result.text
+        assert "<a " not in result.text
+        assert "style=" not in result.text
+        assert "nofollow" not in result.text
+
+    async def test_more_rows_survive_the_same_budget_once_the_markup_is_gone(self, monkeypatch):
+        """The measured claim, pinned: at the live run's actual 2,853-char budget, 9 rows survived
+        with tags against 30 with them stripped. Here the same comparison runs against the
+        untouched truncator, so a regression that stopped stripping shows up as fewer rows."""
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS", 3_000)
+        tagged = _poll_table_csv(60, tagged=True)
+        session = FakeSession({DATASET_URL: _csv_response(tagged, last_modified=_fresh_last_modified())})
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        naive_kept = self._kept_rows(_truncate_csv_middle(tagged.strip(), 2_800, DATASET_URL))
+        stripped_kept = self._kept_rows(result.text)
+        assert stripped_kept > naive_kept, f"{stripped_kept} rows vs {naive_kept} with markup"
+        assert stripped_kept >= 2 * naive_kept, "the whole point is a multiple, not a rounding win"
+        assert len(result.text) <= 3_000
+
+    async def test_a_numeric_dataset_is_untouched_by_the_strip(self):
+        """The two numeric tracker CSVs on the same pages contain zero `<` characters, so the strip
+        must be a provable no-op there rather than a transformation that merely looks harmless."""
+        session = FakeSession({DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified())})
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        assert result.text.endswith(_csv_body(20).strip())
 
 
 def _mock_question(criteria: str) -> MagicMock:

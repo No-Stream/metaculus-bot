@@ -147,7 +147,10 @@ class MarketChild:
     Manifold scores participation on unique bettors and publishes no per-answer count, so its
     children inherit the market's — every answer really does share one bettor pool, and inheriting
     it renders each child the same honest label as its parent instead of a false
-    ``no-liquidity-data`` on a venue that does publish per-answer volume.
+    ``no-liquidity-data`` on a venue that does publish per-answer volume. It is only ever the
+    weaker half of the label: an answer whose OWN ``total_volume`` is present and zero reads
+    ``thin`` regardless of the pool it sits in (``liquidity_label_from_fields``), because a price
+    nobody has traded has no crowd behind it.
 
     ADDITIVE-ONLY past ``close_time``, for the same reason ``MarketMatch`` is: ``raw_log`` archives
     the whole snapshot through ``dataclasses.asdict``, under an envelope whose ``schema_version`` is
@@ -331,13 +334,25 @@ def liquidity_label_from_fields(
 
     Takes loose fields rather than a row so a ``MarketChild`` sub-row is labelled by the SAME rule
     as its parent. Two labelling paths would let a Kalshi strike and its family disagree about what
-    "thin" means.
+    "thin" means — and one of them would drift, which is why Manifold's zero-own-volume rule lives
+    here rather than in the child-only wrapper.
     """
     if platform == "predictit":
         # PredictIt exposes no volume/liquidity/OI fields in its all-markets dump.
         return "no-liquidity-data"
 
     if platform == "manifold":
+        # Own volume, PRESENT and zero, overrides the bettor count. On a CHILD sub-row the bettor
+        # count is the PARENT's — Manifold publishes no per-answer count — so a market with 150
+        # bettors labelled every one of its untouched answers `high`, including the ones
+        # `_priced_or_none` had just refused a price for as sitting at their untouched prior (62 of
+        # 399 archived Manifold children, 15.5%, rendered decent/high with zero own volume). A
+        # price nobody traded has no crowd behind it whatever the market's pool is. Absent volume
+        # is NOT evidence of no trading, so the same `is not None` gate `_priced_or_none` uses
+        # applies here, and the bettor thresholds below are untouched — a parent row carries its
+        # own market volume, so a zero there means the same thing it means on a child.
+        if total_volume is not None and total_volume == 0.0:
+            return "thin"
         if num_bettors is None:
             return "no-liquidity-data"
         if num_bettors < MANIFOLD_THIN_BETTORS:

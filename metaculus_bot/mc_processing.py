@@ -8,6 +8,15 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
 from metaculus_bot.simple_types import OptionProbability
 
+# The zero-mass branches below are unreachable while ``MC_PROB_MIN > 0`` (the clamp puts
+# a positive floor under every option before any total is summed). They raise rather than
+# return ``[1/n] * n``: a uniform ballot is a FORECAST, and manufacturing one from a
+# vector carrying no probability mass at all is the defect class this module was audited
+# for. The day ``MC_PROB_MIN`` is set to 0 they fire loudly instead of publishing 1/n.
+_ZERO_MASS_MESSAGE = (
+    "MC option probabilities carry no mass across {n} options after clamping; refusing to impute a uniform ballot"
+)
+
 
 def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
     """Clamp probabilities into ``[MC_PROB_MIN, MC_PROB_MAX]`` and renormalize to sum 1.
@@ -51,14 +60,17 @@ def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
     # floor). No in-bounds sum-1 solution exists; fall back to a single clamp+renorm,
     # which at least keeps sum ~= 1 for the upstream sum gate.
     if n * MC_PROB_MIN >= 1.0:
+        # Entering this branch requires MC_PROB_MIN > 0, so every clamped value is at
+        # least that floor and the total is positive by construction — no zero-total
+        # case to guard (it used to return [1/n] * n here).
         clamped_degenerate = [max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for p in probabilities]
         total_degenerate = sum(clamped_degenerate)
-        return [p / total_degenerate for p in clamped_degenerate] if total_degenerate > 0 else [1.0 / n] * n
+        return [p / total_degenerate for p in clamped_degenerate]
 
     probs = [max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for p in probabilities]
     total = sum(probs)
     if total <= 0:
-        return [1.0 / n] * n
+        raise ValueError(_ZERO_MASS_MESSAGE.format(n=n))
     probs = [p / total for p in probs]
 
     pinned = [False] * n
@@ -82,9 +94,10 @@ def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
             for i in free:
                 probs[i] *= scale
         else:
-            share = budget / len(free)
-            for i in free:
-                probs[i] = share
+            # Free mass to distribute but every free option is exactly 0 — impossible
+            # while MC_PROB_MIN > 0 floors them. Splitting the budget evenly here would
+            # invent a sub-ballot; see _ZERO_MASS_MESSAGE.
+            raise ValueError(_ZERO_MASS_MESSAGE.format(n=n))
     return probs
 
 
@@ -115,6 +128,16 @@ def build_mc_prediction(
       constructing the PredictedOptionList, so ft 0.2.92's clamp-and-renormalize
       validator is a no-op on construction (no publish-time ValueError).
     - Preserves the order of `allowed_options` in the final list.
+    - **Raises when NOTHING matched.** It used to return an even distribution over
+      the allowed options instead, which is a forecast the model never made: the
+      extraction ladder's rung-3 parser validates an EMPTY option list, so a
+      salvage over a rationale with no ballot in it produced exact 1/n on every
+      option, and that uniform passes every downstream check (full option set,
+      in bounds, sums to 1) — it clamped as a no-op, went into the ensemble
+      median, and published with only ``rung=llm`` (which legitimate salvages
+      also emit) to distinguish it. Raising instead sends the ladder to its
+      typed failure, so the forecaster is dropped and attributed like any other
+      extraction failure.
     """
     # Map normalized allowed names to canonical. Both sides must normalize the
     # SAME way: incoming items run through _normalize_name (which strips a leading
@@ -136,10 +159,11 @@ def build_mc_prediction(
     # Create list in allowed order, skipping truly missing options
     pairs: list[tuple[str, float]] = [(name, accum[name]) for name in allowed_options if name in accum]
 
-    # If everything was filtered out, fall back to an even distribution over allowed options
-    if not pairs and allowed_options:
-        even = 1.0 / len(allowed_options)
-        pairs = [(name, even) for name in allowed_options]
+    if not pairs:
+        raise ValueError(
+            f"no parsed option matched the question's options {list(allowed_options)} "
+            f"(parsed names: {[item.option_name for item in raw_options]}); refusing to impute a uniform ballot"
+        )
 
     # Clamp + renormalize the floats BEFORE construction so ft 0.2.92's validator
     # (which clamps to [0.01, 0.99] + renormalizes + raises on any >0.05 move) sees

@@ -16,6 +16,7 @@ from metaculus_bot.numeric.cluster_processing import (
     compute_cluster_parameters,
     detect_count_like_pattern,
     ensure_strictly_increasing_bounded,
+    is_degenerate_cluster,
 )
 
 
@@ -114,8 +115,14 @@ class TestClusterProcessing:
         assert all(a < b for a, b in zip(cluster_values, cluster_values[1:]))  # Strictly increasing
 
     def test_apply_cluster_spreading_boundary_constraints(self):
-        """Test cluster spreading respects boundary constraints."""
-        values = [0.0, 0.0, 0.0]  # Cluster at lower bound
+        """Test cluster spreading respects boundary constraints.
+
+        The cluster sits at the closed lower bound but is PARTIAL (an unclustered
+        neighbour follows), which is the shape the spreader exists for. It used to
+        use a whole-set collapse, which no longer spreads at all — see
+        ``test_whole_set_collapse_is_not_spread``.
+        """
+        values = [0.0, 0.0, 0.0, 50.0]  # Cluster at lower bound, plus a real neighbour
         question = _make_question(open_lower=False, lower=0.0, upper=100.0)
 
         result, clusters_applied = apply_cluster_spreading(
@@ -125,6 +132,57 @@ class TestClusterProcessing:
         assert clusters_applied == 1
         # All values should be above the lower bound
         assert all(v > question.lower_bound for v in result)
+
+    def test_whole_set_collapse_is_not_spread(self):
+        """A point mass gets NO fabricated width (H2, 2026-08-25).
+
+        Every value inside one epsilon cluster means the model declared no
+        distribution at all. Spreading it invented the width — on a count-like
+        question, a full unit per position — and that invented span was also what
+        let the degenerate declaration pass ``detect_unit_mismatch``. The spreader
+        now leaves it alone and reports 0 clusters; the minimum separation a CDF
+        needs comes from the jitter / strict-ordering passes instead.
+        """
+        values = [42.0] * 13
+        question = _make_question(lower=0.0, upper=100.0)
+
+        result, clusters_applied = apply_cluster_spreading(
+            values.copy(), question, value_eps=1e-7, spread_delta=1.0, range_size=100.0
+        )
+
+        assert clusters_applied == 0
+        assert result == values
+
+    def test_near_equal_whole_set_collapse_is_not_spread(self):
+        """Epsilon-chained (not exactly equal) whole-set collapse counts as a point mass."""
+        values = [42.0 + i * 5e-8 for i in range(13)]
+        question = _make_question(lower=0.0, upper=100.0)
+
+        result, clusters_applied = apply_cluster_spreading(
+            values.copy(), question, value_eps=1e-7, spread_delta=1.0, range_size=100.0
+        )
+
+        assert clusters_applied == 0
+        assert result == values
+
+
+class TestIsDegenerateCluster:
+    """``is_degenerate_cluster`` — the point-mass predicate shared by the spreader
+    and the pipeline's ``NUMERIC_DEGENERATE_DECLARATION`` marker."""
+
+    def test_identical_values(self):
+        assert is_degenerate_cluster([7.0] * 13, 1e-7) is True
+
+    def test_epsilon_chained_values(self):
+        assert is_degenerate_cluster([7.0 + i * 9e-8 for i in range(5)], 1e-7) is True
+
+    def test_one_real_gap_is_not_degenerate(self):
+        assert is_degenerate_cluster([7.0, 7.0, 7.0, 9.0], 1e-7) is False
+
+    def test_single_value_is_not_degenerate(self):
+        # Nothing to compare, and a 1-element set never reaches the spreader.
+        assert is_degenerate_cluster([7.0], 1e-7) is False
+        assert is_degenerate_cluster([], 1e-7) is False
 
     def test_apply_jitter_for_duplicates(self):
         """Test jitter application for duplicate values."""

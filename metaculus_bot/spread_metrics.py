@@ -163,6 +163,16 @@ def numeric_percentile_spread(
     open-ended questions, falls back to the ensemble interquartile range
     (median of 90th percentiles minus median of 10th percentiles) as the
     denominator.
+
+    A non-positive denominator makes the ratio UNDEFINED — the reachable case is
+    an open-bound question whose models all interpolate to the same displayed
+    bound at P10 and P90 (heavy out-of-bound mass clamped by ``np.interp``). This
+    returns ``math.inf`` there, never ``0.0``: a failed measurement must not read
+    as an affirmative "the models agree" (which is exactly how
+    ``route_after_forecasts`` reads a spread of 0 — MEDIAN, skip stacking, marker
+    ``spread_below_threshold``). ``inf`` exceeds every threshold, so an
+    unmeasurable spread escalates to the stacker where stacking is enabled, and
+    the ``SPREAD_UNDEFINED`` WARN names the question either way.
     """
     if len(prediction_values) < 2:
         raise ValueError("numeric_percentile_spread requires at least 2 predictions")
@@ -190,8 +200,14 @@ def numeric_percentile_spread(
         denominator = statistics.median(p90_values) - statistics.median(p10_values)
 
     if denominator <= 0:
-        logger.warning(f"numeric_percentile_spread: non-positive {denominator=}, returning 0.0")
-        return 0.0
+        logger.warning(
+            "SPREAD_UNDEFINED: question=%s qtype=numeric denominator=%.6g models=%d — key-percentile spread is "
+            "unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement",
+            getattr(question, "id_of_question", None),
+            denominator,
+            len(prediction_values),
+        )
+        return math.inf
 
     max_normalized_spread = 0.0
     for pct in _KEY_SPREAD_PERCENTILES:

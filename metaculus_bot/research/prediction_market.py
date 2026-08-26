@@ -456,7 +456,11 @@ async def _rank_pool(question: Any, pool: generation.PoolResult) -> tuple[list[M
     An EMPTY ARRAY from the model is a valid answer, not a failure: width is the model's choice
     in 0..8, it took 3 and 6 rows on the two measured true negatives against a fixed-8 arm's
     12, and conflating `[]` with unusable output would delete the whole adaptive-width
-    mechanism. Only output that cannot be read as a JSON array at all fails open.
+    mechanism. Everything else the parser cannot read as a ranking fails open — output that is
+    not a JSON array of ranking objects (`RankingUnusable`), and a non-empty array yielding no
+    usable row (`RankingShapeRegression`, e.g. a renamed index key). The two are logged with a
+    `reason=` that tells them apart, because one says the model emitted prose and the other says
+    our prompt/parser contract broke.
     """
     if not pool.candidates:
         # Nothing to rank, so the stage does not run and there is no LLM call to lose. A
@@ -484,7 +488,17 @@ async def _rank_pool(question: Any, pool: generation.PoolResult) -> tuple[list[M
     try:
         picks = ranking.parse_ranking(completion, len(pool.candidates))
     except ranking.RankingUnusable as exc:
-        logger.warning(f"Market ranking unusable ({exc}); falling back to retrieval order")
+        # A marker line rather than prose, because the archive has to be able to count these: a
+        # fail-open renders retrieval order under `[ranking unavailable]`, and the run logs it
+        # sits in expire from GHA at 90 days. `reason=shape_regression` is the one that means OUR
+        # contract broke (a renamed index key would otherwise have passed silently as `ok(0)`);
+        # `reason=unreadable` means the model emitted something that is not a ranking array.
+        reason = "shape_regression" if isinstance(exc, ranking.RankingShapeRegression) else "unreadable"
+        logger.warning(
+            f"MARKET_RANKING_DEGRADED: question={getattr(question, 'id_of_question', None)} "
+            f"pool={len(pool.candidates)} reason={reason} "
+            f"detail=falling back to retrieval order; {exc}"
+        )
         return ranking.fail_open_slate(pool.candidates), f"error({type(exc).__name__})", "failopen", len(prompt)
     return ranking.apply_picks(pool.candidates, picks), f"ok({len(picks)})", "ranked", len(prompt)
 
@@ -863,6 +877,11 @@ def format_snapshot_for_research(snapshot: MarketSnapshot, *, qid: int | None = 
     returns `""` and still reads as `status="empty"` downstream. Note the flip side: a
     deliberate-zero question now records `prediction_market: ok` in the provider diagnostics
     rather than `empty`, which is the honest label — the provider did contribute a judgment.
+
+    That claim rests on `ok(0)` meaning ONE thing, which is why `parse_ranking` raises on a
+    non-empty array it can read no row from (`RankingShapeRegression`, 2026-08-26). While that
+    case also returned `[]`, this sentence asserted "none was judged to bear on it" over output
+    whose shape we had failed to parse.
     """
     rendered, child_stats = rendering.render_snapshot_with_stats(
         snapshot, ranking_degraded=is_lost_source(snapshot.sources.get("ranking", ""))

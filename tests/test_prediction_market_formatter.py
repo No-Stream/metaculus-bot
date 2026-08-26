@@ -124,6 +124,29 @@ class TestFormatterDelegate:
         row.num_bettors = num_bettors
         assert _liquidity_label(row) == expected
 
+    @pytest.mark.parametrize("num_bettors", [5, 50, 200])
+    def test_a_manifold_price_with_zero_own_volume_is_thin_at_every_bettor_count(self, num_bettors):
+        """Zero own volume beats the bettor pool. The pool is a MARKET-level figure — Manifold
+        publishes no per-answer count, so every child inherits its parent's — and a market with 200
+        bettors was labelling its untouched answers `high` when nobody had bet on them at all (62 of
+        399 archived Manifold children, 15.5%, read decent/high with zero own volume, right beside
+        the blank price `_priced_or_none` had just refused them)."""
+        row = _row("x", platform="manifold")
+        row.total_volume = 0.0
+        row.open_interest = None
+        row.num_bettors = num_bettors
+        assert _liquidity_label(row) == "thin"
+
+    def test_a_manifold_price_with_absent_volume_still_reads_the_bettor_pool(self):
+        """The complement, and the reason the gate is `is not None` rather than falsy: a MISSING
+        volume is not evidence of no trading, so a payload shape that omits the field must not have
+        every one of its rows demoted to `thin`. Same rule `_priced_or_none` applies."""
+        row = _row("x", platform="manifold")
+        row.total_volume = None
+        row.open_interest = None
+        row.num_bettors = 200
+        assert _liquidity_label(row) == "high"
+
 
 class TestChildRenderMarker:
     """``MARKET_CHILD_RENDER``: emitted by the seam, beside its ``MARKET_RANKING`` sibling.

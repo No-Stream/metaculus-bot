@@ -381,7 +381,10 @@ def manifold_answer_children(detail: dict[str, Any]) -> tuple[MarketChild, ...]:
     ``num_bettors`` is the MARKET's ``uniqueBettorCount``, copied onto every child: Manifold scores
     participation on bettors and publishes no per-answer count, so this is the honest figure for each
     answer (they share one bettor pool) and it makes each sub-row's ``signal`` cell agree with its
-    parent's instead of reading a false ``no-liquidity-data``.
+    parent's instead of reading a false ``no-liquidity-data``. Each answer's OWN ``volume`` outranks
+    it in the label, though — a zero there reads ``thin`` whatever the market's pool is
+    (``liquidity_label_from_fields``), because the shared pool cannot vouch for a rung nobody bet on,
+    and the untouched-prior answers this parser blanks a price for were reading ``high``.
     """
     answers = detail.get("answers")
     if not isinstance(answers, list):

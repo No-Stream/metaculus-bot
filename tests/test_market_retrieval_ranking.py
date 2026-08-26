@@ -34,6 +34,7 @@ from metaculus_bot.research.market_retrieval.ranking import (
     WHY_CHARS,
     Pick,
     RankerQuestion,
+    RankingShapeRegression,
     RankingUnusable,
     apply_picks,
     build_ranker_prompt,
@@ -202,16 +203,13 @@ class TestParseRanking:
         """
         assert [pick.index for pick in parse_ranking(text, 10)] == [1, 4]
 
-    def test_a_dict_bearing_array_without_an_index_key_is_still_the_fallback(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_a_dict_bearing_array_without_an_index_key_is_still_the_fallback(self) -> None:
         """Deferring the dict-bearing array must not DISCARD it either. When nothing carrying
-        `"i"` turns up, the remembered one has to reach the shape-regression WARN — a renamed
+        `"i"` turns up, the remembered one has to reach the shape-regression raise — a renamed
         index key is a genuine defect and must not pass silently as the valid empty answer, which
         is what returning `[]` from here would look like downstream."""
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.ranking"):
-            assert parse_ranking('{"picks": [{"index": 0}, {"index": 1}]}', 10) == []
-        assert any("yielded no usable pick" in message for message in caplog.messages)
+        with pytest.raises(RankingShapeRegression, match="yielded no usable pick"):
+            parse_ranking('{"picks": [{"index": 0}, {"index": 1}]}', 10)
 
     @pytest.mark.parametrize("text", ["[]", '{"picks": []}', '{"excluded": [], "picks": []}'])
     def test_a_completion_whose_arrays_are_all_empty_is_the_valid_empty_answer(self, text: str) -> None:
@@ -258,21 +256,44 @@ class TestParseRanking:
         with pytest.raises(RankingUnusable):
             parse_ranking("[0, 1, 2]", 10)
 
-    def test_a_renamed_index_key_warns_instead_of_passing_as_an_empty_answer(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The residue the fail-open cannot catch. An array of OBJECTS with the wrong key is a
-        usable array, so it parses, yields no pick, and reaches the caller as `ok(0)` — byte
-        identical to a genuine `[]` in the token, the telemetry line and the render. The WARN is
-        the only place the two are distinguishable."""
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.ranking"):
-            assert parse_ranking('[{"index": 0}, {"index": 1}]', 10) == []
-        assert any("yielded no usable pick" in message for message in caplog.messages)
+    def test_a_renamed_index_key_fails_open_instead_of_passing_as_an_empty_answer(self) -> None:
+        """An array of OBJECTS with the wrong key is a usable ARRAY, so it parses and yields no
+        pick — and while that returned `[]`, it reached the caller as `ok(0)`, byte-identical to a
+        genuine `[]` in the token, the telemetry line and the render. Since the render gained its
+        deliberate-empty sentence, that identity put "none was judged to bear on it" in front of a
+        forecaster on output whose shape we could not read. Raising routes it to the fail-open
+        slate and the `[ranking unavailable]` marker instead."""
+        with pytest.raises(RankingShapeRegression, match="renamed index key"):
+            parse_ranking('[{"index": 0}, {"index": 1}]', 10)
 
-    def test_a_genuinely_empty_array_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
-        """The control. `[]` is the adaptive-width mechanism working, so it must stay silent —
-        a WARN on every true negative is how an operator learns to ignore the channel."""
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.ranking"):
+    def test_every_index_hallucinated_past_the_pool_is_a_shape_regression(self) -> None:
+        """The other half of the same class: the model named rows, none of which exist. It clearly
+        did not mean "nothing here bears on the question", so the honest outcome is the degraded
+        slate rather than the deliberate-empty sentence."""
+        with pytest.raises(RankingShapeRegression):
+            parse_ranking('[{"i": 41}, {"i": 42}]', 10)
+
+    def test_a_shape_regression_is_catchable_as_the_base_class(self) -> None:
+        """`_rank_pool` catches `RankingUnusable` and nothing narrower, so the subclass exists for
+        telemetry only. If it stopped being a subclass, the exception would sail past the fail-open
+        to the snapshot-level net and discard the WHOLE prediction-market snapshot."""
+        assert issubclass(RankingShapeRegression, RankingUnusable)
+        with pytest.raises(RankingUnusable):
+            parse_ranking('[{"index": 0}]', 10)
+
+    def test_unreadable_output_is_not_labelled_a_shape_regression(self) -> None:
+        """The two failures get different `reason=` values in the caller's WARN, and they mean
+        different things: prose means the model answered badly, a shape regression means OUR
+        prompt/parser contract broke. Only the base class may be raised for prose."""
+        with pytest.raises(RankingUnusable) as excinfo:
+            parse_ranking("I could not decide.", 10)
+        assert not isinstance(excinfo.value, RankingShapeRegression)
+
+    def test_a_genuinely_empty_array_neither_raises_nor_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The control. `[]` is the adaptive-width mechanism working, so it must stay silent AND
+        keep parsing — a fail-open on a true negative renders 8 near-misses, and a WARN on every
+        true negative is how an operator learns to ignore the channel."""
+        with caplog.at_level(logging.WARNING):
             assert parse_ranking("[]", 10) == []
         assert caplog.messages == []
 
@@ -341,8 +362,12 @@ class TestParseRanking:
 
         assert [pick.index for pick in picks] == [1]
 
-    def test_an_empty_pool_drops_every_index(self) -> None:
-        assert parse_ranking('[{"i": 0}]', 0) == []
+    def test_an_empty_pool_makes_every_index_out_of_range(self) -> None:
+        """Structurally the all-indices-out-of-range regression, so it raises — and harmlessly:
+        `_rank_pool` short-circuits an empty pool before the ranking call ever runs, and
+        `fail_open_slate([])` is `[]` anyway, so the fail-open renders nothing either way."""
+        with pytest.raises(RankingShapeRegression):
+            parse_ranking('[{"i": 0}]', 0)
 
 
 class TestApplyPicks:

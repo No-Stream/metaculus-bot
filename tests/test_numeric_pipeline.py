@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -6,6 +7,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric.validation import detect_unit_mismatch
 
 
 def _build_question(**overrides) -> NumericQuestion:
@@ -62,6 +64,80 @@ def test_sanitize_percentiles_orders_and_jitters(monkeypatch):
 
     # Discrete question (cdf_size != default) should force zero_point to None
     assert zero_point is None
+
+
+class TestPointMassDeclaration:
+    """A point-mass declaration must not be published as a distribution (H2, 2026-08-25).
+
+    A model declaring the SAME value at all 13 percentiles used to be spread into
+    a 12-unit-wide forecast by the cluster spreader (``COUNT_LIKE_DELTA_MULTIPLIER``
+    is a full unit per position, and with no unclustered neighbour nothing
+    compressed it). That fabricated span was ALSO what made the degenerate
+    declaration pass ``detect_unit_mismatch``'s span-ratio test — the guard that
+    exists to withhold exactly this input. Now sanitisation adds only the
+    minimum separation the CDF format needs, so the guard sees the model's own
+    (zero) span and the forecaster is withheld.
+    """
+
+    _POINT_MASS = 42.0
+    _LABELS = [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99]
+
+    def _declared(self) -> list[Percentile]:
+        return [Percentile(percentile=p, value=self._POINT_MASS) for p in self._LABELS]
+
+    def test_no_width_is_invented(self):
+        question = _build_question(zero_point=None)
+        sanitized, _zero_point = sanitize_percentiles(self._declared(), question)
+
+        values = [float(p.value) for p in sanitized]
+        # Strictly increasing (the CDF needs it) but only by the ordering epsilon:
+        # max(MIN_BOUNDARY_DISTANCE * range, STRICT_ORDERING_EPSILON) per step.
+        assert all(b > a for a, b in zip(values, values[1:]))
+        span = max(values) - min(values)
+        assert span < 1e-4, f"sanitisation invented {span} of width from a point mass"
+
+    def test_unit_mismatch_guard_withholds_it(self):
+        question = _build_question(zero_point=None)
+        sanitized, _zero_point = sanitize_percentiles(self._declared(), question)
+
+        mismatch, reason = detect_unit_mismatch(sanitized, question)
+        assert mismatch is True, "a zero-width declaration must be withheld, not published"
+        assert "span" in reason
+
+    def test_marker_is_emitted(self, caplog):
+        question = _build_question(zero_point=None)
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pipeline"):
+            sanitize_percentiles(self._declared(), question, model_name="some/model")
+
+        markers = [r.getMessage() for r in caplog.records if "NUMERIC_DEGENERATE_DECLARATION:" in r.getMessage()]
+        assert len(markers) == 1
+        assert "question=1" in markers[0]
+        assert "model=some/model" in markers[0]
+        assert "n_unique=1" in markers[0]
+        assert "spread_applied=false" in markers[0]
+
+    def test_marker_names_unknown_model_when_caller_has_none(self, caplog):
+        question = _build_question(zero_point=None)
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pipeline"):
+            sanitize_percentiles(self._declared(), question)
+        markers = [r.getMessage() for r in caplog.records if "NUMERIC_DEGENERATE_DECLARATION:" in r.getMessage()]
+        assert len(markers) == 1
+        assert "model=unknown" in markers[0]
+
+    def test_partial_plateau_still_spreads_and_publishes(self, caplog):
+        """The spreader's real job is preserved: a plateau INSIDE a wider
+        declaration is separated, no marker fires, and the guard passes it."""
+        question = _build_question(lower_bound=0.0, upper_bound=20.0, zero_point=None)
+        values = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0]
+        declared = [Percentile(percentile=p, value=v) for p, v in zip(self._LABELS, values)]
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pipeline"):
+            sanitized, _zero_point = sanitize_percentiles(declared, question)
+
+        assert not [r for r in caplog.records if "NUMERIC_DEGENERATE_DECLARATION:" in r.getMessage()]
+        sanitized_values = [float(p.value) for p in sanitized]
+        assert all(b > a for a, b in zip(sanitized_values, sanitized_values[1:]))
+        assert detect_unit_mismatch(sanitized, question) == (False, "")
 
 
 def test_build_numeric_distribution_fallback(monkeypatch):

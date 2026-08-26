@@ -9,12 +9,15 @@ Covers:
   and delegates `close()` to its inner resolver.
 - Datawrapper embed detection (`extract_datawrapper_charts`) on real-shaped
   tracker HTML, the live-data URL builder, and Last-Modified parsing.
+- `decode_text_body`: BOM-then-declared-charset precedence, and the undecodable-char
+  score that lets a caller refuse mojibake instead of rendering it as evidence.
 
 No real network calls: sessions are constructed, inspected, and closed.
 """
 
 from __future__ import annotations
 
+import codecs
 import ipaddress
 import logging
 import socket
@@ -27,12 +30,15 @@ from aiohttp.abc import AbstractResolver
 
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
+    MAX_UNDECODABLE_CHAR_RATIO,
     FilteringResolver,
     build_session,
     datawrapper_live_data_url,
+    decode_text_body,
     extract_datawrapper_charts,
     parse_http_last_modified,
     read_body_capped,
+    undecodable_char_ratio,
 )
 
 
@@ -412,3 +418,84 @@ class TestParseHttpLastModified:
         parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 -0000")
         assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
         assert parsed is not None and parsed.tzinfo is not None
+
+
+class TestDecodeTextBody:
+    """Raw bodies decode by the response's OWN self-description, then get scored.
+
+    The retired blanket `body.decode("utf-8", errors="replace")` turned a UTF-16 or
+    Windows-1252 body into mojibake that still type-checked as text, and the
+    resolution-source fetcher then rendered `0<?>.<?>4<?>2<?>` to a forecaster as
+    primary grading evidence with `status="success"`.
+    """
+
+    def test_a_bom_wins_over_everything_and_is_consumed(self):
+        """Excel exports CSV as BOM'd UTF-16, which is exactly the poll-table shape the
+        Datawrapper hop fetches. The BOM must decide the codec AND not survive into the text."""
+        body = codecs.BOM_UTF16_LE + "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
+
+        text, ratio = decode_text_body(body, "text/csv")
+
+        assert text == "date,value\n2026-08-01,0.42\n"
+        assert ratio == 0.0
+
+    def test_a_utf8_bom_is_stripped_rather_than_read_as_content(self):
+        body = codecs.BOM_UTF8 + b"date,value\n2026-08-01,0.42\n"
+
+        text, ratio = decode_text_body(body, "text/csv")
+
+        assert text.startswith("date,value")
+        assert ratio == 0.0
+
+    def test_a_declared_charset_is_honoured(self):
+        """`charset=` was parsed for ROUTING and then ignored for decoding, so a Windows-1252
+        pollster name lost its apostrophe to a replacement char."""
+        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")
+
+        text, ratio = decode_text_body(body, "text/csv; charset=windows-1252")
+
+        assert "O’Brien Research" in text
+        assert ratio == 0.0
+
+    def test_a_quoted_charset_is_honoured(self):
+        body = "café,1\n".encode("latin-1")
+
+        text, _ratio = decode_text_body(body, 'text/csv; charset="latin-1"')
+
+        assert text == "café,1\n"
+
+    def test_an_unknown_charset_falls_back_to_utf8_rather_than_raising(self):
+        """A typo'd charset label is not a reason to lose the body."""
+        text, ratio = decode_text_body(b"date,value\n", "text/csv; charset=utf-8000")
+
+        assert text == "date,value\n"
+        assert ratio == 0.0
+
+    def test_a_bomless_utf16_body_scores_as_undecodable(self):
+        """The half a replacement-char count alone cannot see: every second byte of BOM-less
+        UTF-16 ASCII is a NUL, which is a VALID UTF-8 character, so the naive decode produced
+        zero replacement chars and passed for text."""
+        body = "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
+
+        _text, ratio = decode_text_body(body, "text/csv")
+
+        assert ratio > MAX_UNDECODABLE_CHAR_RATIO
+
+    def test_a_utf16_bom_read_as_utf8_would_score_as_undecodable(self):
+        """The other shape: had the BOM sniff not fired, the ratio is the backstop."""
+        body = codecs.BOM_UTF16_LE + "date,value\n".encode("utf-16-le")
+
+        assert undecodable_char_ratio(body.decode("utf-8", errors="replace")) > MAX_UNDECODABLE_CHAR_RATIO
+
+    def test_text_with_a_single_bad_byte_stays_usable(self):
+        """The threshold has to sit far above real text's dirt: a page carrying one mis-encoded
+        smart quote is evidence we want, not a body we failed to decode. This is why the bound is
+        0.10 rather than something tight — a 37-char line with one bad byte already scores 0.027."""
+        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")
+
+        _text, ratio = decode_text_body(body, "text/csv")
+
+        assert 0.0 < ratio <= MAX_UNDECODABLE_CHAR_RATIO
+
+    def test_an_empty_body_scores_zero_rather_than_dividing_by_zero(self):
+        assert decode_text_body(b"", "text/csv") == ("", 0.0)

@@ -17,6 +17,18 @@ renders as its own ``MarketChild`` sub-row instead, and the event's price legs a
 placeholder ("Candidate A", "Party B", "Other") reads 0.5 with zero trading — 155 of the archive's
 1,839 ranked-era child outcomes. ``_priced_or_none`` blanks exactly that shape, everywhere this module reads a
 price, since a fabricated 0.5 that sorts to the front of a render is worse than no row at all.
+
+**ABSENT ``outcomePrices`` is Gamma's OTHER way of saying the same thing, and needs no fix**
+(investigated 2026-08-26 after a QA run flagged the sparsity; closed as no-defect). Re-running this
+module's own search shape, 118 of 174 nested markets carried no ``outcomePrices`` — and all 118 were
+``active: false`` with ``volumeNum: 0``; across three queries, ZERO price-less legs had any volume
+(0 of 119). The ``/markets/<id>`` detail endpoint serves ``outcomePrices: null`` for them too, with
+``bestBid: 0 / bestAsk: 1`` — an empty book whose CLOB midpoint is the synthetic $0.50 the blanking
+rule above exists to refuse. So a Polymarket detail fan-out (the Manifold-style enrichment this
+venue deliberately does not have) could only manufacture that 0.50: every informative, traded leg
+already ships a price, and a price-less leg collapses into the ladder's "unquoted" group with a
+count, which is the honest render for an outcome nobody has priced. Not a ``fields=`` projection
+artifact either — we send none.
 """
 
 from __future__ import annotations
