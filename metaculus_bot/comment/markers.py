@@ -83,10 +83,12 @@ STACKER_OUTCOME_RE: re.Pattern[str] = re.compile(
 # new outcome value: STACKER_OUTCOME stays byte-stable for every existing parser
 # of the legacy value. ``config_off`` restates skipped_config_off's reason so the
 # field is self-contained.
-STACKER_SKIP_REASONS: frozenset[str] = frozenset({"spread_below_threshold", "config_off", "single_forecaster"})
+STACKER_SKIP_REASONS: frozenset[str] = frozenset(
+    {"spread_below_threshold", "config_off", "single_forecaster", "wall_clock_budget"}
+)
 
 STACKER_SKIP_REASON_RE: re.Pattern[str] = re.compile(
-    r"<!--\s*STACKER_SKIP_REASON=(spread_below_threshold|config_off|single_forecaster)\s*-->",
+    r"<!--\s*STACKER_SKIP_REASON=(spread_below_threshold|config_off|single_forecaster|wall_clock_budget)\s*-->",
     re.IGNORECASE,
 )
 

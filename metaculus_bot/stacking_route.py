@@ -103,6 +103,15 @@ def _enrichment_timeout(soft_deadline_s: float, time_budget: QuestionTimeBudget)
     positive value rather than 0 — ``asyncio.wait_for(coro, 0)`` cancels before the
     coroutine gets a first step, which would report a stage failure that never
     happened.
+
+    Where this actually binds: on a CLOSE-LIMITED budget it is a no-op by
+    construction, because ``_skip_stacking_for_budget``'s raised floor already
+    sums both enrichment bounds (via ``_stacking_budget_required_s``) and refuses
+    the path without the whole worst case in hand. It bites on the STATIC budget,
+    where the gate's floor stays at 90 s: there a crux extraction entered with
+    e.g. 100 s remaining is clamped to 10 s instead of running its full soft
+    deadline into the publish reserve — a deliberate tightening of the
+    pre-budget behavior on that path.
     """
     affordable = time_budget.remaining_s() - WALL_CLOCK_STACKING_MIN_BUDGET
     return max(1.0, min(float(soft_deadline_s), affordable))
@@ -160,13 +169,23 @@ def _skip_stacking_for_budget(
         "fallback_median" if bot.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING else "fallback_mean"
     )
     logger.warning(
-        "WALLCLOCK_ABORT: skipping stacking for Q %s; remaining=%.1fs < %ds; forcing %s fallback",
+        # The floor ACTUALLY applied, not the static constant: on a close-limited
+        # budget it includes the stacking path's own worst case, and this WARN is
+        # the only record of why the stacker was skipped.
+        "WALLCLOCK_ABORT: skipping stacking for Q %s; remaining=%.1fs < %.0fs; forcing %s fallback",
         qid,
         remaining,
-        WALL_CLOCK_STACKING_MIN_BUDGET,
+        floor,
         budget_skip_outcome,
     )
     bot._stacker_outcome[qid] = budget_skip_outcome
+    # Same skip-reason + counter treatment as the other skip paths
+    # (single_forecaster / config_off / spread_below_threshold): without them a
+    # residual cut keyed on STACKER_SKIP_REASON silently misses this bucket. The
+    # conditional-stacking tally only exists under CONDITIONAL_STACKING.
+    bot._stacker_skip_reason[qid] = "wall_clock_budget"
+    if bot.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
+        bot._conditional_stacking_skipped_count += 1
     # Register so the pipeline's aggregate step (which will run with
     # reasoned_predictions=None) takes the expected base-combine path and doesn't
     # log "Unexpected STACKING combine".
@@ -195,10 +214,12 @@ async def _targeted_research_for_crux(
 
     Both stages are additionally clamped to what the question's remaining budget
     can afford, so an enrichment stage can never spend the time the stacker (and
-    behind it, the prediction POST) still needs. The clamp is the belt to
-    ``_skip_stacking_for_budget``'s braces: that gate refuses to enter this path
-    without the whole worst case in hand, and these clamps hold the line if a stage
-    overruns its own soft deadline anyway.
+    behind it, the prediction POST) still needs. On a close-limited budget the
+    clamp is a no-op by construction — ``_skip_stacking_for_budget``'s raised
+    floor already refused this path without the whole worst case in hand — so
+    what the clamp really guards is the STATIC budget's thin tail, where the
+    gate's 90 s floor admits a stage whose full soft deadline would overrun the
+    publish reserve (see ``_enrichment_timeout``).
     """
     # Crux extraction under a soft deadline: without the wait_for the only bound is
     # the analyzer LLM's own litellm timeout (UTILITY_MODEL_CONFIG in

@@ -36,6 +36,7 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
     STACKER_SOFT_DEADLINE,
+    TIME_BUDGET_MIN_VIABLE_S,
     TS_ANCHOR_CHART_ENABLED_ENV,
     env_flag_enabled,
 )
@@ -57,7 +58,11 @@ from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,
 )
-from metaculus_bot.publish_gate import publish_skipped_closed_count, reset_publish_skipped_closed
+from metaculus_bot.publish_gate import (
+    publish_skipped_closed_count,
+    record_publish_skipped_closed,
+    reset_publish_skipped_closed,
+)
 from metaculus_bot.publish_hardening import publish_attempt_failures, reset_publish_attempt_failures
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
@@ -745,10 +750,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # rejected 405). The message names the close time so the run log says WHY
         # rather than reporting a mysterious zero-forecaster question.
         if time_budget.is_exhausted:
-            self._questions_failed_to_publish += 1
+            # SAME counter as the close gate at publish time: "latency cost us this
+            # question" has one home (publish_skipped_closed, already alertable),
+            # however early the loss was noticed. questions_failed_to_publish
+            # remains the min-forecasters floor's counter alone.
+            record_publish_skipped_closed()
             msg = (
-                f"Q {question.id_of_question} has no publishable time budget "
-                f"(close_time={time_budget.close_time}, budget={time_budget.total_s:.0f}s); "
+                f"Q {question.id_of_question} has no viable time budget "
+                f"(close_time={time_budget.close_time}, budget={time_budget.total_s:.0f}s, "
+                f"minimum viable {TIME_BUDGET_MIN_VIABLE_S}s on a close-limited window); "
                 "skipping before any research or forecaster spend."
             )
             logger.error(msg)

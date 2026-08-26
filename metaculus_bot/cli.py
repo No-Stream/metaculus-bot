@@ -27,6 +27,7 @@ from metaculus_bot.fallback_openrouter import (
     get_credit_key_fallback_count,
     get_donated_404_fallback_count,
     get_generic_key_fallback_count,
+    has_deprecation_alerts,
 )
 from metaculus_bot.fetch_hardening import apply_fetch_hardening
 from metaculus_bot.forecaster import TemplateForecaster
@@ -284,7 +285,19 @@ def main() -> None:
     # read: that run lost a question. Its counters can legitimately be all-zero
     # (q45085's shape), which is why the phrase, not the fields, is what marks a run
     # clean.
-    run_clean = report_summary_error is None and alertable <= 0 and generic_fallback <= 0
+    #
+    # The predicate must be the exact complement of every non-zero exit path in
+    # this function — including the two that run AFTER this line (the credit-floor
+    # breach and the deprecation tripwire). Without those two terms, a run about
+    # to exit red could first stamp the archive's run_alertable_summary record
+    # with the clean token.
+    run_clean = (
+        report_summary_error is None
+        and alertable <= 0
+        and generic_fallback <= 0
+        and not (donated_below_floor and alerts_active)
+        and not has_deprecation_alerts()
+    )
     completion_phrase = "Run completed clean with" if run_clean else "Run completed with"
     breakdown = (
         f"{completion_phrase} {alertable} alertable degradation event(s) "
@@ -306,9 +319,13 @@ def main() -> None:
         # subtraction can't otherwise reach zero from a positive total), so state
         # that rather than leaving a reader to derive it from the arithmetic.
         logger.info("%s every fallback was a suppressed credit event, so this run stays green.", breakdown)
-    else:
+    elif run_clean:
         # The all-clear census line (see ``run_clean`` above).
         logger.info("%s nothing degraded, so this run stays green.", breakdown)
+    else:
+        # Counters are quiet but a red condition below (credit floor breach or the
+        # deprecation tripwire) still decides the exit status — no green claim.
+        logger.info("%s a post-summary check below decides the exit status.", breakdown)
 
     # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
     # already logged by credit_telemetry). The run completed and published

@@ -20,6 +20,8 @@ tests loudly instead of silently dropping records from the archive:
 
 import json
 
+import pytest
+
 from scripts.telemetry.markers import (
     MARKER_SPECS,
     coerce_value,
@@ -839,6 +841,16 @@ DEGRADATION_COUNTERS_LINE = (
     "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
     "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
     "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
+    "publish_attempt_failures=1, publish_skipped_closed=2, time_budget_fast_path=3, "
+    "research_budget_cuts=5"
+)
+# The shape emitted before the off-fast-path budget-cut counter shipped: ends at
+# time_budget_fast_path. Same optional-group rationale as every tail before it.
+DEGRADATION_COUNTERS_PRE_BUDGET_CUT_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
     "publish_attempt_failures=1, publish_skipped_closed=2, time_budget_fast_path=3"
 )
 # The shape emitted before the time-budget counter shipped: ends at
@@ -893,13 +905,19 @@ DEGRADATION_COUNTERS_LEGACY_LINE = (
 
 
 class TestDegradationCounters:
-    def test_all_fourteen_current_keys_parse(self):
+    def test_all_fifteen_current_keys_parse(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
         assert rec["marker"] == "degradation_counters"
+        assert rec["research_budget_cuts"] == 5
         assert rec["time_budget_fast_path"] == 3
         assert rec["publish_skipped_closed"] == 2
         assert rec["forecasters_dropped"] == 2
         assert rec["questions_failed_to_publish"] == 0
+
+    def test_pre_budget_cut_line_still_harvests_everything_else(self):
+        rec = _parse_one(DEGRADATION_COUNTERS_PRE_BUDGET_CUT_LINE)
+        assert rec["time_budget_fast_path"] == 3
+        assert "research_budget_cuts" not in rec
         assert rec["stacker_primary_failed"] == 0
         assert rec["stacker_fallback_used"] == 0
         assert rec["stacker_fallback_failed"] == 0
@@ -920,7 +938,7 @@ class TestDegradationCounters:
         assert rec["publish_skipped_closed"] == 2
         assert rec["publish_attempt_failures"] == 1
         # Absent must read as "this era didn't emit it", never as a measured zero.
-        assert rec["time_budget_fast_path"] is None
+        assert "time_budget_fast_path" not in rec
 
     def test_line_without_the_skip_tail_still_harvests_everything_else(self):
         """Every record archived before 2026-08-25 ends at publish_attempt_failures,
@@ -931,8 +949,8 @@ class TestDegradationCounters:
         assert rec["publish_attempt_failures"] == 1
         assert rec["provider_degradation"] == 1
         # Absent must read as "this era didn't emit it", never as a measured zero.
-        assert rec["publish_skipped_closed"] is None
-        assert rec["time_budget_fast_path"] is None
+        assert "publish_skipped_closed" not in rec
+        assert "time_budget_fast_path" not in rec
 
     def test_line_without_the_publish_tail_still_harvests_everything_else(self):
         """Every record archived before 2026-08-24 ends at provider_degradation, and
@@ -943,9 +961,9 @@ class TestDegradationCounters:
         assert rec["provider_degradation"] == 1
         assert rec["prediction_market_source_losses"] == 4
         # Absent must read as "this era didn't emit it", never as a measured zero.
-        assert rec["publish_attempt_failures"] is None
-        assert rec["publish_skipped_closed"] is None
-        assert rec["time_budget_fast_path"] is None
+        assert "publish_attempt_failures" not in rec
+        assert "publish_skipped_closed" not in rec
+        assert "time_budget_fast_path" not in rec
 
     def test_line_without_the_provider_degradation_tail_still_harvests_everything_else(self):
         """The load-bearing back-compat case. All 290 archived records end at
@@ -962,10 +980,10 @@ class TestDegradationCounters:
         assert rec["prediction_market_degraded"] == 0
         assert rec["prediction_market_source_losses"] == 0
         # Absent must read as "this era didn't emit it", never as a measured zero.
-        assert rec["provider_degradation"] is None
-        assert rec["publish_attempt_failures"] is None
-        assert rec["publish_skipped_closed"] is None
-        assert rec["time_budget_fast_path"] is None
+        assert "provider_degradation" not in rec
+        assert "publish_attempt_failures" not in rec
+        assert "publish_skipped_closed" not in rec
+        assert "time_budget_fast_path" not in rec
 
     def test_per_run_summary_carries_no_question_ref(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
@@ -982,11 +1000,77 @@ class TestDegradationCounters:
         assert rec["research_provider_timeouts"] == 5
         assert rec["gap_fill_v2_errors"] == 0
         assert rec["prediction_market_degraded"] == 1
-        # Keys that did not exist pre-rename coerce to None, not 0 — absent must not
-        # read as "measured zero" in the archive.
-        assert rec["research_provider_failures"] is None
-        assert rec["summarizer_failures"] is None
-        assert rec["prediction_market_source_losses"] is None
+        # Keys that did not exist pre-rename are ABSENT from the record, not 0 —
+        # absent must not read as "measured zero" in the archive.
+        assert "research_provider_failures" not in rec
+        assert "summarizer_failures" not in rec
+        assert "prediction_market_source_losses" not in rec
+
+    def test_a_future_counter_harvests_with_no_spec_change(self):
+        # The whole point of the tokenized tail: appending a key to
+        # format_degradation_summary must never again require a markers.py edit.
+        line = (
+            "2026-08-25 12:00:00,000 - metaculus_bot.forecaster - INFO - "
+            "Degradation counters: forecasters_dropped=0, some_future_counter=7"
+        )
+        rec = _parse_one(line)
+        assert rec["forecasters_dropped"] == 0
+        assert rec["some_future_counter"] == 7
+
+
+class TestTimeBudgetLoudMarkers:
+    """The four budget WARNs docs/operations.md tells the operator to grep. Without
+    specs they vanished at the 90-day GHA log expiry; the mid-phase gap-fill cut on
+    a non-fast-path question was recoverable from nothing else."""
+
+    def test_time_budget_fast_path_roundtrip(self):
+        line = (
+            "2026-08-25 12:00:00,000 - metaculus_bot.forecaster - WARNING - "
+            "TIME_BUDGET_FAST_PATH: qid=45085 budget=1140s close_time=2026-08-25 13:00:00+00:00; "
+            "dropping optional research stages to protect the prediction POST"
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "time_budget_fast_path"
+        assert rec["qid"] == 45085
+        assert rec["qid_kind"] == "question_id"
+        assert rec["budget_s"] == pytest.approx(1140.0)
+        assert rec["close_time"] == "2026-08-25 13:00:00+00:00"
+
+    def test_research_phase_deadline_roundtrip(self):
+        line = (
+            "2026-08-25 12:00:00,000 - metaculus_bot.research.orchestrator - WARNING - "
+            "RESEARCH_PHASE_DEADLINE: cancelled 2/6 providers after 570s (gemini_search,native_search)"
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "research_phase_deadline"
+        assert rec["cancelled"] == 2
+        assert rec["total"] == 6
+        assert rec["deadline_s"] == pytest.approx(570.0)
+        assert rec["providers"] == "gemini_search,native_search"
+        # No question ref on this line; attribution lives in provider_results.
+        assert "qid" not in rec
+
+    def test_gap_fill_skipped_for_budget_roundtrip(self):
+        line = (
+            "2026-08-25 12:00:00,000 - metaculus_bot.research.orchestrator - WARNING - "
+            "GAP_FILL_SKIPPED_FOR_BUDGET: question=45085 fast_path=true research_phase_remaining=n/a"
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "gap_fill_skipped_for_budget"
+        assert rec["qid"] == 45085
+        assert rec["fast_path"] is True
+        assert rec["research_phase_remaining"] is None  # "n/a" coerces to None
+
+    def test_gap_fill_cut_for_budget_roundtrip_both_passes(self):
+        for gap_fill_pass in ("V1", "V2"):
+            line = (
+                "2026-08-25 12:00:00,000 - metaculus_bot.research.orchestrator - WARNING - "
+                f"GAP_FILL_{gap_fill_pass}_CUT_FOR_BUDGET: question=45085; research phase ran out of budget"
+            )
+            rec = _parse_one(line)
+            assert rec["marker"] == "gap_fill_cut_for_budget"
+            assert rec["qid"] == 45085
+            assert rec["gap_fill_pass"] == gap_fill_pass
 
 
 # The per-run provider-degradation summary (metaculus_bot/research/provider_health.py

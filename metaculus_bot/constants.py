@@ -696,16 +696,31 @@ PUBLISH_RESERVE_SECONDS: int = 60
 
 # Below this effective budget, drop the OPTIONAL research stages (every provider
 # but the primary, plus both gap-fill passes) and publish on the fast path.
-# Sized at the full pipeline's configured worst case: research 1155s (provider
-# phase 600 = AskNews 300 + summarizer 300 sequential inside one provider; then
-# gap-fill 555 = analyzer 135 + resolver wave 420) + FORECASTER_SOFT_DEADLINE 600
-# + the publish tail ~= 1815s. So the rule reads: stop running the optional
-# stages once the full pipeline's worst case no longer fits the window. Measured
-# false-positive cost is zero — 0 of 99 published triple-era questions had less
-# than 54 minutes of headroom at run start (scratch/residual_2026-08-24/
-# time_budget_design.md), and the optional stages are worth 84s (gap-fill v2 p50)
-# to 183s (dropping the provider tail at its observed max).
-TIME_BUDGET_FAST_PATH_THRESHOLD: int = 1800
+# Sized at EXACTLY the full pipeline's configured worst case: research 1155s
+# (provider phase 600 = AskNews 300 + summarizer 300 sequential inside one
+# provider; then gap-fill 555 = analyzer 135 + resolver wave 420)
+# + FORECASTER_SOFT_DEADLINE 600 + the publish tail 60 = 1815s. So the rule
+# reads: stop running the optional stages once the full pipeline's worst case no
+# longer fits the window — the value IS that sum, so there is no band where the
+# envelope doesn't fit but the fast path stays off. (SUMMARIZER_WALL_TIMEOUT is
+# defined further down this file, which is why the sum is stated rather than
+# spelled as an expression.) Measured false-positive cost is zero — 0 of 99
+# published triple-era questions had less than 54 minutes of headroom at run
+# start (scratch/residual_2026-08-24/time_budget_design.md), and the optional
+# stages are worth 84s (gap-fill v2 p50) to 183s (dropping the provider tail at
+# its observed max).
+TIME_BUDGET_FAST_PATH_THRESHOLD: int = 1815
+
+# Below this budget the question is skipped at INTAKE rather than run on the
+# fast path: the minimum viable path is the primary provider (measured worst
+# ~110s live; the research phase's half-share of a 300s budget is 150s) plus at
+# least one reasoning forecaster (typical completions run 100-300s against
+# FORECASTER_SOFT_DEADLINE 600; the other half-share of 300s fits only the
+# fastest of them). Below ~5 minutes even that path essentially never lands —
+# the fan-out produces 0 valid forecasters and the min-forecasters guard drops
+# the question AFTER spending — so the intake skip converts guaranteed-wasted
+# spend into an immediate forfeit with a log line naming the close time.
+TIME_BUDGET_MIN_VIABLE_S: int = 300
 
 # Fraction of the TOTAL budget granted to the research phase as ONE fixed window
 # anchored at the budget's start (research_phase_deadline_s = total*share −

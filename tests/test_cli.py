@@ -742,6 +742,46 @@ class TestCliCreditAlertSuppression:
         assert match.group("outcome") == "clean"
         assert match.group("suppressed_credit") is None
 
+    def test_a_floor_breach_run_after_resume_is_not_labelled_clean(self, caplog: pytest.LogCaptureFixture) -> None:
+        """run_clean must be the exact complement of every non-zero exit path,
+        including the credit-floor breach that exits AFTER the summary line: a run
+        about to go red must not first stamp the archive with the clean token."""
+        with (
+            _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=AFTER_RESUME_DATE),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
+
+        summary = [msg for msg in caplog.messages if "alertable degradation event" in msg]
+        assert len(summary) == 1, caplog.messages
+        assert not summary[0].startswith("Run completed clean"), summary
+        spec = next(s for s in MARKER_SPECS if s.name == "run_alertable_summary")
+        match = spec.regex.search(summary[0])
+        assert match is not None, summary
+        assert match.group("outcome") is None
+
+    def test_a_deprecation_alert_run_is_not_labelled_clean(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Same complement rule for the post-summary deprecation tripwire."""
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._DEPRECATION_ALERTS.append(("openrouter/x-ai/grok-4.1-fast", "deprecated"))
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+                caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+
+            summary = [msg for msg in caplog.messages if "alertable degradation event" in msg]
+            assert len(summary) == 1, caplog.messages
+            assert not summary[0].startswith("Run completed clean"), summary
+        finally:
+            fb_module.clear_deprecation_alerts()
+
     def test_a_degraded_run_is_never_labelled_clean(self, caplog: pytest.LogCaptureFixture) -> None:
         """The "clean" phrase is load-bearing telemetry, so it must not leak onto a
         run that fell back. One suppressed credit fallback exits zero, which is the

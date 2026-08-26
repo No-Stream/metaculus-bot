@@ -79,6 +79,17 @@ def clear_deprecation_alerts() -> None:
     _DEPRECATION_ALERTS.clear()
 
 
+def has_deprecation_alerts() -> bool:
+    """Whether any deprecation was recorded this run.
+
+    Read by ``cli.py``'s end-of-run summary so a run that
+    ``check_deprecation_alerts_and_exit`` will shortly turn red cannot first
+    label itself "clean" (the list is module-private, so callers cannot inspect
+    it directly).
+    """
+    return bool(_DEPRECATION_ALERTS)
+
+
 def check_deprecation_alerts_and_exit() -> None:
     """Post-submission tripwire: log loudly and ``sys.exit(1)`` if any deprecation was seen.
 

@@ -41,12 +41,16 @@ from metaculus_bot.constants import (
     PUBLISH_RESERVE_SECONDS,
     RESEARCH_PHASE_BUDGET_SHARE,
     TIME_BUDGET_FAST_PATH_THRESHOLD,
+    TIME_BUDGET_MIN_VIABLE_S,
     WALL_CLOCK_STACKING_MIN_BUDGET,
 )
+from metaculus_bot.publish_gate import reset_publish_skipped_closed
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
+from metaculus_bot.research.provider_diagnostics import pop_provider_detail, record_provider_detail
 from metaculus_bot.stacking_route import (
     _enrichment_timeout,
     _skip_stacking_for_budget,
+    _stacking_budget_required_s,
     _targeted_research_for_crux,
 )
 from metaculus_bot.time_budget import (
@@ -185,6 +189,21 @@ class TestBudgetMath:
         assert PER_QUESTION_WALL_CLOCK_DEADLINE > TIME_BUDGET_FAST_PATH_THRESHOLD
         assert _budget(TIME_BUDGET_FAST_PATH_THRESHOLD).fast_path is False
         assert _budget(TIME_BUDGET_FAST_PATH_THRESHOLD - 1).fast_path is True
+
+    def test_min_viable_floor_boundary(self):
+        """A close-limited budget below the minimum-viable floor intake-skips: the
+        primary-research-plus-one-forecaster path essentially never lands under it,
+        so running would spend a full fan-out only for the min-forecasters guard to
+        drop the question afterwards."""
+        assert _budget(TIME_BUDGET_MIN_VIABLE_S - 1).is_exhausted is True
+        assert _budget(TIME_BUDGET_MIN_VIABLE_S).is_exhausted is False
+
+    def test_min_viable_floor_is_close_derived_only(self):
+        # A deliberately tiny STATIC budget (tests, an operator override of the
+        # static deadline) is a wall-clock experiment, not a hopeless close.
+        assert _budget(TIME_BUDGET_MIN_VIABLE_S - 1, close_limited=False).is_exhausted is False
+        # The arithmetic-unpublishable shape still skips on every path.
+        assert _budget(0.0, close_limited=False).is_exhausted is True
 
     def test_research_phase_gets_its_share_at_grant_time(self):
         budget = _budget(1200)
@@ -388,6 +407,27 @@ class TestResearchPhaseDeadline:
         # A cancelled provider is a budget decision, not a provider defect: counting it
         # as a failure would make research_provider_failures stop meaning "broke".
         assert orchestrator.provider_failure_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_provider_drains_its_detail_registry_entry(self):
+        """CancelledError is a BaseException and used to escape BOTH of _run_one's
+        drain paths, leaving the exact stale same-key registry entry the error
+        drain's own comment says must not happen."""
+        orchestrator = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
+        question = make_real_binary_question(qid=7103)
+
+        async def slow_with_detail(_question) -> str:
+            record_provider_detail(7103, "gemini_search", {"partial": "detail"})
+            await asyncio.sleep(30)
+            return "never"
+
+        await orchestrator._run_providers_parallel(
+            question,
+            [(slow_with_detail, "gemini_search")],
+            time_budget=_budget(0.1 / RESEARCH_PHASE_BUDGET_SHARE),
+        )
+
+        assert pop_provider_detail(7103, "gemini_search") == {}
 
     @pytest.mark.asyncio
     async def test_without_a_budget_the_phase_is_unbounded(self):
@@ -687,14 +727,25 @@ class TestStackingGateUnderACloseLimitedBudget:
 
         assert skipped is False
 
-    def test_a_close_limited_budget_with_two_minutes_left_skips_stacking(self):
+    def test_a_close_limited_budget_with_two_minutes_left_skips_stacking(self, caplog):
         """Same 120 s, but now overrunning forfeits the question — and the stacker
         ladder alone can legitimately run 800 s."""
         bot = self._bot(AggregationStrategy.CONDITIONAL_STACKING)
-        skipped = _skip_stacking_for_budget(bot, make_real_binary_question(qid=7302), 7302, _budget(120))
+        with caplog.at_level(logging.WARNING):
+            skipped = _skip_stacking_for_budget(bot, make_real_binary_question(qid=7302), 7302, _budget(120))
 
         assert skipped is True
         assert bot._stacker_outcome[7302] == "fallback_median"
+        # The skip records the same reason + counter treatment as its siblings, so a
+        # STACKER_SKIP_REASON cut cannot silently miss the budget bucket.
+        assert bot._stacker_skip_reason[7302] == "wall_clock_budget"
+        assert bot._conditional_stacking_skipped_count == 1
+        # The WARN interpolates the floor ACTUALLY applied — the close-limited one
+        # including the stacking path's worst case — not the static 90 s constant,
+        # which would make the line arithmetically false (remaining=120 > 90).
+        abort_line = next(m for m in caplog.messages if "WALLCLOCK_ABORT" in m)
+        expected_floor = WALL_CLOCK_STACKING_MIN_BUDGET + _stacking_budget_required_s(bot)
+        assert f"< {expected_floor:.0f}s" in abort_line
 
     def test_a_close_limited_budget_with_room_for_the_whole_ladder_still_stacks(self):
         skipped = _skip_stacking_for_budget(
@@ -900,6 +951,7 @@ class TestThinWindowThroughThePipeline:
         """The q45085 class. Today this question would research, run three forecasters,
         and then be refused by the publish gate; the budget check makes it cost nothing
         while producing the same skip and the same alertable counter."""
+        reset_publish_skipped_closed()  # module-global counter; don't inherit other tests' skips
         bot = self._bot()
         question = make_real_binary_question(qid=7403, close_time=datetime.now(timezone.utc) + timedelta(seconds=5))
         research = AsyncMock(return_value="Canned research")
@@ -911,12 +963,16 @@ class TestThinWindowThroughThePipeline:
             patch.object(bot, "_gather_predictions_with_wall_clock", new=gather),
         ):
             notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            with pytest.raises(RuntimeError, match="no publishable time budget"):
+            with pytest.raises(RuntimeError, match="no viable time budget"):
                 await bot._research_and_make_predictions(question)
 
         research.assert_not_awaited()
         gather.assert_not_awaited()
-        assert bot._questions_failed_to_publish == 1
+        # The intake skip shares the CLOSE gate's counter ("latency cost us this
+        # question" has one home); questions_failed_to_publish stays the
+        # min-forecasters floor's counter alone.
+        assert bot._publish_skipped_closed_count == 1
+        assert bot._questions_failed_to_publish == 0
         assert bot._time_budget_fast_path_count == 0
 
     @pytest.mark.asyncio
@@ -969,13 +1025,15 @@ class TestThinWindowThroughThePipeline:
 
     @pytest.mark.asyncio
     @pytest.mark.e2e
-    async def test_the_forecaster_fanout_is_cut_by_the_close_derived_deadline(self):
+    async def test_the_forecaster_fanout_is_cut_by_the_close_derived_deadline(self, monkeypatch):
         """The seam the whole feature rests on: the fan-out's ``asyncio.wait`` cap comes
         from the budget, so a close-limited question cancels its stragglers seconds in
         rather than at the 3510 s static deadline. Nothing here monkeypatches
         ``PER_QUESTION_WALL_CLOCK_DEADLINE`` — with the static budget in charge the slow
         forecasters would run to completion and the outer ``wait_for`` would fail the
-        test rather than let it hang."""
+        test rather than let it hang. The min-viable intake floor is zeroed so the
+        sub-second budget reaches the fan-out at all (the floor has its own tests)."""
+        monkeypatch.setattr("metaculus_bot.time_budget.TIME_BUDGET_MIN_VIABLE_S", 0)
         bot = make_e2e_bot(
             AggregationStrategy.MEAN,
             n_forecasters=3,

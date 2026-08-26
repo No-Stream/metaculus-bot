@@ -112,6 +112,10 @@ _LINE_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}),(\d{3})")
 _QID_URL_RE = re.compile(r"/questions/(\d+)")
 _BARE_INT_RE = re.compile(r"\d+")
 
+# One ``key=value`` token of a generic counter tail (see the degradation_counters
+# spec): keys are Python identifiers, values run to the next comma/whitespace.
+_KV_PAIR_RE = re.compile(r"(\w+)=([^,\s]+)")
+
 
 @dataclass(frozen=True)
 class MarkerSpec:
@@ -388,33 +392,18 @@ MARKER_SPECS: list[MarkerSpec] = [
         # positive alertable_count), emitted by forecaster.py's forecast_questions.
         # No per-question ref — it aggregates a whole run — so qid_kind stays None.
         #
-        # The trailing keys are OPTIONAL-group wrapped for the same reason as
-        # gap_fill_v2 above: replace-by-run re-harvesting replays pre-rename logs
-        # (``research_provider_timeouts``, no ``summarizer_failures``,
-        # ``prediction_market_platform_failures`` as the tail), and a mandatory tail
-        # would drop each of those records wholesale instead of harvesting the
-        # counters it does carry. The rename pairs are alternations so one group name
-        # can't cover both spellings; missing groups coerce to None, which reads as
-        # "this era didn't emit it" rather than a measured zero.
-        re.compile(
-            r"Degradation counters:\s*forecasters_dropped=(?P<forecasters_dropped>\S+?),"
-            r"\s*questions_failed_to_publish=(?P<questions_failed_to_publish>\S+?),"
-            r"\s*stacker_primary_failed=(?P<stacker_primary_failed>\S+?),"
-            r"\s*stacker_fallback_used=(?P<stacker_fallback_used>\S+?),"
-            r"\s*stacker_fallback_failed=(?P<stacker_fallback_failed>\S+?),"
-            r"\s*(?:research_provider_failures=(?P<research_provider_failures>\S+?)"
-            r"|research_provider_timeouts=(?P<research_provider_timeouts>\S+?)),"
-            r"(?:\s*summarizer_failures=(?P<summarizer_failures>\S+?),)?"
-            r"\s*gap_fill_v2_errors=(?P<gap_fill_v2_errors>\S+?)"
-            r"(?:,\s*prediction_market_degraded=(?P<prediction_market_degraded>\S+?))?"
-            r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+?)"
-            r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+?)))?"
-            r"(?:,\s*provider_degradation=(?P<provider_degradation>\S+?))?"
-            r"(?:,\s*publish_attempt_failures=(?P<publish_attempt_failures>\S+?))?"
-            r"(?:,\s*publish_skipped_closed=(?P<publish_skipped_closed>\S+?))?"
-            r"(?:,\s*time_budget_fast_path=(?P<time_budget_fast_path>\S+))?"
-            r"\s*$"
-        ),
+        # The tail is parsed GENERICALLY: ``kv_pairs`` captures the whole
+        # ``key=value, key=value`` list and ``_build_record`` tokenizes it, so a
+        # new counter in ``format_degradation_summary`` harvests with NO change
+        # here (the old 17-named-group ``$``-anchored regex needed a coordinated
+        # two-file edit per counter, and getting it wrong dropped the whole
+        # line's harvest). Historic renames survive as their own keys exactly as
+        # before (``research_provider_timeouts`` era-records keep that spelling).
+        # One deliberate delta from the old spec: a key absent from an era's line
+        # is now ABSENT from the record rather than explicitly None — read
+        # ``record.get(key)`` and treat both as "this era didn't emit it", never
+        # as a measured zero.
+        re.compile(r"Degradation counters:\s*(?P<kv_pairs>.*)$"),
     ),
     MarkerSpec(
         "provider_degradation",
@@ -502,6 +491,54 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+fast_path=(?P<fast_path>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # time_budget.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "time_budget_fast_path",
+        # Per-QUESTION WARN (forecaster.py) when the close-derived budget dropped the
+        # optional research stages. The INFO TIME_BUDGET line above carries the same
+        # fact as a field; this is the loud half docs/operations.md tells the operator
+        # to grep, and without a spec it vanished at the 90-day GHA log expiry.
+        # ``close_time`` is a datetime repr with an internal space, so it captures up
+        # to the semicolon rather than as one \S+ token.
+        re.compile(
+            r"TIME_BUDGET_FAST_PATH:\s*qid=(?P<question>\S+)\s+budget=(?P<budget_s>[\d.]+)s\s+close_time=(?P<close_time>[^;]+);"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "research_phase_deadline",
+        # Research-phase deadline WARN (research/orchestrator.py
+        # _await_providers_within_deadline): the outer budget bound cancelled
+        # straggler providers. Carries no question ref — the line names counts and
+        # provider names only — so qid_kind stays None; the cancelled providers also
+        # survive as status="deadline" rows in the archive's provider_results, which
+        # is where per-question attribution lives.
+        re.compile(
+            r"RESEARCH_PHASE_DEADLINE:\s*cancelled (?P<cancelled>\d+)/(?P<total>\d+) providers"
+            r" after (?P<deadline_s>[\d.]+)s \((?P<providers>[^)]*)\)"
+        ),
+    ),
+    MarkerSpec(
+        "gap_fill_skipped_for_budget",
+        # Per-QUESTION gap-fill skip (research/orchestrator.py): both passes dropped
+        # up front, either on the fast path or because the research phase had no
+        # budget left. ``research_phase_remaining`` is "n/a" (fast path — never
+        # computed) or "NNNs".
+        re.compile(
+            r"GAP_FILL_SKIPPED_FOR_BUDGET:\s*question=(?P<question>\S+)"
+            r"\s+fast_path=(?P<fast_path>\S+)\s+research_phase_remaining=(?P<research_phase_remaining>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # orchestrator logs question.id_of_question
+    ),
+    MarkerSpec(
+        "gap_fill_cut_for_budget",
+        # Per-QUESTION mid-phase gap-fill cut (research/orchestrator.py): the pass
+        # STARTED and was then cancelled at the research-phase deadline — the one
+        # budget event recoverable from nothing else once GHA logs expire (the
+        # up-front skip above and the fast path both have their own records).
+        # ``gap_fill_pass`` is V1 or V2.
+        re.compile(r"GAP_FILL_(?P<gap_fill_pass>V1|V2)_CUT_FOR_BUDGET:\s*question=(?P<question>\S+);"),
+        qid_kind=QID_KIND_QUESTION_ID,  # orchestrator logs question.id_of_question
     ),
     MarkerSpec(
         "paid_personal_key_fallback",
@@ -668,6 +705,13 @@ def _build_record(
         "line_ts": _parse_line_ts(line),
     }
     for field, raw in match.groupdict().items():
+        if field == "kv_pairs":
+            # Generic ``key=value`` tail (degradation_counters): every key the
+            # emitter writes harvests with no spec change; a key an era's line
+            # never emitted is absent from the record, never a measured zero.
+            for key, value in _KV_PAIR_RE.findall(raw or ""):
+                record[key] = coerce_value(value)
+            continue
         record[field] = raw if field in _RAW_FIELDS else coerce_value(raw)
     if "question" in record:
         record["qid"] = qid_from_ref(record["question"])

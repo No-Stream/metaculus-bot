@@ -51,6 +51,7 @@ from metaculus_bot.constants import (
     PUBLISH_RESERVE_SECONDS,
     RESEARCH_PHASE_BUDGET_SHARE,
     TIME_BUDGET_FAST_PATH_THRESHOLD,
+    TIME_BUDGET_MIN_VIABLE_S,
 )
 from metaculus_bot.time_utils import _as_utc
 
@@ -80,8 +81,21 @@ class QuestionTimeBudget:
 
     @property
     def is_exhausted(self) -> bool:
-        """True when there is no time to publish in, so no forecast can land."""
-        return self.total_s <= 0.0
+        """True when no forecast can realistically land, so intake should skip.
+
+        Two shapes fold together: a non-positive budget (fetched at or after
+        close — not even an instant forecast fits, on any path), and a
+        CLOSE-LIMITED budget below ``TIME_BUDGET_MIN_VIABLE_S`` — the pipeline's
+        minimum viable path (primary research + one forecaster) essentially
+        never completes under it, so running would spend a fast-path research
+        phase and a full fan-out only for the min-forecasters guard to drop the
+        question afterwards. The floor deliberately does NOT apply to the
+        static budget: a deliberately tiny ``static_deadline_s`` (tests, an
+        operator override) is a wall-clock experiment, not a hopeless close.
+        """
+        if self.total_s <= 0.0:
+            return True
+        return self.close_limited and self.total_s < TIME_BUDGET_MIN_VIABLE_S
 
     @property
     def fast_path(self) -> bool:

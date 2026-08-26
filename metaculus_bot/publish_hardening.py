@@ -139,7 +139,6 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
-import re
 import threading
 from typing import Any, Callable
 
@@ -152,6 +151,7 @@ from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot.constants import PUBLISH_POST_RETRIES, PUBLISH_POST_TIMEOUT
+from metaculus_bot.http_status import http_status_from_exception
 from metaculus_bot.publish_gate import skip_publish_if_closed
 
 assert PUBLISH_POST_RETRIES >= 0, "PUBLISH_POST_RETRIES must be non-negative"
@@ -230,18 +230,9 @@ _COUNTER_LOCK = threading.Lock()
 # failures (socket timeout, connection reset) still retry exactly as before.
 _RETRYABLE_4XX: frozenset[int] = frozenset({408, 429})
 
-# ft's ``raise_for_status_with_additional_info`` re-raises a BARE
-# ``requests.HTTPError`` built from a message string, so the exception we catch has
-# no ``.response``; the original (which does) survives only as ``__cause__``, and
-# the status also appears in the message text. Anchored on ft's literal
-# "Status code: NNN" phrasing so a three-digit number echoed back from a payload
-# can't be mistaken for a status — the substring trap that bit the OpenRouter
-# credit classifier (see AGENTS.md on the bare ``402`` match).
-_STATUS_IN_MESSAGE = re.compile(r"Status code:\s*(?P<status>\d{3})\b")
-
-# Depth bound on the __cause__ walk: ft wraps once, so 4 links is generous and
-# makes a self-referential chain impossible to loop on.
-_CAUSE_CHAIN_DEPTH = 4
+# The __cause__ walk + "Status code: NNN" fallback that recovers the status ft's
+# message-only HTTPError re-raise hides now lives in metaculus_bot.http_status
+# (shared with fetch_hardening, whose retry policy is deliberately different).
 
 
 def _bump_publish_attempt_failure() -> None:
@@ -261,33 +252,18 @@ def reset_publish_attempt_failures() -> None:
     _PUBLISH_ATTEMPT_FAILURES = 0
 
 
-def _http_status_code(exc: BaseException) -> int | None:
-    """Best-effort HTTP status for a requests exception, or None if it carries none.
-
-    Prefers the real ``response.status_code`` (following ft's ``raise ... from e``
-    chain to find it) and falls back to ft's own message text.
-    """
-    current: BaseException | None = exc
-    for _ in range(_CAUSE_CHAIN_DEPTH):
-        if current is None:
-            break
-        status = getattr(getattr(current, "response", None), "status_code", None)
-        if isinstance(status, int):
-            return status
-        current = current.__cause__
-
-    match = _STATUS_IN_MESSAGE.search(str(exc))
-    return int(match.group("status")) if match else None
-
-
 def _is_retryable(exc: BaseException) -> bool:
     """False only for a 4xx that a second identical POST cannot fix.
 
     Unknown status (a bare connection error, a timeout) means retry: the whole
     point of the retry budget is transport flakiness, and refusing to retry
-    something we couldn't classify would be a regression.
+    something we couldn't classify would be a regression. Deliberately the
+    INVERSE default of ``fetch_hardening``'s policy (which allow-lists retryable
+    statuses): a lost publish forfeits the question, a lost fetch retries next
+    run. The status read is shared (``metaculus_bot.http_status``); only the
+    policies differ.
     """
-    status = _http_status_code(exc)
+    status = http_status_from_exception(exc)
     if status is None or not 400 <= status < 500:
         return True
     return status in _RETRYABLE_4XX
@@ -405,7 +381,7 @@ def _wrap_with_timeout_retry(method_name: str, original: Callable[..., Any]) -> 
                         logger.warning(
                             "PUBLISH_HARDENING: %s not retrying status %s — a second identical POST cannot succeed",
                             method_name,
-                            _http_status_code(exc),
+                            http_status_from_exception(exc),
                         )
                     break
         # The single terminal failure point on the publish path: every retry burned

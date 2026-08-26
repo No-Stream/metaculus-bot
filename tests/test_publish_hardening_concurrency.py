@@ -45,6 +45,7 @@ from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot import publish_hardening
 from metaculus_bot.constants import PUBLISH_POST_RETRIES
+from metaculus_bot.http_status import http_status_from_exception
 from scripts.telemetry.markers import parse_log_text
 
 # A real Metaculus publish URL: the forced-timeout override is scoped to the Metaculus
@@ -434,7 +435,7 @@ class TestNonRetryable4xxIsNotRetried:
         # genuine raise_for_status HTTPError carries the response object.
         response = requests.Response()
         response.status_code = 405
-        assert publish_hardening._http_status_code(requests.HTTPError(response=response)) == 405
+        assert http_status_from_exception(requests.HTTPError(response=response)) == 405
 
     def test_status_is_recovered_through_fts_cause_chain(self) -> None:
         # ft does `raise HTTPError(message) from e`, so the original (which has the
@@ -444,14 +445,14 @@ class TestNonRetryable4xxIsNotRetried:
         original = requests.HTTPError(response=response)
         rewrapped = requests.HTTPError("some rephrased message with no status in it")
         rewrapped.__cause__ = original
-        assert publish_hardening._http_status_code(rewrapped) == 403
+        assert http_status_from_exception(rewrapped) == 403
 
     def test_a_three_digit_number_in_a_payload_echo_is_not_read_as_a_status(self) -> None:
         # The substring trap that bit the OpenRouter credit classifier: OpenRouter
         # replays our own prompt text, and forecasting prompts are full of figures.
         # Only ft's literal "Status code: NNN" phrasing counts.
         echoed = requests.HTTPError('Response text: {"flagged_input":"will the index close above 405 by June"}')
-        assert publish_hardening._http_status_code(echoed) is None
+        assert http_status_from_exception(echoed) is None
         assert publish_hardening._is_retryable(echoed) is True
 
     def test_the_forgone_retry_logs_a_line_the_harvester_ignores(self, caplog: pytest.LogCaptureFixture) -> None:

@@ -229,8 +229,6 @@ def _mc_options_line(options: Sequence[str] | None) -> str:
     if not options:
         return ""
     names = [str(option) for option in options]
-    if not names:
-        return ""
     return "Options (in resolution order): " + " | ".join(names)
 
 

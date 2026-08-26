@@ -96,6 +96,19 @@ def reset_publish_skipped_closed() -> None:
     _PUBLISH_SKIPPED_CLOSED = 0
 
 
+def record_publish_skipped_closed() -> None:
+    """Count one question whose latency-vs-close forfeited the publish.
+
+    Called from two sites for the SAME event class: this module's own
+    publish-time gate (the POST would be refused because the question closed),
+    and the forecaster's intake skip (the close-derived budget shows the POST
+    cannot land even if we forecast instantly). One counter, one meaning —
+    "the close beat us" — regardless of how early we noticed.
+    """
+    global _PUBLISH_SKIPPED_CLOSED
+    _PUBLISH_SKIPPED_CLOSED += 1
+
+
 def closed_to_forecasting(question: MetaculusQuestion, now: datetime) -> ClosedVerdict | None:
     """Return why ``question`` can no longer be forecast, or None if it still can.
 
@@ -152,7 +165,6 @@ def skip_publish_if_closed(question: MetaculusQuestion | None, now: datetime | N
     forecasting-tools method, and if that seam ever stops carrying a question we
     want an unguarded publish (the status quo), never a silently withheld one.
     """
-    global _PUBLISH_SKIPPED_CLOSED
     if question is None:
         return False
 
@@ -161,6 +173,6 @@ def skip_publish_if_closed(question: MetaculusQuestion | None, now: datetime | N
     if verdict is None:
         return False
 
-    _PUBLISH_SKIPPED_CLOSED += 1
+    record_publish_skipped_closed()
     logger.warning(format_publish_skipped_marker(question, verdict, moment))
     return True
