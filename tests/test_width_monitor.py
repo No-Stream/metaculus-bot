@@ -13,6 +13,7 @@ from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, GRID_SCALED_MAX_STEP_MERGED_AT
 from metaculus_bot.performance_analysis.width_monitor import (
     KNOWN_BUG_QIDS,
+    MIN_N_FOR_POINT_METRICS,
     TS_ANCHOR_ENABLE,
     WIDENING_FLIP,
     _cdf_and_grid,
@@ -63,6 +64,16 @@ def _linear_cdf_record(
 def _record_with_pit(pit: float, **kwargs) -> dict:
     """A record whose PIT is exactly ``pit`` (identity ramp over [0, 100])."""
     return _linear_cdf_record(resolution=pit * 100.0, **kwargs)
+
+
+def _row_cells(md: str, label: str) -> list[str]:
+    """The stripped cells of one rendered table row, indexed as in the header.
+
+    1=era, 2=n, 3=excl, 4=n_eff, 5=cov80, 6=cov50, 7=cov@10, 8=cov@50, 9=cov@90,
+    10=PIT std, 11=mean PIT, 12=med rel width, 13=band_miss, 14=OOB.
+    """
+    [row] = [line for line in md.splitlines() if line.startswith(f"| {label} |")]
+    return [cell.strip() for cell in row.split("|")]
 
 
 class TestPit:
@@ -459,6 +470,80 @@ class TestEraMetricsClustering:
             recs.append(rec)
         md = render_markdown(compute_all_eras(recs))
         assert "n_eff" in md
+
+
+class TestClusterCorrectionDisclosure:
+    """The cluster correction is inert on every archived dataset (one record per
+    post in all five pulls), while the legend used to tell the operator the CIs
+    had been cluster-widened and a code comment claimed "~62% of records share a
+    post" — a figure no dataset supports. The mechanism stays (a group post can
+    still resolve); the table now says per row whether it fired."""
+
+    def test_one_record_per_post_is_marked_inert(self):
+        recs = []
+        for i, res in enumerate((20.0, 40.0, 60.0, 80.0)):
+            rec = _linear_cdf_record(resolution=res)
+            rec["post_id"] = 100 + i
+            recs.append(rec)
+        [m] = [row for row in compute_all_eras(recs) if row.label == "all"]
+        assert m.ci_clustered is False
+        assert m.cov80 == pytest.approx(jeffreys_ci(4, 4))  # identical to the naive CI
+        md = render_markdown(compute_all_eras(recs))
+        assert _row_cells(md, "all")[4] == f"{m.n_eff} (=n)"
+
+    def test_multi_record_post_is_marked_widened(self):
+        recs = []
+        for i, res in enumerate((20.0, 30.0, 40.0, 60.0, 70.0, 80.0)):
+            rec = _linear_cdf_record(resolution=res)
+            rec["post_id"] = 1 if i < 3 else 2
+            recs.append(rec)
+        [m] = [row for row in compute_all_eras(recs) if row.label == "all"]
+        assert m.ci_clustered is True
+        md = render_markdown(compute_all_eras(recs))
+        assert _row_cells(md, "all")[4] == "2 (widened)"
+
+    def test_legend_states_the_marker_convention_rather_than_asserting_widening(self):
+        md = render_markdown(compute_all_eras([_record_with_pit(0.5)]))
+        assert "`(widened)`" in md
+        assert "`(=n)`" in md
+        assert "Every archived pull to date is `(=n)`." in md
+
+    def test_serialized_row_carries_the_flag(self):
+        m = compute_era_metrics("test", [_record_with_pit(0.5)])
+        assert m is not None
+        assert m.to_dict()["ci_clustered"] is False
+
+
+class TestUnderpoweredPointMetrics:
+    """cov@k / PIT std / mean PIT / band_miss carry no CI, so at small n they read
+    as estimates while their resolution (1/n) is coarser than the target they are
+    compared against. The worst case shipped: pit_std == 0.0 at n=1, which reads
+    as "maximally too WIDE"."""
+
+    def test_single_record_row_renders_na_not_a_zero_pit_std(self):
+        metrics = compute_all_eras([_record_with_pit(0.5)])
+        md = render_markdown(metrics)
+        cells = _row_cells(md, "all")
+        # cov@10, cov@50, cov@90, PIT std, mean PIT, then band_miss.
+        assert cells[7:12] == ["n/a"] * 5
+        assert cells[13] == "n/a"
+        # The CI columns still render: their width is the honest small-n signal.
+        assert cells[5].startswith("0.")
+
+    def test_underpowered_flag_and_raw_values_survive_in_json(self):
+        m = compute_era_metrics("test", [_record_with_pit(0.5)])
+        assert m is not None and m.underpowered is True
+        d = m.to_dict()
+        assert d["underpowered"] is True
+        assert d["pit_std"] == pytest.approx(0.0)  # kept for scripts, hidden from readers
+
+    def test_row_at_the_threshold_renders_numbers(self):
+        recs = [_record_with_pit(p) for p in np.linspace(0.05, 0.95, MIN_N_FOR_POINT_METRICS)]
+        m = compute_era_metrics("test", recs)
+        assert m is not None and m.underpowered is False
+        cells = _row_cells(render_markdown(compute_all_eras(recs)), "all")
+        assert cells[10] == f"{m.pit_std:.3f}"
+        assert "n/a" not in cells[7:12]
 
 
 class TestComputeAllEras:

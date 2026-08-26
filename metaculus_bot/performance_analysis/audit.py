@@ -6,6 +6,14 @@ a cut that ranks the *individual ensemble members* on each wrong question so
 the per-question reasoning can be diffed — e.g. "gpt-5.2 got closest at 55%,
 the ensemble dragged it down to 22%."
 
+Every ranking here goes through ``ranking_cohort.per_model_ranking_cohort``,
+which applies the two exclusions the aggregate cuts in ``analysis.py`` get from
+``per_model_cohort`` (stacker-fired records, anonymous positional keys) plus one
+this module needs on top: a declared percentile curve too sparse to be scored
+against a full one. What a ranking dropped is rendered under the table by
+:func:`ranking_caveats`, so a short ranking is a stated exclusion rather than a
+silently smaller table.
+
 External human-forecaster comments were the original intent but the Metaculus
 ``/api/comments/`` endpoint is restricted to the bot's own author id and
 staff. As a workaround, this module also looks for manually-curated comments
@@ -25,6 +33,13 @@ from metaculus_bot.performance_analysis.collector import load_dataset, resolve_n
 from metaculus_bot.performance_analysis.parsing import (
     _parse_probability,
     parse_per_model_forecasts,
+)
+from metaculus_bot.performance_analysis.ranking_cohort import (
+    MIN_SCOREABLE_ANCHORS,
+    PerModelRankingCohort,
+    declared_anchors,
+    log_ranking_cohort,
+    per_model_ranking_cohort,
 )
 from metaculus_bot.performance_analysis.scoring import brier_score, numeric_log_score
 
@@ -259,14 +274,22 @@ def rank_our_models_by_accuracy(record: dict) -> list[dict]:
     which is intentionally excluded from this audit-side scoring.
 
     Returns a list of dicts. Binary entries: ``{model, prob, score, raw}``.
-    Numeric/discrete entries: ``{model, percentiles, score, raw}`` where
-    ``raw`` is a short summary like ``"P10≈X P50≈Y P90≈Z"``.
+    Numeric/discrete entries: ``{model, percentiles, score, raw, n_anchors}``
+    where ``raw`` is a short summary like ``"P10≈X P50≈Y P90≈Z"`` and
+    ``n_anchors`` is the number of distinct declared percentile labels the score
+    was built from.
+
+    Only entries in the record's per-model cohort are ranked — see
+    :func:`per_model_ranking_cohort`, which drops stacker aggregates, anonymous
+    positional keys, and density-mismatched percentile curves.
 
     Empty list when:
     - Type isn't binary/numeric/discrete.
     - Resolution isn't usable (None binary; non-recognized numeric resolution).
     - Numeric scaling bounds are missing.
     - No parseable per-model entries.
+    - The record is out of the per-model cohort (stacker-fired, or every entry
+      was an anonymous key / a too-sparse curve).
     """
     q_type = record.get("type")
     if q_type == "binary":
@@ -280,10 +303,11 @@ def _rank_binary(record: dict) -> list[dict]:
     resolution = record.get("resolution_parsed")
     if not isinstance(resolution, bool):
         return []
-    per_model = record.get("per_model_forecasts") or {}
+    cohort = per_model_ranking_cohort(record)
+    log_ranking_cohort(record, cohort, cut="audit_rank_binary")
 
     ranked: list[dict] = []
-    for model, raw in per_model.items():
+    for model, raw in cohort.entries.items():
         prob = _parse_probability(raw)
         if prob is None:
             logger.debug(f"Skipping unparseable per-model value: {model}={raw!r}")
@@ -324,12 +348,19 @@ def _rank_numeric(record: dict) -> list[dict]:
     cdf_size = _record_cdf_size(record)
     min_step, max_step = grid_step_constraints(cdf_size)
 
-    per_model = record.get("per_model_numeric_percentiles") or {}
+    cohort = per_model_ranking_cohort(record)
+    log_ranking_cohort(record, cohort, cut="audit_rank_numeric")
+    per_model = cohort.entries
     skipped_count = 0
     ranked: list[dict] = []
     post_id = record.get("post_id")
     for model, percentile_pairs in per_model.items():
-        percentile_dict = {float(p): float(v) for p, v in percentile_pairs}
+        percentile_dict, conflicts = declared_anchors(percentile_pairs)
+        if conflicts:
+            logger.warning(
+                f"Conflicting percentile restatement post={post_id} model={model}: "
+                f"{conflicts} label(s) declared twice with different values; the last value is scored"
+            )
         try:
             cdf, _ = generate_pchip_cdf(
                 percentile_dict,
@@ -368,6 +399,7 @@ def _rank_numeric(record: dict) -> list[dict]:
                 "percentiles": percentile_pairs,
                 "score": score,
                 "raw": _summarize_percentiles(percentile_dict),
+                "n_anchors": len(percentile_dict),
             }
         )
 
@@ -460,19 +492,70 @@ def _format_resolution(record: dict) -> str:
     return f"{parsed} (raw: {raw})"
 
 
-def _format_model_ranking(ranked: list[dict], record: dict) -> str:
-    """Render the per-model ranking table."""
-    if not ranked:
-        return "_No per-model forecasts parsed from the comment._\n"
+def ranking_caveats(cohort: PerModelRankingCohort) -> list[str]:
+    """Markdown lines stating what a ranking excluded, one per exclusion kind.
 
-    lines = ["| rank | model | forecast | Brier | delta vs ensemble |", "|---|---|---|---|---|"]
-    our = record.get("our_prob_yes")
-    for i, r in enumerate(ranked, 1):
-        delta = ""
-        if our is not None:
-            delta_pp = (r["prob"] - our) * 100.0
-            delta = f"{delta_pp:+.1f}pp"
-        lines.append(f"| {i} | {r['model']} | {r['raw']} | {r['score']:.3f} | {delta} |")
+    An excluded row is invisible in the table, so a dossier that does not say
+    what was dropped reads as a complete ranking of a thinner ensemble.
+    """
+    notes: list[str] = []
+    if cohort.stacker_fired:
+        notes.append(
+            "_Not ranked: the stacker produced this question's published value, so the summary "
+            "bullet holds the stacker's aggregate rather than any single member's forecast. "
+            "Read member dissent from the `## Base Model Reasoning` sub-blocks instead._"
+        )
+    if cohort.anonymous_keys:
+        notes.append(
+            f"_Excluded {len(cohort.anonymous_keys)} unattributed bullet(s) "
+            f"({', '.join(cohort.anonymous_keys)}): a positional key is not a model — on a "
+            "stacking-era comment that slot holds the stacker's own aggregate._"
+        )
+    if cohort.sparse_anchors:
+        detail = ", ".join(f"{model} ({n} anchors)" for model, n in sorted(cohort.sparse_anchors.items()))
+        notes.append(
+            f"_Excluded from scoring — insufficient anchors (fewer than {MIN_SCOREABLE_ANCHORS} "
+            f"declared percentiles to rebuild the distribution): {detail}. Their siblings' scores "
+            "stand; a sparse curve PCHIP'd onto the full grid scores tens of log points off._"
+        )
+    if cohort.sparse_era:
+        anchor_counts = sorted({len(declared_anchors(pairs)[0]) for pairs in cohort.entries.values()})
+        counts = "/".join(str(n) for n in anchor_counts)
+        notes.append(
+            f"_Sparse-era question: every member declared only {counts} percentiles, so the "
+            "ranking compares equals and is kept — but the absolute log scores are not comparable "
+            "with a question whose members declared the full set._"
+        )
+    return notes
+
+
+def _format_model_ranking(ranked: list[dict], record: dict) -> str:
+    """Render the per-model ranking table, followed by the exclusions behind it."""
+    caveats = ranking_caveats(per_model_ranking_cohort(record))
+    if not ranked:
+        return "\n".join(caveats or ["_No per-model forecasts parsed from the comment._"]) + "\n"
+
+    if str(record.get("type")) in ("numeric", "discrete"):
+        lines = [
+            "| rank | model | declared | anchors | log score (higher = better) |",
+            "|---|---|---|---|---|",
+        ]
+        for i, r in enumerate(ranked, 1):
+            lines.append(f"| {i} | {r['model']} | {r['raw']} | {r.get('n_anchors', '?')} | {r['score']:+.2f} |")
+    else:
+        lines = [
+            "| rank | model | forecast | Brier (lower = better) | delta vs ensemble |",
+            "|---|---|---|---|---|",
+        ]
+        our = record.get("our_prob_yes")
+        for i, r in enumerate(ranked, 1):
+            delta = ""
+            if our is not None:
+                delta_pp = (r["prob"] - our) * 100.0
+                delta = f"{delta_pp:+.1f}pp"
+            lines.append(f"| {i} | {r['model']} | {r['raw']} | {r['score']:.3f} | {delta} |")
+    if caveats:
+        lines.extend(["", *caveats])
     return "\n".join(lines) + "\n"
 
 
@@ -527,13 +610,16 @@ def emit_miss_markdown(
         lines.append(f"- **category**: {category}")
     lines.append("")
 
-    # Per-model ranking (binary only for now — ranking other types is harder
-    # and would need the full CDF/probability vector per model).
+    # Binary (Brier) and numeric/discrete (log score off each member's rebuilt
+    # CDF) are ranked; MC has no per-member ranker yet.
     lines.append("## Per-model accuracy ranking")
     lines.append("")
     lines.append(_format_model_ranking(ranked_models, record))
 
-    # Flag truncation so the reader knows per-model reasoning may be partial.
+    # Flag truncation so the reader knows per-model reasoning may be partial. This
+    # is the one per-model read here that deliberately stays OUTSIDE the ranking
+    # cohort: it asks "did every bullet keep its rationale", which needs every
+    # bullet — filtering it would hide a trimmed rationale behind an exclusion.
     summary_models = set(parse_per_model_forecasts(record.get("comment_text") or "").keys())
     reasoning_models = set(per_model_reasoning.keys())
     missing = summary_models - reasoning_models
@@ -547,19 +633,22 @@ def emit_miss_markdown(
     ordered_models: list[str]
     if ranked_models:
         ordered_models = [r["model"] for r in ranked_models if r["model"] in per_model_reasoning]
-        # Append any reasoning-only models (ranking skipped them — non-binary or unparseable).
+        # Append any reasoning-only models: MC, an unparseable value, or a member
+        # the ranking cohort excluded (anonymous key, too-sparse curve). Their
+        # prose is still worth reading — only their SCORE was untrustworthy.
         for m in per_model_reasoning:
             if m not in ordered_models:
                 ordered_models.append(m)
     else:
         ordered_models = list(per_model_reasoning.keys())
 
+    score_label = "log score" if q_type in ("numeric", "discrete") else "Brier"
     for model in ordered_models:
         prose = per_model_reasoning.get(model, "")
         forecast_str = ""
         for r in ranked_models:
             if r["model"] == model:
-                forecast_str = f" — forecast **{r['raw']}** (Brier {r['score']:.3f})"
+                forecast_str = f" — forecast **{r['raw']}** ({score_label} {r['score']:.3f})"
                 break
         lines.append(f"### {model}{forecast_str}\n")
         lines.append(prose)
@@ -631,6 +720,11 @@ def emit_synthesis(
     like "times best / times worst" or "High-spread misses" no longer fit).
     Missing keys fall back to defaults; ``framing=None`` is identical to the
     pre-parameterization behavior.
+
+    The tallies count whatever ``entry["ranked"]`` holds, so they inherit the
+    per-model cohort applied by :func:`rank_our_models_by_accuracy`: a
+    stacker-fired record contributes no ranking at all, and an anonymous
+    positional key can no longer win "times best".
     """
     f = {**_DEFAULT_SYNTHESIS_FRAMING, **(framing or {})}
 
@@ -643,6 +737,7 @@ def emit_synthesis(
     avoided_model_tally: dict[str, int] = {}
     binary_count = 0
     ensemble_vs_best_deltas: list[tuple[int, str, float, float, float]] = []
+    missing_ensemble_brier: list[int] = []
     for entry in records_with_rankings:
         rec = entry["record"]
         ranked = entry["ranked"]
@@ -653,12 +748,20 @@ def emit_synthesis(
         worst = ranked[-1]
         best_model_tally[best["model"]] = best_model_tally.get(best["model"], 0) + 1
         avoided_model_tally[worst["model"]] = avoided_model_tally.get(worst["model"], 0) + 1
-        our = rec.get("our_prob_yes")
-        if our is not None:
-            ensemble_brier = rec.get("brier_score")
-            best_brier = best["score"]
-            delta = ensemble_brier - best_brier if ensemble_brier is not None else 0.0
-            ensemble_vs_best_deltas.append((rec["post_id"], best["model"], ensemble_brier or 0.0, best_brier, delta))
+        if rec.get("our_prob_yes") is None:
+            continue
+        ensemble_brier = rec.get("brier_score")
+        if ensemble_brier is None:
+            # No ensemble Brier means no delta. The old fallback rendered the
+            # missing score as 0.000 — a PERFECT ensemble — with delta +0.000,
+            # which reads as "aggregating cost nothing" on a record that was
+            # never scored. Name the omission instead.
+            missing_ensemble_brier.append(rec["post_id"])
+            continue
+        best_brier = best["score"]
+        ensemble_vs_best_deltas.append(
+            (rec["post_id"], best["model"], ensemble_brier, best_brier, ensemble_brier - best_brier)
+        )
 
     lines.append(f"## Scope\n\n- {binary_count} binary records ranked.\n")
 
@@ -678,6 +781,11 @@ def emit_synthesis(
         for pid, best_m, ens, best, delta in sorted(ensemble_vs_best_deltas, key=lambda t: -t[4]):
             lines.append(f"| {pid} | {best_m} | {ens:.3f} | {best:.3f} | {delta:+.3f} |")
         lines.append("")
+    if missing_ensemble_brier:
+        lines.append(
+            f"_Omitted from the delta table — no ensemble Brier on the record, so there is no delta: "
+            f"{sorted(missing_ensemble_brier)}._\n"
+        )
 
     # Spread buckets — large per-model spread + wrong ensemble = stacking case.
     # Only meaningful for binary records: "spread" here is max - min over the

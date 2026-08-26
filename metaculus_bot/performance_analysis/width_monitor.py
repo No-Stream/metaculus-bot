@@ -77,6 +77,18 @@ NUMERIC_TYPES: tuple[str, ...] = ("numeric", "discrete")
 # direction "off" points.
 UNIFORM_PIT_STD: float = 1.0 / np.sqrt(12.0)  # ~0.2887
 
+# Below this many PITs, a row's point metrics (cov@10/50/90, PIT std, mean PIT,
+# band_miss) are not estimates: their resolution is 1/n, coarser than the finest
+# calibrated target they are compared against (cov@10 = 0.10), so the value can
+# only land on a grid whose spacing exceeds the quantity being measured. At n=1
+# pit_std is exactly 0.0, which reads as "maximally too wide" while carrying no
+# information. Those cells render ``n/a`` in the markdown; the JSON keeps the raw
+# values alongside an ``underpowered`` flag, since a script can decide for itself
+# but a reader cannot un-see a number. cov80/cov50 are exempt — they carry CIs
+# that widen honestly at small n, which is exactly the disclosure the point
+# metrics lack.
+MIN_N_FOR_POINT_METRICS: int = 10
+
 
 @dataclass(frozen=True)
 class Era:
@@ -294,11 +306,30 @@ class EraWidthMetrics:
     band_lo: float
     band_hi: float
 
+    @property
+    def ci_clustered(self) -> bool:
+        """True when clustering actually widened this row's CIs.
+
+        ``n_eff < n`` means at least one post carried more than one record. On
+        every archived pull that has never happened (see
+        ``_n_effective_clusters``), so the correction is normally inert and the
+        rendered CI is the naive one — which the table has to say, or the legend's
+        cluster-widening claim describes something that did not occur.
+        """
+        return self.n_eff < self.n_pit
+
+    @property
+    def underpowered(self) -> bool:
+        """True when this row has too few PITs for its point metrics to be read."""
+        return self.n_pit < MIN_N_FOR_POINT_METRICS
+
     def to_dict(self) -> dict:
         return {
             "label": self.label,
             "n_pit": self.n_pit,
             "n_eff": self.n_eff,
+            "ci_clustered": self.ci_clustered,
+            "underpowered": self.underpowered,
             "n_width": self.n_width,
             "n_excluded": self.n_excluded,
             "n_oob_low": self.n_oob_low,
@@ -320,11 +351,22 @@ class EraWidthMetrics:
 def _n_effective_clusters(post_ids: list[object]) -> int:
     """Count distinct question families for the CI's effective sample size.
 
-    Records sharing a ``post_id`` are one correlated family (same series/window,
-    multiple sub-questions per post). A record with no ``post_id`` (``None``) is
-    treated as its own family — assigned a unique sentinel by position so it is
-    never merged with another None-post record — since we can't prove it shares
-    a family with anything else.
+    Records sharing a ``post_id`` are one correlated family: the collector expands
+    a ``group_of_questions`` post into one record per sub-question, and those share
+    a series, a window and a resolution source. A record with no ``post_id``
+    (``None``) is treated as its own family — assigned a unique sentinel by
+    position so it is never merged with another None-post record — since we can't
+    prove it shares a family with anything else.
+
+    **The correction is currently inert, and the table says so per row.** Measured
+    2026-08-25 across all archived pulls (residual_2026-06-15 through
+    residual_2026-08-24, plus coherence_2026-07-15): every post carried exactly one
+    resolved record, so ``n_eff == n`` everywhere and the clustered CI equals the
+    naive one. The mechanism is kept because a group post resolving into the
+    tournament is a matter of question supply, not of code — but nothing may claim
+    the CIs have been widened unless ``EraWidthMetrics.ci_clustered`` says they
+    were. (An earlier version of this comment asserted "~62% of records share a
+    post"; no archived dataset supports that figure.)
     """
     clusters: set[object] = set()
     for i, pid in enumerate(post_ids):
@@ -372,14 +414,15 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
     cov80_k = int(((arr >= 0.10) & (arr <= 0.90)).sum())
     cov50_k = int(((arr >= 0.25) & (arr <= 0.75)).sum())
 
-    # Coverage CIs use n_eff (distinct post_ids), not the raw question count:
-    # ~62% of records share a post (same series/window, multiple sub-questions
-    # per post) and are correlated, so a naive n=question-count Jeffreys CI runs
-    # ~26% too narrow. Cluster on post_id only — the one grouping key already on
-    # every record; a record missing a post_id counts as its own cluster (via a
-    # unique sentinel) so it is never merged with another. The point estimate is
-    # unchanged (cov_k / n); only the CI width widens to reflect n_eff clusters,
-    # via jeffreys_ci(round(cov_k * n_eff / n), n_eff).
+    # Coverage CIs are computed at n_eff (distinct post_ids) rather than the raw
+    # question count, so that a post carrying several correlated sub-questions
+    # cannot narrow the CI as if they were independent. Cluster on post_id only —
+    # the one grouping key already on every record; a record missing a post_id
+    # counts as its own cluster (via a unique sentinel) so it is never merged with
+    # another. The point estimate is unchanged (cov_k / n); only the CI width
+    # reflects n_eff, via jeffreys_ci(round(cov_k * n_eff / n), n_eff). On every
+    # archived pull n_eff == n, so this is a no-op there — see
+    # ``_n_effective_clusters`` and the per-row ``ci_clustered`` marker.
     n_eff = _n_effective_clusters(pit_post_ids)
     cov80 = jeffreys_ci(round(cov80_k * n_eff / n), n_eff)
     cov50 = jeffreys_ci(round(cov50_k * n_eff / n), n_eff)
@@ -466,7 +509,14 @@ def _fmt_ci(ci: tuple[float, float, float]) -> str:
 
 
 def render_markdown(metrics: list[EraWidthMetrics]) -> str:
-    """Compact markdown table of the per-era width/calibration metrics."""
+    """Compact markdown table of the per-era width/calibration metrics.
+
+    Two honesty rules are enforced here rather than left to the reader: the n_eff
+    cell says whether the cluster correction actually fired on that row, and a row
+    below ``MIN_N_FOR_POINT_METRICS`` renders its point metrics as ``n/a`` instead
+    of printing a number whose resolution is coarser than the target it is being
+    compared to.
+    """
     lines: list[str] = []
     lines.append("## Numeric width / calibration monitor (per config era)")
     lines.append("")
@@ -474,9 +524,23 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "Calibrated targets: cov80=0.80, cov50=0.50, cov@10=0.10, cov@50=0.50, "
         f"cov@90=0.90, PIT std={UNIFORM_PIT_STD:.3f}. "
         "PIT std below target => too WIDE; above => too NARROW. "
-        "cov@10 below 0.10 => low tail too wide; median rel width = (P90-P10)/|P50| (raw sharpness). "
-        "cov80/cov50 CIs are computed at n_eff (distinct post_ids), not n: questions cluster into "
-        "correlated families (multiple sub-questions per post), so a naive n-based CI is too narrow."
+        "cov@10 below 0.10 => low tail too wide; median rel width = (P90-P10)/|P50| (raw sharpness)."
+    )
+    lines.append("")
+    lines.append(
+        "cov80/cov50 CIs are computed at n_eff = distinct post_ids, so several correlated "
+        "sub-questions on one post cannot narrow the CI as though they were independent. The n_eff "
+        "cell states whether that correction did anything on the row: `(widened)` when a post "
+        "carried more than one record, `(=n)` when none did and the CI is therefore the naive "
+        "n-based one. Every archived pull to date is `(=n)`."
+    )
+    lines.append("")
+    lines.append(
+        f"Rows with fewer than {MIN_N_FOR_POINT_METRICS} PITs render cov@10/cov@50/cov@90, PIT std, "
+        "mean PIT and band_miss as `n/a`: at that n the metric's resolution (1/n) is coarser than "
+        "the target it is compared against, so the number is not an estimate (at n=1, PIT std is "
+        "0.0, which reads as maximally too WIDE). cov80/cov50 still render — their CIs widen "
+        "honestly. The JSON output keeps the raw values under an `underpowered` flag."
     )
     lines.append("")
     lines.append(
@@ -497,12 +561,31 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
     lines.append(sep)
     for m in metrics:
         rel = f"{m.median_rel_width:.3f} ({m.n_width})" if m.median_rel_width is not None else f"n/a ({m.n_width})"
-        lines.append(
-            f"| {m.label} | {m.n_pit} | {m.n_excluded} | {m.n_eff} | {_fmt_ci(m.cov80)} | {_fmt_ci(m.cov50)} "
-            f"| {m.cov_at_10:.3f} | {m.cov_at_50:.3f} | {m.cov_at_90:.3f} "
-            f"| {m.pit_std:.3f} | {m.mean_pit:.3f} | {rel} "
-            f"| {m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f}) | {m.n_oob_low}/{m.n_oob_high} |"
-        )
+        if m.underpowered:
+            point_metrics = ["n/a"] * 5
+            band = "n/a"
+        else:
+            point_metrics = [
+                f"{m.cov_at_10:.3f}",
+                f"{m.cov_at_50:.3f}",
+                f"{m.cov_at_90:.3f}",
+                f"{m.pit_std:.3f}",
+                f"{m.mean_pit:.3f}",
+            ]
+            band = f"{m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f})"
+        cells = [
+            m.label,
+            str(m.n_pit),
+            str(m.n_excluded),
+            f"{m.n_eff} ({'widened' if m.ci_clustered else '=n'})",
+            _fmt_ci(m.cov80),
+            _fmt_ci(m.cov50),
+            *point_metrics,
+            rel,
+            band,
+            f"{m.n_oob_low}/{m.n_oob_high}",
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
