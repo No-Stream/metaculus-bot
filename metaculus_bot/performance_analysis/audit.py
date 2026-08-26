@@ -602,13 +602,21 @@ def emit_miss_markdown(
     lines.append(f"- **Resolved**: {_format_resolution(record)}")
     lines.append(f"- **Our prediction**: {_format_our_prediction(record)}")
     lines.append(f"- **Score**: {_format_score_header(record)}")
-    # Three states, not two. Absent or None means the collector never read a crowd size;
-    # a literal 0 means it read one and it was zero. Every record pulled before
-    # 2026-08-25 carries 0 for the first reason (the collector read the field off the
-    # question dict, which never carries it), so the two must render differently or a
-    # dossier reader has no way to tell an unmeasured crowd from an empty one.
+    # Three states, not two. Absent or None means the collector never read a crowd size
+    # (the post carried no field). A literal 0 is the pre-2026-08-25 sentinel: every
+    # record pulled before the writer fix carries 0 because the collector read the field
+    # off the question dict, which never carries it. A genuine zero crowd cannot occur on
+    # a question this bot forecast on — the bot's own forecast counts — so a bare "0"
+    # would state an empty crowd nobody measured. Render the sentinel as unknown, with
+    # the reason, so it stays distinguishable from both n/a and a real count.
     crowd = meta.get("nr_forecasters")
-    lines.append(f"- **nr_forecasters**: {'n/a' if crowd is None else crowd}")
+    if crowd == 0:
+        crowd_text = "unknown (0 = pre-2026-08-25 record; the field was never read)"
+    elif crowd is None:
+        crowd_text = "n/a"
+    else:
+        crowd_text = str(crowd)
+    lines.append(f"- **nr_forecasters**: {crowd_text}")
     was_stacked = record.get("was_stacked")
     lines.append(f"- **was_stacked**: {'unknown' if was_stacked is None else was_stacked}")
     category = meta.get("category")

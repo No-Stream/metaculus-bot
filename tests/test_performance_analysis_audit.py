@@ -543,6 +543,23 @@ class TestEmitMissMarkdown:
         content = out_path.read_text()
         assert "- **was_stacked**: False" in content
 
+    def test_nr_forecasters_three_render_states(self, tmp_path):
+        """A real count renders literally, None renders n/a, and the archived 0 renders
+        as unknown: every pre-2026-08-25 record carries a fabricated 0 (the collector
+        read the field off the question dict, which never carries it), and a bare "0"
+        would state an empty crowd nobody measured — on a question this bot itself
+        forecast on, a genuine zero cannot occur.
+        """
+        for crowd, expected in [
+            (50, "- **nr_forecasters**: 50"),
+            (None, "- **nr_forecasters**: n/a"),
+            (0, "- **nr_forecasters**: unknown (0 = pre-2026-08-25 record; the field was never read)"),
+        ]:
+            rec = _binary_record(1, 0.3, True, per_model={}, nr_forecasters=crowd)
+            out_path = tmp_path / "miss.md"
+            emit_miss_markdown(rec, ranked_models=[], per_model_reasoning={}, audit_dir=tmp_path, out_path=out_path)
+            assert expected in out_path.read_text()
+
     def test_inlines_external_comment_when_present(self, tmp_path):
         rec = _binary_record(4242, 0.1, True, per_model={}, title="X")
         # Create a real external-comments file with curated content.

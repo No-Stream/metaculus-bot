@@ -25,6 +25,7 @@ from metaculus_bot.performance_analysis.audit import (
     emit_synthesis,
     load_combined_dataset,
     rank_our_models_by_accuracy,
+    ranking_caveats,
     select_cohort,
     select_worst_misses,
 )
@@ -133,6 +134,7 @@ __all__ = [
     "per_model_cohort",
     "per_model_ranking_cohort",
     "rank_our_models_by_accuracy",
+    "ranking_caveats",
     "rescore_records",
     "research_tags_for_qid",
     "research_tags_for_record",
