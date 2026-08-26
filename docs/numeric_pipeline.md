@@ -94,6 +94,14 @@ a clean, strictly-increasing, in-bounds set. In order:
 4. `_apply_jitter_and_clamp` (`numeric/pipeline.py`) — detect count-like (integer-
    adjacent) clusters and spread them, jitter exact duplicates, clamp values into the
    question bounds with a safety buffer, then enforce strictly increasing values.
+   **Exception: a WHOLE-SET epsilon collapse is not spread.** A model declaring
+   (near-)the same value at all 13 percentiles has declared no width, and spreading it
+   manufactured a ±6-unit distribution — which was precisely what let it pass Step 8's
+   span-ratio test, so the invented width was load-bearing for publishing a forecast the
+   model never stated. A point mass now gets only the format minimum (the jitter /
+   strict-ordering epsilon) and reaches the guard with its own honest span, which
+   withholds the forecaster. Only PARTIAL clusters are spread. Each collapse logs
+   `NUMERIC_DEGENERATE_DECLARATION` (harvested), so the per-model rate is queryable.
 5. `_maybe_widen_tails` — optional tail widening (Step 4).
 
 It also decides whether to force `zero_point=None`: discrete questions and questions
@@ -245,15 +253,32 @@ On a flagged mismatch, `run_numeric_forecast` (`forecaster_runners.py`) raises
 distribution in the wrong units. No network or community stats are needed; it is a pure
 sanity check on the numbers.
 
+The guard **fails SHUT**: it used to wrap its arithmetic in a try/except that returned
+"no mismatch" on any internal error, which is byte-identical to a passing check — so a
+crash inside the guard silently published the order-of-magnitude error it exists to
+block. Errors now propagate. Related: a point-mass declaration reaches this guard with
+its real (zero) span rather than the cluster spreader's invented one, which is why
+Step 3 no longer spreads whole-set collapses.
+
 ## Step 9: ensemble aggregation in CDF space
 
 `aggregate_numeric` (`numeric/utils.py`) combines the per-model distributions
 **pointwise in CDF space**, not by averaging percentiles:
 
-1. Concatenate every model's 201-point CDF into one long frame of `(value, percentile)`
-   pairs.
-2. Group by `value` and take the mean or median of the cumulative probabilities at each
-   value.
+1. Read each model's CDF heights in ORDER and align them POSITIONALLY: grid index `i` is
+   Metaculus bucket `i/(n-1)`, so index `i` means the same thing for every model. A CDF
+   that arrives on a different-length grid is resampled in cdf-LOCATION space (never
+   value space — a log-scaled `zero_point` question's PCHIP CDF carries a linear value
+   axis while forecasting-tools' fallback builder carries a geometric one, so their
+   x-values disagree by construction even when bucket `i` matches) and logs
+   `NUMERIC_AGGREGATE_GRID_MISMATCH`, which should read zero in prod.
+2. Take the mean or median of the cumulative probabilities at each index.
+
+   This replaced a group-by-VALUE aggregation (a pandas groupby on float-equal `value`).
+   The PCHIP grid (`np.linspace`) and the ft-fallback grid (`min + span*i/(n-1)`) differ
+   in float rounding, so a mixed-path ensemble medianed over a rotating SUBSET of its
+   members at misaligned points — measured at 225 unique x-values from 3 models, 48 of
+   them with fewer than 3 contributors — and nothing recorded the partial membership.
 3. `_postprocess_ensemble_cdf` (`numeric/utils.py`) re-pins the endpoints (one-sided
    open/closed logic), enforces monotonicity, applies ramp smoothing if any bin is below
    min-step, and — for discrete questions whose `cdf_size != 201` — resamples the CDF to

@@ -22,6 +22,7 @@ from unittest.mock import patch
 import litellm.exceptions
 import pytest
 
+from metaculus_bot.prompts import binary_prompt
 from metaculus_bot.research import prediction_market as pmp
 from metaculus_bot.research.market_retrieval import generation
 from metaculus_bot.research.market_retrieval.queries import dedupe_queries, strip_dates_and_numbers
@@ -128,7 +129,9 @@ class TestFetchMarketSnapshot:
     async def test_an_empty_ranking_is_a_valid_answer_and_not_a_degradation(self, mock_question, kalshi_events_payload):
         """`[]` means "nothing here bears on the question", which is the whole adaptive-width
         mechanism. Conflating it with a failure would delete that mechanism AND redden CI on a
-        correct answer."""
+        correct answer. The forecaster is TOLD about the deliberate empty answer rather than
+        shown a vanished section (the q45200 outage-lookalike), and the notice quotes the pool
+        the ranker reviewed."""
         handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
 
         snapshot = await _fetch(mock_question, handlers, ranking="[]")
@@ -136,7 +139,10 @@ class TestFetchMarketSnapshot:
         assert snapshot.matches == []
         assert snapshot.sources["ranking"] == "ok(0)"
         assert pmp.prediction_market_source_losses() == 0
-        assert format_snapshot_for_research(snapshot) == ""
+        assert snapshot.pool_size > 0
+        rendered = format_snapshot_for_research(snapshot)
+        assert f"No sufficiently relevant market among {snapshot.pool_size} candidates" in rendered
+        assert "not a provider outage" in rendered
 
     @pytest.mark.asyncio
     async def test_an_unreadable_ranking_fails_open_to_retrieval_order(self, mock_question, kalshi_events_payload):
@@ -155,6 +161,67 @@ class TestFetchMarketSnapshot:
         assert snapshot.sources["ranking"].startswith("error(")
         assert pmp.prediction_market_source_losses() == 1
         assert DEGRADED_RANKING_MARKER in format_snapshot_for_research(snapshot)
+
+    @pytest.mark.asyncio
+    async def test_a_shape_regression_fails_open_and_is_named_in_the_telemetry(
+        self, mock_question, kalshi_events_payload, caplog: pytest.LogCaptureFixture
+    ):
+        """A well-formed array of objects with a RENAMED index key: readable JSON, no usable row.
+
+        This used to render as `ranking: ok(0)` with zero rows — indistinguishable from the
+        model's considered "nothing here bears on the question", and since the deliberate-empty
+        sentence shipped it published that sentence's affirmative claim ("prediction markets were
+        retrieved and reviewed… none was judged to bear on it") over output whose shape we had
+        failed to parse. It now fails open like any other unreadable ranking, and the WARN names
+        `reason=shape_regression` so the archive can tell a broken parser contract from a model
+        that emitted prose.
+        """
+        handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+
+        with caplog.at_level(logging.WARNING):
+            snapshot = await _fetch(mock_question, handlers, ranking='[{"index": 0}, {"index": 1}]')
+
+        assert snapshot.matches, "a fail-open must still render the deterministic slate"
+        assert all(row.relation_tier == "" for row in snapshot.matches)
+        assert snapshot.sources["ranking"] == "error(RankingShapeRegression)"
+        assert pmp.prediction_market_source_losses() == 1
+        rendered = format_snapshot_for_research(snapshot)
+        assert DEGRADED_RANKING_MARKER in rendered
+        assert "No sufficiently relevant market" not in rendered
+        degraded = [m for m in caplog.messages if m.startswith("MARKET_RANKING_DEGRADED:")]
+        assert len(degraded) == 1
+        assert "reason=shape_regression" in degraded[0]
+        assert f"pool={snapshot.pool_size}" in degraded[0]
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_ranking_is_labelled_unreadable_not_a_shape_regression(
+        self, mock_question, kalshi_events_payload, caplog: pytest.LogCaptureFixture
+    ):
+        """The sibling of the case above, and the reason the WARN carries a `reason=` at all: one
+        of these two says the model answered badly, the other says our own prompt/parser contract
+        broke, and only the second is a defect to go fix."""
+        handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+
+        with caplog.at_level(logging.WARNING):
+            await _fetch(mock_question, handlers, ranking="I could not decide.")
+
+        degraded = [m for m in caplog.messages if m.startswith("MARKET_RANKING_DEGRADED:")]
+        assert len(degraded) == 1
+        assert "reason=unreadable" in degraded[0]
+
+    @pytest.mark.asyncio
+    async def test_a_deliberate_empty_ranking_emits_no_degraded_marker(
+        self, mock_question, kalshi_events_payload, caplog: pytest.LogCaptureFixture
+    ):
+        """The control for the marker: `[]` is the mechanism working, so it must not appear in a
+        channel an operator is meant to read as "the ranker is broken"."""
+        handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+
+        with caplog.at_level(logging.WARNING):
+            snapshot = await _fetch(mock_question, handlers, ranking="[]")
+
+        assert snapshot.sources["ranking"] == "ok(0)"
+        assert not [m for m in caplog.messages if m.startswith("MARKET_RANKING_DEGRADED:")]
 
     @pytest.mark.parametrize(
         "exception_factory",
@@ -560,3 +627,134 @@ class TestRetrievalWidthIsNotTheRenderCap:
         assert len(kalshi_lines) == RETRIEVAL_WIDTH_KALSHI
         # And the RENDER stays the ranker's choice, bounded by the budget rather than by the width.
         assert len(snapshot.matches) <= RENDER_BUDGET
+
+
+class TestAFamilyReachesTheForecasterWhole:
+    """The pipeline-visible half of the 2026-08-25 render change, end to end into a forecaster prompt.
+
+    Every other test in this area stops at one seam: the venue parsers pin what a strike ladder parses
+    to, the renderer tests pin the table, the formatter tests pin the marker. None of them shows that a
+    real Kalshi ladder survives catalogue parse -> pool -> ranker -> render -> the string a forecaster
+    is actually handed, and that is exactly where q45189 was lost: every stage was individually correct
+    and the model still saw one bracket of a twelve-bracket distribution.
+
+    The fixture is that shape — a diesel-price bracket ladder with more outcomes than the render's full-row
+    allowance, one strike carrying an empty book (`yes_bid 0.0000` / `yes_ask 1.0000`, whose midpoint is
+    the synthetic $0.50 nobody quoted). Marked `e2e` because it is the pipeline-level guard for a
+    forecast-affecting change; it opens no socket and bills no key (fake aiohttp session, both LLM stages
+    stubbed).
+    """
+
+    # A real Kalshi ladder's shape: mutually-exclusive brackets whose open prices sum to ~0.98, plus one
+    # far-tail strike nobody is quoting. Labels are distinct and none is a substring of another, so
+    # "every outcome reached the prompt" is a real check rather than an accidental one.
+    _BRACKETS: tuple[tuple[str, float | None], ...] = (
+        ("Below $4.00", 0.06),
+        ("$4.00 - $4.19", 0.09),
+        ("$4.20 - $4.39", 0.14),
+        ("$4.40 - $4.59", 0.19),
+        ("$4.60 - $4.79", 0.17),
+        ("$4.80 - $4.99", 0.12),
+        ("$5.00 - $5.19", 0.08),
+        ("$5.20 - $5.39", 0.05),
+        ("$5.40 - $5.59", 0.03),
+        ("$5.60 - $5.79", 0.02),
+        ("$5.80 - $5.99", 0.02),
+        ("Above $6.00", None),
+    )
+
+    def _diesel_question(self, mock_question: Any) -> Any:
+        """The seam's question stub, re-pointed at the ladder's own subject.
+
+        The Kalshi channel scores the catalogue against the question's own text, so an event about a
+        different subject would make the pool membership itself the thing under test.
+        """
+        mock_question.question_text = "What will the US average diesel price be at the end of 2026?"
+        mock_question.title = mock_question.question_text
+        mock_question.short_title = "diesel price end of 2026"
+        mock_question.resolution_criteria = "Resolves to the EIA weekly on-highway diesel average for 2026-12-28."
+        mock_question.background_info = "EIA reports a weekly national average."
+        return mock_question
+
+    def _ladder_event(self) -> dict[str, Any]:
+        markets = []
+        for index, (label, price) in enumerate(self._BRACKETS):
+            bid, ask = (0.0, 1.0) if price is None else (round(price - 0.01, 2), round(price + 0.01, 2))
+            markets.append(
+                {
+                    "ticker": f"KXDIESEL-26DEC-{index:02d}",
+                    "yes_sub_title": label,
+                    "status": "active",
+                    "yes_bid_dollars": f"{bid:.4f}",
+                    "yes_ask_dollars": f"{ask:.4f}",
+                    "notional_value_dollars": "1.0000",
+                    "volume_fp": "42000.00",
+                    "open_interest_fp": "9000.00",
+                    "close_time": "2026-12-28T23:59:59Z",
+                    "rules_primary": "Settles on the EIA weekly on-highway diesel average.",
+                }
+            )
+        return {
+            "event_ticker": "KXDIESEL-26DEC",
+            "title": "What will the US average diesel price be at the end of 2026?",
+            "sub_title": "EIA weekly average, 2026-12-28",
+            "markets": markets,
+        }
+
+    @pytest.mark.e2e
+    @pytest.mark.asyncio
+    async def test_every_bracket_and_no_fabricated_price_reaches_the_forecaster_prompt(
+        self, monkeypatch, mock_question, caplog
+    ):
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "true")
+        question = self._diesel_question(mock_question)
+        handlers = _handlers(
+            **{
+                _KALSHI_EVENTS_URL: FakeResponse(200, {"events": [self._ladder_event()], "cursor": ""}),
+                # The baseline's PredictIt market is emptied out so the ladder is the slate's ONLY family
+                # and the marker's outcome accounting is exact rather than a lower bound.
+                _PREDICTIT_URL: FakeResponse(200, {"markets": []}),
+            }
+        )
+
+        with (
+            caplog.at_level(logging.INFO, logger="metaculus_bot.research.prediction_market"),
+            patch.object(pmp, "build_llm_with_openrouter_fallback", _market_llm(ranking=_rank_one_per_venue)),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            research = await pmp.prediction_market_provider()(question)
+
+        assert "| ↳ |" in research, "the ranker must have picked the ladder, or nothing below is under test"
+        # Completeness: every bracket reaches the text, whether on a full sub-row or in the ladder row.
+        for label, _ in self._BRACKETS:
+            assert label in research, label
+        assert "[remaining " in research, "the fixture must exceed the full-row allowance"
+
+        # No fabricated price: the empty-book strike is named and NOT priced. Its midpoint would be a
+        # synthetic 0.50, which is the class of number this change exists to keep out of the table.
+        unquoted_label = self._BRACKETS[-1][0]
+        assert f"{unquoted_label} -" in research, "an unquoted outcome is named with a dash in the ladder row"
+        assert f"{unquoted_label} 0.50" not in research
+        assert "| 0.50 |" not in research
+
+        # The seam's telemetry, keyed to the question the provider was handed: `withheld` counts the
+        # refusal, and the completeness invariant holds on the EMITTED line rather than only in the renderer.
+        marker = next(rec.getMessage() for rec in caplog.records if rec.getMessage().startswith("MARKET_CHILD_RENDER:"))
+        fields = dict(field.split("=", 1) for field in marker.removeprefix("MARKET_CHILD_RENDER: ").split(" "))
+        assert fields["question"] == str(question.id_of_question)
+        assert int(fields["outcomes"]) == len(self._BRACKETS)
+        assert int(fields["named"]) + int(fields["collapsed"]) == int(fields["outcomes"])
+        assert fields["withheld"] == "1"
+
+        # And the whole ladder plus the instruction for reading it land in ONE forecaster prompt. The
+        # render half is what makes the distribution available; the prompt sentence is what stops a model
+        # reading one bracket as an equality constraint on a tail (the q45189 failure).
+        question.open_time = datetime.now(timezone.utc) - timedelta(days=30)
+        question.scheduled_resolution_time = datetime.now(timezone.utc) + timedelta(days=120)
+        prompt = binary_prompt(question, research=research)
+
+        for label, _ in self._BRACKETS:
+            assert label in prompt, label
+        assert "[remaining " in prompt
+        assert "is a DISTRIBUTION over that market's own question" in prompt
+        assert "Never treat one outcome's price as an equality constraint" in prompt

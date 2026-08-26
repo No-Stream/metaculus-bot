@@ -31,7 +31,11 @@ from metaculus_bot.constants import (
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
 )
-from metaculus_bot.performance_analysis.parsing import _parse_probability
+from metaculus_bot.performance_analysis.parsing import (
+    MIN_SCOREABLE_ANCHORS,
+    _parse_probability,
+    declared_anchors,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -205,15 +209,20 @@ def exceeded_spread_threshold(record: dict) -> bool | None:
         # Key percentile LABELS (raw 0-100 numbers as parsed from comments) at
         # which numeric disagreement is measured: the 10th, 50th, and 90th. Looked
         # up by label so growing the standard percentile set can't shift them.
-        # This branch consumes lenient historical data (>=9 percentiles, possibly
-        # non-standard), so a per-model label dict is used here rather than the
-        # strict PercentileSet value object.
+        # This branch consumes lenient historical data (>= MIN_SCOREABLE_ANCHORS
+        # percentiles, possibly non-standard), so a per-model label dict is used here
+        # rather than the strict PercentileSet value object. The floor is the shared
+        # constant in ``parsing``, counted the way its docstring defines it — DISTINCT
+        # labels via ``declared_anchors``, exactly as ``ranking_cohort`` and
+        # ``analysis.max_step_clamp_screen`` count it. Comment prose can restate a
+        # member's whole set, so the raw pair count overstates density.
         key_labels = [10.0, 50.0, 90.0]
         model_maps: list[dict[float, float]] = []
         for model_pcts in pnp.values():
-            if len(model_pcts) < 9:
+            anchors, _ = declared_anchors(model_pcts)
+            if len(anchors) < MIN_SCOREABLE_ANCHORS:
                 continue
-            label_to_value = {round(float(p), 6): float(v) for p, v in model_pcts}
+            label_to_value = {round(label, 6): value for label, value in anchors.items()}
             if all(round(label, 6) in label_to_value for label in key_labels):
                 model_maps.append(label_to_value)
         if len(model_maps) < 2:

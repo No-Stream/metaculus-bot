@@ -359,6 +359,11 @@ def _extract_mc_community_probs(question: Any) -> tuple[list[float] | None, str]
                         missing,
                         extra,
                     )
+                # `.get(opt, 0.0)` is deliberate HERE, unlike the backtest scorer's version:
+                # the mismatch is already warned about above, and the sum gate below rejects
+                # the record outright when a materially-missing option pulls the total off
+                # 1.0 — so a fabricated zero never reaches a score. A rounding-level gap
+                # (< 1e-3) is renormalized away.
                 probs = [float(pyc.get(opt, 0.0)) for opt in options]
                 total = sum(probs)
                 if abs(total - 1.0) > 1e-6 and abs(total - 1.0) <= 1e-3:

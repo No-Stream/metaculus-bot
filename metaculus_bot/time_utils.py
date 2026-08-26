@@ -23,3 +23,20 @@ def _as_utc(moment: datetime) -> datetime:
     if moment.tzinfo is None:
         return moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(timezone.utc)
+
+
+def parse_iso_utc(raw: str | None) -> datetime | None:
+    """Parse an ISO-8601 timestamp (``Z`` or offset form) to tz-aware UTC.
+
+    None on an absent or unparseable value. The one parser behind every
+    era-bucketing read of ``bot_comment_created_at`` — a second copy that
+    diverged (one accepting a format the other rejects) would let two modules
+    file the same record into different config eras.
+    """
+    if not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _as_utc(moment)

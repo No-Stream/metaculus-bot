@@ -27,20 +27,75 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
   ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
   ranker outcome, and every rendered row's ``venue:pool_index@rank``)
+* ``MARKET_CHILD_RENDER`` — ``metaculus_bot/research/prediction_market.py``
+  ``_log_child_render_telemetry`` (per-QUESTION multi-outcome child accounting:
+  how many outcomes were individually named versus collapsed into a counted
+  group, and ``withheld``, the count of venue-manufactured prices the parsers
+  refused — the field the Kalshi no-price spread threshold gets retuned on)
+* ``MARKET_RANKING_DEGRADED`` — ``metaculus_bot/research/prediction_market.py``
+  ``_rank_pool`` (per-QUESTION ranker fail-open, and WHY: ``shape_regression``
+  means our own prompt/parser contract broke, which used to pass silently as
+  ``ok(0)``, i.e. as a deliberate "we reviewed the markets and none bore on it")
+* ``NUMERIC_DEGENERATE_DECLARATION`` — ``metaculus_bot/numeric/pipeline.py``
+  ``_apply_jitter_and_clamp`` (per-FORECASTER point-mass numeric declaration that
+  is no longer cluster-spread into a width nobody stated — a fabrication-attempt
+  rate, since the unit-mismatch guard then withholds that forecaster)
+* ``NUMERIC_AGGREGATE_GRID_MISMATCH`` — ``metaculus_bot/numeric/utils.py``
+  ``aggregate_numeric`` (per-MODEL CDF whose grid length disagreed with the
+  question's; expect zero in prod, so any record means a length drifted)
+* ``PCHIP CDF construction failed`` (spec ``numeric_pchip_fallback``) —
+  ``metaculus_bot/numeric/diagnostics.py`` ``log_pchip_fallback`` (per-QUESTION
+  PCHIP build failure that fell back to forecasting-tools' own CDF builder; the
+  one numeric repair surface with a confirmed prod fire)
+
+NUMERIC REPAIR TIERS, DELIBERATELY UNHARVESTED (sentinel_value_audit M16 asked for
+one ``numeric_repair`` marker over five repair surfaces): the repair-tier WARNs in
+``numeric/bounds_clamping.py`` — ``Corrected numeric distribution``, ``Heavy bound
+clamping``, ``Cluster spread applied`` — never fire on real model output, because
+``generate_pchip_cdf``'s uniform-mixture construction pre-enforces the min-step
+before any repair tier is reached (0 of 1182 archived numeric forecasts; see
+AGENTS.md "Repair-tier WARN signals are effectively dead code"). Registering specs
+for them would archive permanently-empty files that read as signal, so the omission
+is a decision, not a miss. M16's incidence question is answered by the narrower
+markers above — ``NUMERIC_DEGENERATE_DECLARATION``, ``NUMERIC_AGGREGATE_GRID_MISMATCH``,
+``SPREAD_UNDEFINED`` — plus ``numeric_pchip_fallback`` for the surface that does fire;
+the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker.
+* ``SPREAD_UNDEFINED`` — ``metaculus_bot/spread_metrics.py``
+  ``numeric_percentile_spread`` (per-QUESTION unmeasurable spread: the routing
+  decision was made on no measurement at all)
+* ``TS_ANCHOR_ROUTE``   — ``metaculus_bot/research/ts_routing.py`` ``route_question``
+  (per-QUESTION timeseries-anchor routing decision: routed/skipped, the series
+  involved, and the branch/reject step — the marker that made anchor coverage
+  queryable; before it, 27 of the triple era's 30 route-level misses were the
+  silent ``kw_no_keyword_hit`` return and left no log line at all)
+* ``FINANCIAL_STALE_LATEST`` — ``metaculus_bot/research/financial_data.py``
+  ``_fetch_yfinance_data`` and ``metaculus_bot/research/ts_render.py``
+  ``_render_single`` (per-IDENTIFIER stale "latest" disclosure: the newest
+  observation is older than its own cadence explains, so the rendered latest
+  value — and anything anchored on it — was flagged stale to the forecaster;
+  informational data-quality signal, NOT alertable)
 * ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
   ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
   whether it counted toward the exit code)
 * ``PAID PERSONAL-KEY FALLBACK`` — ``metaculus_bot/fallback_openrouter.py``
   ``_log_fallback`` (per-CALL: which model fell back off the donated key, and why)
-* ``Run completed with N alertable...`` — ``metaculus_bot/cli.py`` (the end-of-run
-  breakdown, emitted on BOTH exit paths so a fully-suppressed green run is still
-  recorded)
+* ``PUBLISH_HARDENING`` — ``metaculus_bot/publish_hardening.py``
+  ``_wrap_with_timeout_retry`` (per-ATTEMPT publish failure: which POST method,
+  which attempt of how many, and the timeout or exception that killed it — the
+  q45085 405-closed shape left no harvestable trace before this spec)
+* ``PUBLISH_SKIPPED_CLOSED`` — ``metaculus_bot/publish_gate.py``
+  ``skip_publish_if_closed`` (per-QUESTION pre-publish skip: the question whose
+  window had already closed, why, and by how many seconds it missed)
+* ``Run completed [clean] with N alertable...`` — ``metaculus_bot/cli.py`` (the
+  end-of-run breakdown, emitted on EVERY path — degraded, fully-suppressed green,
+  crashed, and fully clean — so the archive holds one record per run; the ``clean``
+  variant is the 2026-08-25 addition that keeps a healthy run in the census)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
-* ``STACKER_OUTCOME`` / ``TOOLS_USED`` / ``ANCHOR_OVERSHOOT_PP`` /
-  ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
+* ``STACKER_OUTCOME`` / ``STACKER_SKIP_REASON`` / ``TOOLS_USED`` /
+  ``ANCHOR_OVERSHOOT_PP`` / ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
 
-NOTE ON THE HTML-COMMENT MARKERS: the last four are ``<!-- ... -->`` markers
-injected into the *published Metaculus comment*, not logged to stdout/stderr (the
+NOTE ON THE HTML-COMMENT MARKERS: the ones on that last line are ``<!-- ... -->``
+markers injected into the *published Metaculus comment*, not logged to stdout/stderr (the
 framework logs only ``Posted comment on post N``, never the comment body). They
 are therefore almost never present in run logs — their durable source is the
 comment itself, which ``metaculus_bot.performance_analysis`` already parses. Their
@@ -57,7 +112,10 @@ both work).
 POST-ID vs QUESTION-ID (the ``qid_kind`` field): Metaculus posts contain questions,
 and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
 types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
-``CLOSE_MARGIN`` / ``MARKET_RANKING`` emit ``question.id_of_question`` (the QUESTION id) while
+``CLOSE_MARGIN`` / ``MARKET_RANKING`` / ``MARKET_RANKING_DEGRADED`` /
+``NUMERIC_DEGENERATE_DECLARATION`` / ``NUMERIC_AGGREGATE_GRID_MISMATCH`` /
+``SPREAD_UNDEFINED`` / ``numeric_pchip_fallback`` emit ``question.id_of_question``
+(the QUESTION id) while
 ``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
 ``GHOST_FORECAST_JSON`` emit ``question.page_url`` (a POST id). Each :class:`MarkerSpec` therefore declares
 ``qid_kind`` and every harvested record carries it, so a residual join keyed on one
@@ -93,6 +151,10 @@ _INT_RE = re.compile(r"[+-]?\d+")
 _LINE_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}),(\d{3})")
 _QID_URL_RE = re.compile(r"/questions/(\d+)")
 _BARE_INT_RE = re.compile(r"\d+")
+
+# One ``key=value`` token of a generic counter tail (see the degradation_counters
+# spec): keys are Python identifiers, values run to the next comma/whitespace.
+_KV_PAIR_RE = re.compile(r"(\w+)=([^,\s]+)")
 
 
 @dataclass(frozen=True)
@@ -279,6 +341,176 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
     ),
     MarkerSpec(
+        "market_child_render",
+        # Per-question multi-outcome CHILD render accounting
+        # (research/prediction_market.py:_log_child_render_telemetry). A separate line rather than
+        # extra fields on `market_ranking`, because that regex is not end-anchored and a separate
+        # spec keeps this harvester change purely additive.
+        #
+        # Two fields carry the questions this exists to answer. `withheld` counts the prices the
+        # venue parsers REFUSED as manufactured — an empty Kalshi book, a Polymarket placeholder leg
+        # at Gamma's `["0.5","0.5"]` default, a Manifold answer at its untouched prior. The Kalshi
+        # half of that is gated on `KALSHI_NO_PRICE_SPREAD`, a threshold calibrated on eleven fixture
+        # strikes, so its prod incidence has to be a query rather than a guess. `max_stage` and
+        # `ladder_chars` say whether the ladder's section allowance binds on real slates (0 = every
+        # outcome named, 99 = the per-family hard bound).
+        #
+        # `named` + `collapsed` == `outcomes` is the completeness invariant the render guarantees, so
+        # a harvested line where those disagree is a render bug and not a tuning signal.
+        re.compile(
+            r"MARKET_CHILD_RENDER:\s*question=(?P<question>\S+)\s+families=(?P<families>\S+)"
+            r"\s+full_rows=(?P<full_rows>\S+)\s+ladder_rows=(?P<ladder_rows>\S+)"
+            r"\s+outcomes=(?P<outcomes>\S+)\s+named=(?P<named>\S+)"
+            r"\s+collapsed=(?P<collapsed>\S+)\s+withheld=(?P<withheld>\S+)"
+            r"\s+max_stage=(?P<max_stage>\S+)\s+ladder_chars=(?P<ladder_chars>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "market_ranking_degraded",
+        # Per-question ranker FAIL-OPEN (research/prediction_market.py:_rank_pool), the
+        # discriminating sibling of `market_ranking`'s `outcome=failopen`. That field says a
+        # fail-open happened; only this line says which failure, and the distinction is the
+        # whole finding: `reason=shape_regression` means the ranker's output was structurally
+        # unreadable to US (a renamed index key, indices all out of range), which before
+        # 2026-08-25 was reported as `ok(0)` — i.e. indistinguishable from the model
+        # deliberately answering "none of these markets bear on the question", which the
+        # render turns into an affirmative forecaster-facing sentence. `reason=unreadable`
+        # means the completion was not a ranking array at all.
+        #
+        # NOT end-anchored: `detail=` is free text holding the exception's str (spaces,
+        # semicolons, quotes), captured verbatim via _RAW_FIELDS and optional so a terser
+        # future form still harvests rather than dropping the record.
+        re.compile(
+            r"MARKET_RANKING_DEGRADED:\s*question=(?P<question>\S+)\s+pool=(?P<pool>\S+)"
+            r"\s+reason=(?P<reason>\S+)(?:\s+detail=(?P<detail>.*))?"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "numeric_degenerate_declaration",
+        # Per-FORECASTER point-mass numeric declaration (numeric/pipeline.py
+        # _apply_jitter_and_clamp): the model put (near-)identical values at every
+        # percentile, so the cluster spreader is deliberately NOT applied and the honest
+        # zero span reaches the unit-mismatch guard, which withholds that forecaster. The
+        # count is therefore a per-model fabrication-ATTEMPT rate: before 2026-08-25 the
+        # spreader manufactured a ±6-unit distribution from it and that width was exactly
+        # what let it pass the guard, so the published forecast stated a width nobody
+        # declared. The resulting drop shows up as UnitMismatchError in FORECASTER_DROPS;
+        # this line is the only place the CAUSE is named.
+        #
+        # ``model`` names the forecaster (or the stacker, on the aggregation path). All three
+        # sanitize_percentiles callers pass it, so "unknown" now means a NEW caller forgot to
+        # — it is not in _NONE_SENTINELS, so it stays a readable string rather than coercing
+        # into an absent field.
+        re.compile(
+            r"NUMERIC_DEGENERATE_DECLARATION:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
+            r"\s+n_unique=(?P<n_unique>\S+)\s+span=(?P<span>\S+)\s+value_eps=(?P<value_eps>\S+)"
+            r"\s+spread_applied=(?P<spread_applied>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # numeric/pipeline.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "numeric_aggregate_grid_mismatch",
+        # Per-MODEL grid-length disagreement inside ensemble aggregation
+        # (numeric/utils.py aggregate_numeric). Expect ZERO records in prod: every model's
+        # CDF is built on the question's own point count, so a record means a length
+        # drifted — which used to matter far more than a resample, because the old
+        # group-by-VALUE aggregation silently medianed over a rotating SUBSET of the
+        # ensemble whenever an ft-fallback distribution mixed with PCHIP ones (their x-axes
+        # differ by float rounding, and on a log-scaled question by construction).
+        # Aggregation is positional now, so the mismatch is handled rather than silent —
+        # this marker is what keeps "handled" from meaning "unnoticed".
+        re.compile(
+            r"NUMERIC_AGGREGATE_GRID_MISMATCH:\s*question=(?P<question>\S+)"
+            r"\s+model_index=(?P<model_index>\S+)\s+got_points=(?P<got_points>\S+)"
+            r"\s+expected_points=(?P<expected_points>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # numeric/utils.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "numeric_pchip_fallback",
+        # Per-question PCHIP CDF build failure (numeric/diagnostics.py log_pchip_fallback):
+        # the distribution the forecasters see came from forecasting-tools' fallback CDF
+        # builder, not our PCHIP pipeline. The one numeric repair surface with a confirmed
+        # prod fire (the repair-tier WARNs upstream of it are dead code on real output —
+        # see the module docstring's M16 note), so its absence from the archive was the
+        # one genuine blind spot in that family. The question ref is ``id_of_question``,
+        # rendered "N/A" when absent (a _NONE_SENTINELS member, coerces to None).
+        re.compile(
+            r"Question (?P<question>\S+): PCHIP CDF construction failed "
+            r"\((?P<error>.*)\), falling back to forecasting-tools default"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # numeric/diagnostics.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "spread_undefined",
+        # Per-question unmeasurable disagreement spread (spread_metrics.py
+        # numeric_percentile_spread): the normalizing denominator was non-positive, so no
+        # spread could be computed. It returns inf now — before 2026-08-25 it returned 0.0,
+        # which route_after_forecasts reads as "the models agree", and the comment marker
+        # then claimed `spread_below_threshold`. A measurement FAILURE read as an
+        # affirmative agreement signal.
+        #
+        # Latent in prod while the three per-type stacking gates are off, but it fires in
+        # backtests and ablation, where it marks a question whose routing decision was made
+        # on no measurement at all. ``qtype`` is a field rather than a literal so a future
+        # binary/MC variant of the same shape harvests with no spec change.
+        re.compile(
+            r"SPREAD_UNDEFINED:\s*question=(?P<question>\S+)\s+qtype=(?P<qtype>\S+)"
+            r"\s+denominator=(?P<denominator>\S+)\s+models=(?P<models>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # spread_metrics.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "ts_anchor_route",
+        # Per-question timeseries-anchor routing decision (research/ts_routing.py
+        # route_question). This exists because routing was near-unauditable from telemetry:
+        # route_question logged only the ambiguous/guard branches, so of the triple era's 30
+        # route-level misses exactly 2 left any line in 1,800 run logs, and part (2) of the
+        # research-archive-qa dimension could only be written by re-running the router
+        # offline. One line per numeric/discrete question makes anchor coverage a query.
+        #
+        # `decision` is routed|skipped; `step` names the deciding branch on a route
+        # (url_single / url_spread / kw_single) or the reject reason on a skip
+        # (url_ambiguous, url_quantity_gate, url_change_vs_level_guard,
+        # url_no_relative_return_wording, kw_no_keyword_hit, kw_derivation_gate,
+        # kw_ambiguous, kw_change_vs_level_guard). `series` is the series involved where one
+        # is known — comma-joined on ambiguity, slash-joined on a spread, the "none" sentinel
+        # (-> None) on a plain keyword miss. All values are spaceless, so `\S+` takes each.
+        #
+        # DENOMINATOR CAVEAT: the marker covers routing-ELIGIBLE questions, not every
+        # numeric/discrete question — build_anchor_section returns before route_question
+        # when scheduled_resolution_time is missing/non-datetime, and a disabled
+        # TS_ANCHOR_ENABLED run emits nothing. A coverage query must reconcile against the
+        # run's question list rather than treat absent lines as skips.
+        re.compile(
+            r"TS_ANCHOR_ROUTE:\s*question=(?P<question>\S+)\s+decision=(?P<decision>\S+)"
+            r"\s+series=(?P<series>\S+)\s+step=(?P<step>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # ts_routing.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "financial_stale_latest",
+        # Stale "latest" observation behind a rendered anchor value, WARNING-level and
+        # informational — NOT alertable (the render already tells the forecaster to treat
+        # the value as stale; this line makes each surface's prod incidence a query
+        # instead of a guess). Two emitters share one shape because they share the
+        # estimator (``ts_estimators.stale_latest_age_days``): ``surface=financial_data``
+        # is financial_data.py's ``_fetch_yfinance_data``, ``surface=ts_anchor`` is
+        # ts_render.py's ``_render_single``.
+        #
+        # ``symbol`` is a ticker or FRED series id — carets and dots (^GSPC, BRK.B) are
+        # spaceless, so ``\S+`` takes it and coerce_value keeps it a string. ``cadence``
+        # is the daily-step unit the age was judged against (trading-day /
+        # calendar-day). No question ref — the fetch is per-identifier, and one
+        # question can fire several — so qid_kind stays None.
+        re.compile(
+            r"FINANCIAL_STALE_LATEST:\s*surface=(?P<surface>\S+)\s+symbol=(?P<symbol>\S+)"
+            r"\s+age_d=(?P<age_d>\S+)\s+cadence=(?P<cadence>\S+)"
+        ),
+    ),
+    MarkerSpec(
         "forecaster_drops",
         # Per-run ensemble-drop summary emitted by
         # drop_telemetry.py:emit_drop_telemetry. No per-question ref (it
@@ -316,30 +548,18 @@ MARKER_SPECS: list[MarkerSpec] = [
         # positive alertable_count), emitted by forecaster.py's forecast_questions.
         # No per-question ref — it aggregates a whole run — so qid_kind stays None.
         #
-        # The trailing keys are OPTIONAL-group wrapped for the same reason as
-        # gap_fill_v2 above: replace-by-run re-harvesting replays pre-rename logs
-        # (``research_provider_timeouts``, no ``summarizer_failures``,
-        # ``prediction_market_platform_failures`` as the tail), and a mandatory tail
-        # would drop each of those records wholesale instead of harvesting the
-        # counters it does carry. The rename pairs are alternations so one group name
-        # can't cover both spellings; missing groups coerce to None, which reads as
-        # "this era didn't emit it" rather than a measured zero.
-        re.compile(
-            r"Degradation counters:\s*forecasters_dropped=(?P<forecasters_dropped>\S+?),"
-            r"\s*questions_failed_to_publish=(?P<questions_failed_to_publish>\S+?),"
-            r"\s*stacker_primary_failed=(?P<stacker_primary_failed>\S+?),"
-            r"\s*stacker_fallback_used=(?P<stacker_fallback_used>\S+?),"
-            r"\s*stacker_fallback_failed=(?P<stacker_fallback_failed>\S+?),"
-            r"\s*(?:research_provider_failures=(?P<research_provider_failures>\S+?)"
-            r"|research_provider_timeouts=(?P<research_provider_timeouts>\S+?)),"
-            r"(?:\s*summarizer_failures=(?P<summarizer_failures>\S+?),)?"
-            r"\s*gap_fill_v2_errors=(?P<gap_fill_v2_errors>\S+?)"
-            r"(?:,\s*prediction_market_degraded=(?P<prediction_market_degraded>\S+?))?"
-            r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+?)"
-            r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+?)))?"
-            r"(?:,\s*provider_degradation=(?P<provider_degradation>\S+))?"
-            r"\s*$"
-        ),
+        # The tail is parsed GENERICALLY: ``kv_pairs`` captures the whole
+        # ``key=value, key=value`` list and ``_build_record`` tokenizes it, so a
+        # new counter in ``format_degradation_summary`` harvests with NO change
+        # here (the old 17-named-group ``$``-anchored regex needed a coordinated
+        # two-file edit per counter, and getting it wrong dropped the whole
+        # line's harvest). Historic renames survive as their own keys exactly as
+        # before (``research_provider_timeouts`` era-records keep that spelling).
+        # One deliberate delta from the old spec: a key absent from an era's line
+        # is now ABSENT from the record rather than explicitly None — read
+        # ``record.get(key)`` and treat both as "this era didn't emit it", never
+        # as a measured zero.
+        re.compile(r"Degradation counters:\s*(?P<kv_pairs>.*)$"),
     ),
     MarkerSpec(
         "provider_degradation",
@@ -353,10 +573,128 @@ MARKER_SPECS: list[MarkerSpec] = [
         # _RAW_FIELDS): venue and field names are delimiter-hostile, and residual
         # analysis json.loads it. The trailing suppression clause is free text after
         # the JSON, so ``detail`` stops at the array's closing bracket.
+        #
+        # The observation denominators (venues_observed / catalogues_observed /
+        # pool_rows, added 2026-08-24) are OPTIONAL-group wrapped: re-harvesting
+        # replays the ~1039 archived lines that predate them, and on those a missing
+        # group coerces to None — which reads correctly as "not recorded", never as a
+        # measured zero. They exist because ``findings=0`` alone is byte-identical
+        # between a run that evaluated 400 pool rows and one that evaluated nothing.
         re.compile(
             r"PROVIDER_DEGRADATION:\s*run=(?P<run>\S+)\s+findings=(?P<findings>\d+)"
-            r"\s+alertable=(?P<alertable>\d+)\s+suppressed=(?P<suppressed>\d+)\s+detail=(?P<detail>\[.*?\])"
+            r"\s+alertable=(?P<alertable>\d+)\s+suppressed=(?P<suppressed>\d+)"
+            r"(?:\s+venues_observed=(?P<venues_observed>\d+)"
+            r"\s+catalogues_observed=(?P<catalogues_observed>\d+)"
+            r"\s+pool_rows=(?P<pool_rows>\d+))?"
+            r"\s+detail=(?P<detail>\[.*?\])"
         ),
+    ),
+    MarkerSpec(
+        "publish_hardening",
+        # Per-attempt publish failure WARN (metaculus_bot/publish_hardening.py
+        # _wrap_with_timeout_retry). Two emitted shapes share the prefix:
+        #   "PUBLISH_HARDENING: <method> attempt N/M timed out after Ts"
+        #   "PUBLISH_HARDENING: <method> attempt N/M failed (<ExcType>: <msg>)"
+        # The ``attempt N/M`` clause is what keeps this spec off the OTHER
+        # PUBLISH_HARDENING-prefixed strings in that module (the applied-INFO line,
+        # the seam-moved AttributeErrors, the loop-exited RuntimeError). Exactly one
+        # of ``timeout_s`` / (``error_type``, ``error``) is populated per record; the
+        # counter it complements is ``publish_attempt_failures`` in the degradation
+        # line, but only this marker names WHICH method died and with what. No
+        # question ref (the wrapper sees only the POST), so qid_kind stays None.
+        re.compile(
+            r"PUBLISH_HARDENING:\s*(?P<method>\S+)\s+attempt\s+(?P<attempt>\d+)/(?P<attempts>\d+)\s+"
+            r"(?:timed out after (?P<timeout_s>\d+)s"
+            r"|failed \((?P<error_type>[^:()]+):\s*(?P<error>.*)\))\s*$"
+        ),
+    ),
+    MarkerSpec(
+        "publish_skipped_closed",
+        # Per-QUESTION pre-publish skip WARN (metaculus_bot/publish_gate.py). The
+        # counterpart to publish_hardening above: that marker fires when a POST was
+        # attempted and died, this one when the gate saw the window had closed and
+        # made no POST at all. Both point at the same underlying problem (latency
+        # against a question's close deadline), and this is the one that names the
+        # question and by how many seconds it missed, which is what a latency
+        # analysis needs and what CLOSE_MARGIN alone cannot say (a negative margin
+        # there does not distinguish "published late but accepted" from "never
+        # published"). ``overdue_s`` can be negative under reason=state_closed,
+        # meaning the question was shut ahead of its scheduled close.
+        re.compile(
+            r"PUBLISH_SKIPPED_CLOSED:\s*question=(?P<question>\S+)\s+reason=(?P<reason>\S+)"
+            r"\s+close_time=(?P<close_time>\S+)\s+now=(?P<now>\S+)"
+            r"\s+overdue_s=(?P<overdue_s>\S+)\s+state=(?P<state>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # publish_gate.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "time_budget",
+        # Per-QUESTION budget grant INFO (metaculus_bot/time_budget.py), emitted for
+        # EVERY question including the roomy ones. That is the point: CLOSE_MARGIN,
+        # the only other close-time telemetry, is emitted after a SUCCESSFUL
+        # submission, so it is censored on exactly the thin-window questions the
+        # budget exists for (q45085 had 22 seconds of headroom and appears in no
+        # CLOSE_MARGIN record). This marker is the uncensored denominator: how often a
+        # window is actually thin, and how often the fast path fires.
+        #
+        # ``close_limited`` says the close time — not the static
+        # PER_QUESTION_WALL_CLOCK_DEADLINE — set the budget; ``fast_path`` says the
+        # optional research stages were dropped, and is the per-question detail behind
+        # the ``time_budget_fast_path`` counter in the degradation line.
+        re.compile(
+            r"TIME_BUDGET:\s*question=(?P<question>\S+)\s+budget_s=(?P<budget_s>\S+)"
+            r"\s+close_time=(?P<close_time>\S+)\s+close_limited=(?P<close_limited>\S+)"
+            r"\s+fast_path=(?P<fast_path>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # time_budget.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "time_budget_fast_path",
+        # Per-QUESTION WARN (forecaster.py) when the close-derived budget dropped the
+        # optional research stages. The INFO TIME_BUDGET line above carries the same
+        # fact as a field; this is the loud half docs/operations.md tells the operator
+        # to grep, and without a spec it vanished at the 90-day GHA log expiry.
+        # ``close_time`` is a datetime repr with an internal space, so it captures up
+        # to the semicolon rather than as one \S+ token.
+        re.compile(
+            r"TIME_BUDGET_FAST_PATH:\s*qid=(?P<question>\S+)\s+budget=(?P<budget_s>[\d.]+)s\s+close_time=(?P<close_time>[^;]+);"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "research_phase_deadline",
+        # Research-phase deadline WARN (research/orchestrator.py
+        # _await_providers_within_deadline): the outer budget bound cancelled
+        # straggler providers. Carries no question ref — the line names counts and
+        # provider names only — so qid_kind stays None; the cancelled providers also
+        # survive as status="deadline" rows in the archive's provider_results, which
+        # is where per-question attribution lives.
+        re.compile(
+            r"RESEARCH_PHASE_DEADLINE:\s*cancelled (?P<cancelled>\d+)/(?P<total>\d+) providers"
+            r" after (?P<deadline_s>[\d.]+)s \((?P<providers>[^)]*)\)"
+        ),
+    ),
+    MarkerSpec(
+        "gap_fill_skipped_for_budget",
+        # Per-QUESTION gap-fill skip (research/orchestrator.py): both passes dropped
+        # up front, either on the fast path or because the research phase had no
+        # budget left. ``research_phase_remaining`` is "n/a" (fast path — never
+        # computed) or "NNNs".
+        re.compile(
+            r"GAP_FILL_SKIPPED_FOR_BUDGET:\s*question=(?P<question>\S+)"
+            r"\s+fast_path=(?P<fast_path>\S+)\s+research_phase_remaining=(?P<research_phase_remaining>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # orchestrator logs question.id_of_question
+    ),
+    MarkerSpec(
+        "gap_fill_cut_for_budget",
+        # Per-QUESTION mid-phase gap-fill cut (research/orchestrator.py): the pass
+        # STARTED and was then cancelled at the research-phase deadline — the one
+        # budget event recoverable from nothing else once GHA logs expire (the
+        # up-front skip above and the fast path both have their own records).
+        # ``gap_fill_pass`` is V1 or V2.
+        re.compile(r"GAP_FILL_(?P<gap_fill_pass>V1|V2)_CUT_FOR_BUDGET:\s*question=(?P<question>\S+);"),
+        qid_kind=QID_KIND_QUESTION_ID,  # orchestrator logs question.id_of_question
     ),
     MarkerSpec(
         "paid_personal_key_fallback",
@@ -373,15 +711,23 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "run_alertable_summary",
-        # The end-of-run alertable breakdown (cli.py), emitted on BOTH exit paths —
-        # the green fully-suppressed case is exactly the one that would otherwise
-        # leave no record (the 2026-07-26 drained-key run read alertable=0 alongside
-        # real degradation). ``donated_key`` is the /auth/key probe verdict and is
+        # The end-of-run alertable breakdown (cli.py), emitted on EVERY path — the
+        # green fully-suppressed case is exactly the one that would otherwise leave no
+        # record (the 2026-07-26 drained-key run read alertable=0 alongside real
+        # degradation). ``donated_key`` is the /auth/key probe verdict and is
         # OPTIONAL-group wrapped twice over: it is omitted entirely when no spend-cap
         # failure made the wrapper probe, and the suppression clause between it and
         # ``credit`` only appears mid-window.
+        #
+        # ``outcome`` captures the literal "clean" that cli.py adds when nothing
+        # degraded at all (2026-08-25; before then such a run logged no line, so the
+        # census counted only degraded runs). It is None on every other shape,
+        # including all pre-2026-08-25 records — the alternation is purely additive.
+        # The token is what marks a run clean, NOT all-zero fields: a run that lost a
+        # question to a raising log_report_summary emits all zeros too (q45085's
+        # shape) and deliberately keeps the plain phrase.
         re.compile(
-            r"Run completed with (?P<alertable>\S+) alertable degradation event\(s\)\s*"
+            r"Run completed (?:(?P<outcome>clean) )?with (?P<alertable>\S+) alertable degradation event\(s\)\s*"
             r"\(bot=(?P<bot>\S+?), personal_key_fallback=(?P<personal_key_fallback>\S+?) of which "
             r"donated_404=(?P<donated_404>\S+?), credit=(?P<credit>\S+?)"
             r"(?: with (?P<suppressed_credit>\S+?) credit event\(s\) suppressed until (?P<resume_date>\S+?))?"
@@ -463,6 +809,20 @@ MARKER_SPECS: list[MarkerSpec] = [
             re.IGNORECASE,
         ),
     ),
+    # Additive skip-reason companion to stacker_outcome (comment/markers.py):
+    # separates the mechanisms the plain "skipped" outcome conflates — spread below
+    # threshold, per-type config gate off, single-forecaster short-circuit (computes no
+    # spread at all), wall-clock budget, and ``spread_undefined`` (the spread could not
+    # be MEASURED; it must not read as an affirmative agreement). HTML-comment marker
+    # like its parent, so the same rarely-in-run-logs caveat applies.
+    MarkerSpec(
+        "stacker_skip_reason",
+        re.compile(
+            r"<!--\s*STACKER_SKIP_REASON=(?P<reason>spread_below_threshold|spread_undefined"
+            r"|config_off|single_forecaster|wall_clock_budget)\s*-->",
+            re.IGNORECASE,
+        ),
+    ),
     MarkerSpec("tools_used", re.compile(r"<!--\s*TOOLS_USED=(?P<value>true|false)\s*-->", re.IGNORECASE)),
     # Ensemble-size disclosure (metaculus_bot/comment/markers.py). Like the other
     # HTML-comment markers this lives in the published comment, not stdout — its
@@ -503,6 +863,13 @@ def _build_record(
         "line_ts": _parse_line_ts(line),
     }
     for field, raw in match.groupdict().items():
+        if field == "kv_pairs":
+            # Generic ``key=value`` tail (degradation_counters): every key the
+            # emitter writes harvests with no spec change; a key an era's line
+            # never emitted is absent from the record, never a measured zero.
+            for key, value in _KV_PAIR_RE.findall(raw or ""):
+                record[key] = coerce_value(value)
+            continue
         record[field] = raw if field in _RAW_FIELDS else coerce_value(raw)
     if "question" in record:
         record["qid"] = qid_from_ref(record["question"])

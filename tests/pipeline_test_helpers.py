@@ -200,7 +200,12 @@ _OPEN_TIME = datetime(2026, 1, 1)
 _RESOLVE_TIME = datetime(2026, 12, 31)
 
 
-def make_real_binary_question(qid: int = 1001) -> BinaryQuestion:
+def make_real_binary_question(qid: int = 1001, close_time: datetime | None = None) -> BinaryQuestion:
+    """A real BinaryQuestion. ``close_time`` drives the per-question time budget.
+
+    Left None by default so the existing e2e suite keeps the pre-time-budget shape
+    (no deadline -> the static budget); pass it to exercise a thin window.
+    """
     return BinaryQuestion(
         question_text="Will the US unemployment rate exceed 5% by December 2026?",
         id_of_question=qid,
@@ -216,6 +221,7 @@ def make_real_binary_question(qid: int = 1001) -> BinaryQuestion:
         ),
         fine_print="Uses seasonally adjusted figures from the BLS Employment Situation report.",
         open_time=_OPEN_TIME,
+        close_time=close_time,
         scheduled_resolution_time=_RESOLVE_TIME,
         api_json={"my_forecasts": {"latest": {"forecast_values": [0.3]}}},
     )

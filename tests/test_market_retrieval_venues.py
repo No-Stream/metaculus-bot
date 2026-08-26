@@ -555,32 +555,160 @@ class TestKalshiEventDerivations:
         assert match.volume_24h is None, "24h volume belongs to the quoted strike, and none is quoted"
         assert match.total_volume is not None, "withholding the price must not withhold the money"
         assert [(child.title, child.implied_prob_yes) for child in match.children] == [
+            ("Before Jan 1, 2027", pytest.approx(0.285)),
             ("Before Jul 1, 2027", pytest.approx(0.35)),
             ("Before Jan 1, 2028", pytest.approx(0.445)),
-            ("Before Jan 1, 2027", pytest.approx(0.285)),
         ]
 
-    def test_the_strike_children_are_ordered_by_traded_size(self, multi_close_page: dict[str, Any]) -> None:
-        """The renderer truncates a long ladder from the end, so the order decides which rungs a
-        forecaster sees. Ranked on the same figure the `signal` label scores — the larger of a
-        strike's USD volume and its USD open interest — so the leading sub-row is the one whose
-        price is worth the most weight, not the catalogue's first threshold."""
+    def test_the_strike_children_arrive_in_the_catalogues_own_order(self, multi_close_page: dict[str, Any]) -> None:
+        """Unsorted, which is the 2026-08-25 inversion of this assertion.
+
+        It used to pin price-descending, because the renderer truncated a long ladder from the end and
+        the parser's order therefore decided which rungs a forecaster would ever see. Nothing is
+        truncated now, so the parser has no survival decision to make — and the order it destroyed
+        carries real meaning: Kalshi's nested array is threshold/date-ordered, which is the only order a
+        cumulative ladder reads in. Presentation moved to the renderer, which sorts a copy for the full
+        rows and reads this order for the ladder.
+        """
         event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
-        assert [market["yes_sub_title"] for market in event["markets"]][1] == "Before Jan 1, 2027", (
-            "fixture must not already be in traded-size order, or this proves nothing"
-        )
+        expected = [market["yes_sub_title"] for market in event["markets"] if market["status"] == "active"]
 
         children = venues.kalshi_strike_children(event["markets"])
 
-        depths = [max(child.total_volume or 0.0, child.open_interest or 0.0) for child in children]
-        assert depths == sorted(depths, reverse=True)
-        assert children[0].title == "Before Jul 1, 2027", "the deepest strike leads"
+        assert [child.title for child in children] == expected
+        assert expected == ["Before Jan 1, 2027", "Before Jul 1, 2027", "Before Jan 1, 2028"], (
+            "the fixture's own array is threshold-ordered, which is what makes this order the meaningful one"
+        )
+        prices = [child.implied_prob_yes or 0.0 for child in children]
+        assert prices != sorted(prices, reverse=True), "and it is NOT price order, or this proves nothing"
+
+    def test_an_open_strike_with_an_empty_book_reports_no_price(self) -> None:
+        """A midpoint is only a price when a book supports it.
+
+        An empty Kalshi book is bid 0.0000 / ask 1.0000, whose midpoint is a synthetic $0.50 nobody
+        quoted. `kalshi_tradeable_strikes` already scoped SETTLED strikes out for exactly this reason —
+        calling the result "a synthetic $0.50 nobody traded at" — while an OPEN strike with an empty book
+        had no guard at all, which is how a rendered table came to tell a forecaster the market prices
+        `P(diesel > $5.40) = 0.50` with diesel near $4.70. The raw book still rides along so the render
+        can show what was quoted.
+        """
+        strikes = [
+            {
+                "yes_sub_title": "Above $5.40",
+                "status": "active",
+                "yes_bid_dollars": "0.0000",
+                "yes_ask_dollars": "1.0000",
+                "volume_fp": "0",
+                "open_interest_fp": "0",
+            },
+            {
+                "yes_sub_title": "Above $4.60",
+                "status": "active",
+                "yes_bid_dollars": "0.5100",
+                "yes_ask_dollars": "0.5400",
+                "volume_fp": "900",
+                "open_interest_fp": "900",
+            },
+        ]
+
+        children = venues.kalshi_strike_children(strikes)
+
+        by_label = {child.title: child for child in children}
+        assert by_label["Above $5.40"].implied_prob_yes is None
+        assert by_label["Above $5.40"].price_withheld is True
+        assert (by_label["Above $5.40"].quote_low, by_label["Above $5.40"].quote_high) == (0.0, 1.0)
+        assert by_label["Above $4.60"].implied_prob_yes == pytest.approx(0.525)
+        assert by_label["Above $4.60"].price_withheld is False
+
+    @pytest.mark.parametrize(
+        ("bid", "ask", "priced"),
+        [
+            ("0.0000", "1.0000", False),  # no book at all
+            ("0.3000", "1.0000", False),  # quoted, but far wider than any observed real spread
+            ("0.4000", "0.8000", False),  # exactly at the threshold, which is inclusive
+            ("0.4000", "0.7900", True),  # just inside it
+            ("0.3000", "0.4000", True),  # the widest real spread on any committed capture
+        ],
+    )
+    def test_the_no_price_spread_threshold_is_inclusive(self, bid: str, ask: str, priced: bool) -> None:
+        """`KALSHI_NO_PRICE_SPREAD` is the weakest number in this change — calibrated on eleven live
+        strikes across the committed captures, whose real spreads run 0.01 to 0.10, so 0.40 sits 4x above
+        the widest observed one. Its exact boundary is pinned here because the run-log `withheld=` field
+        is what will retune it, and a silently-shifted comparison would make that measurement
+        uninterpretable."""
+        market = {"yes_bid_dollars": bid, "yes_ask_dollars": ask}
+
+        assert (venues.kalshi_strike_price(market) is not None) is priced
+
+    def test_the_committed_live_books_all_stay_priced(self) -> None:
+        """The false-positive guard, over every live TWO-SIDED book in every committed Kalshi
+        capture (all three files, 11 books): the threshold must blank degenerate books and
+        nothing else. Iterating one capture proved 5 of the 11 the docstring claimed — a
+        threshold retune could have blanked a real book in the other two files with this green."""
+        capture_files = (
+            "kalshi_multi_close_event_2026_08_04.json",
+            "kalshi_live_markets_2026_08_03.json",
+            "kalshi_family_liquidity_2026_08_05.json",
+        )
+        live: list[dict[str, Any]] = []
+        for name in capture_files:
+            page = json.loads((Path(__file__).parent / "data" / name).read_text())
+            live.extend(
+                market
+                for event in page["events"]
+                for market in event.get("markets", [])
+                if market.get("status") == "active"
+                and market.get("yes_bid_dollars") is not None
+                and market.get("yes_ask_dollars") is not None
+            )
+        assert len(live) >= 11, "the committed captures must actually contain the 11 live books"
+
+        for market in live:
+            spread = float(market["yes_ask_dollars"]) - float(market["yes_bid_dollars"])
+            assert spread < venues.kalshi.KALSHI_NO_PRICE_SPREAD, market.get("yes_sub_title")
+            assert venues.kalshi_strike_price(market) is not None, market.get("yes_sub_title")
+
+    def test_the_dollar_conversion_deliberately_does_not_take_the_no_price_rule(self) -> None:
+        """`kalshi_usd_liquidity` still midpoints an empty book, and that is the intended asymmetry.
+
+        The spread guard corrects a PRICE; this function converts a contract COUNT into dollars, so
+        applying the same rule here would delete a real count rather than fix a bad number. Blanking
+        the empty-book midpoint would blank the `total_vol` and `OI` cells on any no-book strike that
+        has traded, which is a strictly worse cell than a stale conversion. The one half of the
+        no-price rule the function DOES take (since 2026-08-25) is the no-price-at-all case: with
+        neither a book nor a last trade there is nothing to convert by, so volume dollars are None
+        rather than the old `price or 0.0` manufactured `$0`. The details its docstring calls
+        unpinned are pinned here too: the `last_price_dollars` fallback, the `or 1.0` notional
+        default, and the truthiness check that routes a genuine 0.0 midpoint to the last trade.
+        """
+        empty_book = {"volume_fp": "1000", "open_interest_fp": "400", "yes_bid_dollars": "0.0000"}
+        empty_book |= {"yes_ask_dollars": "1.0000", "notional_value_dollars": "1.0000"}
+        no_quotes = {"volume_fp": "1000", "last_price_dollars": "0.3000", "notional_value_dollars": "1.0000"}
+        zero_midpoint = {
+            "volume_fp": "1000",
+            "yes_bid_dollars": "0.0000",
+            "yes_ask_dollars": "0.0000",
+            "last_price_dollars": "0.2000",
+        }
+        traded_no_price = {"volume_fp": "1000", "open_interest_fp": "400"}
+
+        assert venues.kalshi_strike_price(empty_book) is None, "the PRICE is still refused"
+        assert venues.kalshi_usd_liquidity(empty_book) == (pytest.approx(500.0), pytest.approx(400.0))
+        assert venues.kalshi_usd_liquidity(no_quotes)[0] == pytest.approx(300.0)
+        # No notional field at all: open interest converts at the $1.00 default rather than vanishing.
+        assert venues.kalshi_usd_liquidity({"open_interest_fp": "400"})[1] == pytest.approx(400.0)
+        assert venues.kalshi_usd_liquidity(zero_midpoint)[0] == pytest.approx(200.0)
+        # A real contract count with no price to convert by is UNKNOWN dollars, not $0: open
+        # interest still converts (notional has a documented $1.00 default) but volume is None.
+        assert venues.kalshi_usd_liquidity(traded_no_price) == (None, pytest.approx(400.0))
 
     def test_a_settled_strike_is_never_rendered_as_a_child(self, multi_close_page: dict[str, Any]) -> None:
         """The same scope the money legs use, for the same reason: a settled Kalshi market publishes
         an EMPTY book (bid 0.0000 / ask 1.0000), so its midpoint is a synthetic $0.50 nobody traded
         at. Rendering that as a sub-row would invent a price, which is worse than the withholding
-        the children replace."""
+        the children replace. Belt and braces since 2026-08-25 — the spread guard would blank that
+        book anyway — but the scope still earns its place: a settled strike's realized figures are not
+        the family's forecast."""
         event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
         settled = event["markets"][0]
         assert (settled["status"], settled["yes_bid_dollars"], settled["yes_ask_dollars"]) == (
@@ -623,7 +751,8 @@ class TestKalshiEventDerivations:
 
         children = venues.kalshi_strike_children(event["markets"])
 
-        assert children[0].title == event["markets"][0]["ticker"]
+        # Membership, not position: the price sort decides where the labelless strike lands.
+        assert event["markets"][0]["ticker"] in {child.title for child in children}
 
     def test_a_collapsed_family_renders_no_children_because_it_quotes_a_price(
         self, family_liquidity_page: dict[str, Any]
@@ -720,6 +849,33 @@ class TestKalshiEventDerivations:
         assert (match.bid, match.ask) == (bid, ask)
         assert match.implied_prob_yes == pytest.approx((bid + ask) / 2.0)
         assert match.spread == pytest.approx(ask - bid)
+        assert match.price_withheld is False
+
+    def test_a_single_strike_event_with_no_book_withholds_its_price_and_keeps_the_book(
+        self, captured_payloads: dict[str, Any]
+    ) -> None:
+        """The PARENT-row half of the no-manufactured-price rule, and the reason one edit to
+        `kalshi_strike_price` fixes both sites.
+
+        A one-strike family quotes that strike's price as the market's own, on a row the ranker stamped
+        with a relation tier and the forecaster prompts tell a model to anchor on — so an empty book here
+        rendered a synthetic $0.50 as the strongest available evidence. The blanking must not take the
+        BOOK with it: `bid` / `ask` / `spread` are the evidence FOR the refusal, not a duplicate of the
+        price, and they are what lets the render show `0.00-1.00` rather than a bare dash.
+        """
+        event = copy.deepcopy(captured_payloads["kalshi_events"]["events"][0])
+        assert len(event["markets"]) == 1, "fixture must be single-market or this proves nothing"
+        event["markets"][0]["yes_bid_dollars"] = "0.0000"
+        event["markets"][0]["yes_ask_dollars"] = "1.0000"
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.implied_prob_yes is None
+        assert match.price_withheld is True
+        assert (match.bid, match.ask) == (0.0, 1.0)
+        assert match.spread == pytest.approx(1.0)
+        assert match.children == (), "still a one-strike family, so no sub-rows"
 
     def test_the_row_carries_the_ranked_retrieval_fields(self, multi_close_page: dict[str, Any]) -> None:
         event = _event(multi_close_page, "USCLIMATE")
@@ -831,6 +987,25 @@ class TestPolymarket:
         assert rows[0].volume_24h == pytest.approx(safe_float(event["volume24hr"]))
         assert rows[0].total_volume is not None and rows[0].total_volume > 4 * child_volume_sum
 
+    def test_an_absent_24h_volume_stays_none_rather_than_carrying_lifetime_volume(
+        self, captured_payloads: dict[str, Any]
+    ) -> None:
+        """`volume24hr` is optional on Gamma events (absent on 25 of 122 archived rows). The old
+        fallback silently substituted the LIFETIME `volume` — a recency field holding a number
+        with no recency, which is only harmless while nothing reads it. Absence must stay None."""
+        payload = copy.deepcopy(captured_payloads["polymarket_search"])
+        event = payload["events"][0]
+        del event["volume24hr"]
+        for market in event["markets"]:
+            market.pop("volume24hr", None)
+        assert safe_float(event["volume"]) is not None, "fixture must carry lifetime volume or this proves nothing"
+
+        rows = venues.parse_polymarket_matches(payload, width=60)
+
+        assert rows is not None
+        assert rows[0].volume_24h is None
+        assert rows[0].total_volume == pytest.approx(safe_float(event["volume"]))
+
     def test_a_single_market_event_is_unchanged_and_gains_no_children(self, captured_payloads: dict[str, Any]) -> None:
         """The superset half: event and market ask the same question when there is only one, so the
         price legs stay the market's and the row renders exactly as it always has."""
@@ -848,16 +1023,134 @@ class TestPolymarket:
         assert rows[1].bid == safe_float(event["markets"][0]["bestBid"])
         assert rows[1].total_volume == pytest.approx(safe_float(event["markets"][0]["volumeNum"]))
 
-    def test_the_children_are_ordered_by_traded_size(self, captured_payloads: dict[str, Any]) -> None:
-        """The renderer truncates from the end, so this order decides which outcomes a forecaster
-        sees. Reversing the payload must not reverse the render."""
+    def test_the_children_arrive_in_gammas_array_order(self, captured_payloads: dict[str, Any]) -> None:
+        """Unsorted, which is the 2026-08-25 inversion of this assertion.
+
+        It used to pin price-descending because the renderer truncated from the end. Nothing is truncated
+        now — the ladder row names every remaining outcome — so the parser has no survival decision to
+        make and Gamma's array order, which is the order an event's own outcome ladder reads in, survives
+        to the renderer. Reversing the payload therefore DOES reverse the children, and the renderer is
+        where the presentation order is applied.
+        """
         payload = copy.deepcopy(captured_payloads["polymarket_search"])
         payload["events"][0]["markets"].reverse()
 
         rows = venues.parse_polymarket_matches(payload, width=60)
 
         assert rows is not None
-        assert [child.title for child in rows[0].children] == ["0 (0 bps)", "1 (25 bps)"]
+        assert [child.title for child in rows[0].children] == ["1 (25 bps)", "0 (0 bps)"]
+
+    def test_an_untouched_placeholder_leg_reports_no_price(self) -> None:
+        """Gamma's `outcomePrices` default is `["0.5","0.5"]`, so a placeholder leg quotes exactly 0.5
+        with nothing behind it — 155 of the archive's 1,839 ranked-era child outcomes.
+
+        This is the shape that made `4e342da` a regression rather than a fix: q45189's own snapshot spent
+        four rows on `Candidate A 0.50, B 0.50, C 0.50, D 0.50` while the four real FL-22 candidates
+        (Carbonara 0.42, Burck 0.29, Keiser 0.15, Askar 0.12) went unrendered, because a fabricated 0.50
+        outranks every one of them under a price-descending order.
+        """
+
+        def outcome(title: str, price: float, **fields: Any) -> dict[str, Any]:
+            return {"groupItemTitle": title, "outcomePrices": json.dumps([str(price)]), **fields}
+
+        markets = [
+            outcome("Candidate A", 0.5, volumeNum=0.0, openInterest=0.0),
+            outcome("Candidate B", 0.5),  # no money fields at all
+            outcome("Carbonara", 0.42, volumeNum=41_000.0),
+        ]
+
+        children = venues.polymarket_event_children(markets)
+
+        by_label = {child.title: child for child in children}
+        assert by_label["Candidate A"].implied_prob_yes is None
+        assert by_label["Candidate A"].price_withheld is True
+        assert by_label["Candidate B"].implied_prob_yes is None
+        assert by_label["Carbonara"].implied_prob_yes == pytest.approx(0.42)
+        assert by_label["Carbonara"].price_withheld is False
+
+    @pytest.mark.parametrize(
+        ("fields", "priced"),
+        [
+            ({"volumeNum": 0.0, "openInterest": 0.0}, False),
+            ({}, False),
+            ({"volumeNum": 1_200.0}, True),
+            ({"openInterest": 900.0}, True),
+            ({"volumeNum": 0.0, "openInterest": 4.0}, True),
+        ],
+    )
+    def test_a_traded_exact_half_keeps_its_price(self, fields: dict[str, Any], priced: bool) -> None:
+        """The false-positive guard, and it is a measurement rather than a worry: the archive holds 3
+        exact-0.5 legs WITH trading against 155 without. A real 50/50 is a real price, so the guard turns
+        on trading evidence and not on the number. Open interest counts as well as volume, because a Gamma
+        leg can omit the volume field entirely (59 archived children) while still carrying OI."""
+        market = {"groupItemTitle": "coin flip", "outcomePrices": json.dumps(["0.5"]), **fields}
+
+        children = venues.polymarket_event_children([market])
+
+        assert (children[0].implied_prob_yes is not None) is priced
+
+    @pytest.mark.parametrize("price", ["0.49", "0.51", "0.500001"])
+    def test_a_price_beside_the_default_is_a_real_price_however_thin(self, price: str) -> None:
+        """The guard compares to Gamma's default EXACTLY, and that is the whole reason it is safe.
+
+        Any trade moves a leg off `["0.5","0.5"]`, so a price merely NEAR 0.5 is one somebody quoted —
+        and a tolerance here would silently delete real prices from every leg that happens to trade
+        close to even. A no-volume leg is a thin market, which the `signal` column already says.
+        """
+        market = {"groupItemTitle": "close to even", "outcomePrices": json.dumps([price]), "volumeNum": 0.0}
+
+        children = venues.polymarket_event_children([market])
+
+        assert children[0].implied_prob_yes == pytest.approx(float(price))
+        assert children[0].price_withheld is False
+
+    def test_a_single_market_events_own_price_takes_the_same_guard(self) -> None:
+        """The PARENT-row half. A single-market event quotes its market's price as the row's own, so an
+        untouched placeholder reaching the pool through that branch is the same fabrication under a
+        relation tier."""
+        event = {
+            "title": "Party B nominee?",
+            "slug": "party-b",
+            "markets": [{"question": "Party B nominee?", "outcomePrices": json.dumps(["0.5"]), "volumeNum": 0.0}],
+        }
+
+        rows = venues.parse_polymarket_matches({"events": [event]}, width=60)
+
+        assert rows is not None
+        assert rows[0].implied_prob_yes is None
+        assert rows[0].price_withheld is True
+
+    def test_the_top_level_markets_branch_takes_the_same_guard(self) -> None:
+        """The fallback path Gamma uses when a search returns no events reads the same field, so it
+        cannot be the one place a manufactured 0.5 survives."""
+        payload = {"markets": [{"question": "Placeholder", "outcomePrices": json.dumps(["0.5"]), "volumeNum": 0.0}]}
+
+        rows = venues.parse_polymarket_matches(payload, width=60)
+
+        assert rows is not None
+        assert rows[0].implied_prob_yes is None
+        assert rows[0].price_withheld is True
+
+    def test_a_settled_leg_is_marked_resolved_in_the_array_order(self) -> None:
+        """A nested Polymarket market can individually be closed while the event stays open (Kalshi
+        pre-scopes its strikes to live ones, so this venue is where the distinction shows). The flag is
+        per-leg, and it is what the RENDERER's order key reads to queue realized prices behind the rungs
+        still carrying uncertainty — the parser itself keeps Gamma's order."""
+
+        def outcome(title: str, price: float, *, closed: bool = False) -> dict[str, Any]:
+            return {"groupItemTitle": title, "outcomePrices": json.dumps([str(price)]), "closed": closed}
+
+        markets = [
+            outcome("0 cuts", 1.00, closed=True),
+            outcome("1 cut", 0.62),
+            outcome("2 cuts", 0.25),
+            outcome("3+ cuts", 0.08),
+        ]
+
+        children = venues.polymarket_event_children(markets)
+
+        assert [child.title for child in children] == ["0 cuts", "1 cut", "2 cuts", "3+ cuts"]
+        assert [child.is_resolved for child in children] == [True, False, False, False]
 
     def test_a_child_falls_back_to_its_question_when_it_has_no_group_label(
         self, captured_payloads: dict[str, Any]
@@ -872,6 +1165,21 @@ class TestPolymarket:
 
         assert rows is not None
         assert rows[0].children[0].title == "Will no Fed rate cuts happen in 2026?"
+
+    def test_a_leg_with_no_usable_label_is_dropped_rather_than_rendered_blank(self) -> None:
+        """A nameless leg would spend a sub-row saying nothing, and the ladder row would name it as a
+        bare price. The guard survived the 2026-08-25 rewrite of this loop (a comprehension with a
+        walrus became an explicit loop when the price guard was added), and the surviving legs keep
+        Gamma's order around the hole."""
+        markets = [
+            {"groupItemTitle": "1 cut", "outcomePrices": json.dumps(["0.62"])},
+            {"outcomePrices": json.dumps(["0.20"])},  # no groupItemTitle, question or title
+            {"groupItemTitle": "2 cuts", "outcomePrices": json.dumps(["0.18"])},
+        ]
+
+        children = venues.polymarket_event_children(markets)
+
+        assert [child.title for child in children] == ["1 cut", "2 cuts"]
 
     def test_the_markets_fallback_branch_also_reads_open_interest(self) -> None:
         payload = {
@@ -1188,29 +1496,146 @@ class TestManifoldMultiOutcome:
             assert by_label[answer["text"]].total_volume == pytest.approx(answer["volume"])
             assert by_label[answer["text"]].implied_prob_yes == pytest.approx(answer["probability"])
 
-    def test_the_answer_children_are_ordered_by_probability(self, manifold_multi_outcome: dict[str, Any]) -> None:
-        """Not by volume like the real-money venues: these answers are a distribution over one
-        question's outcomes, and reading it means seeing where the mass sits."""
-        children = venues.manifold_answer_children(manifold_multi_outcome["detail_multi_numeric"])
+    def test_the_answer_children_arrive_in_the_arrays_own_order(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """Unsorted, which is the 2026-08-25 inversion of this assertion.
 
-        # An answer with no readable probability is dropped rather than carried, so every child here
-        # has one — asserted rather than assumed, since the sort would be undefined otherwise.
-        assert all(child.implied_prob_yes is not None for child in children)
-        assert not any(child.is_resolved for child in children), "this fixture's rungs are all open"
+        This venue's probability-descending order set the pattern the other two copied, and the whole
+        pattern moved into the renderer: the parser was deciding what survived a render budget it could
+        not see, and Manifold's answers array is the ladder's own threshold order. Nothing is truncated
+        now, so that order carries meaning instead of consequence.
+        """
+        detail = manifold_multi_outcome["detail_multi_numeric"]
+
+        children = venues.manifold_answer_children(detail)
+
+        assert [child.title for child in children] == [answer["text"] for answer in detail["answers"]]
         probabilities = [child.implied_prob_yes or 0.0 for child in children]
-        assert probabilities == sorted(probabilities, reverse=True)
-        assert children[0].title == "$3.80 - $4.19"
+        assert probabilities != sorted(probabilities, reverse=True), "and NOT probability order"
+        assert children[0].title == "Below $3.00", "the array's own first rung, not its most probable"
 
-    def test_settled_rungs_queue_behind_the_ones_still_carrying_uncertainty(
-        self, manifold_multi_outcome: dict[str, Any]
-    ) -> None:
-        """Probability alone was the obvious sort and is measurably wrong here.
+    def test_an_untouched_answer_at_the_prior_reports_no_price(self) -> None:
+        """A freshly-created Manifold answer sits at its 0.5 PRIOR until somebody bets, so exactly 0.5
+        with zero volume is the venue's absence of a price. Rendering it told a forecaster the crowd was
+        split 50/50 on a rung nobody had touched.
 
-        A threshold ladder settles its crossed rungs to exactly 1.0 while the market stays open, so
-        this fixture's 10 settled rungs would sort to the front as a block of `1.00 RESOLVED` rows
-        and push all 7 rungs that still carry uncertainty past the render budget — spending the whole
-        allowance on the part of the ladder that is no longer a forecast. The settled rungs are real
-        evidence about the floor the series has crossed, so they follow rather than being dropped.
+        Gated on volume ALONE, unlike the Polymarket sibling: Manifold publishes no per-answer open
+        interest, so volume is the only trading evidence an answer carries. A MISSING volume is not
+        evidence of no trading, and blanking on its absence would delete real prices.
+        """
+        detail = {
+            "uniqueBettorCount": 47,
+            "answers": [
+                {"text": "untouched", "probability": 0.5, "volume": 0.0},
+                {"text": "real coin flip", "probability": 0.5, "volume": 900.0},
+                {"text": "no volume field", "probability": 0.5},
+                {"text": "ordinary rung", "probability": 0.27, "volume": 12.0},
+            ],
+        }
+
+        children = venues.manifold_answer_children(detail)
+
+        by_label = {child.title: child for child in children}
+        assert by_label["untouched"].implied_prob_yes is None
+        assert by_label["real coin flip"].implied_prob_yes == pytest.approx(0.5)
+        assert by_label["no volume field"].implied_prob_yes == pytest.approx(0.5)
+        assert by_label["ordinary rung"].implied_prob_yes == pytest.approx(0.27)
+        assert [child.price_withheld for child in children] == [True, False, False, False]
+
+    def test_an_untouched_binary_market_reports_no_parent_price(self) -> None:
+        """The third same-class surface, missed by the answer-level sweep: a fresh BINARY
+        market is created at exactly 0.50 with zero volume, and that manufactured number
+        rendered as the PARENT `prob` cell — the one the prompt tells models to anchor on
+        (the archive holds a live specimen at 0.5 / volume 0.0). Same volume-gated blanking,
+        same `price_withheld` accounting as the answer surfaces."""
+        payload = [
+            {
+                "id": "m-fresh",
+                "question": "Fresh at the prior?",
+                "outcomeType": "BINARY",
+                "probability": 0.5,
+                "volume": 0.0,
+            },
+            {
+                "id": "m-coin",
+                "question": "Real coin flip?",
+                "outcomeType": "BINARY",
+                "probability": 0.5,
+                "volume": 900.0,
+            },
+            {"id": "m-thin", "question": "Ordinary?", "outcomeType": "BINARY", "probability": 0.27, "volume": 12.0},
+        ]
+
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None
+        by_title = {row.market_title: row for row in rows}
+        assert by_title["Fresh at the prior?"].implied_prob_yes is None
+        assert by_title["Fresh at the prior?"].price_withheld is True
+        assert by_title["Real coin flip?"].implied_prob_yes == pytest.approx(0.5)
+        assert by_title["Real coin flip?"].price_withheld is False
+        assert by_title["Ordinary?"].implied_prob_yes == pytest.approx(0.27)
+
+    def test_an_answer_the_parser_cannot_read_is_skipped_without_losing_its_siblings(self) -> None:
+        """The two guards inside the answer loop, which the 2026-08-25 price rewrite edited around: an
+        entry that is not a dict and an answer with no text or no probability are both skipped, and the
+        readable rungs keep the array's order across the hole. A skip that fell through would put a
+        blank-titled row into a family whose whole point is that every outcome is named."""
+        detail = {
+            "answers": [
+                {"text": "Below $3.00", "probability": 0.21, "volume": 30.0},
+                "not a dict at all",
+                {"text": "", "probability": 0.4},
+                {"text": "no probability"},
+                {"text": "Above $3.00", "probability": 0.79, "volume": 90.0},
+            ]
+        }
+
+        children = venues.manifold_answer_children(detail)
+
+        assert [child.title for child in children] == ["Below $3.00", "Above $3.00"]
+
+    @pytest.mark.parametrize("probability", [0.49, 0.51, 0.500001])
+    def test_a_probability_beside_the_prior_is_a_real_price_however_thin(self, probability: float) -> None:
+        """Compared to the 0.5 prior EXACTLY, because any bet moves an answer off it.
+
+        The Manifold sibling of the Polymarket guard, and the same reasoning: a tolerance would blank
+        real prices on every answer that happens to trade near even, while the volume column already
+        tells a forecaster how thin the rung is.
+        """
+        detail = {"answers": [{"text": "close to even", "probability": probability, "volume": 0.0}]}
+
+        children = venues.manifold_answer_children(detail)
+
+        assert children[0].implied_prob_yes == pytest.approx(probability)
+        assert children[0].price_withheld is False
+
+    def test_an_untouched_answer_is_dropped_from_the_ranker_segment(self) -> None:
+        """The two surfaces dispose of a blanked answer differently, and the asymmetry is deliberate.
+
+        ``manifold_top_answers`` feeds the RANKER's one-line candidate, upstream of the render — so a
+        defaulted 0.5 there does not merely misprice a row, it distorts which markets get selected at all
+        (0.5 leads the three-leader segment and describes the market to the ranker as an even split). A
+        one-line segment has no room to say "unpriced", so the answer is dropped, matching that function's
+        existing rule for an answer with nothing to say. A table row CAN say it, so the child survives.
+        """
+        detail = {
+            "uniqueBettorCount": 47,
+            "answers": [
+                {"text": "untouched", "probability": 0.5, "volume": 0.0},
+                {"text": "ordinary rung", "probability": 0.27, "volume": 12.0},
+            ],
+        }
+
+        assert venues.manifold_top_answers(detail) == (("ordinary rung", 0.27),)
+        assert [child.title for child in venues.manifold_answer_children(detail)] == ["untouched", "ordinary rung"]
+
+    def test_a_settled_rung_keeps_its_place_and_carries_its_flag(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """A threshold ladder settles its crossed rungs to exactly 1.0 while the market stays open — 10
+        of this fixture's 17 answers — and those rungs are the floor the series has already passed.
+
+        The parser reports the flag per answer and leaves each rung where the array put it. Queueing
+        realized prices behind the rungs that still carry uncertainty is the RENDERER's job now, which is
+        where the budget they compete for is visible; the reasoning was never wrong, only misplaced.
         """
         detail = manifold_multi_outcome["detail_multiple_choice"]
         settled = sum(1 for answer in detail["answers"] if answer.get("resolution"))
@@ -1219,11 +1644,9 @@ class TestManifoldMultiOutcome:
         children = venues.manifold_answer_children(detail)
 
         flags = [child.is_resolved for child in children]
-        assert flags == sorted(flags), "every open rung precedes every settled one"
-        open_rungs = [child for child in children if not child.is_resolved]
-        assert len(open_rungs) == len(detail["answers"]) - settled
-        open_probabilities = [child.implied_prob_yes or 0.0 for child in open_rungs]
-        assert open_probabilities == sorted(open_probabilities, reverse=True)
+        assert flags == [bool(answer.get("resolution")) for answer in detail["answers"]]
+        assert flags != sorted(flags), "the parser must NOT hoist the open rungs — the renderer does that"
+        assert sum(flags) == settled
 
     def test_a_market_publishing_answers_publishes_no_market_level_price(
         self, manifold_multi_outcome: dict[str, Any]

@@ -380,7 +380,24 @@ async def run_pdf_for_qid(
             for name in option_order:
                 if name in pred:
                     per_option_values[name].append(pred[name])
-        aggregated = aggregate_mc(per_option_values, option_order, method=aggregation)
+        try:
+            aggregated = aggregate_mc(per_option_values, option_order, method=aggregation)
+        except ValueError as exc:
+            # aggregate_mc raises rather than imputing a share no model declared. One
+            # degenerate ballot is that QUESTION's defect — cache an attributed error
+            # payload instead of aborting a stage whose other questions' forecaster
+            # calls are already paid for.
+            error_payload = make_error_payload(
+                arm=arm_label,
+                reason="degenerate_mc_ballot",
+                model_used=STRUCTURED_MATH_LABEL,
+                n_forecasters=n_structured,
+                cross_model_aggregation=None,
+                errors=[str(exc)],
+            )
+            cache.write_stacker_output(qid=qid, arm=arm_label, payload=error_payload)
+            await asyncio.sleep(0)
+            return error_payload
     elif isinstance(question, NumericQuestion):
         aggregated = await _aggregate_numeric_predictions(structured_predictions, question, aggregation)
     else:

@@ -21,6 +21,12 @@ Two decisions shape everything here.
   ``MarketChild`` sub-row per tradeable strike, each with its own ``yes_sub_title`` and its own
   midpoint, which is what makes the family-level ``None`` a statement about the family rather than
   a loss of the data. A one-strike family is untouched — it still quotes that strike directly.
+- **A midpoint is only a price when a book supports it, and the children arrive in CATALOGUE
+  order.** Both from 2026-08-25. ``kalshi_strike_price`` reports ``None`` on a book at least
+  ``KALSHI_NO_PRICE_SPREAD`` wide, so an empty ``0.0000``/``1.0000`` book stops rendering a
+  synthetic $0.50 as a market price; and the parser no longer sorts its children, because the
+  renderer owns presentation and price-descending scrambles the cumulative threshold ladders that
+  are half of the archived Kalshi families.
 """
 
 from __future__ import annotations
@@ -128,6 +134,16 @@ KALSHI_NESTED_TAIL_FIELDS: tuple[str, ...] = tuple(
 # A Kalshi market whose status is one of these has settled. Load-bearing on the EVENT twice over: an
 # event is resolved only when every nested market is, and its money/price legs read only the rest.
 KALSHI_RESOLVED_STATUSES: frozenset[str] = frozenset({"settled", "finalized", "closed"})
+
+# A book this wide does not imply a price, so `kalshi_strike_price` reports none rather than its
+# midpoint. Calibration is thin and deliberately generous: the only committed live-book captures
+# quote real spreads of 0.01-0.10 (11 live strikes across the three Kalshi fixtures), an empty book
+# is `yes_bid 0.0000` / `yes_ask 1.0000` (spread 1.0), and this module already documents empty books
+# as 1,063 of 1,066 settled strikes versus 44 of 71,413 live ones. 0.40 sits 4x above the widest
+# observed real spread, so it fires on a degenerate book and not on a genuinely wide quote. The
+# `MARKET_CHILD_RENDER` marker's `withheld=` field reports how often it fires in prod, so this can be
+# tightened on measured data instead of guesswork — see the design's "weakest number in the spec".
+KALSHI_NO_PRICE_SPREAD = 0.40
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,9 +446,27 @@ def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | 
     it to "always return 0.0000" (confirmed on 1,504 live markets and all 127 archived rows).
     Scoring off it would wire in a constant zero.
 
-    Three details here are UNPINNED by any test: the ``last_price_dollars`` fallback, the ``or 1.0``
-    notional default, and the ``if not price:`` truthiness (which routes a genuine 0.0 midpoint to
-    the last trade). "Simplifying" any of them blanks or misstates labels with a green suite.
+    This function deliberately does NOT take ``KALSHI_NO_PRICE_SPREAD``'s no-manufactured-price rule,
+    and does not call ``kalshi_strike_price``. It midpoints an empty book too, but it does so to
+    convert a contract COUNT into dollars and it falls back to the last trade — so the choice is
+    between a stale-price conversion and dropping a real count, and the paragraph above argues that
+    tradeoff. Blanking here would delete the count instead of correcting a price. The cost is
+    acknowledged: a no-book strike carrying volume can still render an inflated ``total_vol`` cell,
+    and the exactly-empty book is 44 of 71,413 live strikes.
+
+    What it does NOT do is state a dollar figure with no price to convert by. With neither a
+    book nor a last trade, ``volume_usd`` is None — the count is real but its dollar value is
+    unknown, and the old ``price or 0.0`` turned that into a measured ``$0`` that reads as a
+    market nobody traded. That withholding deliberately covers a priceless ZERO count too (its
+    dollars are knowably $0, but one rule — no price, no dollar claim — beats a special case for
+    a market nobody has traded). Open interest is unaffected: it converts by notional, which has
+    a documented $1.00 default.
+
+    Every detail above is pinned by
+    ``test_the_dollar_conversion_deliberately_does_not_take_the_no_price_rule``: the
+    ``last_price_dollars`` fallback, the ``or 1.0`` notional default, the ``if not price:``
+    truthiness (which routes a genuine 0.0 midpoint to the last trade), and the no-price
+    ``volume_usd is None`` arm. "Simplifying" any of them blanks or misstates labels.
     """
     volume = safe_float(market.get("volume_fp"))
     open_interest = safe_float(market.get("open_interest_fp"))
@@ -448,7 +482,7 @@ def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | 
         price = safe_float(market.get("last_price_dollars"))
     notional = safe_float(market.get("notional_value_dollars")) or 1.0
 
-    volume_usd = None if volume is None else volume * (price or 0.0)
+    volume_usd = None if (volume is None or price is None) else volume * price
     open_interest_usd = None if open_interest is None else open_interest * notional
     return volume_usd, open_interest_usd
 
@@ -495,7 +529,7 @@ def kalshi_event_usd_liquidity(nested: Sequence[dict[str, Any]]) -> tuple[float 
 
 
 def kalshi_strike_price(market: dict[str, Any]) -> float | None:
-    """One strike's implied yes-probability: its bid/ask midpoint, or ``None`` if a side is missing.
+    """One strike's implied yes-probability: its bid/ask midpoint, or ``None`` when the book has none.
 
     The single pricing rule for the venue, shared by the family's own price legs and by every
     strike sub-row, so a family and its children can never disagree about what a strike is worth.
@@ -503,27 +537,54 @@ def kalshi_strike_price(market: dict[str, Any]) -> float | None:
     current price, and its last trade may be arbitrarily stale. (``kalshi_usd_liquidity`` does fall
     back to the last trade, because converting a contract COUNT to dollars at a stale price is far
     better than dropping the count.)
+
+    ``None`` in two cases, and the second one is the 2026-08-25 fix. A missing side has always
+    reported none. A book at least ``KALSHI_NO_PRICE_SPREAD`` wide now does too, because a midpoint is
+    only a price when a book supports it: an EMPTY Kalshi book is ``yes_bid 0.0000`` / ``yes_ask
+    1.0000``, whose midpoint is a synthetic $0.50 nobody quoted, and the render then told a forecaster
+    the market prices ``P(diesel > $5.40) = 0.50`` on a rung that had never traded, with diesel near
+    $4.70. Six of 23 archived cumulative ladders rendered arithmetically impossible non-monotone
+    prices off that default. ``kalshi_tradeable_strikes`` already scoped SETTLED strikes out for
+    exactly this reason and called the result "a synthetic $0.50 nobody traded at"; an OPEN strike
+    with an empty book had no guard at all, which is the gap this closes.
+
+    One edit covers both callers on purpose: the multi-strike sub-rows AND the single-strike FAMILY
+    price that ``kalshi_event_match`` quotes as the parent's, on a row that carries a relation tier.
+    ``kalshi_event_match``'s own ``bid`` / ``ask`` / ``spread`` fields keep reporting the raw book —
+    they are the EVIDENCE for the blanking rather than a duplicate of the price.
     """
     bid, ask = safe_float(market.get("yes_bid_dollars")), safe_float(market.get("yes_ask_dollars"))
-    return (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
+    if bid is None or ask is None:
+        return None
+    return None if ask - bid >= KALSHI_NO_PRICE_SPREAD else (bid + ask) / 2.0
 
 
 def kalshi_strike_children(nested: Sequence[dict[str, Any]]) -> tuple[MarketChild, ...]:
-    """Each tradeable strike as its own sub-row, MOST-TRADED FIRST. ``()`` for a one-strike family.
+    """Each tradeable strike as its own sub-row, in ``kalshi_tradeable_strikes`` order. ``()`` for a
+    one-strike family.
 
     The multi-strike answer, and the exact complement of ``kalshi_price_strike``: children populate
     when that returns ``None`` and are empty when it returns a strike, so a family either quotes one
     price at the family level or quotes every strike's below it, never both and never neither.
 
-    Scoped to ``kalshi_tradeable_strikes`` for the same reason the money legs are: a settled strike
-    publishes an EMPTY book (``yes_bid 0.0000`` / ``yes_ask 1.0000`` on 1,063 of 1,066 settled
-    strikes inside open events), so its midpoint is a synthetic $0.50 nobody traded at. Rendering
-    that as a sub-row would be inventing a price, which is worse than the withholding this replaces.
-    An all-settled family falls back to its own strikes there, so its realized prices do render.
+    Scoped to ``kalshi_tradeable_strikes`` because a settled strike publishes an EMPTY book
+    (``yes_bid 0.0000`` / ``yes_ask 1.0000`` on 1,063 of 1,066 settled strikes inside open events),
+    and a family's live strikes are its forecast. An all-settled family falls back to its own strikes
+    there; those books are empty too, so their prices now blank rather than rendering a synthetic
+    $0.50 — the realized figures a resolved family still carries are its volume and open interest.
 
-    Volume-descending because the renderer truncates from the end and a 17-rung ladder overruns the
-    child budget: the rungs carrying the trading are the ones worth the slots. The sort is STABLE,
-    so a family whose strikes report no volume keeps the catalogue's own (threshold) order.
+    **CATALOGUE ORDER, unsorted**, and that is a contract rather than an omission. Kalshi's
+    ``/events`` nested array arrives threshold/date-ordered (``Before Jul 1 2026, Before Jan 1 2027,
+    Before Jul 1 2027, Before Jan 1 2028`` on the committed multi-close fixture), which is the order
+    the ladder means something in. Sorting here was a presentation decision taken in the parser, where
+    it could not see the render budget it was deciding survival against — and price-descending
+    scrambles a cumulative threshold ladder, which is half of the archived Kalshi families. The
+    renderer owns presentation now: it sorts a copy by ``child_render_order_key`` for the full
+    sub-rows and reads THIS order for the ladder row that names every remaining outcome.
+
+    ``quote_low`` / ``quote_high`` carry the raw book on every child, so a strike whose price blanks
+    still renders what was quoted (``0.00-1.00`` for no book at all, ``0.30-1.00`` for a quoted but
+    unusably wide one) instead of a bare dash.
     """
     tradeable = kalshi_tradeable_strikes(nested)
     if len(tradeable) < 2:
@@ -535,17 +596,23 @@ def kalshi_strike_children(nested: Sequence[dict[str, Any]]) -> tuple[MarketChil
         if not title:
             continue
         volume_usd, open_interest_usd = kalshi_usd_liquidity(market)
+        bid, ask = safe_float(market.get("yes_bid_dollars")), safe_float(market.get("yes_ask_dollars"))
+        price = kalshi_strike_price(market)
         children.append(
             MarketChild(
                 title=title,
-                implied_prob_yes=kalshi_strike_price(market),
+                implied_prob_yes=price,
                 total_volume=volume_usd,
                 open_interest=open_interest_usd,
                 is_resolved=(market.get("status") or "").lower() in KALSHI_RESOLVED_STATUSES,
                 close_time=parse_iso(market.get("close_time") or ""),
+                quote_low=bid,
+                quote_high=ask,
+                # A two-sided book we declined to midpoint, as opposed to a strike the venue quotes
+                # nothing for. Only the first is this repo's refusal, and only it is worth counting.
+                price_withheld=price is None and bid is not None and ask is not None,
             )
         )
-    children.sort(key=lambda child: max(child.total_volume or 0.0, child.open_interest or 0.0), reverse=True)
     return tuple(children)
 
 
@@ -597,6 +664,12 @@ def kalshi_event_match(event: dict[str, Any], *, match_confidence: float, channe
 
     A family that quotes none carries ``children`` instead, one sub-row per strike, so the prices the
     family level cannot state are stated where they are true rather than dropped.
+
+    A SINGLE-strike family is where ``KALSHI_NO_PRICE_SPREAD`` reaches the parent row: its one strike's
+    price IS the row's, on a row the ranker stamped with a relation tier, so a strike with no real book
+    used to quote a synthetic $0.50 as the market's own anchor. ``implied_prob_yes`` now blanks and
+    ``price_withheld`` records that we refused it, while ``bid`` / ``ask`` / ``spread`` still report the
+    raw book — which is what lets the renderer show the range instead of a dash.
     """
     title = event.get("title") or event.get("sub_title") or ""
     if not title:
@@ -637,4 +710,5 @@ def kalshi_event_match(event: dict[str, Any], *, match_confidence: float, channe
         sub_title=str(event.get("sub_title") or ""),
         settlement_sources=settlement_sources(event.get("settlement_sources")),
         children=kalshi_strike_children(nested),
+        price_withheld=implied is None and yes_bid is not None and yes_ask is not None,
     )

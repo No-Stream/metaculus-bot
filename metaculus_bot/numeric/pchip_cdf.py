@@ -254,22 +254,36 @@ def generate_pchip_cdf(
         if abs(zero_point - lower_bound) < 1e-6 or abs(zero_point - upper_bound) < 1e-6:
             raise ValueError(f"zero_point ({zero_point}) too close to bounds [{lower_bound}, {upper_bound}]")
 
-    # Clean and validate percentile values
+    # Clean and validate percentile values.
+    #
+    # The KEY filter is a genuine filter and must stay one: `_postprocess_ensemble_cdf`'s
+    # discrete branch deliberately passes labels of 0.0 and 100.0 (prob*100 over a 0..1
+    # span) and relies on them being dropped here before the boundary points are re-added.
+    # Raising on those would break every discrete question.
+    #
+    # A bad VALUE is the opposite case and now raises. Silently skipping it built a
+    # 12-of-13-point CDF while `declared_percentiles` still advertised 13 — a distribution
+    # missing an anchor the model declared, with nothing recording the loss. It is
+    # reachable: `json.loads` accepts a bare `NaN`, and the strictly-increasing check
+    # (`value <= prev`) is False for NaN, so NaN used to pass the block schema and publish.
+    # Every caller already handles ValueError (`build_numeric_distribution` falls back to
+    # forecasting-tools' builder, which re-validates), and the extraction ladder's own
+    # finiteness check now closes the upstream path.
     pv = {}
     for k, v in percentile_values.items():
         try:
             k_float = float(k)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"non-numeric percentile label {k!r} in declared percentiles") from exc
+        if not (0 < k_float < 100):
+            continue  # Boundary/out-of-range labels: dropped by design (see above).
+        try:
             v_float = float(v)
-
-            if not (0 < k_float < 100):
-                continue  # Skip invalid percentiles
-
-            if not np.isfinite(v_float):
-                continue  # Skip non-finite values
-
-            pv[k_float] = v_float
-        except (ValueError, TypeError):
-            continue  # Skip non-numeric entries
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"non-numeric value {v!r} at percentile {k_float}") from exc
+        if not np.isfinite(v_float):
+            raise ValueError(f"non-finite value {v_float} at percentile {k_float}")
+        pv[k_float] = v_float
 
     if len(pv) < 2:
         raise ValueError(f"Need at least 2 valid percentile points (got {len(pv)})")

@@ -4,6 +4,7 @@ Tests the full conditional stacking flow: spread computation -> threshold check 
 crux extraction -> targeted research -> stacking (or skip to median aggregation).
 """
 
+import math
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
@@ -343,6 +344,8 @@ class TestConditionalStackingBinaryTrigger:
 
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
+            assert bot._stacker_outcome[question.id_of_question] == "skipped"
+            assert bot._stacker_skip_reason[question.id_of_question] == "spread_below_threshold"
 
     @pytest.mark.asyncio
     async def test_diagnostics_seam_on_stacking_paths(self):
@@ -828,6 +831,7 @@ class TestNumericStackingEnabled:
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
             assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
+            assert bot._stacker_skip_reason[question.id_of_question] == "config_off"
 
     @pytest.mark.asyncio
     async def test_binary_high_spread_still_triggers_when_numeric_disabled(self, monkeypatch):
@@ -1268,6 +1272,67 @@ class TestConditionalStackingSkipLogMessage:
         assert bot._conditional_stacking_skipped_count == 1
 
 
+class TestUnmeasurableSpreadRoute:
+    """An UNMEASURABLE spread is its own routing case, not a huge one and not agreement.
+
+    ``numeric_percentile_spread`` reports ``inf`` when its normalizing denominator is
+    non-positive (see its ``SPREAD_UNDEFINED`` WARN). It used to report ``0.0``, which
+    ``route_after_forecasts`` read as "the models agree" and stamped
+    ``spread_below_threshold`` — a measurement failure published as an affirmative
+    agreement signal. ``inf`` alone would swing it the other way, firing a crux
+    extraction, a targeted search and a stacker call off no measurement at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_infinite_spread_skips_stacking_with_its_own_reason(self, monkeypatch, caplog):
+        monkeypatch.setenv("BINARY_STACKING_ENABLED", "true")
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY) as mocks:
+            with patch("metaculus_bot.stacking_route.compute_spread", return_value=math.inf):
+                with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
+                    await bot._research_and_make_predictions(question)
+
+        # No stacker spend: inf must not be read as "disagreement above threshold".
+        mocks["crux"].assert_not_called()
+        mocks["targeted"].assert_not_called()
+        assert bot._conditional_stacking_triggered_count == 0
+        assert bot._conditional_stacking_skipped_count == 1
+        # And the marker says what actually happened rather than claiming agreement.
+        assert bot._stacker_skip_reason[question.id_of_question] == "spread_undefined"
+
+    @pytest.mark.asyncio
+    async def test_the_skip_log_never_claims_the_models_agreed(self, monkeypatch, caplog):
+        monkeypatch.setenv("BINARY_STACKING_ENABLED", "true")
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY):
+            with patch("metaculus_bot.stacking_route.compute_spread", return_value=math.inf):
+                with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
+                    await bot._research_and_make_predictions(question)
+
+        skip_logs = [r.getMessage() for r in caplog.records if "Conditional stacking SKIPPED" in r.getMessage()]
+        assert len(skip_logs) == 1
+        assert "UNMEASURABLE" in skip_logs[0]
+        assert "<=" not in skip_logs[0]
+        assert str(question.id_of_question) in skip_logs[0]
+
+    @pytest.mark.asyncio
+    async def test_a_type_disabled_gate_is_unaffected_by_the_new_branch(self, monkeypatch):
+        # The three skip reasons stay distinct: an unmeasurable spread never reaches the
+        # per-type gate (there is no measurement to gate), so config_off keeps its own path.
+        monkeypatch.setenv("BINARY_STACKING_ENABLED", "false")
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY):
+            await bot._research_and_make_predictions(question)
+
+        assert bot._stacker_skip_reason[question.id_of_question] == "config_off"
+
+
 class TestSingleForecasterShortCircuit:
     """MIN_FORECASTERS_TO_PUBLISH=1 lets a question survive on one forecaster.
 
@@ -1330,6 +1395,9 @@ class TestSingleForecasterShortCircuit:
         assert len(skip_logs) == 1
         assert str(question.id_of_question) in skip_logs[0]
         assert bot._stacker_outcome[question.id_of_question] == "skipped"
+        # The additive skip-reason field: this path computes no spread at all, so
+        # without it the published marker reads identically to a low-spread skip.
+        assert bot._stacker_skip_reason[question.id_of_question] == "single_forecaster"
         assert question.id_of_question in bot._pipeline.expected_base_combines
 
         # The run-level summary must agree with the per-question log line above.

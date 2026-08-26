@@ -71,6 +71,12 @@ class AggregationPipeline:
     # Per-question state
     meta_reasoning: dict[int, str] = field(default_factory=dict)
     outcomes: dict[int, str] = field(default_factory=dict)
+    # Why a "skipped"/"skipped_config_off" outcome skipped: "spread_below_threshold",
+    # "config_off", or "single_forecaster". Only the skip paths in stacking_route
+    # write it; it rides the comment as the additive STACKER_SKIP_REASON marker, so
+    # the single-forecaster short-circuit (which computes no spread at all) stops
+    # reading identically to a spread-below-threshold skip in the published record.
+    skip_reasons: dict[int, str] = field(default_factory=dict)
     expected_base_combines: set[int] = field(default_factory=set)
     counters: AggregationCounters = field(default_factory=AggregationCounters)
 
@@ -164,7 +170,7 @@ class AggregationPipeline:
             )
             self.meta_reasoning[qid] = meta_text
 
-            percentile_list, zero_point = sanitize_percentiles(list(perc_list), question)
+            percentile_list, zero_point = sanitize_percentiles(list(perc_list), question, model_name=stacker_llm.model)
 
             mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
             if mismatch:

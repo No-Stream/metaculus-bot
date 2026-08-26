@@ -10,8 +10,10 @@ import numpy as np
 import pytest
 
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, GRID_SCALED_MAX_STEP_MERGED_AT
 from metaculus_bot.performance_analysis.width_monitor import (
     KNOWN_BUG_QIDS,
+    MIN_N_FOR_POINT_METRICS,
     TS_ANCHOR_ENABLE,
     WIDENING_FLIP,
     _cdf_and_grid,
@@ -20,6 +22,7 @@ from metaculus_bot.performance_analysis.width_monitor import (
     compute_all_eras,
     compute_era_metrics,
     compute_pit,
+    compute_pit_details,
     default_eras,
     jeffreys_ci,
     main,
@@ -63,6 +66,16 @@ def _record_with_pit(pit: float, **kwargs) -> dict:
     return _linear_cdf_record(resolution=pit * 100.0, **kwargs)
 
 
+def _row_cells(md: str, label: str) -> list[str]:
+    """The stripped cells of one rendered table row, indexed as in the header.
+
+    1=era, 2=n, 3=excl, 4=n_eff, 5=cov80, 6=cov50, 7=cov@10, 8=cov@50, 9=cov@90,
+    10=PIT std, 11=mean PIT, 12=med rel width, 13=band_miss, 14=OOB.
+    """
+    [row] = [line for line in md.splitlines() if line.startswith(f"| {label} |")]
+    return [cell.strip() for cell in row.split("|")]
+
+
 class TestPit:
     def test_pit_matches_linear_cdf(self):
         # F(x) = x/100 for the identity ramp, so PIT == resolution/100.
@@ -81,6 +94,84 @@ class TestPit:
         assert compute_pit(rec) is None
         # Non-numeric, non-OOB resolution.
         assert compute_pit(_linear_cdf_record(resolution="annulled")) is None
+
+
+def _below_bound_mass_record(*, resolution, per_model_percentiles=None, **kwargs) -> dict:
+    """The q44218 shape: open lower bound with most of the mass declared BELOW it.
+
+    Published CDF ramps 0.90 -> 0.975 over [100, 200], i.e. F(100) = 0.90: 90% of the
+    mass sits below the displayed lower bound. A resolution under 100 is therefore a
+    LOW-tail event, but grid interpolation clamps it to cdf[0] = 0.90 — the sign flip
+    the declared-percentile fallback exists to prevent.
+    """
+    rec = _linear_cdf_record(resolution=resolution, lower=100.0, upper=200.0, **kwargs)
+    rec["our_forecast_values"] = np.linspace(0.90, 0.975, GRID_N).tolist()
+    if per_model_percentiles is not None:
+        rec["per_model_numeric_percentiles"] = per_model_percentiles
+    return rec
+
+
+class TestOutOfGridPit:
+    """A numeric resolution BEYOND the value grid must not be censored at cdf[0]/cdf[-1]."""
+
+    def test_below_grid_resolution_reads_low_tail_not_the_clamp(self):
+        # Resolution 50 is below every declared value of every member, so each member
+        # curve reads its lowest declared percentile (P10 -> 0.10). The grid clamp
+        # would have said 0.90 — the opposite tail.
+        rec = _below_bound_mass_record(
+            resolution=50.0,
+            per_model_percentiles={
+                "model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]],
+                "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
+            },
+        )
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side == "low"
+        assert pit == pytest.approx(0.10, abs=1e-9)
+        assert compute_pit(rec) == pytest.approx(0.10, abs=1e-9)
+
+    def test_fallback_is_median_of_member_curves(self):
+        # Resolution 95: model-a interpolates 0.50 + (95-90)/(105-90)*0.40 = 0.6333,
+        # model-b reads exactly its P50 = 0.50; the median of the two is their mean.
+        rec = _below_bound_mass_record(
+            resolution=95.0,
+            per_model_percentiles={
+                "model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]],
+                "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
+            },
+        )
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side == "low"
+        assert pit == pytest.approx((0.6333333 + 0.50) / 2, abs=1e-6)
+
+    def test_above_grid_resolution_reads_high_tail(self):
+        rec = _below_bound_mass_record(
+            resolution=250.0,
+            per_model_percentiles={"model-a": [[10.0, 120.0], [50.0, 150.0], [90.0, 220.0]]},
+        )
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side == "high"
+        assert pit == pytest.approx(0.90, abs=1e-9)
+
+    def test_no_member_curves_keeps_grid_read_but_flags_oob(self):
+        # Degraded path (e.g. stacked-era records with no per-model bullets): the
+        # grid-endpoint read is kept, but the OOB side still surfaces the record.
+        rec = _below_bound_mass_record(resolution=50.0)
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side == "low"
+        assert pit == pytest.approx(0.90, abs=1e-9)
+
+    def test_in_grid_resolution_has_no_oob_side(self):
+        pit, oob_side = compute_pit_details(_linear_cdf_record(resolution=50.0))
+        assert oob_side is None
+        assert pit == pytest.approx(0.50, abs=1e-9)
+
+    def test_resolution_exactly_at_bound_keeps_endpoint_read(self):
+        # AT a bound the clamp IS the correct PIT: F(bound) = cdf[0].
+        rec = _below_bound_mass_record(resolution=100.0)
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side is None
+        assert pit == pytest.approx(0.90, abs=1e-9)
 
 
 class TestRelativeBandWidth:
@@ -149,6 +240,26 @@ class TestEraAssignment:
         assert assign_era({"bot_comment_created_at": None}, default_eras()) == "no_timestamp"
         assert assign_era({}, default_eras()) == "no_timestamp"
 
+    def test_unparseable_timestamp_is_not_attributed_to_an_era(self):
+        # A record whose timestamp can't be parsed must land in no_timestamp rather
+        # than silently defaulting into the first (or last) era — mis-attributing one
+        # record's config era is exactly what the shared parser exists to prevent.
+        for raw in ("not-a-date", "2026-13-45T99:00:00Z", ""):
+            assert assign_era({"bot_comment_created_at": raw}, default_eras()) == "no_timestamp"
+
+    def test_offset_and_naive_timestamps_land_in_the_same_era(self):
+        # The archive carries all three ISO shapes (Z, explicit offset, naive). They
+        # must agree, since a naive read of a -07:00 instant is 7 hours off and can
+        # cross a boundary.
+        eras = default_eras()
+        instant_utc = "2026-07-21T18:07:37Z"
+        same_instant_offset = "2026-07-21T11:07:37-07:00"
+        naive_utc = "2026-07-21T18:07:37"
+        labels = {
+            assign_era({"bot_comment_created_at": raw}, eras) for raw in (instant_utc, same_instant_offset, naive_utc)
+        }
+        assert labels == {"ts_anchor (sharpen)"}
+
 
 class TestEraBoundariesAreMergeDates:
     """Era boundaries must be MERGE-TO-MAIN timestamps, never authoring dates.
@@ -216,6 +327,18 @@ class TestEraBoundariesAreMergeDates:
         identical pre-anchor config and belongs in ``widening_off``."""
         assert assign_era({"bot_comment_created_at": created_at}, default_eras()) == "widening_off (k_tail=1.0)"
 
+    def test_every_b4e9df0_gate_reads_the_same_instant(self):
+        """The monitor's era boundary and the clamp screen's era gate are the SAME
+        merge, so they are aliases of one constant.
+
+        Both mark ``b4e9df0``: the era split the width rows are bucketed by, and the
+        instant after which a coarse discrete grid's max-step cap stopped being a flat
+        0.2. Two independently-edited copies could drift, which would file one record
+        into the anchor era while screening it under the pre-fix cap.
+        """
+        assert TS_ANCHOR_ENABLE is B4E9DF0_MERGED_AT
+        assert GRID_SCALED_MAX_STEP_MERGED_AT is B4E9DF0_MERGED_AT
+
     @pytest.mark.parametrize(
         "created_at",
         [
@@ -266,6 +389,30 @@ class TestEraMetrics:
         assert m is not None
         assert m.n_oob_low == 1
         assert m.n_oob_high == 1
+
+    def test_oob_counts_numeric_out_of_grid_resolution(self):
+        # A NUMERIC resolution beyond the grid counts as OOB even though its PIT is
+        # no longer pinned at 0.0/1.0 (it comes off the declared-percentile curves).
+        # The pre-fix counters tested PIT == 0.0/1.0 and read 0/0 on exactly this shape.
+        recs = [
+            _below_bound_mass_record(
+                resolution=50.0,
+                per_model_percentiles={"model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]]},
+            ),
+            _linear_cdf_record(resolution=50.0),
+        ]
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_pit == 2
+        assert m.n_oob_low == 1
+        assert m.n_oob_high == 0
+
+    def test_in_grid_pit_of_zero_is_not_counted_oob(self):
+        # A closed-bound resolution AT the minimum has PIT exactly 0.0 but is not
+        # out of grid; the old value-equality counter miscounted this as OOB.
+        m = compute_era_metrics("test", [_linear_cdf_record(resolution=0.0)])
+        assert m is not None
+        assert m.n_oob_low == 0
 
     def test_returns_none_without_numeric(self):
         assert compute_era_metrics("empty", [{"type": "binary"}]) is None
@@ -325,6 +472,80 @@ class TestEraMetricsClustering:
         assert "n_eff" in md
 
 
+class TestClusterCorrectionDisclosure:
+    """The cluster correction is inert on every archived dataset (one record per
+    post in all five pulls), while the legend used to tell the operator the CIs
+    had been cluster-widened and a code comment claimed "~62% of records share a
+    post" — a figure no dataset supports. The mechanism stays (a group post can
+    still resolve); the table now says per row whether it fired."""
+
+    def test_one_record_per_post_is_marked_inert(self):
+        recs = []
+        for i, res in enumerate((20.0, 40.0, 60.0, 80.0)):
+            rec = _linear_cdf_record(resolution=res)
+            rec["post_id"] = 100 + i
+            recs.append(rec)
+        [m] = [row for row in compute_all_eras(recs) if row.label == "all"]
+        assert m.ci_clustered is False
+        assert m.cov80 == pytest.approx(jeffreys_ci(4, 4))  # identical to the naive CI
+        md = render_markdown(compute_all_eras(recs))
+        assert _row_cells(md, "all")[4] == f"{m.n_eff} (=n)"
+
+    def test_multi_record_post_is_marked_widened(self):
+        recs = []
+        for i, res in enumerate((20.0, 30.0, 40.0, 60.0, 70.0, 80.0)):
+            rec = _linear_cdf_record(resolution=res)
+            rec["post_id"] = 1 if i < 3 else 2
+            recs.append(rec)
+        [m] = [row for row in compute_all_eras(recs) if row.label == "all"]
+        assert m.ci_clustered is True
+        md = render_markdown(compute_all_eras(recs))
+        assert _row_cells(md, "all")[4] == "2 (widened)"
+
+    def test_legend_states_the_marker_convention_rather_than_asserting_widening(self):
+        md = render_markdown(compute_all_eras([_record_with_pit(0.5)]))
+        assert "`(widened)`" in md
+        assert "`(=n)`" in md
+        assert "Every archived pull to date is `(=n)`." in md
+
+    def test_serialized_row_carries_the_flag(self):
+        m = compute_era_metrics("test", [_record_with_pit(0.5)])
+        assert m is not None
+        assert m.to_dict()["ci_clustered"] is False
+
+
+class TestUnderpoweredPointMetrics:
+    """cov@k / PIT std / mean PIT / band_miss carry no CI, so at small n they read
+    as estimates while their resolution (1/n) is coarser than the target they are
+    compared against. The worst case shipped: pit_std == 0.0 at n=1, which reads
+    as "maximally too WIDE"."""
+
+    def test_single_record_row_renders_na_not_a_zero_pit_std(self):
+        metrics = compute_all_eras([_record_with_pit(0.5)])
+        md = render_markdown(metrics)
+        cells = _row_cells(md, "all")
+        # cov@10, cov@50, cov@90, PIT std, mean PIT, then band_miss.
+        assert cells[7:12] == ["n/a"] * 5
+        assert cells[13] == "n/a"
+        # The CI columns still render: their width is the honest small-n signal.
+        assert cells[5].startswith("0.")
+
+    def test_underpowered_flag_and_raw_values_survive_in_json(self):
+        m = compute_era_metrics("test", [_record_with_pit(0.5)])
+        assert m is not None and m.underpowered is True
+        d = m.to_dict()
+        assert d["underpowered"] is True
+        assert d["pit_std"] == pytest.approx(0.0)  # kept for scripts, hidden from readers
+
+    def test_row_at_the_threshold_renders_numbers(self):
+        recs = [_record_with_pit(p) for p in np.linspace(0.05, 0.95, MIN_N_FOR_POINT_METRICS)]
+        m = compute_era_metrics("test", recs)
+        assert m is not None and m.underpowered is False
+        cells = _row_cells(render_markdown(compute_all_eras(recs)), "all")
+        assert cells[10] == f"{m.pit_std:.3f}"
+        assert "n/a" not in cells[7:12]
+
+
 class TestComputeAllEras:
     def test_buckets_by_era_and_emits_all_row(self):
         data = [
@@ -352,15 +573,36 @@ class TestComputeAllEras:
 class TestExcludeQids:
     """``exclude_qids`` drops named questions from every row, and says so.
 
-    The bug pair 43746/43747 (Minions / Toy Story 5 opening-weekend gross) is
-    excluded from every other dimension of the residual analysis; the width
-    monitor was the one place that still counted it. Both records are
-    PIT-extreme and sit in opposite tails, so leaving them in makes the active
-    era read mildly too narrow.
+    The known-pipeline-bug cohort is excluded from every other dimension of the
+    residual analysis; the width monitor was the one place that still counted it.
+    43746/43747 (Minions / Toy Story 5 opening-weekend gross) are both PIT-extreme
+    and sit in opposite tails, so leaving them in makes the active era read mildly
+    too narrow.
     """
 
-    def test_known_bug_qids_names_the_documented_pair(self):
-        assert KNOWN_BUG_QIDS == frozenset({"43746", "43747"})
+    def test_known_bug_qids_pins_the_documented_cohort(self):
+        """Membership is a deliberate, dated decision per question, so it is pinned
+        here rather than left to whatever a caller happens to pass.
+
+        43913 (WSOP bracelets) joined 2026-08-25: pre-`9f1175c` discrete max-step cap,
+        with all six forecasters stating 79.5-83% on the outcome that resolved while
+        the published CDF carried 20.00% on that bin — pinned at exactly 0.200000, the
+        201-grid ceiling misapplied to an 11-point grid. Receipts in
+        `scratch/residual_2026-08-24/dossiers/43913_dossier.md`.
+        """
+        assert KNOWN_BUG_QIDS == frozenset({"43746", "43747", "43913"})
+
+    def test_43913_drops_from_the_rows_it_was_added_for(self):
+        # The reclassification is only worth anything if the id actually matches: the
+        # collector writes question_id as an int, and 43913 is a discrete record, so
+        # both the coercion and the discrete/numeric type gate have to hold.
+        data = [
+            _record_with_pit(0.5, created_at="2026-06-11T00:00:00Z"),
+            _record_with_pit(0.99, created_at="2026-06-11T00:00:00Z", question_id=43913),
+        ]
+        by_label = {m.label: m for m in compute_all_eras(data, exclude_qids=KNOWN_BUG_QIDS)}
+        assert by_label["all"].n_pit == 1
+        assert by_label["all"].n_excluded == 1
 
     def test_default_keeps_every_record(self):
         """Exclusion is opt-in: callers pass the set explicitly."""

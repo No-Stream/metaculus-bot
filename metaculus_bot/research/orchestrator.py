@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import asdict
 
 import openai
@@ -60,10 +60,29 @@ from metaculus_bot.research.providers import (
     choose_provider_with_name,
     native_search_provider,
 )
+from metaculus_bot.time_budget import QuestionTimeBudget
 
 _PROVIDER_ERROR_MESSAGE_MAX_CHARS = 300
 
 logger = logging.getLogger(__name__)
+
+
+async def _empty_provider(_: MetaculusQuestion) -> str:
+    """Stand-in provider for a selection that produced nothing to run."""
+    return ""
+
+
+def _remaining_research_phase_s(time_budget: QuestionTimeBudget | None) -> float | None:
+    """Seconds the research phase may still spend, or None for unbounded.
+
+    ``None`` is both "this caller has no budget" and the value ``asyncio.wait`` /
+    ``asyncio.wait_for`` already take to mean "no timeout", so it passes straight
+    through to them without a sentinel translation.
+    """
+    if time_budget is None:
+        return None
+    return time_budget.research_phase_deadline_s()
+
 
 # Summarizer failures that legitimately soft-fail to the raw AskNews articles:
 # transient LLM-provider hiccups (``openai.APIError`` is the common base for
@@ -139,6 +158,28 @@ class ResearchOrchestrator:
         # alarm (investigating that beats silently missing a dead feature). See
         # run_research for the three mutually-exclusive bump points.
         self.gap_fill_v2_error_count: int = 0
+        # Per-QUESTION count of research thinned by the time budget OFF the fast
+        # path: a provider cancelled at the research-phase deadline, or gap-fill
+        # cut/skipped for budget, on a question whose window was wide enough that
+        # fast_path never fired. The fast path has its own alertable counter
+        # (_time_budget_fast_path_count, forecaster-side); without this one the
+        # band just above the threshold — where the research window can still sit
+        # under research's configured worst case — degraded silently and the
+        # end-of-run census read all-clear. Deduplicated per question (the seen
+        # set), so a question losing a provider AND both gap-fill passes counts
+        # once, and fast-path questions are excluded so nothing double-charges.
+        self.research_budget_cut_count: int = 0
+        self._research_budget_cut_seen: set[object] = set()
+
+    def _record_research_budget_cut(self, question: MetaculusQuestion, *, fast_path: bool) -> None:
+        """Count one question's budget-driven research degradation, once, off the fast path."""
+        if fast_path:
+            return
+        key: object = getattr(question, "id_of_question", None) or id(question)
+        if key in self._research_budget_cut_seen:
+            return
+        self._research_budget_cut_seen.add(key)
+        self.research_budget_cut_count += 1
 
     @property
     def prediction_market_degraded_count(self) -> int:
@@ -248,7 +289,16 @@ class ResearchOrchestrator:
         reset_source_loss_counter()
         reset_provider_health()
 
-    async def run_research(self, question: MetaculusQuestion) -> str:
+    async def run_research(self, question: MetaculusQuestion, time_budget: QuestionTimeBudget | None = None) -> str:
+        """Build one question's research bundle, inside its time budget if it has one.
+
+        ``time_budget`` is None for every caller that isn't the per-question
+        pipeline (tests, the research-only tooling), and then the phase runs
+        unbounded exactly as it did before. When present it does two things: on a
+        thin window (``fast_path``) the OPTIONAL stages are not run at all, and in
+        every case the phase is bounded by its share of the remaining budget so it
+        cannot spend the time the forecast fan-out and the prediction POST need.
+        """
         cache_key, cached = self._lookup_research_cache(question)
         if cached is not None:
             logger.info(f"Using cached research for question {cache_key}")
@@ -260,11 +310,19 @@ class ResearchOrchestrator:
                 logger.info(f"Using cached research for question {cache_key} (double-check)")
                 return cached
 
-            providers = self._select_research_providers()
+            fast_path = time_budget is not None and time_budget.fast_path
+            providers = self._select_research_providers(fast_path=fast_path)
             provider_names = [name for _, name in providers]
             logger.info(f"Using research providers: {provider_names}")
 
-            research, provider_results, asknews_raw = await self._run_providers_parallel(question, providers)
+            research, provider_results, asknews_raw = await self._run_providers_parallel(
+                question, providers, time_budget=time_budget
+            )
+            if any(pr.status == "deadline" for pr in provider_results):
+                # A provider cancelled at the research-phase deadline is budget-driven
+                # degradation; off the fast path nothing else counts it (see
+                # _record_research_budget_cut).
+                self._record_research_budget_cut(question, fast_path=fast_path)
 
             # Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
             # CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
@@ -272,10 +330,30 @@ class ResearchOrchestrator:
             # inside v1's worst-case envelope only under this parallelism).
             # Consequence: the v2 driver's brief sees the bundle WITHOUT v1's
             # addendum. v2's section appends after v1's.
+            #
+            # Both are OPTIONAL, and they are the research phase's largest optional
+            # cost: v1's configured worst case is 555s (analyzer 135 + resolver wave
+            # 420) and v2 measures 84s at p50 / 293s at its observed max. So the
+            # fast path drops both — that is where the time for a thin window comes
+            # from, far more than provider selection.
+            gap_fill_budget_s = _remaining_research_phase_s(time_budget)
+            skip_optional_gap_fill = fast_path or (gap_fill_budget_s is not None and gap_fill_budget_s <= 0.0)
             gap_fill_v1_active = (
-                env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
+                env_flag_enabled(GAP_FILL_ENABLED_ENV)
+                and not skip_optional_gap_fill
+                and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
             )
-            gap_fill_v2_active = env_flag_enabled(GAP_FILL_V2_ENABLED_ENV)
+            gap_fill_v2_active = env_flag_enabled(GAP_FILL_V2_ENABLED_ENV) and not skip_optional_gap_fill
+            if skip_optional_gap_fill and (
+                env_flag_enabled(GAP_FILL_ENABLED_ENV) or env_flag_enabled(GAP_FILL_V2_ENABLED_ENV)
+            ):
+                logger.warning(
+                    "GAP_FILL_SKIPPED_FOR_BUDGET: question=%s fast_path=%s research_phase_remaining=%s",
+                    getattr(question, "id_of_question", None),
+                    str(fast_path).lower(),
+                    "n/a" if gap_fill_budget_s is None else f"{gap_fill_budget_s:.0f}s",
+                )
+                self._record_research_budget_cut(question, fast_path=fast_path)
             gap_fill_v2_payload: dict | None = None
 
             if gap_fill_v1_active or gap_fill_v2_active:
@@ -296,7 +374,23 @@ class ResearchOrchestrator:
                             run_gap_fill_pass,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
                         )
 
-                        return await run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking)
+                        # Bounded by whatever the research phase has left, so a pass
+                        # that overruns its own internal deadlines still cannot spend
+                        # the forecast's time.
+                        return await asyncio.wait_for(
+                            run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking),
+                            timeout=_remaining_research_phase_s(time_budget),
+                        )
+                    except asyncio.TimeoutError:
+                        # Its own branch (like v2's below) because it is not a failure:
+                        # falling into the generic except would log a traceback under
+                        # "stage failed" for a deliberate budget cut.
+                        logger.warning(
+                            "GAP_FILL_V1_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
+                            getattr(question, "id_of_question", None),
+                        )
+                        self._record_research_budget_cut(question, fast_path=fast_path)
+                        return ""
                     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
                         logger.exception("Gap-fill v1 stage failed; proceeding without it")
                         return ""
@@ -324,13 +418,31 @@ class ResearchOrchestrator:
                             run_gap_fill_v2,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
                         )
 
-                        return await run_gap_fill_v2(
-                            question,
-                            research,
-                            is_benchmarking=self._is_benchmarking,
-                            archive_sink=_capture_gap_fill_v2,
-                            on_error=_count_gap_fill_v2_error,
+                        # Same research-phase bound as v1 above, on top of v2's own
+                        # GAP_FILL_V2_WALL_DEADLINE (which measures as never binding:
+                        # 0 of 103 triple-era records report deadline_hit).
+                        return await asyncio.wait_for(
+                            run_gap_fill_v2(
+                                question,
+                                research,
+                                is_benchmarking=self._is_benchmarking,
+                                archive_sink=_capture_gap_fill_v2,
+                                on_error=_count_gap_fill_v2_error,
+                            ),
+                            timeout=_remaining_research_phase_s(time_budget),
                         )
+                    except asyncio.TimeoutError:
+                        # NOT a v2 crash: we cut it to protect the prediction POST, so
+                        # this must not bump gap_fill_v2_error_count (which exists to
+                        # redden CI on a dead v2 feature) — the budget decision is
+                        # alertable via research_budget_cut_count (fast-path questions
+                        # never reach here; gap-fill is skipped upstream for them).
+                        logger.warning(
+                            "GAP_FILL_V2_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
+                            getattr(question, "id_of_question", None),
+                        )
+                        self._record_research_budget_cut(question, fast_path=fast_path)
+                        return ""
                     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
                         logger.exception("Gap-fill v2 stage failed; proceeding without it")
                         # Path (c): an import failure (or any escape past the
@@ -456,6 +568,9 @@ class ResearchOrchestrator:
             fine_print=question.fine_print or "",
             open_date=question.open_time.strftime("%Y-%m-%d"),
             research=research,
+            # The MC ballot (None on other types): the relevance screen needs the candidate
+            # names to judge which articles bear on the resolution (q44952).
+            options=getattr(question, "options", None),
         )
         try:
             # Broad retry under the TRANSIENT_RETRY_MAX_ELAPSED_S elapsed gate
@@ -511,14 +626,30 @@ class ResearchOrchestrator:
         )
         return provider, provider_name
 
-    def _select_research_providers(self) -> list[tuple[ResearchCallable, str]]:
+    def _select_research_providers(self, fast_path: bool = False) -> list[tuple[ResearchCallable, str]]:
+        """Assemble the enabled providers for one question.
+
+        ``fast_path`` is the time-budget thin-window mode: drop the two SLOW search
+        providers (native_search, gemini_search) and keep everything else. The
+        optional providers all run CONCURRENTLY with the primary, whose own worst
+        case (AskNews 300 s + summarizer 300 s, sequential inside one provider) is
+        the phase's longest configured pole — so dropping the cheap hard-capped
+        providers (resolution_source 45 s, prediction_market 150 s, ts_anchor 20 s,
+        financial classifier 30 s) cannot shorten the phase and only discards the
+        resolution ground truth. What the fast path CAN shed is the measured tail:
+        native_search is the phase's slowest provider on 51.5% of questions and
+        reached 292 s against the primary's 110 s measured worst case
+        (scratch/residual_2026-08-24/time_budget_design.md). Anything still
+        straggling past the research window is cancelled by
+        ``_await_providers_within_deadline`` with its partial bundle kept.
+        """
         providers: list[tuple[ResearchCallable, str]] = []
 
         primary, primary_name = self._select_research_provider()
         if primary_name != "none":
             providers.append((primary, primary_name))
 
-        if env_flag_enabled(NATIVE_SEARCH_ENABLED_ENV):
+        if not fast_path and env_flag_enabled(NATIVE_SEARCH_ENABLED_ENV):
             model = os.getenv(NATIVE_SEARCH_MODEL_ENV)
             providers.append(
                 (
@@ -527,7 +658,7 @@ class ResearchOrchestrator:
                 )
             )
 
-        if env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
+        if not fast_path and env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
             from metaculus_bot.research.gemini_search import (
                 gemini_search_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
             )
@@ -569,11 +700,7 @@ class ResearchOrchestrator:
             providers.append((resolution_source_provider(is_benchmarking=self._is_benchmarking), "resolution_source"))
 
         if not providers:
-
-            async def _empty(_: MetaculusQuestion) -> str:
-                return ""
-
-            providers.append((_empty, "none"))
+            providers.append((_empty_provider, "none"))
 
         return providers
 
@@ -581,6 +708,7 @@ class ResearchOrchestrator:
         self,
         question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
+        time_budget: QuestionTimeBudget | None = None,
     ) -> tuple[str, list[ProviderResult], str]:
         from metaculus_bot.research.providers import (
             is_asknews_subscription_error,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
@@ -614,9 +742,13 @@ class ResearchOrchestrator:
                 # pass through raw — no lossy second-pass summarization. When
                 # AskNews fails and we fall back to Perplexity/Exa, that fallback
                 # is already prose, so skip summarization too.
-                if name == "asknews" and not used_fallback:
-                    if raw and raw.strip():
-                        asknews_raw_holder["text"] = raw
+                if name == "asknews" and not used_fallback and raw and raw.strip():
+                    # Empty raw skips the summarizer entirely: there is nothing to brief
+                    # from, and asking anyway spends a call to get either a refusal or an
+                    # invented briefing (the summarizer prompt has no no-data escape).
+                    # AskNews already recorded an `articles: empty(no_articles)` loss token,
+                    # so the `empty` status below stays distinguishable from a skipped run.
+                    asknews_raw_holder["text"] = raw
                     raw = await self._summarize_asknews(question, raw)
                 latency_ms = int((time.monotonic() - started) * 1000)
                 has_output = bool(raw and raw.strip())
@@ -635,6 +767,14 @@ class ResearchOrchestrator:
                     fallback_provider=fallback_provider,
                 )
                 return (raw, result)
+            except asyncio.CancelledError:
+                # A deadline-cancelled provider must drain its registry entry too:
+                # CancelledError is a BaseException and would otherwise skip both
+                # drain paths, leaving exactly the stale same-key entry the except
+                # below exists to prevent. Re-raised so the caller still records
+                # the cancellation as status="deadline".
+                pop_provider_detail(qid, name)
+                raise
             except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
                 # Drain-and-discard any partial detail the provider recorded before
                 # raising: an errored result carries the error, not source detail,
@@ -668,8 +808,7 @@ class ResearchOrchestrator:
                 )
                 return ("", result)
 
-        tasks = [_run_one(p, n) for p, n in providers]
-        results: list[tuple[str, ProviderResult]] = await asyncio.gather(*tasks)
+        results = await self._await_providers_within_deadline(providers, _run_one, time_budget)
 
         combined_parts = []
         provider_results: list[ProviderResult] = []
@@ -686,6 +825,87 @@ class ResearchOrchestrator:
 
         combined = "\n\n---\n\n".join(combined_parts) if combined_parts else ""
         return combined, provider_results, asknews_raw_holder.get("text", "")
+
+    @staticmethod
+    async def _await_providers_within_deadline(
+        providers: list[tuple[ResearchCallable, str]],
+        run_one: Callable[[ResearchCallable, str], Coroutine[object, object, tuple[str, ProviderResult]]],
+        time_budget: QuestionTimeBudget | None,
+    ) -> list[tuple[str, ProviderResult]]:
+        """Run every provider concurrently, cancelling any still running at the deadline.
+
+        Replaces a bare ``asyncio.gather``, which had no outer bound at all: each
+        provider carries its own wall timeout, but the PHASE carried none, so one
+        provider whose internal timeout failed to fire could hold the question past
+        its close with nothing to stop it. Stragglers are cancelled and recorded as
+        ``status="deadline"``, so the partial bundle is used rather than lost and the
+        cut providers are named in the diagnostics block and the research archive.
+
+        A cancelled provider does NOT bump ``provider_failure_count``: it did not
+        fail, we stopped it. The budget decision is alertable instead through
+        ``research_budget_cut_count`` (bumped by the caller when any result comes
+        back ``status="deadline"`` off the fast path; fast-path questions are
+        already counted by the forecaster's ``time_budget_fast_path`` counter).
+        Keeping the two apart is what lets ``research_provider_failures`` keep
+        meaning "a provider broke".
+
+        With no budget (every caller outside the per-question pipeline) the wait is
+        unbounded and behavior is identical to the old gather.
+        """
+        if not providers:
+            # ``asyncio.gather()`` returned [] on an empty list; ``asyncio.wait(set())``
+            # raises. Selection always yields at least the "none" stub, so this is the
+            # direct-call path only.
+            return []
+
+        tasks = [asyncio.create_task(run_one(provider, name), name=f"research:{name}") for provider, name in providers]
+        task_name = {task: name for task, (_, name) in zip(tasks, providers, strict=True)}
+
+        deadline_s = time_budget.research_phase_deadline_s() if time_budget is not None else None
+        _done, pending = await asyncio.wait(tasks, timeout=deadline_s, return_when=asyncio.ALL_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if pending:
+            # Let the cancellations land so no "task was destroyed but it is pending"
+            # warning escapes into the run log.
+            await asyncio.wait(pending, timeout=2.0)
+            logger.warning(
+                "RESEARCH_PHASE_DEADLINE: cancelled %d/%d providers after %.0fs (%s)",
+                len(pending),
+                len(tasks),
+                deadline_s or 0.0,
+                ",".join(sorted(task_name.get(task, "unknown") for task in pending)),
+            )
+
+        # Provider order is the section order in the research bundle and the row order
+        # in the diagnostics block, so rebuild it from `providers` rather than from
+        # asyncio.wait's unordered sets.
+        results: list[tuple[str, ProviderResult]] = []
+        for task, (_, name) in zip(tasks, providers, strict=True):
+            if task in pending:
+                # Latency IS the deadline for a cancelled provider: every task starts
+                # at phase start, so one still running when the deadline lands ran for
+                # exactly that long.
+                results.append(
+                    (
+                        "",
+                        ProviderResult(
+                            name=name,
+                            status="deadline",
+                            chars=0,
+                            latency_ms=round((deadline_s or 0.0) * 1000),
+                        ),
+                    )
+                )
+                continue
+            exc = task.exception()
+            if exc is not None:
+                # _run_one converts every provider exception into a ProviderResult, so
+                # reaching here means the wrapper itself broke — a bug, not a provider
+                # failure, and it must not be swallowed into a fake result.
+                raise exc
+            results.append(task.result())
+        return results
 
     @staticmethod
     def _provider_header(name: str) -> str:

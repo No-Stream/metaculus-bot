@@ -22,7 +22,12 @@ from typing import Any
 
 import pytest
 
-from metaculus_bot.research.agentic.loop import run_agentic_loop
+from metaculus_bot.research.agentic.loop import (
+    _SPAN_JOINER_MAX_CHARS,
+    _normalize_quote_text,
+    _quote_is_grounded,
+    run_agentic_loop,
+)
 from metaculus_bot.research.agentic.types import ToolOutcome
 from tests.agentic_fakes import FakeLlm
 from tests.agentic_fakes import gap_accounting as _accounting
@@ -281,6 +286,245 @@ class TestProvenanceGate:
             for r in caplog.records
             if r.name == "metaculus_bot.research.agentic.loop"
         )
+
+    async def _run_quote_check(self, *, source_body: str, quote: str) -> Any:
+        """Drive the standard plan -> search -> record -> conclude loop with one
+        finding whose ``quote`` is spot-checked against ``source_body`` (which
+        carries the citation URL so the hard provenance gate accepts the finding)."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://agency.example/report", quote=quote)]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning(f"https://agency.example/report — {source_body}")
+        return await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+    @pytest.mark.asyncio
+    async def test_stitched_quote_with_bounded_joiners_is_grounded(self) -> None:
+        """The four stitch joiners the 2026-08-24 residual round measured as 65% of
+        all warnings ever emitted: ``and``, semicolon, comma, and a short narration
+        fragment between two verbatim spans. Each span appears verbatim in the
+        source but separated there by unrelated text, so before the bounded-connective
+        boundary none of these could ever pass (0 of 156 on a corpus containing
+        every span verbatim)."""
+        # Real shape from run_31868372733: two FEC table rows the driver joined
+        # with " and ", each verbatim in the source but non-adjacent there.
+        row_a = '"MARC L. ANDREESSEN | CONTRIBUTION | 02/11/2026 | 12500000.00"'
+        row_b = '"BENJAMIN HOROWITZ | CONTRIBUTION | 02/11/2026 | 12500000.00"'
+        source_body = (
+            "Filing index. MARC L. ANDREESSEN | CONTRIBUTION | 02/11/2026 | 12500000.00 "
+            "(receipt 881). Additional rows follow the schedule appendix. "
+            "BENJAMIN HOROWITZ | CONTRIBUTION | 02/11/2026 | 12500000.00 (receipt 882)."
+        )
+        for quote in (
+            f"{row_a} and {row_b}",
+            f"{row_a}; {row_b}",
+            f"{row_a}, {row_b}",
+            f"{row_a} and later {row_b}",
+        ):
+            result = await self._run_quote_check(source_body=source_body, quote=quote)
+            assert result.telemetry.findings_count == 1
+            assert result.telemetry.quote_mismatch_warnings == 0, quote
+
+    @pytest.mark.asyncio
+    async def test_stitched_quote_with_fabricated_span_still_warns(self) -> None:
+        """The broadening must not rubber-stamp: a stitched quote whose second span
+        never appears in the source keeps warning — every weight-bearing span is
+        still checked independently."""
+        result = await self._run_quote_check(
+            source_body="MARC L. ANDREESSEN | CONTRIBUTION | 02/11/2026 | 12500000.00 (receipt 881).",
+            quote='"MARC L. ANDREESSEN | CONTRIBUTION | 02/11/2026 | 12500000.00" and '
+            '"A FABRICATED DONOR | CONTRIBUTION | 02/11/2026 | 99900000.00"',
+        )
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_long_narration_joiner_still_reads_as_one_span_and_warns(self) -> None:
+        """The connective is BOUNDED (24 chars): a full narration sentence between
+        spans — the briefing-vs-fetched discrepancy shape, whose form guarantees a
+        mismatch by construction — still reads as one span and stays a warning."""
+        result = await self._run_quote_check(
+            source_body="Musk has personally donated more than $85 million toward the midterms.",
+            quote='The briefing says: "Elon Musk — $90.6 million." The fetched report instead says: '
+            '"Musk has personally donated more than $85 million toward the midterms."',
+        )
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_fabricated_figure_in_the_joiner_still_warns(self) -> None:
+        """The connective between two verbatim spans is CHECKED when it carries a
+        digit. `re.split` on a group-less boundary discarded the joiner entirely, so
+        a fabricated figure riding between two genuine spans grounded cleanly on the
+        spans alone — the exact hole the digit clause exists to close."""
+        result = await self._run_quote_check(
+            source_body="Total revenue was 4.2 billion dollars for the quarter. Unrelated filler follows here. "
+            "The prior fiscal year closed with lower totals across segments.",
+            quote='"Total revenue was 4.2 billion dollars" up 47.3% from "the prior fiscal year closed"',
+        )
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_genuine_figure_in_the_joiner_grounds(self) -> None:
+        """The digit-gated connective check is a grounding requirement, not a ban:
+        when the joiner's figure really is in the source, the stitched quote passes."""
+        result = await self._run_quote_check(
+            source_body="Total revenue was 4.2 billion dollars for the quarter, up 47.3% from a year earlier. "
+            "The prior fiscal year closed with lower totals across segments.",
+            quote='"Total revenue was 4.2 billion dollars" up 47.3% from "the prior fiscal year closed"',
+        )
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_span_ending_in_whitespace_before_its_glyph_still_splits(self) -> None:
+        """The whitespace-only boundary survives as its own alternative: the bounded
+        connective's `(?<=\\S)` lookbehind fails when the first span ends in
+        whitespace before its closing glyph, so without the old clause this shape
+        reads as one contiguous span and warns — the 2026-07-28 false-positive
+        class, reintroduced."""
+        result = await self._run_quote_check(
+            source_body="Contribution schedules list MARC L. ANDREESSEN in the filing index. Later pages "
+            "name BENJAMIN HOROWITZ under the same schedule.",
+            quote='"MARC L. ANDREESSEN in the filing " "name BENJAMIN HOROWITZ under"',
+        )
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_the_joiner_bound_splits_at_the_constant_and_not_one_past_it(self) -> None:
+        """Pins _SPAN_JOINER_MAX_CHARS at N and N+1 so the empirically-tuned bound
+        cannot drift silently: a connective of exactly the bound still splits (both
+        verbatim spans ground, digit-free narration unchecked), one char past it
+        reads as a single span and warns."""
+
+        source_body = (
+            "Contribution schedules list MARC L. ANDREESSEN in the filing index. Later pages "
+            "name BENJAMIN HOROWITZ under the same schedule."
+        )
+        span_a = '"MARC L. ANDREESSEN in the filing"'
+        span_b = '"name BENJAMIN HOROWITZ under"'
+
+        at_bound = "x" * _SPAN_JOINER_MAX_CHARS
+        result = await self._run_quote_check(source_body=source_body, quote=f"{span_a}{at_bound}{span_b}")
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+        past_bound = "x" * (_SPAN_JOINER_MAX_CHARS + 1)
+        result = await self._run_quote_check(source_body=source_body, quote=f"{span_a}{past_bound}{span_b}")
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_quote_mismatch_warning_dedupes_on_resubmission(self) -> None:
+        """The driver re-lists banked findings (record_findings, then the same
+        finding again in a later record_findings): an unmatched quote warns ONCE per
+        (source_url, quote) per run — 5.5% of archived warnings were exact
+        re-submissions inflating the per-question density."""
+        finding = _finding(
+            "https://agency.example/report",
+            quote="A sentence that never appears in the tool result body.",
+        )
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(tool_calls=[_tool_call("rec1", "record_findings", {"findings": [finding]})]),
+                _response(tool_calls=[_tool_call("rec2", "record_findings", {"findings": [finding]})]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning("See https://agency.example/report — the body says something else entirely.")
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_web", search)],
+            _config(max_steps=6),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1  # second submission deduped at banking
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_two_distinct_unmatched_quotes_on_one_url_both_warn(self) -> None:
+        """The dedup key is (source_url, quote), not source_url: two DIFFERENT
+        ungrounded quotes citing the same page are two separate problems and must
+        both be counted. Keying on the URL alone would hide every quote after the
+        first on a page the driver cites repeatedly — the common case, since one
+        fetched document backs several findings."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote="A first sentence that is absent from the tool result body.",
+                                    ),
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote="A second sentence that is also absent from the body.",
+                                    ),
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning("See https://agency.example/report — the body says something else entirely.")
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_web", search)],
+            _config(),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.quote_mismatch_warnings == 2
+
+    @pytest.mark.asyncio
+    async def test_all_short_nonnumeric_spans_fall_back_to_the_whole_quote(self) -> None:
+        """When every split piece is a sub-floor digit-free fragment, no piece
+        carries weight — and the fallback tests the WHOLE normalized quote instead
+        of passing for free. Without it the broadened boundary would auto-pass any
+        quote chopped into short fragments, which is the cheapest way to defeat the
+        check entirely."""
+        absent = await self._run_quote_check(
+            source_body="The filing lists one fact in the appendix; nothing else was disclosed.",
+            quote='"one fact" and "two"',
+        )
+        assert absent.telemetry.findings_count == 1
+        assert absent.telemetry.quote_mismatch_warnings == 1
+
+        present = await self._run_quote_check(
+            source_body="The filing lists one fact and two others in the appendix.",
+            quote='"one fact" and "two"',
+        )
+        assert present.telemetry.quote_mismatch_warnings == 0
 
     @pytest.mark.asyncio
     async def test_quote_found_in_tool_content_emits_no_warning(self) -> None:
@@ -772,6 +1016,82 @@ class TestProvenanceGate:
         assert "quote_mismatch_warnings=0" in marker
 
 
+# Every stitch joiner that appears in the archived quote_mismatch corpus (341
+# distinct quotes across the GHA run logs in `backtests/gha_artifact_store/`,
+# mined 2026-08-25), with its occurrence count. The archive is gitignored, so
+# these shapes are transcribed here to keep the sensitivity result reproducible
+# in CI; the SPANS are synthetic, only the joiner is corpus-verbatim, which is
+# all the boundary regex keys on.
+#
+# The 7 shapes marked "was 0/N" below are the ones the pre-2026-08-24
+# whitespace-only clause could not split at all: every one of them warned even
+# when both spans sat verbatim in the source. The rest were already handled by
+# the ellipsis / whitespace clauses and are pinned here so broadening the regex
+# never quietly loses them.
+_ARCHIVED_STITCH_JOINERS: list[tuple[str, int, bool]] = [
+    ('"; "', 198, True),  # was 0/198 — semicolon joiner, the single most common shape
+    ("...", 155, False),
+    ("”; “", 115, True),  # was 0/115 — curly-glyph semicolon
+    ("” ... “", 52, False),
+    ('", "', 50, True),  # was 0/50 — comma joiner
+    ("” “", 49, False),
+    ('" ... "', 40, False),
+    ("” and “", 34, True),  # was 0/34 — the "and" joiner
+    ('" "', 32, False),
+    ("`; `", 27, True),  # was 0/27 — backtick spans (markdown table cells)
+    ('" and "', 25, True),  # was 0/25
+    ("…", 19, False),
+    ('": "', 18, True),  # was 0/18 — colon joiner (label: value)
+    ("”\n\n“", 13, False),
+    ("” … “", 13, False),
+]
+
+_CORPUS_SPAN_A = "The agency published the schedule on 11 February 2026"
+_CORPUS_SPAN_B = "the review board recorded no objections that quarter"
+# Both spans verbatim, but NON-ADJACENT — the property that makes a stitched
+# quote impossible to ground as one contiguous substring.
+_CORPUS_BODY = _normalize_quote_text(
+    f"Filing index. {_CORPUS_SPAN_A}, per the docket. Several unrelated paragraphs of "
+    f"procedural text follow here. Later, {_CORPUS_SPAN_B}, closing the item."
+)
+
+
+class TestArchivedStitchShapesGround:
+    """Corpus regression pins for the span-boundary broadening (2026-08-24).
+
+    The measured failure was total: 0 of 156 archived multi-span quotes could
+    ground on a corpus containing every span verbatim, so quote_mismatch was
+    reporting the driver's punctuation rather than its honesty. These pin the real
+    joiner shapes at the unit level — the loop-driven tests above cover the same
+    property end to end for a few of them, but only a table over the whole corpus
+    catches a regex edit that fixes one shape by dropping another.
+    """
+
+    @pytest.mark.parametrize(
+        ("joiner", "archived_count", "missed_before"),
+        [pytest.param(*case, id=repr(case[0])) for case in _ARCHIVED_STITCH_JOINERS],
+    )
+    def test_stitched_shape_grounds_when_both_spans_are_verbatim(
+        self, joiner: str, archived_count: int, missed_before: bool
+    ) -> None:
+        del archived_count, missed_before  # documentation; see the table above
+        quote = f'"{_CORPUS_SPAN_A}{joiner}{_CORPUS_SPAN_B}"'
+        assert _quote_is_grounded(quote, _CORPUS_BODY)
+
+    @pytest.mark.parametrize(
+        ("joiner", "archived_count", "missed_before"),
+        [pytest.param(*case, id=repr(case[0])) for case in _ARCHIVED_STITCH_JOINERS],
+    )
+    def test_stitched_shape_still_warns_when_a_span_is_fabricated(
+        self, joiner: str, archived_count: int, missed_before: bool
+    ) -> None:
+        """Same shapes, second span invented: broadening the boundary must not turn
+        the check into a rubber stamp for anything containing a joiner."""
+        del archived_count, missed_before
+        quote = f'"{_CORPUS_SPAN_A}{joiner}A FABRICATED CLAUSE THAT IS ABSENT FROM THE SOURCE"'
+        assert not _quote_is_grounded(quote, _CORPUS_BODY)
+
+
 class TestVerificationTierStamping:
     """W4 end-to-end: the loop stamps each banked finding's verification_tier
     from the URL->best-method map — CODE-derived, not driver-claimed. A search-
@@ -1164,6 +1484,70 @@ class TestResearchPlanGate:
 
         assert any("GHOST_PRE:" in m.getMessage() for m in caplog.records)
         assert not any("GHOST_PRE_JSON:" in m.getMessage() for m in caplog.records)
+        # No dry run supplied at all is the LEGITIMATE suppression: no WARN.
+        assert not any("GHOST_PRE_JSON suppressed" in m.getMessage() for m in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_ghost_pre_json_suppression_on_unparseable_dry_run_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A dry run that WAS supplied but fails to parse into a structured forecast
+        (the observed prod case: flat declared percentiles failing schema validation,
+        run 30718626314) suppresses GHOST_PRE_JSON — and that loss must be countable,
+        because it drops exactly the flattest pre-research views, biasing the archived
+        zero-move rate. GHOST_PRE still fires; the JSON half is replaced by a WARN."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[
+                        _plan_call(
+                            gaps=[{"id": "g1", "question": "q?"}],
+                            dry_run_forecast={"not_a_recognizable_block": True},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        await run_agentic_loop("system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm)
+
+        assert any("GHOST_PRE:" in m.getMessage() for m in caplog.records)
+        assert not any("GHOST_PRE_JSON:" in m.getMessage() for m in caplog.records)
+        warns = [r for r in caplog.records if "GHOST_PRE_JSON suppressed" in r.getMessage()]
+        assert len(warns) == 1
+        assert warns[0].levelno == logging.WARNING
+
+    @pytest.mark.asyncio
+    async def test_ghost_pre_json_suppression_on_non_dict_dry_run_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The other half of the same loss: a driver that answers `dry_run_forecast`
+        with a bare scalar rather than a forecast block. It is discarded by the
+        isinstance check before any parse is attempted, so only the "was something
+        supplied at all" test separates it from the legitimate no-dry-run case — and
+        it must count, for the same non-random-loss reason."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "plan0",
+                            "set_research_plan",
+                            {"gaps": [{"id": "g1", "question": "q?"}], "dry_run_forecast": "0.42"},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        await run_agentic_loop("system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm)
+
+        assert not any("GHOST_PRE_JSON:" in m.getMessage() for m in caplog.records)
+        warns = [r for r in caplog.records if "GHOST_PRE_JSON suppressed" in r.getMessage()]
+        assert len(warns) == 1
+        assert warns[0].levelno == logging.WARNING
 
     @pytest.mark.asyncio
     async def test_plan_nudge_cap_soft_continues_without_plan(self, caplog: pytest.LogCaptureFixture) -> None:

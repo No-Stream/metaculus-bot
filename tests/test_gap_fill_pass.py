@@ -20,7 +20,7 @@ import pytest
 from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.constants import GAP_FILL_MAX_GAPS
-from metaculus_bot.research.targeted import _parse_gap_list, run_gap_fill_pass
+from metaculus_bot.research.targeted import _parse_gap_list, _run_analyzer, run_gap_fill_pass
 
 
 @dataclass
@@ -36,6 +36,9 @@ class MockQuestion:
     fine_print: str | None = "See bls.gov for data."
     id_of_question: int = 42
     page_url: str = "https://example.com/q/42"
+    # The MC ballot; None on non-MC questions, matching MetaculusQuestion's attribute surface
+    # (the analyzer call site reads it via getattr).
+    options: list[str] | None = None
 
     _unused: dict[str, str] = field(default_factory=dict)
 
@@ -289,6 +292,26 @@ async def test_malformed_analyzer_output_soft_fails() -> None:
 
     assert out == ""
     fake_search.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_analyzer_prompt_carries_the_mc_ballot() -> None:
+    """The gap analyzer must see an MC question's option list: a "no coverage of candidate X"
+    gap is only findable when the analyzer knows the candidates (q44952 — no research stage
+    ever saw the ballot, and the winner went unsearched)."""
+    question = MockQuestion(options=["Mir Kim", "Hunter Feuerstein", "Other"])
+
+    stub_llm = MagicMock()
+    stub_llm.invoke = AsyncMock(return_value='{"gaps": []}')
+    with patch(
+        "metaculus_bot.fallback_openrouter.build_llm_with_openrouter_fallback",
+        MagicMock(return_value=stub_llm),
+    ):
+        await _run_analyzer(_q(question), "first-pass research", is_benchmarking=False)
+
+    assert stub_llm.invoke.await_args is not None
+    prompt = stub_llm.invoke.await_args.args[0]
+    assert "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other" in prompt
 
 
 @pytest.mark.asyncio

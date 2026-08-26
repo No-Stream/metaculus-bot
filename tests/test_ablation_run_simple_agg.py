@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from metaculus_bot.ablation.aggregation_primitives import aggregate_mc
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.run_simple_agg import run_mean_for_qid, run_median_for_qid
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, ARM_MEAN, ARM_MEDIAN
@@ -238,6 +239,54 @@ class TestMultipleChoice:
         red_prob = next(o["probability"] for o in options if o["option_name"] == "Red")
         green_prob = next(o["probability"] for o in options if o["option_name"] == "Green")
         assert red_prob > green_prob
+
+    def test_a_degenerate_ballot_fails_that_question_not_the_stage(
+        self, cache: AblationCache, method_label: str, runner_fn: RunnerFn, arm_constant: str
+    ) -> None:
+        # aggregate_mc raises on an option no model declared; at the per-qid boundary
+        # that must become an attributed error payload (like insufficient_forecasters),
+        # not an exception that aborts the whole stage after every other question's
+        # forecaster calls were already paid for.
+        question = make_mock_mc_question(qid=202)
+        no_green = {"Red": 0.6, "Blue": 0.4}
+        forecaster_payloads = {
+            model_slug_to_filename(f"openrouter/test/m{i}"): _mc_payload(f"openrouter/test/m{i}", no_green)
+            for i in (1, 2, 3)
+        }
+        payload = asyncio.run(
+            runner_fn(qid=202, question=question, forecaster_payloads=forecaster_payloads, cache=cache)
+        )
+        assert payload["success"] is False
+        assert payload["reason"] == "degenerate_mc_ballot"
+        assert any("Green" in err for err in payload["errors"])
+        cached = cache.read_stacker_output(qid=202, arm=arm_constant)
+        assert cached is not None
+        assert payload.items() <= cached.items()  # cache adds its schema-version stamp
+
+
+class TestAggregateMcRefusesImputation:
+    """The primitive raises when an option has no declared values (H1's ablation sibling).
+
+    The old ``1.0 / n_options`` fallback averaged a uniform share NO model declared
+    into the ablation aggregate, indistinguishable from a real ballot — the same
+    defect the production ``build_mc_prediction`` stopped doing (f852f8a). Upstream
+    accumulation covers every option in ``option_order``, so an empty list means that
+    invariant broke and the run must say so.
+    """
+
+    def test_an_undeclared_option_raises_instead_of_imputing(self) -> None:
+        per_option = {"Red": [0.6, 0.5], "Blue": [0.4, 0.5]}  # nobody declared Green
+        with pytest.raises(ValueError, match="no model declared a probability for option 'Green'"):
+            aggregate_mc(per_option, ["Red", "Blue", "Green"], method="median")
+
+    def test_a_fully_declared_ballot_still_aggregates(self) -> None:
+        per_option = {"Red": [0.6, 0.4], "Blue": [0.3, 0.4], "Green": [0.1, 0.2]}
+
+        result = aggregate_mc(per_option, ["Red", "Blue", "Green"], method="mean")
+
+        probs = {o.option_name: o.probability for o in result.predicted_options}
+        assert math.isclose(sum(probs.values()), 1.0, abs_tol=1e-6)
+        assert probs["Red"] > probs["Green"]
 
 
 # ===========================================================================

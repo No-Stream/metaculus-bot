@@ -49,11 +49,21 @@ from metaculus_bot.research.timeseries_anchor import (
     timeseries_anchor_provider,
 )
 from metaculus_bot.research.ts_estimators import (
+    CALENDAR_DAYS_PER_YEAR,
+    MONTHLY_CLOCK,
+    TRADING_DAYS_PER_YEAR,
+    SeriesClock,
     _build_spread_series,
+    _detect_freq,
     _empirical_change_band,
     _empirical_max_band,
+    _horizon_end_date,
     _n_eff,
+    annualized_realized_vol_pct,
+    clock_matches_cadence,
     horizon_steps,
+    observed_periods_per_year,
+    series_clock,
 )
 from metaculus_bot.research.ts_fetch import FRED_CSV_URL, SeriesSpec
 from metaculus_bot.research.ts_render import (
@@ -88,6 +98,19 @@ def _daily_positive_series(name: str, *, seed: int = 0, end: str = "2026-06-30",
     return pd.Series(np.abs(walk) + 8.0, index=idx, name=name)
 
 
+def _twenty_four_seven_series(name: str, *, seed: int = 0, end: str = "2026-06-30", years: int = 6) -> pd.Series:
+    """A strictly-positive series with a bar EVERY calendar day — the crypto shape.
+
+    Same generator as ``_daily_positive_series`` but on ``date_range(freq="D")`` instead of
+    ``bdate_range``, so ``_detect_freq`` still reads "daily" while the observed density is 1.0
+    rows/day rather than 5/7. That gap is the whole defect class."""
+    end_ts = pd.Timestamp(end)
+    idx = pd.date_range(end=end_ts, periods=round(years * CALENDAR_DAYS_PER_YEAR), freq="D")
+    rng = np.random.default_rng(seed)
+    walk = 20.0 + np.cumsum(rng.normal(0.0, 0.3, len(idx)))
+    return pd.Series(np.abs(walk) + 8.0, index=idx, name=name)
+
+
 def _monthly_series(name: str, *, seed: int = 0, end: str = "2026-06-01", n: int = 96) -> pd.Series:
     """A strictly-positive monthly (month-start) series, deterministic per seed. n months
     ending at ``end`` — long enough that a small monthly horizon leaves ample overlap."""
@@ -95,6 +118,15 @@ def _monthly_series(name: str, *, seed: int = 0, end: str = "2026-06-01", n: int
     rng = np.random.default_rng(seed)
     walk = 200.0 + np.cumsum(rng.normal(0.0, 1.0, n))
     return pd.Series(np.abs(walk) + 50.0, index=idx, name=name)
+
+
+def _weekly_series(name: str, *, seed: int = 0, end: str = "2026-06-26", n: int = 300) -> pd.Series:
+    """A strictly-positive weekly series — the GASREGW shape, and the only frequency whose
+    step noun and horizon divisor differ from both daily bases."""
+    idx = pd.date_range(end=pd.Timestamp(end), periods=n, freq="W-FRI")
+    rng = np.random.default_rng(seed)
+    walk = 3.0 + np.cumsum(rng.normal(0.0, 0.02, n))
+    return pd.Series(np.abs(walk) + 1.0, index=idx, name=name)
 
 
 # Render.
@@ -115,8 +147,32 @@ class TestRenderSingle:
         # count (n_obs // h). A daily 14-day horizon -> h=10 trading days.
         assert "overlapping windows" in out
         assert "independent" in out
-        h = horizon_steps("daily", 14)
+        h = horizon_steps(series_clock(pd.DatetimeIndex(series.index)), 14)
         assert f"~{series.size // h:,} independent" in out
+
+    def test_stale_series_renames_the_range_instead_of_claiming_52_weeks(self):
+        """A discontinued series has no observation inside the trailing year, and the whole
+        history is the only band there is — but rendering it as a "52-week range" states a
+        recency the numbers don't have (a 2019 high reads as this year's)."""
+        series = _daily_positive_series("^DEAD", end="2024-06-28", years=2)
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^DEAD"), label="Dead index")
+
+        out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        first_date = pd.DatetimeIndex(series.index).min().strftime("%Y-%m-%d")
+        assert "52-week range" not in out
+        assert f"full-history range ({first_date} to 2024-06-28; no observation inside the trailing year)" in out
+        # The band itself still renders — the fallback carries real information.
+        assert "of the way up the range" in out or "range is flat" in out
+
+    def test_a_current_series_keeps_the_52_week_label(self):
+        series = _daily_positive_series("^VIX")
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^VIX"), label="CBOE VIX")
+
+        out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        assert "- 52-week range:" in out
+        assert "full-history range" not in out
 
     def test_note_rendered_and_band_withheld_when_not_model_target(self):
         series = _daily_positive_series("PAYEMS")
@@ -135,6 +191,44 @@ class TestRenderSingle:
         # model_target=False -> no empirical band emitted at all.
         assert "P10 / P50 / P90" not in out
         assert "empirical band" not in out.lower()
+
+    def test_todays_bar_marked_in_progress_on_a_live_ceiling(self, monkeypatch: pytest.MonkeyPatch):
+        """A latest bar dated the fetch ceiling, rendered the same day, is still forming —
+        and the empirical band anchors on it, so the header must say so. ``_today_utc``
+        is frozen to the fixture's ceiling to simulate the live case deterministically."""
+        series = _daily_positive_series("^VIX")
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^VIX"), label="CBOE VIX")
+        monkeypatch.setattr(tsrender, "_today_utc", lambda: date(2026, 6, 30))
+
+        out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        assert "as of 2026-06-30 — today's bar, in progress;" in out.splitlines()[0]
+
+    def test_no_in_progress_marker_when_the_ceiling_is_a_past_date(self):
+        """The benchmark shape: the bar is dated the ceiling, but the render runs later
+        (the wall clock is NOT frozen), so the same-dated bar is a completed historical
+        one and must not be called in-progress."""
+        series = _daily_positive_series("^VIX")
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^VIX"), label="CBOE VIX")
+
+        out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        assert "in progress" not in out
+        assert "⚠" not in out  # a latest AT the ceiling is fresh, not stale
+
+    def test_stale_daily_latest_gets_a_note_and_a_warn(self, caplog: pytest.LogCaptureFixture):
+        """A daily series whose newest bar is years older than the ceiling: the 52-week
+        fallback already renames the range, but the header's latest value — the number
+        the band is applied to — needs its own staleness flag, in render and run logs."""
+        series = _daily_positive_series("^DEAD", end="2024-06-28", years=2)
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^DEAD"), label="Dead index")
+
+        with caplog.at_level(logging.WARNING):
+            out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        age = (date(2026, 6, 30) - date(2024, 6, 28)).days
+        assert f"⚠ Latest observation is {age} days old" in out
+        assert f"FINANCIAL_STALE_LATEST: surface=ts_anchor symbol=^DEAD age_d={age} cadence=trading-day" in caplog.text
 
 
 class TestRenderSpread:
@@ -347,14 +441,16 @@ PROVENANCE_MARKER = "Statistical extrapolation of the resolution series' own his
 # swapped horizon constant) that a string-presence render test cannot see.
 class TestEstimatorMath:
     def test_horizon_steps_matches_documented_formula(self):
-        # daily: round(days * 252/365); weekly: round(days/7); monthly: round(days/30.4375).
-        assert horizon_steps("daily", 30) == 21  # round(30 * 252 / 365) = round(20.7123)
-        assert horizon_steps("weekly", 21) == 3  # round(21 / 7)
-        assert horizon_steps("monthly", 90) == 3  # round(90 / 30.4375) = round(2.9569)
+        # daily on the trading-day basis: round(days * 252/365); weekly: round(days/7);
+        # monthly: round(days/30.4375).
+        trading = SeriesClock(freq="daily", periods_per_year=TRADING_DAYS_PER_YEAR)
+        assert horizon_steps(trading, 30) == 21  # round(30 * 252 / 365) = round(20.7123)
+        assert horizon_steps(SeriesClock(freq="weekly", periods_per_year=TRADING_DAYS_PER_YEAR), 21) == 3
+        assert horizon_steps(SeriesClock(freq="monthly", periods_per_year=TRADING_DAYS_PER_YEAR), 90) == 3
 
     def test_horizon_steps_floored_at_one(self):
         # round(5 / 30.4375) = round(0.164) = 0 -> floored to 1 (never a 0-step horizon).
-        assert horizon_steps("monthly", 5) == 1
+        assert horizon_steps(SeriesClock(freq="monthly", periods_per_year=TRADING_DAYS_PER_YEAR), 5) == 1
 
     def test_change_band_additive_ramp_is_exactly_h_step(self):
         # Constant-step additive ramp: every overlapping h-step change equals h*step
@@ -431,6 +527,440 @@ class TestEstimatorMath:
         b = pd.Series([1.0, 2.0], index=pd.to_datetime(["2026-02-01", "2026-02-02"]))
         with pytest.raises(ValueError, match="no overlapping dates"):
             _build_spread_series(a, b)
+
+
+# The calendar/frequency assumption class (the q44882 sqrt(252) defect and its ts-anchor
+# siblings). Every test here contrasts a business-day series against a 24/7 one whose bars land
+# every calendar day: `_detect_freq` reads both as "daily", so `freq` alone cannot drive a
+# calendar<->row conversion and `SeriesClock` carries the observed density alongside it.
+class TestSeriesClockAndCalendarBases:
+    def test_detect_freq_cannot_tell_the_two_daily_shapes_apart(self):
+        # The reason SeriesClock exists: the median gap is 1.0 day for BOTH a business-day
+        # series (gaps 1,1,1,1,3) and a 24/7 one, so freq is blind to a 365/252 = 1.45x
+        # difference in rows per year. If this ever stops holding, the clock can be simplified.
+        business = _daily_positive_series("^GSPC")
+        continuous = _twenty_four_seven_series("BTC-USD")
+        assert _detect_freq(pd.DatetimeIndex(business.index)) == "daily"
+        assert _detect_freq(pd.DatetimeIndex(continuous.index)) == "daily"
+
+    def test_clock_reads_the_two_bases_off_the_index(self):
+        business = series_clock(pd.DatetimeIndex(_daily_positive_series("^GSPC").index))
+        continuous = series_clock(pd.DatetimeIndex(_twenty_four_seven_series("BTC-USD").index))
+        assert (business.freq, business.periods_per_year, business.step_unit) == (
+            "daily",
+            TRADING_DAYS_PER_YEAR,
+            "trading-day",
+        )
+        assert (continuous.freq, continuous.periods_per_year, continuous.step_unit) == (
+            "daily",
+            CALENDAR_DAYS_PER_YEAR,
+            "calendar-day",
+        )
+
+    def test_clock_leaves_weekly_and_monthly_on_the_nominal_basis(self):
+        # Their horizon conversions are already calendar-honest (/7, /30.4375), so the density
+        # read is not consulted and must not perturb them.
+        monthly = series_clock(pd.DatetimeIndex(_monthly_series("CPIAUCSL").index))
+        assert (monthly.freq, monthly.periods_per_year, monthly.step_unit) == (
+            "monthly",
+            TRADING_DAYS_PER_YEAR,
+            "month",
+        )
+
+    def test_horizon_on_a_24_7_series_is_the_calendar_window_itself(self):
+        # One step IS one calendar day, so a 90-day question is a 90-step horizon. The shipped
+        # formula gave round(90 * 252/365) = 62 — a 62-day change band presented as 90 days,
+        # ~sqrt(90/62) = 1.20x too narrow on exactly the most volatile asset class we route.
+        continuous = series_clock(pd.DatetimeIndex(_twenty_four_seven_series("BTC-USD").index))
+        assert horizon_steps(continuous, 90) == 90
+        assert horizon_steps(continuous, 31) == 31
+        business = series_clock(pd.DatetimeIndex(_daily_positive_series("^GSPC").index))
+        assert horizon_steps(business, 90) == 62  # round(90 * 252/365) — unchanged
+
+    def test_horizon_end_date_inverts_horizon_steps_on_the_same_clock(self):
+        # These two conversions used to be wrong in OPPOSITE directions by the same 365/252, so
+        # on a 24/7 series they cancelled: the chart ribbon ended at about the right date while
+        # the band it drew was a 62-day band labelled 90. Pin the round-trip on BOTH bases so a
+        # future fix to one alone fails here instead of skewing the chart.
+        as_of = pd.Timestamp("2026-06-30")
+        for series in (_daily_positive_series("^GSPC"), _twenty_four_seven_series("BTC-USD")):
+            clock = series_clock(pd.DatetimeIndex(series.index))
+            for calendar_days in (31, 90, 180):
+                h = horizon_steps(clock, calendar_days)
+                end = _horizon_end_date(as_of, clock, h)
+                assert abs((end - as_of).days - calendar_days) <= 1, (clock, calendar_days, end)
+
+    def test_density_read_degrades_to_the_trading_day_basis_when_unmeasurable(self):
+        # Same fail-safe contract financial_data's fixtures pin: too few rows, a non-datetime
+        # index, or a zero-span index all keep the historical 252 behavior.
+        short = pd.date_range(end="2026-06-30", periods=10, freq="D")
+        assert observed_periods_per_year(short) == TRADING_DAYS_PER_YEAR
+        assert observed_periods_per_year(pd.RangeIndex(50)) == TRADING_DAYS_PER_YEAR
+        assert observed_periods_per_year(pd.DatetimeIndex(["2026-06-30"] * 50)) == TRADING_DAYS_PER_YEAR
+
+    def test_density_read_splits_at_six_bars_a_week_not_at_five(self):
+        # The threshold is the whole discriminator between the two bases, and it sits at 6/7
+        # rows per day precisely so an exchange series with holidays (0.690) and a six-session
+        # week both stay on 252 while only a genuinely 24/7 series (1.0) crosses. A six-day
+        # trading week is the nearest real shape below the line, so pin it: nudging the
+        # threshold down to 5/7 would silently re-annualize every equity series on 365.
+        six_day_week = pd.DatetimeIndex(
+            [d for d in pd.date_range(end="2026-06-30", periods=700, freq="D") if d.weekday() != 6]
+        )
+        assert observed_periods_per_year(six_day_week) == TRADING_DAYS_PER_YEAR
+        every_day = pd.date_range(end="2026-06-30", periods=700, freq="D")
+        assert observed_periods_per_year(every_day) == CALENDAR_DAYS_PER_YEAR
+
+    def test_density_read_needs_a_fortnight_of_bars_before_it_overrules_the_default(self):
+        # The minimum-rows guard: a fortnight of bars cannot distinguish 5/7 from 7/7, so
+        # anything shorter keeps the historical basis. Pinned at N-1 and N because an off-by-one
+        # here is invisible in output — it just quietly re-annualizes short crypto frames.
+        for n_rows, expected in ((13, TRADING_DAYS_PER_YEAR), (14, CALENDAR_DAYS_PER_YEAR)):
+            index = pd.date_range(end="2026-06-30", periods=n_rows, freq="D")
+            assert observed_periods_per_year(index) == expected, n_rows
+
+    def test_clock_and_horizon_on_a_weekly_series_convert_on_sevens(self):
+        # Weekly is the frequency whose step noun and horizon divisor differ from BOTH daily
+        # bases, and the density read must stay unconsulted on it (a weekly index reads ~0.14
+        # rows/day, well under the split, so a stray read would be harmless here but wrong in
+        # principle — the basis field is nominal for non-daily clocks).
+        clock = series_clock(pd.DatetimeIndex(_weekly_series("GASREGW").index))
+        assert (clock.freq, clock.periods_per_year, clock.step_unit) == ("weekly", TRADING_DAYS_PER_YEAR, "week")
+        assert horizon_steps(clock, 90) == 13  # round(90 / 7)
+        assert horizon_steps(clock, 3) == 1  # floored at one step
+        as_of = pd.Timestamp("2026-06-30")
+        assert _horizon_end_date(as_of, clock, 13) == as_of + pd.Timedelta(weeks=13)
+
+    def test_horizon_end_date_on_the_monthly_clock_steps_calendar_months(self):
+        # The derived-target clock (MoM change / MoM % / monthly average). One step is one
+        # calendar month, so the ribbon end is a DateOffset — not h * 30.4375 days, which would
+        # drift a day or two per quarter against the month the question actually resolves in.
+        as_of = pd.Timestamp("2026-06-30")
+        assert MONTHLY_CLOCK.step_unit == "month"
+        assert _horizon_end_date(as_of, MONTHLY_CLOCK, 3) == pd.Timestamp("2026-09-30")
+        assert horizon_steps(MONTHLY_CLOCK, 90) == 3  # round(90 / 30.4375)
+
+    def test_weekly_render_names_weeks_and_omits_the_daily_only_vol_line(self):
+        # `step_unit` reaching the rendered band line through its real caller (`_band_line`),
+        # on the one frequency where the noun is neither "trading-day" nor "calendar-day".
+        # The vol note is daily-only, so a weekly series must not grow one — annualizing 30
+        # WEEKLY returns on either daily basis would be off by ~sqrt(52/252).
+        weekly = _weekly_series("GASREGW")
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="fred", series_id="GASREGW"),
+            label="US regular gasoline ($/gal)",
+        )
+
+        out, band = _render_single(weekly, route=route, ceiling=date(2026, 6, 30), calendar_days=90)
+
+        assert band is not None
+        assert "all 13-week change windows" in out
+        assert "trading-day" not in out and "calendar-day" not in out
+        assert "volatility" not in out
+
+    def test_realized_vol_line_annualizes_on_the_observed_density(self):
+        continuous = _twenty_four_seven_series("BTC-USD")
+        clock = series_clock(pd.DatetimeIndex(continuous.index))
+        returns = continuous.pct_change().dropna().tail(tsrender.REALIZED_VOL_WINDOW)
+        expected = float(returns.std() * np.sqrt(CALENDAR_DAYS_PER_YEAR) * 100.0)
+        shipped_252 = float(returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
+
+        line = tsrender._realized_vol_line(continuous, clock)
+
+        assert line == f"- 30-calendar-day annualized realized volatility: {expected:.1f}%"
+        # The defect was worth a factor of sqrt(365/252) = 1.2035; make sure the old number is
+        # genuinely different at the rendered precision rather than a rounding coincidence.
+        assert f"{shipped_252:.1f}" != f"{expected:.1f}"
+        assert expected == pytest.approx(shipped_252 * float(np.sqrt(365 / 252)))
+
+    def test_realized_vol_line_labels_trading_days_on_an_exchange_series(self):
+        # 30 rows is six calendar weeks here, so "30-day" was itself a row count posing as a
+        # calendar window. The number is unchanged from the shipped sqrt(252) behavior.
+        business = _daily_positive_series("^GSPC")
+        clock = series_clock(pd.DatetimeIndex(business.index))
+        returns = business.pct_change().dropna().tail(tsrender.REALIZED_VOL_WINDOW)
+        expected = float(returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
+
+        assert tsrender._realized_vol_line(business, clock) == (
+            f"- 30-trading-day annualized realized volatility: {expected:.1f}%"
+        )
+
+    def test_rendered_band_on_a_24_7_series_uses_calendar_steps_and_says_so(self):
+        continuous = _twenty_four_seven_series("BTC-USD")
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="yfinance", series_id="BTC-USD"),
+            label="Bitcoin price ($)",
+        )
+        calendar_days = 90
+
+        out, band = _render_single(continuous, route=route, ceiling=date(2026, 6, 30), calendar_days=calendar_days)
+
+        assert band is not None
+        # h == the calendar window, and the label names calendar steps rather than trading days.
+        assert f"all {calendar_days}-calendar-day change windows" in out
+        assert "trading-day" not in out
+        # And the band really is the 90-step band, materially wider than the 62-step one the
+        # shipped horizon produced.
+        y = continuous.to_numpy(dtype="float64")
+        last = float(continuous.iloc[-1])
+        expected = _empirical_change_band(y, calendar_days, use_log=True, anchor=last)
+        assert band == pytest.approx(expected)
+        shipped = _empirical_change_band(y, round(calendar_days * 252 / 365), use_log=True, anchor=last)
+        assert (band[2] - band[0]) > (shipped[2] - shipped[0])
+
+    def test_business_day_render_is_unchanged_by_the_clock(self):
+        # The 252 path must stay byte-identical apart from the vol label's unit word, so the
+        # fix cannot have moved any exchange-traded question's band.
+        business = _daily_positive_series("^VIX")
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^VIX"), label="VIX")
+
+        out, band = _render_single(business, route=route, ceiling=date(2026, 6, 30), calendar_days=90)
+
+        assert band is not None
+        assert "all 62-trading-day change windows" in out  # round(90 * 252/365)
+        y = business.to_numpy(dtype="float64")
+        expected = _empirical_change_band(y, 62, use_log=True, anchor=float(business.iloc[-1]))
+        assert band == pytest.approx(expected)
+
+    def test_chart_ribbon_and_band_agree_on_the_calendar_horizon(self, monkeypatch):
+        # The chart path has its own copy of the freq -> h -> horizon_end walk, so it gets its
+        # own guard: on a 24/7 series the ribbon must end at as_of + calendar_days AND the band
+        # it draws must be the calendar-step band (pre-fix the ribbon was right by cancellation
+        # while the band was the 62-step one).
+        continuous = _twenty_four_seven_series("BTC-USD", end="2026-03-15")
+        as_of = datetime(2026, 3, 15, tzinfo=UTC)
+        resolves = datetime(2026, 6, 13, tzinfo=UTC)  # 90 calendar days out
+        calendar_days = (resolves.date() - as_of.date()).days
+        captured: dict[str, object] = {}
+
+        monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: continuous)
+        monkeypatch.setattr(
+            "metaculus_bot.research.ts_chart.render_anchor_chart",
+            lambda *_a, **kw: captured.update(kw) or "FAKE_PNG_BASE64",
+        )
+        q = _make_numeric_q(
+            qid=9317,
+            resolution_criteria="Resolves per https://finance.yahoo.com/quote/BTC-USD/history/",
+            scheduled_resolution_time=resolves,
+            lower_bound=0.0,
+            upper_bound=10000.0,
+        )
+
+        out = build_anchor_section(q, as_of)
+
+        assert out
+        assert ts._session_charts.get(9317) == "FAKE_PNG_BASE64"
+        assert captured["horizon_end"] == pd.Timestamp("2026-03-15") + pd.Timedelta(days=calendar_days)
+        y = continuous.to_numpy(dtype="float64")
+        expected = _empirical_change_band(y, calendar_days, use_log=True, anchor=float(continuous.iloc[-1]))
+        assert captured["band"] == pytest.approx(expected)
+
+    def test_spread_band_reads_the_density_of_the_JOINED_series(self):
+        # `_render_spread` has its own freq -> h walk, on the INNER-JOINED index. Two 24/7 legs
+        # join to a calendar-daily series, so the horizon is the calendar window; a mixed
+        # 24/7-plus-exchange pair joins down to business days and keeps the 252 basis. The
+        # shipped code used 252 unconditionally, so it was right only by luck on mixed pairs.
+        leg_a = _twenty_four_seven_series("BTC-USD", seed=1)
+        leg_b = _twenty_four_seven_series("ETH-USD", seed=2)
+        route = _Route(
+            kind="spread",
+            spec=SeriesSpec(source="yfinance", series_id="BTC-USD"),
+            label="BTC-USD",
+            spec_b=SeriesSpec(source="yfinance", series_id="ETH-USD"),
+            label_b="ETH-USD",
+        )
+
+        out, _band = _render_spread(leg_a, leg_b, route=route, calendar_days=90)
+
+        assert "Forward 90-calendar-day relative-return band" in out
+
+        mixed_out, _ = _render_spread(leg_a, _daily_positive_series("^GSPC", seed=3), route=route, calendar_days=90)
+        assert "Forward 62-trading-day relative-return band" in mixed_out
+
+
+# Row-wise month-over-month derivations are only "month-over-month" when one row is one month.
+def _quarterly_series(name: str, *, seed: int = 0, end: str = "2026-04-01", n: int = 60) -> pd.Series:
+    """A strictly-positive quarterly (quarter-start) series — the GDPC1 shape."""
+    idx = pd.date_range(end=pd.Timestamp(end), periods=n, freq="QS")
+    rng = np.random.default_rng(seed)
+    walk = 20000.0 + np.cumsum(rng.normal(50.0, 120.0, n))
+    return pd.Series(np.abs(walk) + 500.0, index=idx, name=name)
+
+
+def _semiannual_series(name: str, *, seed: int = 0, n: int = 40) -> pd.Series:
+    """~183-day cadence — the crack between the quarterly and annual buckets."""
+    idx = pd.date_range(end=pd.Timestamp("2026-04-01"), periods=n, freq="183D")
+    rng = np.random.default_rng(seed)
+    walk = 100.0 + np.cumsum(rng.normal(0.0, 2.0, n))
+    return pd.Series(np.abs(walk) + 10.0, index=idx, name=name)
+
+
+class TestCoarseCadenceClocks:
+    """Quarterly/annual series get real buckets with calendar-honest steps.
+
+    Before them, `_detect_freq` topped out at "monthly": a quarterly series (GDPC1, ~92-day
+    gaps) classified monthly and every horizon converted at 30.4375 days per step — a 3x-too-
+    wide band under false "monthly" labels ("series frequency: monthly", "Last monthly
+    observations", "3-month change windows" for what is a 3-QUARTER band), reachable through
+    any coarse FRED series cited by URL (`_single_url_route` builds a model-target level route
+    for every unregistered id). The same row-count-as-calendar defect class as the 24/7
+    sqrt(252), in the low-frequency direction.
+    """
+
+    def test_quarterly_and_annual_series_get_their_own_buckets(self):
+        quarterly = _quarterly_series("GDPC1")
+        annual = pd.Series(
+            np.linspace(100.0, 200.0, 30),
+            index=pd.date_range(end="2026-01-01", periods=30, freq="YS"),
+        )
+        q_clock = series_clock(pd.DatetimeIndex(quarterly.index))
+        a_clock = series_clock(pd.DatetimeIndex(annual.index))
+        assert (q_clock.freq, q_clock.step_unit) == ("quarterly", "quarter")
+        assert (a_clock.freq, a_clock.step_unit) == ("annual", "year")
+
+    def test_quarterly_horizons_convert_on_calendar_quarters(self):
+        clock = series_clock(pd.DatetimeIndex(_quarterly_series("GDPC1").index))
+        # A 90-day question is ONE quarterly step (the monthly bucket read it as 3 steps —
+        # a 276-day band presented as 90 days); a year is four.
+        assert horizon_steps(clock, 90) == 1
+        assert horizon_steps(clock, 365) == 4
+
+    def test_horizon_end_date_inverts_on_the_coarse_clocks_too(self):
+        as_of = pd.Timestamp("2026-06-30")
+        quarterly = series_clock(pd.DatetimeIndex(_quarterly_series("GDPC1").index))
+        assert abs((_horizon_end_date(as_of, quarterly, 1) - as_of).days - 91) <= 3
+        annual = SeriesClock(freq="annual", periods_per_year=TRADING_DAYS_PER_YEAR)
+        assert abs((_horizon_end_date(as_of, annual, 1) - as_of).days - 365) <= 1
+
+    def test_gdpc1_shape_renders_a_quarter_band_under_honest_labels(self, monkeypatch):
+        """End-to-end through the URL branch (the verified exposure): a quarterly FRED series
+        must render quarter-labelled history and a quarter-step band, not the monthly trio of
+        false statements."""
+        quarterly = _quarterly_series("GDPC1")
+        monkeypatch.setenv("TS_ANCHOR_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: quarterly)
+        q = _make_numeric_q(
+            qid=9451,
+            resolution_criteria="Resolves per https://fred.stlouisfed.org/series/GDPC1 for the quarter.",
+            scheduled_resolution_time=datetime(2026, 9, 28, tzinfo=UTC),
+            lower_bound=0.0,
+            upper_bound=100000.0,
+        )
+
+        out = build_anchor_section(q, datetime(2026, 6, 30, tzinfo=UTC))
+
+        assert "series frequency: quarterly" in out
+        assert "Last quarterly observations" in out
+        assert "-quarter change windows" in out
+        assert "monthly" not in out
+
+    def test_a_cadence_the_buckets_misdescribe_is_refused_a_band(self, monkeypatch, caplog):
+        """The fail-safe for the cracks: a ~183-day semiannual series lands in the annual
+        bucket, where one 365.25-day step spans TWO real observations — a band too narrow by
+        the same factor. `clock_matches_cadence` refuses it and the band-None guard drops the
+        section rather than serving a mis-converted quantity."""
+        semiannual = _semiannual_series("BOGUS1")
+        clock = series_clock(pd.DatetimeIndex(semiannual.index))
+        assert clock.freq == "annual"
+        assert clock_matches_cadence(clock, pd.DatetimeIndex(semiannual.index)) is False
+
+        monkeypatch.setenv("TS_ANCHOR_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: semiannual)
+        q = _make_numeric_q(
+            qid=9452,
+            resolution_criteria="Resolves per https://fred.stlouisfed.org/series/BOGUS1 on the date.",
+            scheduled_resolution_time=datetime(2026, 9, 28, tzinfo=UTC),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            out = build_anchor_section(q, datetime(2026, 6, 30, tzinfo=UTC))
+
+        assert out == ""
+        assert any("cadence" in record.getMessage() for record in caplog.records)
+
+    def test_matching_cadences_all_pass_the_guard(self):
+        for series in (
+            _daily_positive_series("^GSPC"),
+            _twenty_four_seven_series("BTC-USD"),
+            _monthly_series("CPIAUCSL"),
+            _quarterly_series("GDPC1"),
+        ):
+            index = pd.DatetimeIndex(series.index)
+            assert clock_matches_cadence(series_clock(index), index) is True, series.name
+
+
+class TestSharedVolEstimator:
+    """The one vol definition (`annualized_realized_vol_pct`), after the q44882 defect was
+    fixed in one of its two byte-identical copies weeks before the other."""
+
+    def test_matches_the_hand_computed_value(self):
+        series = _twenty_four_seven_series("BTC-USD")
+        expected = float(series.pct_change().dropna().tail(30).std() * np.sqrt(365) * 100.0)
+        assert annualized_realized_vol_pct(series, window=30, periods_per_year=365) == pytest.approx(expected)
+
+    def test_returns_none_below_the_window(self):
+        # 30 closes yield 29 returns — a "30-observation" vol computed on 29 would wear the
+        # window's label without its sample size.
+        short = pd.Series(
+            np.linspace(100.0, 110.0, 30),
+            index=pd.date_range(end="2026-06-30", periods=30, freq="D"),
+        )
+        assert annualized_realized_vol_pct(short, window=30, periods_per_year=365) is None
+
+
+class TestDerivationFrequencyInvariant:
+    def test_mom_derivations_reject_a_non_monthly_source(self):
+        weekly = pd.Series(
+            np.linspace(3.0, 4.0, 60),
+            index=pd.date_range(end="2026-06-29", periods=60, freq="W"),
+            name="GASREGW",
+        )
+        for derivation in ("mom_diff", "mom_pct"):
+            with pytest.raises(ValueError, match="must be one month"):
+                _apply_derivation(weekly, derivation, 1.0)
+
+    def test_mom_derivations_accept_a_monthly_source(self):
+        monthly = _monthly_series("PAYEMS", n=48)
+        assert len(_apply_derivation(monthly, "mom_diff", 1000.0)) == 47
+        assert len(_apply_derivation(monthly, "mom_pct", 1.0)) == 47
+
+    def test_monthly_avg_resamples_before_any_row_wise_step(self):
+        # The weekly -> monthly derivation is calendar-based (resample), so it is exempt from the
+        # invariant above and must still work on the weekly series that rejected mom_*.
+        weekly = pd.Series(
+            np.linspace(3.0, 4.0, 60),
+            index=pd.date_range(end="2026-06-29", periods=60, freq="W"),
+            name="GASREGW",
+        )
+        out = _apply_derivation(weekly, "monthly_avg", 1.0)
+        assert _detect_freq(pd.DatetimeIndex(out.index)) == "monthly"
+
+    @pytest.mark.asyncio
+    async def test_a_non_monthly_source_soft_fails_the_section_not_the_run(self, monkeypatch, caplog):
+        """The invariant's whole point is that it withholds a mislabelled quantity — so it has to
+        reach the provider as a soft-fail, not as an exception that takes the research fan-out
+        down. Wired through the real caller: a MoM CPI question citing the CPIAUCSL URL routes to
+        mom_pct, and the fetch hands back a WEEKLY-cadence frame (the hazard shape — a registry
+        entry declaring mom_pct whose source series is not monthly). The provider catches
+        ValueError, so this pins the invariant against being "fixed" into a bare crash."""
+        monkeypatch.setenv("TS_ANCHOR_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: _weekly_series("CPIAUCSL"))
+        question = _make_numeric_q(
+            qid=9911,
+            question_text="What will be the month-over-month percent change in US headline CPI for December 2026?",
+            resolution_criteria="Resolves per https://fred.stlouisfed.org/series/CPIAUCSL on the release date.",
+            lower_bound=-1.0,
+            upper_bound=2.0,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await timeseries_anchor_provider()(question)
+
+        assert result == ""
+        assert any("soft-fail for qid=9911" in r.message and "ValueError" in r.message for r in caplog.records)
 
 
 # Provider factory (flag gating, benchmark ceiling, soft-fail, determinism).
@@ -778,7 +1308,8 @@ class TestNoBandNoSection:
         # The fixture only exercises the withheld branch if y.size <= h; assert that rather
         # than trusting the arithmetic, so a constant change can't quietly make the tests
         # below pass for the wrong reason.
-        assert self._HISTORY_OBSERVATIONS <= horizon_steps("daily", self._HORIZON_CALENDAR_DAYS)
+        clock = series_clock(pd.DatetimeIndex(self._short_history().index))
+        assert self._HISTORY_OBSERVATIONS <= horizon_steps(clock, self._HORIZON_CALENDAR_DAYS)
         assert (self._RESOLVES.date() - self._AS_OF.date()).days == self._HORIZON_CALENDAR_DAYS
 
     def test_section_suppressed_when_horizon_exceeds_history(self, monkeypatch, caplog):

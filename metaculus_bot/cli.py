@@ -27,6 +27,7 @@ from metaculus_bot.fallback_openrouter import (
     get_credit_key_fallback_count,
     get_donated_404_fallback_count,
     get_generic_key_fallback_count,
+    has_deprecation_alerts,
 )
 from metaculus_bot.fetch_hardening import apply_fetch_hardening
 from metaculus_bot.forecaster import TemplateForecaster
@@ -198,7 +199,20 @@ def main() -> None:
         if research_writer is not None:
             research_writer.flush()
 
-    TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
+    # The report summary RAISES by design when any report is an exception
+    # (compact_log_report_summary re-raises so a failed question reddens CI under
+    # return_exceptions=True) — but it used to sit ABOVE the alertable block, so
+    # the one run that most needed a summary record left none: q45085's publish
+    # failure (2026-08-03) propagated here, ``alertable`` was never computed, and
+    # that run is the single forecasting run since 2026-07-26 with no
+    # run_alertable_summary line in the archive. Emit-then-raise: hold the error,
+    # emit the breakdown below on this path too, then re-raise — the original
+    # exception keeps its traceback and CI stays exactly as red as before.
+    report_summary_error: Exception | None = None
+    try:
+        TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
+    except Exception as exc:  # noqa: HARNESS-SCAN-EXEMPT-broad-except  # held only until the breakdown is emitted, then re-raised below
+        report_summary_error = exc
 
     # Alert on degraded runs. Publication has already happened inside
     # forecast_on_tournament / forecast_questions above, so every Q that met
@@ -249,16 +263,54 @@ def main() -> None:
     # probe rather than "no run this shape ever needed one".
     probed_donated_key_state = get_probed_donated_key_state()
     donated_key_note = "" if probed_donated_key_state is None else f", donated_key={probed_donated_key_state.value}"
-    # One breakdown, both exit paths. The green path needs it as much as the red
-    # one: when every donated-key call fell back and the credit subset cancels the
-    # whole generic total, ``alertable`` is 0 — the exact shape of the 2026-07-26
-    # drained-key run — and gating this line on the exit status would leave that
-    # run's degradation and probe verdict entirely unrecorded.
+    # One breakdown, EVERY path — degraded, suppressed-green, crashed, and fully
+    # clean. The green paths need it as much as the red one: when every donated-key
+    # call fell back and the credit subset cancels the whole generic total,
+    # ``alertable`` is 0 — the exact shape of the 2026-07-26 drained-key run — and
+    # gating this line on the exit status would leave that run's degradation and
+    # probe verdict entirely unrecorded.
+    #
+    # A fully clean run says so explicitly, under a distinguishable "clean" phrase
+    # that harvests as the same run_alertable_summary marker. It used to emit
+    # NOTHING, so that the line's presence would stay a signal rather than
+    # boilerplate; the operator OVERTURNED that on 2026-08-25. The reason: silence
+    # is not distinguishable from a run that died before reaching this block, and
+    # once the donated key is refilled (past CREDIT_ALERT_RESUME_DATE) the clean
+    # shape becomes the COMMON one, so the archive's per-run census would lose
+    # exactly the runs that went well. During the drained-key window the question
+    # was moot — every run fell back at least once, and 0 of the 73 archived
+    # records are the clean shape.
+    #
+    # A raising ``log_report_summary`` is never "clean" no matter what the counters
+    # read: that run lost a question. Its counters can legitimately be all-zero
+    # (q45085's shape), which is why the phrase, not the fields, is what marks a run
+    # clean.
+    #
+    # The predicate must be the exact complement of every non-zero exit path in
+    # this function — including the two that run AFTER this line (the credit-floor
+    # breach and the deprecation tripwire). Without those two terms, a run about
+    # to exit red could first stamp the archive's run_alertable_summary record
+    # with the clean token.
+    run_clean = (
+        report_summary_error is None
+        and alertable <= 0
+        and generic_fallback <= 0
+        and not (donated_below_floor and alerts_active)
+        and not has_deprecation_alerts()
+    )
+    completion_phrase = "Run completed clean with" if run_clean else "Run completed with"
     breakdown = (
-        f"Run completed with {alertable} alertable degradation event(s) "
+        f"{completion_phrase} {alertable} alertable degradation event(s) "
         f"(bot={bot_alertable}, personal_key_fallback={generic_fallback} of which "
         f"donated_404={donated_404}, credit={credit_fallback}{suppression_note}{donated_key_note});"
     )
+    if report_summary_error is not None:
+        # Emit-then-raise, never swallow: the breakdown line above is the record
+        # the archive needs, and re-raising (rather than sys.exit) preserves the
+        # forecasting failure's traceback in the log. Takes precedence over the
+        # alertable exit below because the exception is the richer red signal.
+        logger.warning("%s re-raising the forecasting failure so CI marks this run red.", breakdown)
+        raise report_summary_error
     if alertable > 0:
         logger.warning("%s exiting non-zero so CI marks this run red.", breakdown)
         sys.exit(1)
@@ -267,6 +319,13 @@ def main() -> None:
         # subtraction can't otherwise reach zero from a positive total), so state
         # that rather than leaving a reader to derive it from the arithmetic.
         logger.info("%s every fallback was a suppressed credit event, so this run stays green.", breakdown)
+    elif run_clean:
+        # The all-clear census line (see ``run_clean`` above).
+        logger.info("%s nothing degraded, so this run stays green.", breakdown)
+    else:
+        # Counters are quiet but a red condition below (credit floor breach or the
+        # deprecation tripwire) still decides the exit status — no green claim.
+        logger.info("%s a post-summary check below decides the exit status.", breakdown)
 
     # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
     # already logged by credit_telemetry). The run completed and published

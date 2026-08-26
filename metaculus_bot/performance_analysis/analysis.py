@@ -2,17 +2,26 @@
 
 import logging
 import math
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Callable
 
 import numpy as np
 from scipy.stats import spearmanr
 
+from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
-from metaculus_bot.performance_analysis.parsing import _parse_probability, is_anonymous_model_key
+from metaculus_bot.performance_analysis.parsing import (
+    MIN_SCOREABLE_ANCHORS,
+    _parse_probability,
+    declared_anchors,
+    is_anonymous_model_key,
+)
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
 from metaculus_bot.performance_analysis.stacker_detection import detect_stacker_fired
 from metaculus_bot.spread_metrics import binary_prob_range_spread
+from metaculus_bot.time_utils import parse_iso_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -220,6 +229,13 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
         elif resolution == "below_lower_bound":
             pit = 0.0
         elif isinstance(resolution, (int, float)):
+            if upper_bound - lower_bound <= 0:
+                # No range, no interpolated PIT — the record is dropped rather than
+                # contributing the 0.5 that used to come back from _interpolate_pit, which
+                # is the single most favorable value available (inside BOTH coverage bands).
+                # Scoped to the interpolated branch: an out-of-bound resolution's 0.0/1.0 is
+                # a real reading that never touched the range.
+                continue
             pit = _interpolate_pit(
                 float(resolution),
                 lower_bound,
@@ -227,6 +243,7 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
                 cdf_values,
                 value_grid=scaling.get("continuous_range"),
                 zero_point=grid_zero_point(scaling.get("zero_point"), lower_bound),
+                per_model_percentiles=r.get("per_model_numeric_percentiles"),
             )
         else:
             continue
@@ -258,6 +275,177 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
     }
 
 
+def declared_percentile_pit(
+    per_model_percentiles: Mapping[str, Sequence[Sequence[float]]] | None,
+    resolution: float,
+) -> float | None:
+    """PIT from the MEDIAN of the ensemble members' declared percentile curves.
+
+    The declared ``(percentile, value)`` pairs are the models' raw output and are NOT
+    clipped to the question's displayed range, so a resolution beyond the CDF grid
+    still gets a real quantile: interpolate each member's own value -> percentile
+    curve at the resolution (clamping to the curve's endpoint percentiles beyond its
+    ends) and take the median across members — the same median-of-members the
+    published aggregate is built from, read in percentile space where the bound is
+    not a wall. Returns None when no member curve is usable.
+
+    Anonymous ``Forecaster N`` keys are EXCLUDED, matching ``max_step_clamp_screen``
+    next door and ``per_model_cohort``: on a stacker-fired record that positional
+    bucket holds the stacker's AGGREGATE, so pooling it into a median-of-members
+    counts the aggregate as an extra member and pulls the median toward itself. The
+    two sets don't intersect in today's archive, so this is a latent fix — but the
+    two sibling consumers of this field already filter, and one that didn't was how
+    the 50-forecast mixture got in.
+
+    Sparse curves are NOT excluded here, deliberately — no ``MIN_SCOREABLE_ANCHORS``
+    gate, unlike the ranking/clamp-screen consumers. Their ~96-log-point artifact
+    comes from PCHIP-rebuilding a sparse curve onto a full CDF grid and log-scoring
+    it; this path only linearly interpolates the declared pairs in percentile space
+    for a single quantile, where a 3-anchor curve is coarse but not a fabricated
+    distribution, and its member PIT is then medianed against its siblings' rather
+    than scored on its own. Gating here would also delete the uniformly-sparse-era
+    records (fall-2025 comments declare 8-percentile sets) whose PITs are valid.
+    """
+    curves = {
+        model: pairs for model, pairs in (per_model_percentiles or {}).items() if not is_anonymous_model_key(str(model))
+    }
+    pits = [pit for pit in (_single_curve_pit(pairs, resolution) for pairs in curves.values()) if pit is not None]
+    return float(np.median(pits)) if pits else None
+
+
+def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: float) -> float | None:
+    """Interpolate one member's declared (percentile 0-100, value) curve at ``resolution``."""
+    if len(percentile_pairs) < 2:
+        # A single recovered pair interpolates to a constant PIT at every resolution
+        # (trimmed comments can lose most of a member's declared lines) — unusable.
+        return None
+    try:
+        pcts = np.array([float(p[0]) / 100.0 for p in percentile_pairs], dtype=float)
+        vals = np.array([float(p[1]) for p in percentile_pairs], dtype=float)
+    except (TypeError, ValueError, IndexError):
+        # Archived per-model pairs are parsed from comment text and can be malformed.
+        return None
+    order = np.argsort(vals, kind="stable")
+    vals, pcts = vals[order], pcts[order]
+    if np.any(np.diff(pcts) < 0):
+        # Percentiles that DECREASE as values increase after the value sort mean the
+        # member declared a non-monotonic set; interpolating it inverts the curve.
+        return None
+    if not np.all(np.diff(vals) > 0):
+        # Duplicate declared values (e.g. a flat tail): jitter into strict monotonicity.
+        eps = max(1e-9, float(np.abs(vals).max()) * 1e-9)
+        vals = vals + np.arange(len(vals)) * eps
+        if not np.all(np.diff(vals) > 0):
+            return None
+    return float(np.interp(resolution, vals, pcts))
+
+
+# ``b4e9df0`` — the merge that landed the july15 bundle on main. THE single source of
+# truth for this era boundary across the package: width_monitor's ``TS_ANCHOR_ENABLE``
+# aliases it, and every screen gated on the bundle's contents keys on it. Era
+# boundaries are merge-to-main COMMITTER timestamps, never authoring dates.
+B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+
+# ``9f1175c`` (grid-scaled max-step for discrete CDF resampling) rode that merge.
+# Before this instant a flat 0.2 per-bin cap applied at EVERY grid size; after it,
+# coarse discrete grids get the relaxed ``grid_step_constraints`` cap.
+GRID_SCALED_MAX_STEP_MERGED_AT = B4E9DF0_MERGED_AT
+
+# A published bin counts as sitting at the cap within this tolerance, and the members
+# must want at least this much MORE mass there for the record to be clamp-suspected.
+_CLAMP_CAP_ATOL = 1e-6
+_CLAMP_MEMBER_MARGIN = 0.10
+
+
+def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_MARGIN) -> dict:
+    """Did a per-bin max-step cap, not the forecasters, decide the published mass at the truth?
+
+    On a coarse discrete grid the pre-``9f1175c`` flat 0.2 cap can hold the realized
+    bin far below what every member asked for (q43913: published 0.200 where members'
+    own curves wanted 0.575-0.823 — peer −38.67). That is a pipeline defect
+    masquerading as a forecast error, and it manufactures apparent dissent: each
+    member keeps its concentrated mass while the published curve does not.
+
+    The cap is ERA-CORRECT, gated on the submit timestamp: the flat 0.2 before the
+    grid-scaled cap reached main (``GRID_SCALED_MAX_STEP_MERGED_AT``), the record's
+    own ``grid_step_constraints(len(cdf))`` max after. Without the gate every
+    post-fix coarse-grid discrete that legitimately holds a 0.2 bin false-positives.
+    A missing/unparseable timestamp is treated as pre-fix — the undated records in
+    the archive all predate the fix.
+
+    Suspected requires ALL of: the realized bin within ``_CLAMP_CAP_ATOL`` of the
+    era-correct cap, at least two attributed member curves, and the LEAST
+    concentrated member wanting at least ``member_margin`` more mass on that bin —
+    "every member" is the point; a clamp overrides the whole ensemble, unlike a
+    median.
+    """
+    out: dict = {"applicable": record.get("type") in ("numeric", "discrete"), "suspected": False}
+    if not out["applicable"]:
+        return out
+    grid = (record.get("scaling") or {}).get("continuous_range")
+    cdf = record.get("our_forecast_values")
+    resolution = record.get("resolution_parsed")
+    if not isinstance(resolution, (int, float)) or isinstance(resolution, bool):
+        out["reason"] = "non-numeric resolution"
+        return out
+    if not grid or not cdf or len(grid) != len(cdf):
+        out["reason"] = "no usable grid"
+        return out
+
+    grid_arr = np.asarray(grid, dtype=float)
+    cdf_arr = np.maximum.accumulate(np.clip(np.asarray(cdf, dtype=float), 0.0, 1.0))
+    steps = np.diff(cdf_arr)
+    # side="left": a resolution sitting exactly ON a grid point belongs to the bin
+    # BELOW it, matching the platform scorer (resolution_to_bucket_index assigns an
+    # exact grid point to the lower bucket); side="right" screens the bin above and
+    # misses the q43913 signature whenever the resolution lands on a grid edge.
+    index = int(np.clip(np.searchsorted(grid_arr, float(resolution), side="left") - 1, 0, len(steps) - 1))
+    published_bin_mass = float(steps[index])
+    bin_low, bin_high = float(grid_arr[index]), float(grid_arr[index + 1])
+
+    submitted = parse_iso_utc(record.get("bot_comment_created_at"))
+    before_fix = submitted is None or submitted < GRID_SCALED_MAX_STEP_MERGED_AT
+    cap = MAX_CDF_PROB_STEP if before_fix else grid_step_constraints(len(grid_arr))[1]
+
+    member_bin_masses: dict[str, float] = {}
+    for model, pairs in (record.get("per_model_numeric_percentiles") or {}).items():
+        if is_anonymous_model_key(model):
+            # A positional key on a stacked record can hold the stacker's aggregate,
+            # which is not a member curve (see per_model_cohort).
+            continue
+        if len(declared_anchors(pairs)[0]) < MIN_SCOREABLE_ANCHORS:
+            # The screen's verdict turns on the MINIMUM member bin mass, so one sparse
+            # recovery can decide it — and a 3-anchor curve interpolated across a bin is
+            # not the distribution the model declared. That is the same reason
+            # ranking_cohort gates its log-scored curves; the shared floor lives in
+            # parsing so the two cannot drift.
+            continue
+        low = _single_curve_pit(pairs, bin_low)
+        high = _single_curve_pit(pairs, bin_high)
+        if low is not None and high is not None:
+            member_bin_masses[model] = high - low
+    min_member = min(member_bin_masses.values()) if member_bin_masses else None
+
+    at_cap = abs(published_bin_mass - cap) <= _CLAMP_CAP_ATOL
+    out |= {
+        "n_grid_points": len(grid_arr),
+        "max_step_cap": cap,
+        "submitted_before_grid_scaled_cap": before_fix,
+        "resolution_bin": [bin_low, bin_high],
+        "published_bin_mass": published_bin_mass,
+        "resolution_bin_at_cap": at_cap,
+        "member_bin_masses": member_bin_masses,
+        "min_member_bin_mass": min_member,
+        "suspected": bool(
+            at_cap
+            and min_member is not None
+            and min_member > published_bin_mass + member_margin
+            and len(member_bin_masses) >= 2
+        ),
+    }
+    return out
+
+
 def _interpolate_pit(
     resolution: float,
     lower_bound: float,
@@ -265,6 +453,7 @@ def _interpolate_pit(
     cdf_values: list[float],
     value_grid: list[float] | None = None,
     zero_point: float | None = None,
+    per_model_percentiles: Mapping[str, Sequence[Sequence[float]]] | None = None,
 ) -> float:
     """Interpolate the PIT value ``F(resolution)`` for a numeric resolution given its CDF.
 
@@ -277,18 +466,47 @@ def _interpolate_pit(
     is used directly if its length matches ``cdf_values``. Otherwise the grid is reconstructed
     via :func:`build_cdf_value_grid` using ``zero_point``.
     """
-    total_range = upper_bound - lower_bound
-    if total_range <= 0:
-        return 0.5
+    if upper_bound - lower_bound <= 0:
+        # A zero-width question has no PIT, so this raises rather than answering. The old
+        # ``return 0.5`` was the single most favorable value available — it falls inside BOTH
+        # coverage bands, so a degenerate record silently improved every calibration
+        # statistic it entered. Callers screen the range before calling (see
+        # ``numeric_pit_analysis``); reaching here means one didn't.
+        raise ValueError(f"degenerate question range [{lower_bound}, {upper_bound}] has no PIT")
 
     if value_grid is not None and len(value_grid) == len(cdf_values):
         grid = np.asarray(value_grid, dtype=float)
     else:
         grid = build_cdf_value_grid(lower_bound, upper_bound, zero_point, num_points=len(cdf_values))
 
-    # np.interp clamps to the grid endpoints: a resolution at/below grid[0] reads cdf_values[0]
-    # and at/above grid[-1] reads cdf_values[-1], which is the correct PIT at the bounds.
-    return float(np.interp(resolution, grid, np.asarray(cdf_values, dtype=float)))
+    return pit_on_grid(resolution, grid, np.asarray(cdf_values, dtype=float), per_model_percentiles)[0]
+
+
+def pit_on_grid(
+    resolution: float,
+    grid: np.ndarray,
+    cdf: np.ndarray,
+    per_model_percentiles: Mapping[str, Sequence[Sequence[float]]] | None,
+) -> tuple[float, str | None]:
+    """``(pit, oob_side)`` for a numeric resolution against a value grid.
+
+    THE single home of the out-of-grid rule shared by both PIT paths
+    (``_interpolate_pit`` here and ``width_monitor.compute_pit_details``).
+    ``np.interp`` clamps beyond the grid to ``cdf[0]`` / ``cdf[-1]`` — the correct
+    PIT for a resolution exactly AT a bound (F(bound) = cdf[0]) but NOT for one
+    BEYOND the grid: with below/above-bound mass expressible on open bounds,
+    ``cdf[0]`` can be ~0.9, so the clamp reads a below-grid resolution — a
+    low-tail event — as a HIGH PIT, flipping the sign of the miss. Beyond the
+    grid the PIT comes off the members' declared-percentile curves; the clamp is
+    kept only when no curve is usable, and ``oob_side`` (``"low"``/``"high"``/None)
+    reports the beyond-grid case either way.
+    """
+    oob_side = "low" if resolution < grid[0] else ("high" if resolution > grid[-1] else None)
+    if oob_side is not None:
+        fallback = declared_percentile_pit(per_model_percentiles, resolution)
+        if fallback is not None:
+            return fallback, oob_side
+    return float(np.interp(resolution, grid, cdf)), oob_side
 
 
 def mc_summary(data: list[dict]) -> dict:
@@ -311,8 +529,19 @@ def mc_summary(data: list[dict]) -> dict:
 
         if resolution in options and forecast_values:
             correct_idx = options.index(resolution)
-            prob = forecast_values[correct_idx] if correct_idx < len(forecast_values) else 0.0
-            prob_on_correct.append(prob)
+            if correct_idx < len(forecast_values):
+                prob_on_correct.append(forecast_values[correct_idx])
+            else:
+                # A forecast vector shorter than the option list cannot say what probability
+                # we put on the winner. The old ``else 0.0`` recorded that as "we gave the
+                # correct option zero" — the worst possible value — dragging
+                # mean_prob_correct down on a PARSE gap rather than on a forecast. The
+                # mc_log_score gate upstream makes this unreachable today; if it ever isn't,
+                # the record leaves this one statistic instead of poisoning it.
+                logger.warning(
+                    f"MC forecast vector shorter than its option list: post_id={r.get('post_id')} "
+                    f"options={len(options)} values={len(forecast_values)}; dropped from mean_prob_correct"
+                )
 
             # "Correct" = highest predicted probability was on the correct option
             max_prob_idx = forecast_values.index(max(forecast_values))

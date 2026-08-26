@@ -1,6 +1,12 @@
+import asyncio
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.providers import (
+    _asknews_provider,
     _dedup_articles_by_url,
     _format_asknews_dual_sections,
     _normalize_url_for_dedup,
@@ -47,9 +53,7 @@ def test_dedup_articles_by_url_preserves_order_and_keeps_non_url_items() -> None
     assert isinstance(deduped[2], dict) and deduped[2].get("no_url")
 
 
-# ---------------------------------------------------------------------------
-# Tests for dual research stream formatting
-# ---------------------------------------------------------------------------
+# Dual research stream formatting.
 
 
 class TestFormatAsknewsDualSections:
@@ -81,10 +85,49 @@ class TestFormatAsknewsDualSections:
         assert "## Recent Developments & Current News" in result
         assert "New Event" in result
 
-    def test_empty_lists_returns_no_articles_message(self) -> None:
+    def test_empty_lists_return_nothing_rather_than_a_no_articles_sentence(self) -> None:
+        """Both phases empty must yield "" — the old prose sentence read as research.
+
+        It defeated every downstream empty guard at once: the orchestrator's ``has_output``
+        saw chars>0 and reported ``ok``, the summarizer was handed the sentence as its
+        article set, and the briefing rendered under the AskNews header. This test used to
+        assert the sentence; it encoded the defect, so it now asserts the refusal.
+        """
         result = _format_asknews_dual_sections(hot_articles=[], historical_articles=[])
 
-        assert "No articles were found" in result
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_the_empty_case_records_a_source_loss_token(self, monkeypatch) -> None:
+        # "" alone is byte-identical to a provider that was never asked, so the empty read
+        # has to leave a `lost=articles:...` token on the diagnostics line. The token is
+        # written by _asknews_provider (which owns the qid), keeping the formatter pure —
+        # a formatter writing the module-global registry raced _degraded_to_raw_articles'
+        # write for the same key only by accident of ordering.
+        monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
+        monkeypatch.setenv("ASKNEWS_SECRET", "secret")
+        pop_provider_detail(4242, "asknews")  # start from a clean registry key
+
+        async def _no_articles(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            resp = AsyncMock()
+            resp.as_dicts = []
+            return resp
+
+        question = MagicMock()
+        question.question_text = "Will X happen?"
+        question.id_of_question = 4242
+        with (
+            patch("asknews_sdk.AsyncAskNewsSDK") as sdk_class,
+            patch("metaculus_bot.research.providers.asyncio.sleep", new=AsyncMock()),
+        ):
+            sdk = AsyncMock()
+            sdk.news.search_news = _no_articles
+            sdk_class.return_value.__aenter__.return_value = sdk
+            result = await _asknews_provider()(question)
+
+        assert result == ""
+        assert pop_provider_detail(4242, "asknews") == {"sources": {"articles": "empty(no_articles)"}}
 
     def test_cross_set_dedup_removes_hot_duplicates_of_historical(self) -> None:
         shared_url = "https://example.com/shared-article"

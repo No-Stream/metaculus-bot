@@ -560,6 +560,29 @@ async def test_fetch_pagination_second_call_uses_cache(monkeypatch: pytest.Monke
     assert fetch_plain.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_fetch_plain_textual_branch_strips_allowlisted_markup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The raw-text branch runs the same allow-listed tag strip as the Tier-1 CSV path:
+    a poll-tracker CSV's styled per-row anchors are markup the driver's result budget
+    should not buy, and inequality signs in data cells must survive untouched."""
+    csv_body = (
+        b"date,pollster,margin\n"
+        b"\"8/16 - 8/17, 2026\",<a href='https://poller.example/aug' style='color:#000'>Emerson College</a>,-12.8\n"
+        b"note,a < 5 and b > 3,0.0\n"
+    )
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/csv"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=csv_body))
+
+    result = await agentic_tools._fetch_plain("https://example.com/data.csv")
+
+    assert result.status == "ok"
+    assert "Emerson College" in result.text
+    assert "<a " not in result.text and "style=" not in result.text
+    assert "a < 5 and b > 3" in result.text
+
+
 def test_extract_links_caps_at_twenty_five() -> None:
     html = "".join(f'<a href="/{index}">link{index}</a>' for index in range(30))
 
@@ -988,6 +1011,42 @@ async def test_fetch_plain_thin_extraction_is_ok_not_empty(monkeypatch: pytest.M
     assert result.status == "ok"
     assert result.escalate_rendered is True  # thin -> escalate, but the content is real
     assert result.text == "Short but real official statement."
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_honors_declared_charset_on_textual_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A windows-1252 CSV with its charset declared decodes faithfully. The old
+    forced-UTF-8 read turned every high byte into U+FFFD and shipped the
+    mojibake to the driver as status="ok"."""
+    body = "date,séries\n2026-08-01,0.42\n".encode("windows-1252")
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/csv; charset=windows-1252"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
+
+    result = await agentic_tools._fetch_plain("https://example.com/data.csv")
+
+    assert result.status == "ok"
+    assert "séries" in result.text
+    assert "�" not in result.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_refuses_an_undecodable_textual_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A BOM-less UTF-16 body with no declared charset decodes to NUL-interleaved
+    garbage — a failed decode, not text we read. It must report "empty" (never
+    "ok") and escalate, so the rendered rung's browser sniffing gets a try."""
+    body = "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/plain"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
+
+    result = await agentic_tools._fetch_plain("https://example.com/data.txt")
+
+    assert result.status == "empty"
+    assert result.escalate_rendered is True
+    assert "could not decode" in result.text
 
 
 @pytest.mark.asyncio

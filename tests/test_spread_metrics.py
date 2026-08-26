@@ -539,3 +539,49 @@ class TestDuplicateStandardLabelsHardening:
         assert p10 == pytest.approx(5.0)
         assert p50 == pytest.approx(15.0)
         assert p90 == pytest.approx(28.0)
+
+
+class TestUndefinedDenominator:
+    """An unmeasurable spread must never read as agreement (M11, 2026-08-25).
+
+    On an open-bound question the denominator is the ensemble IQR, and it can
+    collapse to zero: an open-bound CDF grid with heavy out-of-bound mass makes
+    ``np.interp`` clamp P10 and P90 onto the same displayed bound for every model.
+    The old code logged a WARN and returned ``0.0`` — which
+    ``route_after_forecasts`` reads as "the models agree", taking MEDIAN, skipping
+    stacking and publishing the marker ``spread_below_threshold``. A failed
+    measurement now reports ``inf``, which exceeds every threshold, so it
+    escalates instead of asserting consensus.
+    """
+
+    def _pinned_grid(self, bound_value: float, offset: float) -> list[Percentile]:
+        """A CDF grid whose every key percentile interpolates to ``bound_value``.
+
+        Labels start above 0.90, so np.interp clamps P10/P50/P90 to values[0].
+        """
+        labels = [0.94, 0.96, 0.97, 0.98, 0.99, 1.0]
+        values = [bound_value + offset * i for i in range(len(labels))]
+        return [Percentile(percentile=p, value=v) for p, v in zip(labels, values)]
+
+    def test_zero_iqr_denominator_reports_inf(self, caplog):
+        question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        model1 = self._pinned_grid(100.0, 0.0)
+        model2 = self._pinned_grid(100.0, 1.0)
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.spread_metrics"):
+            spread = numeric_percentile_spread([model1, model2], question)
+
+        assert spread == math.inf
+        markers = [r.getMessage() for r in caplog.records if "SPREAD_UNDEFINED:" in r.getMessage()]
+        assert len(markers) == 1
+        assert "qtype=numeric" in markers[0]
+        assert "models=2" in markers[0]
+
+    def test_inf_exceeds_every_threshold(self):
+        """The routing consequence: an undefined spread cannot skip stacking."""
+        question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        spread = numeric_percentile_spread(
+            [self._pinned_grid(100.0, 0.0), self._pinned_grid(100.0, 1.0)],
+            question,
+        )
+        assert spread > CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD

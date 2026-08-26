@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 
 import requests
 
@@ -21,7 +22,9 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_per_model_numeric_percentiles,
     parse_resolution,
     parse_stacked_marker,
+    parse_stacker_skip_reason_marker,
 )
+from metaculus_bot.performance_analysis.research_tags import DEFAULT_RESEARCH_ARCHIVE_LATEST, attach_research_tags
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score, mc_log_score, numeric_log_score
 
@@ -164,7 +167,8 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
     title = post_data.get("title", "")
 
     if title.startswith("[PRACTICE]"):
-        logger.info(f"  Skipping PRACTICE post {post_id}: {title[:60]}")
+        title_preview = title[:60]  # HARNESS-SCAN-EXEMPT-subsampling  # log display truncation
+        logger.info(f"  Skipping PRACTICE post {post_id}: {title_preview}")
         return []
 
     group = post_data.get("group_of_questions")
@@ -201,6 +205,10 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
         stacker_outcome, stacker_outcome_source = parse_inferred_stacker_outcome(comment_text)
     else:
         stacker_outcome, stacker_outcome_source = None, "none"
+    # Additive skip-reason disclosure: a plain "skipped" outcome alone can't tell a
+    # below-threshold skip from the single-forecaster short-circuit (q44870). None
+    # on comments predating the marker.
+    stacker_skip_reason = parse_stacker_skip_reason_marker(comment_text) if comment_text else None
     # Ensemble-size disclosure: (n_used, n_configured) when the FORECASTERS_USED
     # marker is present, else None (older comments predate it). Lets era-bucketing
     # tell a degraded publish (a model dropped) from a genuine roster change —
@@ -240,6 +248,7 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
             comment_created_at=comment_created_at,
             stacker_outcome=stacker_outcome,
             stacker_outcome_source=stacker_outcome_source,
+            stacker_skip_reason=stacker_skip_reason,
             per_base_model_forecasts=per_base_model_forecasts,
             forecasters_used=forecasters_used,
         )
@@ -262,6 +271,7 @@ def _process_single_question(
     comment_created_at: str | None = None,
     stacker_outcome: str | None = None,
     stacker_outcome_source: str = "none",
+    stacker_skip_reason: str | None = None,
     per_base_model_forecasts: dict[str, str | dict[str, float]] | None = None,
     forecasters_used: tuple[int, int] | None = None,
 ) -> dict | None:
@@ -353,6 +363,11 @@ def _process_single_question(
         # skips; earlier comments collapse both into "skipped".
         "stacker_outcome": stacker_outcome,
         "stacker_outcome_source": stacker_outcome_source,
+        # Why the stacker was skipped ("spread_below_threshold" | "config_off" |
+        # "single_forecaster"), from the additive STACKER_SKIP_REASON comment
+        # marker. None whenever the stacker was not skipped or the comment
+        # predates the marker.
+        "stacker_skip_reason": stacker_skip_reason,
         # Bot ensemble size from the FORECASTERS_USED comment marker (distinct
         # from metadata.nr_forecasters, which is the Metaculus CROWD count):
         # forecasters that contributed to the published aggregate (== per-model
@@ -378,7 +393,19 @@ def _process_single_question(
         # was captured; always populated on fresh pulls of resolved questions.
         "metaculus_scores": metaculus_scores,
         "metadata": {
-            "nr_forecasters": q.get("nr_forecasters", 0),
+            # The Metaculus CROWD size, which lives on the POST, not on the question
+            # (verified against archived post payloads: every post carries
+            # ``nr_forecasters`` and ``forecasts_count``; no question dict carries
+            # either). Reading it off ``q`` with a 0 default made the field read 0 in
+            # all 2196 records ever pulled, which is not "no crowd" — it is "never
+            # read" — and it silently killed audit.py's own ``n/a`` fallback, since a
+            # real 0 is not a missing key. None when the post genuinely omits it, so a
+            # crowd-size cut can drop those records instead of averaging a fabricated
+            # zero into them. HISTORICAL RECORDS STAY 0: nothing rewrites the archive,
+            # so a reader must treat metadata.nr_forecasters == 0 on a pre-2026-08-25
+            # pull as unknown rather than as a measurement (fresh pulls carry real
+            # counts, typically 100-250 on tournament questions).
+            "nr_forecasters": post_data.get("nr_forecasters"),
             "open_time": q.get("open_time"),
             "actual_resolve_time": q.get("actual_resolve_time"),
             "scheduled_resolve_time": q.get("scheduled_resolve_time"),
@@ -467,7 +494,7 @@ def _compute_scores(record: dict) -> None:
                 zero_point,
             )
         except (ValueError, ZeroDivisionError) as e:
-            logger.warning(f"Failed numeric scoring for post {record['post_id']}: {e}")
+            logger.warning(f"Failed numeric scoring for post {record.get('post_id')}: {e}")
 
     elif q_type == "multiple_choice" and isinstance(resolution, str):
         options = record.get("options") or []
@@ -476,7 +503,7 @@ def _compute_scores(record: dict) -> None:
                 correct_idx = options.index(resolution)
                 record["mc_log_score"] = mc_log_score(forecast_values, correct_idx)
             except (ValueError, IndexError) as e:
-                logger.warning(f"Failed MC scoring for post {record['post_id']}: {e}")
+                logger.warning(f"Failed MC scoring for post {record.get('post_id')}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -488,11 +515,21 @@ def build_performance_dataset(
     tournament: str = DEFAULT_TOURNAMENT,
     token: str | None = None,
     author_id: int = DEFAULT_BOT_USER_ID,
+    research_archive_dir: str | Path = DEFAULT_RESEARCH_ARCHIVE_LATEST,
 ) -> list[dict]:
     """Fetch questions + comments, match them, parse per-model predictions, compute scores.
 
     Returns the structured dataset as a list of record dicts.
     Token defaults to METACULUS_TOKEN env var.
+
+    Each record is also stamped with the research-archive treatment tags
+    (``anchor_present`` / ``gfv2_present`` / ``gfv2_loop_ran`` / ``gfv2_confidence`` /
+    ``anchor_confidence`` / ``research_source_class``) read off
+    ``research_archive_dir``; questions with no archive record — including every
+    record when the archive isn't on disk — carry None on all six, never False.
+    ``gfv2_loop_ran`` is additionally None on any record whose writer could not have
+    carried the v2 payload, so the untreated arm of a v2 cut holds only measured
+    Falses (see :mod:`metaculus_bot.performance_analysis.research_tags`).
     """
     if token is None:
         token = os.environ["METACULUS_TOKEN"]
@@ -511,6 +548,8 @@ def build_performance_dataset(
         post_records = _process_post(post_data, comment_lookup)
         records.extend(post_records)
 
+    attach_research_tags(records, research_archive_dir)
+
     logger.info(f"Collected {len(records)} question records")
     return records
 
@@ -527,9 +566,74 @@ def save_dataset(data: list[dict], path: str) -> None:
     logger.info(f"Saved {len(data)} records to {path}")
 
 
+_SCORE_FIELDS = ("brier_score", "log_score", "numeric_log_score", "mc_log_score")
+
+
+def _rescorable(record: object) -> bool:
+    """Whether a cached record carries every field ``_compute_scores`` reads.
+
+    ``_compute_scores`` stays fail-fast for the fresh-build path (``_process_post``
+    constructs every key); ``rescore_records`` takes arbitrary JSON off disk —
+    hand-trimmed fixtures, older schemas — so the tolerance lives here. The check
+    is branch-aware: a numeric record does not need ``our_prob_yes``.
+    """
+    if not isinstance(record, dict):
+        return False
+    if not all(k in record for k in ("type", "resolution_parsed", "our_forecast_values")):
+        return False
+    q_type = record.get("type")
+    if q_type == "binary" and "our_prob_yes" not in record:
+        return False
+    if q_type in ("numeric", "discrete") and not all(k in record for k in ("open_lower_bound", "open_upper_bound")):
+        return False
+    return True
+
+
+# Recomputation float wiggle vs a genuinely different stored value. The scorer
+# reproduces the platform to ~1e-14; the known-stale gaps start at 0.6.
+_RESCORE_ATOL = 1e-6
+
+
+def rescore_records(records: list[dict]) -> int:
+    """Recompute every record's score fields from its own stored inputs, in place.
+
+    Scores are pure functions of fields the record already carries (type,
+    resolution, forecast values, scaling, bounds) — but the score VALUES in a
+    cached dataset are whatever the scorer computed when the file was written,
+    so a scorer fix never reaches previously-saved JSON. That bit for a month:
+    seven fall-2025 ``zero_point`` log-scaled records kept linear-bucket
+    ``numeric_log_score`` values up to 358.8 off the platform after the
+    zero-point coercion fix (``3c7a3e2``) had already corrected the live path,
+    because the round datasets merge frozen per-tournament baselines.
+
+    A field is only overwritten when recomputation yields a value, so healing
+    can never DELETE a score whose inputs are no longer recomputable. Returns
+    the number of records whose scores changed.
+    """
+    changed = 0
+    for record in records:
+        if not _rescorable(record):
+            continue
+        fresh = {**record, **{field: None for field in _SCORE_FIELDS}}
+        _compute_scores(fresh)
+        record_changed = False
+        for field in _SCORE_FIELDS:
+            new = fresh[field]
+            old = record.get(field)
+            if new is not None and (old is None or abs(new - old) > _RESCORE_ATOL):
+                record[field] = new
+                record_changed = True
+        changed += record_changed
+    return changed
+
+
 def load_dataset(path: str) -> list[dict]:
-    """Load dataset from a JSON file."""
+    """Load dataset from a JSON file, healing any stale stored scores (see rescore_records)."""
     with open(path) as f:
         data = json.load(f)
-    logger.info(f"Loaded {len(data)} records from {path}")
+    changed = rescore_records(data)
+    if changed:
+        logger.info(f"Loaded {len(data)} records from {path}; rescored {changed} with stale stored scores")
+    else:
+        logger.info(f"Loaded {len(data)} records from {path}")
     return data

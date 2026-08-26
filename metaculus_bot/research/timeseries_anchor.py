@@ -55,10 +55,10 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.ts_estimators import (
-    _detect_freq,
     _empirical_change_band,
     _horizon_end_date,
     horizon_steps,
+    series_clock,
 )
 from metaculus_bot.research.ts_fetch import (
     FetchError,
@@ -136,8 +136,11 @@ def _maybe_stash_single_chart(
     # Chart the derived (unit-scaled) series so the ribbon matches the text band exactly;
     # for plain level (scale=1.0) this is a no-op and identical to before.
     charted = _apply_derivation(series, route.derivation, route.scale)
-    freq = _detect_freq(pd.DatetimeIndex(charted.index))
-    h = horizon_steps(freq, calendar_days)
+    # Only plain-LEVEL routes reach here (derived targets returned above), so the charted
+    # series is the fetched one and its own clock — resolution AND observed density — is what
+    # both the horizon and the ribbon's calendar end must be computed on.
+    clock = series_clock(pd.DatetimeIndex(charted.index))
+    h = horizon_steps(clock, calendar_days)
     y = charted.to_numpy(dtype="float64")
     if y.size <= h:
         return  # band withheld in the text too; nothing to chart
@@ -154,7 +157,7 @@ def _maybe_stash_single_chart(
         _session_charts[qid] = render_anchor_chart(
             charted,
             as_of=as_of_ts,
-            horizon_end=_horizon_end_date(as_of_ts, freq, h),
+            horizon_end=_horizon_end_date(as_of_ts, clock, h),
             band=band,
             title=route.label,
         )

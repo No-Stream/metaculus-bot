@@ -20,6 +20,9 @@ tests loudly instead of silently dropping records from the archive:
 
 import json
 
+import pytest
+
+from metaculus_bot.comment.markers import STACKER_SKIP_REASONS
 from scripts.telemetry.markers import (
     MARKER_SPECS,
     coerce_value,
@@ -109,12 +112,32 @@ MARKET_RANKING_RANKED_LINE = (
 MARKET_RANKING_EMPTY_LINE = (
     PFX + "MARKET_RANKING: question=44620 pool=0 outcome=empty rows=0 prompt_chars=0 rendered=none"
 )
+MARKET_CHILD_RENDER_LINE = (
+    PFX + "MARKET_CHILD_RENDER: question=45363 families=6 full_rows=14 ladder_rows=6 outcomes=158 "
+    "named=71 collapsed=87 withheld=3 max_stage=5 ladder_chars=1368"
+)
 MARKET_RANKING_FAILOPEN_LINE = (
     PFX + "MARKET_RANKING: question=None pool=4 outcome=failopen rows=2 prompt_chars=36412 "
     "rendered=polymarket:2@0,kalshi:0@1"
 )
 MARKET_RANKING_UNTRACEABLE_INDEX_LINE = (
     PFX + "MARKET_RANKING: question=44620 pool=4 outcome=ranked rows=1 prompt_chars=36412 rendered=manifold:-1@0"
+)
+TS_ANCHOR_ROUTE_ROUTED_LINE = PFX + "TS_ANCHOR_ROUTE: question=45401 decision=routed series=PAYEMS step=kw_single"
+TS_ANCHOR_ROUTE_GATE_SKIP_LINE = (
+    PFX + "TS_ANCHOR_ROUTE: question=45367 decision=skipped series=PAYEMS step=kw_derivation_gate"
+)
+TS_ANCHOR_ROUTE_NO_HIT_LINE = (
+    PFX + "TS_ANCHOR_ROUTE: question=45193 decision=skipped series=none step=kw_no_keyword_hit"
+)
+TS_ANCHOR_ROUTE_SPREAD_LINE = PFX + "TS_ANCHOR_ROUTE: question=44700 decision=routed series=CL=F/^GSPC step=url_spread"
+# Copied from the two emitters sharing the shape: financial_data.py:_fetch_yfinance_data
+# and ts_render.py:_render_single (same stale_latest_age_days estimator behind both).
+FINANCIAL_STALE_LATEST_YFINANCE_LINE = (
+    PFX_WARN + "FINANCIAL_STALE_LATEST: surface=financial_data symbol=TEST age_d=3 cadence=calendar-day"
+)
+FINANCIAL_STALE_LATEST_TS_ANCHOR_LINE = (
+    PFX_WARN + "FINANCIAL_STALE_LATEST: surface=ts_anchor symbol=^DEAD age_d=9 cadence=trading-day"
 )
 CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=123.45 usage=4.16"
 CREDIT_BALANCE_SKIP_LINE = (
@@ -462,6 +485,320 @@ class TestMarketRanking:
         assert rec["rendered"] == "manifold:-1@0"
 
 
+class TestMarketChildRender:
+    """The multi-outcome render's own instrument, and the reason it is a SEPARATE marker.
+
+    `market_ranking`'s regex is not end-anchored, so appending fields to that line would have
+    re-cut a spec other work touches; a new marker keeps the harvester change purely additive.
+
+    `withheld` is what the line exists for. The Kalshi no-price spread threshold that blanks an
+    empty book is calibrated on eleven fixture strikes, so its prod incidence has to be a query
+    rather than a guess, and the same field counts the Polymarket placeholder legs and Manifold
+    untouched priors. Run logs leave GHA at 90 days, so an unharvested line is unanswerable later.
+    """
+
+    def test_the_fields_survive_harvesting(self):
+        rec = _parse_one(MARKET_CHILD_RENDER_LINE)
+        assert rec["marker"] == "market_child_render"
+        assert rec["families"] == 6
+        assert rec["full_rows"] == 14
+        assert rec["ladder_rows"] == 6
+        assert rec["outcomes"] == 158
+        assert rec["withheld"] == 3
+        assert rec["max_stage"] == 5
+        assert rec["ladder_chars"] == 1368
+
+    def test_the_completeness_invariant_is_checkable_from_the_archive(self):
+        """`named + collapsed == outcomes` is what the render guarantees, so a harvested line where
+        they disagree is a render bug rather than a tuning signal — which only works if both halves
+        reach the archive as numbers."""
+        rec = _parse_one(MARKET_CHILD_RENDER_LINE)
+
+        assert rec["named"] + rec["collapsed"] == rec["outcomes"]
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(MARKET_CHILD_RENDER_LINE)
+        # prediction_market.py emits question.id_of_question, matching its MARKET_RANKING sibling.
+        assert rec["qid"] == 45363
+        assert rec["qid_kind"] == "question_id"
+
+
+# The ranker fail-open WARN (research/prediction_market.py:_rank_pool), verbatim from the
+# f-string there. `reason=shape_regression` is the one the finding is about: before
+# 2026-08-25 that case reported `ok(0)`, i.e. it rendered the deliberate "we reviewed the
+# markets and none bore on the question" sentence on a path where the ranker's answer was
+# unreadable. `detail=` holds the exception's str, which carries spaces and a repr.
+MARKET_RANKING_DEGRADED_SHAPE_LINE = (
+    PFX_WARN + "MARKET_RANKING_DEGRADED: question=44620 pool=17 reason=shape_regression "
+    "detail=falling back to retrieval order; 3 entries yielded no usable pick (renamed index key, "
+    "or every index outside a pool of 17); first={'index': 4, 'tier': 'weak'}"
+)
+MARKET_RANKING_DEGRADED_UNREADABLE_LINE = (
+    PFX_WARN + "MARKET_RANKING_DEGRADED: question=None pool=4 reason=unreadable "
+    "detail=falling back to retrieval order; empty completion"
+)
+
+
+class TestMarketRankingDegraded:
+    """The sibling that says WHY a question rendered retrieval order.
+
+    `market_ranking`'s `outcome=failopen` records that a fail-open happened; only this line
+    separates "the model emitted something that is not a ranking array" from "our own
+    prompt/parser contract broke", and the second is the regression that used to arrive as
+    `ok(0)`. Run logs leave GHA at 90 days, so an archive holding one line and not the other
+    cannot answer which failure a degraded question hit.
+    """
+
+    def test_shape_regression_fields(self):
+        rec = _parse_one(MARKET_RANKING_DEGRADED_SHAPE_LINE)
+        assert rec["marker"] == "market_ranking_degraded"
+        assert rec["pool"] == 17
+        assert rec["reason"] == "shape_regression"
+
+    def test_detail_free_text_survives_verbatim(self):
+        # detail holds repr(exc): spaces, parentheses, quotes, a dict repr. It belongs to
+        # _RAW_FIELDS so it is never coerced, and the regex is not end-anchored so a
+        # terser future form still harvests.
+        rec = _parse_one(MARKET_RANKING_DEGRADED_SHAPE_LINE)
+        assert "renamed index key" in rec["detail"]
+        assert rec["detail"].endswith("first={'index': 4, 'tier': 'weak'}")
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(MARKET_RANKING_DEGRADED_SHAPE_LINE)
+        # prediction_market.py emits question.id_of_question, matching its two siblings.
+        assert rec["qid"] == 44620
+        assert rec["qid_kind"] == "question_id"
+
+    def test_unreadable_reason_and_absent_qid(self):
+        rec = _parse_one(MARKET_RANKING_DEGRADED_UNREADABLE_LINE)
+        assert rec["reason"] == "unreadable"
+        assert rec["qid"] is None
+
+    def test_does_not_collide_with_the_market_ranking_spec(self):
+        # MARKET_RANKING_DEGRADED contains MARKET_RANKING as a prefix, and market_ranking's
+        # spec sits EARLIER in MARKER_SPECS — under the one-marker-per-line break, a
+        # colon-less prefix match there would have swallowed every degraded line.
+        harvested = parse_log_text(
+            MARKET_RANKING_DEGRADED_SHAPE_LINE + "\n" + MARKET_RANKING_RANKED_LINE + "\n", **_META
+        )
+        assert len(harvested["market_ranking_degraded"]) == 1
+        assert len(harvested["market_ranking"]) == 1
+
+
+# Verbatim emitted bytes from metaculus_bot/numeric/pipeline.py (captured under the prod log
+# format), metaculus_bot/numeric/utils.py, and metaculus_bot/spread_metrics.py. All three
+# lines carry trailing em-dash prose, so none of the specs may be end-anchored.
+NUMERIC_DEGENERATE_DECLARATION_LINE = (
+    "2026-08-25 23:07:17,044 - metaculus_bot.numeric.pipeline - WARNING - "
+    "NUMERIC_DEGENERATE_DECLARATION: question=77 model=openrouter/openai/gpt-5.6-sol n_unique=1 "
+    "span=0 value_eps=1e-07 spread_applied=false"
+)
+NUMERIC_DEGENERATE_DECLARATION_UNLABELLED_LINE = (
+    "2026-08-25 23:07:17,044 - metaculus_bot.numeric.pipeline - WARNING - "
+    "NUMERIC_DEGENERATE_DECLARATION: question=77 model=unknown n_unique=1 "
+    "span=1.5e-06 value_eps=1e-07 spread_applied=false"
+)
+NUMERIC_AGGREGATE_GRID_MISMATCH_LINE = (
+    "2026-08-25 23:07:17,044 - metaculus_bot.numeric.utils - WARNING - "
+    "NUMERIC_AGGREGATE_GRID_MISMATCH: question=44620 model_index=2 got_points=201 expected_points=11 "
+    "— resampling in cdf-location space before aggregation"
+)
+SPREAD_UNDEFINED_LINE = (
+    "2026-08-25 23:07:17,044 - metaculus_bot.spread_metrics - WARNING - "
+    "SPREAD_UNDEFINED: question=45363 qtype=numeric denominator=-0 models=3 — key-percentile spread "
+    "is unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement"
+)
+NUMERIC_PCHIP_FALLBACK_LINE = (
+    "2026-06-11 21:14:03,512 - metaculus_bot.numeric.diagnostics - WARNING - "
+    "Question 43913: PCHIP CDF construction failed (Percentile values must be strictly increasing), "
+    "falling back to forecasting-tools default"
+)
+NUMERIC_PCHIP_FALLBACK_NO_ID_LINE = (
+    "2026-06-11 21:14:03,512 - metaculus_bot.numeric.diagnostics - WARNING - "
+    "Question N/A: PCHIP CDF construction failed (boom), falling back to forecasting-tools default"
+)
+
+
+class TestNumericDegenerateDeclaration:
+    """A per-forecaster fabrication-ATTEMPT rate, which is why it needs a spec.
+
+    A point-mass declaration is no longer cluster-spread, so the unit-mismatch guard sees the
+    model's own zero span and withholds the forecaster. The drop itself lands in
+    FORECASTER_DROPS as an UnitMismatchError; only this line names the cause, and its
+    predecessor (`Cluster spread applied`) was never harvested — which is exactly why the
+    finding's prod incidence was unanswerable from the archive.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_LINE)
+        assert rec["marker"] == "numeric_degenerate_declaration"
+        assert rec["model"] == "openrouter/openai/gpt-5.6-sol"
+        assert rec["n_unique"] == 1
+        assert rec["span"] == 0
+        assert rec["value_eps"] == pytest.approx(1e-07)
+        assert rec["spread_applied"] is False
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_LINE)
+        assert rec["qid"] == 77
+        assert rec["qid_kind"] == "question_id"
+
+    def test_unlabelled_model_stays_a_readable_string(self):
+        # "unknown" is what the line carries when a caller doesn't pass model_name. All
+        # three production callers now do (8cccdaa), so it survives for historical lines
+        # and any future caller that forgets. It is NOT in _NONE_SENTINELS, so it must
+        # survive as a string — a None here would be indistinguishable from a missing field.
+        rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_UNLABELLED_LINE)
+        assert rec["model"] == "unknown"
+        # %.6g renders a sub-epsilon span in exponent form; it must reach the archive as a
+        # number, since the span is what the unit-mismatch guard then judges.
+        assert rec["span"] == pytest.approx(1.5e-06)
+
+
+class TestNumericAggregateGridMismatch:
+    """Expect zero records in prod; a nonzero count means a model's CDF length drifted.
+
+    Worth harvesting because the predecessor defect was invisible: group-by-VALUE
+    aggregation medianed over a rotating SUBSET of the ensemble whenever an ft-fallback
+    distribution mixed with PCHIP ones, and nothing recorded the partial membership.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_GRID_MISMATCH_LINE)
+        assert rec["marker"] == "numeric_aggregate_grid_mismatch"
+        assert rec["model_index"] == 2
+        assert rec["got_points"] == 201
+        assert rec["expected_points"] == 11
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_GRID_MISMATCH_LINE)
+        assert rec["qid"] == 44620
+        assert rec["qid_kind"] == "question_id"
+
+
+class TestNumericPchipFallback:
+    """The one numeric repair surface with a confirmed prod fire (q43913's degenerate
+    declaration raised out of generate_pchip_cdf), so it earns a spec where the dead
+    repair-tier WARNs deliberately do not — see the M16 note in markers.py."""
+
+    def test_fields(self):
+        rec = _parse_one(NUMERIC_PCHIP_FALLBACK_LINE)
+        assert rec["marker"] == "numeric_pchip_fallback"
+        assert rec["error"] == "Percentile values must be strictly increasing"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(NUMERIC_PCHIP_FALLBACK_LINE)
+        assert rec["qid"] == 43913
+        assert rec["qid_kind"] == "question_id"
+
+    def test_a_questionless_emission_still_harvests(self):
+        # log_pchip_fallback renders a missing id as "N/A" (a _NONE_SENTINELS member).
+        rec = _parse_one(NUMERIC_PCHIP_FALLBACK_NO_ID_LINE)
+        assert rec["qid"] is None
+        assert rec["error"] == "boom"
+
+
+class TestSpreadUndefined:
+    def test_fields(self):
+        rec = _parse_one(SPREAD_UNDEFINED_LINE)
+        assert rec["marker"] == "spread_undefined"
+        assert rec["qtype"] == "numeric"
+        assert rec["models"] == 3
+        # %.6g of a negative zero denominator renders "-0"; it must read as the number it
+        # is rather than falling through to a string.
+        assert rec["denominator"] == 0
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(SPREAD_UNDEFINED_LINE)
+        assert rec["qid"] == 45363
+        assert rec["qid_kind"] == "question_id"
+
+    def test_positive_denominator_variant_of_the_same_shape_harvests(self):
+        # The guard is `denominator <= 0`, so a plain 0 is the common case; qtype is a
+        # captured field rather than a literal so a future binary/MC variant needs no
+        # spec change.
+        rec = _parse_one(
+            PFX_WARN + "SPREAD_UNDEFINED: question=1 qtype=numeric denominator=0 models=2 — key-percentile spread "
+            "is unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement"
+        )
+        assert rec["denominator"] == 0
+        assert rec["models"] == 2
+
+
+class TestTsAnchorRoute:
+    """The routing marker that made anchor coverage a query instead of an offline re-run.
+
+    route_question used to log only the ambiguous/guard branches: 27 of the triple era's 30
+    route-level misses were the silent `kw_no_keyword_hit` return and left no line in 1,800
+    persisted run logs. Every decision now emits one line, and losing it from the archive
+    would put the next coverage audit back to reconstructing routes offline.
+    """
+
+    def test_routed_fields(self):
+        rec = _parse_one(TS_ANCHOR_ROUTE_ROUTED_LINE)
+        assert rec["marker"] == "ts_anchor_route"
+        assert rec["decision"] == "routed"
+        assert rec["series"] == "PAYEMS"
+        assert rec["step"] == "kw_single"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(TS_ANCHOR_ROUTE_ROUTED_LINE)
+        assert rec["qid"] == 45401
+        assert rec["qid_kind"] == "question_id"
+
+    def test_derivation_gate_skip_names_the_refusing_entry(self):
+        # The q45401 defect class: title keywords hit, the quantity gate refused. Naming
+        # the series is what makes the marker actionable — a bare "skipped" would collapse
+        # this back into the no-keyword miss it was previously indistinguishable from.
+        rec = _parse_one(TS_ANCHOR_ROUTE_GATE_SKIP_LINE)
+        assert rec["decision"] == "skipped"
+        assert rec["series"] == "PAYEMS"
+        assert rec["step"] == "kw_derivation_gate"
+
+    def test_a_plain_keyword_miss_reads_none_series(self):
+        rec = _parse_one(TS_ANCHOR_ROUTE_NO_HIT_LINE)
+        # "none" is a _NONE_SENTINELS value, so a series-less skip reads as None.
+        assert rec["series"] is None
+        assert rec["step"] == "kw_no_keyword_hit"
+
+    def test_a_spread_ref_survives_whole(self):
+        rec = _parse_one(TS_ANCHOR_ROUTE_SPREAD_LINE)
+        assert rec["series"] == "CL=F/^GSPC"
+        assert rec["step"] == "url_spread"
+
+
+class TestFinancialStaleLatest:
+    """The stale-"latest" disclosure, one spec for both emitting surfaces.
+
+    Informational, not alertable: the render already tells the forecaster to treat the
+    value as stale. Harvesting it is what turns "how often does each surface serve a
+    stale anchor value" into a query — run logs expire from GHA at 90 days.
+    """
+
+    def test_yfinance_surface_fields(self):
+        rec = _parse_one(FINANCIAL_STALE_LATEST_YFINANCE_LINE)
+        assert rec["marker"] == "financial_stale_latest"
+        assert rec["surface"] == "financial_data"
+        assert rec["symbol"] == "TEST"
+        assert rec["age_d"] == 3
+        assert rec["cadence"] == "calendar-day"
+
+    def test_ts_anchor_surface_fields(self):
+        # A caret-prefixed Yahoo index symbol must survive as the string it is.
+        rec = _parse_one(FINANCIAL_STALE_LATEST_TS_ANCHOR_LINE)
+        assert rec["surface"] == "ts_anchor"
+        assert rec["symbol"] == "^DEAD"
+        assert rec["age_d"] == 9
+        assert rec["cadence"] == "trading-day"
+
+    def test_no_question_ref(self):
+        # Per-identifier, not per-question (one question can fire several), so the
+        # record carries no qid at all — same shape as the credit markers.
+        rec = _parse_one(FINANCIAL_STALE_LATEST_YFINANCE_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+
 class TestCredit:
     def test_balance(self):
         rec = _parse_one(CREDIT_BALANCE_LINE)
@@ -529,6 +866,30 @@ class TestHtmlCommentMarkers:
         rec = _parse_one("<!-- STACKER_OUTCOME=skipped_config_off -->")
         assert rec["marker"] == "stacker_outcome"
         assert rec["outcome"] == "skipped_config_off"
+
+    def test_stacker_skip_reason(self):
+        # The additive skip-reason companion: the reason the plain "skipped"
+        # outcome can't express (single-forecaster skips compute no spread at all).
+        # Iterates the comment side's frozenset — the single source of truth — so a
+        # reason added there is uncoverable-by-omission here: this alternation is a
+        # hand-maintained duplicate with no import-time assert tying it back (the
+        # comment side self-defends; the telemetry side has only this test), and a
+        # dropped bucket is unrecoverable after the 90-day GHA log expiry.
+
+        for reason in sorted(STACKER_SKIP_REASONS):
+            rec = _parse_one(f"<!-- STACKER_SKIP_REASON={reason} -->")
+            assert rec["marker"] == "stacker_skip_reason", reason
+            assert rec["reason"] == reason
+
+    def test_stacker_skip_reason_does_not_collide_with_stacker_outcome(self):
+        # One marker per line: a comment tail carries both markers on separate
+        # lines, and each line must harvest as exactly its own marker.
+        harvested = parse_log_text(
+            "<!-- STACKER_OUTCOME=skipped -->\n<!-- STACKER_SKIP_REASON=single_forecaster -->\n",
+            **_META,
+        )
+        assert [r["outcome"] for r in harvested["stacker_outcome"]] == ["skipped"]
+        assert [r["reason"] for r in harvested["stacker_skip_reason"]] == ["single_forecaster"]
 
     def test_tools_used(self):
         rec = _parse_one("<!-- TOOLS_USED=false -->")
@@ -728,6 +1089,46 @@ DEGRADATION_COUNTERS_LINE = (
     PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
     "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
     "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
+    "publish_attempt_failures=1, publish_skipped_closed=2, time_budget_fast_path=3, "
+    "research_budget_cuts=5"
+)
+# The shape emitted before the off-fast-path budget-cut counter shipped: ends at
+# time_budget_fast_path. Same optional-group rationale as every tail before it.
+DEGRADATION_COUNTERS_PRE_BUDGET_CUT_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
+    "publish_attempt_failures=1, publish_skipped_closed=2, time_budget_fast_path=3"
+)
+# The shape emitted before the time-budget counter shipped: ends at
+# publish_skipped_closed. Same optional-group rationale as every tail before it.
+DEGRADATION_COUNTERS_NO_BUDGET_TAIL_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
+    "publish_attempt_failures=1, publish_skipped_closed=2"
+)
+# The 2026-08-25-and-earlier shape: ends at publish_attempt_failures, i.e. no
+# publish_skipped_closed tail (the close-time gate's counter). Same optional-group
+# rationale as its predecessors — the regex is $-anchored, so a mandatory tail would
+# drop every record before the gate shipped.
+DEGRADATION_COUNTERS_NO_SKIP_TAIL_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
+    "publish_attempt_failures=1"
+)
+# The 2026-08-24-and-earlier shape: ends at provider_degradation, i.e. no
+# publish_attempt_failures tail. Every archived record until that date has this
+# shape, so the newest key is optional-group wrapped like its predecessors.
+DEGRADATION_COUNTERS_NO_PUBLISH_TAIL_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
     "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1"
 )
 # The shape every one of the 290 archived records carries: the same keys as the
@@ -753,11 +1154,19 @@ DEGRADATION_COUNTERS_LEGACY_LINE = (
 
 
 class TestDegradationCounters:
-    def test_all_eleven_current_keys_parse(self):
+    def test_all_fifteen_current_keys_parse(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
         assert rec["marker"] == "degradation_counters"
+        assert rec["research_budget_cuts"] == 5
+        assert rec["time_budget_fast_path"] == 3
+        assert rec["publish_skipped_closed"] == 2
         assert rec["forecasters_dropped"] == 2
         assert rec["questions_failed_to_publish"] == 0
+
+    def test_pre_budget_cut_line_still_harvests_everything_else(self):
+        rec = _parse_one(DEGRADATION_COUNTERS_PRE_BUDGET_CUT_LINE)
+        assert rec["time_budget_fast_path"] == 3
+        assert "research_budget_cuts" not in rec
         assert rec["stacker_primary_failed"] == 0
         assert rec["stacker_fallback_used"] == 0
         assert rec["stacker_fallback_failed"] == 0
@@ -767,6 +1176,43 @@ class TestDegradationCounters:
         assert rec["prediction_market_degraded"] == 0
         assert rec["prediction_market_source_losses"] == 4
         assert rec["provider_degradation"] == 1
+        assert rec["publish_attempt_failures"] == 1
+
+    def test_line_without_the_budget_tail_still_harvests_everything_else(self):
+        """Every record archived before the time-budget counter shipped ends at
+        publish_skipped_closed, and that now-lazy group must still capture its full
+        value there rather than handing a digit to backtracking."""
+        rec = _parse_one(DEGRADATION_COUNTERS_NO_BUDGET_TAIL_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["publish_skipped_closed"] == 2
+        assert rec["publish_attempt_failures"] == 1
+        # Absent must read as "this era didn't emit it", never as a measured zero.
+        assert "time_budget_fast_path" not in rec
+
+    def test_line_without_the_skip_tail_still_harvests_everything_else(self):
+        """Every record archived before 2026-08-25 ends at publish_attempt_failures,
+        and that now-lazy group must still capture its full value there rather than
+        handing a digit to backtracking, while the newest key reads as absent."""
+        rec = _parse_one(DEGRADATION_COUNTERS_NO_SKIP_TAIL_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["publish_attempt_failures"] == 1
+        assert rec["provider_degradation"] == 1
+        # Absent must read as "this era didn't emit it", never as a measured zero.
+        assert "publish_skipped_closed" not in rec
+        assert "time_budget_fast_path" not in rec
+
+    def test_line_without_the_publish_tail_still_harvests_everything_else(self):
+        """Every record archived before 2026-08-24 ends at provider_degradation, and
+        the lazy provider_degradation group must still capture its full value there
+        (not hand a digit to backtracking) while the newer keys read as absent."""
+        rec = _parse_one(DEGRADATION_COUNTERS_NO_PUBLISH_TAIL_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["provider_degradation"] == 1
+        assert rec["prediction_market_source_losses"] == 4
+        # Absent must read as "this era didn't emit it", never as a measured zero.
+        assert "publish_attempt_failures" not in rec
+        assert "publish_skipped_closed" not in rec
+        assert "time_budget_fast_path" not in rec
 
     def test_line_without_the_provider_degradation_tail_still_harvests_everything_else(self):
         """The load-bearing back-compat case. All 290 archived records end at
@@ -783,7 +1229,10 @@ class TestDegradationCounters:
         assert rec["prediction_market_degraded"] == 0
         assert rec["prediction_market_source_losses"] == 0
         # Absent must read as "this era didn't emit it", never as a measured zero.
-        assert rec["provider_degradation"] is None
+        assert "provider_degradation" not in rec
+        assert "publish_attempt_failures" not in rec
+        assert "publish_skipped_closed" not in rec
+        assert "time_budget_fast_path" not in rec
 
     def test_per_run_summary_carries_no_question_ref(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
@@ -800,11 +1249,77 @@ class TestDegradationCounters:
         assert rec["research_provider_timeouts"] == 5
         assert rec["gap_fill_v2_errors"] == 0
         assert rec["prediction_market_degraded"] == 1
-        # Keys that did not exist pre-rename coerce to None, not 0 — absent must not
-        # read as "measured zero" in the archive.
-        assert rec["research_provider_failures"] is None
-        assert rec["summarizer_failures"] is None
-        assert rec["prediction_market_source_losses"] is None
+        # Keys that did not exist pre-rename are ABSENT from the record, not 0 —
+        # absent must not read as "measured zero" in the archive.
+        assert "research_provider_failures" not in rec
+        assert "summarizer_failures" not in rec
+        assert "prediction_market_source_losses" not in rec
+
+    def test_a_future_counter_harvests_with_no_spec_change(self):
+        # The whole point of the tokenized tail: appending a key to
+        # format_degradation_summary must never again require a markers.py edit.
+        line = (
+            "2026-08-25 12:00:00,000 - metaculus_bot.forecaster - INFO - "
+            "Degradation counters: forecasters_dropped=0, some_future_counter=7"
+        )
+        rec = _parse_one(line)
+        assert rec["forecasters_dropped"] == 0
+        assert rec["some_future_counter"] == 7
+
+
+class TestTimeBudgetLoudMarkers:
+    """The four budget WARNs docs/operations.md tells the operator to grep. Without
+    specs they vanished at the 90-day GHA log expiry; the mid-phase gap-fill cut on
+    a non-fast-path question was recoverable from nothing else."""
+
+    def test_time_budget_fast_path_roundtrip(self):
+        line = (
+            "2026-08-25 12:00:00,000 - metaculus_bot.forecaster - WARNING - "
+            "TIME_BUDGET_FAST_PATH: qid=45085 budget=1140s close_time=2026-08-25 13:00:00+00:00; "
+            "dropping the slow search providers and gap-fill to protect the prediction POST"
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "time_budget_fast_path"
+        assert rec["qid"] == 45085
+        assert rec["qid_kind"] == "question_id"
+        assert rec["budget_s"] == pytest.approx(1140.0)
+        assert rec["close_time"] == "2026-08-25 13:00:00+00:00"
+
+    def test_research_phase_deadline_roundtrip(self):
+        line = (
+            "2026-08-25 12:00:00,000 - metaculus_bot.research.orchestrator - WARNING - "
+            "RESEARCH_PHASE_DEADLINE: cancelled 2/6 providers after 570s (gemini_search,native_search)"
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "research_phase_deadline"
+        assert rec["cancelled"] == 2
+        assert rec["total"] == 6
+        assert rec["deadline_s"] == pytest.approx(570.0)
+        assert rec["providers"] == "gemini_search,native_search"
+        # No question ref on this line; attribution lives in provider_results.
+        assert "qid" not in rec
+
+    def test_gap_fill_skipped_for_budget_roundtrip(self):
+        line = (
+            "2026-08-25 12:00:00,000 - metaculus_bot.research.orchestrator - WARNING - "
+            "GAP_FILL_SKIPPED_FOR_BUDGET: question=45085 fast_path=true research_phase_remaining=n/a"
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "gap_fill_skipped_for_budget"
+        assert rec["qid"] == 45085
+        assert rec["fast_path"] is True
+        assert rec["research_phase_remaining"] is None  # "n/a" coerces to None
+
+    def test_gap_fill_cut_for_budget_roundtrip_both_passes(self):
+        for gap_fill_pass in ("V1", "V2"):
+            line = (
+                "2026-08-25 12:00:00,000 - metaculus_bot.research.orchestrator - WARNING - "
+                f"GAP_FILL_{gap_fill_pass}_CUT_FOR_BUDGET: question=45085; research phase ran out of budget"
+            )
+            rec = _parse_one(line)
+            assert rec["marker"] == "gap_fill_cut_for_budget"
+            assert rec["qid"] == 45085
+            assert rec["gap_fill_pass"] == gap_fill_pass
 
 
 # The per-run provider-degradation summary (metaculus_bot/research/provider_health.py
@@ -818,6 +1333,13 @@ PROVIDER_DEGRADATION_LINE = (
     '{"signal":"catalogue_empty","venue":"predictit_markets","questions":1,"entries":0,"fetch_ok":true}]'
 )
 PROVIDER_DEGRADATION_CLEAN_LINE = PFX + "PROVIDER_DEGRADATION: run=local findings=0 alertable=0 suppressed=0 detail=[]"
+# Current shape (2026-08-24): the observation denominators that let a reader tell a
+# measured zero (venues_observed=4 pool_rows=404) from a vacuous one (a run that
+# forecast nothing and evaluated nothing — 96% of the archived records).
+PROVIDER_DEGRADATION_DENOMINATED_LINE = (
+    PFX + "PROVIDER_DEGRADATION: run=32300000000 findings=0 alertable=0 suppressed=0 "
+    "venues_observed=4 catalogues_observed=2 pool_rows=404 detail=[]"
+)
 PROVIDER_DEGRADATION_SUPPRESSED_LINE = (
     PFX + "PROVIDER_DEGRADATION: run=local findings=1 alertable=0 suppressed=1 "
     'detail=[{"signal":"market_field_contract","venue":"manifold","questions":1,"fields":"num_bettors",'
@@ -866,6 +1388,23 @@ class TestProviderDegradation:
         assert rec["alertable"] == 0
         assert rec["suppressed"] == 1
         assert json.loads(rec["detail"])[0]["suppressed_until"] == "2026-09-10"
+
+    def test_observation_denominators_parse(self):
+        rec = _parse_one(PROVIDER_DEGRADATION_DENOMINATED_LINE)
+        assert rec["findings"] == 0
+        assert rec["venues_observed"] == 4
+        assert rec["catalogues_observed"] == 2
+        assert rec["pool_rows"] == 404
+
+    def test_pre_denominator_lines_read_absent_not_zero(self):
+        """All ~1039 archived lines predate the denominators; on a re-harvest they
+        must keep parsing, with the new fields None — a vacuous zero must never be
+        promoted into a measured one."""
+        for line in (PROVIDER_DEGRADATION_LINE, PROVIDER_DEGRADATION_CLEAN_LINE, PROVIDER_DEGRADATION_SUPPRESSED_LINE):
+            rec = _parse_one(line)
+            assert rec["venues_observed"] is None
+            assert rec["catalogues_observed"] is None
+            assert rec["pool_rows"] is None
 
     def test_per_run_summary_carries_no_question_ref(self):
         rec = _parse_one(PROVIDER_DEGRADATION_LINE)
@@ -920,6 +1459,166 @@ class TestPaidPersonalKeyFallback:
         assert harvested["paid_personal_key_fallback"] == []
 
 
+# The per-attempt publish-failure WARN (publish_hardening.py _wrap_with_timeout_retry).
+# Two emitted shapes; the failed one is copied from q45085's real 405-closed run
+# (2026-08-03), the incident that showed a publish failure left no harvestable trace.
+PUBLISH_HARDENING_TIMEOUT_LINE = (
+    PFX_WARN + "PUBLISH_HARDENING: _post_question_prediction attempt 1/2 timed out after 20s"
+)
+PUBLISH_HARDENING_FAILED_LINE = (
+    PFX_WARN + "PUBLISH_HARDENING: _post_question_prediction attempt 2/2 failed "
+    "(HTTPError: Error while posting prediction: Status code: 405. "
+    'Response: {"error":"Question 45085 is already closed to forecasting !"})'
+)
+
+
+class TestPublishHardening:
+    def test_timeout_shape(self):
+        rec = _parse_one(PUBLISH_HARDENING_TIMEOUT_LINE)
+        assert rec["marker"] == "publish_hardening"
+        assert rec["method"] == "_post_question_prediction"
+        assert rec["attempt"] == 1
+        assert rec["attempts"] == 2
+        assert rec["timeout_s"] == 20
+        # Exactly one branch populates per record.
+        assert rec["error_type"] is None
+        assert rec["error"] is None
+
+    def test_exception_shape_captures_class_and_message(self):
+        rec = _parse_one(PUBLISH_HARDENING_FAILED_LINE)
+        assert rec["method"] == "_post_question_prediction"
+        assert rec["attempt"] == 2
+        assert rec["attempts"] == 2
+        assert rec["error_type"] == "HTTPError"
+        assert "405" in rec["error"]
+        assert rec["timeout_s"] is None
+
+    def test_comment_post_method_parses_too(self):
+        rec = _parse_one(PFX_WARN + "PUBLISH_HARDENING: post_question_comment attempt 1/2 timed out after 20s")
+        assert rec["method"] == "post_question_comment"
+
+    def test_other_publish_hardening_strings_are_not_harvested(self):
+        """The module reuses the PUBLISH_HARDENING prefix in its seam-moved
+        AttributeErrors and its loop-exited RuntimeError; only the per-attempt
+        failure WARNs carry the ``attempt N/M`` clause, so only those harvest."""
+        non_attempt_lines = [
+            PFX + "Publish hardening applied: 2 MetaculusClient.post_* methods wrapped with 20s timeout + 1 retry",
+            PFX_WARN + "PUBLISH_HARDENING: MetaculusClient defines no '_post_question_prediction' to patch. "
+            "The forecasting-tools publish seam moved or was renamed; repoint _PATCHED_METHODS.",
+            PFX_WARN + "PUBLISH_HARDENING: _post_question_prediction loop exited without running",
+        ]
+        for line in non_attempt_lines:
+            harvested = parse_log_text(line + "\n", **_META)
+            assert harvested["publish_hardening"] == [], line
+
+    def test_per_call_marker_carries_no_question_ref(self):
+        # The wrapper sees only the POST, so there is no id space to stamp.
+        rec = _parse_one(PUBLISH_HARDENING_TIMEOUT_LINE)
+        assert "qid" not in rec
+
+    def test_the_new_not_retrying_line_is_not_harvested_as_an_attempt(self):
+        """The non-retryable-4xx WARN shares the prefix but carries no ``attempt N/M``
+        clause on purpose — folding it into the line above would have broken the
+        attempt spec's anchored shape."""
+        line = (
+            PFX_WARN + "PUBLISH_HARDENING: _post_question_prediction not retrying status 405 "
+            "— a second identical POST cannot succeed"
+        )
+        assert parse_log_text(line + "\n", **_META)["publish_hardening"] == []
+
+
+# The per-question pre-publish skip WARN (publish_gate.py skip_publish_if_closed).
+# Values are q45085's real numbers: fetched at 11:59:38Z against a 12:00:00Z close,
+# publish reached at 12:05:06Z.
+PUBLISH_SKIPPED_CLOSED_LINE = (
+    PFX_WARN + "PUBLISH_SKIPPED_CLOSED: question=45085 reason=close_time_passed "
+    "close_time=2026-08-03T12:00:00+00:00 now=2026-08-03T12:05:06+00:00 overdue_s=306 state=open"
+)
+
+
+class TestPublishSkippedClosed:
+    def test_close_time_passed_shape(self):
+        rec = _parse_one(PUBLISH_SKIPPED_CLOSED_LINE)
+        assert rec["marker"] == "publish_skipped_closed"
+        assert rec["reason"] == "close_time_passed"
+        assert rec["close_time"] == "2026-08-03T12:00:00+00:00"
+        assert rec["now"] == "2026-08-03T12:05:06+00:00"
+        assert rec["overdue_s"] == 306
+        assert rec["state"] == "open"
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # publish_gate emits question.id_of_question, so a residual join must not read
+        # it as a post id (the two share one integer space).
+        rec = _parse_one(PUBLISH_SKIPPED_CLOSED_LINE)
+        assert rec["qid"] == 45085
+        assert rec["qid_kind"] == "question_id"
+
+    def test_state_closed_shape_with_absent_close_time(self):
+        rec = _parse_one(
+            PFX_WARN + "PUBLISH_SKIPPED_CLOSED: question=45093 reason=state_closed "
+            "close_time=n/a now=2026-08-06T09:00:00+00:00 overdue_s=n/a state=resolved"
+        )
+        assert rec["reason"] == "state_closed"
+        # n/a must read as absent, never as a measured zero overdue.
+        assert rec["close_time"] is None
+        assert rec["overdue_s"] is None
+
+    def test_negative_overdue_parses(self):
+        # An early admin close leaves close_time in the future, so overdue is negative.
+        rec = _parse_one(
+            PFX_WARN + "PUBLISH_SKIPPED_CLOSED: question=45093 reason=state_closed "
+            "close_time=2026-08-07T00:00:00+00:00 now=2026-08-06T09:00:00+00:00 "
+            "overdue_s=-54000 state=closed"
+        )
+        assert rec["overdue_s"] == -54000
+
+
+# The per-question budget grant INFO (time_budget.py). Emitted for EVERY question,
+# which is the point: CLOSE_MARGIN fires only after a SUCCESSFUL submission, so it is
+# censored on exactly the thin-window questions the budget exists for. Values below
+# are q45085's real close time against a 20-minutes-out fetch.
+TIME_BUDGET_THIN_LINE = (
+    PFX + "TIME_BUDGET: question=45085 budget_s=1140 close_time=2026-08-03T12:00:00+00:00 "
+    "close_limited=true fast_path=true"
+)
+TIME_BUDGET_ROOMY_LINE = (
+    PFX + "TIME_BUDGET: question=44870 budget_s=3510 close_time=2026-07-24T15:00:00+00:00 "
+    "close_limited=false fast_path=false"
+)
+
+
+class TestTimeBudget:
+    def test_thin_window_shape(self):
+        rec = _parse_one(TIME_BUDGET_THIN_LINE)
+        assert rec["marker"] == "time_budget"
+        assert rec["budget_s"] == 1140
+        assert rec["close_time"] == "2026-08-03T12:00:00+00:00"
+        assert rec["close_limited"] is True
+        assert rec["fast_path"] is True
+
+    def test_roomy_window_shape_reads_the_static_budget(self):
+        """The uncensored denominator: a roomy question emits this line too, so a later
+        round can measure how often a window is actually thin."""
+        rec = _parse_one(TIME_BUDGET_ROOMY_LINE)
+        assert rec["budget_s"] == 3510
+        assert rec["close_limited"] is False
+        assert rec["fast_path"] is False
+
+    def test_absent_close_time_reads_as_none(self):
+        rec = _parse_one(
+            PFX + "TIME_BUDGET: question=14333 budget_s=3510 close_time=n/a close_limited=false fast_path=false"
+        )
+        # n/a must read as absent, never as a parsed timestamp or a zero.
+        assert rec["close_time"] is None
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # time_budget emits question.id_of_question, so a residual join must not read it
+        # as a post id (the two share one integer space).
+        rec = _parse_one(TIME_BUDGET_THIN_LINE)
+        assert rec["qid"] == 45085
+        assert rec["qid_kind"] == "question_id"
+
+
 # The end-of-run alertable breakdown (cli.py). Emitted on BOTH exit paths — the
 # fully-suppressed green run is exactly the one that would otherwise leave no
 # record, since the credit subset can cancel the whole generic total and read
@@ -932,6 +1631,14 @@ RUN_ALERTABLE_SUPPRESSED_LINE = (
     PFX + "Run completed with 0 alertable degradation event(s) (bot=0, personal_key_fallback=7 "
     "of which donated_404=0, credit=7 with 7 credit event(s) suppressed until 2026-09-10, "
     "donated_key=drained); every fallback was a suppressed credit event, so this run stays green."
+)
+# The 2026-08-25 addition: a run where nothing degraded at all. It logged no line
+# before, so the census counted only degraded runs — which the drained-key window
+# hid, since every run in it fell back at least once.
+RUN_ALERTABLE_CLEAN_LINE = (
+    PFX + "Run completed clean with 0 alertable degradation event(s) (bot=0, personal_key_fallback=0 "
+    "of which donated_404=0, credit=0 with 0 credit event(s) suppressed until 2026-09-10); "
+    "nothing degraded, so this run stays green."
 )
 
 
@@ -948,6 +1655,8 @@ class TestRunAlertableSummary:
         # zero — "never needed a probe" must not read as "the probe said unknown".
         assert rec["suppressed_credit"] is None
         assert rec["donated_key"] is None
+        # A degraded line carries no phrase marker; ``outcome`` is only ever "clean".
+        assert rec["outcome"] is None
 
     def test_suppressed_green_run_carries_the_probe_verdict(self):
         """The shape the drained-donated-key incident produced: alertable=0 with seven
@@ -959,6 +1668,25 @@ class TestRunAlertableSummary:
         assert rec["suppressed_credit"] == 7
         assert rec["resume_date"] == "2026-09-10"
         assert rec["donated_key"] == "drained"
+        # Pre-2026-08-25 records carry no phrase marker, and neither does any
+        # degraded line since — ``outcome`` is what says "clean", so it must stay
+        # absent here rather than defaulting to it.
+        assert rec["outcome"] is None
+
+    def test_clean_run_is_harvested_and_flagged(self):
+        """The all-clear shape harvests as the same marker, distinguishable by
+        ``outcome`` rather than by its all-zero fields — a run that lost a question
+        also reads all zeros (q45085's shape) and keeps the plain phrase."""
+        rec = _parse_one(RUN_ALERTABLE_CLEAN_LINE)
+        assert rec["marker"] == "run_alertable_summary"
+        assert rec["outcome"] == "clean"
+        assert rec["alertable"] == 0
+        assert rec["bot"] == 0
+        assert rec["personal_key_fallback"] == 0
+        assert rec["donated_404"] == 0
+        assert rec["credit"] == 0
+        assert rec["suppressed_credit"] == 0
+        assert rec["donated_key"] is None
 
 
 # Gemini ungrounded-suppression WARN (metaculus_bot/research/gemini_search.py

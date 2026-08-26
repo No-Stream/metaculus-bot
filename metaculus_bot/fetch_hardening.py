@@ -74,6 +74,7 @@ from metaculus_bot.constants import (
     FETCH_GET_RETRIES,
     FETCH_GET_TIMEOUT,
 )
+from metaculus_bot.http_status import http_status_from_exception, iter_cause_chain
 
 assert FETCH_GET_RETRIES >= 0, "FETCH_GET_RETRIES must be non-negative"
 assert FETCH_GET_BACKOFF_BASE >= 0, "FETCH_GET_BACKOFF_BASE must be non-negative"
@@ -121,41 +122,29 @@ def _install_get_timeout_default(timeout_s: float) -> None:
 def _is_retryable(exc: BaseException) -> bool:
     """Return True iff the exception represents a transient failure worth retrying.
 
-    Walks the ``__cause__`` chain because forecasting-tools'
-    ``raise_for_status_with_additional_info`` re-raises a fresh ``HTTPError``
-    with no ``response`` attached, chaining the original via ``raise ... from
-    e``. We need to inspect the original to read the status code.
+    The status read is shared with publish_hardening
+    (``metaculus_bot.http_status`` — the ``__cause__`` walk over ft's
+    message-only ``HTTPError`` re-raise); the POLICY here is deliberately its
+    inverse: fetches allow-list retryable statuses and default to no-retry,
+    because a failed fetch retries next run for free while a failed publish
+    forfeits the question.
     """
-    cur: BaseException | None = exc
-    seen: set[int] = set()
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if isinstance(cur, (requests.Timeout, requests.ConnectionError)):
+    for cause in iter_cause_chain(exc):
+        if isinstance(cause, (requests.Timeout, requests.ConnectionError)):
             return True
-        if isinstance(cur, requests.HTTPError) and cur.response is not None:
-            if cur.response.status_code in _RETRYABLE_STATUSES:
-                return True
-        cur = cur.__cause__
-    return False
+    status = http_status_from_exception(exc)
+    return status in _RETRYABLE_STATUSES
 
 
 def _summarize_exc(exc: BaseException) -> str:
     """One-line summary for log readability.
 
-    Walks ``__cause__`` for the same reason ``_is_retryable`` does: the
-    real-world failure goes through ``raise_for_status_with_additional_info``
-    which re-raises an unattached ``HTTPError`` with the original chained.
-    Without the chain walk, the WARNING line would say "HTTP ?" for every
-    real Metaculus failure, defeating the debuggability of the log.
+    Uses the shared status read (which also recovers "Status code: NNN" from
+    ft's message text) so a real Metaculus failure logs "HTTP 405" rather than
+    the type name of the message-only re-raise.
     """
-    cur: BaseException | None = exc
-    seen: set[int] = set()
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if isinstance(cur, requests.HTTPError) and cur.response is not None:
-            return f"HTTP {cur.response.status_code}"
-        cur = cur.__cause__
-    return type(exc).__name__
+    status = http_status_from_exception(exc)
+    return f"HTTP {status}" if status is not None else type(exc).__name__
 
 
 def _backoff_seconds(attempt: int) -> float:

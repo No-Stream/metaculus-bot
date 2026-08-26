@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket as _socket
+import time
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -38,10 +39,13 @@ from metaculus_bot.research.resolution_source import (
     is_fred_url,
     is_metaculus_self_ref,
     is_yahoo_ticker_url,
+    looks_like_csv_rows,
     looks_like_js_wall,
     resolution_source_provider,
     select_fetchable_urls,
+    strip_html_tags,
     strip_markdown_escapes,
+    vacuous_body_status,
 )
 
 # ---------------------------------------------------------------------------
@@ -130,8 +134,12 @@ class FakeSession:
         # captured in host_peak[host]. Provider must keep per-host peak == 1.
         self.host_inflight: dict[str, int] = {}
         self.host_peak: dict[str, int] = {}
+        # Every URL requested, in order — lets tests pin which routes were
+        # (and, critically for the Datawrapper hop, were NOT) fetched.
+        self.requested: list[str] = []
 
     def get(self, url: str, **_kwargs: Any) -> "_TrackingResponse":
+        self.requested.append(url)
         for prefix, handler_list in self._handlers.items():
             if url.startswith(prefix):
                 idx = min(self._call_counts[prefix], len(handler_list) - 1)
@@ -401,6 +409,125 @@ class TestLooksLikeJsWall:
         assert looks_like_js_wall("       \n\n   ") is True
 
 
+class TestStripHtmlTags:
+    """Markup stripping for the RAW-body branches. Two properties matter: real tags go, and
+    inequality signs in a data cell are NOT tags. The naive `</?[A-Za-z][^>]*>` form fails the
+    second — it eats `x <a and y > b` down to `x  b`."""
+
+    _VUUVZ_ROW = (
+        '"8/16 - 8/17, 2026@@24335",'
+        "<a href='https://emersoncollegepolling.com/august-2026-national-poll/'"
+        "style='color:#000000; text-decoration: underline;'target='_blank' rel='nofollow noopener'>"
+        "Emerson College</a>,"
+        '"1,000 LV@@1000",1.108478,36.4,49.2,-12.8'
+    )
+
+    def test_a_live_poll_table_row_keeps_the_pollster_and_loses_the_markup(self):
+        """The measured shape from the live VUUVz dataset (2026-08-26 receipts): a styled anchor
+        per pollster row, 69% of that CSV's 33k chars being tag markup. The pollster name IS the
+        content, so it stays and the tags go — 248 chars down to 84."""
+        out = strip_html_tags(self._VUUVZ_ROW)
+
+        assert "Emerson College" in out
+        assert "<a " not in out and "</a>" not in out and "style=" not in out
+        assert len(out) < len(self._VUUVZ_ROW) / 2.5
+
+    @pytest.mark.parametrize(
+        "cell",
+        ["a < 5, b > 3", "x <a and y > b", "1 < 2 and 3 > 2", "temp < -40 or > 40"],
+    )
+    def test_inequalities_in_a_data_cell_are_untouched(self, cell: str):
+        """`<a and y >` is why the tag NAME is an allow-list and an attribute region must contain
+        an `=`: without both halves this eats real numeric data out of a dataset."""
+        assert strip_html_tags(cell) == cell
+
+    def test_a_body_with_no_angle_brackets_is_byte_identical(self):
+        """The numeric tracker CSVs (1mU3g / kSCt4) contain zero `<` characters, so the strip must
+        be a provable no-op there rather than merely a small one."""
+        csv = "modeldate,approve,disapprove\n8/25/2026,36.41889,55.62032\n"
+        assert strip_html_tags(csv) == csv
+
+    def test_a_bare_link_cell_keeps_its_href_as_the_content(self):
+        """An anchor with empty inner text carries its content in the href, so dropping the tag
+        outright would delete the cell."""
+        assert strip_html_tags("source,<a href='https://x.test/report'></a>") == "source,https://x.test/report"
+
+    def test_an_unlisted_tag_name_is_left_alone(self):
+        """The allow-list is closed: `<body>`/`<script>` never appear in a CSV cell, and matching
+        every `<word>` is what makes the inequality cases above fail."""
+        assert strip_html_tags("<body class='x'>hi</body>") == "<body class='x'>hi</body>"
+
+    def test_a_pathological_no_close_tag_body_strips_in_linear_time(self):
+        """The tag-body alternation must reach its first `=` exactly one way. With `[^<>]*` on
+        both sides of the `=`, a body holding one `<b ` lookalike followed by an angle-bracket-free
+        run of URL cells (query-string `=` signs, no closing `>`) backtracks quadratically: 3.4s at
+        200 KiB measured, ~35 minutes at the 5 MiB response cap — synchronously on the event loop,
+        wedging the sibling fetches past every wall timeout. The linear form is sub-millisecond
+        here, so the 1s bound has three orders of magnitude of slack on either side."""
+        body = "x <b " + ("url=https://example.test/p?q=1&r=2, " * 6000)
+        start = time.perf_counter()
+        out = strip_html_tags(body)
+        elapsed = time.perf_counter() - start
+        assert out == body, "`<b ` with no closing `>` names no tag — the body must be untouched"
+        assert elapsed < 1.0, f"quadratic backtracking regression: {elapsed:.2f}s on a ~220 KiB body"
+
+
+class TestLooksLikeCsvRows:
+    """The precondition for the Tier-2 lead's `Dataset published <ts>` liveness claim."""
+
+    def test_a_header_plus_a_row_is_a_dataset(self):
+        assert looks_like_csv_rows("date,value\n2026-08-01,0.42\n") is True
+
+    def test_a_header_alone_is_not(self):
+        assert looks_like_csv_rows("date,value\n") is False
+
+    def test_a_delimiterless_header_is_not(self):
+        assert looks_like_csv_rows("Not Found\nThe requested chart is unavailable\n") is False
+
+    def test_an_html_error_page_is_not_even_when_it_carries_commas(self):
+        """A soft-404 page passes a bare delimiter test easily, which is why markup is rejected
+        outright on the first non-blank line."""
+        body = "<!DOCTYPE html>\n<html><head><title>404, not found</title></head>\n<body>gone</body>\n"
+        assert looks_like_csv_rows(body) is False
+
+    def test_tab_and_semicolon_delimiters_count(self):
+        assert looks_like_csv_rows("date\tvalue\n2026-08-01\t0.42\n") is True
+        assert looks_like_csv_rows("date;value\n2026-08-01;0.42\n") is True
+
+
+class TestVacuousBodyStatus:
+    """The one place "does this 200 body carry information?" is decided."""
+
+    def test_content_returns_none(self):
+        assert vacuous_body_status("date,value\n2026-08-01,0.42\n", 0.0, require_csv_rows=True) is None
+
+    @pytest.mark.parametrize("body", ["", "   ", "\n\n\t"])
+    def test_an_empty_or_whitespace_body_is_empty_body(self, body: str):
+        assert vacuous_body_status(body, 0.0, require_csv_rows=False) == "empty_body"
+
+    def test_an_undecodable_body_is_unsupported_type(self):
+        assert vacuous_body_status("d\x00a\x00t\x00e\x00", 0.5, require_csv_rows=False) == "unsupported_type"
+
+    def test_the_row_shape_requirement_is_dataset_only(self):
+        """A cited JSON or plain-text page has no row shape to satisfy; only a dataset claiming to
+        be a live series does."""
+        assert vacuous_body_status('{"cve": "x"}', 0.0, require_csv_rows=False) is None
+        assert vacuous_body_status('{"cve": "x"}', 0.0, require_csv_rows=True) == "unsupported_type"
+
+
+class TestFetchResultInvariant:
+    def test_a_success_with_blank_text_cannot_be_constructed(self):
+        """The invariant the field comment always stated and nothing enforced. An empty 200 body
+        shipped as `success` rendered an empty section under the "primary grading evidence"
+        caveat, suppressed the all-failed notice for its siblings, and reported `ok` to provider
+        diagnostics — so a future edit that reintroduces it should crash, not publish a hole."""
+        with pytest.raises(ValueError, match="blank text"):
+            FetchResult(url="https://x.test/a", status="success", text="   ", http_status=200, content_type="text/csv")
+
+    def test_a_failure_with_blank_text_is_the_normal_case(self):
+        assert FetchResult(url="https://x.test/a", status="empty_body", text="", http_status=200, content_type=None)
+
+
 class TestFormatResolutionSections:
     def test_empty_results_returns_empty_string(self):
         assert format_resolution_sections([], datetime(2026, 7, 9, tzinfo=timezone.utc)) == ""
@@ -433,6 +560,31 @@ class TestFormatResolutionSections:
         assert "the resolving page was unreachable; weight other evidence accordingly" in out
         # Body only — the orchestrator prepends the "## Resolution Source Snapshot" header.
         assert "## Resolution Source Snapshot" not in out
+
+    def test_an_empty_body_result_no_longer_suppresses_the_all_failed_notice(self):
+        """The render half of the empty-200 defect. While an empty body counted as `success`, ONE
+        such result put the section on the success path: it rendered an empty `### <url>` block
+        under the primary-grading-evidence caveat, and the "resolving page was unreachable" notice
+        — the whole point of which is to tell the forecaster to weight other evidence — was
+        withheld for the sibling URLs that genuinely failed."""
+        results = [
+            FetchResult(
+                url="https://empty.example.com/x",
+                status="empty_body",
+                text="",
+                http_status=200,
+                content_type="application/json",
+            ),
+            FetchResult(url="https://bad.com/y", status="blocked", text="", http_status=403, content_type=None),
+        ]
+
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+
+        assert "2 resolution source(s) could not be fetched" in out
+        assert "empty.example.com: empty_body" in out
+        assert "the resolving page was unreachable" in out
+        assert "primary grading evidence" not in out
+        assert "### https://empty.example.com/x" not in out
 
     def test_partial_success_appends_failure_note(self):
         # Some sources fetched, some failed: keep the success content and append
@@ -497,6 +649,30 @@ class TestFormatResolutionSections:
         assert "https://example.com/0" in out
         # We should NOT see all four full 300-char blocks packed together.
         assert out.count("A" * 300) <= 2
+
+    def test_a_budget_trim_leaves_a_visible_truncation_marker(self, monkeypatch):
+        """The aggregate trim goes through the marker-emitting truncator, not a bare slice.
+
+        A bare slice cut mid-sentence and could eat the per-URL ``[truncated at N chars ...]``
+        marker the fetch already appended at the end — so an already-truncated page rendered
+        as complete. Reachable on prod constants (5 x 6000 per-URL against an 18000 total).
+        """
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        results = [
+            FetchResult(
+                url="https://example.com/long",
+                status="success",
+                text="B" * 5000 + "\n[truncated at 5000 chars — full source at https://example.com/long]",
+                http_status=200,
+                content_type="text/html",
+            )
+        ]
+
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+
+        # The section is cut, and the cut says so rather than ending mid-body.
+        assert "[truncated at 400 chars — full source at https://example.com/long]" in out
+        assert "B" * 5000 not in out
 
     def test_dropped_sections_note_appended(self, monkeypatch):
         # Tighten TOTAL cap so at least one section is dropped entirely: cap=300,
@@ -645,6 +821,89 @@ class TestFetchOne:
         assert f"[truncated at {cap} chars — full source at https://json.example.com/kev]" in result.text
         assert len(result.text) <= cap
 
+    @pytest.mark.parametrize(
+        ("body", "content_type"),
+        [
+            (b"", "application/json"),
+            (b"   \n\t\n ", "application/json"),
+            (b"", "text/csv"),
+            (b"\n\n", "text/plain"),
+        ],
+    )
+    async def test_a_200_with_an_empty_body_is_not_a_success(self, body: bytes, content_type: str):
+        """`read_body_capped` returns `b""` for an empty body and the only guard was `is None`, so
+        an empty 200 shipped as `success` with `text=""`. Three things followed: an empty `###
+        <url>` section rendered under the "primary grading evidence" caveat, that one result
+        suppressed the "resolving page was unreachable" notice for every OTHER failed URL, and
+        provider diagnostics reported `ok` — indistinguishable from a real fetch."""
+        session = FakeSession({"https://empty.example.com/x": FakeResponse(200, body=body, content_type=content_type)})
+
+        result = await _fetch_one(session, "https://empty.example.com/x", {})
+
+        assert result.status == "empty_body"
+        assert result.text == ""
+        assert result.http_status == 200
+
+    async def test_a_declared_charset_body_decodes_instead_of_mojibaking(self):
+        """`charset=` was parsed for ROUTING and then ignored for decoding, so a Windows-1252 CSV
+        rendered as grading evidence with replacement characters where its punctuation had been."""
+        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")
+        session = FakeSession(
+            {
+                "https://poll.example.com/d.csv": FakeResponse(
+                    200, body=body, content_type="text/csv; charset=windows-1252"
+                )
+            }
+        )
+
+        result = await _fetch_one(session, "https://poll.example.com/d.csv", {})
+
+        assert result.status == "success"
+        assert "O’Brien Research" in result.text
+        assert "�" not in result.text
+
+    async def test_an_undecodable_body_is_refused_rather_than_rendered_as_mojibake(self):
+        """BOM-less UTF-16 — the shape a replacement-char count alone cannot see, since every
+        second byte decodes as a valid NUL. `0<?>.<?>4<?>2<?>` type-checks as text and used to
+        reach the forecaster under the primary-grading-evidence caveat."""
+        body = "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
+        session = FakeSession({"https://odd.example.com/d.csv": FakeResponse(200, body=body, content_type="text/csv")})
+
+        result = await _fetch_one(session, "https://odd.example.com/d.csv", {})
+
+        assert result.status == "unsupported_type"
+        assert result.text == ""
+
+    async def test_html_markup_inside_a_csv_cell_is_stripped_on_the_text_branch(self):
+        """The Tier-1 half of the Datawrapper budget fix: the same class of input (a delimited
+        table whose cells carry styled anchors) reaches this branch whenever a source serves its
+        data as CSV directly, and the per-URL char budget should buy rows rather than markup."""
+        body = (
+            "Dates,Pollster,Approve\n8/16,<a href='https://x.test/p' style='color:#000'>Emerson College</a>,36.4\n"
+        ).encode("utf-8")
+        session = FakeSession(
+            {"https://poll.example.com/rows.csv": FakeResponse(200, body=body, content_type="text/csv")}
+        )
+
+        result = await _fetch_one(session, "https://poll.example.com/rows.csv", {})
+
+        assert result.status == "success"
+        assert "Emerson College" in result.text
+        assert "<a " not in result.text and "style=" not in result.text
+
+    async def test_json_bodies_keep_their_angle_brackets(self):
+        """A JSON body's angle brackets sit inside string values that ARE the data, so the strip is
+        confined to the text branches."""
+        body = b'{"note": "value <a and b > c", "n": 1}'
+        session = FakeSession(
+            {"https://api.example.com/v": FakeResponse(200, body=body, content_type="application/json")}
+        )
+
+        result = await _fetch_one(session, "https://api.example.com/v", {})
+
+        assert result.status == "success"
+        assert result.text == body.decode("utf-8")
+
     async def test_pdf_content_type_is_unsupported(self):
         # PDF: body is NEVER read (per the plan). A read() that raises verifies that.
         class UnreadableResponse(FakeResponse):
@@ -770,6 +1029,48 @@ class TestFetchResolutionSources:
         assert results[0].status == "success"
         assert results[0].url == "https://a.example.com/final"
 
+    async def test_unexpected_error_cancels_and_drains_an_in_flight_sibling(self, monkeypatch):
+        """The other half of the F5 teardown guard (the wall-clock-cancellation half
+        is pinned in the Datawrapper suite): when one task dies on an exception the
+        fetcher does NOT catch, the gather re-raises immediately and its still-running
+        siblings must be cancelled and drained BEFORE the session closes. Closing
+        first is what yanks transports out from under live requests."""
+        events: list[str] = []
+
+        class _HangingResponse(FakeResponse):
+            async def read(self) -> bytes:
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    events.append("sibling-settled")
+                    raise
+                raise AssertionError("unreachable: the sibling should be cancelled")
+
+        class _EventSession(FakeSession):
+            async def close(self) -> None:
+                events.append("session-closed")
+                await super().close()
+
+        session = _EventSession(
+            {
+                "https://slow.example.com/x": _HangingResponse(200, body=b"", content_type="text/html"),
+                # RuntimeError is outside the (ClientError, TimeoutError) the fetcher
+                # handles, so it propagates out of the gather.
+                "https://broken.example.com/y": RuntimeError("driver blew up mid-fetch"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        with pytest.raises(RuntimeError, match="driver blew up mid-fetch"):
+            await asyncio.wait_for(
+                fetch_resolution_sources(["https://slow.example.com/x", "https://broken.example.com/y"]),
+                timeout=5.0,
+            )
+
+        assert events == ["sibling-settled", "session-closed"]
+        assert session.host_inflight["slow.example.com"] == 0
+        assert session.closed is True
+
 
 # ---------------------------------------------------------------------------
 # 3. Factory + gating
@@ -883,6 +1184,15 @@ class TestResolutionSourceProvider:
         assert sources["www.bls.gov"] == "ok"
         assert sources["www.bls.gov#2"] == "blocked"
         assert sources["www.bls.gov#3"] == "js_wall"
+
+    def test_an_empty_body_is_a_loss_token_not_ok(self):
+        """The diagnostics half of the empty-200 defect: it reported `ok`, so the block read fully
+        healthy on a question whose only cited source returned nothing."""
+        results = [
+            FetchResult(url="https://x.test/a", status="empty_body", text="", http_status=200, content_type="text/csv")
+        ]
+
+        assert _fetch_result_sources(results) == {"x.test": "empty_body"}
 
 
 # ---------------------------------------------------------------------------

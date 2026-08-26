@@ -41,14 +41,15 @@ Soft-fail on every path. This provider returns an empty snapshot on any failure 
 raises — a broken venue API must never break a forecast — so the degradation counters below
 are the ONLY route by which an outage reddens CI.
 
-One analysis hazard follows from the ranker being allowed to say nothing. A question where it
-returns zero rows renders no section at all, so the `## Prediction Market Snapshot` header is
-absent — which means a comment- or log-backfilled archive record, whose `providers_used` is
-reconstructed by scanning for that header, drops the provider entirely, while an artifact record
-still lists it under `providers_attempted`. A fall in prediction-market presence across
-backfilled records can therefore mean "the ranker declined" rather than "the provider broke".
-The `MARKET_RANKING:` line's `outcome=` field distinguishes the two. No code change: the
-header-scan reconstruction is lossy by construction and always was.
+One analysis note follows from the ranker being allowed to say nothing. A question where it
+DELIBERATELY returns zero rows over a non-empty pool now renders a one-sentence "no sufficiently
+relevant market among N candidates" notice (see `format_snapshot_for_research`), so the
+`## Prediction Market Snapshot` header is present and the provider diagnostics read `ok` rather
+than `empty`. Records from before that change (pre 2026-08-24) render no section at all on those
+questions, so a header-scan `providers_used` reconstruction drops the provider there while an
+artifact record still lists it under `providers_attempted` — a fall in prediction-market presence
+across old records can mean "the ranker declined" rather than "the provider broke". The
+`MARKET_RANKING:` line's `outcome=` field distinguishes the two in every era.
 """
 
 from __future__ import annotations
@@ -455,7 +456,11 @@ async def _rank_pool(question: Any, pool: generation.PoolResult) -> tuple[list[M
     An EMPTY ARRAY from the model is a valid answer, not a failure: width is the model's choice
     in 0..8, it took 3 and 6 rows on the two measured true negatives against a fixed-8 arm's
     12, and conflating `[]` with unusable output would delete the whole adaptive-width
-    mechanism. Only output that cannot be read as a JSON array at all fails open.
+    mechanism. Everything else the parser cannot read as a ranking fails open — output that is
+    not a JSON array of ranking objects (`RankingUnusable`), and a non-empty array yielding no
+    usable row (`RankingShapeRegression`, e.g. a renamed index key). The two are logged with a
+    `reason=` that tells them apart, because one says the model emitted prose and the other says
+    our prompt/parser contract broke.
     """
     if not pool.candidates:
         # Nothing to rank, so the stage does not run and there is no LLM call to lose. A
@@ -483,7 +488,17 @@ async def _rank_pool(question: Any, pool: generation.PoolResult) -> tuple[list[M
     try:
         picks = ranking.parse_ranking(completion, len(pool.candidates))
     except ranking.RankingUnusable as exc:
-        logger.warning(f"Market ranking unusable ({exc}); falling back to retrieval order")
+        # A marker line rather than prose, because the archive has to be able to count these: a
+        # fail-open renders retrieval order under `[ranking unavailable]`, and the run logs it
+        # sits in expire from GHA at 90 days. `reason=shape_regression` is the one that means OUR
+        # contract broke (a renamed index key would otherwise have passed silently as `ok(0)`);
+        # `reason=unreadable` means the model emitted something that is not a ranking array.
+        reason = "shape_regression" if isinstance(exc, ranking.RankingShapeRegression) else "unreadable"
+        logger.warning(
+            f"MARKET_RANKING_DEGRADED: question={getattr(question, 'id_of_question', None)} "
+            f"pool={len(pool.candidates)} reason={reason} "
+            f"detail=falling back to retrieval order; {exc}"
+        )
         return ranking.fail_open_slate(pool.candidates), f"error({type(exc).__name__})", "failopen", len(prompt)
     return ranking.apply_picks(pool.candidates, picks), f"ok({len(picks)})", "ranked", len(prompt)
 
@@ -714,7 +729,7 @@ async def _fetch_market_snapshot_impl(
 
     _log_ranking_telemetry(qid, pool, ranked_rows, outcome=outcome, prompt_chars=prompt_chars)
     _record_venue_health(qid, pool, ranked_rows, pool_by_venue=pool_by_venue, sources=sources, platforms=platforms)
-    return MarketSnapshot(matches=ranked_rows, sources=sources)
+    return MarketSnapshot(matches=ranked_rows, sources=sources, pool_size=len(pool.candidates))
 
 
 def _log_ranking_telemetry(
@@ -787,10 +802,16 @@ def _record_venue_health(
     for venue in generation.VENUE_ORDER:
         if venue not in platforms:
             continue
-        # A venue that lost a sub-fetch is already alertable via _bump_source_loss, so
+        # A venue that lost its whole fan-out is already alertable via _bump_source_loss, so
         # provider_health skips it rather than counting one outage twice (and "check the query
-        # construction" would be the wrong remedy for a 503 anyway).
-        if is_lost_source(sources.get(venue, "")):
+        # construction" would be the wrong remedy for a 503 anyway). The skip is narrowed to
+        # TOTAL losses (error/timeout-class tokens, which leave no pool rows to measure): a
+        # partial(ok/total) venue still produced rows, and skipping it blinded Signal A for
+        # that venue on exactly the runs where one of its queries flaked — 3 of the 4 CI-red
+        # source-loss events in the 2026-08-24 residual round were partials, each of which
+        # suppressed the liquidity-field read over the ~59 rows that DID parse.
+        token = sources.get(venue, "")
+        if is_lost_source(token) and not token.startswith("partial("):
             continue
         rows = pool_by_venue.get(venue, [])
         present = {
@@ -814,14 +835,63 @@ def _record_venue_health(
 # ---------------------------------------------------------------------------
 
 
-def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
+def _log_child_render_telemetry(qid: int | None, stats: rendering.ChildRenderStats) -> None:
+    """One INFO line per rendered snapshot, beside `MARKET_RANKING`.
+
+    `withheld` is why it exists: the Kalshi no-price spread threshold is calibrated on eleven fixture
+    strikes, so its prod incidence has to be a query rather than a guess, and the same field counts the
+    Polymarket placeholder legs and Manifold untouched priors the parsers now blank. `max_stage` and
+    `ladder_chars` say whether `LADDER_SECTION_MAX_CHARS` binds on real slates. `named` + `collapsed`
+    should always equal `outcomes` — that is the completeness invariant, so a line where they disagree
+    is a render bug rather than a tuning signal.
+
+    A SEPARATE marker rather than extra fields on `MARKET_RANKING`, because the harvester's
+    `market_ranking` regex is not end-anchored: a new line keeps `scripts/telemetry/markers.py` purely
+    additive instead of re-cutting a spec other tracks are editing this round.
+    """
+    logger.info(
+        f"MARKET_CHILD_RENDER: question={qid} families={stats.families} full_rows={stats.full_rows} "
+        f"ladder_rows={stats.ladder_rows} outcomes={stats.outcomes} named={stats.named} "
+        f"collapsed={stats.collapsed} withheld={stats.withheld} max_stage={stats.max_stage} "
+        f"ladder_chars={stats.ladder_chars}"
+    )
+
+
+def format_snapshot_for_research(snapshot: MarketSnapshot, *, qid: int | None = None) -> str:
     """The markdown block for the research bundle, or `""` when there is nothing to show.
 
-    A thin delegate to `rendering.render_snapshot`; the degraded-ranking marker is derived from
-    the snapshot's own `ranking` source token rather than passed in, so the render is
-    reproducible from an archived snapshot alone.
+    A thin delegate to `rendering.render_snapshot_with_stats`; the degraded-ranking marker is derived
+    from the snapshot's own `ranking` source token rather than passed in, so the render is
+    reproducible from an archived snapshot alone. `qid` is telemetry-only — it labels the
+    `MARKET_CHILD_RENDER` line and changes nothing about the text, so a caller replaying an archived
+    snapshot can omit it.
+
+    One zero-row case renders a sentence instead of `""`: a ranker that reviewed a non-empty
+    pool and deliberately kept nothing (`ranking: ok(0)` — the adaptive-width empty answer).
+    Before this, that section vanished wholesale and read exactly like a provider outage, while
+    the forecaster prompt still shipped the market-weighting clauses for a table that wasn't
+    there (q45200: healthy 381-candidate pool, correct zero-row answer, no `## Prediction Market
+    Snapshot` header at all). The gate is deliberately narrow — `ok(0)` is emitted only by a
+    successful ranking call returning an empty array, and `pool_size > 0` excludes the
+    nothing-to-rank case — so every failure path (`error(...)`, timeout, empty pool) still
+    returns `""` and still reads as `status="empty"` downstream. Note the flip side: a
+    deliberate-zero question now records `prediction_market: ok` in the provider diagnostics
+    rather than `empty`, which is the honest label — the provider did contribute a judgment.
+
+    That claim rests on `ok(0)` meaning ONE thing, which is why `parse_ranking` raises on a
+    non-empty array it can read no row from (`RankingShapeRegression`, 2026-08-26). While that
+    case also returned `[]`, this sentence asserted "none was judged to bear on it" over output
+    whose shape we had failed to parse.
     """
-    return rendering.render_snapshot(snapshot, ranking_degraded=is_lost_source(snapshot.sources.get("ranking", "")))
+    rendered, child_stats = rendering.render_snapshot_with_stats(
+        snapshot, ranking_degraded=is_lost_source(snapshot.sources.get("ranking", ""))
+    )
+    if rendered:
+        _log_child_render_telemetry(qid, child_stats)
+        return rendered
+    if snapshot.sources.get("ranking") == "ok(0)" and snapshot.pool_size > 0:
+        return rendering.render_no_relevant_market_line(snapshot.pool_size)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +944,6 @@ def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallabl
             provider="prediction_market",
             payload=snapshot,
         )
-        return format_snapshot_for_research(snapshot)
+        return format_snapshot_for_research(snapshot, qid=getattr(question, "id_of_question", None))
 
     return _fetch

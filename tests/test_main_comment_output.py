@@ -35,12 +35,20 @@ from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
     GeneralLlm,
+    MultipleChoiceQuestion,
     ReasonedPrediction,
 )
+from forecasting_tools.data_models.binary_report import BinaryReport
 from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
+from forecasting_tools.data_models.multiple_choice_report import (
+    MultipleChoiceReport,
+    PredictedOption,
+    PredictedOptionList,
+)
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.comment.formatting import build_unified_explanation
 from metaculus_bot.comment.markers import (
     FORECASTERS_USED_MARKER_RE,
     STACKED_MARKER_FALSE,
@@ -52,6 +60,7 @@ from metaculus_bot.comment.markers import (
     STACKER_OUTCOME_SKIPPED,
     STACKER_OUTCOME_SKIPPED_CONFIG_OFF,
 )
+from metaculus_bot.constants import COMMENT_CHAR_LIMIT
 from metaculus_bot.performance_analysis.collector import _process_post, _process_single_question
 from metaculus_bot.performance_analysis.parsing import (
     parse_per_model_forecasts,
@@ -59,6 +68,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_per_model_reasoning_text,
     parse_stacked_marker,
     parse_stacker_outcome_marker,
+    parse_stacker_skip_reason_marker,
 )
 from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 from tests.conftest import gather_predictions_stub
@@ -149,6 +159,25 @@ class TestStackedMarkerInjection:
             bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
         assert q.id_of_question not in bot._stacker_outcome
+
+    def test_skip_reason_marker_emitted_and_state_popped(self):
+        # The mid-chain link of the STACKER_SKIP_REASON pipeline: stacking_route
+        # records the reason on the bot dict, and THIS method is the only place it
+        # is popped and handed to build_unified_explanation. Without this test,
+        # dropping the skip_reason= pass-through (or the pop) leaves every published
+        # comment without the marker while both chain ends stay green.
+        bot = _make_bot(AggregationStrategy.STACKING)
+        q = _make_binary_question()
+        bot._stacker_outcome[q.id_of_question] = "skipped"
+        bot._stacker_skip_reason[q.id_of_question] = "single_forecaster"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert "<!-- STACKER_SKIP_REASON=single_forecaster -->" in out
+        assert parse_stacker_skip_reason_marker(out) == "single_forecaster"
+        # State cleaned: a stale entry must not leak onto the next question.
+        assert q.id_of_question not in bot._stacker_skip_reason
 
     def test_stacking_primary_emits_primary_and_legacy_true_markers(self):
         # primary outcome → tri-state STACKER_OUTCOME=primary AND legacy STACKED=true
@@ -321,8 +350,6 @@ class TestStackedMarkerInjection:
         # trim_comment preserves the tail when truncating; the marker is
         # appended at the very end, so it must survive even when the base
         # text is pushed over the comment char limit.
-        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
-
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
         bot._stacker_outcome[q.id_of_question] = "primary"
@@ -355,8 +382,6 @@ class TestStackedMarkerInjection:
         # preservation + per-model regex extraction). On forecaster rotation,
         # update them to current names but verify the parser logic still
         # matches the new shape (provider/family-name/version pattern).
-        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
-
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
         bot._stacker_outcome[q.id_of_question] = "primary"
@@ -444,7 +469,6 @@ class TestFormatAndExpandResearchSummaryAnnotation:
             errors=[],
             predictions=predictions,
         )
-        from forecasting_tools.data_models.binary_report import BinaryReport
 
         with patch.object(
             ForecastBot,
@@ -1312,8 +1336,6 @@ class TestProducerConsumerRoundTrip:
         )
 
         # Produce the annotated summary via the annotation wiring.
-        from forecasting_tools.data_models.binary_report import BinaryReport
-
         parent_summary = (
             "## Report 1 Summary\n"
             "### Forecasts\n"
@@ -1356,8 +1378,6 @@ class TestProducerConsumerRoundTrip:
         # combine_stacker_and_base_reasoning(). The per-base-model percentiles
         # are only recoverable from the combined reasoning body (the summary
         # bullet shows only the stacker's aggregate).
-        from forecasting_tools.data_models.binary_report import BinaryReport
-
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question(qid=777)
         bot._stacker_outcome[q.id_of_question] = "primary"
@@ -1514,9 +1534,6 @@ class TestOversizedCommentReportConstruction:
     """
 
     def _oversized_explanation(self, question: object) -> str:
-        from metaculus_bot.comment.formatting import build_unified_explanation
-        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
-
         summary = "\n".join(f"*Forecaster {i}*: {60 + i}.0%" for i in range(1, 7))
         rationales = "\n".join(
             f"## R1: Forecaster {i} Reasoning\nModel: openrouter/provider/m{i}\nrationale body {i}" for i in range(1, 7)
@@ -1534,8 +1551,6 @@ class TestOversizedCommentReportConstruction:
         return out
 
     def test_binary_report_constructs_from_oversized_comment(self) -> None:
-        from forecasting_tools.data_models.binary_report import BinaryReport
-
         question = BinaryQuestion(
             question_text="Will it happen?", background_info="bg", resolution_criteria="rc", fine_print=""
         )
@@ -1545,13 +1560,6 @@ class TestOversizedCommentReportConstruction:
         assert report.explanation.lstrip().startswith("#")
 
     def test_mc_report_constructs_from_oversized_comment(self) -> None:
-        from forecasting_tools import MultipleChoiceQuestion
-        from forecasting_tools.data_models.multiple_choice_report import (
-            MultipleChoiceReport,
-            PredictedOption,
-            PredictedOptionList,
-        )
-
         question = MultipleChoiceQuestion(
             question_text="Which option?",
             background_info="bg",
@@ -1641,8 +1649,6 @@ class TestOfflineAssemblySmoke:
         ]
 
     def test_healthy_6model_comment_assembles_with_research_and_real_headings(self) -> None:
-        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
-
         bot, q = self._bot_and_question()
         sentinel = "RESEARCH_ONCE_SENTINEL"
         collection = ResearchWithPredictions(
@@ -1666,10 +1672,6 @@ class TestOfflineAssemblySmoke:
         assert "<!-- STACKED=true -->" in explanation
 
     def test_oversized_6model_comment_holds_invariant_and_constructs(self) -> None:
-        from forecasting_tools.data_models.binary_report import BinaryReport
-
-        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
-
         bot, q = self._bot_and_question()
         # Large rationales force the comment well past the limit; research is
         # sacrificed first by design, so we don't assert it survives — only that

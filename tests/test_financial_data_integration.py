@@ -62,12 +62,15 @@ def test_yfinance_real_fetch_returns_parseable_markdown():
         pytest.skip("yfinance returned empty (transient: rate-limit, network, or symbol-not-found)")
 
     assert md.startswith("### AAPL"), f"Expected ### AAPL header, got: {md[:80]!r}"
-    assert "Current price:" in md, "Missing 'Current price' line"
+    assert "Latest price:" in md, "Missing dated 'Latest price' line"
+    assert "(as of " in md, "Latest price must carry its observation date"
     assert "52-week range:" in md, "Missing '52-week range' line"
     assert "Last 5 closes:" in md, "Missing 'Last 5 closes' section"
     assert "Period returns:" in md, "Missing 'Period returns' section"
-    # Volatility line is conditional on >=30 daily returns; AAPL always has that.
-    assert "30-day annualized volatility:" in md, "Missing volatility line"
+    # Volatility line is conditional on >=30 daily returns; AAPL always has that. AAPL is
+    # exchange-traded, so the label must name TRADING days — a bare "30-day" would mean the
+    # observed-density read misfired and annualized a business-day series on the 365 basis.
+    assert "30-trading-day annualized volatility:" in md, "Missing volatility line"
 
 
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
@@ -81,7 +84,7 @@ def test_yfinance_real_fetch_index_symbol():
         pytest.skip("yfinance returned empty for ^GSPC (transient or upstream issue)")
 
     assert md.startswith("### ^GSPC"), f"Expected ### ^GSPC header, got: {md[:80]!r}"
-    assert "Current price:" in md
+    assert "Latest price:" in md
     assert "52-week range:" in md
 
 

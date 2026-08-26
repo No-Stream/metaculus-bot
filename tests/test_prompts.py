@@ -553,6 +553,14 @@ class TestPredictionMarketFraming:
         for tier in ("same_quantity_same_date", "same_quantity_other_cut", "driver_or_consequence"):
             assert f"`{tier}`" in lowered, tier
         assert "realized outcome rather than a forecast" in lowered
+        # Which label wins when the two axes disagree. A tight relation on a THIN market is the shape
+        # that cost q45189: all three forecasters imported a thin single-strike price at full weight,
+        # because the prompt named both labels and never said the liquidity warning governs the price.
+        # The instruction has to be directional too — widen around the implied value rather than
+        # transplant it — since "discount a thin market" alone is what they thought they were doing.
+        assert "the liquidity warning governs the price" in lowered
+        assert "widening your distribution around its implied value" in lowered
+        assert "rather than transplanting its price exactly" in lowered
         # A multi-outcome market (Kalshi strike family, Polymarket event, PredictIt ballot) has no
         # single price, so the row the forecaster is told to anchor on renders a blank `prob` cell
         # and its outcomes carry the prices on indented sub-rows. Without this the strongest
@@ -560,6 +568,28 @@ class TestPredictionMarketFraming:
         # rendered table's legend; what belongs in the prompt is the anchoring rule.
         assert "a market with several outcomes has no single price" in lowered
         assert "anchor on the outcome matching this question" in lowered
+        # And the rule that anchoring on ONE of those outcomes is not enough. A family of `↳` rows is
+        # a distribution over the market's own question, so reading one bracket as an equality
+        # constraint on a tail is a category error — which is exactly what q45189 cost: all three
+        # forecasters correctly identified the margin-vs-share mismatch on a ten-bracket Kalshi ladder,
+        # then each anchored on the single bracket the render had shown them and cut the resolving
+        # bucket below its own prior. The render change makes the whole ladder available; this sentence
+        # is what tells a forecaster to read it as a distribution.
+        assert "is a distribution over that market's own question" in lowered
+        assert "read the whole ladder" in lowered
+        assert "[remaining n]" in lowered, "the prompt must name the row the rest of the ladder lives on"
+        # The ladder sentence must describe what the renderer actually does under
+        # compaction: outcomes are either named with their own price or inside a
+        # counted group with its summed price (rendering.py's collapse stages —
+        # unquoted, then settled, then the cheapest open outcomes).
+        assert "accounts for every outcome not given a row of its own" in lowered
+        assert "inside a counted group with its summed price" in lowered
+        # The pre-fix overstatement must stay gone: from stage 3 up some OPEN
+        # outcomes carry only a count and a summed price, so "prices every
+        # outcome" asserted a render the collapse stages do not always deliver
+        # (verify_market-render.md Issue D).
+        assert "which prices every outcome" not in lowered
+        assert "never treat one outcome's price as an equality constraint" in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
         # The mis-scoped "you may deviate from a market" carve-out must NOT be present —
@@ -983,6 +1013,43 @@ def _summarizer_prompt(**overrides) -> str:
     )
     kwargs.update(overrides)
     return asknews_summarizer_prompt(**kwargs)
+
+
+class TestResearchPromptsCarryMcOptions:
+    """Every research-side prompt that shows the question must show an MC ballot with it.
+
+    On q44952 (World Yo-Yo champion, MC) no research stage ever saw the candidate list —
+    the prompts carried only question_text — and AskNews returned zero mentions of the
+    eventual winner even though the ballot named him. A searching model can only query
+    names it has been shown, and a summarizer can only relevance-gate articles against
+    candidates it knows exist.
+    """
+
+    _BALLOT = ["Mir Kim", "Hunter Feuerstein", "Other"]
+    _LINE = "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other"
+
+    def test_web_research_prompt_names_the_ballot(self) -> None:
+        assert self._LINE in web_research_prompt("Who wins?", options=self._BALLOT)
+
+    def test_summarizer_prompt_names_the_ballot(self) -> None:
+        assert self._LINE in _summarizer_prompt(options=self._BALLOT)
+
+    def test_gap_fill_analyzer_prompt_names_the_ballot(self) -> None:
+        prompt = gap_fill_analyzer_prompt(
+            question_text="Who wins?",
+            resolution_criteria="rc",
+            fine_print="fp",
+            first_pass_research="research",
+            options=self._BALLOT,
+        )
+        assert self._LINE in prompt
+
+    @pytest.mark.parametrize("options", [None, [], ()])
+    def test_non_mc_questions_carry_no_options_line(self, options) -> None:
+        # Binary/numeric questions have no ballot; an empty "Options" header would invite
+        # the model to invent one.
+        assert "Options (in resolution order)" not in web_research_prompt("Will X happen?", options=options)
+        assert "Options (in resolution order)" not in _summarizer_prompt(options=options)
 
 
 class TestSourceTierTagging:

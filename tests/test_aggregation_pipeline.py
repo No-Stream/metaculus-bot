@@ -23,9 +23,12 @@ from forecasting_tools import (
 )
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
+from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.aggregation_pipeline import AggregationCounters, AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.pipeline import sanitize_percentiles
 from tests.conftest import make_mock_numeric_question
 
 
@@ -439,3 +442,39 @@ class TestRegisterExpectedBaseCombine:
 
         with pytest.raises(AssertionError):
             pipeline.register_expected_base_combine(question)
+
+
+class TestStackerNumericAttribution:
+    @pytest.mark.asyncio
+    async def test_sanitize_percentiles_receives_the_stacker_model_name(self):
+        """NUMERIC_DEGENERATE_DECLARATION attributes by ``model_name``, and the telemetry
+        archive reads ``model=unknown`` as "a caller forgot to pass it" — so the stacker
+        path must wire its own model through, mirroring the forecaster_runners wiring test
+        (test_sanitize_percentiles_receives_the_forecaster_model_name)."""
+        pipeline = _make_pipeline()
+        question = make_mock_numeric_question(id_of_question=301, cdf_size=201)
+        percentiles = [
+            Percentile(percentile=p, value=5.0 + 90.0 * i / (len(STANDARD_PERCENTILES) - 1))
+            for i, p in enumerate(STANDARD_PERCENTILES)
+        ]
+        reasoned = cast(
+            "list[ReasonedPrediction[PredictionTypes]]",
+            [
+                ReasonedPrediction(prediction_value=0.5, reasoning="Model: m1\n\nLow."),
+                ReasonedPrediction(prediction_value=0.5, reasoning="Model: m2\n\nHigh."),
+            ],
+        )
+
+        with (
+            patch(
+                "metaculus_bot.aggregation_pipeline.stacking.run_stacking_numeric",
+                new=AsyncMock(return_value=(percentiles, "meta")),
+            ),
+            patch(
+                "metaculus_bot.aggregation_pipeline.sanitize_percentiles",
+                wraps=sanitize_percentiles,
+            ) as spy,
+        ):
+            await pipeline.run_stacking(question, "research", reasoned)
+
+        assert spy.call_args.kwargs["model_name"] == "test-model"

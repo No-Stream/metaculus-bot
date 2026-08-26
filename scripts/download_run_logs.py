@@ -52,6 +52,11 @@ RUN_LOG_ARTIFACT_PREFIXES: tuple[str, ...] = ("research-", "logs-")
 DEFAULT_REPO = "No-Stream/metaculus-bot"
 DEFAULT_ARCHIVE_DIR = "backtests/telemetry_archive"
 
+# Bound on the workflow-runs enumeration's ``created`` filter. Generous relative to the
+# 90-day artifact retention, but GitHub's 1000-item pagination cap almost always
+# dominates it in practice (see build_workflow_map).
+_RUNS_ENUMERATION_WINDOW_DAYS = 120
+
 
 def workflow_slug_from_path(path: str) -> str:
     """Map a workflow file path to a short slug (``run_bot_on_tournament.yaml`` -> ``tournament``)."""
@@ -59,19 +64,21 @@ def workflow_slug_from_path(path: str) -> str:
     return stem.removeprefix("run_bot_on_")
 
 
-def build_workflow_map(repo: str, since_days: int = 120) -> dict[int, str]:
+def build_workflow_map(repo: str) -> dict[int, str]:
     """Best-effort ``{run_id: workflow_slug}`` map via the workflow-runs endpoint.
 
     The artifacts endpoint doesn't carry the workflow name, so we enumerate runs to
     attribute each artifact to its exact workflow (tournament vs cup vs minibench vs
-    test_bot). The enumeration is BOUNDED to runs created in the last ``since_days``
-    (default 120, comfortably past the 90-day artifact retention) via the API's
-    ``created`` filter — an unbounded ``--paginate`` walks the repo's ENTIRE run history
-    (thousands of runs) and stalls for minutes on a nicety. On any failure we return
-    ``{}`` and callers fall back to prefix inference; the map is manifest-bucketing
-    convenience, never load-bearing for the markers.
+    test_bot). The ``created`` filter bounds the walk to the last
+    ``_RUNS_ENUMERATION_WINDOW_DAYS`` (an unbounded ``--paginate`` walks the repo's
+    ENTIRE run history and stalls for minutes on a nicety), but the effective bound is
+    tighter: GitHub caps ``created``-filtered pagination at 1000 items, so this map
+    never covers the full window — always resolve through :func:`resolve_workflow_map`.
+    On any failure we return ``{}`` and the resolver degrades to the archive-derived
+    map alone; the map is manifest-bucketing convenience, never load-bearing for the
+    markers.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=_RUNS_ENUMERATION_WINDOW_DAYS)).strftime("%Y-%m-%d")
     cmd = [
         "gh",
         "api",
@@ -91,10 +98,14 @@ def build_workflow_map(repo: str, since_days: int = 120) -> dict[int, str]:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        logger.warning(f"workflow-runs enumeration timed out ({GH_API_TIMEOUT_S}s); using prefix inference only")
+        logger.warning(
+            f"workflow-runs enumeration timed out ({GH_API_TIMEOUT_S}s); falling back to the archive-derived map"
+        )
         return {}
     if result.returncode != 0:
-        logger.warning(f"workflow-runs enumeration failed ({result.stderr.strip()}); using prefix inference only")
+        logger.warning(
+            f"workflow-runs enumeration failed ({result.stderr.strip()}); falling back to the archive-derived map"
+        )
         return {}
 
     workflow_map: dict[int, str] = {}
@@ -116,12 +127,10 @@ def build_workflow_map(repo: str, since_days: int = 120) -> dict[int, str]:
 def workflow_map_from_archive(archive_dir: Path) -> dict[int, str]:
     """Rebuild ``{run_id: workflow_slug}`` from the telemetry archive's own run manifest.
 
-    The offline (``--from-store``) harvest must make no network call, so it cannot ask the
-    workflow-runs endpoint. Every run harvested before recorded its workflow in
-    ``runs.jsonl``, and replaying that is what keeps a re-harvest from DOWNGRADING good
-    attribution: without it every ``research-*`` run reads ``unknown`` (see
-    ``infer_workflow``) and the replace-by-run merge writes that over the real slug.
-    ``unknown`` entries are skipped so they never displace a later exact resolution.
+    The under-layer of :func:`resolve_workflow_map` on BOTH paths: offline
+    (``--from-store``) it is the whole map, online it fills the runs GitHub's window no
+    longer returns. ``unknown`` entries are skipped so they never displace a later
+    exact resolution.
     """
     mapping: dict[int, str] = {}
     for record in load_run_manifest(Path(archive_dir)):
@@ -130,6 +139,31 @@ def workflow_map_from_archive(archive_dir: Path) -> dict[int, str]:
         if run_id.isdigit() and workflow and workflow != "unknown":
             mapping[int(run_id)] = workflow
     return mapping
+
+
+def resolve_workflow_map(repo: str, archive_dir: Path, *, from_store: bool = False) -> dict[int, str]:
+    """``{run_id: workflow_slug}`` for a harvest: GitHub's fresh window layered OVER the archive.
+
+    ``build_workflow_map``'s enumeration returns at most 1000 runs (GitHub caps
+    ``created``-filtered pagination), so any run older than ~15 days is absent from the
+    fresh map. ``infer_workflow`` reads those as ``unknown``, and the replace-by-run
+    merge then writes that over the correct slug the archive already recorded. Merging
+    the archive's own manifest UNDERNEATH the fresh map keeps that attribution: GitHub
+    wins wherever both know a run (it is the exact source), the archive fills every run
+    the window no longer returns. Offline (``from_store``) there is no network, so the
+    archive map is the whole answer.
+    """
+    archive_map = workflow_map_from_archive(archive_dir)
+    if from_store:
+        logger.info(f"Offline harvest: recovered {len(archive_map)} run->workflow mappings from {archive_dir}")
+        return archive_map
+    fresh_map = build_workflow_map(repo)
+    merged = {**archive_map, **fresh_map}
+    logger.info(
+        f"Workflow map: {len(fresh_map)} run->workflow mapping(s) from GitHub "
+        f"+ {len(merged) - len(fresh_map)} archive-only (total {len(merged)})"
+    )
+    return merged
 
 
 def infer_workflow(artifact_name: str, run_id: int, workflow_map: dict[int, str]) -> str:
@@ -217,8 +251,7 @@ def download_and_harvest(
         from_store=from_store,
     )
 
-    workflow_map = workflow_map_from_archive(archive_dir) if from_store else build_workflow_map(repo)
-    logger.info(f"Resolved {len(workflow_map)} run->workflow mappings")
+    workflow_map = resolve_workflow_map(repo, archive_dir, from_store=from_store)
 
     runs: list[HarvestedRun] = []
     for run_id, art, run_dir in persisted_run_dirs(

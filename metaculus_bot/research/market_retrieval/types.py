@@ -147,7 +147,27 @@ class MarketChild:
     Manifold scores participation on unique bettors and publishes no per-answer count, so its
     children inherit the market's — every answer really does share one bettor pool, and inheriting
     it renders each child the same honest label as its parent instead of a false
-    ``no-liquidity-data`` on a venue that does publish per-answer volume.
+    ``no-liquidity-data`` on a venue that does publish per-answer volume. It is only ever the
+    weaker half of the label: an answer whose OWN ``total_volume`` is present and zero reads
+    ``thin`` regardless of the pool it sits in (``liquidity_label_from_fields``), because a price
+    nobody has traded has no crowd behind it.
+
+    ADDITIVE-ONLY past ``close_time``, for the same reason ``MarketMatch`` is: ``raw_log`` archives
+    the whole snapshot through ``dataclasses.asdict``, under an envelope whose ``schema_version`` is
+    shared across every provider, so a removal or a reorder changes the archive with no version to
+    bump.
+
+    The last three fields are the 2026-08-25 no-manufactured-price change:
+
+    - ``quote_low`` / ``quote_high`` are the venue's own two-sided book, carried so a blanked price
+      can still say WHAT the book was. That distinguishes "nobody is quoting this rung"
+      (``0.00-1.00``) from "quoted, very wide" (``0.30-1.00``), which ``implied_prob_yes is None``
+      alone cannot. Only Kalshi publishes a per-strike book, so only Kalshi fills them.
+    - ``price_withheld`` marks a price this repo REFUSED because the venue manufactured it — a
+      Kalshi strike with no real book, a Polymarket placeholder leg at Gamma's ``["0.5","0.5"]``
+      default, a Manifold answer sitting at its untouched 0.5 prior with zero volume. Separate from
+      ``implied_prob_yes is None`` because the renderer and the telemetry both need to tell a refusal
+      from "the venue published no price at all", and the two look identical without it.
     """
 
     title: str
@@ -157,6 +177,9 @@ class MarketChild:
     num_bettors: int | None = None
     is_resolved: bool = False
     close_time: datetime | None = None
+    quote_low: float | None = None
+    quote_high: float | None = None
+    price_withheld: bool = False
 
 
 @dataclass
@@ -224,12 +247,20 @@ class MarketMatch:
     # view stays flat — a candidate line describes the parent alone and a pick costs one slot — so
     # this field is written by the venue parsers and read only by `rendering`.
     #
-    # ADAPTER ORDER IS THE RENDER ORDER, verbatim, exactly as the ranker's order is for parents: the
-    # renderer truncates a long list from the END, so each adapter orders by what its own venue
-    # makes worth keeping (traded size on the real-money venues, probability on Manifold, ballot
-    # order on PredictIt) and documents that choice. A row with children carries
-    # `implied_prob_yes=None` on every venue — the invariant that makes "the parent has no single
-    # probability" a fact about the data rather than a rendering convention.
+    # THE VENUE'S OWN CATALOGUE ORDER, verbatim: Kalshi's threshold-ordered nested array, Gamma's
+    # event array, Manifold's answers array, PredictIt's ballot. Presentation belongs to `rendering`,
+    # which sorts a copy by `venues/_shared.child_render_order_key` for the full sub-rows and reads THIS
+    # order for the ladder row that names every remaining outcome. `rendering` is the only consumer of
+    # the order (`generation` writes the Manifold enrichment and reads nothing). A row with children
+    # carries `implied_prob_yes=None` on every venue — the invariant that makes "the parent has no
+    # single probability" a fact about the data rather than a rendering convention.
+    #
+    # ⚠ THE ARCHIVED ORDER CHANGES MEANING AT 2026-08-25, and there is no schema version to bump (the
+    # `raw_log` envelope's `schema_version` is shared across every provider). Records written BEFORE
+    # that date preserve the RENDER order the parser imposed — open-first price-descending on the three
+    # price-bearing venues, traded-size before `4e342da` — and records after it preserve the venue's
+    # CATALOGUE order. Any replay that reconstructs "what the forecaster saw" from the archive must key
+    # on the record's timestamp; a replay that re-sorts is comparing two different things.
     children: tuple[MarketChild, ...] = ()
     # A SCALAR market's traded value, on the only venue that has one (Manifold `PSEUDO_NUMERIC`).
     # Mutually exclusive with `implied_prob_yes` by construction in the venue parser, for the reason
@@ -237,6 +268,13 @@ class MarketMatch:
     # a scale position on a scalar one, and a row that carried both would put two incompatible
     # numbers in one `prob` cell. Empty on every other row and every other venue.
     scalar_estimate: ScalarEstimate | None = None
+    # Set when the venue DID publish a number for this row's own price and we refused it as
+    # manufactured — the single-strike Kalshi family whose one strike has no real book, or a
+    # single-market Polymarket event sitting at Gamma's `["0.5","0.5"]` default. `MarketChild`
+    # carries the same flag for the same reason (see its docstring): `implied_prob_yes is None`
+    # cannot distinguish a refusal from a venue that quotes nothing, and the `MARKET_CHILD_RENDER`
+    # marker has to count refusals to say how often the Kalshi spread threshold fires in prod.
+    price_withheld: bool = False
 
 
 @dataclass
@@ -256,6 +294,13 @@ class MarketSnapshot:
     # `ranking: none` means the pool was empty so the ranking call never ran. See
     # provider_diagnostics.
     sources: dict[str, str] = field(default_factory=dict)
+    # How many candidates the ranker was shown. ADDITIVE (archived via `asdict` alongside
+    # `sources`, so removal/reorder changes the raw-archive shape with no version to bump).
+    # What it exists for: `ranking: ok(0)` alone cannot say "nothing bore on the question"
+    # versus "there was nothing to rank" — the formatter renders the deliberate-zero notice
+    # only when a non-empty pool was reviewed, and this is the N that notice quotes. 0 on
+    # every whole-provider failure path (timeout, outer-except), matching their empty sources.
+    pool_size: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,13 +334,25 @@ def liquidity_label_from_fields(
 
     Takes loose fields rather than a row so a ``MarketChild`` sub-row is labelled by the SAME rule
     as its parent. Two labelling paths would let a Kalshi strike and its family disagree about what
-    "thin" means.
+    "thin" means — and one of them would drift, which is why Manifold's zero-own-volume rule lives
+    here rather than in the child-only wrapper.
     """
     if platform == "predictit":
         # PredictIt exposes no volume/liquidity/OI fields in its all-markets dump.
         return "no-liquidity-data"
 
     if platform == "manifold":
+        # Own volume, PRESENT and zero, overrides the bettor count. On a CHILD sub-row the bettor
+        # count is the PARENT's — Manifold publishes no per-answer count — so a market with 150
+        # bettors labelled every one of its untouched answers `high`, including the ones
+        # `_priced_or_none` had just refused a price for as sitting at their untouched prior (62 of
+        # 399 archived Manifold children, 15.5%, rendered decent/high with zero own volume). A
+        # price nobody traded has no crowd behind it whatever the market's pool is. Absent volume
+        # is NOT evidence of no trading, so the same `is not None` gate `_priced_or_none` uses
+        # applies here, and the bettor thresholds below are untouched — a parent row carries its
+        # own market volume, so a zero there means the same thing it means on a child.
+        if total_volume is not None and total_volume == 0.0:
+            return "thin"
         if num_bettors is None:
             return "no-liquidity-data"
         if num_bettors < MANIFOLD_THIN_BETTORS:

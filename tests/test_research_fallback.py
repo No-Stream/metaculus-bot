@@ -39,7 +39,9 @@ async def test_run_research_falls_back_to_openrouter(monkeypatch, question, base
     bot = TemplateForecaster(llms=base_llms, aggregation_strategy=AggregationStrategy.MEAN)
 
     failing_provider = AsyncMock(side_effect=RuntimeError("primary failure"))
-    monkeypatch.setattr(bot._research, "_select_research_providers", lambda: [(failing_provider, "asknews")])
+    monkeypatch.setattr(
+        bot._research, "_select_research_providers", lambda fast_path=False: [(failing_provider, "asknews")]
+    )
 
     fallback = AsyncMock(return_value="fallback research")
     monkeypatch.setattr(bot._research, "_call_perplexity", fallback)
@@ -66,7 +68,9 @@ async def test_run_research_returns_empty_when_all_providers_fail(monkeypatch, q
     )
 
     failing_provider = AsyncMock(side_effect=RuntimeError("primary failure"))
-    monkeypatch.setattr(bot._research, "_select_research_providers", lambda: [(failing_provider, "asknews")])
+    monkeypatch.setattr(
+        bot._research, "_select_research_providers", lambda fast_path=False: [(failing_provider, "asknews")]
+    )
 
     monkeypatch.setattr(bot._research, "_call_perplexity", AsyncMock(side_effect=RuntimeError("fallback fail")))
     monkeypatch.setattr(bot._research, "_call_exa_smart_searcher", AsyncMock(side_effect=RuntimeError("exa fail")))

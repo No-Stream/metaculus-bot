@@ -404,6 +404,39 @@ class TestRunNumericForecast:
         assert discrete_vote is True
 
     @pytest.mark.asyncio
+    async def test_sanitize_percentiles_receives_the_forecaster_model_name(
+        self, numeric_question, forecaster_llm, parser_llm
+    ) -> None:
+        """The NUMERIC_DEGENERATE_DECLARATION marker attributes a collapsed declaration
+        to the forecaster that made it, and that attribution exists only because this
+        caller passes ``model_name`` — a ``model=unknown`` in the archive means a caller
+        forgot to (see the ``sanitize_percentiles`` docstring)."""
+        mock_parse_structured = AsyncMock(return_value=OutcomeTypeResult(is_discrete_integer=False))
+
+        with (
+            patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
+            patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="reasoning")),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_parse_structured),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_numeric",
+                new=AsyncMock(
+                    return_value=ExtractionOutcome(value=_STANDARD_PERCENTILES, rung="block", block_present=True)
+                ),
+            ),
+            patch(
+                "metaculus_bot.forecaster_runners.sanitize_percentiles",
+                return_value=(_STANDARD_PERCENTILES, None),
+            ) as mock_sanitize,
+            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+            patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
+            patch("metaculus_bot.forecaster_runners.log_final_prediction"),
+        ):
+            await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm)
+
+        assert mock_sanitize.call_args.kwargs["model_name"] == forecaster_llm.model
+
+    @pytest.mark.asyncio
     async def test_unit_mismatch_raises(self, numeric_question, forecaster_llm, parser_llm) -> None:
         """When detect_unit_mismatch returns True, raises UnitMismatchError."""
         mock_parse_structured = AsyncMock(return_value=OutcomeTypeResult(is_discrete_integer=False))

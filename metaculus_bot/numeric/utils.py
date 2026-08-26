@@ -8,7 +8,6 @@ import logging
 from typing import Literal, Sequence
 
 import numpy as np
-import pandas as pd
 from forecasting_tools import PredictedOptionList
 from forecasting_tools.data_models.numeric_report import (
     NumericDistribution,
@@ -155,12 +154,77 @@ def _postprocess_ensemble_cdf(
     )
 
 
+def _canonical_cdf_length(question: NumericQuestion) -> int:
+    """Points the question's submitted CDF has: ``cdf_size``, else the 201-point default.
+
+    Mirrors ``build_numeric_distribution``'s target (pipeline.py reads a None
+    ``cdf_size`` as the standard grid the same way), so per-model CDFs and the
+    ensemble CDF live on the same grid by construction. An out-of-range value
+    raises LOUDLY rather than silently substituting 201: the substitution would
+    only defer the crash to ``_postprocess_ensemble_cdf``, which re-reads
+    ``question.cdf_size`` and would then disagree with the grid the models were
+    just aligned onto.
+    """
+    if question.cdf_size is None:
+        return PCHIP_CDF_POINTS
+    target = int(question.cdf_size)
+    if target < 2:
+        raise ValueError(f"NumericQuestion.cdf_size must be >= 2 to define a CDF grid, got {target}")
+    return target
+
+
+def _cdf_heights_on_canonical_grid(
+    prediction: NumericDistribution,
+    n_points: int,
+    question: NumericQuestion,
+    model_index: int,
+) -> np.ndarray:
+    """One model's CDF heights, resampled to ``n_points`` if it arrived on another grid.
+
+    Grid index ``i`` means the same thing in every CDF — Metaculus bucket
+    ``i / (n - 1)`` of the question's range — so a length mismatch is resolved by
+    interpolating in that shared cdf-location space, NOT in value space: a
+    log-scaled (``zero_point``) question's PCHIP CDF carries a linear value axis
+    while forecasting-tools' fallback builder carries a geometric one, so the
+    x-values disagree by construction even when bucket ``i`` matches.
+    """
+    heights = np.asarray([float(p.percentile) for p in prediction.get_cdf()], dtype=float)
+    if heights.size < 2:
+        raise ValueError(f"Model {model_index} contributed a {heights.size}-point CDF; cannot aggregate")
+    if heights.size == n_points:
+        return heights
+    logger.warning(
+        "NUMERIC_AGGREGATE_GRID_MISMATCH: question=%s model_index=%d got_points=%d expected_points=%d — "
+        "resampling in cdf-location space before aggregation",
+        getattr(question, "id_of_question", None),
+        model_index,
+        heights.size,
+        n_points,
+    )
+    return np.interp(
+        np.linspace(0.0, 1.0, n_points),
+        np.linspace(0.0, 1.0, heights.size),
+        heights,
+    )
+
+
 def aggregate_numeric(
     predictions: Sequence[NumericDistribution],
     question: NumericQuestion,
     method: str | Literal["mean", "median"] = "mean",
 ) -> NumericDistribution:
-    """Aggregate numeric distributions by mean or median.
+    """Aggregate numeric distributions by mean or median, pointwise in CDF space.
+
+    Every model contributes to every grid point. The aggregation is POSITIONAL
+    (grid index i across all models), because grouping on the float ``value``
+    axis silently medianed over a SUBSET: the PCHIP path's ``np.linspace`` grid
+    and forecasting-tools' fallback ``min + span*i/(n-1)`` grid are equal in
+    exact arithmetic but differ in the last bits, so a mixed-path ensemble
+    produced ~225 distinct x-values for 201 buckets and roughly a quarter of them
+    had fewer than n contributors — with nothing recording the partial
+    membership, and the resulting length mismatch logging a spurious "Discrete
+    aggregation detected". A model that genuinely arrives on a different-length
+    grid is resampled first (logged, see ``_cdf_heights_on_canonical_grid``).
 
     Parameters
     ----------
@@ -178,13 +242,18 @@ def aggregate_numeric(
     if method not in ("mean", "median"):
         raise ValueError(f"Invalid aggregation method: {method}")
 
-    numeric_predictions = list(predictions)
-    cdfs_as_dfs = [pd.DataFrame([p.model_dump() for p in pred.get_cdf()]) for pred in numeric_predictions]
-    combined_cdf = pd.concat(cdfs_as_dfs, ignore_index=True)
+    n_points = _canonical_cdf_length(question)
+    heights = np.vstack(
+        [
+            _cdf_heights_on_canonical_grid(prediction, n_points, question, index)
+            for index, prediction in enumerate(predictions)
+        ]
+    )
+    if heights.shape != (len(predictions), n_points):
+        raise ValueError(f"Aligned CDF matrix has shape {heights.shape}, expected {(len(predictions), n_points)}")
 
-    agg_series = combined_cdf.groupby("value", sort=True)["percentile"].agg(method)
-    x_vals = agg_series.index.to_numpy(dtype=float)
-    p_vals = agg_series.to_numpy(dtype=float)
+    p_vals = heights.mean(axis=0) if method == "mean" else np.median(heights, axis=0)
+    x_vals = np.linspace(question.lower_bound, question.upper_bound, n_points)
 
     return _postprocess_ensemble_cdf(x_vals, p_vals, question, method_label=method)
 

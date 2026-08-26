@@ -216,6 +216,21 @@ class TestAskNewsSummarization:
         assert "NEVER include your own forecast, probability estimate, or probability distribution" in collapsed
 
     @pytest.mark.asyncio
+    async def test_prompt_carries_the_mc_ballot(self, orchestrator, question):
+        """The summarizer's relevance screen needs the candidate names: on q44952 (World
+        Yo-Yo champion, MC) no research stage ever saw the ballot, and AskNews returned
+        zero mentions of the eventual winner even though the options named him."""
+        question.options = ["Mir Kim", "Hunter Feuerstein", "Other"]
+        with patch.object(
+            orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock, return_value="summary"
+        ) as invoke:
+            await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert invoke.await_args is not None
+        prompt = invoke.await_args.args[0]
+        assert "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other" in prompt
+
+    @pytest.mark.asyncio
     async def test_missing_open_time_asserts(self, orchestrator, question):
         """Missing open_time is a data bug — fail loudly (matches the
         _forecasting_window_str contract), never silently skip stamping."""

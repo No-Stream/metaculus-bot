@@ -25,12 +25,14 @@ the same time — the two ways the hardening's own machinery leaked into its nei
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
+import requests
 from forecasting_tools.data_models.binary_report import BinaryReport
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.data_models.questions import (
@@ -42,11 +44,26 @@ from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot import publish_hardening
+from metaculus_bot.constants import PUBLISH_POST_RETRIES
+from metaculus_bot.http_status import http_status_from_exception
+from scripts.telemetry.markers import parse_log_text
 
 # A real Metaculus publish URL: the forced-timeout override is scoped to the Metaculus
 # host on purpose (metaculus_client.requests IS the global requests module, so an
 # unscoped permanent patch would re-time every other POST in the process).
 _METACULUS_POST_URL = "https://www.metaculus.com/api/questions/forecast/"
+
+# One GHA-shaped log line's prefix plus the harvest metadata, so a WARN this module
+# actually emitted can be run through the real telemetry parser (the run logs the
+# archive harvests are the workflow's `python | tee` output, not caplog's messages).
+_LOG_PREFIX = "2026-08-03 12:05:06,123 - metaculus_bot.publish_hardening - WARNING - "
+_HARVEST_META = {
+    "run_id": "999",
+    "workflow": "tournament",
+    "artifact": "research-999",
+    "run_date": "2026-08-03T12:00:00Z",
+    "log_file": "run.log",
+}
 
 
 @pytest.fixture
@@ -289,3 +306,204 @@ class TestHardeningStillCoversThePostSeam:
                 original = getattr(raw, "__wrapped__", None)
                 if original is not None:
                     setattr(report_type, publish_hardening._PUBLISH_METHOD, original)
+
+
+class TestPublishAttemptFailureCounter:
+    """The retry wrapper's terminal ``raise last_exc`` is the one place a publish
+    ATTEMPT failure becomes countable. Before the counter, q45085's 405-closed
+    (2026-08-03) burned both attempts and every degradation counter still read
+    zero — ``questions_failed_to_publish`` only sees the min-forecasters floor.
+    Telemetry only: the raise itself must be untouched."""
+
+    def test_exhausted_retries_bump_the_counter_once_and_reraise(self) -> None:
+        def always_405(*_args: Any, **_kwargs: Any) -> None:
+            raise requests.HTTPError("Error while posting prediction: Status code: 405")
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("_post_question_prediction", always_405)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with pytest.raises(requests.HTTPError):
+                wrapped()
+            # One exhausted publish = ONE counted failure, not one per attempt.
+            assert publish_hardening.publish_attempt_failures() == 1
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+    def test_retry_recovery_leaves_the_counter_at_zero(self) -> None:
+        attempts: list[int] = []
+
+        def flaky_then_ok(*_args: Any, **_kwargs: Any) -> str:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise requests.ConnectionError("transient")
+            return "ok"
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("post_question_comment", flaky_then_ok)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            assert wrapped() == "ok"
+            # A retried-then-successful publish is not a failure.
+            assert publish_hardening.publish_attempt_failures() == 0
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+    def test_reset_zeroes_the_module_counter(self) -> None:
+        publish_hardening._bump_publish_attempt_failure()
+        publish_hardening.reset_publish_attempt_failures()
+        assert publish_hardening.publish_attempt_failures() == 0
+
+    def test_concurrent_exhausted_publishes_both_count(self) -> None:
+        # Layer 3 runs each report's publish on its own worker thread and ft's gather
+        # can have several questions publishing at once, so the increment really is
+        # reached concurrently. ``+=`` on a module global is interruptible between
+        # bytecodes; unlocked, a lost update would let a two-question publish outage
+        # read as one.
+        def always_fails(*_args: Any, **_kwargs: Any) -> None:
+            raise requests.ConnectionError("dead socket")
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("post_question_comment", always_fails)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(wrapped) for _ in range(40)]
+                for future in futures:
+                    with pytest.raises(requests.ConnectionError):
+                        future.result()
+            assert publish_hardening.publish_attempt_failures() == 40
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+
+class TestNonRetryable4xxIsNotRetried:
+    """A 4xx that is not 408/429 is a permanent verdict on THIS request, so a second
+    identical POST can only burn wall clock inside the per-question budget. q45085's
+    405-closed was retried 4s later and failed identically. 5xx and transport-level
+    failures still retry exactly as before."""
+
+    @staticmethod
+    def _ft_style_error(status: int) -> requests.HTTPError:
+        """Reproduce ft's re-raise shape: ``raise_for_status_with_additional_info``
+        builds a BRAND-NEW HTTPError from a message string, so the exception the
+        wrapper catches has no ``.response`` and the status lives only in the text."""
+        return requests.HTTPError(
+            f"HTTPError. Url: https://www.metaculus.com/api/questions/forecast/. Status code: {status}. "
+            'Response reason: Method Not Allowed. Response text: {"error":"Question 45085 is already '
+            'closed to forecasting !"}. Response JSON: None.'
+        )
+
+    def _count_attempts(self, exc: BaseException) -> int:
+        attempts: list[int] = []
+
+        def always_raises(*_args: Any, **_kwargs: Any) -> None:
+            attempts.append(1)
+            raise exc
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("_post_question_prediction", always_raises)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with pytest.raises(type(exc)):
+                wrapped()
+            # Either way the terminal counter fires exactly once — only the attempt
+            # count changes, never the telemetry or the raise.
+            assert publish_hardening.publish_attempt_failures() == 1
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+        return len(attempts)
+
+    def test_405_already_closed_is_attempted_once(self) -> None:
+        assert self._count_attempts(self._ft_style_error(405)) == 1
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 405])
+    def test_permanent_4xx_statuses_are_attempted_once(self, status: int) -> None:
+        assert self._count_attempts(self._ft_style_error(status)) == 1
+
+    @pytest.mark.parametrize("status", [408, 429])
+    def test_transient_4xx_statuses_still_retry(self, status: int) -> None:
+        assert self._count_attempts(self._ft_style_error(status)) == PUBLISH_POST_RETRIES + 1
+
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    def test_5xx_still_retries(self, status: int) -> None:
+        assert self._count_attempts(self._ft_style_error(status)) == PUBLISH_POST_RETRIES + 1
+
+    def test_statusless_transport_error_still_retries(self) -> None:
+        # Unclassifiable means retry: transport flakiness is what the budget is FOR,
+        # and refusing to retry something we couldn't read would be the regression.
+        assert self._count_attempts(requests.ConnectionError("connection reset by peer")) == PUBLISH_POST_RETRIES + 1
+
+    def test_status_is_read_off_a_real_response_when_present(self) -> None:
+        # Belt and braces for a caller that doesn't route through ft's re-raise: a
+        # genuine raise_for_status HTTPError carries the response object.
+        response = requests.Response()
+        response.status_code = 405
+        assert http_status_from_exception(requests.HTTPError(response=response)) == 405
+
+    def test_status_is_recovered_through_fts_cause_chain(self) -> None:
+        # ft does `raise HTTPError(message) from e`, so the original (which has the
+        # response) survives as __cause__ even when the message text changes shape.
+        response = requests.Response()
+        response.status_code = 403
+        original = requests.HTTPError(response=response)
+        rewrapped = requests.HTTPError("some rephrased message with no status in it")
+        rewrapped.__cause__ = original
+        assert http_status_from_exception(rewrapped) == 403
+
+    def test_a_three_digit_number_in_a_payload_echo_is_not_read_as_a_status(self) -> None:
+        # The substring trap that bit the OpenRouter credit classifier: OpenRouter
+        # replays our own prompt text, and forecasting prompts are full of figures.
+        # Only ft's literal "Status code: NNN" phrasing counts.
+        echoed = requests.HTTPError('Response text: {"flagged_input":"will the index close above 405 by June"}')
+        assert http_status_from_exception(echoed) is None
+        assert publish_hardening._is_retryable(echoed) is True
+
+    def test_the_forgone_retry_logs_a_line_the_harvester_ignores(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Emitter half of the telemetry pin. The publish_hardening MarkerSpec is
+        anchored on the ``attempt N/M`` shape, so this second WARN deliberately carries
+        no such clause — appending the text to the attempt line instead would have
+        stopped EVERY publish failure from harvesting. test_telemetry_markers pins the
+        harvester against a hand-written literal; this drives the real emitter, so the
+        two cannot drift apart without a test going red."""
+
+        def always_405(*_args: Any, **_kwargs: Any) -> None:
+            raise self._ft_style_error(405)
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("_post_question_prediction", always_405)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with caplog.at_level(logging.WARNING, logger="metaculus_bot.publish_hardening"):
+                with pytest.raises(requests.HTTPError):
+                    wrapped()
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+        forgone = [message for message in caplog.messages if "not retrying" in message]
+        assert len(forgone) == 1, caplog.messages
+        assert forgone[0] == (
+            "PUBLISH_HARDENING: _post_question_prediction not retrying status 405 "
+            "— a second identical POST cannot succeed"
+        )
+        harvested = parse_log_text(f"{_LOG_PREFIX}{forgone[0]}\n", **_HARVEST_META)
+        assert harvested["publish_hardening"] == [], (
+            "the forgone-retry WARN must not harvest as a publish attempt — it carries no attempt N/M clause"
+        )
+        # The attempt WARN that DOES carry the clause still harvests, so the exclusion
+        # above is about this line's shape rather than a broken spec.
+        attempt = [message for message in caplog.messages if "attempt 1/" in message]
+        assert len(attempt) == 1, caplog.messages
+        assert parse_log_text(f"{_LOG_PREFIX}{attempt[0]}\n", **_HARVEST_META)["publish_hardening"] != []
+
+    def test_a_retried_status_logs_no_forgone_retry_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The line is emitted only where a retry was actually given up; on a 429 (and on
+        # the final attempt of anything) saying "not retrying" would be noise or a lie.
+        def always_429(*_args: Any, **_kwargs: Any) -> None:
+            raise self._ft_style_error(429)
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("post_question_comment", always_429)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with caplog.at_level(logging.WARNING, logger="metaculus_bot.publish_hardening"):
+                with pytest.raises(requests.HTTPError):
+                    wrapped()
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+        assert not any("not retrying" in message for message in caplog.messages), caplog.messages

@@ -213,6 +213,9 @@ async def _run_analyzer(
         first_pass_research=first_pass_research,
         is_benchmarking=is_benchmarking,
         max_gaps=GAP_FILL_MAX_GAPS,
+        # The MC ballot (None on other types): a "no coverage of candidate X" gap is only
+        # findable when the analyzer knows the candidates (q44952).
+        options=getattr(question, "options", None),
     )
     logger.info(f"GapFill: calling analyzer {GAP_FILL_ANALYZER_MODEL} for gap identification")
     # Wall-clock backstop (now owned by invoke_with_transient_retry) has slight

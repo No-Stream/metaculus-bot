@@ -18,8 +18,12 @@ from typing import Literal
 # Status of one provider call. ``ok``: non-empty output. ``empty``: returned but
 # blank/whitespace. ``errored``: raised an unexpected exception. ``inactive``:
 # AskNews off-season subscription error (expected, not alertable). ``fallback``:
-# AskNews failed but a prose fallback provider supplied the result.
-ProviderStatus = Literal["ok", "empty", "errored", "inactive", "fallback"]
+# AskNews failed but a prose fallback provider supplied the result. ``deadline``:
+# still running when the research phase's time budget expired, so the orchestrator
+# cancelled it (see ``QuestionTimeBudget.research_phase_deadline_s``) — a budget
+# decision rather than a provider defect, which is why it is its own status and
+# not folded into ``errored``.
+ProviderStatus = Literal["ok", "empty", "errored", "inactive", "fallback", "deadline"]
 
 # Markdown header for the diagnostics section. Named so the leakage screen can
 # recognize a diagnostics-only blob without hardcoding the literal in two places.

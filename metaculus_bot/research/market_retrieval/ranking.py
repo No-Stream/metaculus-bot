@@ -25,15 +25,12 @@ patch point for the tests and stops the two stages drifting on retry policy.
 from __future__ import annotations
 
 import json
-import logging
 import re
 from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _liquidity_label
 from metaculus_bot.structured_output_schema import extract_json_block
-
-logger = logging.getLogger(__name__)
 
 # MAXIMUM rows the ranker may emit. A ceiling, not a target.
 RENDER_BUDGET = 8
@@ -212,7 +209,19 @@ class Pick:
 
 
 class RankingUnusable(ValueError):
-    """The ranking output could not be read as a JSON array. The one trigger for fail-open."""
+    """The ranking output could not be read as a ranking. The one trigger for fail-open."""
+
+
+class RankingShapeRegression(RankingUnusable):
+    """A well-formed but non-empty array from which NO row could be read.
+
+    Split out from its parent so the caller's telemetry can name which failure it hit: this one
+    means the model answered in a shape this parser no longer understands (a renamed index key,
+    every index hallucinated past the pool), where the parent means the output could not be read
+    as an array of ranking objects at all. Both fail open to the deterministic slate — the
+    difference is diagnostic, and it is the difference between "our prompt/parser contract broke"
+    and "the model emitted prose".
+    """
 
 
 def _settlement_sources_text(match: MarketMatch) -> str:
@@ -401,9 +410,19 @@ def _first_usable_array(text: str) -> list[Any]:
 def parse_ranking(text: str, pool_size: int) -> list[Pick]:
     """``[{"i": 12, "tier": "...", "why": "..."}]`` -> picks in the MODEL's order.
 
-    ``[]`` returns ``[]``: an empty array is a valid answer and the whole adaptive-width
-    mechanism, so only output that cannot be read as an array of ranking objects at all raises
-    ``RankingUnusable`` and fails open.
+    ``[]`` returns ``[]``: an EMPTY array is a valid answer and the whole adaptive-width
+    mechanism, so it must never fail open — a fail-open on a true negative renders 8
+    near-misses.
+
+    A NON-EMPTY array that yields no pick is the opposite case and raises
+    ``RankingShapeRegression``. Returning ``[]`` there made a broken parser contract
+    indistinguishable from the model's considered "nothing bears on this": both reached the
+    caller as ``ok(0)``, and since the renderer gained its deliberate-empty sentence
+    (2026-08-24) that conflation put an affirmative claim in front of the forecaster —
+    "prediction markets were retrieved and reviewed… none was judged to bear on it" — on a
+    question whose ranking we could not read. Fail-open renders the deterministic slate under
+    the ``[ranking unavailable]`` marker instead, which is what the bare-int regression
+    already got.
 
     Out-of-range indices are dropped, repeats collapse to their first (best-ranked)
     occurrence, an unrecognised tier is recorded as ``unspecified`` without dropping the row,
@@ -446,13 +465,15 @@ def parse_ranking(text: str, pool_size: int) -> list[Pick]:
         )
     if parsed and not picks:
         # A non-empty array yielding no usable pick is a SHAPE regression (a renamed key, all
-        # indices hallucinated past the pool), NOT the adaptive-width `[]`. Both reach the caller
-        # as `ok(0)`, which `provider_diagnostics.is_lost_source` does not flag, so nothing else
-        # in the pipeline can tell them apart: the token, the `MARKET_RANKING:` line and the empty
-        # render are byte-identical. The WARN has to live HERE because `_rank_pool` only ever
-        # sees `picks`, never `parsed`.
-        logger.warning(
-            f"market ranker: {len(parsed)} entries yielded no usable pick; first={repr(parsed[0])[:160]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
+        # indices hallucinated past the pool), NOT the adaptive-width `[]`. It RAISES rather than
+        # returning `[]`, because `[]` reaches the caller as `ok(0)` — which
+        # `provider_diagnostics.is_lost_source` does not flag — and from there the token, the
+        # `MARKET_RANKING:` line and the render were byte-identical to a genuine empty answer, so
+        # the forecaster got the deliberate-empty sentence's affirmative claim over unreadable
+        # output. The message carries the diagnosis because only this frame sees `parsed`.
+        raise RankingShapeRegression(
+            f"{len(parsed)} entries yielded no usable pick (renamed index key, or every index "
+            f"outside a pool of {pool_size}); first={repr(parsed[0])[:160]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
         )
     return picks[:RENDER_BUDGET]
 

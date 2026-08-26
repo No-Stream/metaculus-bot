@@ -275,7 +275,7 @@ async def run_numeric_forecast(
         question_id=qid,
         model_name=forecaster_llm.model,
     )
-    sanitized_percentiles, zero_point = sanitize_percentiles(outcome.value, question)
+    sanitized_percentiles, zero_point = sanitize_percentiles(outcome.value, question, model_name=forecaster_llm.model)
 
     prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
 

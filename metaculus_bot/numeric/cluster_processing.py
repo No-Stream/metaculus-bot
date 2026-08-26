@@ -31,6 +31,29 @@ def detect_count_like_pattern(values: list[float]) -> bool:
         return False
 
 
+def is_degenerate_cluster(values: list[float], value_eps: float) -> bool:
+    """True when EVERY declared value sits inside ONE ``value_eps`` cluster.
+
+    That is a point mass: the model declared (near-)identical values at all
+    percentiles, so the declaration carries no distribution width at all. It is
+    matched with the same adjacent-gap chaining ``apply_cluster_spreading`` uses
+    to grow a cluster, so the two agree on what "one cluster" means by
+    construction.
+
+    Callers need this separately from the spreader because the whole-set case is
+    the one where spreading would INVENT the width instead of separating
+    genuinely-plateaued neighbours: with no unclustered neighbour to compress
+    against, the spread runs the full ``+-(k-1)/2 * spread_delta``, which on a
+    count-like question is a full unit per position (a 13-percentile point mass
+    on [0, 100] came out 12 units wide). That fabricated span is also exactly
+    what let the point mass PASS ``detect_unit_mismatch``'s span-ratio test,
+    which would otherwise have withheld the degenerate declaration.
+    """
+    if len(values) < 2:
+        return False
+    return all(abs(b - a) <= value_eps for a, b in zip(values, values[1:]))
+
+
 def compute_cluster_parameters(
     range_size: float, count_like: bool, span: float | None = None
 ) -> tuple[float, float, float]:
@@ -53,7 +76,20 @@ def apply_cluster_spreading(
     spread_delta: float,
     range_size: float,
 ) -> tuple[list[float], int]:
-    """Apply cluster spreading to ensure strictly increasing values."""
+    """Spread epsilon-clustered values apart so the set can carry a CDF.
+
+    Separates genuinely-plateaued neighbours (a count-like question where a model
+    declares P20 = P40 = P50 = 1) from each other; it does NOT invent a
+    distribution where the model declared none. A whole-set collapse — every
+    value inside one epsilon cluster — is left ALONE and reported as 0 clusters
+    applied: downstream jitter / strict-ordering give it the minimum separation
+    the CDF format needs, and ``detect_unit_mismatch`` then sees the honest
+    (essentially zero) span and withholds the forecaster. See
+    ``is_degenerate_cluster``.
+    """
+    if is_degenerate_cluster(modified_values, value_eps):
+        return modified_values, 0
+
     clusters_applied = 0
     i = 0
 

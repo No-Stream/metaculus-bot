@@ -48,10 +48,9 @@ from scripts.download_research import (
 from scripts.download_run_logs import DEFAULT_ARCHIVE_DIR as TELEMETRY_ARCHIVE_DIR
 from scripts.download_run_logs import (
     RUN_LOG_ARTIFACT_PREFIXES,
-    build_workflow_map,
     harvest_run_logs_from_dir,
     infer_workflow,
-    workflow_map_from_archive,
+    resolve_workflow_map,
 )
 from scripts.download_run_logs import merge_and_write as merge_telemetry
 from scripts.gha_artifacts import add_store_arguments, persisted_run_dirs, select_artifacts
@@ -82,23 +81,6 @@ class SyncSummary:
     raw_totals: dict[str, int] = field(default_factory=dict)
 
 
-def _resolve_workflow_map(repo: str, *, telemetry_dir: Path, from_store: bool) -> dict[int, str]:
-    """``{run_id: workflow_slug}`` from the GitHub runs endpoint, or offline from the archive.
-
-    The offline path cannot ask GitHub, and falling back to prefix inference would read
-    ``unknown`` for every ``research-*`` run — which the replace-by-run merge would then
-    write over the good attribution already in ``runs.jsonl``. Replaying the archive's own
-    manifest keeps it.
-    """
-    if from_store:
-        workflow_map = workflow_map_from_archive(telemetry_dir)
-        logger.info(f"Offline harvest: recovered {len(workflow_map)} run->workflow mappings from {telemetry_dir}")
-        return workflow_map
-    workflow_map = build_workflow_map(repo)
-    logger.info(f"Resolved {len(workflow_map)} run->workflow mappings")
-    return workflow_map
-
-
 def run_sync(
     repo: str,
     since_days: int,
@@ -125,7 +107,7 @@ def run_sync(
         from_store=from_store,
     )
 
-    workflow_map = _resolve_workflow_map(repo, telemetry_dir=telemetry_dir, from_store=from_store)
+    workflow_map = resolve_workflow_map(repo, telemetry_dir, from_store=from_store)
 
     research_records: list[dict] = []
     telemetry_runs: list[HarvestedRun] = []

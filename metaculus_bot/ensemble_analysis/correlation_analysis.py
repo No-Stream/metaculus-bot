@@ -94,11 +94,18 @@ class CorrelationAnalyzer:
 
                 prediction = ModelPrediction(
                     model_name=model_name,
+                    # An absent id collapses to 0, which pools every id-less question into
+                    # ONE pivot row. Kept because question_id is the pivot index and group
+                    # key throughout this module, so it cannot be None; the collapse is
+                    # noted here rather than surfacing as a pandas duplicate-index error.
                     question_id=report.question.id_of_question or 0,
                     question_url=report.question.page_url or "",
+                    # No `or 0.0` on either: an unscored report or a run with no price
+                    # estimate must not enter an analysis as a real 0.0 (the worst-possible
+                    # baseline score). Both fields are None-able on ModelPrediction.
                     prediction_value=pred_value,
-                    baseline_score=report.expected_baseline_score or 0.0,
-                    cost=report.price_estimate or 0.0,
+                    baseline_score=report.expected_baseline_score,
+                    cost=report.price_estimate,
                 )
                 self.predictions.append(prediction)
 

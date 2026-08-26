@@ -17,7 +17,8 @@ some derivation of the raw series, and the level case (scale 1.0) is the identit
 
 from __future__ import annotations
 
-from datetime import date
+import logging
+from datetime import UTC, date, datetime
 
 import numpy as np
 import pandas as pd
@@ -31,25 +32,36 @@ from metaculus_bot.constants import (
     TS_ANCHOR_WEEKLY_TABLE_ROWS,
 )
 from metaculus_bot.research.ts_estimators import (
-    TRADING_DAYS_PER_YEAR,
+    MONTHLY_CLOCK,
     Freq,
+    SeriesClock,
     _build_spread_series,
     _detect_freq,
     _empirical_change_band,
     _empirical_max_band,
     _n_eff,
+    annualized_realized_vol_pct,
+    clock_matches_cadence,
     horizon_steps,
+    series_clock,
+    stale_latest_age_days,
 )
 from metaculus_bot.research.ts_routing import Derivation, _Route
 
-REALIZED_VOL_WINDOW = 30  # trailing daily returns for the annualized-vol note
+logger = logging.getLogger(__name__)
+
+# Trailing OBSERVATIONS behind the annualized-vol note — a smoothing choice, not a calendar
+# window, which is why the rendered label names the step unit ("30 trading days" vs "30 days")
+# instead of claiming 30 calendar days on both bases. Deliberately not converted to a calendar
+# window: the row count sets the estimator's sample size, and rescaling it to 21 rows on
+# exchange-traded series would degrade every equity vol reading to make a label true, when
+# naming the unit makes it true for free.
+REALIZED_VOL_WINDOW = 30
 
 PROVENANCE_FOOTER = (
     "Statistical extrapolation of the resolution series' own history; blind to news, "
     "events, and policy — weigh against the rest of the research."
 )
-
-_FREQ_UNIT: dict[Freq, str] = {"daily": "trading-day", "weekly": "week", "monthly": "month"}
 
 # Human phrasing for the derived-quantity label line and the history-block header.
 _DERIVED_TARGET_DESC: dict[Derivation, str] = {
@@ -62,6 +74,17 @@ _DERIVED_HISTORY_HEADER: dict[Derivation, str] = {
     "mom_pct": "Last monthly MoM % changes (derived)",
     "monthly_avg": "Last monthly averages (derived)",
 }
+
+
+def _today_utc() -> date:
+    """Wall-clock UTC date, module-level so tests can freeze it.
+
+    The renderer only gets a ``ceiling`` (the fetch as-of date), which equals today on a
+    live run but is a past date under benchmarking — where the same-dated bar is a
+    COMPLETED historical one. Comparing the ceiling against the real wall clock is what
+    lets the partial-bar marker fire only when the bar can actually still be forming.
+    """
+    return datetime.now(UTC).date()
 
 
 def _fmt(v: float) -> str:
@@ -110,14 +133,14 @@ def _multi_res_history(series: pd.Series, freq: Freq, monthly_header: str = "Las
         blocks.append(_history_lines(series, TS_ANCHOR_WEEKLY_TABLE_ROWS, "Last weekly observations"))
         monthly = _downsample_last(series, "M")
         blocks.append(_history_lines(monthly, TS_ANCHOR_MONTHLY_TABLE_ROWS, "Monthly (last obs of month)"))
-    else:  # monthly
+    elif freq == "monthly":
         blocks.append(_history_lines(series, TS_ANCHOR_MONTHLY_TABLE_ROWS, monthly_header))
+    else:  # quarterly / annual: native rows only, honestly labelled — no finer resolution exists
+        blocks.append(_history_lines(series, TS_ANCHOR_MONTHLY_TABLE_ROWS, f"Last {freq} observations"))
     return blocks
 
 
-# ---------------------------------------------------------------------------
-# Derived-target transforms (ported from the replay's build_target_series)
-# ---------------------------------------------------------------------------
+# Derived-target transforms (ported from the replay's build_target_series).
 
 
 def _apply_derivation(series: pd.Series, derivation: Derivation, scale: float) -> pd.Series:
@@ -128,15 +151,30 @@ def _apply_derivation(series: pd.Series, derivation: Derivation, scale: float) -
       - mom_diff      → month-over-month first difference × scale (PAYEMS ×1000, thousands→persons).
       - mom_pct       → month-over-month % change (×100), first NaN dropped.
       - monthly_avg   → calendar-month mean of a higher-frequency series (weekly gasoline → month).
+
+    The two ``mom_*`` branches are ROW-based (``diff()`` / ``shift(1)``), so "month-over-month"
+    is only true when one row IS one month. Every registry entry that declares them names a
+    monthly FRED series (CPIAUCSL, PAYEMS) and ``monthly_avg`` resamples to months first, so the
+    invariant holds today — but a future entry declaring ``mom_pct`` on the weekly GASREGW would
+    silently render a week-over-week change under a month-over-month label, the same
+    row-count-as-calendar defect as the rest of this class. Checked rather than assumed: a
+    non-monthly source raises, and the provider soft-fails the section instead of publishing a
+    mislabelled quantity.
     """
     if derivation == "level":
         return series * scale if scale != 1.0 else series
-    if derivation == "mom_diff":
-        return series.diff().dropna() * scale
-    if derivation == "mom_pct":
-        return ((series / series.shift(1) - 1.0) * 100.0).dropna()
     if derivation == "monthly_avg":
         return series.resample("MS").mean().dropna()
+    if derivation in ("mom_diff", "mom_pct"):
+        source_freq = _detect_freq(pd.DatetimeIndex(series.index))
+        if source_freq != "monthly":
+            raise ValueError(
+                f"derivation {derivation!r} is a row-wise month-over-month change but the source "
+                f"series is {source_freq}; one row must be one month for the label to be true"
+            )
+        if derivation == "mom_diff":
+            return series.diff().dropna() * scale
+        return ((series / series.shift(1) - 1.0) * 100.0).dropna()
     raise ValueError(f"unhandled derivation {derivation!r}")  # unreachable via Literal
 
 
@@ -160,30 +198,54 @@ def _realized_max_floor(series: pd.Series, window_start: date | None, ceiling: d
 
 
 def _fifty_two_week_line(series: pd.Series, ceiling: date, last: float) -> str:
+    """The trailing-year high/low band, or the whole series' band NAMED as such.
+
+    A stale or discontinued series has no observation inside the trailing year, and
+    falling back to the full history under a "52-week range" label states a recency the
+    numbers do not have — a 2019 high reads as this year's. The fallback still carries
+    real information (it is the only band there is), so it renders, with its own dates
+    in the label instead.
+    """
     cutoff = pd.Timestamp(ceiling) - pd.Timedelta(days=365)
     window = series[series.index >= cutoff]
+    label = "52-week range"
     if window.empty:
         window = series
+        dates = pd.DatetimeIndex(window.index)
+        label = (
+            f"full-history range ({dates.min().strftime('%Y-%m-%d')} to {dates.max().strftime('%Y-%m-%d')}; "
+            "no observation inside the trailing year)"
+        )
     low = float(window.min())
     high = float(window.max())
     span = high - low
     pct = f"{(last - low) / span * 100:.0f}% of the way up the range" if span > 0 else "range is flat"
-    return f"- 52-week range: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"
+    return f"- {label}: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"
 
 
-def _realized_vol_line(series: pd.Series) -> str | None:
-    """30-day annualized realized volatility (daily financial series only)."""
-    returns = series.pct_change().dropna()
-    if len(returns) < REALIZED_VOL_WINDOW:
+def _realized_vol_line(series: pd.Series, clock: SeriesClock) -> str | None:
+    """Annualized realized volatility over the last ``REALIZED_VOL_WINDOW`` observations.
+
+    Annualizes on the series' OBSERVED density, not a fixed sqrt(252): a 24/7 series prints
+    ~365 bars a year, so the trading-day factor understated its volatility by
+    sqrt(365/252) = 1.2035x — the q44882 (ETH-USD) defect, whose twin in ``financial_data`` was
+    fixed in e6ae276 while this copy kept the constant. The estimator now lives once in
+    ``ts_estimators.annualized_realized_vol_pct`` so the two surfaces cannot be corrected
+    separately again; only the sentence wording is local. The label names the step unit for
+    the same reason: 30 rows is six calendar weeks on an exchange-traded series, so calling it
+    "30-day" was a row count masquerading as a calendar window.
+    """
+    annualized = annualized_realized_vol_pct(
+        series, window=REALIZED_VOL_WINDOW, periods_per_year=clock.periods_per_year
+    )
+    if annualized is None:
         return None
-    recent = returns.tail(REALIZED_VOL_WINDOW)
-    annualized = float(recent.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
-    return f"- 30-day annualized realized volatility: {annualized:.1f}%"
+    return f"- {REALIZED_VOL_WINDOW}-{clock.step_unit} annualized realized volatility: {annualized:.1f}%"
 
 
 def _band_line(
     kind: str,
-    freq: Freq,
+    clock: SeriesClock,
     h: int,
     lookback_years: int,
     band: tuple[float, float, float],
@@ -192,7 +254,7 @@ def _band_line(
     n_windows: int,
     n_eff: int,
 ) -> str:
-    unit = _FREQ_UNIT[freq]
+    unit = clock.step_unit
     p10, p50, p90 = band
     return (
         f"- Horizon-matched empirical band (empirical P10/P50/P90 of all {h}-{unit} {kind} windows "
@@ -219,14 +281,25 @@ def _render_single(
     # for the derived shapes). For plain level (scale=1.0) `derived` IS `series`, so the
     # level path is byte-identical to before.
     raw_last = float(series.iloc[-1])
-    raw_last_date = pd.DatetimeIndex(series.index)[-1].strftime("%Y-%m-%d")
+    raw_last_ts = pd.DatetimeIndex(series.index)[-1]
+    raw_last_date = raw_last_ts.strftime("%Y-%m-%d")
+    # A bar dated the fetch ceiling, rendered on the very day it is forming, is today's
+    # still-in-progress bar (live runs set ceiling == today; a backtest's past-dated
+    # ceiling matches a completed historical bar, which _today_utc keeps unmarked). The
+    # empirical band anchors on this value, so the reader is told it can still move.
+    partial_suffix = " — today's bar, in progress" if raw_last_ts.date() == ceiling == _today_utc() else ""
     derived = _apply_derivation(series, route.derivation, route.scale)
     is_derived = route.derivation != "level"
-    # MoM change / MoM % / monthly-average all collapse to a monthly effective frequency;
+    # MoM change / MoM % / monthly-average all collapse to a monthly effective clock (enforced
+    # in `_apply_derivation`, which refuses a non-monthly source for the row-wise mom_* shapes);
     # the horizon and band are computed on that, matching the replay's build_target_series.
-    freq: Freq = "monthly" if is_derived else _detect_freq(pd.DatetimeIndex(derived.index))
+    # Everything else reads BOTH clock facts off the series: `freq` alone can't tell a
+    # business-day series from a 24/7 one, and the horizon conversion needs that (see
+    # `SeriesClock`).
+    clock = MONTHLY_CLOCK if is_derived else series_clock(pd.DatetimeIndex(derived.index))
+    freq: Freq = clock.freq
     last = float(derived.iloc[-1])
-    h = horizon_steps(freq, calendar_days)
+    h = horizon_steps(clock, calendar_days)
     y = derived.to_numpy(dtype="float64")
     use_log = bool(np.all(y > 0.0))
     # A forward-window-max question (from title framing OR a High-column yfinance spec)
@@ -237,12 +310,25 @@ def _render_single(
         parts: list[str] = [
             f"**{route.label}** — latest derived value {_fmt(last)} "
             f"({_DERIVED_TARGET_DESC[route.derivation]}; from raw level {_fmt(raw_last)} "
-            f"as of {raw_last_date}; effective series frequency: {freq})"
+            f"as of {raw_last_date}{partial_suffix}; effective series frequency: {freq})"
         ]
     else:
-        parts = [f"**{route.label}** — latest {_fmt(last)} (as of {raw_last_date}; series frequency: {freq})"]
+        parts = [
+            f"**{route.label}** — latest {_fmt(last)} (as of {raw_last_date}{partial_suffix}; series frequency: {freq})"
+        ]
     if route.note:
         parts.append(f"- Note: {route.note}")
+    if clock.freq == "daily":
+        stale_age = stale_latest_age_days(raw_last_ts.date(), ceiling, clock.periods_per_year)
+        if stale_age is not None:
+            parts.append(
+                f"- ⚠ Latest observation is {stale_age} days old — beyond what a {clock.step_unit} "
+                "cadence explains; treat the latest value (and the band anchored on it) as stale."
+            )
+            logger.warning(
+                f"FINANCIAL_STALE_LATEST: surface=ts_anchor symbol={route.spec.series_id} "
+                f"age_d={stale_age} cadence={clock.step_unit}"
+            )
 
     if is_derived:
         parts.extend(_multi_res_history(derived, freq, monthly_header=_DERIVED_HISTORY_HEADER[route.derivation]))
@@ -251,7 +337,21 @@ def _render_single(
         parts.append(_fifty_two_week_line(derived, ceiling, last))
 
     band: tuple[float, float, float] | None = None
-    if route.model_target and y.size > h:
+    cadence_ok = clock_matches_cadence(clock, pd.DatetimeIndex(derived.index))
+    if not cadence_ok and route.model_target:
+        # A cadence the freq buckets misdescribe (a ~183-day semiannual series in the
+        # "annual" bucket, a 2-4-day series on the daily basis) would convert the horizon
+        # by the same wrong factor its gap disagrees by — a mis-sized band under a
+        # confident label. Withhold the band; the caller's band-None guard then drops the
+        # section rather than serving a wrong quantity.
+        logger.warning(
+            "ts_anchor: series cadence (median gap) disagrees >1.5x with the %s clock's %.1f-day step "
+            "for %s — withholding the empirical band rather than mis-converting the horizon",
+            clock.freq,
+            clock.nominal_step_days,
+            route.label,
+        )
+    if route.model_target and y.size > h and cadence_ok:
         n_eff = _n_eff(int(y.size), h)
         if is_max:
             band = _empirical_max_band(y, h, use_log=use_log, last=last)
@@ -266,7 +366,7 @@ def _render_single(
             parts.append(
                 _band_line(
                     "forward-max",
-                    freq,
+                    clock,
                     h,
                     TS_ANCHOR_LOOKBACK_YEARS,
                     band,
@@ -281,7 +381,7 @@ def _render_single(
             parts.append(
                 _band_line(
                     "change",
-                    freq,
+                    clock,
                     h,
                     TS_ANCHOR_LOOKBACK_YEARS,
                     band,
@@ -293,8 +393,8 @@ def _render_single(
     elif route.model_target:
         parts.append(f"- (Horizon {h} exceeds available history; empirical band withheld.)")
 
-    if freq == "daily" and use_log:
-        vol_line = _realized_vol_line(derived)
+    if clock.freq == "daily" and use_log:
+        vol_line = _realized_vol_line(derived, clock)
         if vol_line:
             parts.append(vol_line)
 
@@ -315,8 +415,8 @@ def _render_spread(
     spread always emits a band (a too-short history raises ValueError first), so the band
     is never None here."""
     spread_series = _build_spread_series(series_a, series_b)  # raises ValueError on bad legs
-    freq = _detect_freq(pd.DatetimeIndex(spread_series.index))
-    h = horizon_steps(freq, calendar_days)
+    clock = series_clock(pd.DatetimeIndex(spread_series.index))
+    h = horizon_steps(clock, calendar_days)
     y = spread_series.to_numpy(dtype="float64")
     if y.size <= h:
         raise ValueError(f"spread history length {y.size} too short for horizon {h}")
@@ -336,7 +436,7 @@ def _render_spread(
     ]
     parts.append(_history_lines(series_a, TS_ANCHOR_NATIVE_TABLE_ROWS, f"{route.label} recent"))
     parts.append(_history_lines(series_b, TS_ANCHOR_NATIVE_TABLE_ROWS, f"{route.label_b} recent"))
-    unit = _FREQ_UNIT[freq]
+    unit = clock.step_unit
     # y[:-h] vs y[h:] pairs yield y.size - h overlapping h-step changes.
     parts.append(
         f"- Forward {h}-{unit} relative-return band (pp, empirical over the last "

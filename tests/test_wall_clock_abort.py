@@ -29,6 +29,7 @@ from forecasting_tools.data_models.data_organizer import PredictionTypes
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.publish_hardening import reset_publish_attempt_failures
 
 
 def _stub_open_time() -> datetime:
@@ -37,6 +38,16 @@ def _stub_open_time() -> datetime:
 
 def _stub_resolve_time() -> datetime:
     return datetime.now() + timedelta(days=365)
+
+
+@pytest.fixture(autouse=True)
+def _reset_publish_attempt_failures():
+    """The retry-exhaustion tests below bump publish_hardening's module-global
+    counter; without a reset it leaks into whichever test file runs next and
+    makes the suite order-dependent."""
+    reset_publish_attempt_failures()
+    yield
+    reset_publish_attempt_failures()
 
 
 @pytest.fixture
@@ -172,6 +183,10 @@ async def test_tight_budget_skips_stacking_forces_fallback_median(monkeypatch, m
     # outcome=fallback_median *before* _aggregate_predictions runs.
     await bot._research_and_make_predictions(mock_binary_question)
     assert bot._stacker_outcome.get(mock_binary_question.id_of_question) == "fallback_median"
+    # The budget skip records the same skip-reason + counter treatment as its
+    # sibling skip paths, so a STACKER_SKIP_REASON cut cannot miss this bucket.
+    assert bot._stacker_skip_reason.get(mock_binary_question.id_of_question) == "wall_clock_budget"
+    assert bot._conditional_stacking_skipped_count == 1
 
 
 @pytest.mark.asyncio

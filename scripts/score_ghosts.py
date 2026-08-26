@@ -15,7 +15,15 @@ Two marker sources, in preference order:
   pre-upgrade era (binary/MC scoreable from the summary; numeric exposes a median only,
   so it stays unscoreable there).
 
-Both are harvested into ``backtests/telemetry_archive/`` by ``make sync_telemetry``.
+A third marker, ``GHOST_PRE_JSON`` (the turn-one, PRE-research dry run), feeds the
+identity split rather than the scoring: on 7 of the first 12 scored pairs the
+concluding ghost was byte-identical to the pre-research dry run (2026-08-24 residual
+round), so a pooled ghost delta mixes measurements of the driver's PRIOR with
+measurements of the loop's research. The report therefore splits the delta by whether
+the loop moved the driver's own forecast, and the retirement gate should read the
+loop-moved subset, never the pool.
+
+All are harvested into ``backtests/telemetry_archive/`` by ``make sync_telemetry``.
 Resolved-question records come from a pre-built performance-analysis dataset JSON
 (``--perf-json``) or a live read-only pull (``--tournament``, free).
 
@@ -103,7 +111,15 @@ def _normalize_json_ghost(record: dict) -> dict | None:
         return None
     if not isinstance(payload, dict):
         return None
-    return {"qid": record.get("qid"), "qtype": payload.get("qtype"), "source": "json", "payload": payload}
+    return {
+        "qid": record.get("qid"),
+        "qtype": payload.get("qtype"),
+        "source": "json",
+        "payload": payload,
+        # Run identity, so the pre/post split can require both halves to come
+        # from the SAME run (a qid can be forecast in several archived runs).
+        "run_id": record.get("run_id"),
+    }
 
 
 def _select_ghost_per_qid(json_ghosts: list[dict], legacy_ghosts: list[dict]) -> dict[int, dict]:
@@ -327,7 +343,39 @@ def _summarize_rows(rows: list[dict]) -> dict:
     }
 
 
-def join_and_score(json_ghosts: list[dict], legacy_ghosts: list[dict], records: list[dict]) -> dict:
+def _pre_identity(ghost: dict, pre_by_qid: dict[int, dict]) -> bool | None:
+    """Whether the concluding ghost is byte-identical to the pre-research dry run.
+
+    ``True``/``False`` only when both halves are JSON payloads FROM THE SAME RUN
+    (the two markers serialize through the same ``_summarize_ghost`` path, so dict
+    equality IS the byte-identity the split needs). ``None`` when there is nothing
+    to compare: no ``GHOST_PRE_JSON`` for this qid, a legacy summary-only ghost
+    (the pre marker and the JSON ghost landed in the same merge, so a legacy ghost
+    predates both), or a pre-ghost from a DIFFERENT run — a run can emit one
+    marker without the other (a schema-invalid dry run suppresses GHOST_PRE_JSON;
+    a deadline-hit run can bank a pre with no concluding ghost), and comparing
+    across runs would file a cross-run pair into ``pre_identical``/``loop_moved``.
+    """
+    if ghost["source"] != "json":
+        return None
+    pre = pre_by_qid.get(ghost["qid"])
+    if pre is None or pre.get("run_id") != ghost.get("run_id"):
+        return None
+    return pre["payload"] == ghost["payload"]
+
+
+def _split_bucket(pre_identical: bool | None) -> str:
+    if pre_identical is None:
+        return "no_pre_marker"
+    return "pre_identical" if pre_identical else "loop_moved"
+
+
+def join_and_score(
+    json_ghosts: list[dict],
+    legacy_ghosts: list[dict],
+    records: list[dict],
+    pre_ghosts: list[dict] | None = None,
+) -> dict:
     """Join the latest ghost per qid to resolved records and compute paired log-score deltas.
 
     JSON-source ghosts (full forecast) are preferred over legacy summary-only ghosts
@@ -347,6 +395,13 @@ def join_and_score(json_ghosts: list[dict], legacy_ghosts: list[dict], records: 
     """
     records_by_post_id = {r.get("post_id"): r for r in records}
     selected = _select_ghost_per_qid(json_ghosts, legacy_ghosts)
+    # Latest GHOST_PRE_JSON per qid (same post-id space as the concluding ghosts —
+    # both markers carry the same log_prefix ref), normalized to comparable payloads.
+    pre_by_qid: dict[int, dict] = {}
+    for qid, record in _latest_ghost_per_qid(pre_ghosts or []).items():
+        normalized = _normalize_json_ghost(record)
+        if normalized is not None:
+            pre_by_qid[qid] = normalized
 
     source_counts: dict[str, int] = {"json": 0, "legacy": 0}
     for ghost in selected.values():
@@ -358,6 +413,11 @@ def join_and_score(json_ghosts: list[dict], legacy_ghosts: list[dict], records: 
     numeric_unscoreable: dict[str, int] = {}
     numeric_joined = 0
     n_joined = 0
+    split_rows: dict[str, list[dict]] = {"pre_identical": [], "loop_moved": [], "no_pre_marker": []}
+
+    def _record_scored_row(ghost: dict, row: dict) -> None:
+        row["pre_identical"] = _pre_identity(ghost, pre_by_qid)
+        split_rows[_split_bucket(row["pre_identical"])].append(row)
 
     for qid, ghost in selected.items():
         record = records_by_post_id.get(qid)
@@ -369,15 +429,18 @@ def join_and_score(json_ghosts: list[dict], legacy_ghosts: list[dict], records: 
             row = _score_binary(ghost, record)
             if row is not None:
                 binary_rows.append(row)
+                _record_scored_row(ghost, row)
         elif qtype == "multiple_choice":
             row = _score_mc(ghost, record)
             if row is not None:
                 mc_rows.append(row)
+                _record_scored_row(ghost, row)
         elif qtype == "numeric":
             numeric_joined += 1
             outcome = _score_numeric(ghost, record)
             if outcome["scoreable"]:
                 numeric_rows.append(outcome)
+                _record_scored_row(ghost, outcome)
             else:
                 reason = outcome["reason"]
                 numeric_unscoreable[reason] = numeric_unscoreable.get(reason, 0) + 1
@@ -394,6 +457,14 @@ def join_and_score(json_ghosts: list[dict], legacy_ghosts: list[dict], records: 
             "n_joined": numeric_joined,
             "n_unscoreable": sum(numeric_unscoreable.values()),
             "unscoreable_reasons": numeric_unscoreable,
+        },
+        # Pooled across types, keyed on whether the concluding ghost equals the
+        # pre-research dry run. The identical bucket measures the driver's PRIOR
+        # (the loop's findings never moved its own number), so only the loop_moved
+        # bucket says anything about v2's research — see the module docstring.
+        "split_by_pre_identity": {
+            bucket: {"n": len(rows), "mean_delta": mean(r["delta"] for r in rows) if rows else None}
+            for bucket, rows in split_rows.items()
         },
     }
 
@@ -425,6 +496,19 @@ def render_report(summary: dict) -> str:
         )
         for reason, count in sorted(numeric["unscoreable_reasons"].items()):
             lines.append(f"    - {reason}: {count}")
+    split = summary.get("split_by_pre_identity")
+    if split and summary["n_scored"]:
+        bucket_labels = {
+            "pre_identical": "byte-identical to the pre-research dry run (measures the driver's prior)",
+            "loop_moved": "loop moved the driver's forecast (the only bucket that measures v2's research)",
+            "no_pre_marker": "no GHOST_PRE_JSON to compare (predates the marker, or legacy ghost)",
+        }
+        lines.append("Ghost vs pre-research dry run (pooled across types — do not quote the pooled delta):")
+        for bucket, label in bucket_labels.items():
+            block = split[bucket]
+            if not block["n"]:
+                continue
+            lines.append(f"  {label}: n={block['n']} mean_delta={block['mean_delta']:+.4f}")
     return "\n".join(lines)
 
 
@@ -466,13 +550,14 @@ def main() -> None:
 
     json_ghosts = load_marker_records(Path(args.archive_dir), "ghost_forecast_json")
     legacy_ghosts = load_marker_records(Path(args.archive_dir), "ghost_forecast")
+    pre_ghosts = load_marker_records(Path(args.archive_dir), "ghost_pre_json")
     logger.info(
         f"Loaded {len(json_ghosts)} ghost_forecast_json + {len(legacy_ghosts)} legacy ghost_forecast "
-        f"record(s) from {args.archive_dir}"
+        f"+ {len(pre_ghosts)} ghost_pre_json record(s) from {args.archive_dir}"
     )
 
     records = _load_records(args.perf_json, args.tournament)
-    summary = join_and_score(json_ghosts, legacy_ghosts, records)
+    summary = join_and_score(json_ghosts, legacy_ghosts, records, pre_ghosts=pre_ghosts)
     print(render_report(summary))
 
     if args.output:

@@ -150,17 +150,20 @@ def _format_grounded_response(
     fabrication vector (Q38195, 2026-07-19: 30 search queries, 0 grounding chunks,
     a confident fabricated contract table with fake ``[primary]`` tags reached
     forecasters). ``qid`` / ``model`` are threaded in only to make that
-    suppression WARN greppable.
+    suppression WARN greppable. "No grounding evidence" includes a response with no
+    candidates at all: there is no path around the floor that returns text.
     """
     text = response.text or ""
     if not text:
         return ""
 
+    # No candidates means no grounding metadata at all, which IS the ungrounded case the
+    # floor below exists to refuse — the old early `return text` here bypassed the Q38195
+    # guard entirely. Unreachable on today's SDK (``response.text`` is derived from a
+    # candidate, so text-without-candidates cannot happen), but a hole in a fabrication
+    # guard should not depend on an SDK invariant it doesn't own.
     candidates = response.candidates
-    if not candidates:
-        return text
-
-    metadata = candidates[0].grounding_metadata
+    metadata = candidates[0].grounding_metadata if candidates else None
     if metadata is None or not metadata.grounding_chunks:
         # Grounded-chunk floor. No google_search grounding chunks reached us:
         # either the search tool never fired (metadata is None) or it fired and
@@ -316,6 +319,9 @@ def gemini_search_provider(
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         prompt = web_research_prompt(
             question.question_text,
+            # The MC ballot (None on other types): grounded search can only query candidate
+            # names it has been shown (q44952 — zero retrieval on the eventual winner).
+            options=getattr(question, "options", None),
             is_benchmarking=is_benchmarking,
             citation_style="auto_annotated",
             allow_resolution_source_reading=True,

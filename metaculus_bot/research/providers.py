@@ -41,6 +41,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.prompts import web_research_prompt
+from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.raw_log import record_raw_research
 
 ResearchCallable = Callable[[MetaculusQuestion], Awaitable[str]]
@@ -262,6 +263,13 @@ def _asknews_provider() -> ResearchCallable:
                     hot_articles=hot_articles,
                     historical_articles=historical_articles,
                 )
+                if not formatted_articles:
+                    logger.warning(
+                        f"ASKNEWS_NO_ARTICLES: question={qid} "
+                        f"hot={len(hot_articles)} historical={len(historical_articles)}"
+                    )
+                    record_provider_detail(qid, "asknews", {"sources": {"articles": "empty(no_articles)"}})
+                    return ""
 
                 logger.info(
                     f"AskNews: Success, got {len(formatted_articles)} chars from {len(hot_articles)} hot + {len(historical_articles)} historical articles"
@@ -289,6 +297,17 @@ def _format_asknews_dual_sections(
 
     Deduplicates within each list and cross-deduplicates (hot articles that duplicate historical
     URLs are removed). Historical section comes first in the output.
+
+    Both phases empty returns ``""``, NOT a prose "no articles" sentence. The sentence
+    defeated every downstream empty guard: the orchestrator's ``has_output`` read chars>0
+    and reported ``ok``, the summarizer LLM (whose prompt has no no-data escape) was asked
+    to write a briefing from it, and the result rendered under the AskNews header as if it
+    were research. Gemini's grounded-chunk floor next door is the pattern — refuse.
+
+    Pure: the ASKNEWS_NO_ARTICLES WARN and the ``lost=articles:...`` registry token
+    belong to ``_asknews_provider``, which owns the qid — a formatter writing the
+    module-global provider-detail registry raced ``_degraded_to_raw_articles``' write
+    for the same key only by accident of ordering.
     """
     hist_deduped = _dedup_articles_by_url(historical_articles) if historical_articles else []
     hot_deduped = _dedup_articles_by_url(hot_articles) if hot_articles else []
@@ -298,7 +317,7 @@ def _format_asknews_dual_sections(
         hot_deduped = [a for a in hot_deduped if _normalize_url_for_dedup(str(a.article_url)) not in hist_urls]
 
     if not hist_deduped and not hot_deduped:
-        return "No articles were found for this query.\n\n"
+        return ""
 
     total_before = len(historical_articles) + len(hot_articles)
     total_after = len(hist_deduped) + len(hot_deduped)
@@ -491,6 +510,9 @@ def _native_search_provider(
         llm = build_native_search_llm(model_slug)
         prompt = web_research_prompt(
             question.question_text,
+            # The MC ballot (None on other types): a searching model can only query candidate
+            # names it has been shown (q44952 — zero retrieval on the eventual winner).
+            options=getattr(question, "options", None),
             is_benchmarking=is_benchmarking,
             citation_style="markdown",
         )

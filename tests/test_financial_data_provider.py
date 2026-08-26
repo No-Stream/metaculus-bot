@@ -1,13 +1,42 @@
 """Tests for the financial data research provider (yfinance + FRED)."""
 
-from datetime import UTC, date, datetime
+import math
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
+from forecasting_tools import GeneralLlm
+from pandas.tseries.holiday import USFederalHolidayCalendar
 
-from metaculus_bot.research.provider_diagnostics import pop_provider_detail
+from metaculus_bot.constants import FINANCIAL_YFINANCE_LOOKBACK_DAYS, MAX_FINANCIAL_IDENTIFIERS
+from metaculus_bot.research.financial_data import (
+    _PERIOD_SLIP_GRACE_DAYS,
+    _PERIOD_TARGET_DAYS,
+    CLASSIFIER_PROMPT,
+    FRED_LABELS,
+    KNOWN_FRED_SERIES,
+    KNOWN_TICKERS,
+    TICKER_LABELS,
+    _cap_identifiers,
+    _classify_financial_question,
+    _fetch_fred_data,
+    _fetch_fred_data_ceiling,
+    _fetch_yfinance_data,
+    _render_fred_series,
+    extract_financial_identifiers_from_criteria,
+    financial_data_provider,
+)
+from metaculus_bot.research.orchestrator import ResearchOrchestrator
+from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
+from metaculus_bot.research.ts_estimators import (
+    CALENDAR_DAYS_PER_YEAR,
+    TRADING_DAYS_PER_YEAR,
+    observed_periods_per_year,
+    stale_latest_age_days,
+)
+from metaculus_bot.research.ts_fetch import FetchError
 
 
 def _make_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> MagicMock:
@@ -23,7 +52,8 @@ def _make_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> M
 
 # Fixed open_time used across the benchmarking date-ceiling tests. as_of derivation
 # under is_benchmarking pins to this, so the yfinance start/end and FRED ceiling are
-# both deterministic: end == open_time.date() + 1 day, start == open_time.date() - 365d.
+# both deterministic: end == open_time.date() + 1 day, start == open_time.date() minus
+# the FINANCIAL_YFINANCE_LOOKBACK_DAYS calendar window.
 _BENCH_OPEN_TIME = datetime(2026, 3, 15, 14, 30, tzinfo=UTC)
 
 
@@ -48,8 +78,6 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL, MSFT\nFRED_SERIES: NONE"
 
-        from metaculus_bot.research.financial_data import _classify_financial_question
-
         result, _error = await _classify_financial_question(
             "Will Apple stock price exceed $200 by end of 2026?", mock_llm
         )
@@ -63,8 +91,6 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: UNRATE, CPIAUCSL"
 
-        from metaculus_bot.research.financial_data import _classify_financial_question
-
         result, _error = await _classify_financial_question("Will US unemployment rate exceed 5% in 2026?", mock_llm)
 
         assert result is not None
@@ -75,8 +101,6 @@ class TestClassifyFinancialQuestion:
     async def test_classifies_mixed_question_with_both(self) -> None:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: ^GSPC\nFRED_SERIES: FEDFUNDS"
-
-        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result, _error = await _classify_financial_question("Will the S&P 500 drop if the Fed raises rates?", mock_llm)
 
@@ -89,8 +113,6 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
 
-        from metaculus_bot.research.financial_data import _classify_financial_question
-
         result, _error = await _classify_financial_question("Will it rain in London tomorrow?", mock_llm)
 
         assert result is None
@@ -99,8 +121,6 @@ class TestClassifyFinancialQuestion:
     async def test_llm_failure_returns_none_and_names_the_error(self) -> None:
         mock_llm = AsyncMock()
         mock_llm.invoke.side_effect = RuntimeError("LLM timeout")
-
-        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result, error = await _classify_financial_question("Will Apple stock exceed $200?", mock_llm)
 
@@ -116,8 +136,6 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
 
-        from metaculus_bot.research.financial_data import _classify_financial_question
-
         result, error = await _classify_financial_question("Will it rain in London tomorrow?", mock_llm)
 
         assert result is None
@@ -128,8 +146,6 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "I don't understand the question format."
 
-        from metaculus_bot.research.financial_data import _classify_financial_question
-
         result, _error = await _classify_financial_question("Will Apple stock exceed $200?", mock_llm)
 
         assert result is None
@@ -139,8 +155,6 @@ class TestClassifyFinancialQuestion:
         """If classifier says YES but extracts nothing useful, treat as non-financial."""
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: NONE"
-
-        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result, _error = await _classify_financial_question("Will the economy improve?", mock_llm)
 
@@ -181,8 +195,6 @@ class TestFetchYfinanceData:
         with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.return_value = mock_ticker_instance
 
-            from metaculus_bot.research.financial_data import _fetch_yfinance_data
-
             result = _fetch_yfinance_data("AAPL")
 
         assert result != ""
@@ -197,8 +209,6 @@ class TestFetchYfinanceData:
         with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.side_effect = Exception("Network error")
 
-            from metaculus_bot.research.financial_data import _fetch_yfinance_data
-
             result = _fetch_yfinance_data("INVALID")
 
         assert result == ""
@@ -211,8 +221,6 @@ class TestFetchYfinanceData:
         with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.return_value = mock_ticker_instance
 
-            from metaculus_bot.research.financial_data import _fetch_yfinance_data
-
             result = _fetch_yfinance_data("FAKE")
 
         assert result == ""
@@ -221,6 +229,415 @@ class TestFetchYfinanceData:
 # ---------------------------------------------------------------------------
 # FRED fetch tests
 # ---------------------------------------------------------------------------
+
+
+class TestAnnualizationBasis:
+    """The vol/window basis must come from the OBSERVED series density, not a fixed 252.
+
+    24/7-traded assets (crypto) print ~365 daily bars a year, so sqrt(252)
+    understates their annualized vol by ~17% (sqrt(252/365) ~= 0.83) and the
+    252-row "1y"/"52-week" windows span only ~8.2 calendar months — the q44882
+    (ETH-USD) defect. Exchange-traded series (5 rows/week) must stay byte-identical
+    to the historical 252 behavior, and an unmeasurable density must degrade to
+    252, never crash.
+    """
+
+    @staticmethod
+    def _fetch_with_history(close: pd.Series, **kwargs) -> str:
+        history = pd.DataFrame(
+            {"Close": close, "Open": close * 0.99, "High": close * 1.01, "Low": close * 0.98},
+            index=close.index,
+        )
+        mock_ticker_instance = MagicMock()
+        mock_ticker_instance.history.return_value = history
+        mock_ticker_instance.info = {"shortName": "Test Asset"}
+        with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker_instance
+            return _fetch_yfinance_data("TEST", **kwargs)
+
+    @staticmethod
+    def _line_value(markdown: str, prefix: str) -> str:
+        for line in markdown.splitlines():
+            if line.strip().startswith(prefix):
+                return line.split(":", 1)[1].strip()
+        raise AssertionError(f"no {prefix!r} line in:\n{markdown}")
+
+    def test_business_day_series_keeps_trading_day_basis(self):
+        rng = np.random.default_rng(7)
+        dates = pd.bdate_range(end="2026-03-30", periods=300)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 300))), index=dates)
+        assert observed_periods_per_year(close.index) == 252
+
+        result = self._fetch_with_history(close)
+        expected_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(252) * 100
+        assert self._line_value(result, "- 30-trading-day annualized volatility") == f"{expected_vol:.1f}%"
+        # The 1y row and the 52-week band both read a true calendar year, not a
+        # 252-row count (which on a holiday-bearing exchange index spans ~50 weeks).
+        year_ago = close.index[-1] - pd.Timedelta(days=365)
+        expected_1y = (close.iloc[-1] / close.loc[:year_ago].iloc[-1] - 1) * 100
+        assert self._line_value(result, "- 1y") == f"{expected_1y:+.2f}%"
+        year_slice = close[close.index >= year_ago]
+        assert self._line_value(result, "- 52-week range") == f"{year_slice.min():.2f} - {year_slice.max():.2f}"
+
+    def test_24_7_series_gets_calendar_basis_and_full_year_windows(self):
+        rng = np.random.default_rng(11)
+        dates = pd.date_range(end="2026-07-31", periods=366, freq="D")
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, 366))), index=dates)
+        # Plant a spike only the 365-row window can see: 300 rows back is beyond
+        # the old 252-row slice but inside the true 52 calendar weeks.
+        close.iloc[-300] = close.max() * 3
+        assert observed_periods_per_year(close.index) == 365
+
+        result = self._fetch_with_history(close)
+        expected_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(365) * 100
+        assert self._line_value(result, "- 30-calendar-day annualized volatility") == f"{expected_vol:.1f}%"
+        # A 252-basis vol would be ~17% lower; make sure that's not what rendered.
+        wrong_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(252) * 100
+        assert f"{wrong_vol:.1f}%" != f"{expected_vol:.1f}%"
+        # 1y = 365 calendar rows back, 1w = 7 rows back.
+        expected_1y = (close.iloc[-1] / close.iloc[-366] - 1) * 100
+        assert self._line_value(result, "- 1y") == f"{expected_1y:+.2f}%"
+        expected_1w = (close.iloc[-1] / close.iloc[-8] - 1) * 100
+        assert self._line_value(result, "- 1w") == f"{expected_1w:+.2f}%"
+        # The 52-week high must include the spike the 252-row slice misses.
+        assert self._line_value(result, "- 52-week range").endswith(f"{close.iloc[-300]:.2f}")
+
+    def test_the_production_fetch_window_still_renders_the_1y_row(self):
+        """The boundary the lookback constant exists to clear: the 1y lookup needs an
+        observation at least 365 days back, and the fetch window is what supplies it.
+        Built WINDOW-shaped — an end-inclusive span of LOOKBACK+1 calendar dates, exactly
+        what the start-date fetch returns for a gap-free 24/7 series — so a future trim
+        of the constant fails here, not in prod. (The old version built `periods=LOOKBACK`
+        ROWS, silently encoding the gap-free bar-count assumption this replaced.)"""
+        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS > 365, "the 1y lookup needs a >365-day window"
+        rng = np.random.default_rng(7)
+        n_rows = FINANCIAL_YFINANCE_LOOKBACK_DAYS + 1  # end-inclusive window, one bar per date
+        dates = pd.date_range(end="2026-07-31", periods=n_rows, freq="D")
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, n_rows))), index=dates)
+        assert observed_periods_per_year(close.index) == 365
+
+        result = self._fetch_with_history(close)
+
+        expected_1y = (close.iloc[-1] / close.iloc[-366] - 1) * 100
+        assert self._line_value(result, "- 1y") == f"{expected_1y:+.2f}%"
+
+    def test_one_more_closure_than_worst_observed_density_keeps_the_1y_row(self):
+        """The listed-asset margin that measured EXACTLY ZERO under the old sizing: real
+        SPY windows bottomed out at 253 bars per 373-date window, so one more unscheduled
+        closure (a mourning-day, a Sandy) left 252 bars — and the old row-offset 1y lookup
+        (needs strictly more than 252 rows) silently dropped the row. The date-based
+        lookup reads the window's SPAN, so the same frame keeps its 1y return."""
+        end = pd.Timestamp("2026-08-21")  # a Friday, like a normal trading day
+        idx = pd.bdate_range(start=end - pd.Timedelta(days=372), end=end)
+        n_closures = len(idx) - 252
+        assert n_closures > 0
+        closed = np.linspace(30, len(idx) - 30, n_closures).astype(int)
+        idx = idx[np.setdiff1d(np.arange(len(idx)), closed)]
+        assert len(idx) == 252, "worst observed density plus one extra closure"
+        rng = np.random.default_rng(11)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 252))), index=idx)
+        assert observed_periods_per_year(close.index) == 252
+
+        result = self._fetch_with_history(close)
+
+        # Value-pinned, not presence-pinned: a lookup that lands weeks off target would
+        # still put a "- 1y" substring in the render.
+        start = close.loc[: close.index[-1] - pd.Timedelta(days=365)]
+        expected = (close.iloc[-1] / start.iloc[-1] - 1) * 100
+        assert self._line_value(result, "- 1y") == f"{expected:+.2f}%"
+
+    def test_scattered_crypto_gaps_keep_the_1y_row(self):
+        """Yahoo data holes on a 24/7 series subtract rows instead of extending the window
+        (a persistent one-day BTC-USD hole was observed live). Thirty scattered holes take
+        a full production window to 361 rows — under the old 366-row requirement, which
+        dropped the 1y row; the date-based lookup still finds the year-ago observation."""
+        window_dates = FINANCIAL_YFINANCE_LOOKBACK_DAYS + 1
+        idx = pd.date_range(end="2026-08-21", periods=window_dates, freq="D")
+        holes = np.linspace(30, window_dates - 11, 30).astype(int)
+        idx = idx[np.setdiff1d(np.arange(window_dates), holes)]
+        assert len(idx) == window_dates - 30
+        assert len(idx) < 366, "the fixture must be thinner than the old row requirement"
+        rng = np.random.default_rng(13)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, len(idx)))), index=idx)
+        assert observed_periods_per_year(close.index) == 365
+
+        result = self._fetch_with_history(close)
+
+        start = close.loc[: close.index[-1] - pd.Timedelta(days=365)]
+        expected = (close.iloc[-1] / start.iloc[-1] - 1) * 100
+        assert self._line_value(result, "- 1y") == f"{expected:+.2f}%"
+
+    def test_lookback_constant_covers_both_bases_with_headroom(self):
+        """Both binding constraints, so no future trim can under-size either basis: the
+        365 basis needs 366 rows plus gap headroom; the 252 basis needs 253 bars plus a
+        week of closures, converted at the trading-day density. The old 372 passed the
+        first and cleared the second by arithmetic accident (margin zero on real
+        windows)."""
+        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS >= 365 + 14
+        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS >= math.ceil((252 + 7) * 365.25 / 252)
+        # Documented crypto tolerance: end-inclusive window dates minus the 366 rows the
+        # 1y lookup wants on a gap-free frame.
+        assert (FINANCIAL_YFINANCE_LOOKBACK_DAYS + 1) - 366 >= 24
+
+    def test_the_offset_table_is_the_documented_convention(self):
+        # The table IS the behavior: every period-return label on every financial snapshot is
+        # only a true calendar period because of these numbers. Pinned verbatim so an edit is a
+        # deliberate act — ONE table of calendar days for both bases (business-day steps on the
+        # 252 basis silently landed ~10 trading days short of a year across market holidays),
+        # each resolved to a target DATE and matched at-or-before. What stays per-basis is the
+        # slip grace: 3 days absorbs a weekend-plus-holiday landing on the 252 basis, while a
+        # 24/7 series should print every date, so ANY slip there disclosves as a data gap.
+        assert _PERIOD_TARGET_DAYS == [
+            ("1d", 1),
+            ("1w", 7),
+            ("1m", 30),
+            ("3m", 91),
+            ("6m", 182),
+            ("1y", 365),
+        ]
+        assert _PERIOD_SLIP_GRACE_DAYS == {TRADING_DAYS_PER_YEAR: 3, CALENDAR_DAYS_PER_YEAR: 0}
+
+    @pytest.mark.parametrize("basis", [TRADING_DAYS_PER_YEAR, CALENDAR_DAYS_PER_YEAR])
+    def test_every_period_row_reads_a_true_calendar_period_on_both_bases(self, basis: int):
+        # The bases are pinned end-to-end above only on 1w/1y; walk ALL six labels so a
+        # mis-keyed intermediate target (3m reading 63 days = 9 calendar weeks under a
+        # "3m" label) can't hide between the two tested ones. Table-driven, so a new
+        # period label is covered the moment it lands. The expected start is pandas' own
+        # at-or-before read of `last − days` — pinning the table plus the match semantics
+        # — and on the gap-free daily index the 365-basis reads are additionally asserted
+        # bit-identical to the historical row offsets, so the calendar-day rewrite
+        # provably left 24/7 numbers unchanged. The marker asserts at the bottom pin the
+        # render delta to purely additive (no span disclosures, no staleness).
+        rng = np.random.default_rng(3)
+        # Enough rows to cover the 365-day 1y target on either index density.
+        index = (
+            pd.bdate_range(end="2026-07-31", periods=400)
+            if basis == TRADING_DAYS_PER_YEAR
+            else pd.date_range(end="2026-07-31", periods=400, freq="D")
+        )
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(index)))), index=index)
+        assert observed_periods_per_year(close.index) == basis
+
+        # as_of one day past the last bar: fresh enough that no staleness note can fire,
+        # not the bar's own date so no partial-bar marker fires.
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+
+        for label, days in _PERIOD_TARGET_DAYS:
+            start = close.loc[: close.index[-1] - pd.Timedelta(days=days)]
+            expected = (close.iloc[-1] / start.iloc[-1] - 1) * 100
+            assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", (basis, label)
+            if basis == CALENDAR_DAYS_PER_YEAR:
+                assert start.iloc[-1] == close.iloc[-(days + 1)], (basis, label)
+        assert "(actual" not in result, "weekend slips stay inside the 252 grace; gap-free 365 has none"
+        assert "⚠" not in result, "a fresh latest must not read as stale"
+        assert "in progress" not in result
+
+    def test_short_series_degrades_to_trading_day_basis(self):
+        dates = pd.date_range(end="2026-07-31", periods=10, freq="D")
+        close = pd.Series(np.linspace(100.0, 110.0, 10), index=dates)
+        assert observed_periods_per_year(close.index) == 252
+        # And the full fetch still renders (no vol line under 30 rows, no crash).
+        result = self._fetch_with_history(close)
+        assert "- Latest price:" in result
+        assert "volatility" not in result
+
+    def test_non_datetime_index_degrades_to_trading_day_basis(self):
+        close = pd.Series(np.linspace(100.0, 110.0, 50))  # RangeIndex
+        assert observed_periods_per_year(close.index) == 252
+
+    def test_zero_span_index_degrades_to_trading_day_basis(self):
+        dates = pd.DatetimeIndex(["2026-07-31"] * 50)
+        close = pd.Series(np.linspace(100.0, 110.0, 50), index=dates)
+        assert observed_periods_per_year(close.index) == 252
+
+
+class TestDatedLatestAndStaleness:
+    """Every rendered "latest" carries its observation date, a still-forming bar says so,
+    and a latest older than the series' own cadence allows is flagged as stale.
+
+    The undated "Current price" read as live even when Yahoo's newest bar was days old:
+    a weekend Friday close, or a null-close consolidation hole silently dropped from the
+    frame by yfinance's keepna=False default — indistinguishable to the reader either way.
+    """
+
+    _fetch_with_history = staticmethod(TestAnnualizationBasis._fetch_with_history)
+    _line_value = staticmethod(TestAnnualizationBasis._line_value)
+
+    @staticmethod
+    def _daily_series(end: str, n: int = 366, freq: str = "D") -> pd.Series:
+        rng = np.random.default_rng(5)
+        dates = pd.date_range(end=end, periods=n, freq=freq)
+        return pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, n))), index=dates)
+
+    def test_latest_price_line_carries_its_observation_date(self):
+        close = self._daily_series("2026-08-24")
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 25, 12, 0, tzinfo=UTC))
+        assert "- Latest price:" in result
+        assert "(as of 2026-08-24)" in self._line_value(result, "- Latest price")
+
+    def test_todays_bar_is_marked_in_progress(self):
+        close = self._daily_series("2026-08-26")
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 4, 52, tzinfo=UTC))
+        assert "(as of 2026-08-26) — today's bar, in progress" in result
+
+    def test_a_completed_bar_carries_no_in_progress_marker(self):
+        close = self._daily_series("2026-08-25")
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 4, 52, tzinfo=UTC))
+        assert "in progress" not in result
+
+    def test_benchmarking_never_marks_in_progress(self):
+        # Under a backtest the as_of-dated bar is a COMPLETED historical bar fetched
+        # later; calling it in-progress would be false.
+        close = self._daily_series("2026-08-26")
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 4, 52, tzinfo=UTC), is_benchmarking=True)
+        assert "(as of 2026-08-26)" in result
+        assert "in progress" not in result
+
+    def test_stale_calendar_basis_latest_is_flagged_and_warned(self, caplog: pytest.LogCaptureFixture):
+        # A 24/7 series should print a bar every date; a 3-day-old latest is beyond the
+        # 1-step + 1-grace-day allowance and must be flagged in render AND run logs.
+        close = self._daily_series("2026-08-23")
+        with caplog.at_level("WARNING"):
+            result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 4, 52, tzinfo=UTC))
+        assert "⚠ Latest observation is 3 days old" in result
+        assert "FINANCIAL_STALE_LATEST: surface=financial_data symbol=TEST age_d=3 cadence=calendar-day" in caplog.text
+
+    def test_weekend_friday_close_on_trading_basis_stays_silent(self):
+        # Friday close read on Sunday is 2 days old — routine on the 252 basis (the
+        # allowance absorbs a weekend plus a holiday), so no flag and no WARN.
+        rng = np.random.default_rng(5)
+        dates = pd.bdate_range(end="2026-08-21", periods=300)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 300))), index=dates)
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 23, 12, 0, tzinfo=UTC))
+        assert "⚠" not in result
+
+    def test_a_tz_aware_exchange_index_ages_in_its_own_timezone(self):
+        # yfinance serves listed-asset bars on a tz-aware exchange-local index (ts_fetch
+        # normalizes the same frames), while window_end is UTC. Comparing dates across the
+        # two zones inflates a US-equity age by one for part of every day: a Friday close
+        # read at Wednesday 02:00 UTC (Tuesday 22:00 ET) is 4 ET days old — inside the
+        # 252-basis allowance — but 5 UTC days old, a false staleness warning.
+        rng = np.random.default_rng(5)
+        dates = pd.bdate_range(end="2026-08-21", periods=300, tz="America/New_York")
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 300))), index=dates)
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 2, 0, tzinfo=UTC))
+        assert "⚠" not in result
+
+    def test_stale_helper_thresholds_per_basis(self):
+        # The shared helper's exact boundaries: >2 days on the 365 basis, >4 on the 252.
+        as_of = date(2026, 8, 26)
+        assert stale_latest_age_days(date(2026, 8, 24), as_of, CALENDAR_DAYS_PER_YEAR) is None
+        assert stale_latest_age_days(date(2026, 8, 23), as_of, CALENDAR_DAYS_PER_YEAR) == 3
+        assert stale_latest_age_days(date(2026, 8, 22), as_of, TRADING_DAYS_PER_YEAR) is None
+        assert stale_latest_age_days(date(2026, 8, 21), as_of, TRADING_DAYS_PER_YEAR) == 5
+
+
+class TestDateBasedPeriodReturns:
+    """Period returns look up their start value by DATE (at-or-before the label's target),
+    so a gapped index cannot shift every row by the hole count.
+
+    The row-offset arithmetic this replaced rendered a "1d" return spanning 53 hours when
+    Yahoo dropped a null-close bar: every offset walked one row too far, and nothing in
+    the render said so.
+    """
+
+    _fetch_with_history = staticmethod(TestAnnualizationBasis._fetch_with_history)
+    _line_value = staticmethod(TestAnnualizationBasis._line_value)
+
+    @staticmethod
+    def _gapped_btc_shape() -> pd.Series:
+        # A long healthy 24/7 series whose second-to-last DATE is missing — the observed
+        # Yahoo consolidation-hole shape (a null-close bar deleted by keepna=False).
+        idx = pd.date_range(end="2026-08-26", periods=400, freq="D")
+        idx = idx.drop([pd.Timestamp("2026-08-25")])
+        rng = np.random.default_rng(7)
+        return pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)
+
+    def test_1d_over_a_hole_discloses_the_actual_span(self):
+        close = self._gapped_btc_shape()
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 12, 0, tzinfo=UTC))
+        one_d = next(line.strip() for line in result.splitlines() if line.strip().startswith("- 1d"))
+        assert one_d.startswith("- 1d (actual 2d):"), one_d
+
+    def test_longer_rows_hit_the_same_calendar_dates_as_an_ungapped_index(self):
+        # Row offsets would shift 1m/3m/6m/1y one row deep past the hole; the date-based
+        # lookup must read the observation dated exactly N days before the last bar.
+        close = self._gapped_btc_shape()
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 12, 0, tzinfo=UTC))
+        last_ts = close.index[-1]
+        for label, days in [("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365)]:
+            expected = (close.iloc[-1] / close.loc[last_ts - pd.Timedelta(days=days)] - 1) * 100
+            assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", label
+
+    def test_a_nan_close_row_renders_identically_to_a_dropped_row(self):
+        """Yahoo's consolidation hole arrives in TWO representations: yfinance's
+        keepna=False default usually deletes the row, but a NaN close that does arrive
+        must not poison the tail-anchored stats — without the dropna, "Latest price:
+        nan" and NaN period returns go straight into a forecaster prompt."""
+        dropped = self._gapped_btc_shape()
+        as_nan_row = dropped.reindex(pd.date_range(end="2026-08-26", periods=400, freq="D"))
+        assert as_nan_row.isna().sum() == 1
+
+        as_of = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+        result_nan = self._fetch_with_history(as_nan_row, as_of=as_of)
+
+        assert result_nan == self._fetch_with_history(dropped, as_of=as_of)
+        assert "- 1d (actual 2d):" in result_nan
+        assert "nan" not in result_nan  # an f-string'd NaN renders exactly "nan"
+
+    def test_an_all_null_close_frame_renders_nothing(self, caplog: pytest.LogCaptureFixture):
+        idx = pd.date_range(end="2026-08-26", periods=40, freq="D")
+        all_nan = pd.Series(np.nan, index=idx)
+        with caplog.at_level("WARNING"):
+            result = self._fetch_with_history(all_nan, as_of=datetime(2026, 8, 26, 12, 0, tzinfo=UTC))
+        assert result == ""
+        assert "no non-null closes" in caplog.text
+
+    def test_a_holiday_bearing_exchange_index_still_reads_a_full_calendar_year(self):
+        """A real exchange index is missing every market HOLIDAY, not just weekends.
+
+        Resolving the 252-basis targets in business days (`pd.offsets.BDay`) landed the
+        "1y" match ~10 trading days short on a NYSE-shaped index — ~352 calendar days
+        back under a label that claims a year, with slip 0 so the `(actual Nd)`
+        disclosure never fired. Targets resolve in calendar days on BOTH bases, so a
+        holiday under the target is absorbed by the at-or-before match within the slip
+        grace instead of silently shortening every long horizon.
+        """
+
+        end = pd.Timestamp("2026-08-21")  # a Friday
+        idx = pd.bdate_range(start=end - pd.Timedelta(days=420), end=end)
+        holidays = USFederalHolidayCalendar().holidays(start=idx[0], end=idx[-1])
+        idx = idx.difference(holidays)
+        rng = np.random.default_rng(17)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)
+        assert observed_periods_per_year(close.index) == 252
+
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 22, 12, 0, tzinfo=UTC))
+
+        last_ts = close.index[-1]
+        for label, days in [("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365)]:
+            start = close.loc[: last_ts - pd.Timedelta(days=days)]
+            expected = (close.iloc[-1] / start.iloc[-1] - 1) * 100
+            assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", label
+            actual_span = (last_ts - start.index[-1]).days
+            assert days - 3 <= actual_span <= days, (label, actual_span)
+        assert "(actual" not in result, "weekend/holiday slip is routine on the 252 basis, not a mislabel"
+
+    def test_a_holiday_under_a_trading_basis_target_stays_undisclosed(self):
+        # A market holiday sitting exactly under the 1m target slips the match one
+        # business day — routine on the 252 basis, so the label must stay plain AND
+        # still read the nearest prior observation.
+        idx = pd.bdate_range(end="2026-08-21", periods=400)
+        holiday = pd.Timestamp("2026-07-22")  # the exact 30-calendar-day 1m target, a Wednesday
+        assert holiday in idx
+        idx = idx.drop([holiday])
+        rng = np.random.default_rng(9)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 22, 12, 0, tzinfo=UTC))
+        one_m = next(line.strip() for line in result.splitlines() if line.strip().startswith("- 1m"))
+        assert one_m.startswith("- 1m:"), one_m
+        expected = (close.iloc[-1] / close.loc[:holiday].iloc[-1] - 1) * 100
+        assert one_m == f"- 1m: {expected:+.2f}%"
 
 
 class TestFetchFredData:
@@ -240,8 +657,6 @@ class TestFetchFredData:
         with patch("metaculus_bot.research.financial_data.Fred") as mock_fred_class:
             mock_fred_class.return_value = mock_fred_instance
 
-            from metaculus_bot.research.financial_data import _fetch_fred_data
-
             result = _fetch_fred_data("UNRATE", "fake_api_key")
 
         assert result != ""
@@ -252,8 +667,6 @@ class TestFetchFredData:
     def test_fred_exception_returns_empty_string(self) -> None:
         with patch("metaculus_bot.research.financial_data.Fred") as mock_fred_class:
             mock_fred_class.return_value.get_series.side_effect = Exception("API error")
-
-            from metaculus_bot.research.financial_data import _fetch_fred_data
 
             result = _fetch_fred_data("INVALID", "fake_api_key")
 
@@ -275,8 +688,6 @@ class TestRenderFredSeriesYoY:
         raise AssertionError(f"no year-over-year line in:\n{markdown}")
 
     def test_daily_series_uses_365d_ago_value_not_obs_minus_13(self) -> None:
-        from metaculus_bot.research.financial_data import _render_fred_series
-
         # 800 business days ending 2026-03-02. The value is a linear ramp from 0.0
         # to 799.0 (one unit per observation), so the value at any date equals its
         # integer offset from the start — making the two lookups trivially distinct.
@@ -298,8 +709,6 @@ class TestRenderFredSeriesYoY:
         assert rendered_yoy != pytest.approx(latest_value - wrong_offset_value, abs=1e-6)
 
     def test_monthly_series_still_correct(self) -> None:
-        from metaculus_bot.research.financial_data import _render_fred_series
-
         # 60 monthly observations; the value ~12 months back is one year ago.
         dates = pd.date_range(end="2026-03-01", periods=60, freq="MS")
         data = pd.Series(np.arange(60.0), index=dates, name="UNRATE")
@@ -314,8 +723,6 @@ class TestRenderFredSeriesYoY:
         assert rendered_yoy == pytest.approx(latest_value - expected_prior, abs=1e-6)
 
     def test_short_series_omits_yoy_line(self) -> None:
-        from metaculus_bot.research.financial_data import _render_fred_series
-
         # Only ~3 months of monthly data: nothing is ~365 days back, so the YoY
         # line is omitted rather than reaching for a nonexistent observation.
         dates = pd.date_range(end="2026-03-01", periods=3, freq="MS")
@@ -324,6 +731,50 @@ class TestRenderFredSeriesYoY:
         markdown = _render_fred_series("UNRATE", data, "unemployment rate")
 
         assert "Year-over-year change" not in markdown
+
+
+class TestRenderFredSeriesZeroBasePercent:
+    """A base of exactly 0 has no percent change; it must not render as 0.00%.
+
+    FRED spread series cross zero routinely (T10Y2Y inverted through 2023-24), and the
+    old ``else 0`` put a fabricated "unchanged" percentage next to a genuine absolute
+    move in a forecaster prompt.
+    """
+
+    def test_zero_previous_observation_omits_the_percent_clause(self) -> None:
+        dates = pd.date_range(end="2026-03-01", periods=3, freq="MS")
+        data = pd.Series([0.5, 0.0, 0.31], index=dates, name="T10Y2Y")
+
+        markdown = _render_fred_series("T10Y2Y", data, "10Y-2Y spread")
+        change_line = next(line for line in markdown.splitlines() if line.startswith("- Change from previous:"))
+
+        assert change_line == "- Change from previous: +0.31"
+        assert "0.00%" not in markdown
+
+    def test_zero_year_ago_observation_omits_only_the_yoy_percent(self) -> None:
+        # 25 monthly observations so the ~365-day lookup lands on a real row, which is
+        # set to exactly 0. The month-over-month clause is unaffected.
+        dates = pd.date_range(end="2026-03-01", periods=25, freq="MS")
+        values = [1.0] * 25
+        values[12] = 0.0  # the observation ~365 days before the last one
+        data = pd.Series(values, index=dates, name="T10Y3M")
+        data.iloc[-1] = 0.4
+        data.iloc[-2] = 0.2
+
+        markdown = _render_fred_series("T10Y3M", data, "10Y-3M spread")
+        yoy_line = next(line for line in markdown.splitlines() if line.startswith("- Year-over-year change:"))
+        mom_line = next(line for line in markdown.splitlines() if line.startswith("- Change from previous:"))
+
+        assert yoy_line == "- Year-over-year change: +0.4"
+        assert "(+100.00%)" in mom_line
+
+    def test_a_nonzero_base_still_renders_its_percent(self) -> None:
+        dates = pd.date_range(end="2026-03-01", periods=2, freq="MS")
+        data = pd.Series([2.0, 3.0], index=dates, name="UNRATE")
+
+        markdown = _render_fred_series("UNRATE", data, "unemployment rate")
+
+        assert "- Change from previous: +1 (+50.00%)" in markdown
 
 
 # ---------------------------------------------------------------------------
@@ -370,8 +821,6 @@ class TestFinancialDataProviderIntegration:
             mock_yf.Ticker.return_value = mock_ticker
             mock_fred_class.return_value = mock_fred_instance
 
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.setenv("FRED_API_KEY", "fake_key")
             try:
@@ -393,8 +842,6 @@ class TestFinancialDataProviderIntegration:
         mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
 
         with patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             provider = financial_data_provider()
             result = await provider(_make_q("Will it rain in London tomorrow?"))
 
@@ -429,8 +876,6 @@ class TestFinancialDataProviderIntegration:
         ):
             mock_yf.Ticker.side_effect = ticker_factory
 
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             provider = financial_data_provider()
             result = await provider(_make_q("Compare Apple and BADTICKER stock performance"))
 
@@ -460,8 +905,6 @@ class TestFinancialDataProviderIntegration:
         ):
             mock_yf.Ticker.return_value = mock_ticker
 
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.delenv("FRED_API_KEY", raising=False)
             try:
@@ -486,8 +929,6 @@ class TestExtractFinancialIdentifiers:
     """Tests for extract_financial_identifiers_from_criteria (Part A)."""
 
     def test_extracts_fred_series_from_url(self) -> None:
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         text = "This resolves based on https://fred.stlouisfed.org/series/DGS10 as published."
         result = extract_financial_identifiers_from_criteria(text)
 
@@ -495,16 +936,12 @@ class TestExtractFinancialIdentifiers:
         assert result["tickers"] == []
 
     def test_extracts_fred_series_with_underscores_and_digits(self) -> None:
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         text = "High-yield spread: https://fred.stlouisfed.org/series/BAMLH0A0HYM2 and the 10y-2y https://fred.stlouisfed.org/series/T10Y2Y."
         result = extract_financial_identifiers_from_criteria(text)
 
         assert result["fred_series"] == ["BAMLH0A0HYM2", "T10Y2Y"]
 
     def test_extracts_yahoo_ticker_with_url_encoded_caret(self) -> None:
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         text = "Resolves on the 10Y yield index at https://finance.yahoo.com/quote/%5ETNX/"
         result = extract_financial_identifiers_from_criteria(text)
 
@@ -516,23 +953,17 @@ class TestExtractFinancialIdentifiers:
         (`.../quote/%5ETNX.` -> `^TNX.`), which isn't in KNOWN_TICKERS and silently
         defeats the q43650 deterministic-fire guarantee. The trailing `.` must be
         stripped; internal dots (e.g. DX-Y.NYB) are preserved by rstrip."""
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         result = extract_financial_identifiers_from_criteria("Resolves on https://finance.yahoo.com/quote/%5ETNX.")
 
         assert result["tickers"] == ["^TNX"]
 
     def test_extracts_yahoo_ticker_with_special_chars(self) -> None:
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         text = "Crude: https://finance.yahoo.com/quote/CL=F bitcoin: https://finance.yahoo.com/quote/BTC-USD"
         result = extract_financial_identifiers_from_criteria(text)
 
         assert result["tickers"] == ["CL=F", "BTC-USD"]
 
     def test_extracts_both_fred_and_yahoo(self) -> None:
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         text = (
             "Yield per https://fred.stlouisfed.org/series/DGS10 and proxy "
             "https://finance.yahoo.com/quote/%5ETNX for context."
@@ -543,8 +974,6 @@ class TestExtractFinancialIdentifiers:
         assert result["tickers"] == ["^TNX"]
 
     def test_dedupes_preserving_order(self) -> None:
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         text = (
             "https://fred.stlouisfed.org/series/DGS10 ... again "
             "https://fred.stlouisfed.org/series/DGS2 ... once more "
@@ -555,15 +984,11 @@ class TestExtractFinancialIdentifiers:
         assert result["fred_series"] == ["DGS10", "DGS2"]
 
     def test_no_match_returns_empty_lists(self) -> None:
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         result = extract_financial_identifiers_from_criteria("Will it rain in London tomorrow?")
 
         assert result == {"tickers": [], "fred_series": []}
 
     def test_empty_string_returns_empty_lists(self) -> None:
-        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
-
         result = extract_financial_identifiers_from_criteria("")
 
         assert result == {"tickers": [], "fred_series": []}
@@ -607,8 +1032,6 @@ class TestDeterministicRouting:
             patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
             patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.setenv("FRED_API_KEY", "fake_key")
             try:
@@ -637,8 +1060,6 @@ class TestDeterministicRouting:
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.setenv("FRED_API_KEY", "fake_key")
             try:
@@ -667,8 +1088,6 @@ class TestDeterministicRouting:
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_yf),
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             result = await financial_data_provider()(question)
 
         assert "### AAPL" in result  # the good ticker contributed
@@ -697,8 +1116,6 @@ class TestDeterministicRouting:
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_yf),
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             result = await financial_data_provider()(question)
 
         assert "### AAPL" in result  # the healthy ticker still contributes
@@ -732,8 +1149,6 @@ class TestDeterministicRouting:
             patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
             patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.setenv("FRED_API_KEY", "fake_key")
             try:
@@ -767,8 +1182,6 @@ class TestDeterministicRouting:
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             with caplog.at_level("WARNING", logger="metaculus_bot.research.financial_data"):
                 provider = financial_data_provider()
                 result = await provider(question)
@@ -797,8 +1210,6 @@ class TestDeterministicRouting:
             patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
             patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.setenv("FRED_API_KEY", "fake_key")
             try:
@@ -822,8 +1233,6 @@ class TestDeterministicRouting:
         mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
 
         with patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             provider = financial_data_provider()
             result = await provider(_make_q("Will it rain in London tomorrow?"))
 
@@ -842,19 +1251,10 @@ class TestAllowlistPromptConsistency:
     These tests guard that derivation (and would catch a future hardcode regression)."""
 
     def test_every_known_id_appears_in_prompt(self) -> None:
-        from metaculus_bot.research.financial_data import CLASSIFIER_PROMPT, KNOWN_FRED_SERIES, KNOWN_TICKERS
-
         for identifier in KNOWN_TICKERS | KNOWN_FRED_SERIES:
             assert identifier in CLASSIFIER_PROMPT, f"{identifier} missing from CLASSIFIER_PROMPT reference table"
 
     def test_frozensets_derived_from_label_dicts(self) -> None:
-        from metaculus_bot.research.financial_data import (
-            FRED_LABELS,
-            KNOWN_FRED_SERIES,
-            KNOWN_TICKERS,
-            TICKER_LABELS,
-        )
-
         assert KNOWN_TICKERS == frozenset(TICKER_LABELS)
         assert KNOWN_FRED_SERIES == frozenset(FRED_LABELS)
 
@@ -872,10 +1272,6 @@ class TestProviderSelection:
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
-
-        from forecasting_tools import GeneralLlm
-
-        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
 
@@ -898,10 +1294,6 @@ class TestProviderSelection:
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 
-        from forecasting_tools import GeneralLlm
-
-        from metaculus_bot.research.orchestrator import ResearchOrchestrator
-
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
         mock_provider = AsyncMock(return_value="primary research")
@@ -917,10 +1309,6 @@ class TestProviderSelection:
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
-
-        from forecasting_tools import GeneralLlm
-
-        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
@@ -944,8 +1332,9 @@ class TestBenchmarkingDateCeiling:
 
     def test_yfinance_benchmarking_uses_start_end_ceiling_and_skips_info(self) -> None:
         """Benchmarking yfinance fetch: history is called with start/end (NOT period),
-        end == open_time.date() + 1 day, start == open_time.date() - 365d, and `.info`
-        is never accessed (a PropertyMock that would raise if touched)."""
+        end == open_time.date() + 1 day, start == open_time.date() − the lookback
+        constant, and `.info` is never accessed (a PropertyMock that would raise if
+        touched)."""
         dates = pd.date_range(end="2026-03-15", periods=252, freq="B")
         close_prices = np.linspace(150.0, 200.0, 252)
         mock_history = pd.DataFrame({"Close": close_prices}, index=dates)
@@ -960,22 +1349,24 @@ class TestBenchmarkingDateCeiling:
         with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.return_value = mock_ticker
 
-            from metaculus_bot.research.financial_data import _fetch_yfinance_data
-
             result = _fetch_yfinance_data("AAPL", as_of=_BENCH_OPEN_TIME, is_benchmarking=True)
 
         info_prop.assert_not_called()
         mock_ticker.history.assert_called_once()
         _, kwargs = mock_ticker.history.call_args
         assert "period" not in kwargs
-        assert kwargs["start"] == "2025-03-15"  # open_time.date() - 365d
+        expected_start = (_BENCH_OPEN_TIME - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
+        assert kwargs["start"] == expected_start.isoformat()
         assert kwargs["end"] == "2026-03-16"  # open_time.date() + 1d (end EXCLUSIVE)
         assert "AAPL" in result
         assert "[omitted under backtest" in result
 
-    def test_yfinance_live_path_unchanged_period_based(self) -> None:
-        """Live path (default is_benchmarking=False): period-based call preserved, no
-        start/end, and `.info` still consulted for fundamentals."""
+    def test_yfinance_live_path_fetches_by_start_date_with_no_end_ceiling(self) -> None:
+        """Live path (default is_benchmarking=False): fetch by explicit start date only.
+        No ``period=`` — Yahoo reads a bare custom period as trading BARS for listed
+        assets, a different unit than the calendar days the backtest branch spends the
+        same constant as. No ``end=`` — yfinance defaults it to now, keeping today's
+        partial bar. `.info` still consulted for fundamentals."""
         dates = pd.date_range(end="2026-03-30", periods=252, freq="B")
         close_prices = np.linspace(150.0, 200.0, 252)
         mock_history = pd.DataFrame({"Close": close_prices}, index=dates)
@@ -984,16 +1375,16 @@ class TestBenchmarkingDateCeiling:
         mock_ticker.history.return_value = mock_history
         mock_ticker.info = {"shortName": "Apple Inc.", "trailingPE": 28.5}
 
+        as_of = datetime(2026, 3, 30, 12, 0, tzinfo=UTC)
         with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.return_value = mock_ticker
 
-            from metaculus_bot.research.financial_data import _fetch_yfinance_data
-
-            result = _fetch_yfinance_data("AAPL")
+            result = _fetch_yfinance_data("AAPL", as_of=as_of)
 
         mock_ticker.history.assert_called_once()
         _, kwargs = mock_ticker.history.call_args
-        assert kwargs == {"period": "365d"}
+        expected_start = (as_of - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
+        assert kwargs == {"start": expected_start.isoformat()}
         assert "P/E ratio" in result  # .info fundamentals rendered
 
     def test_fred_benchmarking_routes_through_ts_fetch_with_ceiling(self) -> None:
@@ -1012,8 +1403,6 @@ class TestBenchmarkingDateCeiling:
             return mock_series
 
         with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=fake_fetch_series):
-            from metaculus_bot.research.financial_data import _fetch_fred_data_ceiling
-
             result = _fetch_fred_data_ceiling("CPIAUCSL", _BENCH_OPEN_TIME)
 
         assert captured["ceiling"] == date(2026, 3, 15)  # open_time.date()
@@ -1037,8 +1426,6 @@ class TestBenchmarkingDateCeiling:
             return mock_series
 
         with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=fake_fetch_series):
-            from metaculus_bot.research.financial_data import _fetch_fred_data_ceiling
-
             result = _fetch_fred_data_ceiling("DGS10", _BENCH_OPEN_TIME)
 
         assert captured["spec"].revises is False
@@ -1046,11 +1433,7 @@ class TestBenchmarkingDateCeiling:
 
     def test_fred_ceiling_fetch_soft_fails_on_fetch_error(self) -> None:
         """A ts_fetch FetchError soft-fails to "" (never propagates)."""
-        from metaculus_bot.research.ts_fetch import FetchError
-
         with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=FetchError("bad id")):
-            from metaculus_bot.research.financial_data import _fetch_fred_data_ceiling
-
             result = _fetch_fred_data_ceiling("BOGUS", _BENCH_OPEN_TIME)
 
         assert result == ""
@@ -1083,8 +1466,6 @@ class TestBenchmarkingDateCeiling:
         ):
             mock_yf.Ticker.return_value = mock_ticker
 
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.delenv("FRED_API_KEY", raising=False)
             try:
@@ -1109,8 +1490,6 @@ class TestBenchmarkingDateCeiling:
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             provider = financial_data_provider(is_benchmarking=True)
             # _make_q leaves open_time as an auto-child MagicMock (not a datetime).
             result = await provider(_make_q("Will Apple stock exceed $200?"))
@@ -1132,9 +1511,6 @@ class TestBenchmarkingDateCeiling:
         that the source a question actually resolves on gets fetched even when the
         classifier misroutes, so only classifier-only extras are trimmed.
         """
-        from metaculus_bot.constants import MAX_FINANCIAL_IDENTIFIERS
-        from metaculus_bot.research.financial_data import _cap_identifiers
-
         extracted = {"tickers": ["AAPL"], "fred_series": ["UNRATE"]}
         # Far more classifier ids than the cap, with the two extracted ones in the middle.
         tickers = [f"TK{i}" for i in range(10)] + ["AAPL"] + [f"ZZ{i}" for i in range(10)]
@@ -1150,8 +1526,6 @@ class TestBenchmarkingDateCeiling:
         assert kept_fred == [f for f in fred_series if f in kept_fred]
 
     def test_identifier_cap_is_a_no_op_under_the_limit(self) -> None:
-        from metaculus_bot.research.financial_data import _cap_identifiers
-
         extracted = {"tickers": ["AAPL"], "fred_series": []}
         kept_tickers, kept_fred = _cap_identifiers(["AAPL", "MSFT"], ["UNRATE"], extracted)
         assert kept_tickers == ["AAPL", "MSFT"]
@@ -1160,9 +1534,6 @@ class TestBenchmarkingDateCeiling:
     def test_identifier_cap_keeps_all_extracted_even_past_the_limit(self) -> None:
         # Correctness beats the bound when they conflict: dropping a resolving source to
         # honor a capacity cap would silently answer the wrong question.
-        from metaculus_bot.constants import MAX_FINANCIAL_IDENTIFIERS
-        from metaculus_bot.research.financial_data import _cap_identifiers
-
         many = [f"EX{i}" for i in range(MAX_FINANCIAL_IDENTIFIERS + 5)]
         extracted = {"tickers": many, "fred_series": []}
         kept_tickers, kept_fred = _cap_identifiers([*many, "CLASSIFIER_EXTRA"], [], extracted)
@@ -1180,8 +1551,6 @@ class TestBenchmarkingDateCeiling:
         to produce no diagnostics detail at all. That makes a model retirement, a schema
         change, or a quota indistinguishable from a weather question.
         """
-        from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
-
         mock_llm = AsyncMock()
         mock_llm.invoke.side_effect = RuntimeError("classifier model retired")
 
@@ -1189,8 +1558,6 @@ class TestBenchmarkingDateCeiling:
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
         ):
-            from metaculus_bot.research.financial_data import financial_data_provider
-
             question = _make_q("Will it rain in London tomorrow?")
             question.id_of_question = 4242
             question.resolution_criteria = ""
@@ -1206,8 +1573,8 @@ class TestBenchmarkingDateCeiling:
 
     @pytest.mark.asyncio
     async def test_provider_default_is_live(self) -> None:
-        """Default (no is_benchmarking arg) → live path: period-based yfinance, `.info`
-        consulted, and no open_time needed."""
+        """Default (no is_benchmarking arg) → live path: start-date yfinance fetch with
+        no end ceiling, `.info` consulted, and no open_time needed."""
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: NONE"
 
@@ -1223,11 +1590,17 @@ class TestBenchmarkingDateCeiling:
         ):
             mock_yf.Ticker.return_value = mock_ticker
 
-            from metaculus_bot.research.financial_data import financial_data_provider
-
+            before = datetime.now(UTC)
             provider = financial_data_provider()
             result = await provider(_make_q("Will Apple stock exceed $200?"))
+            after = datetime.now(UTC)
 
         _, kwargs = mock_ticker.history.call_args
-        assert kwargs == {"period": "365d"}
+        # The provider derives start from its own now(); bracket it so a midnight
+        # rollover between our two clock reads can't flake the assert.
+        expected_starts = {
+            (t - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date().isoformat() for t in (before, after)
+        }
+        assert set(kwargs) == {"start"}
+        assert kwargs["start"] in expected_starts
         assert "### AAPL" in result

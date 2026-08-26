@@ -96,6 +96,12 @@ def predictit_contract_children(contracts: Sequence[dict[str, Any]]) -> tuple[Ma
     carries no volume field at all — the same absence that makes every PredictIt row read
     ``no-liquidity-data``) and its own order is the meaningful one: seat-count rungs and candidate
     lists arrive ordered, and re-sorting a ladder by price would scramble it.
+
+    That reasoning was right and is now the rule for every venue: as of 2026-08-25 the other three
+    parsers stopped sorting too, and the renderer owns presentation. The half of the old asymmetry
+    that DID cost something here is gone with it — truncation used to cut the end of a ballot, which
+    on this venue meant the last contracts on the paper rather than the cheap tail. Nothing is cut
+    now; a family's remaining outcomes are all named in one ladder row, in this order.
     """
     return tuple(
         MarketChild(

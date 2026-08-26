@@ -461,6 +461,128 @@ class TestRungFailure:
         assert "size cap" in str(excinfo.value)
 
 
+class TestSalvageFidelity:
+    """Every rung's output must be a value the rationale could have STATED.
+
+    The LLM rung decodes under a schema, so handed a rationale with no forecast it *must*
+    emit numbers — "absent" is not expressible. Shape checks (bounds, canonical set,
+    sum-to-1) therefore cannot carry the documented "the parser can never smuggle in a
+    fabricated value" claim on their own, and the post-rung validators are fidelity checks.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_value_disordered_llm_salvage_fails_the_rung(self) -> None:
+        """One out-of-place value must fail rather than be force-monotonized.
+
+        ``sort_percentiles_by_value`` sorts by LABEL, so downstream never reorders a
+        value-disordered set — it force-monotonizes it, which on one bad value pinned 10 of
+        13 percentiles at the upper bound and published. A full reversal was already caught
+        by the unit-mismatch guard; PARTIAL disorder was the hole.
+        """
+        disordered = full_percentile_list()
+        disordered[1] = Percentile(percentile=disordered[1].percentile, value=999.0)
+        llm_mock = AsyncMock(return_value=disordered)
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            with pytest.raises(ValueExtractionError) as excinfo:
+                await extract_numeric("prose with no block at all", PARSER_LLM)
+
+        assert "value-disordered" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_ties_are_still_accepted(self) -> None:
+        # A repeated value is a legitimate concentrated (often count-like) declaration, and
+        # the cluster spreader exists to separate exactly those — only a strict DECREASE
+        # with rising percentile is incoherent.
+        tied = full_percentile_list()
+        tied[1] = Percentile(percentile=tied[1].percentile, value=tied[0].value)
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(return_value=tied)):
+            outcome = await extract_numeric("prose with no block at all", PARSER_LLM)
+
+        assert outcome.rung == "llm"
+        assert [p.value for p in outcome.value] == [p.value for p in tied]
+
+    @pytest.mark.asyncio
+    async def test_a_non_finite_salvaged_value_fails_the_rung(self) -> None:
+        with_nan = full_percentile_list()
+        with_nan[6] = Percentile(percentile=with_nan[6].percentile, value=float("nan"))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(return_value=with_nan)):
+            with pytest.raises(ValueExtractionError) as excinfo:
+                await extract_numeric("prose with no block at all", PARSER_LLM)
+
+        assert "non-finite" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_numeric_literal_is_never_repaired(self) -> None:
+        """``json_repair`` completes a value as readily as it completes syntax.
+
+        A rationale cut mid-decimal leaves ``"posterior_prob": 0.`` inside a surviving
+        fence; repairing that yields ``0.0``, which passes bounds validation and would
+        publish as the binary clamp floor. The digits are gone, so any repair is invention —
+        the rung refuses and falls through to the LLM salvage.
+        """
+        truncated = '{"question_type": "binary", "posterior_prob": 0.}'
+        llm_mock = AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.72))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_binary(rationale_with(truncated), PARSER_LLM)
+
+        assert outcome.rung == "llm"
+        assert outcome.value == 0.72
+
+    @pytest.mark.asyncio
+    async def test_prose_numerals_do_not_veto_a_faithful_repair(self) -> None:
+        """Hyphenated numerals in prose fields ("2019-2023") are not truncated literals.
+
+        The fidelity check lexes numeric runs OUTSIDE string literals, and prose lives
+        inside them in EITHER quote style — single-quoted blocks are exactly what the
+        repair rung exists to fix (see TestRungRepair.test_single_quotes), so a
+        double-quote-only lexer read their prose as value position and refused a repair
+        json_repair performs value-identically.
+        """
+        double_quoted = (
+            '{"question_type": "binary", '
+            '"base_rate": {"k": 3, "n": 4, "ref_class": "cuts in 2019-2023"}, '
+            '"posterior_prob": 0.28,}'
+        )
+        single_quoted = (
+            "{'question_type': 'binary', "
+            "'base_rate': {'k': 3, 'n': 4, 'ref_class': 'cuts in 2019-2023'}, "
+            "'posterior_prob': 0.28}"
+        )
+        for candidate in (double_quoted, single_quoted):
+            with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+                outcome = await extract_binary(rationale_with(candidate), PARSER_LLM)
+            assert outcome.rung == "repair", f"candidate quoting style wrongly refused: {candidate[:40]}"
+            assert outcome.value == 0.28
+            llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_literal_still_refuses_in_a_single_quoted_block(self) -> None:
+        # The single-quote handling above must not blind the check to a genuinely
+        # truncated value-position literal — the digits after "0." are gone in any
+        # quoting style, so the rung refuses and falls through to the LLM salvage.
+        truncated = "{'question_type': 'binary', 'posterior_prob': 0.}"
+        llm_mock = AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.72))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_binary(rationale_with(truncated), PARSER_LLM)
+
+        assert outcome.rung == "llm"
+        assert outcome.value == 0.72
+
+    @pytest.mark.asyncio
+    async def test_a_repair_may_drop_a_number_but_never_introduce_one(self) -> None:
+        # Syntax-only repairs stay allowed: a trailing comma changes no value, so the
+        # deterministic rung still handles the common malformed-block case (see
+        # TestRungRepair). This pins the direction of the asymmetry.
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_binary(
+                rationale_with('{"question_type": "binary", "posterior_prob": 0.28,}'), PARSER_LLM
+            )
+
+        assert outcome.rung == "repair"
+        assert outcome.value == 0.28
+        llm.assert_not_awaited()
+
+
 class TestMcCanonicalization:
     @pytest.mark.asyncio
     async def test_case_and_whitespace_insensitive_block_keys(self) -> None:

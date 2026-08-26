@@ -1,4 +1,5 @@
 import json
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -214,9 +215,27 @@ SOURCE TIER TAGS: annotate each factual claim inline with its source tier, e.g. 
 Tag only when the tier is reasonably clear — leave a claim untagged if unsure. NEVER discard a fact because its tier is low: low-tier facts stay in, tagged."""
 
 
+def _mc_options_line(options: Sequence[str] | None) -> str:
+    """One line naming a multiple-choice question's ballot; ``""`` for every other type.
+
+    Research providers used to receive only ``question_text``, so on an MC question no
+    search stage ever saw the candidate list — on q44952 (World Yo-Yo champion) AskNews
+    returned zero mentions of the eventual winner even though the ballot named him, because
+    nothing downstream of the question title knew the names to look for. Interpolated into
+    every research-side prompt that carries the question (web research, AskNews summarizer,
+    gap-fill analyzer), so a searching model can query the named candidates directly and a
+    summarizer can gate article relevance against them.
+    """
+    if not options:
+        return ""
+    names = [str(option) for option in options]
+    return "Options (in resolution order): " + " | ".join(names)
+
+
 def web_research_prompt(
     question_text: str,
     *,
+    options: Sequence[str] | None = None,
     is_benchmarking: bool = False,
     citation_style: CitationStyle = "markdown",
     allow_resolution_source_reading: bool = False,
@@ -225,6 +244,7 @@ def web_research_prompt(
 
     Shared by the OpenRouter native-search provider (markdown citations) and
     the Gemini grounding provider (SDK auto-annotates via grounding metadata).
+    ``options`` is the MC ballot (see ``_mc_options_line``); None on other types.
     """
     citation_clause = (
         "Include inline citations [source name](url) for all factual claims"
@@ -245,6 +265,7 @@ def web_research_prompt(
         "" if is_benchmarking else "\n- Prediction market odds and forecasts (if available)"
     )
     benchmarking_warning = _benchmarking_warning("search") if is_benchmarking else ""
+    options_block = f"\n{_mc_options_line(options)}" if options else ""
 
     return f"""You are a research assistant gathering factual information for a forecaster.
 
@@ -279,7 +300,7 @@ Where the question invites reference-class reasoning (how often events like this
 {_SOURCE_TIER_TAG_INSTRUCTION}
 
 QUESTION:
-{question_text}
+{question_text}{options_block}
 
 {footer}"""
 
@@ -291,12 +312,15 @@ def asknews_summarizer_prompt(
     fine_print: str,
     open_date: str,
     research: str,
+    options: Sequence[str] | None = None,
 ) -> str:
     """Analyst-briefing prompt for compressing raw AskNews articles.
 
     Lived inline in ``ResearchOrchestrator._summarize_asknews`` until 2026-07;
     moved here so both research-side prompts share ``_SOURCE_TIER_TAG_INSTRUCTION``
     from one module and orchestrator diffs stay confined to orchestration logic.
+    ``options`` is the MC ballot (see ``_mc_options_line``) — the relevance screen below
+    needs the candidate names to judge which articles bear on the resolution.
     """
     return clean_indents(
         f"""
@@ -304,6 +328,7 @@ def asknews_summarizer_prompt(
 
         The forecaster needs to answer this question:
         {question_text}
+        {_mc_options_line(options)}
 
         Resolution criteria:
         {resolution_criteria}
@@ -463,11 +488,23 @@ _MARKET_RELATION_WEIGHTING_SENTENCE = (
     "`relation` label saying how it relates to this question: `same_quantity_same_date` measures the same "
     "thing on the same date and is the strongest anchor available; `same_quantity_other_cut` measures the "
     "same thing at a different date, threshold, or source, so extrapolate from it rather than discounting it "
-    "vaguely; `driver_or_consequence` and `weak` are context to reason from, not anchors. A row marked "
+    "vaguely; `driver_or_consequence` and `weak` are context to reason from, not anchors. When the relation "
+    "and liquidity labels disagree — a tightly-related market whose signal is thin — the liquidity warning "
+    "governs the price: a thin market's price is noisy even when its relation is tight, so extrapolate from "
+    "a thin market by widening your distribution around its implied value rather than transplanting its "
+    "price exactly. A row marked "
     "RESOLVED has already settled, so its price is a realized outcome rather than a forecast — read it as "
     "evidence about what happened, not as a probability. A market with several outcomes has no single price, so "
     "its own `prob` cell is blank and each outcome is listed beneath it on a `↳` row with its own price — anchor "
-    "on the outcome matching this question, and do not read the blank parent cell as a missing market."
+    "on the outcome matching this question, and do not read the blank parent cell as a missing market. "
+    "A market with several `↳` outcomes is a DISTRIBUTION over that market's own question, not a set of "
+    "independent facts: read the whole ladder (including the `↳ [remaining N]` row, which accounts for every "
+    "outcome not given a row of its own — priced individually where space allows, otherwise inside a counted "
+    "group with its summed price, never silently dropped) and translate it into this question's outcome space. "
+    "Never treat one "
+    "outcome's price as an equality constraint that fixes a tail — a single bracket of a ten-bracket ladder "
+    "constrains almost nothing on its own, and reading it that way has cut the resolving bucket below the "
+    "forecaster's own prior."
 )
 
 
@@ -1459,11 +1496,14 @@ def gap_fill_analyzer_prompt(
     *,
     is_benchmarking: bool = False,
     max_gaps: int = 5,
+    options: Sequence[str] | None = None,
 ) -> str:
     """Prompt for a cheap model to identify factual gaps in the first-pass research.
 
     Returns a JSON list of gap objects (or empty list). Quality over quantity:
-    most questions have 0-2 meaningful gaps; at most ``max_gaps``.
+    most questions have 0-2 meaningful gaps; at most ``max_gaps``. ``options`` is the MC
+    ballot (see ``_mc_options_line``) — a gap like "no coverage of candidate X" is only
+    findable when the analyzer knows the candidates.
     """
     benchmarking_warning = _benchmarking_warning("gap_flagging") if is_benchmarking else ""
     resolution_block = (resolution_criteria or "(none provided)").strip()
@@ -1521,6 +1561,7 @@ def gap_fill_analyzer_prompt(
 
         Question:
         {question_text}
+        {_mc_options_line(options)}
 
         Resolution criteria:
         {resolution_block}

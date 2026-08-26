@@ -51,6 +51,7 @@ from metaculus_bot.ablation.run_stacker import (
     run_stacker_batch,
     run_stacker_for_arm,
 )
+from metaculus_bot.numeric.pipeline import sanitize_percentiles
 
 FEATURE_FLAG = "PROBABILISTIC_TOOLS_ENABLED"
 
@@ -1428,6 +1429,10 @@ class TestQuestionTypeDispatch:
                 "metaculus_bot.ablation.run_stacker.stacking.run_stacking_numeric",
                 new=AsyncMock(side_effect=_fake_numeric),
             ),
+            patch(
+                "metaculus_bot.numeric.pipeline.sanitize_percentiles",
+                wraps=sanitize_percentiles,
+            ) as sanitize_spy,
         ):
             payload = _run(
                 run_stacker_for_arm(
@@ -1452,6 +1457,10 @@ class TestQuestionTypeDispatch:
         assert "0.0" in lower_msg or "0" in lower_msg
         assert "100" in upper_msg
         assert payload["success"] is True
+        # NUMERIC_DEGENERATE_DECLARATION attributes by model_name and the archive reads
+        # model=unknown as "a caller forgot to pass it" — the ablation stacker path must
+        # wire its own model through, like the prod stacker and forecaster paths do.
+        assert sanitize_spy.call_args.kwargs["model_name"] is stacker_llm.model
 
     def test_dispatch_stacker_wraps_numeric_with_sanitize_and_build(
         self,

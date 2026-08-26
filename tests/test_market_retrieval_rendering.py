@@ -36,6 +36,8 @@ from metaculus_bot.research.market_retrieval.ranking import (
 from metaculus_bot.research.market_retrieval.rendering import (
     CHILD_ROW_MARKER,
     CHILD_TITLE_MAX_CHARS,
+    LADDER_MIN_ROW_CHARS,
+    LADDER_SECTION_MAX_CHARS,
     MARKET_PREAMBLE_NEUTRAL,
     MARKET_PREAMBLE_STRONG,
     MARKET_SIGNAL_LEGEND,
@@ -45,6 +47,7 @@ from metaculus_bot.research.market_retrieval.rendering import (
     TABLE_COLUMNS,
     TITLE_MAX_CHARS,
     render_snapshot,
+    render_snapshot_with_stats,
 )
 from metaculus_bot.research.market_retrieval.types import (
     MarketChild,
@@ -56,48 +59,43 @@ from tests.test_market_retrieval_generation import Platform
 
 _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 
-# Char budget for the WORST-CASE rendered snapshot: 8 rows with every field simultaneously at its
-# cap, EVERY row multi-outcome, and every one of its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too.
-# Measured at 10,298 chars. 10,600 leaves ~3% headroom, the same deliberate tightness the
-# pre-expansion budget had: this section goes to the expensive forecaster models, so adding a
-# column, lengthening the legend, or raising a child cap has to trip it.
+# Char budgets for the rendered snapshot, held deliberately TIGHT (~1-3% headroom): this section
+# goes to the expensive forecaster models on every question, so anything that widens it — a new
+# column, a longer legend, a raised child cap, a longer truncation marker — must trip a budget and
+# earn an explicit re-derivation of all three figures (the invariant; the per-change history lives
+# in the commit log, not here). `MAX_CHILD_ROWS_PER_SNAPSHOT` bounds the sub-row half, which is
+# most of the total; the per-market cap never binds on a full 8-row slate.
 #
-# **All three figures were re-derived when multi-outcome markets started rendering `↳` sub-rows, and
-# the growth is the point of that change rather than a regression.** For the record: maxed
-# 6,304 → 10,137, realistic 4,648 → 7,465, fixed overhead 1,444 → 1,621. Two separate causes, worth
-# keeping apart. The sub-rows are nearly all of it — 3,680 chars on the maxed slate and 2,664 on the
-# realistic one, measured by rendering the same rows with `children` stripped — and `~190` is the
-# legend's one added `↳` sentence. `MAX_CHILD_ROWS_PER_SNAPSHOT` is what bounds the sub-row half; the
-# per-market cap never binds on a full 8-row slate, so raising it would not move these numbers.
-#
-# The operator's directive here superseded its own earlier ~6,000 figure: that number described
-# "roughly today's 12-row render" BEFORE maximum-info expansion was chosen, and expansion that
-# renders every outcome's own price cannot fit a budget set for rendering none of them. What did NOT
-# change is the reason the budgets exist, so they are re-derived tight rather than loosened.
-#
-# The scalar-market `prob` cell added one legend sentence, +161 chars on all three figures.
-# Only the fixed-overhead ceiling moved with it: the two whole-render budgets absorbed the growth
-# and are deliberately LEFT where they were, so this change spent their headroom rather than
-# raising them. That is why maxed now sits at ~3% and realistic at ~1% — a guard that is nearly
-# touching is doing its job, and the next thing that widens the section re-derives all three.
+# MAXED: 8 rows with every field simultaneously at its cap, EVERY row multi-outcome, every one of
+# its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too. Measured at 10,341 chars against the shipped
+# constants (`MAX_CHILD_ROWS_PER_SNAPSHOT` = 14 full sub-rows plus the 1,400-char ladder section
+# allowance — rendering.py's own comment explains why 14 beat the design's gridded 16), so the
+# slack is 259 and this budget has genuinely stopped being a formality. Naming every outcome
+# instead of cutting the tail is what spent it; the legend's added sentences are the rest.
 MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 10_600
 
-# 8 rows of realistic content, using shapes measured off live payloads rather than chosen — the
-# figure that describes what a real question renders. Measured at 7,626 chars.
-MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 7_700
+# REALISTIC: 8 rows of content shaped like live payloads rather than chosen — what a real question
+# renders. Measured at 7,499 chars, ~450 BELOW the pre-completeness-change figure: a four-outcome
+# family names all four either way, and the lower full-row cap moves two of them from a full
+# sub-row into the ladder.
+MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_050
 
 # Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
-# 1,782 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
+# 2,329 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
 # the only part with no data to justify it — the whole-snapshot budget has slack that would
-# otherwise absorb an added paragraph unnoticed. At 1,782 of 1,850 this is still the tightest
+# otherwise absorb an added paragraph unnoticed. At 2,329 of 2,400 this is still the tightest
 # budget in the file, which is the point: the next legend sentence has to earn a re-derivation.
 #
-# This one WAS re-derived, from 1,700, and what it bought is on the record: a `prob` cell may now
-# hold a scalar market's value, and a forecaster told to anchor on that column needs the legend to
-# say so. The sentence was cut to its contract (the `value` prefix, the units, "not a probability")
-# rather than paid for at full length, because it explains a shape that appears on a small minority
-# of questions while the legend ships on every one.
-MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 1_850
+# Re-derived twice, and both purchases are on the record. From 1,700 to 1,850: a `prob` cell may hold
+# a scalar market's value, and a forecaster told to anchor on that column needs the legend to say so.
+# From 1,850 to 2,400: the ladder row and the `LO-HI` quote-range cell are two new cell shapes, and
+# the legend's contract is that it names every shape a cell can hold — an unexplained `+8 settled at
+# 1.00` group or an unexplained `0.00-1.00` price is one a forecaster guesses at, and the guess the
+# range replaces was "the market says 50/50". Each is one sentence, cut to its contract. The third
+# purchase is the `+N off certainty by under X` group: a cumulative threshold ladder collapses BOTH of
+# its tails, so a forecaster reading that label against a rung it knows trades at 0.99 needs to be told
+# the figure is a distance from certainty rather than a price.
+MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 2_400
 
 _REAL_TITLE = "Will the US unemployment rate be above 4.5% in June 2026?"
 _REAL_RULES = (
@@ -634,6 +632,65 @@ class TestRenderBudget:
             for _ in range(RENDER_BUDGET)
         ]
 
+    def _maxed_open_priced_rows(self) -> list[MarketMatch]:
+        """The adversarial slate for the LADDER: 8 rows x 10 OPEN, distinctly-priced, maxed-title
+        outcomes.
+
+        ``_maxed_rows`` cannot stress the ladder's expensive path, because its children are all
+        SETTLED and all identical — settled outcomes collapse at compaction stage 2 into one short
+        group, so that slate's ladder rows are cheap by construction. Ten distinct open prices have no
+        such escape: nothing collapses them until the price floor climbs past them, which is exactly
+        the case ``LADDER_SECTION_MAX_CHARS`` exists to bound. Without this fixture the budget tests
+        would pass while the worst real shape went unmeasured.
+        """
+        return [
+            _row(
+                title="M" * TITLE_MAX_CHARS,
+                tier="same_quantity_other_cut",
+                why="W" * WHY_CHARS,
+                rules="R" * RAW_BULLET_BODY_MAX_CHARS,
+                url="https://kalshi.com/markets/" + "T" * 40,
+                prob=None,
+                volume=123456789.0,
+                oi=98765432.0,
+                close=datetime(2026, 12, 31, tzinfo=timezone.utc),
+                children=tuple(
+                    MarketChild(
+                        title=f"{'C' * (CHILD_TITLE_MAX_CHARS - 2)}{index:02d}",
+                        implied_prob_yes=0.91 - 0.03 * index,
+                        total_volume=123456789.0,
+                        open_interest=98765432.0,
+                        close_time=datetime(2026, 12, 31, tzinfo=timezone.utc),
+                    )
+                    for index in range(MAX_CHILD_ROWS_PER_MARKET)
+                ),
+            )
+            for _ in range(RENDER_BUDGET)
+        ]
+
+    def test_an_open_priced_slate_fits_the_maxed_budget(self) -> None:
+        """The ladder's worst committed shape, against the same ceiling as `_maxed_rows`."""
+        rendered = render_snapshot(MarketSnapshot(matches=self._maxed_open_priced_rows()))
+
+        assert len(rendered) < MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET, (
+            f"an all-open distinctly-priced slate rendered {len(rendered)} chars, over the "
+            f"{MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET} budget"
+        )
+        assert len(rendered) < RESEARCH_SECTION_CHAR_LIMIT / 4
+
+    @pytest.mark.parametrize("fixture", ["_maxed_rows", "_realistic_rows", "_maxed_open_priced_rows"])
+    def test_the_ladder_titles_never_exceed_their_section_allowance(self, fixture: str) -> None:
+        """The section-level bound, asserted directly rather than inferred from the whole-snapshot
+        figure. A per-ROW cap cannot bound a SECTION: eight 436-char ladder rows each fit their own
+        600-char cap and took the maxed fixture to 13,306 chars, which is why the section allowance
+        exists at all."""
+        rows: list[MarketMatch] = getattr(self, fixture)()
+
+        _, stats = render_snapshot_with_stats(MarketSnapshot(matches=rows))
+
+        assert stats.ladder_rows > 0, "a fixture with no ladder row cannot pin the ladder budget"
+        assert stats.ladder_chars <= LADDER_SECTION_MAX_CHARS
+
     def test_a_maxed_eight_row_snapshot_fits_the_char_budget(self) -> None:
         rendered = render_snapshot(MarketSnapshot(matches=self._maxed_rows()))
 
@@ -739,10 +796,21 @@ class TestRulesBullets:
         so the bullets are structurally out of its reach. Note the regex is NOT end-anchored,
         so "ends with" understates it — any ``: NN%`` on an in-scope line would match.
         """
-        for rules in ("Resolves at 45%", "Threshold: 45%", "45% chance", ""):
+        for rules in ("Resolves at 45%", "Threshold: 45%", "45% chance"):
             rendered = render_snapshot(MarketSnapshot(matches=[_row(rules=rules)]))
 
             assert _bullets(rendered) == [f"- **kalshi** <https://example.test/m>: {rules}"]
+
+    def test_an_empty_rules_body_names_the_gap_instead_of_rendering_bare(self) -> None:
+        """A bare ``- **manifold** <url>: `` reads as "this market states no criteria" — a claim
+        about the MARKET, when in fact we carried nothing. 6 of 146 archived rows rendered that
+        way, all Manifold, whose description field is optional. The empty case used to ride
+        along in the percentage-shape loop above, which is what kept it unnoticed."""
+        rendered = render_snapshot(MarketSnapshot(matches=[_row(rules="")]))
+
+        assert _bullets(rendered) == [
+            "- **kalshi** <https://example.test/m>: [rules unavailable — venue published no description]"
+        ]
 
     def test_a_truncated_bullet_cannot_gain_a_percentage_tail(self) -> None:
         """The one thing the formatter does append is the truncation ellipsis, and a bullet
@@ -819,15 +887,20 @@ class TestMultiOutcomeRows:
         assert cells[0]["platform"] == "polymarket"
         assert [cell["platform"] for cell in cells[1:]] == [CHILD_ROW_MARKER, CHILD_ROW_MARKER]
 
-    def test_sub_rows_render_in_the_adapters_order_verbatim(self) -> None:
-        """The same rule as the ranked slate, one level down. The adapter ordered these by what its
-        venue makes worth keeping and the renderer truncates from the END, so re-sorting here would
-        silently change which outcomes survive the budget."""
+    def test_full_sub_rows_are_price_descending_whatever_order_the_venue_shipped(self) -> None:
+        """Presentation lives in the RENDERER, which is the 2026-08-25 inversion of this assertion.
+
+        It used to read the adapter's order verbatim, because the renderer truncated from the END and
+        re-sorting here would have changed which outcomes survived. Nothing is truncated now — every
+        remaining outcome is named in the ladder row — so the order only decides which outcomes keep a
+        full row's liquidity cells, and the renderer owns it. Reversing the venue's array must not
+        reverse the full rows.
+        """
         reversed_children = tuple(reversed(self._CHILDREN))
 
         cells = _table_rows(render_snapshot(MarketSnapshot(matches=[self._parent(children=reversed_children)])))
 
-        assert [cell["title"] for cell in cells[1:]] == ["1 (25 bps)", "0 (0 bps)"]
+        assert [cell["title"] for cell in cells[1:]] == ["0 (0 bps)", "1 (25 bps)"]
 
     def test_a_sub_row_carries_no_relation_grade(self) -> None:
         """The ranker graded the MARKET, never its individual outcomes. Repeating the parent's grade
@@ -851,6 +924,25 @@ class TestMultiOutcomeRows:
         assert cells[0]["signal"] == "decent"
         assert cells[1]["signal"] == "decent"
         assert cells[1]["total_vol"] == "417", "the child's own volume, not its parent's"
+
+    def test_a_sub_row_with_zero_own_volume_reads_thin_beside_its_traded_sibling(self) -> None:
+        """The inherited bettor count is the WEAKER half of the label. An answer at its untouched
+        prior — the same zero-volume shape `_priced_or_none` refuses a price for — was rendering the
+        parent's `decent`/`high` next to its own blank price and `total_vol 0`, a self-contradicting
+        row that told the forecaster a crowd stood behind a rung nobody had bet on."""
+        answers = (
+            MarketChild(title="Over $4.60", implied_prob_yes=0.4992, total_volume=417.0, num_bettors=47),
+            MarketChild(
+                title="Over $9.99", implied_prob_yes=None, total_volume=0.0, num_bettors=47, price_withheld=True
+            ),
+        )
+
+        cells = _table_rows(
+            render_snapshot(MarketSnapshot(matches=[self._parent(platform="manifold", children=answers, bettors=47)]))
+        )
+
+        assert cells[1]["signal"] == "decent"
+        assert (cells[2]["signal"], cells[2]["total_vol"], cells[2]["prob"]) == ("thin", "0", "-")
 
     def test_the_bullet_carries_rules_text_alone(self) -> None:
         """A multi-outcome bullet used to LEAD with `answers: Over $4.60 (50%), ...` because the
@@ -903,12 +995,18 @@ class TestMultiOutcomeRows:
 
 
 class TestChildRowBudget:
-    """How the ``↳`` rows are rationed, and what a thinned table has to admit.
+    """How the FULL ``↳`` rows are rationed.
 
     The section goes to the expensive forecaster models on every question and 86.5% of the Kalshi
     catalogue is multi-strike, so an 8-row slate is mostly parents with outcomes and the per-market
     cap alone would license 80 sub-rows. The allocation is what keeps that bounded WITHOUT
     reintroducing the priceless-parent row it exists to remove.
+
+    Since 2026-08-25 it rations DETAIL rather than prices: every outcome past a family's allowance is
+    named with its own price in that family's ladder row, so these caps decide which outcomes keep
+    their volume / OI / signal / close / status cells and nothing more. The ladder itself — the
+    completeness invariant, the compaction stages, the section allowance — is pinned in
+    ``tests/test_market_retrieval_ladder.py``.
     """
 
     def _outcomes(self, count: int) -> tuple[MarketChild, ...]:
@@ -934,13 +1032,20 @@ class TestChildRowBudget:
         assert len(priced_sub_rows) >= RENDER_BUDGET
 
     def test_the_allowance_is_shared_one_round_at_a_time(self) -> None:
-        """Eight markets wanting ten outcomes each get three apiece, not ten-ten-four-nothing."""
+        """Eight markets wanting ten outcomes each get two apiece, not ten-four-nothing.
+
+        The cap is not a multiple of `RENDER_BUDGET`, so the final partial round goes to the markets the
+        RANKER put first — which is the right tiebreak, since those are the rows it judged most
+        evidential. Asserted rather than assumed because the alternative (a remainder landing on the
+        weakest rows) would be invisible in the totals.
+        """
         rendered = render_snapshot(
             MarketSnapshot(matches=self._slate(rows=RENDER_BUDGET, outcomes=MAX_CHILD_ROWS_PER_MARKET))
         )
 
         per_market = _sub_rows_per_market(rendered)
-        assert per_market == [MAX_CHILD_ROWS_PER_SNAPSHOT // RENDER_BUDGET] * RENDER_BUDGET
+        full_rounds, remainder = divmod(MAX_CHILD_ROWS_PER_SNAPSHOT, RENDER_BUDGET)
+        assert per_market == [full_rounds + 1] * remainder + [full_rounds] * (RENDER_BUDGET - remainder)
         assert sum(per_market) == MAX_CHILD_ROWS_PER_SNAPSHOT
 
     def test_a_market_with_fewer_outcomes_hands_its_unused_slots_back(self) -> None:
@@ -956,36 +1061,40 @@ class TestChildRowBudget:
         assert per_market == [MAX_CHILD_ROWS_PER_MARKET, 2]
 
     def test_the_per_market_cap_bounds_a_single_market(self) -> None:
-        """With the snapshot cap wide open, one market still cannot render a 30-rung ladder."""
+        """With the snapshot cap wide open, one market still cannot render 30 FULL rows — and every
+        one of the 20 it does not is still named, with its price, in the ladder row."""
         matches = [_row(title="ladder", prob=None, children=self._outcomes(30))]
 
         rendered = render_snapshot(MarketSnapshot(matches=matches))
 
         assert _sub_rows_per_market(rendered) == [MAX_CHILD_ROWS_PER_MARKET]
-        assert f"[{30 - MAX_CHILD_ROWS_PER_MARKET} more outcomes omitted — render budget]" in rendered
+        ladder = _table_rows(rendered)[-1]["title"]
+        assert ladder.startswith(f"[remaining {30 - MAX_CHILD_ROWS_PER_MARKET}] ")
+        assert ladder.count("0.50") == 30 - MAX_CHILD_ROWS_PER_MARKET
+        assert "omitted" not in rendered
 
-    def test_a_truncated_market_says_so_in_a_marker_row(self) -> None:
-        """A thinned table must never read as a complete one. The wording mirrors the
-        resolution-source fetcher's `[N additional source(s) omitted — section budget]`."""
-        matches = [_row(title="ladder", prob=None, children=self._outcomes(MAX_CHILD_ROWS_PER_MARKET + 1))]
-
-        cells = _table_rows(render_snapshot(MarketSnapshot(matches=matches)))
-
-        assert cells[-1]["title"] == "[1 more outcome omitted — render budget]"
-        assert cells[-1]["platform"] == CHILD_ROW_MARKER
-
-    def test_a_marker_row_fills_every_column(self) -> None:
-        """A row short of a cell would end the markdown table and orphan every row after it."""
+    def test_no_row_shape_can_skew_the_table(self) -> None:
+        """A row short of a cell would end the markdown table and orphan every row after it, so every
+        shape — parent, full sub-row, ladder row — has to fill all ten columns."""
         matches = [_row(title="ladder", prob=None, children=self._outcomes(MAX_CHILD_ROWS_PER_MARKET + 4))]
 
         rendered = render_snapshot(MarketSnapshot(matches=matches))
 
         widths = {line.count("|") for line in rendered.split("\n") if line.startswith("| ")}
         assert widths == {len(TABLE_COLUMNS) + 1}
-        assert _table_rows(rendered)[-1]["title"] == "[4 more outcomes omitted — render budget]"
+        assert _table_rows(rendered)[-1]["title"].startswith("[remaining 4] ")
 
     def test_the_snapshot_cap_is_at_least_the_row_budget(self) -> None:
         """The constant relationship the priceless-parent invariant rests on: fewer sub-row slots
-        than rendered rows would mean some multi-outcome market gets none."""
+        than rendered rows would mean some multi-outcome market gets none. Doubly true now — a family
+        granted zero full rows still renders a ladder row carrying every price."""
         assert MAX_CHILD_ROWS_PER_SNAPSHOT >= RENDER_BUDGET
         assert MAX_CHILD_ROWS_PER_MARKET <= MAX_CHILD_ROWS_PER_SNAPSHOT
+
+    def test_the_ladder_section_allowance_binds_at_the_row_budget(self) -> None:
+        """`LADDER_SECTION_MAX_CHARS` is only a real bound while every ladder row can be squeezed to
+        its share of it, and a hard-bounded row cannot go below `LADDER_MIN_ROW_CHARS` because it
+        always names its highest-priced outcome. This is the constant relationship that makes the
+        allowance hold on any slate the ranking stage can produce — 11 rows' worth of room against a
+        `RENDER_BUDGET` of 8."""
+        assert RENDER_BUDGET <= LADDER_SECTION_MAX_CHARS // LADDER_MIN_ROW_CHARS

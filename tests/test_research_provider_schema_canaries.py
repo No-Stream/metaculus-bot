@@ -34,9 +34,7 @@ from forecasting_tools import MetaculusQuestion
 from google.genai import types as genai_types
 from pydantic import AnyUrl
 
-# ---------------------------------------------------------------------------
-# Helpers — build realistic, real-typed payloads
-# ---------------------------------------------------------------------------
+# Helpers — build realistic, real-typed payloads.
 
 
 def _make_real_grounding_response(
@@ -145,9 +143,7 @@ def _make_real_asknews_article(
     )
 
 
-# ---------------------------------------------------------------------------
-# Gemini grounded search — formatter pinned against real types
-# ---------------------------------------------------------------------------
+# Gemini grounded search — formatter pinned against real types.
 
 
 class TestGeminiGroundedFormatterAgainstRealTypes:
@@ -352,9 +348,7 @@ class TestGeminiToolWiringAgainstRealTypes:
         assert len(url_context_tools) == 1, "Expected exactly one tool with .url_context populated"
 
 
-# ---------------------------------------------------------------------------
-# AskNews — formatter pinned against real SDK types
-# ---------------------------------------------------------------------------
+# AskNews — formatter pinned against real SDK types.
 
 
 class TestAskNewsFormatterAgainstRealTypes:
@@ -458,15 +452,17 @@ class TestAskNewsFormatterAgainstRealTypes:
         # Unique hot article retained.
         assert "Genuinely new hot article" in out
 
-    def test_empty_inputs_produce_no_articles_message(self) -> None:
-        """Both lists empty → ``No articles were found...`` message instead of empty sections."""
+    def test_empty_inputs_produce_nothing_at_all(self) -> None:
+        """Both lists empty → ``""``, not a prose "no articles" sentence.
+
+        The sentence used to be the assertion here. It was the defect: chars>0 made the
+        orchestrator report ``ok``, and the summarizer wrote a briefing from it.
+        """
         from metaculus_bot.research.providers import _format_asknews_dual_sections
 
         out = _format_asknews_dual_sections(hot_articles=[], historical_articles=[])
 
-        assert "No articles were found for this query." in out
-        assert "## Historical Context" not in out
-        assert "## Recent Developments" not in out
+        assert out == ""
 
 
 class TestAskNewsSDKResponseShapeContract:

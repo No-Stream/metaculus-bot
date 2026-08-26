@@ -660,8 +660,9 @@ is absent from the table rather than present-and-empty.
 uv run python -m metaculus_bot.performance_analysis.width_monitor --tournament <slug>
 # or against a cached dataset:
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path>
-# drop the known open-bound bug pair (43746/43747) from every row; the excluded
-# count is rendered in the table, so the exclusion is never silent:
+# drop the known-pipeline-bug cohort (43746/43747, the open-bound arithmetic bug;
+# 43913, the pre-9f1175c discrete max-step cap) from every row; the excluded count
+# is rendered in the table, so the exclusion is never silent:
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path> --exclude-qids known_bug
 ```
 
@@ -747,14 +748,33 @@ the telemetry markers:
   described above. `CREDIT_FLOOR_BREACH` keeps firing during the credit-alert
   suppression window, so seeing one on a green run is expected until 2026-09-10;
   the adjacent INFO line names the resume date.
+- `TIME_BUDGET: question=... budget_s=... close_time=... close_limited=...
+  fast_path=...` — one line per question, emitted by `time_budget.py` before any
+  research runs. Emitted even on roomy questions on purpose: `CLOSE_MARGIN` fires
+  only after a SUCCESSFUL submission, so it is censored on exactly the thin-window
+  questions this budget exists for. `close_limited=true` means the question's own
+  close time, not the static `PER_QUESTION_WALL_CLOCK_DEADLINE`, set the budget.
+  `fast_path=true` means it fell below `TIME_BUDGET_FAST_PATH_THRESHOLD`, so the
+  optional research stages were dropped to protect the prediction POST — companion
+  `TIME_BUDGET_FAST_PATH` and `GAP_FILL_SKIPPED_FOR_BUDGET` WARNs say so too, and
+  `RESEARCH_PHASE_DEADLINE` names any provider cancelled at the phase deadline.
+  A question with no publishable budget at all (close already passed, or so near
+  that the prediction POST cannot fit) is skipped before any spend and bumps
+  `questions_failed_to_publish`.
 - `Degradation counters: forecasters_dropped=..., questions_failed_to_publish=...,
   stacker_primary_failed=..., stacker_fallback_used=...,
   stacker_fallback_failed=..., research_provider_failures=...,
   summarizer_failures=..., gap_fill_v2_errors=...,
-  prediction_market_degraded=..., prediction_market_source_losses=...` — the
+  prediction_market_degraded=..., prediction_market_source_losses=...,
+  provider_degradation=..., publish_attempt_failures=...,
+  publish_skipped_closed=..., time_budget_fast_path=...` — the
   end-of-run summary from `forecaster.py`'s `forecast_questions`, and the line
   that decides CI color: these are exactly the counters `alertable_count` sums, so
   any one of them non-zero exits the run non-zero.
+  `time_budget_fast_path` is the earliest-firing member of the publish-side family:
+  the other three fire once a publish has already failed or been withheld, while
+  this one fires while the question is still savable and says latency is closing in
+  on a close deadline.
   `research_provider_failures` counts any provider exception, not only timeouts —
   it was named `research_provider_timeouts` until 2026-07-26, when
   `prediction_market_platform_failures` also became
@@ -780,6 +800,17 @@ across backfilled records can mean "the ranker declined" rather than "the provid
 broke", and the two are only distinguishable from an artifact record or from the
 `MARKET_RANKING:` line's `outcome=` field. No code change: the header-scan
 reconstruction is lossy by construction and always was.
+
+`outcome=` alone does not say WHY a question fell back, so read the sibling
+`MARKET_RANKING_DEGRADED:` line beside it: `reason=shape_regression` means a
+well-formed but non-empty ranking array yielded no usable row — a renamed index key,
+or every index outside the pool — i.e. OUR prompt/parser contract broke, and before
+2026-08-25 that case was reported as `ok(0)` and rendered the deliberate-empty
+sentence ("prediction markets were retrieved and reviewed… none was judged to bear on
+it") to forecasters. `reason=unreadable` means the completion was not a ranking array
+at all. Both are harvested as `market_ranking_degraded`, so the split survives the
+90-day GHA log expiry; a `MARKET_RANKING` line with `outcome=failopen` and no
+degraded sibling in the archive predates this marker.
 
 A run can also exit non-zero for degradation alerts — the counters above,
 personal-key fallbacks, or the model-deprecation tripwire — even when every

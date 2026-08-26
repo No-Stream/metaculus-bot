@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from metaculus_bot.numeric.validation import (
     check_discrete_question_properties,
+    detect_unit_mismatch,
     sort_percentiles_by_value,
     validate_percentile_count_and_values,
 )
@@ -58,6 +59,43 @@ def _standard_13() -> list[Percentile]:
         Percentile(percentile=0.975, value=97.5),
         Percentile(percentile=0.99, value=99.0),
     ]
+
+
+class TestUnitMismatchFailsShut:
+    """``detect_unit_mismatch`` may never report "no mismatch" because it broke.
+
+    It used to wrap its arithmetic in ``except (AttributeError, TypeError,
+    ValueError): return False, ""`` — the same answer a passing check gives — so a
+    crash inside the guard silently published the order-of-magnitude error the
+    guard exists to block. Errors now propagate; every caller treats that the way
+    it treats a detected mismatch (drop the forecaster, or fall back to MEDIAN on
+    the stacker path).
+    """
+
+    def test_unparseable_value_propagates(self):
+        question = _make_question()
+        broken = cast(
+            list[Percentile], [SimpleNamespace(percentile=p.percentile, value="not-a-number") for p in _standard_13()]
+        )
+
+        with pytest.raises(ValueError):
+            detect_unit_mismatch(broken, question)
+
+    def test_missing_value_attribute_propagates(self):
+        question = _make_question()
+        broken = cast(list[Percentile], [SimpleNamespace(percentile=0.5)])
+
+        with pytest.raises(AttributeError):
+            detect_unit_mismatch(broken, question)
+
+    def test_empty_list_is_still_a_mismatch(self):
+        """The one honest early return: nothing to judge means withhold."""
+        mismatch, reason = detect_unit_mismatch([], _make_question())
+        assert mismatch is True
+        assert reason == "empty percentile values"
+
+    def test_healthy_declaration_passes(self):
+        assert detect_unit_mismatch(_standard_13(), _make_question()) == (False, "")
 
 
 class TestPercentileValidation:

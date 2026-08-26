@@ -7,16 +7,22 @@ Covers:
   multi-chunk streaming and mid-stream abort without consuming the remaining stream
 - `FilteringResolver` filters private IPs, raises OSError when everything is filtered,
   and delegates `close()` to its inner resolver.
+- Datawrapper embed detection (`extract_datawrapper_charts`) on real-shaped
+  tracker HTML, the live-data URL builder, and Last-Modified parsing.
+- `decode_text_body`: BOM-then-declared-charset precedence, and the undecodable-char
+  score that lets a caller refuse mojibake instead of rendering it as evidence.
 
 No real network calls: sessions are constructed, inspected, and closed.
 """
 
 from __future__ import annotations
 
+import codecs
 import ipaddress
 import logging
 import socket
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -24,9 +30,15 @@ from aiohttp.abc import AbstractResolver
 
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
+    MAX_UNDECODABLE_CHAR_RATIO,
     FilteringResolver,
     build_session,
+    datawrapper_live_data_url,
+    decode_text_body,
+    extract_datawrapper_charts,
+    parse_http_last_modified,
     read_body_capped,
+    undecodable_char_ratio,
 )
 
 
@@ -212,3 +224,304 @@ class TestFilteringResolver:
         assert inner.close_called is False
         await r.close()
         assert inner.close_called is True
+
+
+# ---------------------------------------------------------------------------
+# Datawrapper embed detection (resolution-source Tier-2 hop)
+# ---------------------------------------------------------------------------
+
+# Miniature of the REAL natesilver.net Iran-war tracker markup (qid 44858):
+# Substack wraps each Datawrapper embed in an HTML-escaped JSON `data-attrs`
+# whose `url` pins a STALE version (`/1mU3g/11/` — the live chart was at
+# v2570 when this shape was captured, 2026-08-25) and whose `title` follows
+# two S3 thumbnail URLs. Structure preserved; prose trimmed.
+_IRAN_TRACKER_SHAPED_HTML = (
+    "<p><span>Polling on the war remains negative.</span></p>"
+    '<div id="datawrapper-iframe" data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/1mU3g/11/&quot;,'
+    "&quot;thumbnail_url&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/aaa_1220x708.png&quot;,"
+    "&quot;thumbnail_url_full&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/bbb_1220x1076.png&quot;,"
+    "&quot;height&quot;:527,&quot;title&quot;:&quot;Do Americans support or oppose the Iran War?&quot;,"
+    '&quot;description&quot;:&quot;&quot;}"></div>'
+    "<p>Methodology notes follow.</p>"
+    '<div id="datawrapper-iframe" data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/VUUVz/7/&quot;,'
+    "&quot;thumbnail_url&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ccc_1220x994.png&quot;,"
+    "&quot;height&quot;:673,&quot;title&quot;:&quot;Polls included in our Iran War support average&quot;,"
+    '&quot;description&quot;:&quot;&quot;}"></div>'
+)
+
+# Miniature of the Trump-approval tracker (qid 44841): five charts, the
+# resolving one (`kSCt4`) first in document order, one title carrying an
+# apostrophe (the shape that truncates a naive quote-terminated regex).
+_TRUMP_TRACKER_SHAPED_HTML = (
+    '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/kSCt4/349/&quot;,'
+    "&quot;thumbnail_url&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ddd_1260x660.png&quot;,"
+    '&quot;height&quot;:478,&quot;title&quot;:&quot;Do Americans approve or disapprove of Donald Trump?&quot;}"></div>'
+    '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/vknzT/269/&quot;,'
+    '&quot;height&quot;:827,&quot;title&quot;:&quot;Polls included in our average&quot;}"></div>'
+    '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/RFXsV/73/&quot;,'
+    '&quot;height&quot;:448,&quot;title&quot;:&quot;Trump&#8217;s net approval on the issues&quot;}"></div>'
+)
+
+
+class TestExtractDatawrapperCharts:
+    def test_iran_tracker_shape_ids_titles_document_order(self):
+        charts = extract_datawrapper_charts(_IRAN_TRACKER_SHAPED_HTML)
+        assert [c.chart_id for c in charts] == ["1mU3g", "VUUVz"]
+        assert charts[0].title == "Do Americans support or oppose the Iran War?"
+        assert charts[1].title == "Polls included in our Iran War support average"
+
+    def test_trump_tracker_shape_resolving_chart_first(self):
+        charts = extract_datawrapper_charts(_TRUMP_TRACKER_SHAPED_HTML)
+        assert [c.chart_id for c in charts] == ["kSCt4", "vknzT", "RFXsV"]
+        assert charts[0].title == "Do Americans approve or disapprove of Donald Trump?"
+
+    def test_title_with_apostrophe_survives(self):
+        # "Trump's net approval …" — a quote-class terminator would cut at the
+        # apostrophe and label the chart just "Trump" (observed on the live page).
+        charts = extract_datawrapper_charts(_TRUMP_TRACKER_SHAPED_HTML)
+        assert charts[2].title == "Trump’s net approval on the issues"
+
+    def test_plain_iframe_embed_with_title_attribute(self):
+        # Datawrapper's own responsive embed: title= sits BEFORE src in the tag.
+        html = (
+            '<iframe title="Weekly jobless claims" aria-label="Interactive line chart" '
+            'id="datawrapper-chart-Ab9x2" src="https://datawrapper.dwcdn.net/Ab9x2/4/" '
+            'scrolling="no" frameborder="0"></iframe>'
+        )
+        charts = extract_datawrapper_charts(html)
+        assert len(charts) == 1
+        assert charts[0].chart_id == "Ab9x2"
+        assert charts[0].title == "Weekly jobless claims"
+
+    def test_a_title_on_a_neighbouring_element_is_not_borrowed(self):
+        """The proximity window alone let an unrelated `title=` render as the chart's
+        identity in the Tier-2 lead — and the lead names the chart it is serving data for,
+        so a borrowed title is a false claim about which series is being read. The title
+        has to sit inside the URL's own tag."""
+        html = (
+            '<a href="#" title="Share on X">share</a>'
+            '<script defer src="https://datawrapper.dwcdn.net/Xy12Z/embed.js"></script>'
+        )
+        charts = extract_datawrapper_charts(html)
+
+        assert [c.chart_id for c in charts] == ["Xy12Z"]
+        assert charts[0].title is None
+
+    def test_a_forward_json_title_on_a_later_element_is_not_borrowed(self):
+        # Same rule in the forward direction: a `"title":` blob that belongs to the NEXT
+        # element must not attach to this chart just because it fell inside the window.
+        html = (
+            '<script defer src="https://datawrapper.dwcdn.net/Xy12Z/embed.js"></script>'
+            '<div data-attrs="{&quot;title&quot;:&quot;Some unrelated card&quot;}"></div>'
+        )
+        charts = extract_datawrapper_charts(html)
+
+        assert [c.chart_id for c in charts] == ["Xy12Z"]
+        assert charts[0].title is None
+
+    def test_embed_script_form_yields_id_without_title(self):
+        html = '<script defer src="https://datawrapper.dwcdn.net/Xy12Z/embed.js" charset="utf-8"></script>'
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["Xy12Z"]
+        assert charts[0].title is None
+
+    def test_json_escaped_slashes_match(self):
+        # Embed URLs inside plain (non-HTML-escaped) JSON carry `\/` slashes.
+        html = '{"url":"https:\\/\\/datawrapper.dwcdn.net\\/Qw3rT\\/12\\/","title":"Escaped chart"}'
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["Qw3rT"]
+        assert charts[0].title == "Escaped chart"
+
+    def test_static_data_url_form_matches(self):
+        html = '<a href="https://static.dwcdn.net/data/kSCt4.csv">Get the data</a>'
+        assert [c.chart_id for c in extract_datawrapper_charts(html)] == ["kSCt4"]
+
+    def test_dedup_first_seen_wins(self):
+        html = (
+            '<iframe src="https://datawrapper.dwcdn.net/1mU3g/11/"></iframe>'
+            '<a href="https://static.dwcdn.net/data/1mU3g.csv">data</a>'
+        )
+        assert [c.chart_id for c in extract_datawrapper_charts(html)] == ["1mU3g"]
+
+    def test_longer_path_segments_do_not_match(self):
+        # Chart ids are exactly 5 alnum chars; asset paths must not match.
+        html = '<script src="https://datawrapper.dwcdn.net/plugins/render.js"></script>'
+        assert extract_datawrapper_charts(html) == []
+
+    def test_titleless_chart_does_not_steal_neighbours_title(self):
+        # First embed has no title; the second (within the forward window)
+        # does. The window is bounded at the next embed, so chart one stays
+        # untitled instead of inheriting chart two's title.
+        html = (
+            '<iframe src="https://datawrapper.dwcdn.net/AAAA1/3/"></iframe>'
+            '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/BBBB2/5/&quot;,'
+            '&quot;title&quot;:&quot;Chart two title&quot;}"></div>'
+        )
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["AAAA1", "BBBB2"]
+        assert charts[0].title is None
+        assert charts[1].title == "Chart two title"
+
+    def test_titleless_chart_does_not_steal_a_preceding_iframe_title(self):
+        # Mirror image of the test above, for the BACKWARD half of the scan: the
+        # first embed carries an iframe `title=` attribute, the second (embed.js
+        # form) carries none and sits well inside the 300-char backward window.
+        # The backward scan is clamped at the previous embed's URL, so chart two
+        # stays untitled instead of being labelled with chart one's title — a
+        # mislabelled dataset is worse than an unlabelled one, since the lead
+        # line the forecaster reads names the chart.
+        html = (
+            '<iframe title="First chart" src="https://datawrapper.dwcdn.net/AAAA1/3/"></iframe>'
+            '<script defer src="https://datawrapper.dwcdn.net/BBBB2/embed.js"></script>'
+        )
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["AAAA1", "BBBB2"]
+        assert charts[0].title == "First chart"
+        assert charts[1].title is None
+
+    def test_single_quoted_iframe_title_attribute(self):
+        # The attribute form alternates on quote style; single-quoted markup is
+        # common in hand-written embeds and must resolve to the same title.
+        html = "<iframe title='Weekly jobless claims' src='https://datawrapper.dwcdn.net/Ab9x2/4/'></iframe>"
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["Ab9x2"]
+        assert charts[0].title == "Weekly jobless claims"
+
+    def test_json_title_beyond_the_forward_window_is_not_attached(self):
+        # The forward window brackets the observed Substack layout (~380 chars
+        # of thumbnail URLs between the embed URL and its title). A `"title"`
+        # far past that belongs to some other page structure, so the chart stays
+        # untitled rather than borrowing it.
+        filler = "&quot;description&quot;:&quot;" + ("x" * 800) + "&quot;,"
+        html = (
+            '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/Cccc3/9/&quot;,'
+            f"{filler}"
+            '&quot;title&quot;:&quot;Too far away to be this chart&quot;}"></div>'
+        )
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["Cccc3"]
+        assert charts[0].title is None
+
+    def test_no_embeds_returns_empty(self):
+        assert extract_datawrapper_charts("<html><body>No charts here.</body></html>") == []
+        assert extract_datawrapper_charts("") == []
+
+
+class TestDatawrapperLiveDataUrl:
+    def test_builds_version_free_static_route(self):
+        # The one dataset route that serves LIVE data. The versioned
+        # `datawrapper.dwcdn.net/<id>/<ver>/dataset.csv` form pinned in page
+        # HTML served 5- and 14-month-stale snapshots on the two real trackers
+        # (2026-08-24 verifications) and must never be constructed.
+        assert datawrapper_live_data_url("1mU3g") == "https://static.dwcdn.net/data/1mU3g.csv"
+        assert datawrapper_live_data_url("kSCt4") == "https://static.dwcdn.net/data/kSCt4.csv"
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        ["", "abcd", "abcdef", "ab/c1", "../..", "a b c", "1mU3g\n", "1mU3g/2053"],
+    )
+    def test_rejects_non_chart_id_shapes(self, bad_id: str):
+        with pytest.raises(ValueError, match="not a Datawrapper chart id"):
+            datawrapper_live_data_url(bad_id)
+
+
+class TestParseHttpLastModified:
+    def test_parses_rfc7231_to_aware_utc(self):
+        parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 GMT")
+        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
+        assert parsed is not None and parsed.tzinfo is not None
+
+    def test_malformed_returns_none(self):
+        assert parse_http_last_modified("not a date") is None
+        assert parse_http_last_modified("") is None
+
+    def test_timezoneless_value_is_stamped_utc(self):
+        # RFC 5322's "-0000" means "no timezone information", and
+        # `parsedate_to_datetime` returns a NAIVE datetime for it. The freshness
+        # guard subtracts this from an aware `now`, which raises TypeError on a
+        # naive operand — so the UTC stamp is what keeps an odd CDN header
+        # producing a `stale_data` verdict instead of a crashed hop.
+        parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 -0000")
+        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
+        assert parsed is not None and parsed.tzinfo is not None
+
+
+class TestDecodeTextBody:
+    """Raw bodies decode by the response's OWN self-description, then get scored.
+
+    The retired blanket `body.decode("utf-8", errors="replace")` turned a UTF-16 or
+    Windows-1252 body into mojibake that still type-checked as text, and the
+    resolution-source fetcher then rendered `0<?>.<?>4<?>2<?>` to a forecaster as
+    primary grading evidence with `status="success"`.
+    """
+
+    def test_a_bom_wins_over_everything_and_is_consumed(self):
+        """Excel exports CSV as BOM'd UTF-16, which is exactly the poll-table shape the
+        Datawrapper hop fetches. The BOM must decide the codec AND not survive into the text."""
+        body = codecs.BOM_UTF16_LE + "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
+
+        text, ratio = decode_text_body(body, "text/csv")
+
+        assert text == "date,value\n2026-08-01,0.42\n"
+        assert ratio == 0.0
+
+    def test_a_utf8_bom_is_stripped_rather_than_read_as_content(self):
+        body = codecs.BOM_UTF8 + b"date,value\n2026-08-01,0.42\n"
+
+        text, ratio = decode_text_body(body, "text/csv")
+
+        assert text.startswith("date,value")
+        assert ratio == 0.0
+
+    def test_a_declared_charset_is_honoured(self):
+        """`charset=` was parsed for ROUTING and then ignored for decoding, so a Windows-1252
+        pollster name lost its apostrophe to a replacement char."""
+        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")
+
+        text, ratio = decode_text_body(body, "text/csv; charset=windows-1252")
+
+        assert "O’Brien Research" in text
+        assert ratio == 0.0
+
+    def test_a_quoted_charset_is_honoured(self):
+        body = "café,1\n".encode("latin-1")
+
+        text, _ratio = decode_text_body(body, 'text/csv; charset="latin-1"')
+
+        assert text == "café,1\n"
+
+    def test_an_unknown_charset_falls_back_to_utf8_rather_than_raising(self):
+        """A typo'd charset label is not a reason to lose the body."""
+        text, ratio = decode_text_body(b"date,value\n", "text/csv; charset=utf-8000")
+
+        assert text == "date,value\n"
+        assert ratio == 0.0
+
+    def test_a_bomless_utf16_body_scores_as_undecodable(self):
+        """The half a replacement-char count alone cannot see: every second byte of BOM-less
+        UTF-16 ASCII is a NUL, which is a VALID UTF-8 character, so the naive decode produced
+        zero replacement chars and passed for text."""
+        body = "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
+
+        _text, ratio = decode_text_body(body, "text/csv")
+
+        assert ratio > MAX_UNDECODABLE_CHAR_RATIO
+
+    def test_a_utf16_bom_read_as_utf8_would_score_as_undecodable(self):
+        """The other shape: had the BOM sniff not fired, the ratio is the backstop."""
+        body = codecs.BOM_UTF16_LE + "date,value\n".encode("utf-16-le")
+
+        assert undecodable_char_ratio(body.decode("utf-8", errors="replace")) > MAX_UNDECODABLE_CHAR_RATIO
+
+    def test_text_with_a_single_bad_byte_stays_usable(self):
+        """The threshold has to sit far above real text's dirt: a page carrying one mis-encoded
+        smart quote is evidence we want, not a body we failed to decode. This is why the bound is
+        0.10 rather than something tight — a 37-char line with one bad byte already scores 0.027."""
+        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")
+
+        _text, ratio = decode_text_body(body, "text/csv")
+
+        assert 0.0 < ratio <= MAX_UNDECODABLE_CHAR_RATIO
+
+    def test_an_empty_body_scores_zero_rather_than_dividing_by_zero(self):
+        assert decode_text_body(b"", "text/csv") == ("", 0.0)

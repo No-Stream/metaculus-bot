@@ -43,8 +43,10 @@ Per era it reports, on the bot's PUBLISHED 201-point CDF:
     opposite corrections.
 
 PIT is F_bot(resolution) evaluated on the canonical Metaculus value grid
-(``build_cdf_value_grid``); out-of-bounds resolutions map to PIT 0.0 (below
-lower) / 1.0 (above upper). Method mirrors
+(``build_cdf_value_grid``); string out-of-bound resolutions map to PIT 0.0
+(below lower) / 1.0 (above upper), and a NUMERIC resolution beyond the grid is
+scored off the members' declared-percentile curves rather than the grid clamp
+(see ``compute_pit_details``). Method mirrors
 ``scratch/calibration_audit_2026-07-16/mc_numeric_calibration.py``.
 """
 
@@ -62,8 +64,10 @@ from scipy import stats
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, pit_on_grid
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
 from metaculus_bot.performance_analysis.scaling import grid_zero_point as _grid_zero_point
+from metaculus_bot.time_utils import parse_iso_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -72,6 +76,18 @@ NUMERIC_TYPES: tuple[str, ...] = ("numeric", "discrete")
 # Calibrated reference values, surfaced in the legend so a reader knows which
 # direction "off" points.
 UNIFORM_PIT_STD: float = 1.0 / np.sqrt(12.0)  # ~0.2887
+
+# Below this many PITs, a row's point metrics (cov@10/50/90, PIT std, mean PIT,
+# band_miss) are not estimates: their resolution is 1/n, coarser than the finest
+# calibrated target they are compared against (cov@10 = 0.10), so the value can
+# only land on a grid whose spacing exceeds the quantity being measured. At n=1
+# pit_std is exactly 0.0, which reads as "maximally too wide" while carrying no
+# information. Those cells render ``n/a`` in the markdown; the JSON keeps the raw
+# values alongside an ``underpowered`` flag, since a script can decide for itself
+# but a reader cannot un-see a number. cov80/cov50 are exempt — they carry CIs
+# that widen honestly at small n, which is exactly the disclosure the point
+# metrics lack.
+MIN_N_FOR_POINT_METRICS: int = 10
 
 
 @dataclass(frozen=True)
@@ -103,14 +119,29 @@ class Era:
 # run in that gap under the wrong config. Re-derive with
 # `TZ=UTC git log -1 --date=iso-local --format='%h %cd' <merge-sha>`.
 WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=timezone.utc)  # 0e85e1b: k_tail 1.25 -> 1.0
-TS_ANCHOR_ENABLE = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)  # b4e9df0: july15 bundle
+# b4e9df0 (july15 bundle) — aliased so this boundary and the max-step clamp screen's
+# era gate can never disagree; the timestamp's single home is analysis.py.
+TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
 
-# Questions excluded from headline calibration rows by every other dimension of
-# the residual analysis: 43746 (Minions & Monsters) and 43747 (Toy Story 5)
-# opening-weekend gross, both mis-forecast by the pre-2026-07-07 open-bound
-# arithmetic bug rather than by judgment. Not excluded by default — callers pass
-# the set explicitly so an exclusion is always a visible choice.
-KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747"})
+# The CANONICAL known-pipeline-bug cohort: questions whose published forecast was
+# produced by a since-fixed pipeline defect rather than by judgment, so pooling them
+# into a calibration row measures the old bug instead of the current bot. Not
+# excluded by default — callers pass the set explicitly so an exclusion is always a
+# visible choice, and every row reports how many it dropped. Import this constant
+# rather than re-hardcoding the ids: analysis scripts that kept private copies have
+# already drifted from it.
+#
+# - 43746 (Minions & Monsters) and 43747 (Toy Story 5) opening-weekend gross:
+#   the pre-2026-07-07 open-bound arithmetic bug.
+# - 43913 (WSOP bracelets held by the 2026 Main Event winner), added 2026-08-25:
+#   the pre-`9f1175c` discrete max-step cap. All six forecasters stated 79.5-83%
+#   on the outcome that resolved (exactly 1 bracelet) and the published CDF carried
+#   20.00%, its first bin pinned at exactly 0.200000 on an 11-point grid — the
+#   201-grid ceiling applied to a 10-bin question whose real server ceiling was 4.0.
+#   Receipts: scratch/residual_2026-08-24/dossiers/43913_dossier.md and
+#   dim_discrete-maxstep-counterfactual.md. The fix reached prod inside `b4e9df0`
+#   (2026-07-21T17:07:37Z), so no post-triple-era question can carry this shape.
+KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747", "43913"})
 
 # The CLI token standing in for KNOWN_BUG_QIDS in --exclude-qids.
 KNOWN_BUG_SHORTHAND = "known_bug"
@@ -154,23 +185,10 @@ def default_eras() -> list[Era]:
 NO_TIMESTAMP_LABEL = "no_timestamp"
 
 
-def _parse_created_at(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    s = s.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 def assign_era(record: dict, eras: list[Era]) -> str:
     """Return the era label for a record, or ``NO_TIMESTAMP_LABEL`` when the
     bot-comment timestamp is missing/unparseable (can't be era-attributed)."""
-    dt = _parse_created_at(record.get("bot_comment_created_at"))
+    dt = parse_iso_utc(record.get("bot_comment_created_at"))
     if dt is None:
         return NO_TIMESTAMP_LABEL
     for era in eras:
@@ -215,20 +233,38 @@ def _cdf_and_grid(record: dict) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def compute_pit(record: dict) -> float | None:
-    """PIT = F_bot(resolution) on the canonical value grid. Out-of-bounds
-    resolutions map to 0.0 / 1.0. Returns None when the record can't be scored."""
+    """PIT = F_bot(resolution) on the canonical value grid.
+
+    STRING out-of-bound resolutions (``below_lower_bound`` / ``above_upper_bound``)
+    map to 0.0 / 1.0; a NUMERIC resolution beyond the grid is read off the members'
+    declared-percentile curves instead of the grid clamp (see
+    :func:`compute_pit_details` for why). Returns None when the record can't be
+    scored."""
+    return compute_pit_details(record)[0]
+
+
+def compute_pit_details(record: dict) -> tuple[float | None, str | None]:
+    """``(pit, oob_side)`` — ``oob_side`` is ``"low"``/``"high"`` when the resolution
+    fell beyond the value grid (string marker or numeric), else None.
+
+    String out-of-bound markers map to 0.0/1.0; a numeric resolution goes through
+    the shared :func:`pit_on_grid`, whose docstring holds the out-of-grid rule
+    (declared-percentile fallback beyond the grid, endpoint clamp only when no
+    member curve is usable). ``oob_side`` surfaces beyond-grid records in the
+    ``n_oob_*`` counters either way.
+    """
     built = _cdf_and_grid(record)
     if built is None:
-        return None
+        return None, None
     cdf, grid = built
     res = record.get("resolution_parsed")
     if res == "below_lower_bound":
-        return 0.0
+        return 0.0, "low"
     if res == "above_upper_bound":
-        return 1.0
+        return 1.0, "high"
     if isinstance(res, (int, float)) and not isinstance(res, bool):
-        return float(np.interp(float(res), grid, cdf))
-    return None
+        return pit_on_grid(float(res), grid, cdf, record.get("per_model_numeric_percentiles"))
+    return None, None
 
 
 def relative_band_width(record: dict, *, median_floor: float = 1e-9) -> float | None:
@@ -270,11 +306,30 @@ class EraWidthMetrics:
     band_lo: float
     band_hi: float
 
+    @property
+    def ci_clustered(self) -> bool:
+        """True when clustering actually widened this row's CIs.
+
+        ``n_eff < n`` means at least one post carried more than one record. On
+        every archived pull that has never happened (see
+        ``_n_effective_clusters``), so the correction is normally inert and the
+        rendered CI is the naive one — which the table has to say, or the legend's
+        cluster-widening claim describes something that did not occur.
+        """
+        return self.n_eff < self.n_pit
+
+    @property
+    def underpowered(self) -> bool:
+        """True when this row has too few PITs for its point metrics to be read."""
+        return self.n_pit < MIN_N_FOR_POINT_METRICS
+
     def to_dict(self) -> dict:
         return {
             "label": self.label,
             "n_pit": self.n_pit,
             "n_eff": self.n_eff,
+            "ci_clustered": self.ci_clustered,
+            "underpowered": self.underpowered,
             "n_width": self.n_width,
             "n_excluded": self.n_excluded,
             "n_oob_low": self.n_oob_low,
@@ -296,11 +351,22 @@ class EraWidthMetrics:
 def _n_effective_clusters(post_ids: list[object]) -> int:
     """Count distinct question families for the CI's effective sample size.
 
-    Records sharing a ``post_id`` are one correlated family (same series/window,
-    multiple sub-questions per post). A record with no ``post_id`` (``None``) is
-    treated as its own family — assigned a unique sentinel by position so it is
-    never merged with another None-post record — since we can't prove it shares
-    a family with anything else.
+    Records sharing a ``post_id`` are one correlated family: the collector expands
+    a ``group_of_questions`` post into one record per sub-question, and those share
+    a series, a window and a resolution source. A record with no ``post_id``
+    (``None``) is treated as its own family — assigned a unique sentinel by
+    position so it is never merged with another None-post record — since we can't
+    prove it shares a family with anything else.
+
+    **The correction is currently inert, and the table says so per row.** Measured
+    2026-08-25 across all archived pulls (residual_2026-06-15 through
+    residual_2026-08-24, plus coherence_2026-07-15): every post carried exactly one
+    resolved record, so ``n_eff == n`` everywhere and the clustered CI equals the
+    naive one. The mechanism is kept because a group post resolving into the
+    tournament is a matter of question supply, not of code — but nothing may claim
+    the CIs have been widened unless ``EraWidthMetrics.ci_clustered`` says they
+    were. (An earlier version of this comment asserted "~62% of records share a
+    post"; no archived dataset supports that figure.)
     """
     clusters: set[object] = set()
     for i, pid in enumerate(post_ids):
@@ -319,13 +385,23 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
     pits: list[float] = []
     pit_post_ids: list[object] = []
     widths: list[float] = []
+    n_oob_low = 0
+    n_oob_high = 0
     for r in records:
         if r.get("type") not in NUMERIC_TYPES:
             continue
-        pit = compute_pit(r)
+        pit, oob_side = compute_pit_details(r)
         if pit is not None:
             pits.append(pit)
             pit_post_ids.append(r.get("post_id"))
+            # OOB is a property of the resolution (beyond the grid), not of the PIT
+            # value: an out-of-grid resolution scored off the declared-percentile
+            # curves rarely lands at exactly 0.0/1.0, and an in-grid PIT of exactly
+            # 0.0 (closed bound, resolution at the minimum) is not OOB.
+            if oob_side == "low":
+                n_oob_low += 1
+            elif oob_side == "high":
+                n_oob_high += 1
         w = relative_band_width(r)
         if w is not None:
             widths.append(w)
@@ -335,19 +411,18 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
 
     arr = np.asarray(pits, dtype=float)
     n = len(arr)
-    n_oob_low = int((arr == 0.0).sum())
-    n_oob_high = int((arr == 1.0).sum())
     cov80_k = int(((arr >= 0.10) & (arr <= 0.90)).sum())
     cov50_k = int(((arr >= 0.25) & (arr <= 0.75)).sum())
 
-    # Coverage CIs use n_eff (distinct post_ids), not the raw question count:
-    # ~62% of records share a post (same series/window, multiple sub-questions
-    # per post) and are correlated, so a naive n=question-count Jeffreys CI runs
-    # ~26% too narrow. Cluster on post_id only — the one grouping key already on
-    # every record; a record missing a post_id counts as its own cluster (via a
-    # unique sentinel) so it is never merged with another. The point estimate is
-    # unchanged (cov_k / n); only the CI width widens to reflect n_eff clusters,
-    # via jeffreys_ci(round(cov_k * n_eff / n), n_eff).
+    # Coverage CIs are computed at n_eff (distinct post_ids) rather than the raw
+    # question count, so that a post carrying several correlated sub-questions
+    # cannot narrow the CI as if they were independent. Cluster on post_id only —
+    # the one grouping key already on every record; a record missing a post_id
+    # counts as its own cluster (via a unique sentinel) so it is never merged with
+    # another. The point estimate is unchanged (cov_k / n); only the CI width
+    # reflects n_eff, via jeffreys_ci(round(cov_k * n_eff / n), n_eff). On every
+    # archived pull n_eff == n, so this is a no-op there — see
+    # ``_n_effective_clusters`` and the per-row ``ci_clustered`` marker.
     n_eff = _n_effective_clusters(pit_post_ids)
     cov80 = jeffreys_ci(round(cov80_k * n_eff / n), n_eff)
     cov50 = jeffreys_ci(round(cov50_k * n_eff / n), n_eff)
@@ -393,8 +468,8 @@ def compute_all_eras(
     ``exclude_qids`` drops the named questions from every row and reports the
     dropped count per row (``EraWidthMetrics.n_excluded``, rendered in the
     table), so an exclusion is never silent. Pass ``KNOWN_BUG_QIDS`` for the
-    documented open-bound bug pair, which every other dimension of the residual
-    analysis already excludes.
+    documented known-pipeline-bug cohort, which every other dimension of the
+    residual analysis already excludes.
     """
     if eras is None:
         eras = default_eras()
@@ -434,7 +509,14 @@ def _fmt_ci(ci: tuple[float, float, float]) -> str:
 
 
 def render_markdown(metrics: list[EraWidthMetrics]) -> str:
-    """Compact markdown table of the per-era width/calibration metrics."""
+    """Compact markdown table of the per-era width/calibration metrics.
+
+    Two honesty rules are enforced here rather than left to the reader: the n_eff
+    cell says whether the cluster correction actually fired on that row, and a row
+    below ``MIN_N_FOR_POINT_METRICS`` renders its point metrics as ``n/a`` instead
+    of printing a number whose resolution is coarser than the target it is being
+    compared to.
+    """
     lines: list[str] = []
     lines.append("## Numeric width / calibration monitor (per config era)")
     lines.append("")
@@ -442,34 +524,65 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "Calibrated targets: cov80=0.80, cov50=0.50, cov@10=0.10, cov@50=0.50, "
         f"cov@90=0.90, PIT std={UNIFORM_PIT_STD:.3f}. "
         "PIT std below target => too WIDE; above => too NARROW. "
-        "cov@10 below 0.10 => low tail too wide; median rel width = (P90-P10)/|P50| (raw sharpness). "
-        "cov80/cov50 CIs are computed at n_eff (distinct post_ids), not n: questions cluster into "
-        "correlated families (multiple sub-questions per post), so a naive n-based CI is too narrow."
+        "cov@10 below 0.10 => low tail too wide; median rel width = (P90-P10)/|P50| (raw sharpness)."
+    )
+    lines.append("")
+    lines.append(
+        "cov80/cov50 CIs are computed at n_eff = distinct post_ids, so several correlated "
+        "sub-questions on one post cannot narrow the CI as though they were independent. The n_eff "
+        "cell states whether that correction did anything on the row: `(widened)` when a post "
+        "carried more than one record, `(=n)` when none did and the CI is therefore the naive "
+        "n-based one. Every archived pull to date is `(=n)`."
+    )
+    lines.append("")
+    lines.append(
+        f"Rows with fewer than {MIN_N_FOR_POINT_METRICS} PITs render cov@10/cov@50/cov@90, PIT std, "
+        "mean PIT and band_miss as `n/a`: at that n the metric's resolution (1/n) is coarser than "
+        "the target it is compared against, so the number is not an estimate (at n=1, PIT std is "
+        "0.0, which reads as maximally too WIDE). cov80/cov50 still render — their CIs widen "
+        "honestly. The JSON output keeps the raw values under an `underpowered` flag."
     )
     lines.append("")
     lines.append(
         "band_miss = P(PIT<0.10) + P(PIT>0.90), target 0.20 with lo ~= hi ~= 0.10. Well above 0.20 => "
         "band too TIGHT; a lo/hi skew at roughly the target => band roughly the right width but "
         "MIS-CENTERED (misses piled in one tail), which calls for shifting the band rather than "
-        "widening it. Distinct from OOB lo/hi, which counts resolutions outside the QUESTION's own "
-        "declared range (PIT exactly 0.0 / 1.0). excl = records dropped by --exclude-qids."
+        "widening it. Distinct from OOB lo/hi, which counts resolutions that fell beyond the "
+        "QUESTION's own value grid (string marker or numeric; their PIT is read off the members' "
+        "declared-percentile curves). excl = records dropped by --exclude-qids."
     )
     lines.append("")
     header = (
         "| era | n | excl | n_eff | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
         "| PIT std | mean PIT | med rel width (n) | band_miss (lo/hi) | OOB lo/hi |"
     )
-    sep = "|" + "|".join(["---"] * 14) + "|"
+    sep = "|" + "|".join(["---"] * (header.count("|") - 1)) + "|"
     lines.append(header)
     lines.append(sep)
     for m in metrics:
         rel = f"{m.median_rel_width:.3f} ({m.n_width})" if m.median_rel_width is not None else f"n/a ({m.n_width})"
-        lines.append(
-            f"| {m.label} | {m.n_pit} | {m.n_excluded} | {m.n_eff} | {_fmt_ci(m.cov80)} | {_fmt_ci(m.cov50)} "
-            f"| {m.cov_at_10:.3f} | {m.cov_at_50:.3f} | {m.cov_at_90:.3f} "
-            f"| {m.pit_std:.3f} | {m.mean_pit:.3f} | {rel} "
-            f"| {m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f}) | {m.n_oob_low}/{m.n_oob_high} |"
-        )
+
+        def _point(value: float, *, underpowered: bool = m.underpowered) -> str:
+            return "n/a" if underpowered else f"{value:.3f}"
+
+        band = "n/a" if m.underpowered else f"{m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f})"
+        cells = [
+            m.label,
+            str(m.n_pit),
+            str(m.n_excluded),
+            f"{m.n_eff} ({'widened' if m.ci_clustered else '=n'})",
+            _fmt_ci(m.cov80),
+            _fmt_ci(m.cov50),
+            _point(m.cov_at_10),
+            _point(m.cov_at_50),
+            _point(m.cov_at_90),
+            _point(m.pit_std),
+            _point(m.mean_pit),
+            rel,
+            band,
+            f"{m.n_oob_low}/{m.n_oob_high}",
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
@@ -491,10 +604,10 @@ def main(argv: list[str] | None = None) -> None:
         default="",
         help=(
             "Comma-separated question ids to drop from every row (the count is rendered in the table "
-            f"so the exclusion is visible). The documented open-bound bug pair is {','.join(sorted(KNOWN_BUG_QIDS))}; "
-            f"pass '{KNOWN_BUG_SHORTHAND}' as shorthand for it, anywhere in the list — it composes with "
-            f"explicit ids, so '{KNOWN_BUG_SHORTHAND},43800' excludes the pair AND 43800. "
-            "Default: exclude nothing."
+            "so the exclusion is visible). The documented known-pipeline-bug cohort is "
+            f"{','.join(sorted(KNOWN_BUG_QIDS))}; pass '{KNOWN_BUG_SHORTHAND}' as shorthand for it, "
+            f"anywhere in the list — it composes with explicit ids, so '{KNOWN_BUG_SHORTHAND},43800' "
+            "excludes the cohort AND 43800. Default: exclude nothing."
         ),
     )
     args = parser.parse_args(argv)

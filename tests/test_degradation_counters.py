@@ -7,11 +7,14 @@ telemetry parser reads them, so the text is a contract, not a convenience.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from forecasting_tools.data_models.questions import BinaryQuestion
 
 from main import TemplateForecaster
+from metaculus_bot import publish_gate, publish_hardening
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.research import prediction_market, provider_health
 
@@ -33,7 +36,7 @@ def _bot(mock_general_llm, *, with_stacker: bool = False, **kwargs: Any) -> Temp
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum all eleven degradation counters. Using distinct powers of 2
+    """Property must sum all thirteen degradation counters. Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """
@@ -62,8 +65,19 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     # siblings answered. Same read-only shape as the two above, so stub the accessor
     # the property imports rather than recording 1024 observations.
     monkeypatch.setattr(provider_health, "provider_degradation_count", lambda: 1024)
+    # Twelfth term: a publish POST that exhausted the publish-hardening retry
+    # budget (q45085's 405 shape) — the module global the bot property reads.
+    monkeypatch.setattr(publish_hardening, "_PUBLISH_ATTEMPT_FAILURES", 2048)
+    # Thirteenth term: a question whose close time was too near for the full
+    # pipeline, so the optional research stages were dropped (time_budget.py).
+    bot._time_budget_fast_path_count = 4096
+    # Fourteenth term: budget-driven research degradation OFF the fast path — a
+    # provider cancelled at the research-window deadline or gap-fill cut/skipped
+    # for budget on a question that never fast-pathed (orchestrator-side,
+    # deduplicated per question).
+    bot._research.research_budget_cut_count = 8192
 
-    assert bot.alertable_count == 2047
+    assert bot.alertable_count == 16383
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):
@@ -116,7 +130,14 @@ async def test_provider_degradation_rides_the_run_summary(mock_general_llm, capl
         await bot.forecast_questions([])
 
     degradation = next(line for line in caplog.messages if line.startswith("Degradation counters:"))
-    assert degradation.endswith("provider_degradation=0"), degradation
+    assert "provider_degradation=0" in degradation, degradation
+    assert "publish_attempt_failures=0" in degradation, degradation
+    assert "publish_skipped_closed=0" in degradation, degradation
+    # The newest key is the tail, and the tail is where the telemetry parser's optional
+    # groups end — appending past it without extending that regex breaks the whole
+    # line's harvest, because the pattern is $-anchored.
+    assert "time_budget_fast_path=0" in degradation, degradation
+    assert degradation.endswith("research_budget_cuts=0"), degradation
     assert any(line.startswith("PROVIDER_DEGRADATION:") for line in caplog.messages), caplog.messages
 
 
@@ -142,6 +163,56 @@ async def test_run_start_resets_provider_health_observations(mock_general_llm):
 
     await bot.forecast_questions([])
     assert bot.alertable_count == 0
+
+
+@pytest.mark.asyncio
+async def test_forecast_questions_resets_publish_attempt_failures(mock_general_llm):
+    """The publish-hardening retry-exhaustion counter is module state (the wrapper
+    has no handle back to the bot), so forecast_questions must zero it at run start
+    — same rationale as the prediction-market counters below."""
+    bot = _bot(mock_general_llm)
+
+    publish_hardening._bump_publish_attempt_failure()
+    try:
+        assert publish_hardening.publish_attempt_failures() == 1
+        assert bot.alertable_count == 1
+
+        await bot.forecast_questions([])
+
+        assert publish_hardening.publish_attempt_failures() == 0
+        assert bot.alertable_count == 0
+    finally:
+        publish_hardening.reset_publish_attempt_failures()
+
+
+@pytest.mark.asyncio
+async def test_close_time_skip_is_alertable_and_reset_per_run(mock_general_llm, caplog):
+    """A publish skipped because the question had already closed means latency cost us
+    a question, so it must redden CI rather than pass quietly — and like its
+    publish-hardening sibling the counter is module state that forecast_questions has
+    to zero, else it leaks into the next run in the same process."""
+    bot = _bot(mock_general_llm)
+
+    publish_gate.skip_publish_if_closed(
+        BinaryQuestion(
+            question_text="Will this have closed by publish time?",
+            id_of_question=45085,
+            close_time=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        )
+    )
+    try:
+        assert publish_gate.publish_skipped_closed_count() == 1
+        assert bot.alertable_count == 1
+
+        with caplog.at_level(logging.INFO):
+            await bot.forecast_questions([])
+
+        assert publish_gate.publish_skipped_closed_count() == 0
+        assert bot.alertable_count == 0
+        degradation = next(line for line in caplog.messages if line.startswith("Degradation counters:"))
+        assert "publish_skipped_closed=0" in degradation, degradation
+    finally:
+        publish_gate.reset_publish_skipped_closed()
 
 
 @pytest.mark.asyncio

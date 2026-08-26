@@ -17,6 +17,11 @@ on the scale rather than a probability of anything. Live 2026-08-05, the market 
 ranker graded ``same_quantity_same_date`` rendered ``prob`` 0.48 where its ``value`` was 120.97
 years, and ``probability * max == value`` to full float precision.
 
+A third read of the same array is a REFUSAL: an answer at exactly 0.5 with zero volume is sitting at
+its untouched prior, so ``_priced_or_none`` reports no price for it. Both surfaces take that rule, and
+they dispose of it differently — the ranker segment DROPS the answer (a one-line candidate has no room
+to say "unpriced") while the sub-row keeps it and renders a blank price, which is itself information.
+
 An allow-list rather than a ``PSEUDO_NUMERIC`` deny-list because the two failures are not
 symmetric. A type this parser has not met yet loses a real price VISIBLY — ``prob`` renders ``-``,
 and a WARN fires whenever a non-null ``probability`` is declined with no readable ``value`` to show
@@ -60,6 +65,25 @@ MANIFOLD_PRICED_OUTCOME_TYPE = "BINARY"
 # sub-row titles too, under the renderer's own tighter `CHILD_TITLE_MAX_CHARS`.
 MANIFOLD_TOP_ANSWERS_RENDERED = 3
 MANIFOLD_ANSWER_TEXT_MAX_CHARS = 60
+
+# A freshly-created Manifold answer sits at its 0.5 PRIOR until somebody bets. Exactly this value
+# with zero volume is therefore the venue's absence of a price rather than a price, and rendering it
+# told a forecaster the crowd was split 50/50 on a rung nobody had touched. Compared exactly, because
+# any bet moves the answer off it.
+MANIFOLD_UNTOUCHED_PROBABILITY = 0.5
+
+
+def _priced_or_none(probability: float | None, *, volume: float | None) -> float | None:
+    """``None`` for an answer sitting at its untouched 0.5 prior; the probability otherwise.
+
+    Gated on ``volume`` ALONE, unlike the Polymarket sibling: Manifold publishes no per-answer open
+    interest, so volume is the only trading evidence an answer carries. And the field must be PRESENT
+    and zero — a missing ``volume`` is not evidence of no trading, and blanking on its absence would
+    delete real prices from any payload shape that omits it.
+    """
+    if probability is None or probability != MANIFOLD_UNTOUCHED_PROBABILITY:
+        return probability
+    return None if volume is not None and volume == 0.0 else probability
 
 
 def _walk_tiptap_text(node: Any) -> list[str]:
@@ -166,8 +190,15 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | N
                 close_time = None
 
         # Either a probability or a scalar value, never both — the whole point of the allow-list.
+        raw_probability: float | None = None
         if market.get("outcomeType") == MANIFOLD_PRICED_OUTCOME_TYPE:
-            implied_prob_yes = safe_float(market.get("probability"))
+            # Same untouched-prior blanking the two ANSWER surfaces get: a fresh binary
+            # market is created at exactly 0.50 with zero volume, and that manufactured
+            # number would render in the PARENT `prob` cell — the one the prompt tells
+            # models to anchor on (the sweep's one missed same-class site; the archive
+            # holds a live specimen at 0.5 / volume 0.0).
+            raw_probability = safe_float(market.get("probability"))
+            implied_prob_yes = _priced_or_none(raw_probability, volume=safe_float(market.get("volume")))
             scalar_estimate = None
         else:
             implied_prob_yes = None
@@ -203,6 +234,10 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | N
                 venue_market_id=str(market.get("id") or ""),
                 retrieval_channel="venue_search",
                 scalar_estimate=scalar_estimate,
+                # Same contract as the Polymarket parent: withheld means "the venue
+                # published a number and this repo refused it", so the render's
+                # `withheld=` telemetry counts the blanked parent too.
+                price_withheld=implied_prob_yes is None and raw_probability is not None,
             )
         )
     return out
@@ -284,6 +319,17 @@ def manifold_top_answers(detail: dict[str, Any]) -> tuple[tuple[str, float], ...
     An answer without usable text or a readable probability is dropped rather than carried blank,
     mirroring ``predictit_contract_names``: an empty label spends ranker tokens saying nothing, and a
     non-finite probability would defeat every comparison in the sort and then render as ``nan%``.
+
+    An answer at its untouched 0.5 prior with zero volume is dropped under the SAME rule
+    (``_priced_or_none``), and this surface matters upstream of the render: these pairs are what the
+    RANKER sees of a multi-outcome Manifold market, so a defaulted answer here distorts which markets
+    get selected at all — a 0.5 answer would routinely lead the three-leader segment and describe the
+    market to the ranker as an even split. Dropping rather than carrying it blank is this function's
+    existing rule for an answer with nothing to say.
+
+    The sort is unchanged and stays here: it picks the LEADERS for a one-line prompt segment, which is
+    a selection rather than a presentation order, so the "parsers do not sort" rule that moved the
+    render order into ``rendering`` does not reach it.
     """
     answers = detail.get("answers")
     if not isinstance(answers, list):
@@ -296,7 +342,7 @@ def manifold_top_answers(detail: dict[str, Any]) -> tuple[tuple[str, float], ...
         # Answer text is user-authored, so whitespace is collapsed here at the boundary — a
         # newline would break both the one-line candidate line and the one-line rules bullet.
         text = " ".join(str(answer.get("text") or "").split())
-        probability = safe_float(answer.get("probability"))
+        probability = _priced_or_none(safe_float(answer.get("probability")), volume=safe_float(answer.get("volume")))
         if not text or probability is None:
             continue
         scored.append((text[:MANIFOLD_ANSWER_TEXT_MAX_CHARS], probability))
@@ -305,7 +351,7 @@ def manifold_top_answers(detail: dict[str, Any]) -> tuple[tuple[str, float], ...
 
 
 def manifold_answer_children(detail: dict[str, Any]) -> tuple[MarketChild, ...]:
-    """Every answer as its own sub-row, MOST-PROBABLE FIRST. ``()`` on a BINARY market.
+    """Every answer as its own sub-row, in the ANSWERS ARRAY's own order. ``()`` on a BINARY market.
 
     The render-side counterpart to ``manifold_top_answers``, off the same ``answers`` array and with
     the same discriminator (a BINARY detail carries no such key), differing in two ways that follow
@@ -315,22 +361,30 @@ def manifold_answer_children(detail: dict[str, Any]) -> tuple[MarketChild, ...]:
     for. And each answer keeps its own ``volume`` — the sub-row has a column for it, the ranker line
     does not.
 
-    Ordered by OPEN-FIRST, then by PROBABILITY — not by volume like the real-money venues, because
-    these answers are a distribution over one question's outcomes and reading it means seeing where
-    the mass sits. Probability alone was the obvious choice and is measurably wrong on this module's
-    own committed fixture: a threshold ladder settles its crossed rungs to exactly 1.0 while the
-    market stays open, so 10 of that market's 17 answers sort to the front as a block of ``1.00
-    RESOLVED`` rows and push all 7 rungs that still carry uncertainty past the render budget. The
-    settled rungs are real evidence — they establish the floor the series has already crossed — but
-    they are not the forecast, so they queue behind it.
+    **Unsorted, and that is the contract.** This venue's ordering set the pattern the other two
+    copied, and the whole pattern moved into ``rendering`` on 2026-08-25: the renderer sorts a copy by
+    ``child_render_order_key`` for the full sub-rows and reads THIS order for the ladder row naming
+    every remaining outcome. A parser sorting its children was deciding what survived a render budget
+    it could not see, and Manifold's array order is the ladder's own threshold order.
 
-    Within each group the sort is the same stable one ``manifold_top_answers`` documents: the tied
-    1.0 rungs keep the array's own order, which is what makes the render deterministic across runs.
+    Nothing about the old ordering argument was wrong, only misplaced: a threshold ladder settles its
+    crossed rungs to exactly 1.0 while the market stays open (10 of 17 on this module's committed
+    fixture), so a price-only order would still spend the full rows on the part of the ladder that is
+    no longer a forecast. ``child_render_order_key`` still queues settled rungs behind open ones for
+    exactly that reason — it just does it where the budget is visible.
+
+    An answer at its untouched 0.5 prior with zero volume carries no price (``_priced_or_none``) and
+    says so via ``price_withheld``. It is still RENDERED, unlike in ``manifold_top_answers``: a table
+    row can say "this rung exists and nobody has priced it", which is real information, where a
+    one-line ranker segment cannot.
 
     ``num_bettors`` is the MARKET's ``uniqueBettorCount``, copied onto every child: Manifold scores
     participation on bettors and publishes no per-answer count, so this is the honest figure for each
     answer (they share one bettor pool) and it makes each sub-row's ``signal`` cell agree with its
-    parent's instead of reading a false ``no-liquidity-data``.
+    parent's instead of reading a false ``no-liquidity-data``. Each answer's OWN ``volume`` outranks
+    it in the label, though — a zero there reads ``thin`` whatever the market's pool is
+    (``liquidity_label_from_fields``), because the shared pool cannot vouch for a rung nobody bet on,
+    and the untouched-prior answers this parser blanks a price for were reading ``high``.
     """
     answers = detail.get("answers")
     if not isinstance(answers, list):
@@ -342,20 +396,22 @@ def manifold_answer_children(detail: dict[str, Any]) -> tuple[MarketChild, ...]:
         if not isinstance(answer, dict):
             continue
         text = " ".join(str(answer.get("text") or "").split())
-        probability = safe_float(answer.get("probability"))
-        if not text or probability is None:
+        raw_probability = safe_float(answer.get("probability"))
+        volume = safe_float(answer.get("volume"))
+        if not text or raw_probability is None:
             continue
+        probability = _priced_or_none(raw_probability, volume=volume)
         children.append(
             MarketChild(
                 title=text[:MANIFOLD_ANSWER_TEXT_MAX_CHARS],
                 implied_prob_yes=probability,
-                total_volume=safe_float(answer.get("volume")),
+                total_volume=volume,
                 num_bettors=num_bettors,
                 # A resolved answer carries a `resolution` verdict ("YES"/"NO"); an open one carries
                 # null. On a threshold ladder the crossed rungs settle individually while the market
                 # stays open, so this is per-answer rather than the market's own flag.
                 is_resolved=bool(answer.get("resolution")),
+                price_withheld=probability is None,
             )
         )
-    children.sort(key=lambda child: (child.is_resolved, -(child.implied_prob_yes or 0.0)))
     return tuple(children)

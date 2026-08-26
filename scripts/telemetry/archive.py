@@ -117,6 +117,16 @@ def merge_and_write(archive_dir: Path, runs: list[HarvestedRun]) -> dict[str, in
 
 def _merge_manifest(archive_dir: Path, runs: list[HarvestedRun], replaced_run_ids: set[str]) -> None:
     existing = load_run_manifest(archive_dir)
+    existing_workflows = {str(r.get("run_id", "")): str(r.get("workflow", "")) for r in existing}
+    downgraded = sum(
+        1 for run in runs if run.workflow == "unknown" and existing_workflows.get(run.run_id, "") not in ("", "unknown")
+    )
+    if downgraded:
+        logger.warning(
+            f"{downgraded} of {len(runs)} harvested run(s) overwrite a concrete archived workflow label with "
+            f"'unknown' in {archive_dir} — the resolved workflow map supplied no label for runs the archive "
+            f"already attributes"
+        )
     kept = [r for r in existing if r.get("run_id") not in replaced_run_ids]
     incoming = [
         {

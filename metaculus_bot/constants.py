@@ -431,6 +431,34 @@ RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = (
 )
 RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
 RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
+# --- Datawrapper second hop (Tier 2) ---
+# Poll-tracker pages lock their resolving daily series inside Datawrapper
+# iframes that trafilatura drops (qids 44858/44841). The hop fetches the
+# version-free live dataset (static.dwcdn.net/data/<id>.csv) for charts found
+# in a fetched page's raw HTML.
+RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS: int = (
+    3  # datasets per question; hero/resolving chart is ~always first in document order (Trump tracker carries 5 embeds)
+)
+# The hop runs as a SECOND network phase after the Tier-1 page gather, inside the same
+# 45s provider wall, and the datasets share one CDN host so the per-host politeness
+# semaphore serializes them (worst case MAX_CHARTS x the 20s HTTP timeout = 60s > the
+# wall). Bounding the hop at whatever wall budget remains — and skipping it below this
+# floor — is what keeps a slow CDN tail from cancelling the whole provider and throwing
+# away Tier-1 pages that already fetched. The floor admits at least one typical dwcdn
+# fetch (a poll CSV is tens of KB off a CDN, sub-second-to-~2s — same probe basis as the
+# HTTP timeout's "0-2s typical"); below it the hop cannot land anything and the pages
+# are worth more than the attempt.
+RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S: float = 3.0
+# Wall margin the hop leaves the outer wait_for, so the inner bound fires first and the
+# provider returns the pages instead of being cancelled mid-render.
+RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S: float = 2.0
+# Per-dataset render cap, deliberately WELL under the 6,000-char page cap: a
+# middle-truncated daily series keeps ~12 rows at each end per 1,000 chars, so 3,000
+# still carries weeks of values around today, and the formatter budgets datasets against
+# their own allowance (MAX_CHARTS x this) so a chart's data can never evict the cited
+# page text the section exists to serve.
+RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS: int = 3000
+RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS: float = 30.0  # freshness bound on the dataset's Last-Modified vs fetch time. Live trackers republish at least daily; the stale-route failure class this guards against served 5-14 MONTH old snapshots as HTTP 200 (2026-08-24 verifications). Older/undatable data is withheld (stale_data), never served as live.
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
@@ -588,9 +616,22 @@ FRED_API_KEY_ENV: str = "FRED_API_KEY"
 # tier (mini → luna 2026-08-03, when luna's markdown made it cheaper than mini).
 FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5.6-luna"
 FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
-FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 365
+# Calendar-day lookback behind every yfinance history() fetch. BOTH paths (live and
+# backtest) fetch by explicit start date = as_of − this many days, end-inclusive, so the
+# window holds LOOKBACK+1 calendar dates. Never spent as a bare `period="Nd"`: Yahoo's
+# chart API reads that custom range as N trading BARS for listed assets but ~N calendar
+# DATES for 24/7 ones — one integer under two unit systems, which is how the listed-asset
+# backtest margin was never sized at all. Sized so the deepest consumers clear on BOTH
+# daily-bar bases, with real headroom:
+#   - 365 basis (24/7 markets): the "1y" return needs an observation ≥366 days back, and
+#     the 52-week slice wants 365 rows → 391 dates leave ~25 Yahoo gap-days of tolerance
+#     (the old 372 left 6, and a persistent one-day BTC-USD hole has been observed live).
+#   - 252 basis (exchange-traded): the "1y" return reaches ~365 calendar days back and
+#     the 52-week slice wants 252 bars → 391 dates ≈ 265 bars at the worst observed NYSE
+#     density (253 bars per 373-date window, measured over three years of real SPY
+#     windows), ~12 bars of margin where the old 372 measured margin EXACTLY zero.
+FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 390
 FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
-FINANCIAL_FRED_LOOKBACK_YEARS: int = 5
 # Cap on how many tickers + FRED series one question may fetch. The identifier list is
 # whatever an LLM classifier named plus whatever URL extraction found, and it was
 # previously unbounded: each identifier gets its own asyncio.to_thread, all of them
@@ -645,6 +686,62 @@ PER_QUESTION_WALL_CLOCK_DEADLINE: int = 3510
 # POST plus the comment POST, each up to
 # PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1) — plus headroom.
 WALL_CLOCK_STACKING_MIN_BUDGET: int = 90
+
+# --- Close-aware per-question time budget (metaculus_bot/time_budget.py) ---
+# PER_QUESTION_WALL_CLOCK_DEADLINE above is sized against the CRON PERIOD, not
+# against a question's own deadline, so on its own it lets a question closing in
+# 20 minutes spend 58.5. These three size the close-derived budget that bounds it.
+#
+# Time held back from the budget so the PREDICTION POST can still land: ft's
+# _post_question_prediction opens with one _sleep_between_requests (3.5-4.5s)
+# before the POST, and publish_hardening bounds that POST at
+# PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1) = 40s. 60 leaves ~15s slack.
+# Deliberately SMALLER than WALL_CLOCK_STACKING_MIN_BUDGET, which reserves for
+# BOTH POSTs: only the prediction has to beat the close, and a comment posted a
+# few seconds late is still accepted.
+PUBLISH_RESERVE_SECONDS: int = 60
+
+# Below this effective budget, drop the OPTIONAL research stages (every provider
+# but the primary, plus both gap-fill passes) and publish on the fast path.
+# Sized at EXACTLY the full pipeline's configured worst case: research 1155s
+# (provider phase 600 = AskNews 300 + summarizer 300 sequential inside one
+# provider; then gap-fill 555 = analyzer 135 + resolver wave 420)
+# + FORECASTER_SOFT_DEADLINE 600 + the publish tail 60 = 1815s. So the rule
+# reads: stop running the optional stages once the full pipeline's worst case no
+# longer fits the window — the value IS that sum, so there is no band where the
+# envelope doesn't fit but the fast path stays off. (SUMMARIZER_WALL_TIMEOUT is
+# defined further down this file, which is why the sum is stated rather than
+# spelled as an expression.) Measured false-positive cost is zero — 0 of 99
+# published triple-era questions had less than 54 minutes of headroom at run
+# start (scratch/residual_2026-08-24/time_budget_design.md), and the optional
+# stages are worth 84s (gap-fill v2 p50) to 183s (dropping the provider tail at
+# its observed max).
+TIME_BUDGET_FAST_PATH_THRESHOLD: int = 1815
+
+# Below this budget the question is skipped at INTAKE rather than run on the
+# fast path: the minimum viable path is the primary provider (measured worst
+# ~110s live; the research phase's half-share of a 300s budget is 150s) plus at
+# least one reasoning forecaster (typical completions run 100-300s against
+# FORECASTER_SOFT_DEADLINE 600; the other half-share of 300s fits only the
+# fastest of them). Below ~5 minutes even that path essentially never lands —
+# the fan-out produces 0 valid forecasters and the min-forecasters guard drops
+# the question AFTER spending — so the intake skip converts guaranteed-wasted
+# spend into an immediate forfeit with a log line naming the close time.
+TIME_BUDGET_MIN_VIABLE_S: int = 300
+
+# Fraction of the TOTAL budget granted to the research phase as ONE fixed window
+# anchored at the budget's start (research_phase_deadline_s = total*share −
+# elapsed), enforced as a deadline on the parallel-provider phase and on each
+# gap-fill pass. Fixed rather than a rolling share of remaining: research
+# consults the deadline at two sequential points, and re-taking 50% of remaining
+# at each compounds to ~75% of the budget — leaving the fan-out under its own
+# soft deadline on the close-limited band this budget exists for. The fixed
+# window guarantees forecast-and-publish the complementary half, and a slow
+# intake spends research's half, not the forecast's. At the static 3510s budget
+# the window is ~1755s, well above research's 1155s configured worst case, so it
+# never fires on a roomy question; at a close-limited 2400s budget it splits
+# 1200 research / 1200 forecast-and-publish.
+RESEARCH_PHASE_BUDGET_SHARE: float = 0.5
 
 # Per-publish-POST timeout (post_binary/numeric/mc + post_question_comment).
 # Stock forecasting-tools uses synchronous `requests.post` with no timeout, so

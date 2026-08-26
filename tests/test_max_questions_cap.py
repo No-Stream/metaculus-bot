@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -8,16 +9,21 @@ from forecasting_tools.forecast_bots.forecast_bot import ForecastBot
 from main import TemplateForecaster
 
 
-def _supported_question(done: bool = False) -> MetaculusQuestion:
+def _supported_question(done: bool = False, closes_in: timedelta | None = None) -> MetaculusQuestion:
     """A stand-in question that survives forecast_questions' unsupported-type gate.
 
     forecast_questions drops anything that is not Binary/MC/Numeric up front, so a
     bare object no longer reaches the cap/skip logic. A spec'd MagicMock passes
     ``isinstance(q, BinaryQuestion)`` while letting us set ``already_forecasted``
-    for the skip filter — the cap logic never touches any other attribute.
+    for the skip filter.
+
+    ``close_time`` has to be set explicitly because ``spec=BinaryQuestion`` does not
+    expose Pydantic field names as class attributes, and forecast_questions now sorts
+    on it (tightest close first, so the cap keeps the most urgent questions).
     """
     q = MagicMock(spec=BinaryQuestion)
     q.already_forecasted = done
+    q.close_time = datetime.now(timezone.utc) + (closes_in if closes_in is not None else timedelta(days=1))
     return cast(MetaculusQuestion, q)
 
 
