@@ -576,7 +576,7 @@ class TestLadderSectionBudget:
 
         title = _ladder_titles(rendered)[0]
         assert len(title) <= LADDER_ROW_MAX_CHARS
-        assert re.search(r"\+\d+ more \(\d+\.\d\d summed\)$", title), title
+        assert re.search(r"\+\d+ more \(\d+ priced, \d+\.\d\d summed\)$", title), title
         assert stats.named >= 1
         assert stats.named + stats.collapsed == stats.outcomes
 
@@ -638,7 +638,7 @@ class TestLadderSectionBudget:
         for title in titles:
             assert len(title) <= max(LADDER_SECTION_MAX_CHARS // len(titles), LADDER_MIN_ROW_CHARS)
             assert _ladder_terms(title), "a hard-bounded row still names its most informative outcome"
-            assert re.search(r"\+\d+ more \(\d+\.\d\d summed\)$", title), title
+            assert re.search(r"\+\d+ more \(\d+ priced, \d+\.\d\d summed\)$", title), title
 
     def test_an_unquoted_outcome_is_the_first_thing_a_hard_bound_drops(self) -> None:
         """A hard bound spends its characters on prices, so an outcome carrying none goes first.
@@ -663,9 +663,12 @@ class TestLadderSectionBudget:
         named = _ladder_terms(title)
         assert named and all(price is not None for _, price, _ in named)
         # The remainder's summed price counts the dropped PRICED rungs only, so the three unquoted ones
-        # are inside the count and contribute nothing to the sum — which is what makes the figure honest.
+        # are inside the count and contribute nothing to the sum. The row now STATES that denominator:
+        # the count the sum covers used to be invisible, so `+160 more (78.50 summed)` read as 78.50
+        # across 160 outcomes when it was 78.50 across 157 — and on a settled ladder the same shape hid
+        # rungs realized at 1.00.
         dropped_priced = stats.collapsed - 3
-        assert f"+{stats.collapsed} more ({dropped_priced * 0.5:.2f} summed)" in title
+        assert f"+{stats.collapsed} more ({dropped_priced} priced, {dropped_priced * 0.5:.2f} summed)" in title
         assert stats.named + stats.collapsed == stats.outcomes
 
 

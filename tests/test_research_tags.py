@@ -28,10 +28,18 @@ def _record(
     diagnostics_block: str | None = None,
     gap_fill_v2: dict | None = None,
     is_trimmed: bool | None = None,
+    schema_version: int | None = 2,
 ) -> dict:
+    """One archive record. Defaults to the modern schema-v2 artifact writer.
+
+    ``schema_version`` is load-bearing for the gfv2 tags: only a schema-v2 artifact
+    record can carry the ``gap_fill_v2`` payload, so on anything else the absence of
+    that payload is unrecorded rather than measured (see ``_writer_can_carry_gfv2_payload``).
+    """
     return {
         "research_text": text,
         "source": source,
+        "schema_version": schema_version,
         "provider_diagnostics_block": diagnostics_block,
         "gap_fill_v2": gap_fill_v2,
         "is_trimmed": is_trimmed,
@@ -92,6 +100,7 @@ class TestGfv2SectionVsTranscript:
         )
         assert tags["gfv2_present"] is True
         assert tags["gfv2_loop_ran"] is True
+        assert tags["gfv2_confidence"] == "header"
 
     def test_transcript_without_section_is_not_treatment(self):
         # The v2 driver banks a transcript even when it soft-fails and contributes no
@@ -99,15 +108,71 @@ class TestGfv2SectionVsTranscript:
         tags = research_tags_for_record(_record("## News Articles (AskNews)\n", gap_fill_v2={"steps": 0}))
         assert tags["gfv2_present"] is False
         assert tags["gfv2_loop_ran"] is True
+        assert tags["gfv2_confidence"] == "payload_ran_no_section"
 
     def test_neither(self):
         tags = research_tags_for_record(_record("## News Articles (AskNews)\n"))
         assert tags["gfv2_present"] is False
         assert tags["gfv2_loop_ran"] is False
+        assert tags["gfv2_confidence"] == "payload_confirms_absent"
 
     def test_reheaded_gfv2_section(self):
         tags = research_tags_for_record(_record("### Agentic Research Findings\n", source="comment_backfill"))
         assert tags["gfv2_present"] is True
+
+
+class TestGfv2LoopRanIsTernary:
+    """The fix that keeps the planned v2 treated/untreated split honest.
+
+    ``bool(record.get("gap_fill_v2"))`` collapsed "this writer cannot carry the field"
+    into False, which put 880 archived can't-carry records into the untreated arm
+    against 77 measured ones. Only a schema-v2 artifact record can carry the payload:
+    that writer omits the key when the loop did not run, so there its absence IS the
+    measurement, and everywhere else it is silence.
+    """
+
+    def test_comment_backfill_record_reads_none_not_false(self):
+        tags = research_tags_for_record(
+            _record("### News Articles (AskNews)\n", source="comment_backfill", schema_version=1)
+        )
+        assert tags["gfv2_loop_ran"] is None
+        assert tags["gfv2_confidence"] == "absent_no_payload"
+
+    def test_schema_v1_artifact_record_reads_none_not_false(self):
+        # A live-capture record from before the payload existed. The run may well have
+        # had v2 on; the writer simply had nowhere to say so.
+        tags = research_tags_for_record(_record("## News Articles (AskNews)\n", schema_version=1))
+        assert tags["gfv2_loop_ran"] is None
+
+    def test_missing_schema_version_reads_none_not_false(self):
+        tags = research_tags_for_record(_record("## News Articles (AskNews)\n", schema_version=None))
+        assert tags["gfv2_loop_ran"] is None
+
+    def test_trimmed_uncarryable_record_is_flagged_ambiguous(self):
+        # The middle-trim keeps head + tail, so a v2 section sitting mid-bundle can be
+        # eaten — the False header read is not evidence of an untreated question.
+        tags = research_tags_for_record(
+            _record("tail only", source="comment_backfill", schema_version=1, is_trimmed=True)
+        )
+        assert tags["gfv2_present"] is False
+        assert tags["gfv2_loop_ran"] is None
+        assert tags["gfv2_confidence"] == "ambiguous_trimmed_no_payload"
+
+    def test_a_section_proves_the_loop_ran_whatever_the_writer(self):
+        # The section IS the loop's output, so it cannot exist without a run. That
+        # observation is independent of whether the writer could bank the payload.
+        tags = research_tags_for_record(
+            _record("### Agentic Research Findings\n", source="comment_backfill", schema_version=1)
+        )
+        assert tags["gfv2_loop_ran"] is True
+        assert tags["gfv2_confidence"] == "header"
+
+    def test_a_null_payload_is_not_a_recorded_loop(self):
+        # The writer only ever writes a non-None payload, but a null must never read as
+        # a run — that is the same key-present-but-empty trap the bool() collapse was.
+        tags = research_tags_for_record(_record("## News Articles (AskNews)\n", gap_fill_v2=None))
+        assert tags["gfv2_loop_ran"] is False
+        assert tags["gfv2_confidence"] == "payload_confirms_absent"
 
 
 class TestAbsentArchiveRecord:
@@ -117,6 +182,7 @@ class TestAbsentArchiveRecord:
             "anchor_present": None,
             "gfv2_present": None,
             "gfv2_loop_ran": None,
+            "gfv2_confidence": None,
             "anchor_confidence": None,
             "research_source_class": None,
         }

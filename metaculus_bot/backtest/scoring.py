@@ -194,7 +194,19 @@ def mc_log_score_from_report(report: MultipleChoiceReport, correct_option: str) 
             opt.option_name: opt.probability for opt in report.prediction.predicted_options
         }
 
-        predicted_probs = [option_probs.get(opt, 0.0) for opt in options]
+        # A missing option means the ballot doesn't cover the question, so there is no
+        # probability to score. The old `.get(opt, 0.0)` scored it as "we assigned the
+        # option zero" — and if that option is the one that resolved, the log score is the
+        # worst value the scale has. Unreachable today (upstream validation forces the full
+        # option set), so this returns None the way every other unscoreable shape here does.
+        missing_options = [opt for opt in options if opt not in option_probs]
+        if missing_options:
+            logger.warning(
+                f"MultipleChoiceReport ballot is missing question options {missing_options}; cannot score this question"
+            )
+            return None
+
+        predicted_probs = [option_probs[opt] for opt in options]
         options_list = list(options)
         try:
             correct_index = options_list.index(correct_option)

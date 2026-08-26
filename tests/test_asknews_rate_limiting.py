@@ -84,5 +84,8 @@ async def test_asknews_calls_both_endpoints():
             assert "news knowledge" in search_calls
             assert len(search_calls) == 2
 
-            # Verify result format
-            assert "No articles were found" in result
+            # Both endpoints fired and returned nothing, so the provider contributes "".
+            # The old assertion here was the "No articles were found" sentence, which read
+            # downstream as research; this test's subject is the two-endpoint call pattern
+            # above, which is unchanged.
+            assert result == ""

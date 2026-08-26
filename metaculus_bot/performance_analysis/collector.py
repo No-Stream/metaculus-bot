@@ -393,7 +393,19 @@ def _process_single_question(
         # was captured; always populated on fresh pulls of resolved questions.
         "metaculus_scores": metaculus_scores,
         "metadata": {
-            "nr_forecasters": q.get("nr_forecasters", 0),
+            # The Metaculus CROWD size, which lives on the POST, not on the question
+            # (verified against archived post payloads: every post carries
+            # ``nr_forecasters`` and ``forecasts_count``; no question dict carries
+            # either). Reading it off ``q`` with a 0 default made the field read 0 in
+            # all 2196 records ever pulled, which is not "no crowd" — it is "never
+            # read" — and it silently killed audit.py's own ``n/a`` fallback, since a
+            # real 0 is not a missing key. None when the post genuinely omits it, so a
+            # crowd-size cut can drop those records instead of averaging a fabricated
+            # zero into them. HISTORICAL RECORDS STAY 0: nothing rewrites the archive,
+            # so a reader must treat metadata.nr_forecasters == 0 on a pre-2026-08-25
+            # pull as unknown rather than as a measurement (fresh pulls carry real
+            # counts, typically 100-250 on tournament questions).
+            "nr_forecasters": post_data.get("nr_forecasters"),
             "open_time": q.get("open_time"),
             "actual_resolve_time": q.get("actual_resolve_time"),
             "scheduled_resolve_time": q.get("scheduled_resolve_time"),
@@ -511,10 +523,13 @@ def build_performance_dataset(
     Token defaults to METACULUS_TOKEN env var.
 
     Each record is also stamped with the research-archive treatment tags
-    (``anchor_present`` / ``gfv2_present`` / ``gfv2_loop_ran`` /
+    (``anchor_present`` / ``gfv2_present`` / ``gfv2_loop_ran`` / ``gfv2_confidence`` /
     ``anchor_confidence`` / ``research_source_class``) read off
     ``research_archive_dir``; questions with no archive record — including every
-    record when the archive isn't on disk — carry None on all five, never False.
+    record when the archive isn't on disk — carry None on all six, never False.
+    ``gfv2_loop_ran`` is additionally None on any record whose writer could not have
+    carried the v2 payload, so the untreated arm of a v2 cut holds only measured
+    Falses (see :mod:`metaculus_bot.performance_analysis.research_tags`).
     """
     if token is None:
         token = os.environ["METACULUS_TOKEN"]

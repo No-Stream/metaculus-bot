@@ -37,8 +37,10 @@ from metaculus_bot.performance_analysis.collector import (
     save_dataset,
 )
 from metaculus_bot.performance_analysis.parsing import (
+    MIN_SCOREABLE_ANCHORS,
     annotate_forecaster_bullets_with_models,
     anonymous_model_key,
+    declared_anchors,
     detect_historical_stacker_signature,
     extract_model_display_name_from_reasoning,
     is_anonymous_model_key,
@@ -51,6 +53,11 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_stacked_marker,
     parse_stacker_outcome_marker,
     parse_stacker_skip_reason_marker,
+)
+from metaculus_bot.performance_analysis.ranking_cohort import (
+    PerModelRankingCohort,
+    log_ranking_cohort,
+    per_model_ranking_cohort,
 )
 from metaculus_bot.performance_analysis.research_tags import (
     attach_research_tags,
@@ -75,6 +82,8 @@ from metaculus_bot.performance_analysis.stacker_detection import (
 
 __all__ = [
     "DetectorVerdict",
+    "MIN_SCOREABLE_ANCHORS",
+    "PerModelRankingCohort",
     "annotate_forecaster_bullets_with_models",
     "anonymous_model_key",
     "attach_research_tags",
@@ -83,6 +92,7 @@ __all__ = [
     "brier_score",
     "build_performance_dataset",
     "compute_production_vs_median_delta",
+    "declared_anchors",
     "declared_percentile_pit",
     "detect_historical_stacker_signature",
     "detect_stacker_fired",
@@ -103,6 +113,7 @@ __all__ = [
     "is_anonymous_model_key",
     "load_combined_dataset",
     "load_dataset",
+    "log_ranking_cohort",
     "max_step_clamp_screen",
     "mc_log_score",
     "mc_summary",
@@ -120,6 +131,7 @@ __all__ = [
     "parse_stacker_skip_reason_marker",
     "per_model_binary_scores",
     "per_model_cohort",
+    "per_model_ranking_cohort",
     "rank_our_models_by_accuracy",
     "rescore_records",
     "research_tags_for_qid",

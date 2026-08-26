@@ -214,7 +214,11 @@ def _polymarket_event_match(event: dict[str, Any], rank: int) -> MarketMatch:
         bid=bid,
         ask=ask,
         spread=(ask - bid) if (bid is not None and ask is not None) else None,
-        volume_24h=vol_24h if vol_24h is not None else volume,
+        # No lifetime-volume substitute when `volume24hr` is absent. It was silently
+        # carrying all-time volume on 25 of 122 archived rows — a recency field holding a
+        # number with no recency, which is only harmless while nothing reads it. None says
+        # "the venue didn't publish a 24h figure", which is what happened.
+        volume_24h=vol_24h,
         close_time=parse_iso(event.get("endDate") or event.get("end_date_iso") or ""),
         is_resolved=bool(event.get("closed")) or bool(event.get("resolved")),
         match_confidence=100.0 - rank,

@@ -602,7 +602,13 @@ def emit_miss_markdown(
     lines.append(f"- **Resolved**: {_format_resolution(record)}")
     lines.append(f"- **Our prediction**: {_format_our_prediction(record)}")
     lines.append(f"- **Score**: {_format_score_header(record)}")
-    lines.append(f"- **nr_forecasters**: {meta.get('nr_forecasters', 'n/a')}")
+    # Three states, not two. Absent or None means the collector never read a crowd size;
+    # a literal 0 means it read one and it was zero. Every record pulled before
+    # 2026-08-25 carries 0 for the first reason (the collector read the field off the
+    # question dict, which never carries it), so the two must render differently or a
+    # dossier reader has no way to tell an unmeasured crowd from an empty one.
+    crowd = meta.get("nr_forecasters")
+    lines.append(f"- **nr_forecasters**: {'n/a' if crowd is None else crowd}")
     was_stacked = record.get("was_stacked")
     lines.append(f"- **was_stacked**: {'unknown' if was_stacked is None else was_stacked}")
     category = meta.get("category")

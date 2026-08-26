@@ -308,6 +308,16 @@ class DatawrapperChartRef:
     title: str | None
 
 
+def _within_one_tag(html_text: str, start: int, end: int) -> bool:
+    """True when ``html_text[start:end]`` crosses no tag boundary.
+
+    The proximity window alone cannot tell "this iframe's own title" from "a share
+    button's title 200 chars earlier". A `>` or `<` between the two means they live on
+    different elements, so the candidate is not this chart's title.
+    """
+    return "<" not in html_text[start:end] and ">" not in html_text[start:end]
+
+
 def extract_datawrapper_charts(html_text: str) -> list[DatawrapperChartRef]:
     """Scan RAW page HTML for Datawrapper chart embeds.
 
@@ -319,6 +329,15 @@ def extract_datawrapper_charts(html_text: str) -> list[DatawrapperChartRef]:
     hero/resolving chart first). Titles are best-effort: the JSON-attrs form
     is searched forward of the URL (bounded at the next embed so a titleless
     chart can't steal its neighbour's), the iframe-attribute form backward.
+
+    Both forms are additionally anchored to the URL's own TAG: a candidate with a
+    tag boundary between it and the chart URL is rejected. Without that, the window
+    alone let an unrelated `title="Share on X"` or an `og:title` on a neighbouring
+    element render as the chart's identity inside the Tier-2 lead — the lead names
+    the chart it is serving data for, so a borrowed title is a false claim about
+    which series the forecaster is reading. Both real layouts sit inside one tag
+    (the Substack `data-attrs` JSON blob, and an iframe's own `title=`), so the
+    anchor costs nothing on them.
     """
     if not html_text:
         return []
@@ -336,13 +355,17 @@ def extract_datawrapper_charts(html_text: str) -> list[DatawrapperChartRef]:
             forward_end = min(forward_end, matches[i + 1].start())
         raw_title: str | None = None
         json_match = _DW_TITLE_JSON_RE.search(html_text, m.end(), forward_end)
-        if json_match is not None:
+        if json_match is not None and _within_one_tag(html_text, m.end(), json_match.start()):
             raw_title = json_match.group(1)
         else:
             backward_start = max(0, m.start() - _DW_TITLE_BACKWARD_WINDOW)
             if i > 0:
                 backward_start = max(backward_start, matches[i - 1].end())
-            attr_matches = list(_DW_TITLE_ATTR_RE.finditer(html_text, backward_start, m.start()))
+            attr_matches = [
+                match
+                for match in _DW_TITLE_ATTR_RE.finditer(html_text, backward_start, m.start())
+                if _within_one_tag(html_text, match.end(), m.start())
+            ]
             if attr_matches:
                 # The attr pattern alternates on quote style; exactly one group is set.
                 raw_title = attr_matches[-1].group(1) or attr_matches[-1].group(2)

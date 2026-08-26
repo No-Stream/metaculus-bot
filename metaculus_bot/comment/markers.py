@@ -83,12 +83,17 @@ STACKER_OUTCOME_RE: re.Pattern[str] = re.compile(
 # new outcome value: STACKER_OUTCOME stays byte-stable for every existing parser
 # of the legacy value. ``config_off`` restates skipped_config_off's reason so the
 # field is self-contained.
+# ``spread_undefined`` is the fifth and rarest: the spread could not be MEASURED at all
+# (a non-positive normalizing denominator — see spread_metrics' SPREAD_UNDEFINED WARN), so
+# the routing decision rests on no measurement. It must not read as
+# ``spread_below_threshold``, which is an affirmative "the models agreed".
 STACKER_SKIP_REASONS: frozenset[str] = frozenset(
-    {"spread_below_threshold", "config_off", "single_forecaster", "wall_clock_budget"}
+    {"spread_below_threshold", "spread_undefined", "config_off", "single_forecaster", "wall_clock_budget"}
 )
 
 STACKER_SKIP_REASON_RE: re.Pattern[str] = re.compile(
-    r"<!--\s*STACKER_SKIP_REASON=(spread_below_threshold|config_off|single_forecaster|wall_clock_budget)\s*-->",
+    r"<!--\s*STACKER_SKIP_REASON="
+    r"(spread_below_threshold|spread_undefined|config_off|single_forecaster|wall_clock_budget)\s*-->",
     re.IGNORECASE,
 )
 

@@ -58,9 +58,10 @@ def sanitize_percentiles(
     """Filter, validate, sort, jitter, and optionally widen percentile declarations.
 
     ``model_name`` only labels the ``NUMERIC_DEGENERATE_DECLARATION`` marker (the
-    forecaster whose declaration collapsed); callers that don't know which model
-    produced the percentiles leave it empty and the marker reads
-    ``model=unknown``.
+    forecaster whose declaration collapsed). All three production callers pass it —
+    ``forecaster_runners`` the forecaster, ``aggregation_pipeline`` and
+    ``ablation.run_stacker`` the stacker — so a ``model=unknown`` in the archive means a
+    NEW caller forgot to, not that the field is unavailable.
     """
 
     filtered = filter_to_standard_percentiles(percentile_list)

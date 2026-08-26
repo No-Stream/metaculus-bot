@@ -150,6 +150,30 @@ class TestRenderSingle:
         h = horizon_steps(series_clock(pd.DatetimeIndex(series.index)), 14)
         assert f"~{series.size // h:,} independent" in out
 
+    def test_stale_series_renames_the_range_instead_of_claiming_52_weeks(self):
+        """A discontinued series has no observation inside the trailing year, and the whole
+        history is the only band there is — but rendering it as a "52-week range" states a
+        recency the numbers don't have (a 2019 high reads as this year's)."""
+        series = _daily_positive_series("^DEAD", end="2024-06-28", years=2)
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^DEAD"), label="Dead index")
+
+        out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        first_date = pd.DatetimeIndex(series.index).min().strftime("%Y-%m-%d")
+        assert "52-week range" not in out
+        assert f"full-history range ({first_date} to 2024-06-28; no observation inside the trailing year)" in out
+        # The band itself still renders — the fallback carries real information.
+        assert "of the way up the range" in out or "range is flat" in out
+
+    def test_a_current_series_keeps_the_52_week_label(self):
+        series = _daily_positive_series("^VIX")
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^VIX"), label="CBOE VIX")
+
+        out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        assert "- 52-week range:" in out
+        assert "full-history range" not in out
+
     def test_note_rendered_and_band_withheld_when_not_model_target(self):
         series = _daily_positive_series("PAYEMS")
         route = _Route(
@@ -167,6 +191,44 @@ class TestRenderSingle:
         # model_target=False -> no empirical band emitted at all.
         assert "P10 / P50 / P90" not in out
         assert "empirical band" not in out.lower()
+
+    def test_todays_bar_marked_in_progress_on_a_live_ceiling(self, monkeypatch: pytest.MonkeyPatch):
+        """A latest bar dated the fetch ceiling, rendered the same day, is still forming —
+        and the empirical band anchors on it, so the header must say so. ``_today_utc``
+        is frozen to the fixture's ceiling to simulate the live case deterministically."""
+        series = _daily_positive_series("^VIX")
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^VIX"), label="CBOE VIX")
+        monkeypatch.setattr(tsrender, "_today_utc", lambda: date(2026, 6, 30))
+
+        out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        assert "as of 2026-06-30 — today's bar, in progress;" in out.splitlines()[0]
+
+    def test_no_in_progress_marker_when_the_ceiling_is_a_past_date(self):
+        """The benchmark shape: the bar is dated the ceiling, but the render runs later
+        (the wall clock is NOT frozen), so the same-dated bar is a completed historical
+        one and must not be called in-progress."""
+        series = _daily_positive_series("^VIX")
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^VIX"), label="CBOE VIX")
+
+        out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        assert "in progress" not in out
+        assert "⚠" not in out  # a latest AT the ceiling is fresh, not stale
+
+    def test_stale_daily_latest_gets_a_note_and_a_warn(self, caplog: pytest.LogCaptureFixture):
+        """A daily series whose newest bar is years older than the ceiling: the 52-week
+        fallback already renames the range, but the header's latest value — the number
+        the band is applied to — needs its own staleness flag, in render and run logs."""
+        series = _daily_positive_series("^DEAD", end="2024-06-28", years=2)
+        route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^DEAD"), label="Dead index")
+
+        with caplog.at_level(logging.WARNING):
+            out, _ = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+
+        age = (date(2026, 6, 30) - date(2024, 6, 28)).days
+        assert f"⚠ Latest observation is {age} days old" in out
+        assert f"FINANCIAL_STALE_LATEST: surface=ts_anchor symbol=^DEAD age_d={age} cadence=trading-day" in caplog.text
 
 
 class TestRenderSpread:

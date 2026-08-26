@@ -455,6 +455,26 @@ class TestCollectorCommentCreatedAt:
         assert len(records) == 1
         assert records[0]["bot_comment_created_at"] is None
 
+    def test_crowd_size_is_read_off_the_post_not_the_question(self):
+        """``nr_forecasters`` is a POST field; reading it off the question dict with a 0
+        default made it read 0 in all 2196 archived records — "never read", rendered as a
+        measured empty crowd. This fixture deliberately keeps the decoy on the question."""
+        post = self._post_data(5, 55)
+        post["nr_forecasters"] = 170
+        records = _process_post(post, {})
+
+        assert records[0]["metadata"]["nr_forecasters"] == 170
+
+    def test_a_post_with_no_crowd_field_reads_none_not_zero(self):
+        # None means "the post didn't say", which a crowd-size cut can drop. A 0 would
+        # average a fabricated empty crowd into the cut, and would also silently kill
+        # audit.py's `n/a` fallback (a real 0 is not a missing key).
+        post = self._post_data(6, 66)
+        post.pop("nr_forecasters", None)
+        records = _process_post(post, {})
+
+        assert records[0]["metadata"]["nr_forecasters"] is None
+
     def test_record_has_none_when_comment_lacks_created_at(self):
         post = self._post_data(3, 33)
         comment = {"id": 1000, "text": "*Forecaster 1*: 70%\n", "on_post": 3}
@@ -684,9 +704,15 @@ class TestInterpolatePit:
         result = _interpolate_pit(50.0, lower, upper, cdf, value_grid=bad_grid, zero_point=None)
         assert result == pytest.approx(0.5)
 
-    def test_degenerate_range_returns_half(self):
+    def test_degenerate_range_raises_instead_of_answering_with_the_best_case(self):
+        """A zero-width question has no PIT. This used to return 0.5, which is the single most
+        favorable value available — inside BOTH coverage bands — so a degenerate record
+        silently improved every calibration statistic it entered. The caller screens the
+        range now (see ``TestDeclaredPercentilePitDropsDegenerateRanges``)."""
         cdf = list(np.linspace(0.0, 1.0, 201))
-        assert _interpolate_pit(5.0, 10.0, 10.0, cdf) == pytest.approx(0.5)
+
+        with pytest.raises(ValueError, match="degenerate question range"):
+            _interpolate_pit(5.0, 10.0, 10.0, cdf)
 
 
 class TestInterpolatePitOutOfGrid:
@@ -774,6 +800,39 @@ class TestInterpolatePitOutOfGrid:
         assert result["pit_values"][0] == pytest.approx(0.10, abs=1e-9)
 
 
+class TestDeclaredPercentilePitDropsDegenerateRanges:
+    """A zero-width question contributes no PIT rather than the most favorable one.
+
+    ``_interpolate_pit`` used to answer 0.5 there, which is inside both coverage bands, so a
+    degenerate record silently improved every calibration statistic it entered.
+    """
+
+    @staticmethod
+    def _record(range_min: float, range_max: float) -> dict:
+        return {
+            "post_id": 1,
+            "type": "numeric",
+            "our_forecast_values": list(np.linspace(0.0, 1.0, 201)),
+            "resolution_parsed": 5.0,
+            "scaling": {"range_min": range_min, "range_max": range_max, "zero_point": None},
+            "open_lower_bound": False,
+            "open_upper_bound": False,
+            "numeric_log_score": 0.0,
+            "metadata": {"category": None},
+        }
+
+    def test_zero_width_record_is_dropped_not_scored_at_half(self):
+        assert numeric_pit_analysis([self._record(10.0, 10.0)]) == {"count": 0}
+
+    def test_an_inverted_range_is_dropped_too(self):
+        assert numeric_pit_analysis([self._record(10.0, 5.0)]) == {"count": 0}
+
+    def test_a_real_range_still_scores(self):
+        result = numeric_pit_analysis([self._record(0.0, 100.0)])
+
+        assert result["count"] == 1
+
+
 class TestDeclaredPercentileCurveTolerance:
     """Member curves come out of comment TEXT, so the fallback must tolerate junk.
 
@@ -797,6 +856,24 @@ class TestDeclaredPercentileCurveTolerance:
     def test_pair_missing_its_value_is_unusable(self):
         # A truncated line recovered as a bare percentile with no value.
         assert _single_curve_pit([[10.0], [50.0]], 50.0) is None
+
+    def test_anonymous_keys_are_excluded_from_the_median_of_members(self):
+        """A positional ``Forecaster N`` bucket on a stacker-fired record holds the STACKER's
+        aggregate, so pooling it into a median-of-members counts the aggregate as an extra
+        member and pulls the median toward itself. ``max_step_clamp_screen`` next door and
+        ``per_model_cohort`` both filter these; this consumer used not to."""
+        curves = cast(
+            "dict[str, list[list[float]]]",
+            {"model-a": self._GOOD, "Forecaster 1": [[10.0, 10.0], [50.0, 12.0], [90.0, 14.0]]},
+        )
+
+        # The anonymous curve would read ~0.90 at resolution 50 and swing the median.
+        assert declared_percentile_pit(curves, 50.0) == pytest.approx(0.10, abs=1e-9)
+
+    def test_an_all_anonymous_record_yields_none_rather_than_the_stacker_curve(self):
+        curves = cast("dict[str, list[list[float]]]", {"Forecaster 1": self._GOOD})
+
+        assert declared_percentile_pit(curves, 50.0) is None
 
     def test_duplicate_declared_values_stay_usable(self):
         # A flat tail (P10 == P50) is legitimate model output: jitter it into strict
@@ -834,10 +911,20 @@ class TestMaxStepClampScreen:
     # 11-point integer grid; steps[1] (the [1, 2] bin) is exactly 0.20.
     _GRID = [float(v) for v in range(11)]
     _CDF = [0.0, 0.05, 0.25, 0.45, 0.65, 0.85, 0.90, 0.93, 0.96, 0.98, 1.0]
-    # Both members concentrate ~0.65 of their mass on the [1, 2] bin.
+    # Both members concentrate ~0.70 of their mass on the [1, 2] bin. Curves are
+    # 11-ANCHOR on purpose: the screen now drops any member under
+    # MIN_SCOREABLE_ANCHORS, because its verdict turns on the MINIMUM member bin mass
+    # and a 3-anchor interpolation across one bin is not the declared distribution.
+    _LABELS = [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0]
     _MEMBERS = {
-        "model-a": [[10.0, 0.9], [50.0, 1.3], [90.0, 2.1]],
-        "model-b": [[10.0, 0.95], [50.0, 1.4], [90.0, 2.2]],
+        "model-a": [
+            [label, value]
+            for label, value in zip(_LABELS, [0.90, 1.00, 1.15, 1.30, 1.45, 1.55, 1.70, 1.85, 2.00, 2.30, 2.60])
+        ],
+        "model-b": [
+            [label, value]
+            for label, value in zip(_LABELS, [0.95, 1.05, 1.18, 1.32, 1.46, 1.56, 1.72, 1.90, 2.05, 2.35, 2.65])
+        ],
     }
     _PRE_FIX_TS = "2026-06-11T00:00:00Z"
     _POST_FIX_TS = "2026-08-01T00:00:00Z"
@@ -878,9 +965,22 @@ class TestMaxStepClampScreen:
         steps[100] = 0.2
         cdf = np.concatenate([[0.0], np.cumsum(steps)]).tolist()
         grid = np.linspace(0.0, 200.0, 201).tolist()
+        # 11-anchor curves (see _MEMBERS): each puts ~0.70 on the [100, 101] bin.
         members = {
-            "model-a": [[10.0, 99.5], [50.0, 100.4], [90.0, 101.2]],
-            "model-b": [[10.0, 99.6], [50.0, 100.5], [90.0, 101.3]],
+            "model-a": [
+                [label, value]
+                for label, value in zip(
+                    self._LABELS,
+                    [99.90, 100.00, 100.15, 100.30, 100.45, 100.55, 100.70, 100.85, 101.00, 101.30, 101.60],
+                )
+            ],
+            "model-b": [
+                [label, value]
+                for label, value in zip(
+                    self._LABELS,
+                    [99.95, 100.05, 100.18, 100.32, 100.46, 100.56, 100.72, 100.90, 101.05, 101.35, 101.65],
+                )
+            ],
         }
         screen = max_step_clamp_screen(
             self._record(submitted=self._POST_FIX_TS, members=members, cdf=cdf, grid=grid, resolution=100.5)
@@ -949,6 +1049,35 @@ class TestMaxStepClampScreen:
         }
         screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=one_pair))
         assert list(screen["member_bin_masses"]) == ["model-b"]
+        assert screen["suspected"] is False
+
+    def test_a_sparse_member_curve_is_excluded_from_the_min(self):
+        """The verdict turns on the MINIMUM member bin mass, so one sparse recovery can
+        decide it — and a 3-anchor interpolation across one bin is not the distribution the
+        model declared. q43913's KNOWN_BUG_QIDS entry survives this gate on its own
+        11-anchor member; the 3-anchor sibling never decided that verdict."""
+        mixed = {
+            "model-a": self._MEMBERS["model-a"],
+            "model-sparse": [[10.0, 0.0], [50.0, 3.0], [90.0, 8.0]],
+        }
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=mixed))
+
+        assert list(screen["member_bin_masses"]) == ["model-a"]
+        # One usable curve is below the >=2-curves requirement, so nothing is suspected.
+        assert screen["suspected"] is False
+
+    def test_a_uniformly_sparse_record_reports_no_member_masses(self):
+        # The sparse-era shape: no curve clears the floor, so the screen has no member
+        # evidence at all rather than ranking equals against each other (a bin-mass
+        # comparison is absolute, unlike ranking_cohort's relative one).
+        sparse = {
+            "model-a": [[10.0, 0.9], [50.0, 1.3], [90.0, 2.1]],
+            "model-b": [[10.0, 0.95], [50.0, 1.4], [90.0, 2.2]],
+        }
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=sparse))
+
+        assert screen["member_bin_masses"] == {}
+        assert screen["min_member_bin_mass"] is None
         assert screen["suspected"] is False
 
     def test_non_monotonic_member_curve_is_unusable(self):

@@ -32,6 +32,20 @@ against the ACTUAL emitted format strings (the source of truth):
   how many outcomes were individually named versus collapsed into a counted
   group, and ``withheld``, the count of venue-manufactured prices the parsers
   refused — the field the Kalshi no-price spread threshold gets retuned on)
+* ``MARKET_RANKING_DEGRADED`` — ``metaculus_bot/research/prediction_market.py``
+  ``_rank_pool`` (per-QUESTION ranker fail-open, and WHY: ``shape_regression``
+  means our own prompt/parser contract broke, which used to pass silently as
+  ``ok(0)``, i.e. as a deliberate "we reviewed the markets and none bore on it")
+* ``NUMERIC_DEGENERATE_DECLARATION`` — ``metaculus_bot/numeric/pipeline.py``
+  ``_apply_jitter_and_clamp`` (per-FORECASTER point-mass numeric declaration that
+  is no longer cluster-spread into a width nobody stated — a fabrication-attempt
+  rate, since the unit-mismatch guard then withholds that forecaster)
+* ``NUMERIC_AGGREGATE_GRID_MISMATCH`` — ``metaculus_bot/numeric/utils.py``
+  ``aggregate_numeric`` (per-MODEL CDF whose grid length disagreed with the
+  question's; expect zero in prod, so any record means a length drifted)
+* ``SPREAD_UNDEFINED`` — ``metaculus_bot/spread_metrics.py``
+  ``numeric_percentile_spread`` (per-QUESTION unmeasurable spread: the routing
+  decision was made on no measurement at all)
 * ``TS_ANCHOR_ROUTE``   — ``metaculus_bot/research/ts_routing.py`` ``route_question``
   (per-QUESTION timeseries-anchor routing decision: routed/skipped, the series
   involved, and the branch/reject step — the marker that made anchor coverage
@@ -75,7 +89,9 @@ both work).
 POST-ID vs QUESTION-ID (the ``qid_kind`` field): Metaculus posts contain questions,
 and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
 types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
-``CLOSE_MARGIN`` / ``MARKET_RANKING`` emit ``question.id_of_question`` (the QUESTION id) while
+``CLOSE_MARGIN`` / ``MARKET_RANKING`` / ``MARKET_RANKING_DEGRADED`` /
+``NUMERIC_DEGENERATE_DECLARATION`` / ``NUMERIC_AGGREGATE_GRID_MISMATCH`` /
+``SPREAD_UNDEFINED`` emit ``question.id_of_question`` (the QUESTION id) while
 ``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
 ``GHOST_FORECAST_JSON`` emit ``question.page_url`` (a POST id). Each :class:`MarkerSpec` therefore declares
 ``qid_kind`` and every harvested record carries it, so a residual join keyed on one
@@ -325,6 +341,87 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+max_stage=(?P<max_stage>\S+)\s+ladder_chars=(?P<ladder_chars>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "market_ranking_degraded",
+        # Per-question ranker FAIL-OPEN (research/prediction_market.py:_rank_pool), the
+        # discriminating sibling of `market_ranking`'s `outcome=failopen`. That field says a
+        # fail-open happened; only this line says which failure, and the distinction is the
+        # whole finding: `reason=shape_regression` means the ranker's output was structurally
+        # unreadable to US (a renamed index key, indices all out of range), which before
+        # 2026-08-25 was reported as `ok(0)` — i.e. indistinguishable from the model
+        # deliberately answering "none of these markets bear on the question", which the
+        # render turns into an affirmative forecaster-facing sentence. `reason=unreadable`
+        # means the completion was not a ranking array at all.
+        #
+        # NOT end-anchored: `detail=` is free text holding the exception's str (spaces,
+        # semicolons, quotes), captured verbatim via _RAW_FIELDS and optional so a terser
+        # future form still harvests rather than dropping the record.
+        re.compile(
+            r"MARKET_RANKING_DEGRADED:\s*question=(?P<question>\S+)\s+pool=(?P<pool>\S+)"
+            r"\s+reason=(?P<reason>\S+)(?:\s+detail=(?P<detail>.*))?"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "numeric_degenerate_declaration",
+        # Per-FORECASTER point-mass numeric declaration (numeric/pipeline.py
+        # _apply_jitter_and_clamp): the model put (near-)identical values at every
+        # percentile, so the cluster spreader is deliberately NOT applied and the honest
+        # zero span reaches the unit-mismatch guard, which withholds that forecaster. The
+        # count is therefore a per-model fabrication-ATTEMPT rate: before 2026-08-25 the
+        # spreader manufactured a ±6-unit distribution from it and that width was exactly
+        # what let it pass the guard, so the published forecast stated a width nobody
+        # declared. The resulting drop shows up as UnitMismatchError in FORECASTER_DROPS;
+        # this line is the only place the CAUSE is named.
+        #
+        # ``model`` names the forecaster (or the stacker, on the aggregation path). All three
+        # sanitize_percentiles callers pass it, so "unknown" now means a NEW caller forgot to
+        # — it is not in _NONE_SENTINELS, so it stays a readable string rather than coercing
+        # into an absent field.
+        re.compile(
+            r"NUMERIC_DEGENERATE_DECLARATION:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
+            r"\s+n_unique=(?P<n_unique>\S+)\s+span=(?P<span>\S+)\s+value_eps=(?P<value_eps>\S+)"
+            r"\s+spread_applied=(?P<spread_applied>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # numeric/pipeline.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "numeric_aggregate_grid_mismatch",
+        # Per-MODEL grid-length disagreement inside ensemble aggregation
+        # (numeric/utils.py aggregate_numeric). Expect ZERO records in prod: every model's
+        # CDF is built on the question's own point count, so a record means a length
+        # drifted — which used to matter far more than a resample, because the old
+        # group-by-VALUE aggregation silently medianed over a rotating SUBSET of the
+        # ensemble whenever an ft-fallback distribution mixed with PCHIP ones (their x-axes
+        # differ by float rounding, and on a log-scaled question by construction).
+        # Aggregation is positional now, so the mismatch is handled rather than silent —
+        # this marker is what keeps "handled" from meaning "unnoticed".
+        re.compile(
+            r"NUMERIC_AGGREGATE_GRID_MISMATCH:\s*question=(?P<question>\S+)"
+            r"\s+model_index=(?P<model_index>\S+)\s+got_points=(?P<got_points>\S+)"
+            r"\s+expected_points=(?P<expected_points>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # numeric/utils.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "spread_undefined",
+        # Per-question unmeasurable disagreement spread (spread_metrics.py
+        # numeric_percentile_spread): the normalizing denominator was non-positive, so no
+        # spread could be computed. It returns inf now — before 2026-08-25 it returned 0.0,
+        # which route_after_forecasts reads as "the models agree", and the comment marker
+        # then claimed `spread_below_threshold`. A measurement FAILURE read as an
+        # affirmative agreement signal.
+        #
+        # Latent in prod while the three per-type stacking gates are off, but it fires in
+        # backtests and ablation, where it marks a question whose routing decision was made
+        # on no measurement at all. ``qtype`` is a field rather than a literal so a future
+        # binary/MC variant of the same shape harvests with no spec change.
+        re.compile(
+            r"SPREAD_UNDEFINED:\s*question=(?P<question>\S+)\s+qtype=(?P<qtype>\S+)"
+            r"\s+denominator=(?P<denominator>\S+)\s+models=(?P<models>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # spread_metrics.py emits question.id_of_question
     ),
     MarkerSpec(
         "ts_anchor_route",
@@ -654,14 +751,16 @@ MARKER_SPECS: list[MarkerSpec] = [
         ),
     ),
     # Additive skip-reason companion to stacker_outcome (comment/markers.py):
-    # separates the three mechanisms the plain "skipped" outcome conflates
-    # (spread below threshold, per-type config gate off, single-forecaster
-    # short-circuit — the last computes no spread at all). HTML-comment marker
+    # separates the mechanisms the plain "skipped" outcome conflates — spread below
+    # threshold, per-type config gate off, single-forecaster short-circuit (computes no
+    # spread at all), wall-clock budget, and ``spread_undefined`` (the spread could not
+    # be MEASURED; it must not read as an affirmative agreement). HTML-comment marker
     # like its parent, so the same rarely-in-run-logs caveat applies.
     MarkerSpec(
         "stacker_skip_reason",
         re.compile(
-            r"<!--\s*STACKER_SKIP_REASON=(?P<reason>spread_below_threshold|config_off|single_forecaster)\s*-->",
+            r"<!--\s*STACKER_SKIP_REASON=(?P<reason>spread_below_threshold|spread_undefined"
+            r"|config_off|single_forecaster|wall_clock_budget)\s*-->",
             re.IGNORECASE,
         ),
     ),

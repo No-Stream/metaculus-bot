@@ -293,6 +293,32 @@ class TestExtractDatawrapperCharts:
         assert charts[0].chart_id == "Ab9x2"
         assert charts[0].title == "Weekly jobless claims"
 
+    def test_a_title_on_a_neighbouring_element_is_not_borrowed(self):
+        """The proximity window alone let an unrelated `title=` render as the chart's
+        identity in the Tier-2 lead — and the lead names the chart it is serving data for,
+        so a borrowed title is a false claim about which series is being read. The title
+        has to sit inside the URL's own tag."""
+        html = (
+            '<a href="#" title="Share on X">share</a>'
+            '<script defer src="https://datawrapper.dwcdn.net/Xy12Z/embed.js"></script>'
+        )
+        charts = extract_datawrapper_charts(html)
+
+        assert [c.chart_id for c in charts] == ["Xy12Z"]
+        assert charts[0].title is None
+
+    def test_a_forward_json_title_on_a_later_element_is_not_borrowed(self):
+        # Same rule in the forward direction: a `"title":` blob that belongs to the NEXT
+        # element must not attach to this chart just because it fell inside the window.
+        html = (
+            '<script defer src="https://datawrapper.dwcdn.net/Xy12Z/embed.js"></script>'
+            '<div data-attrs="{&quot;title&quot;:&quot;Some unrelated card&quot;}"></div>'
+        )
+        charts = extract_datawrapper_charts(html)
+
+        assert [c.chart_id for c in charts] == ["Xy12Z"]
+        assert charts[0].title is None
+
     def test_embed_script_form_yields_id_without_title(self):
         html = '<script defer src="https://datawrapper.dwcdn.net/Xy12Z/embed.js" charset="utf-8"></script>'
         charts = extract_datawrapper_charts(html)

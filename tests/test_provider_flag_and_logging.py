@@ -64,11 +64,15 @@ async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
         mock_sdk.news.search_news.return_value = mock_response
         mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
 
-        # Since no articles are returned, it should return the message with provider header
+        # No articles means no section at all — not a header over a "no articles" sentence.
+        # This test used to assert that sentence plus the header; both were the defect,
+        # since an empty AskNews read then arrived as `ok` with chars>0 and the summarizer
+        # was asked to brief from prose that carried no facts.
         with caplog.at_level(logging.INFO):
             res = await bot.run_research(q)
-        assert "No articles were found for this query." in res
-        assert "## News Articles (AskNews)" in res
+        assert "No articles were found for this query." not in res
+        assert "## News Articles (AskNews)" not in res
+        assert any("ASKNEWS_NO_ARTICLES: question=" in rec.message for rec in caplog.records)
         assert any("Using research providers:" in rec.message for rec in caplog.records)
 
 
@@ -475,10 +479,12 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
     assert "gemini_search" in provider_log
     assert "prediction_market" in provider_log
 
-    # Combined research carries the prediction-market block + Gemini block.
-    # AskNews returns no articles → its block is the "No articles" message.
+    # Combined research carries the prediction-market block + Gemini block. AskNews
+    # returns no articles, so it contributes NO section — the assertion here used to be
+    # that its header rendered over a "No articles were found" sentence, which is the
+    # sentinel that made an empty read look like research.
     assert "Gemini grounded research output" in research
-    assert "## News Articles (AskNews)" in research
+    assert "## News Articles (AskNews)" not in research
     # Prediction-market formatter leads with the strong-evidence header, which the canned
     # ranking earns by grading its one row `same_quantity_same_date` — verify criteria, date and
     # topic before weighting.

@@ -170,7 +170,7 @@ class AggregationPipeline:
             )
             self.meta_reasoning[qid] = meta_text
 
-            percentile_list, zero_point = sanitize_percentiles(list(perc_list), question)
+            percentile_list, zero_point = sanitize_percentiles(list(perc_list), question, model_name=stacker_llm.model)
 
             mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
             if mismatch:

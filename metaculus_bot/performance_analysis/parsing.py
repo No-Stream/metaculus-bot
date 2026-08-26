@@ -30,7 +30,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Literal, TypeGuard
 
 from metaculus_bot.comment.markers import (
@@ -73,11 +73,12 @@ def parse_stacker_outcome_marker(comment_text: str) -> str | None:
 def parse_stacker_skip_reason_marker(comment_text: str) -> str | None:
     """Return the STACKER_SKIP_REASON literal in ``comment_text``, else None.
 
-    One of ``"spread_below_threshold"``, ``"config_off"``, ``"single_forecaster"``
-    (always lower-cased). The marker is additive alongside STACKER_OUTCOME: a
-    plain ``skipped`` outcome alone cannot distinguish a below-threshold skip
-    from the single-forecaster short-circuit (q44870), and comments predating
-    the marker return None.
+    One of the ``comment.markers.STACKER_SKIP_REASONS`` literals (always lower-cased). The
+    marker is additive alongside STACKER_OUTCOME: a plain ``skipped`` outcome alone cannot
+    distinguish a below-threshold skip from the single-forecaster short-circuit (q44870), and
+    comments predating the marker return None. ``spread_undefined`` (added 2026-08-25) is the
+    one a calibration cut must NOT pool with ``spread_below_threshold``: it means no spread
+    was measurable, not that the models agreed.
     """
     match = STACKER_SKIP_REASON_RE.search(comment_text)
     if match is None:
@@ -405,6 +406,42 @@ def is_anonymous_model_key(key: str) -> bool:
     return _ANONYMOUS_MODEL_KEY_RE.match(key) is not None
 
 
+# Minimum DISTINCT percentile labels a member's declared curve needs before anything
+# rebuilds a distribution from it and compares that against another member's. A sparse
+# recovery gets treated as a distribution the model never declared: on q43729 a 3-anchor
+# curve ranked #1 at +92.01 against five 11-anchor siblings, and on q43826 the same shape
+# ranked LAST at -135.86 — a ~96-point artifact either way, which is what made "gemini was
+# catastrophically worse" a scoring-path artifact in that question's dossier.
+#
+# It lives HERE, beside the recovery that produces these curves, because three consumers in
+# two modules gate on it — ``ranking_cohort`` (which re-exports it), ``analysis``'s
+# ``max_step_clamp_screen``, and ``stacker_detection.exceeded_spread_threshold`` — and each
+# used to carry its own literal 9. ``analysis`` cannot import ``ranking_cohort`` (that module
+# imports ``analysis``), so a shared leaf is the only home that all three can reach.
+MIN_SCOREABLE_ANCHORS: int = 9
+
+
+def declared_anchors(pairs: Sequence[Sequence[float]]) -> tuple[dict[float, float], int]:
+    """``(label -> value, n_conflicting_restatements)`` for one declared curve.
+
+    Percentile lines are recovered from comment prose, and a member sometimes restates its
+    whole set (one archived curve carries a byte-identical 11-point set twice, arriving as 22
+    pairs). Keying by label is what the PCHIP build already does, so the count that matters
+    for density is the number of DISTINCT labels, never the number of lines — a 3-anchor set
+    restated three times is still a 3-anchor set. A restatement that disagrees with itself is
+    counted so the caller can report it; the dict build otherwise takes the last value
+    silently.
+    """
+    anchors: dict[float, float] = {}
+    conflicts = 0
+    for pair in pairs:
+        label, value = float(pair[0]), float(pair[1])
+        if label in anchors and anchors[label] != value:
+            conflicts += 1
+        anchors[label] = value
+    return anchors, conflicts
+
+
 def _iter_per_model_blocks(
     comment_text: str,
     model_names: list[str] | None = None,
@@ -589,6 +626,13 @@ def _numeric_percentiles_from_block_tolerant(body_text: str) -> list[tuple[float
     Same decimal→raw-percent label conversion as the strict reader. Keys must
     coerce to float in (0, 1); values must be finite numbers. Returns None when
     nothing usable survives.
+
+    A PARTIAL set is a legitimate return here, deliberately: recovering 3 of 13 anchors off
+    an old-era block is the whole point of this rung, and whether 3 is enough depends on what
+    the caller does with the curve. Completeness is therefore a CONSUMER gate — see
+    ``ranking_cohort.MIN_SCOREABLE_ANCHORS``, which drops sparse curves before they are
+    PCHIP'd into a full CDF and log-scored beside 11-anchor members. A consumer that scores
+    these without that gate is measuring interpolation, not the model.
     """
     payload = _tolerant_block_payload(body_text, "numeric")
     if payload is None:

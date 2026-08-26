@@ -514,6 +514,176 @@ class TestMarketChildRender:
         assert rec["qid_kind"] == "question_id"
 
 
+# The ranker fail-open WARN (research/prediction_market.py:_rank_pool), verbatim from the
+# f-string there. `reason=shape_regression` is the one the finding is about: before
+# 2026-08-25 that case reported `ok(0)`, i.e. it rendered the deliberate "we reviewed the
+# markets and none bore on the question" sentence on a path where the ranker's answer was
+# unreadable. `detail=` holds the exception's str, which carries spaces and a repr.
+MARKET_RANKING_DEGRADED_SHAPE_LINE = (
+    PFX_WARN + "MARKET_RANKING_DEGRADED: question=44620 pool=17 reason=shape_regression "
+    "detail=falling back to retrieval order; 3 entries yielded no usable pick (renamed index key, "
+    "or every index outside a pool of 17); first={'index': 4, 'tier': 'weak'}"
+)
+MARKET_RANKING_DEGRADED_UNREADABLE_LINE = (
+    PFX_WARN + "MARKET_RANKING_DEGRADED: question=None pool=4 reason=unreadable "
+    "detail=falling back to retrieval order; empty completion"
+)
+
+
+class TestMarketRankingDegraded:
+    """The sibling that says WHY a question rendered retrieval order.
+
+    `market_ranking`'s `outcome=failopen` records that a fail-open happened; only this line
+    separates "the model emitted something that is not a ranking array" from "our own
+    prompt/parser contract broke", and the second is the regression that used to arrive as
+    `ok(0)`. Run logs leave GHA at 90 days, so an archive holding one line and not the other
+    cannot answer which failure a degraded question hit.
+    """
+
+    def test_shape_regression_fields(self):
+        rec = _parse_one(MARKET_RANKING_DEGRADED_SHAPE_LINE)
+        assert rec["marker"] == "market_ranking_degraded"
+        assert rec["pool"] == 17
+        assert rec["reason"] == "shape_regression"
+
+    def test_detail_free_text_survives_verbatim(self):
+        # detail holds repr(exc): spaces, parentheses, quotes, a dict repr. It belongs to
+        # _RAW_FIELDS so it is never coerced, and the regex is not end-anchored so a
+        # terser future form still harvests.
+        rec = _parse_one(MARKET_RANKING_DEGRADED_SHAPE_LINE)
+        assert "renamed index key" in rec["detail"]
+        assert rec["detail"].endswith("first={'index': 4, 'tier': 'weak'}")
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(MARKET_RANKING_DEGRADED_SHAPE_LINE)
+        # prediction_market.py emits question.id_of_question, matching its two siblings.
+        assert rec["qid"] == 44620
+        assert rec["qid_kind"] == "question_id"
+
+    def test_unreadable_reason_and_absent_qid(self):
+        rec = _parse_one(MARKET_RANKING_DEGRADED_UNREADABLE_LINE)
+        assert rec["reason"] == "unreadable"
+        assert rec["qid"] is None
+
+    def test_does_not_collide_with_the_market_ranking_spec(self):
+        # MARKET_RANKING_DEGRADED contains MARKET_RANKING as a prefix, and market_ranking's
+        # spec sits EARLIER in MARKER_SPECS — under the one-marker-per-line break, a
+        # colon-less prefix match there would have swallowed every degraded line.
+        harvested = parse_log_text(
+            MARKET_RANKING_DEGRADED_SHAPE_LINE + "\n" + MARKET_RANKING_RANKED_LINE + "\n", **_META
+        )
+        assert len(harvested["market_ranking_degraded"]) == 1
+        assert len(harvested["market_ranking"]) == 1
+
+
+# Verbatim emitted bytes from metaculus_bot/numeric/pipeline.py (captured under the prod log
+# format), metaculus_bot/numeric/utils.py, and metaculus_bot/spread_metrics.py. All three
+# lines carry trailing em-dash prose, so none of the specs may be end-anchored.
+NUMERIC_DEGENERATE_DECLARATION_LINE = (
+    "2026-08-25 23:07:17,044 - metaculus_bot.numeric.pipeline - WARNING - "
+    "NUMERIC_DEGENERATE_DECLARATION: question=77 model=openrouter/openai/gpt-5.6-sol n_unique=1 "
+    "span=0 value_eps=1e-07 spread_applied=false"
+)
+NUMERIC_DEGENERATE_DECLARATION_UNLABELLED_LINE = (
+    "2026-08-25 23:07:17,044 - metaculus_bot.numeric.pipeline - WARNING - "
+    "NUMERIC_DEGENERATE_DECLARATION: question=77 model=unknown n_unique=1 "
+    "span=1.5e-06 value_eps=1e-07 spread_applied=false"
+)
+NUMERIC_AGGREGATE_GRID_MISMATCH_LINE = (
+    "2026-08-25 23:07:17,044 - metaculus_bot.numeric.utils - WARNING - "
+    "NUMERIC_AGGREGATE_GRID_MISMATCH: question=44620 model_index=2 got_points=201 expected_points=11 "
+    "— resampling in cdf-location space before aggregation"
+)
+SPREAD_UNDEFINED_LINE = (
+    "2026-08-25 23:07:17,044 - metaculus_bot.spread_metrics - WARNING - "
+    "SPREAD_UNDEFINED: question=45363 qtype=numeric denominator=-0 models=3 — key-percentile spread "
+    "is unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement"
+)
+
+
+class TestNumericDegenerateDeclaration:
+    """A per-forecaster fabrication-ATTEMPT rate, which is why it needs a spec.
+
+    A point-mass declaration is no longer cluster-spread, so the unit-mismatch guard sees the
+    model's own zero span and withholds the forecaster. The drop itself lands in
+    FORECASTER_DROPS as an UnitMismatchError; only this line names the cause, and its
+    predecessor (`Cluster spread applied`) was never harvested — which is exactly why the
+    finding's prod incidence was unanswerable from the archive.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_LINE)
+        assert rec["marker"] == "numeric_degenerate_declaration"
+        assert rec["model"] == "openrouter/openai/gpt-5.6-sol"
+        assert rec["n_unique"] == 1
+        assert rec["span"] == 0
+        assert rec["value_eps"] == pytest.approx(1e-07)
+        assert rec["spread_applied"] is False
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_LINE)
+        assert rec["qid"] == 77
+        assert rec["qid_kind"] == "question_id"
+
+    def test_unlabelled_model_stays_a_readable_string(self):
+        # "unknown" is what the line carries until the three sanitize_percentiles callers
+        # pass model_name. It is NOT in _NONE_SENTINELS, so it must survive as a string —
+        # a None here would be indistinguishable from a missing field.
+        rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_UNLABELLED_LINE)
+        assert rec["model"] == "unknown"
+        # %.6g renders a sub-epsilon span in exponent form; it must reach the archive as a
+        # number, since the span is what the unit-mismatch guard then judges.
+        assert rec["span"] == pytest.approx(1.5e-06)
+
+
+class TestNumericAggregateGridMismatch:
+    """Expect zero records in prod; a nonzero count means a model's CDF length drifted.
+
+    Worth harvesting because the predecessor defect was invisible: group-by-VALUE
+    aggregation medianed over a rotating SUBSET of the ensemble whenever an ft-fallback
+    distribution mixed with PCHIP ones, and nothing recorded the partial membership.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_GRID_MISMATCH_LINE)
+        assert rec["marker"] == "numeric_aggregate_grid_mismatch"
+        assert rec["model_index"] == 2
+        assert rec["got_points"] == 201
+        assert rec["expected_points"] == 11
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_GRID_MISMATCH_LINE)
+        assert rec["qid"] == 44620
+        assert rec["qid_kind"] == "question_id"
+
+
+class TestSpreadUndefined:
+    def test_fields(self):
+        rec = _parse_one(SPREAD_UNDEFINED_LINE)
+        assert rec["marker"] == "spread_undefined"
+        assert rec["qtype"] == "numeric"
+        assert rec["models"] == 3
+        # %.6g of a negative zero denominator renders "-0"; it must read as the number it
+        # is rather than falling through to a string.
+        assert rec["denominator"] == 0
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(SPREAD_UNDEFINED_LINE)
+        assert rec["qid"] == 45363
+        assert rec["qid_kind"] == "question_id"
+
+    def test_positive_denominator_variant_of_the_same_shape_harvests(self):
+        # The guard is `denominator <= 0`, so a plain 0 is the common case; qtype is a
+        # captured field rather than a literal so a future binary/MC variant needs no
+        # spec change.
+        rec = _parse_one(
+            PFX_WARN + "SPREAD_UNDEFINED: question=1 qtype=numeric denominator=0 models=2 — key-percentile spread "
+            "is unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement"
+        )
+        assert rec["denominator"] == 0
+        assert rec["models"] == 2
+
+
 class TestTsAnchorRoute:
     """The routing marker that made anchor coverage a query instead of an offline re-run.
 

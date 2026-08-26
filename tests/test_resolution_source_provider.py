@@ -635,6 +635,30 @@ class TestFormatResolutionSections:
         # We should NOT see all four full 300-char blocks packed together.
         assert out.count("A" * 300) <= 2
 
+    def test_a_budget_trim_leaves_a_visible_truncation_marker(self, monkeypatch):
+        """The aggregate trim goes through the marker-emitting truncator, not a bare slice.
+
+        A bare slice cut mid-sentence and could eat the per-URL ``[truncated at N chars ...]``
+        marker the fetch already appended at the end — so an already-truncated page rendered
+        as complete. Reachable on prod constants (5 x 6000 per-URL against an 18000 total).
+        """
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        results = [
+            FetchResult(
+                url="https://example.com/long",
+                status="success",
+                text="B" * 5000 + "\n[truncated at 5000 chars — full source at https://example.com/long]",
+                http_status=200,
+                content_type="text/html",
+            )
+        ]
+
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+
+        # The section is cut, and the cut says so rather than ending mid-body.
+        assert "[truncated at 400 chars — full source at https://example.com/long]" in out
+        assert "B" * 5000 not in out
+
     def test_dropped_sections_note_appended(self, monkeypatch):
         # Tighten TOTAL cap so at least one section is dropped entirely: cap=300,
         # 4 sources of 300 chars each — first section fills the budget, 3 dropped.

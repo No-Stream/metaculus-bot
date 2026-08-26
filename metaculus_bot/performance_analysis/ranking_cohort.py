@@ -22,25 +22,24 @@ member's declared percentiles are PCHIP'd into a full CDF and log-scored.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from metaculus_bot.performance_analysis.analysis import per_model_cohort
-from metaculus_bot.performance_analysis.parsing import is_anonymous_model_key
+from metaculus_bot.performance_analysis.parsing import (
+    MIN_SCOREABLE_ANCHORS,
+    declared_anchors,
+    is_anonymous_model_key,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Minimum DISTINCT percentile labels a member's declared curve needs before its
-# PCHIP-rebuilt CDF may be log-scored against another member's. A sparse recovery
-# gets scored as a distribution the model never declared: on q43729 a 3-anchor
-# curve ranked #1 at +92.01 against five 11-anchor siblings, and on q43826 the
-# same shape ranked LAST at -135.86 — a ~96-point artifact either way, which is
-# what made "gemini was catastrophically worse" a scoring-path artifact in that
-# question's dossier. Deliberately the same number as the per-curve gate in
-# ``stacker_detection.exceeded_spread_threshold`` (``len(model_pcts) < 9``): the
-# two guard the same field for the same reason and should move together.
-MIN_SCOREABLE_ANCHORS: int = 9
+# ``MIN_SCOREABLE_ANCHORS`` and ``declared_anchors`` live in ``parsing`` (beside the recovery
+# that produces these curves) and are re-exported below because this module was their first
+# home and residual scripts import them from it. The move made three consumers share one
+# number instead of each carrying a literal 9 — ``analysis.max_step_clamp_screen`` and
+# ``stacker_detection.exceeded_spread_threshold`` are the other two, and ``analysis`` cannot
+# import this module (this module imports ``analysis``).
 
 # Which per-model field a ranking reads, by question type. MC has no ranker.
 _PER_MODEL_FIELD_BY_TYPE: dict[str, str] = {
@@ -74,28 +73,6 @@ class PerModelRankingCohort:
     anonymous_keys: tuple[str, ...] = ()
     sparse_anchors: dict[str, int] = field(default_factory=dict)
     sparse_era: bool = False
-
-
-def declared_anchors(pairs: Sequence[Sequence[float]]) -> tuple[dict[float, float], int]:
-    """``(label -> value, n_conflicting_restatements)`` for one declared curve.
-
-    Percentile lines are recovered from comment prose, and a member sometimes
-    restates its whole set (one archived curve carries a byte-identical 11-point
-    set twice, arriving as 22 pairs). Keying by label is what the PCHIP build
-    already does, so the count that matters for density is the number of DISTINCT
-    labels, never the number of lines — a 3-anchor set restated three times is
-    still a 3-anchor set. A restatement that disagrees with itself is counted so
-    the caller can report it; the dict build otherwise takes the last value
-    silently.
-    """
-    anchors: dict[float, float] = {}
-    conflicts = 0
-    for pair in pairs:
-        label, value = float(pair[0]), float(pair[1])
-        if label in anchors and anchors[label] != value:
-            conflicts += 1
-        anchors[label] = value
-    return anchors, conflicts
 
 
 def _split_by_anchor_density(curves: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int], bool]:

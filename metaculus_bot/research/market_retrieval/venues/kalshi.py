@@ -454,6 +454,12 @@ def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | 
     acknowledged: a no-book strike carrying volume can still render an inflated ``total_vol`` cell,
     and the exactly-empty book is 44 of 71,413 live strikes.
 
+    What it does NOT do is state a dollar figure with no price to convert by. With neither a
+    book nor a last trade, ``volume_usd`` is None — the count is real but its dollar value is
+    unknown, and the old ``price or 0.0`` turned that into a measured ``$0`` that reads as a
+    market nobody traded. Open interest is unaffected: it converts by notional, which has a
+    documented $1.00 default.
+
     Three details here are UNPINNED by any test: the ``last_price_dollars`` fallback, the ``or 1.0``
     notional default, and the ``if not price:`` truthiness (which routes a genuine 0.0 midpoint to
     the last trade). "Simplifying" any of them blanks or misstates labels with a green suite.
@@ -472,7 +478,7 @@ def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | 
         price = safe_float(market.get("last_price_dollars"))
     notional = safe_float(market.get("notional_value_dollars")) or 1.0
 
-    volume_usd = None if volume is None else volume * (price or 0.0)
+    volume_usd = None if (volume is None or price is None) else volume * price
     open_interest_usd = None if open_interest is None else open_interest * notional
     return volume_usd, open_interest_usd
 

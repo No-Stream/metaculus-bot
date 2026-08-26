@@ -18,14 +18,25 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelPrediction:
-    """Single model's prediction on a question."""
+    """Single model's prediction on a question.
+
+    ``baseline_score`` and ``cost`` are OPTIONAL because a benchmark report can legitimately
+    lack either — an unscored question, a run with no price estimate. They used to be coerced
+    with ``or 0.0`` at construction, which pooled an unscored report into an analysis as a
+    real 0.0, the worst-possible baseline score. Nothing reads either field today; None keeps
+    them honest for whoever first does.
+
+    ``question_id`` stays a plain int, coerced at the call site: it is the pivot index and
+    group key for every correlation here, so an absent id has to collapse somewhere. That
+    collapse is documented at the coercion rather than pushed into pandas.
+    """
 
     model_name: str
     question_id: int
     question_url: str
     prediction_value: float  # For binary: probability, for numeric: aggregated value
-    baseline_score: float
-    cost: float
+    baseline_score: float | None
+    cost: float | None
 
 
 @dataclass

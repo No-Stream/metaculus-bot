@@ -11,7 +11,12 @@ from scipy.stats import spearmanr
 
 from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
-from metaculus_bot.performance_analysis.parsing import _parse_probability, is_anonymous_model_key
+from metaculus_bot.performance_analysis.parsing import (
+    MIN_SCOREABLE_ANCHORS,
+    _parse_probability,
+    declared_anchors,
+    is_anonymous_model_key,
+)
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
 from metaculus_bot.performance_analysis.stacker_detection import detect_stacker_fired
@@ -224,6 +229,13 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
         elif resolution == "below_lower_bound":
             pit = 0.0
         elif isinstance(resolution, (int, float)):
+            if upper_bound - lower_bound <= 0:
+                # No range, no interpolated PIT — the record is dropped rather than
+                # contributing the 0.5 that used to come back from _interpolate_pit, which
+                # is the single most favorable value available (inside BOTH coverage bands).
+                # Scoped to the interpolated branch: an out-of-bound resolution's 0.0/1.0 is
+                # a real reading that never touched the range.
+                continue
             pit = _interpolate_pit(
                 float(resolution),
                 lower_bound,
@@ -276,12 +288,19 @@ def declared_percentile_pit(
     ends) and take the median across members — the same median-of-members the
     published aggregate is built from, read in percentile space where the bound is
     not a wall. Returns None when no member curve is usable.
+
+    Anonymous ``Forecaster N`` keys are EXCLUDED, matching ``max_step_clamp_screen``
+    next door and ``per_model_cohort``: on a stacker-fired record that positional
+    bucket holds the stacker's AGGREGATE, so pooling it into a median-of-members
+    counts the aggregate as an extra member and pulls the median toward itself. The
+    two sets don't intersect in today's archive, so this is a latent fix — but the
+    two sibling consumers of this field already filter, and one that didn't was how
+    the 50-forecast mixture got in.
     """
-    pits = [
-        pit
-        for pit in (_single_curve_pit(pairs, resolution) for pairs in (per_model_percentiles or {}).values())
-        if pit is not None
-    ]
+    curves = {
+        model: pairs for model, pairs in (per_model_percentiles or {}).items() if not is_anonymous_model_key(str(model))
+    }
+    pits = [pit for pit in (_single_curve_pit(pairs, resolution) for pairs in curves.values()) if pit is not None]
     return float(np.median(pits)) if pits else None
 
 
@@ -385,6 +404,13 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
             # A positional key on a stacked record can hold the stacker's aggregate,
             # which is not a member curve (see per_model_cohort).
             continue
+        if len(declared_anchors(pairs)[0]) < MIN_SCOREABLE_ANCHORS:
+            # The screen's verdict turns on the MINIMUM member bin mass, so one sparse
+            # recovery can decide it — and a 3-anchor curve interpolated across a bin is
+            # not the distribution the model declared. That is the same reason
+            # ranking_cohort gates its log-scored curves; the shared floor lives in
+            # parsing so the two cannot drift.
+            continue
         low = _single_curve_pit(pairs, bin_low)
         high = _single_curve_pit(pairs, bin_high)
         if low is not None and high is not None:
@@ -431,9 +457,13 @@ def _interpolate_pit(
     is used directly if its length matches ``cdf_values``. Otherwise the grid is reconstructed
     via :func:`build_cdf_value_grid` using ``zero_point``.
     """
-    total_range = upper_bound - lower_bound
-    if total_range <= 0:
-        return 0.5
+    if upper_bound - lower_bound <= 0:
+        # A zero-width question has no PIT, so this raises rather than answering. The old
+        # ``return 0.5`` was the single most favorable value available — it falls inside BOTH
+        # coverage bands, so a degenerate record silently improved every calibration
+        # statistic it entered. Callers screen the range before calling (see
+        # ``numeric_pit_analysis``); reaching here means one didn't.
+        raise ValueError(f"degenerate question range [{lower_bound}, {upper_bound}] has no PIT")
 
     if value_grid is not None and len(value_grid) == len(cdf_values):
         grid = np.asarray(value_grid, dtype=float)
@@ -490,8 +520,19 @@ def mc_summary(data: list[dict]) -> dict:
 
         if resolution in options and forecast_values:
             correct_idx = options.index(resolution)
-            prob = forecast_values[correct_idx] if correct_idx < len(forecast_values) else 0.0
-            prob_on_correct.append(prob)
+            if correct_idx < len(forecast_values):
+                prob_on_correct.append(forecast_values[correct_idx])
+            else:
+                # A forecast vector shorter than the option list cannot say what probability
+                # we put on the winner. The old ``else 0.0`` recorded that as "we gave the
+                # correct option zero" — the worst possible value — dragging
+                # mean_prob_correct down on a PARSE gap rather than on a forecast. The
+                # mc_log_score gate upstream makes this unreachable today; if it ever isn't,
+                # the record leaves this one statistic instead of poisoning it.
+                logger.warning(
+                    f"MC forecast vector shorter than its option list: post_id={r.get('post_id')} "
+                    f"options={len(options)} values={len(forecast_values)}; dropped from mean_prob_correct"
+                )
 
             # "Correct" = highest predicted probability was on the correct option
             max_prob_idx = forecast_values.index(max(forecast_values))

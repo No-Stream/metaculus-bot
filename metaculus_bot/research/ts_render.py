@@ -18,7 +18,7 @@ some derivation of the raw series, and the level case (scale 1.0) is the identit
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import UTC, date, datetime
 
 import numpy as np
 import pandas as pd
@@ -44,6 +44,7 @@ from metaculus_bot.research.ts_estimators import (
     clock_matches_cadence,
     horizon_steps,
     series_clock,
+    stale_latest_age_days,
 )
 from metaculus_bot.research.ts_routing import Derivation, _Route
 
@@ -73,6 +74,17 @@ _DERIVED_HISTORY_HEADER: dict[Derivation, str] = {
     "mom_pct": "Last monthly MoM % changes (derived)",
     "monthly_avg": "Last monthly averages (derived)",
 }
+
+
+def _today_utc() -> date:
+    """Wall-clock UTC date, module-level so tests can freeze it.
+
+    The renderer only gets a ``ceiling`` (the fetch as-of date), which equals today on a
+    live run but is a past date under benchmarking — where the same-dated bar is a
+    COMPLETED historical one. Comparing the ceiling against the real wall clock is what
+    lets the partial-bar marker fire only when the bar can actually still be forming.
+    """
+    return datetime.now(UTC).date()
 
 
 def _fmt(v: float) -> str:
@@ -128,9 +140,7 @@ def _multi_res_history(series: pd.Series, freq: Freq, monthly_header: str = "Las
     return blocks
 
 
-# ---------------------------------------------------------------------------
-# Derived-target transforms (ported from the replay's build_target_series)
-# ---------------------------------------------------------------------------
+# Derived-target transforms (ported from the replay's build_target_series).
 
 
 def _apply_derivation(series: pd.Series, derivation: Derivation, scale: float) -> pd.Series:
@@ -188,15 +198,29 @@ def _realized_max_floor(series: pd.Series, window_start: date | None, ceiling: d
 
 
 def _fifty_two_week_line(series: pd.Series, ceiling: date, last: float) -> str:
+    """The trailing-year high/low band, or the whole series' band NAMED as such.
+
+    A stale or discontinued series has no observation inside the trailing year, and
+    falling back to the full history under a "52-week range" label states a recency the
+    numbers do not have — a 2019 high reads as this year's. The fallback still carries
+    real information (it is the only band there is), so it renders, with its own dates
+    in the label instead.
+    """
     cutoff = pd.Timestamp(ceiling) - pd.Timedelta(days=365)
     window = series[series.index >= cutoff]
+    label = "52-week range"
     if window.empty:
         window = series
+        dates = pd.DatetimeIndex(window.index)
+        label = (
+            f"full-history range ({dates.min().strftime('%Y-%m-%d')} to {dates.max().strftime('%Y-%m-%d')}; "
+            "no observation inside the trailing year)"
+        )
     low = float(window.min())
     high = float(window.max())
     span = high - low
     pct = f"{(last - low) / span * 100:.0f}% of the way up the range" if span > 0 else "range is flat"
-    return f"- 52-week range: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"
+    return f"- {label}: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"
 
 
 def _realized_vol_line(series: pd.Series, clock: SeriesClock) -> str | None:
@@ -257,7 +281,13 @@ def _render_single(
     # for the derived shapes). For plain level (scale=1.0) `derived` IS `series`, so the
     # level path is byte-identical to before.
     raw_last = float(series.iloc[-1])
-    raw_last_date = pd.DatetimeIndex(series.index)[-1].strftime("%Y-%m-%d")
+    raw_last_ts = pd.DatetimeIndex(series.index)[-1]
+    raw_last_date = raw_last_ts.strftime("%Y-%m-%d")
+    # A bar dated the fetch ceiling, rendered on the very day it is forming, is today's
+    # still-in-progress bar (live runs set ceiling == today; a backtest's past-dated
+    # ceiling matches a completed historical bar, which _today_utc keeps unmarked). The
+    # empirical band anchors on this value, so the reader is told it can still move.
+    partial_suffix = " — today's bar, in progress" if raw_last_ts.date() == ceiling == _today_utc() else ""
     derived = _apply_derivation(series, route.derivation, route.scale)
     is_derived = route.derivation != "level"
     # MoM change / MoM % / monthly-average all collapse to a monthly effective clock (enforced
@@ -280,12 +310,25 @@ def _render_single(
         parts: list[str] = [
             f"**{route.label}** — latest derived value {_fmt(last)} "
             f"({_DERIVED_TARGET_DESC[route.derivation]}; from raw level {_fmt(raw_last)} "
-            f"as of {raw_last_date}; effective series frequency: {freq})"
+            f"as of {raw_last_date}{partial_suffix}; effective series frequency: {freq})"
         ]
     else:
-        parts = [f"**{route.label}** — latest {_fmt(last)} (as of {raw_last_date}; series frequency: {freq})"]
+        parts = [
+            f"**{route.label}** — latest {_fmt(last)} (as of {raw_last_date}{partial_suffix}; series frequency: {freq})"
+        ]
     if route.note:
         parts.append(f"- Note: {route.note}")
+    if clock.freq == "daily":
+        stale_age = stale_latest_age_days(raw_last_ts.date(), ceiling, clock.periods_per_year)
+        if stale_age is not None:
+            parts.append(
+                f"- ⚠ Latest observation is {stale_age} days old — beyond what a {clock.step_unit} "
+                "cadence explains; treat the latest value (and the band anchored on it) as stale."
+            )
+            logger.warning(
+                f"FINANCIAL_STALE_LATEST: surface=ts_anchor symbol={route.spec.series_id} "
+                f"age_d={stale_age} cadence={clock.step_unit}"
+            )
 
     if is_derived:
         parts.extend(_multi_res_history(derived, freq, monthly_header=_DERIVED_HISTORY_HEADER[route.derivation]))

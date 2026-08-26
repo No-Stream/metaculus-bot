@@ -170,9 +170,10 @@ def numeric_percentile_spread(
     returns ``math.inf`` there, never ``0.0``: a failed measurement must not read
     as an affirmative "the models agree" (which is exactly how
     ``route_after_forecasts`` reads a spread of 0 — MEDIAN, skip stacking, marker
-    ``spread_below_threshold``). ``inf`` exceeds every threshold, so an
-    unmeasurable spread escalates to the stacker where stacking is enabled, and
-    the ``SPREAD_UNDEFINED`` WARN names the question either way.
+    ``spread_below_threshold``). The caller reads ``inf`` as its own case rather than as a
+    huge spread: it routes to MEDIAN without spending a crux extraction, a targeted search
+    and a stacker call on no measurement, and stamps the skip reason ``spread_undefined`` so
+    the marker never claims agreement. The ``SPREAD_UNDEFINED`` WARN names the question.
     """
     if len(prediction_values) < 2:
         raise ValueError("numeric_percentile_spread requires at least 2 predictions")

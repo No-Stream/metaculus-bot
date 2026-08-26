@@ -230,9 +230,16 @@ async def is_public_http_url(url: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# How far ahead of our clock a dataset's `Last-Modified` may sit before the freshness
+# guard treats it as unusable rather than as freshest-possible. Small on purpose: this
+# tolerates ordinary CDN/host clock skew and nothing more, because the only thing a
+# future date can mean past that is a broken clock or a misparse — and the lead the
+# stamp authorizes asserts a publication date to forecasters.
+_DATAWRAPPER_CLOCK_SKEW_TOLERANCE = timedelta(hours=6)
+
 # `stale_data` is Tier-2-only: the Datawrapper hop reached a dataset whose
-# Last-Modified is older than the freshness bound (or missing/unparseable) —
-# withheld rather than served as live.
+# Last-Modified is outside the freshness window — older than the bound, missing,
+# unparseable, or implausibly far in the FUTURE — withheld rather than served as live.
 #
 # `empty_body` is the 200-with-nothing-in-it case: a body that is empty or
 # whitespace-only carries no information, so calling it `success` published an
@@ -550,6 +557,12 @@ def _truncate_with_marker(text: str, cap: int, url: str) -> str:
     (pathologically small cap in tests), returns the raw truncation without
     the marker rather than emitting only-marker text.
     """
+    if cap <= 0:
+        # No budget at all — the caller's arithmetic (section allowance minus a lead line
+        # minus a very long parent URL) can go negative. ``text[:cap]`` on a negative cap
+        # returns nearly the WHOLE text while the invariant claims a bound, so a
+        # zero-budget slot would have rendered a full page.
+        return ""
     if len(text) <= cap:
         return text
     marker = f"\n[truncated at {cap} chars — full source at {url}]"
@@ -748,7 +761,13 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
             continue
         body = r.text
         if len(body) > remaining:
-            body = body[:remaining].rstrip()
+            # Through the marker-emitting truncator, not a bare slice. A bare slice cut
+            # mid-sentence AND could eat the per-URL `[truncated at N chars ...]` marker the
+            # fetch already appended at the end — leaving an already-truncated page rendering
+            # as complete. Reachable on prod constants (5 x 6000 per-URL against an 18000
+            # total). The CSV variant keeps both ends, which is what makes a dataset's newest
+            # rows survive whichever direction it runs.
+            body = (_truncate_csv_middle if is_dataset else _truncate_with_marker)(body, remaining, r.url)
         if is_dataset:
             dataset_remaining -= len(body)
         else:
@@ -1223,18 +1242,28 @@ async def _fetch_datawrapper_dataset(
                 last_modified_raw = resp.headers.get("Last-Modified") if resp.headers else None
                 last_modified = parse_http_last_modified(last_modified_raw) if last_modified_raw else None
                 now = datetime.now(timezone.utc)
-                if last_modified is None or now - last_modified > timedelta(
-                    days=RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS
+                # Two-sided, deliberately. The lead this stamp authorizes asserts a
+                # publication date, and a FUTURE one means a broken clock or a misparse on
+                # one side — so it is unusable as a freshness claim, not maximally fresh.
+                # The old one-sided check let any future date through as the freshest
+                # possible dataset.
+                if (
+                    last_modified is None
+                    or now - last_modified > timedelta(days=RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS)
+                    or last_modified - now > _DATAWRAPPER_CLOCK_SKEW_TOLERANCE
                 ):
-                    age_desc = (
-                        f"published {last_modified.isoformat()}, age {(now - last_modified).days}d"
-                        if last_modified is not None
-                        else "no parseable Last-Modified"
-                    )
+                    if last_modified is None:
+                        age_desc = "no parseable Last-Modified"
+                    elif last_modified > now:
+                        age_desc = f"published {last_modified.isoformat()}, which is in the FUTURE"
+                    else:
+                        age_desc = (
+                            f"published {last_modified.isoformat()}, age {(now - last_modified).days}d "
+                            f"> {RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS}d bound"
+                        )
                     logger.warning(
                         f"resolution_source datawrapper hop {chart.chart_id}: dataset failed the "
-                        f"freshness guard ({age_desc} > {RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS}d "
-                        f"bound) — withheld, not served as live"
+                        f"freshness guard ({age_desc}) — withheld, not served as live"
                     )
                     return FetchResult(
                         url=url,

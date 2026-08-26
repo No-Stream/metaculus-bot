@@ -14,6 +14,18 @@ Detection rules (source-class-aware, per the 2026-08-24 research-archive-qa dim)
   marker. ``gfv2_loop_ran`` is deliberately separate: the v2 driver loop banks a
   transcript on the record even when it soft-fails and contributes NO section to
   the bundle, so payload-presence overstates treatment.
+* ``gfv2_loop_ran`` is TERNARY for the same reason the anchor read is qualified.
+  Only a schema-v2 ``artifact`` record can carry the ``gap_fill_v2`` payload at
+  all: the v2 writer omits the key when the loop didn't run, so on those records
+  its absence IS a measured False. Every other writer class — comment-backfill,
+  schema-v1 artifacts, an artifact with no ``schema_version`` — cannot carry the
+  key whatever happened, and reading those as False put 880 can't-carry records
+  in the untreated arm against 77 honest ones, which would have poisoned the v2
+  treated/untreated calibration split outright. Those now read None.
+* A ``False`` gfv2 read is qualified by ``gfv2_confidence`` the way the anchor
+  read is by ``anchor_confidence``, and for a different corroborating source:
+  gap-fill is not one of the orchestrator's providers, so it has no Provider
+  Diagnostics line — the ``gap_fill_v2`` payload on the record is the evidence.
 * A ``False`` anchor read is qualified by ``anchor_confidence``: the trim-immune
   ``## Provider Diagnostics`` block corroborates it when present
   (``diag_confirms_absent``), and a trimmed record with no diagnostics line stays
@@ -54,9 +66,25 @@ _ABSENT_TAGS: dict[str, None] = {
     "anchor_present": None,
     "gfv2_present": None,
     "gfv2_loop_ran": None,
+    "gfv2_confidence": None,
     "anchor_confidence": None,
     "research_source_class": None,
 }
+
+# The one writer class whose records can carry the ``gap_fill_v2`` payload: the
+# schema-v2 live-capture writer (``research/persistence.py``), which writes the key
+# only when the v2 loop actually ran. Comment-backfill and schema-v1 records never
+# carry it regardless, so their silence is not evidence.
+_GFV2_PAYLOAD_SCHEMA_VERSION = 2
+_GFV2_PAYLOAD_SOURCE = "artifact"
+
+
+def _writer_can_carry_gfv2_payload(record: dict) -> bool:
+    """Whether this record's WRITER could have recorded a v2 loop, had one run."""
+    schema_version = record.get("schema_version")
+    if not isinstance(schema_version, int):
+        return False
+    return schema_version >= _GFV2_PAYLOAD_SCHEMA_VERSION and record.get("source") == _GFV2_PAYLOAD_SOURCE
 
 
 def _timeseries_anchor_diag_status(record: dict) -> str | None:
@@ -94,13 +122,50 @@ def research_tags_for_record(record: dict) -> dict:
     else:
         confidence = "absent_no_diag"
 
+    gfv2_present = bool(_GFV2_HEADER_RE.search(text))
+    gfv2_loop_ran, gfv2_confidence = _gfv2_read(record, gfv2_present)
+
     return {
         "anchor_present": anchor_present,
-        "gfv2_present": bool(_GFV2_HEADER_RE.search(text)),
-        "gfv2_loop_ran": bool(record.get("gap_fill_v2")),
+        "gfv2_present": gfv2_present,
+        "gfv2_loop_ran": gfv2_loop_ran,
+        "gfv2_confidence": gfv2_confidence,
         "anchor_confidence": confidence,
         "research_source_class": record.get("source"),
     }
+
+
+def _gfv2_read(record: dict, gfv2_present: bool) -> tuple[bool | None, str]:
+    """``(gfv2_loop_ran, gfv2_confidence)`` for one archive record.
+
+    Two things prove the loop ran: the banked ``gap_fill_v2`` payload, and the section
+    header itself (the section IS the loop's output, so it cannot exist without one).
+    Either is enough on its own, whatever the writer class. ``gfv2_loop_ran`` is None
+    only where NEITHER is present AND the writer could not have carried the payload
+    anyway — "unrecorded", not "did not run" (see the module docstring's ternary note).
+    The confidence token says what a ``gfv2_present`` of False is worth:
+
+    * ``header``: the section is in the text, so the forecasters read it.
+    * ``payload_ran_no_section``: the loop ran and contributed nothing — a soft-fail
+      or an empty findings artifact. Treated arm by loop, untreated arm by section.
+    * ``payload_confirms_absent``: a carryable record with neither header nor
+      payload, so the loop genuinely did not run. The only confident untreated read.
+    * ``ambiguous_trimmed_no_payload``: a trimmed comment record, where the section
+      could have been eaten by the middle-trim, and no payload can corroborate.
+    * ``absent_no_payload``: an untrimmed record from a writer that cannot carry the
+      payload (schema-v1 artifact), so the header read stands uncorroborated.
+    """
+    if gfv2_present:
+        return True, "header"
+    if record.get("gap_fill_v2") is not None:
+        return True, "payload_ran_no_section"
+    # Only now does carryability matter: a present payload proves a run whatever the
+    # writer class, but an ABSENT one is a measurement only where it could have been
+    # written. A null payload counts as absent — key-present-but-empty must never read
+    # as a run, which is the same collapse the old bool() had.
+    if not _writer_can_carry_gfv2_payload(record):
+        return None, "ambiguous_trimmed_no_payload" if record.get("is_trimmed") else "absent_no_payload"
+    return False, "payload_confirms_absent"
 
 
 def _load_archive_record(qid: object, latest_dir: Path | str) -> dict | None:

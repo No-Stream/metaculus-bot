@@ -41,6 +41,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.prompts import web_research_prompt
+from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.raw_log import record_raw_research
 
 ResearchCallable = Callable[[MetaculusQuestion], Awaitable[str]]
@@ -261,6 +262,7 @@ def _asknews_provider() -> ResearchCallable:
                 formatted_articles = _format_asknews_dual_sections(
                     hot_articles=hot_articles,
                     historical_articles=historical_articles,
+                    qid=qid,
                 )
 
                 logger.info(
@@ -284,11 +286,21 @@ def _format_single_article(article: Any) -> str:
 def _format_asknews_dual_sections(
     hot_articles: list[Any],
     historical_articles: list[Any],
+    *,
+    qid: int | None = None,
 ) -> str:
     """Format AskNews articles into two labeled sections: Historical Context and Recent Developments.
 
     Deduplicates within each list and cross-deduplicates (hot articles that duplicate historical
     URLs are removed). Historical section comes first in the output.
+
+    Both phases empty returns ``""``, NOT a prose "no articles" sentence. The sentence
+    defeated every downstream empty guard: the orchestrator's ``has_output`` read chars>0
+    and reported ``ok``, the summarizer LLM (whose prompt has no no-data escape) was asked
+    to write a briefing from it, and the result rendered under the AskNews header as if it
+    were research. Gemini's grounded-chunk floor next door is the pattern — refuse, and
+    leave a ``lost=articles:...`` token so the ``empty`` status is distinguishable from a
+    provider that was never asked.
     """
     hist_deduped = _dedup_articles_by_url(historical_articles) if historical_articles else []
     hot_deduped = _dedup_articles_by_url(hot_articles) if hot_articles else []
@@ -298,7 +310,11 @@ def _format_asknews_dual_sections(
         hot_deduped = [a for a in hot_deduped if _normalize_url_for_dedup(str(a.article_url)) not in hist_urls]
 
     if not hist_deduped and not hot_deduped:
-        return "No articles were found for this query.\n\n"
+        logger.warning(
+            f"ASKNEWS_NO_ARTICLES: question={qid} hot={len(hot_articles)} historical={len(historical_articles)}"
+        )
+        record_provider_detail(qid, "asknews", {"sources": {"articles": "empty(no_articles)"}})
+        return ""
 
     total_before = len(historical_articles) + len(hot_articles)
     total_after = len(hist_deduped) + len(hot_deduped)

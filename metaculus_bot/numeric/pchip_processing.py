@@ -280,6 +280,14 @@ def create_fallback_numeric_distribution(
     linear-interpolation path (the 0.2.54 behavior this fallback was written
     against); the endpoint/step enforcement is our own ``safe_cdf_bounds`` pass,
     not upstream's ``_standardize_cdf``.
+
+    KNOWN AVAILABILITY GAP (2026-08-25 sentinel audit, unfixed): on a log-scaled
+    (``zero_point``) question, upstream's ``get_cdf()`` can itself raise on a
+    float-epsilon overshoot of 1.0 — so the fallback is unavailable on exactly the
+    question shape where PCHIP is most likely to have failed in the first place. That
+    fails FAST (the forecaster is dropped and attributed), which is why it was left: a
+    drop is not a fabricated distribution. Fixing it means reaching into upstream's
+    builder, which is its own change.
     """
 
     class BoundSafeNumericDistribution(NumericDistribution):

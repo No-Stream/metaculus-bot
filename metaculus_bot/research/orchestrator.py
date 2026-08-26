@@ -742,9 +742,13 @@ class ResearchOrchestrator:
                 # pass through raw — no lossy second-pass summarization. When
                 # AskNews fails and we fall back to Perplexity/Exa, that fallback
                 # is already prose, so skip summarization too.
-                if name == "asknews" and not used_fallback:
-                    if raw and raw.strip():
-                        asknews_raw_holder["text"] = raw
+                if name == "asknews" and not used_fallback and raw and raw.strip():
+                    # Empty raw skips the summarizer entirely: there is nothing to brief
+                    # from, and asking anyway spends a call to get either a refusal or an
+                    # invented briefing (the summarizer prompt has no no-data escape).
+                    # AskNews already recorded an `articles: empty(no_articles)` loss token,
+                    # so the `empty` status below stays distinguishable from a skipped run.
+                    asknews_raw_holder["text"] = raw
                     raw = await self._summarize_asknews(question, raw)
                 latency_ms = int((time.monotonic() - started) * 1000)
                 has_output = bool(raw and raw.strip())

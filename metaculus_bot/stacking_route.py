@@ -24,6 +24,7 @@ expected-base-combine registry that keeps the pipeline from logging an
 
 import asyncio
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from forecasting_tools import (
@@ -334,7 +335,15 @@ async def route_after_forecasts(
         spread = compute_spread(question, [pred.prediction_value for pred in valid_predictions])
         threshold = bot._get_threshold_for_question(question)
 
-        spread_exceeds_threshold = spread > threshold
+        # An UNMEASURABLE spread reports inf (spread_metrics' SPREAD_UNDEFINED: a
+        # non-positive normalizing denominator), and inf > threshold would fire the stacker —
+        # crux extraction, a targeted search and a stacker call — off no measurement at all.
+        # It used to report 0.0 and skip while the marker claimed the models AGREED, which is
+        # the affirmative reading this whole finding is about. Skipping is the conservative
+        # route (MEDIAN, no spend), and the reason names what actually happened so residual
+        # analysis can find these questions.
+        spread_undefined = math.isinf(spread)
+        spread_exceeds_threshold = not spread_undefined and spread > threshold
         # Disagreement was high enough to trigger stacking, but the per-type gate is
         # off, so we deliberately bypass it.
         type_stacking_disabled = spread_exceeds_threshold and not _type_gate_enabled(question)
@@ -382,7 +391,14 @@ async def route_after_forecasts(
             )
 
         bot._conditional_stacking_skipped_count += 1
-        if type_stacking_disabled:
+        if spread_undefined:
+            logger.warning(
+                "Conditional stacking SKIPPED: spread was UNMEASURABLE for question %s "
+                "(see the SPREAD_UNDEFINED warning above); routing to MEDIAN without a "
+                "disagreement measurement",
+                qid,
+            )
+        elif type_stacking_disabled:
             logger.info(
                 "Conditional stacking SKIPPED: stacking disabled for this question type "
                 "(spread=%.3f, threshold=%.3f) for question %s",
@@ -405,7 +421,12 @@ async def route_after_forecasts(
         # restates it in the one field shared with the single-forecaster path, so a
         # consumer can read STACKER_SKIP_REASON alone.
         bot._stacker_outcome[qid] = "skipped_config_off" if type_stacking_disabled else "skipped"
-        bot._stacker_skip_reason[qid] = "config_off" if type_stacking_disabled else "spread_below_threshold"
+        if spread_undefined:
+            bot._stacker_skip_reason[qid] = "spread_undefined"
+        elif type_stacking_disabled:
+            bot._stacker_skip_reason[qid] = "config_off"
+        else:
+            bot._stacker_skip_reason[qid] = "spread_below_threshold"
         return base_predictions_collection()
 
     # Catch-all: a non-stacking strategy, OR a stacking strategy whose budget gate

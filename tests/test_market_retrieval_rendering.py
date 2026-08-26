@@ -796,10 +796,21 @@ class TestRulesBullets:
         so the bullets are structurally out of its reach. Note the regex is NOT end-anchored,
         so "ends with" understates it — any ``: NN%`` on an in-scope line would match.
         """
-        for rules in ("Resolves at 45%", "Threshold: 45%", "45% chance", ""):
+        for rules in ("Resolves at 45%", "Threshold: 45%", "45% chance"):
             rendered = render_snapshot(MarketSnapshot(matches=[_row(rules=rules)]))
 
             assert _bullets(rendered) == [f"- **kalshi** <https://example.test/m>: {rules}"]
+
+    def test_an_empty_rules_body_names_the_gap_instead_of_rendering_bare(self) -> None:
+        """A bare ``- **manifold** <url>: `` reads as "this market states no criteria" — a claim
+        about the MARKET, when in fact we carried nothing. 6 of 146 archived rows rendered that
+        way, all Manifold, whose description field is optional. The empty case used to ride
+        along in the percentage-shape loop above, which is what kept it unnoticed."""
+        rendered = render_snapshot(MarketSnapshot(matches=[_row(rules="")]))
+
+        assert _bullets(rendered) == [
+            "- **kalshi** <https://example.test/m>: [rules unavailable — venue published no description]"
+        ]
 
     def test_a_truncated_bullet_cannot_gain_a_percentage_tail(self) -> None:
         """The one thing the formatter does append is the truncation ellipsis, and a bullet

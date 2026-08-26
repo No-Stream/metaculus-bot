@@ -33,6 +33,7 @@ from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_source import (
     _fetch_datawrapper_dataset,
     _truncate_csv_middle,
+    _truncate_with_marker,
     fetch_resolution_sources,
     format_resolution_sections,
     resolution_source_provider,
@@ -171,6 +172,18 @@ class TestTruncateCsvMiddle:
         out = _truncate_csv_middle(_csv_body(n_rows), cap, DATASET_URL)
         assert len(out) <= cap
 
+    @pytest.mark.parametrize("cap", [0, -1, -400])
+    def test_a_nonpositive_cap_yields_nothing_rather_than_the_whole_text(self, cap: int):
+        """A zero-or-negative budget renders nothing.
+
+        The caller's arithmetic (section allowance minus a lead line minus a very long parent
+        URL) can go negative, and ``text[:cap]`` on a negative cap returns nearly the WHOLE
+        text while the documented invariant claims a bound — so a zero-budget slot would have
+        rendered a full page.
+        """
+        assert _truncate_csv_middle(_csv_body(500), cap, DATASET_URL) == ""
+        assert _truncate_with_marker("x" * 5_000, cap, DATASET_URL) == ""
+
 
 class TestDatawrapperHop:
     async def test_page_plus_live_dataset_happy_path(self, monkeypatch):
@@ -276,6 +289,40 @@ class TestDatawrapperHop:
         results = await fetch_resolution_sources([PAGE_URL])
         assert results[1].status == "stale_data"
         assert results[1].text == ""
+
+    async def test_a_future_dated_dataset_is_withheld_not_treated_as_freshest(self, monkeypatch):
+        """The freshness check is two-sided. A ``Last-Modified`` in the future means a broken
+        clock or a misparse on one side, which makes it unusable as the publication date the
+        lead asserts — the one-sided check passed any future date as maximally fresh."""
+        tomorrow = _http_date(datetime.now(timezone.utc) + timedelta(days=1))
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(20), last_modified=tomorrow),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL])
+
+        assert results[1].status == "stale_data"
+        assert results[1].text == ""
+
+    async def test_a_dataset_inside_the_clock_skew_tolerance_is_still_served(self, monkeypatch):
+        # Ordinary CDN/host clock skew must not cost us a live dataset, so the future side
+        # carries a small tolerance rather than a hard `> now` bound.
+        skewed = _http_date(datetime.now(timezone.utc) + timedelta(minutes=30))
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(20), last_modified=skewed),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL])
+
+        assert results[1].status == "success"
 
     async def test_dataset_just_inside_bound_is_served(self, monkeypatch):
         bound = resolution_source.RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS

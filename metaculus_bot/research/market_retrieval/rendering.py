@@ -522,6 +522,19 @@ def _forecast_content(child: MarketChild, *, cumulative: bool) -> float:
     return min(price, 1.0 - price) if cumulative else price
 
 
+def _quoted_price(child: MarketChild) -> float:
+    """The child's quoted price, refusing an unquoted one LOUDLY.
+
+    Every caller reaches this behind an ``implied_prob_yes is not None`` filter, so a None
+    here means that filter regressed. The point of not writing ``or 0.0`` at the call site is
+    that such a regression must not turn into a rendered ``0.00`` — that is exactly the
+    withheld-price-as-real-zero shape 58175a7 fixed at the venue parsers.
+    """
+    if child.implied_prob_yes is None:
+        raise ValueError(f"unquoted outcome reached price arithmetic: {child.title!r}")
+    return child.implied_prob_yes
+
+
 def _ladder_content_key(child: MarketChild, *, cumulative: bool) -> tuple[bool, float]:
     """Collapse-survival order: open before settled, then most-informative first."""
     return (child.is_resolved, -_forecast_content(child, cumulative=cumulative))
@@ -599,7 +612,11 @@ def _ladder_at_stage(rest: Sequence[MarketChild], *, stage: int) -> _LadderRow:
         parts.append(f"+{len(unquoted)} unquoted")
         collapsed += len(unquoted)
     if collapse_settled and settled:
-        prices = [rest[index].implied_prob_yes or 0.0 for index in settled]
+        # `_quoted_price`, not `or 0.0`: ``settled`` is built with `implied_prob_yes is not
+        # None`, so a fallback here is dead code covering exactly the shape 58175a7 fixed —
+        # a withheld price re-entering the arithmetic as a real 0.00. A regression in that
+        # filter now raises instead of rendering a fabricated span.
+        prices = [_quoted_price(rest[index]) for index in settled]
         low, high = min(prices), max(prices)
         span = f"{low:.2f}" if low == high else f"{low:.2f}-{high:.2f}"
         last = _cell(rest[settled[-1]].title, limit=CHILD_TITLE_MAX_CHARS)
@@ -649,7 +666,15 @@ def _ladder_hard_bound(rest: Sequence[MarketChild], *, cap: int = LADDER_ROW_MAX
 
     dropped = [child for index, child in enumerate(rest) if index not in kept]
     parts = [_ladder_term(rest[index]) for index in sorted(kept)]
-    parts.append(f"+{len(dropped)} more ({_open_price_total(dropped):.2f} summed)")
+    # The count the sum covers, stated. `_open_price_total` sums only the OPEN, PRICED
+    # members (a settled rung's price is a realized outcome, an unquoted one has none),
+    # so a bare `+12 more (0.35 summed)` could hide 8 outcomes settled at 1.00 — the
+    # reader has no way to tell 0.35-across-12 from 0.35-across-4. The stage path splits
+    # into named per-kind groups instead; the hard bound is already at its character
+    # ceiling, so it names the denominator rather than adding rows (a 200-rung worst case
+    # renders "+199 more (199 priced, 145.00 summed)", 37 chars against a 60-char reserve).
+    priced = [child for child in dropped if child.implied_prob_yes is not None and not child.is_resolved]
+    parts.append(f"+{len(dropped)} more ({len(priced)} priced, {_open_price_total(dropped):.2f} summed)")
     return _LadderRow(
         title=_ladder_join(len(rest), parts),
         stage=LADDER_HARD_BOUND_STAGE,
@@ -846,6 +871,13 @@ def render_snapshot_with_stats(
         body = _bullet_body(match)
         if len(body) > RAW_BULLET_BODY_MAX_CHARS:
             body = body[:RAW_BULLET_BODY_MAX_CHARS] + "..."
+        # An empty body used to render a bare `- **manifold** <url>: ` line, which reads as
+        # "this market publishes no resolution criteria" — a claim about the market rather
+        # than about our retrieval. 6 of 146 archived rows (all Manifold, whose description
+        # field is optional) rendered that way. Naming the gap keeps a forecaster from
+        # discounting a market for saying nothing when it was us who carried nothing.
+        if not body:
+            body = "[rules unavailable — venue published no description]"
         link = f" <{match.market_url}>" if match.market_url else ""
         lines.append(f"- **{match.platform}**{link}: {body}")
 

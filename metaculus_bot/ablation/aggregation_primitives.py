@@ -37,15 +37,24 @@ def aggregate_mc(
 ) -> PredictedOptionList:
     """Option-wise central tendency, then clamp + renormalize.
 
-    Accepts pre-accumulated per-option value lists. Handles missing options
-    with a uniform fallback (1/N).
+    Accepts pre-accumulated per-option value lists. **Raises when an option has no
+    values**: a uniform ``1/N`` there is a probability no model declared, imputed into
+    an aggregate that then reads as a real forecast — the same defect the production
+    ``build_mc_prediction`` stopped doing. Upstream accumulation covers every option in
+    ``option_order`` (each contributing ballot is validated against the question's full
+    option set), so an empty list means that invariant broke and the run should say so
+    rather than average in an invented share.
     """
     agg_fn = _AGG_FUNC[method]
-    n_options = len(option_order)
     ordered_raw: list[float] = []
     for name in option_order:
         values = per_option_values.get(name, [])
-        ordered_raw.append(float(agg_fn(values)) if values else 1.0 / n_options)
+        if not values:
+            raise ValueError(
+                f"no model declared a probability for option {name!r}; "
+                f"cannot aggregate without imputing one (options={list(option_order)})"
+            )
+        ordered_raw.append(float(agg_fn(values)))
 
     # Drift-free clamp + renormalize (the single shared helper build_mc_prediction
     # uses). Guarantees every option lands in [MC_PROB_MIN, MC_PROB_MAX] summing to
