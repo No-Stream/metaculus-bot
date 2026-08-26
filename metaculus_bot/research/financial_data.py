@@ -392,6 +392,12 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
             return ""
         current_price = close.iloc[-1]
         latest_obs_date = cast(pd.Timestamp, close.index[-1]).date()
+        # yfinance serves listed-asset bars on a tz-aware exchange-local index while
+        # window_end is UTC; the two dates disagree for part of every day, so age and
+        # the partial-bar check compare in the index's own timezone (a 00:03 UTC cron
+        # would otherwise inflate every US-equity age by one).
+        index_tz = cast(pd.DatetimeIndex, close.index).tz
+        reference_date = window_end.astimezone(index_tz).date() if index_tz is not None else window_end.date()
 
         parts = [f"### {ticker}"]
         name = info.get("shortName", "")
@@ -401,15 +407,16 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
         # even when Yahoo's newest bar is days old (a weekend Friday close, or a
         # null-close hole silently dropped from the frame).
         latest_line = f"- Latest price: {current_price:.2f} (as of {latest_obs_date.isoformat()})"
-        if not is_benchmarking and latest_obs_date == window_end.date():
+        if not is_benchmarking and latest_obs_date == reference_date:
             latest_line += " — today's bar, in progress"
         parts.append(latest_line)
 
-        # 252 for exchange-traded assets, 365 for 24/7 markets (crypto) — the same
-        # basis drives the annualization factor AND every "1y"/"52-week" row count.
+        # 252 for exchange-traded assets, 365 for 24/7 markets (crypto) — the basis
+        # drives the annualization factor, the staleness allowance, and the period-return
+        # slip grace (the period/52-week windows themselves are date-based on both bases).
         periods_per_year = observed_periods_per_year(close.index)
 
-        stale_age = stale_latest_age_days(latest_obs_date, window_end.date(), periods_per_year)
+        stale_age = stale_latest_age_days(latest_obs_date, reference_date, periods_per_year)
         if stale_age is not None:
             unit = daily_step_unit(periods_per_year)
             parts.append(
@@ -439,8 +446,11 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
             unit = daily_step_unit(periods_per_year)
             parts.append(f"- {FINANCIAL_YFINANCE_RECENT_DAYS}-{unit} annualized volatility: {annualized_vol:.1f}%")
 
-        # 52-week range
-        year_slice = close.iloc[-min(periods_per_year, len(close)) :]
+        # 52-week range, windowed by DATE like the period returns: a row-count slice
+        # under a fixed "52-week" label spans ~13 months on a gapped 24/7 series and
+        # over a year on a holiday-bearing exchange index. Never empty — the last
+        # observation is always inside its own trailing year.
+        year_slice = close[close.index >= close.index[-1] - pd.Timedelta(days=CALENDAR_DAYS_PER_YEAR)]
         low_52w = year_slice.min()
         high_52w = year_slice.max()
         parts.append(f"- 52-week range: {low_52w:.2f} - {high_52w:.2f}")
@@ -475,54 +485,51 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
 # between them are the package's shared definitions, imported from ts_estimators above, so a
 # correction cannot miss a copy — the ts-anchor stack had exactly that miss until 2026-08-25.
 
-# Steps back behind each period-return label, in the basis's own step unit: BUSINESS
-# days on the 252 basis (the trading-day conventions, 5/wk), calendar days on the 365
-# basis. Each step count is resolved to a target DATE and matched at-or-before — never
-# used as a row offset, because a gapped index (Yahoo's dropped null-close bar, an
-# unscheduled closure) shifts every row offset by the hole count, which is how a "1d"
-# return spanning 53 hours once rendered on a BTC-USD snapshot. On a gap-free index the
-# date match lands on exactly the row the old offsets read, so the numbers are unchanged.
-_PERIOD_TARGET_STEPS: dict[int, list[tuple[str, int]]] = {
-    TRADING_DAYS_PER_YEAR: [("1d", 1), ("1w", 5), ("1m", 21), ("3m", 63), ("6m", 126), ("1y", TRADING_DAYS_PER_YEAR)],
-    CALENDAR_DAYS_PER_YEAR: [
-        ("1d", 1),
-        ("1w", 7),
-        ("1m", 30),
-        ("3m", 91),
-        ("6m", 182),
-        ("1y", CALENDAR_DAYS_PER_YEAR),
-    ],
-}
+# Calendar days back behind each period-return label, on BOTH bases. Each count is
+# resolved to a target DATE and matched at-or-before — never used as a row offset,
+# because a gapped index (Yahoo's dropped null-close bar, an unscheduled closure)
+# shifts every row offset by the hole count, which is how a "1d" return spanning 53
+# hours once rendered on a BTC-USD snapshot. Calendar days rather than business days
+# deliberately: `pd.offsets.BDay` skips only weekends and knows nothing about market
+# HOLIDAYS, so a business-day 1y target on a NYSE-shaped index landed ~352 calendar
+# days back under a label claiming a year, at slip 0 — silently. With calendar
+# targets, every label is a true calendar period on both bases, and the weekend or
+# holiday under a 252-basis target is absorbed by the at-or-before match within the
+# slip grace below.
+_PERIOD_TARGET_DAYS: list[tuple[str, int]] = [
+    ("1d", 1),
+    ("1w", 7),
+    ("1m", 30),
+    ("3m", 91),
+    ("6m", 182),
+    ("1y", CALENDAR_DAYS_PER_YEAR),
+]
 
 # Calendar days a period-return match may land before its target date before the label
-# discloses the actual span. The 252 basis resolves targets in business days, so a market
-# holiday under the target slips the match up to 3 days over an adjacent weekend —
-# routine, not a mislabel. On the 365 basis every date should print a bar, so ANY slip is
-# a data gap the label must own up to.
+# discloses the actual span. On the 252 basis a target can fall on a weekend day with a
+# market holiday under the adjacent Friday — a 3-day slip that is routine, not a
+# mislabel. On the 365 basis every date should print a bar, so ANY slip is a data gap
+# the label must own up to.
 _PERIOD_SLIP_GRACE_DAYS: dict[int, int] = {TRADING_DAYS_PER_YEAR: 3, CALENDAR_DAYS_PER_YEAR: 0}
 
 
 def _compute_period_returns(close: pd.Series, periods_per_year: int) -> str:
     """Compute returns over standard periods via date-based at-or-before lookups.
 
-    ``periods_per_year`` is REQUIRED (no trading-day default): it selects the step unit
-    that makes each label a true calendar period, so a caller that forgets it would
-    silently reproduce the q44882 mislabelling on a 24/7 series. Each label's start value
-    is the newest observation at or before ``last − steps`` (the same pattern as the FRED
-    YoY lookup below); a label whose match lands beyond the basis's slip grace discloses
-    the actual span ("1d (actual 2d)") instead of wearing a period it doesn't cover. A
-    label with no observation at or before its target is omitted, exactly as the old
-    too-few-rows guard omitted it.
+    ``periods_per_year`` is REQUIRED (no trading-day default): it selects the slip
+    grace that separates routine weekend/holiday slippage from a data gap, so a caller
+    that forgets it would silently reproduce the q44882 mislabelling on a 24/7 series.
+    Each label's start value is the newest observation at or before ``last − days``
+    (the same pattern as the FRED YoY lookup below); a label whose match lands beyond
+    the basis's slip grace discloses the actual span ("1d (actual 2d)") instead of
+    wearing a period it doesn't cover. A label with no observation at or before its
+    target is omitted, exactly as the old too-few-rows guard omitted it.
     """
     last_ts = cast(pd.Timestamp, close.index[-1])
     end_price = close.iloc[-1]
     lines = []
-    for label, steps in _PERIOD_TARGET_STEPS[periods_per_year]:
-        target = (
-            last_ts - pd.offsets.BDay(steps)
-            if periods_per_year == TRADING_DAYS_PER_YEAR
-            else last_ts - pd.Timedelta(days=steps)
-        )
+    for label, days in _PERIOD_TARGET_DAYS:
+        target = last_ts - pd.Timedelta(days=days)
         prior = close.loc[:target]
         if prior.empty:
             continue

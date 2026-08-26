@@ -13,10 +13,12 @@ and all three used to be ranked as though they were:
 * a declared percentile curve recovered with too few anchors to rebuild the
   distribution the model actually declared.
 
-The first two exclusions come from ``analysis.py``'s ``per_model_cohort``, called
-rather than restated so the rule cannot drift between the aggregate cuts and the
-dossiers. The third is specific to the audit's own scoring path, where each
-member's declared percentiles are PCHIP'd into a full CDF and log-scored.
+The first two exclusions apply the same predicates ``analysis.py``'s
+``per_model_cohort`` uses for the aggregate cuts — ``detect_stacker_fired(record)
+== "confirmed_stacker"`` and ``parsing.is_anonymous_model_key`` — called rather
+than restated so the rule cannot drift between the cuts and the dossiers. The
+third is specific to the audit's own scoring path, where each member's declared
+percentiles are PCHIP'd into a full CDF and log-scored.
 """
 
 from __future__ import annotations
@@ -25,21 +27,14 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from metaculus_bot.performance_analysis.analysis import per_model_cohort
 from metaculus_bot.performance_analysis.parsing import (
     MIN_SCOREABLE_ANCHORS,
     declared_anchors,
     is_anonymous_model_key,
 )
+from metaculus_bot.performance_analysis.stacker_detection import detect_stacker_fired
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-# ``MIN_SCOREABLE_ANCHORS`` and ``declared_anchors`` live in ``parsing`` (beside the recovery
-# that produces these curves) and are re-exported below because this module was their first
-# home and residual scripts import them from it. The move made three consumers share one
-# number instead of each carrying a literal 9 — ``analysis.max_step_clamp_screen`` and
-# ``stacker_detection.exceeded_spread_threshold`` are the other two, and ``analysis`` cannot
-# import this module (this module imports ``analysis``).
 
 # Which per-model field a ranking reads, by question type. MC has no ranker.
 _PER_MODEL_FIELD_BY_TYPE: dict[str, str] = {
@@ -112,8 +107,12 @@ def per_model_ranking_cohort(record: dict) -> PerModelRankingCohort:
     if field_name is None:
         return PerModelRankingCohort({})
     per_model = record.get(field_name) or {}
-    if not per_model_cohort([record], cut="audit_ranking"):
-        # per_model_cohort drops a record only on a confirmed-stacker verdict.
+    if detect_stacker_fired(record) == "confirmed_stacker":
+        # The same predicate per_model_cohort applies for the aggregate cuts. Called
+        # directly rather than through per_model_cohort because that function logs a
+        # per-cut PER_MODEL_COHORT aggregate on every call — routing one record through
+        # it doubled the marker per dossier render and polluted its tallies with
+        # eligible_records=0|1 singletons.
         return PerModelRankingCohort({}, stacker_fired=True)
     anonymous = tuple(sorted(key for key in per_model if is_anonymous_model_key(key)))
     attributed = {name: value for name, value in per_model.items() if not is_anonymous_model_key(name)}
@@ -149,9 +148,7 @@ def log_ranking_cohort(record: dict, cohort: PerModelRankingCohort, *, cut: str)
 
 
 __all__ = [
-    "MIN_SCOREABLE_ANCHORS",
     "PerModelRankingCohort",
-    "declared_anchors",
     "log_ranking_cohort",
     "per_model_ranking_cohort",
 ]

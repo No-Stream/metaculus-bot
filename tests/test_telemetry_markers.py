@@ -22,6 +22,7 @@ import json
 
 import pytest
 
+from metaculus_bot.comment.markers import STACKER_SKIP_REASONS
 from scripts.telemetry.markers import (
     MARKER_SPECS,
     coerce_value,
@@ -607,6 +608,15 @@ SPREAD_UNDEFINED_LINE = (
     "SPREAD_UNDEFINED: question=45363 qtype=numeric denominator=-0 models=3 — key-percentile spread "
     "is unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement"
 )
+NUMERIC_PCHIP_FALLBACK_LINE = (
+    "2026-06-11 21:14:03,512 - metaculus_bot.numeric.diagnostics - WARNING - "
+    "Question 43913: PCHIP CDF construction failed (Percentile values must be strictly increasing), "
+    "falling back to forecasting-tools default"
+)
+NUMERIC_PCHIP_FALLBACK_NO_ID_LINE = (
+    "2026-06-11 21:14:03,512 - metaculus_bot.numeric.diagnostics - WARNING - "
+    "Question N/A: PCHIP CDF construction failed (boom), falling back to forecasting-tools default"
+)
 
 
 class TestNumericDegenerateDeclaration:
@@ -664,6 +674,28 @@ class TestNumericAggregateGridMismatch:
         rec = _parse_one(NUMERIC_AGGREGATE_GRID_MISMATCH_LINE)
         assert rec["qid"] == 44620
         assert rec["qid_kind"] == "question_id"
+
+
+class TestNumericPchipFallback:
+    """The one numeric repair surface with a confirmed prod fire (q43913's degenerate
+    declaration raised out of generate_pchip_cdf), so it earns a spec where the dead
+    repair-tier WARNs deliberately do not — see the M16 note in markers.py."""
+
+    def test_fields(self):
+        rec = _parse_one(NUMERIC_PCHIP_FALLBACK_LINE)
+        assert rec["marker"] == "numeric_pchip_fallback"
+        assert rec["error"] == "Percentile values must be strictly increasing"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(NUMERIC_PCHIP_FALLBACK_LINE)
+        assert rec["qid"] == 43913
+        assert rec["qid_kind"] == "question_id"
+
+    def test_a_questionless_emission_still_harvests(self):
+        # log_pchip_fallback renders a missing id as "N/A" (a _NONE_SENTINELS member).
+        rec = _parse_one(NUMERIC_PCHIP_FALLBACK_NO_ID_LINE)
+        assert rec["qid"] is None
+        assert rec["error"] == "boom"
 
 
 class TestSpreadUndefined:
@@ -838,9 +870,15 @@ class TestHtmlCommentMarkers:
     def test_stacker_skip_reason(self):
         # The additive skip-reason companion: the reason the plain "skipped"
         # outcome can't express (single-forecaster skips compute no spread at all).
-        for reason in ("single_forecaster", "spread_below_threshold", "config_off"):
+        # Iterates the comment side's frozenset — the single source of truth — so a
+        # reason added there is uncoverable-by-omission here: this alternation is a
+        # hand-maintained duplicate with no import-time assert tying it back (the
+        # comment side self-defends; the telemetry side has only this test), and a
+        # dropped bucket is unrecoverable after the 90-day GHA log expiry.
+
+        for reason in sorted(STACKER_SKIP_REASONS):
             rec = _parse_one(f"<!-- STACKER_SKIP_REASON={reason} -->")
-            assert rec["marker"] == "stacker_skip_reason"
+            assert rec["marker"] == "stacker_skip_reason", reason
             assert rec["reason"] == reason
 
     def test_stacker_skip_reason_does_not_collide_with_stacker_outcome(self):

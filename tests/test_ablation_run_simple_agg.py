@@ -240,6 +240,29 @@ class TestMultipleChoice:
         green_prob = next(o["probability"] for o in options if o["option_name"] == "Green")
         assert red_prob > green_prob
 
+    def test_a_degenerate_ballot_fails_that_question_not_the_stage(
+        self, cache: AblationCache, method_label: str, runner_fn: RunnerFn, arm_constant: str
+    ) -> None:
+        # aggregate_mc raises on an option no model declared; at the per-qid boundary
+        # that must become an attributed error payload (like insufficient_forecasters),
+        # not an exception that aborts the whole stage after every other question's
+        # forecaster calls were already paid for.
+        question = make_mock_mc_question(qid=202)
+        no_green = {"Red": 0.6, "Blue": 0.4}
+        forecaster_payloads = {
+            model_slug_to_filename(f"openrouter/test/m{i}"): _mc_payload(f"openrouter/test/m{i}", no_green)
+            for i in (1, 2, 3)
+        }
+        payload = asyncio.run(
+            runner_fn(qid=202, question=question, forecaster_payloads=forecaster_payloads, cache=cache)
+        )
+        assert payload["success"] is False
+        assert payload["reason"] == "degenerate_mc_ballot"
+        assert any("Green" in err for err in payload["errors"])
+        cached = cache.read_stacker_output(qid=202, arm=arm_constant)
+        assert cached is not None
+        assert payload.items() <= cached.items()  # cache adds its schema-version stamp
+
 
 class TestAggregateMcRefusesImputation:
     """The primitive raises when an option has no declared values (H1's ablation sibling).

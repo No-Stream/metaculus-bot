@@ -178,14 +178,16 @@ LADDER_MAX_STAGE = _LADDER_STAGE_COLLAPSE_SETTLED + len(LADDER_PRICE_FLOORS) - 1
 # "this fell off the end of the ladder" rather than reading as one more ordinary stage.
 LADDER_HARD_BOUND_STAGE = 99
 
-# Characters the hard bound reserves for the `[remaining N] ` prefix and the `+N more (X.XX summed)`
-# tail it appends, so the greedy term fill cannot spend the whole row cap on terms alone.
+# Characters the hard bound reserves for the `[remaining N] ` prefix and the
+# `+N more (N priced, X.XX summed)` tail it appends, so the greedy term fill cannot spend the
+# whole row cap on terms alone (worst-case tail ~40 chars incl. the ` / ` separator).
 _LADDER_HARD_BOUND_RESERVE = 60
 
 # The shortest a hard-bounded ladder row can be asked to get, because it always names at least its
 # highest-priced remaining outcome: `[remaining NNN] ` (<= 17) + one term at `CHILD_TITLE_MAX_CHARS`
-# plus a price and a resolved flag (<= 55) + ` / +NNN more (NN.NN summed)` (<= 29) = 101 chars. 120
-# leaves a margin without pretending the floor is tighter than the arithmetic allows.
+# plus a price and a resolved flag (<= 55) + ` / +NNN more (NNN priced, NNN.NN summed)` (<= 40)
+# = ~112 chars. 120 leaves ~8 chars of margin without pretending the floor is tighter than the
+# arithmetic allows.
 #
 # It is what makes `LADDER_SECTION_MAX_CHARS` a real bound rather than a target: the section binds
 # exactly while a slate has no more than `LADDER_SECTION_MAX_CHARS // LADDER_MIN_ROW_CHARS` ladder
@@ -456,15 +458,22 @@ def _table_row(cells: dict[str, str]) -> str:
     return "| " + " | ".join(cells[column] for column in TABLE_COLUMNS) + " |"
 
 
+def _open_priced(children: Sequence[MarketChild]) -> list[MarketChild]:
+    """The OPEN, PRICED children — the one definition of the membership every disclosed
+    price figure (a group's sum AND its stated count) is computed over, so the two cannot
+    drift apart."""
+    return [child for child in children if child.implied_prob_yes is not None and not child.is_resolved]
+
+
 def _open_price_total(children: Sequence[MarketChild]) -> float:
     """The summed quoted prices of the OPEN children — every price figure the ladder discloses.
 
-    One definition, so a collapse group's summed price and the hard bound's remainder cannot drift
-    apart. Resolved children are excluded because a settled rung's price is a realized outcome rather
-    than forecast content, and reporting it as a summed price a forecaster is not seeing would
-    overstate what the collapse cost. Unquoted children contribute nothing, which is why blanking the
-    venues' manufactured 0.50 defaults corrects these figures for free: a fabricated price used to
-    inflate them.
+    Sums ``_open_priced``, so a collapse group's summed price, its stated count, and the hard
+    bound's remainder all read one membership rule. Resolved children are excluded because a
+    settled rung's price is a realized outcome rather than forecast content, and reporting it
+    as a summed price a forecaster is not seeing would overstate what the collapse cost.
+    Unquoted children contribute nothing, which is why blanking the venues' manufactured 0.50
+    defaults corrects these figures for free: a fabricated price used to inflate them.
 
     A raw sum rather than a share of the family, deliberately. A cumulative Kalshi threshold ladder's
     nested survival prices routinely sum past 1.0 (median 1.46 across the archived Kalshi families),
@@ -472,9 +481,7 @@ def _open_price_total(children: Sequence[MarketChild]) -> float:
     rather than standing in for outcomes the forecaster cannot see at all, so it reads as arithmetic
     about that group instead of a claim about the distribution.
     """
-    return sum(
-        child.implied_prob_yes for child in children if child.implied_prob_yes is not None and not child.is_resolved
-    )
+    return sum(child.implied_prob_yes for child in _open_priced(children) if child.implied_prob_yes is not None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,7 +680,8 @@ def _ladder_hard_bound(rest: Sequence[MarketChild], *, cap: int = LADDER_ROW_MAX
     # into named per-kind groups instead; the hard bound is already at its character
     # ceiling, so it names the denominator rather than adding rows (a 200-rung worst case
     # renders "+199 more (199 priced, 145.00 summed)", 37 chars against a 60-char reserve).
-    priced = [child for child in dropped if child.implied_prob_yes is not None and not child.is_resolved]
+    # `_open_priced` is the same filter `_open_price_total` sums, by construction.
+    priced = _open_priced(dropped)
     parts.append(f"+{len(dropped)} more ({len(priced)} priced, {_open_price_total(dropped):.2f} summed)")
     return _LadderRow(
         title=_ladder_join(len(rest), parts),

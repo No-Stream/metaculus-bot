@@ -672,12 +672,14 @@ class TestKalshiEventDerivations:
         """`kalshi_usd_liquidity` still midpoints an empty book, and that is the intended asymmetry.
 
         The spread guard corrects a PRICE; this function converts a contract COUNT into dollars, so
-        applying the same rule here would delete a real count rather than fix a bad number. A sibling
-        "fix" that swept this function in with the 2026-08-25 change would blank the `total_vol` and `OI`
-        cells on any no-book strike that has traded, which is a strictly worse cell than a stale
-        conversion. The three details its own docstring calls unpinned are pinned here too: the
-        `last_price_dollars` fallback, the `or 1.0` notional default, and the truthiness check that
-        routes a genuine 0.0 midpoint to the last trade.
+        applying the same rule here would delete a real count rather than fix a bad number. Blanking
+        the empty-book midpoint would blank the `total_vol` and `OI` cells on any no-book strike that
+        has traded, which is a strictly worse cell than a stale conversion. The one half of the
+        no-price rule the function DOES take (since 2026-08-25) is the no-price-at-all case: with
+        neither a book nor a last trade there is nothing to convert by, so volume dollars are None
+        rather than the old `price or 0.0` manufactured `$0`. The details its docstring calls
+        unpinned are pinned here too: the `last_price_dollars` fallback, the `or 1.0` notional
+        default, and the truthiness check that routes a genuine 0.0 midpoint to the last trade.
         """
         empty_book = {"volume_fp": "1000", "open_interest_fp": "400", "yes_bid_dollars": "0.0000"}
         empty_book |= {"yes_ask_dollars": "1.0000", "notional_value_dollars": "1.0000"}
@@ -688,6 +690,7 @@ class TestKalshiEventDerivations:
             "yes_ask_dollars": "0.0000",
             "last_price_dollars": "0.2000",
         }
+        traded_no_price = {"volume_fp": "1000", "open_interest_fp": "400"}
 
         assert venues.kalshi_strike_price(empty_book) is None, "the PRICE is still refused"
         assert venues.kalshi_usd_liquidity(empty_book) == (pytest.approx(500.0), pytest.approx(400.0))
@@ -695,6 +698,9 @@ class TestKalshiEventDerivations:
         # No notional field at all: open interest converts at the $1.00 default rather than vanishing.
         assert venues.kalshi_usd_liquidity({"open_interest_fp": "400"})[1] == pytest.approx(400.0)
         assert venues.kalshi_usd_liquidity(zero_midpoint)[0] == pytest.approx(200.0)
+        # A real contract count with no price to convert by is UNKNOWN dollars, not $0: open
+        # interest still converts (notional has a documented $1.00 default) but volume is None.
+        assert venues.kalshi_usd_liquidity(traded_no_price) == (None, pytest.approx(400.0))
 
     def test_a_settled_strike_is_never_rendered_as_a_child(self, multi_close_page: dict[str, Any]) -> None:
         """The same scope the money legs use, for the same reason: a settled Kalshi market publishes

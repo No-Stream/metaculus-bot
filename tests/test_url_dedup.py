@@ -1,7 +1,12 @@
+import asyncio
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.providers import (
+    _asknews_provider,
     _dedup_articles_by_url,
     _format_asknews_dual_sections,
     _normalize_url_for_dedup,
@@ -92,13 +97,36 @@ class TestFormatAsknewsDualSections:
 
         assert result == ""
 
-    def test_the_empty_case_records_a_source_loss_token(self) -> None:
+    @pytest.mark.asyncio
+    async def test_the_empty_case_records_a_source_loss_token(self, monkeypatch) -> None:
         # "" alone is byte-identical to a provider that was never asked, so the empty read
-        # has to leave a `lost=articles:...` token on the diagnostics line.
+        # has to leave a `lost=articles:...` token on the diagnostics line. The token is
+        # written by _asknews_provider (which owns the qid), keeping the formatter pure —
+        # a formatter writing the module-global registry raced _degraded_to_raw_articles'
+        # write for the same key only by accident of ordering.
+        monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
+        monkeypatch.setenv("ASKNEWS_SECRET", "secret")
         pop_provider_detail(4242, "asknews")  # start from a clean registry key
 
-        _format_asknews_dual_sections(hot_articles=[], historical_articles=[], qid=4242)
+        async def _no_articles(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            resp = AsyncMock()
+            resp.as_dicts = []
+            return resp
 
+        question = MagicMock()
+        question.question_text = "Will X happen?"
+        question.id_of_question = 4242
+        with (
+            patch("asknews_sdk.AsyncAskNewsSDK") as sdk_class,
+            patch("metaculus_bot.research.providers.asyncio.sleep", new=AsyncMock()),
+        ):
+            sdk = AsyncMock()
+            sdk.news.search_news = _no_articles
+            sdk_class.return_value.__aenter__.return_value = sdk
+            result = await _asknews_provider()(question)
+
+        assert result == ""
         assert pop_provider_detail(4242, "asknews") == {"sources": {"articles": "empty(no_articles)"}}
 
     def test_cross_set_dedup_removes_hot_duplicates_of_historical(self) -> None:

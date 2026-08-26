@@ -31,13 +31,13 @@ from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from metaculus_bot.performance_analysis.collector import load_dataset, resolve_numeric_record_to_score_inputs
 from metaculus_bot.performance_analysis.parsing import (
+    MIN_SCOREABLE_ANCHORS,
     _parse_probability,
+    declared_anchors,
     parse_per_model_forecasts,
 )
 from metaculus_bot.performance_analysis.ranking_cohort import (
-    MIN_SCOREABLE_ANCHORS,
     PerModelRankingCohort,
-    declared_anchors,
     log_ranking_cohort,
     per_model_ranking_cohort,
 )
@@ -541,7 +541,7 @@ def _format_model_ranking(ranked: list[dict], record: dict) -> str:
             "|---|---|---|---|---|",
         ]
         for i, r in enumerate(ranked, 1):
-            lines.append(f"| {i} | {r['model']} | {r['raw']} | {r.get('n_anchors', '?')} | {r['score']:+.2f} |")
+            lines.append(f"| {i} | {r['model']} | {r['raw']} | {r['n_anchors']} | {r['score']:+.2f} |")
     else:
         lines = [
             "| rank | model | forecast | Brier (lower = better) | delta vs ensemble |",

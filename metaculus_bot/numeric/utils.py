@@ -157,14 +157,20 @@ def _postprocess_ensemble_cdf(
 def _canonical_cdf_length(question: NumericQuestion) -> int:
     """Points the question's submitted CDF has: ``cdf_size``, else the 201-point default.
 
-    Mirrors ``build_numeric_distribution``'s target, so per-model CDFs and the
-    ensemble CDF live on the same grid by construction.
+    Mirrors ``build_numeric_distribution``'s target (pipeline.py reads a None
+    ``cdf_size`` as the standard grid the same way), so per-model CDFs and the
+    ensemble CDF live on the same grid by construction. An out-of-range value
+    raises LOUDLY rather than silently substituting 201: the substitution would
+    only defer the crash to ``_postprocess_ensemble_cdf``, which re-reads
+    ``question.cdf_size`` and would then disagree with the grid the models were
+    just aligned onto.
     """
-    target = getattr(question, "cdf_size", None)
-    if target is None:
+    if question.cdf_size is None:
         return PCHIP_CDF_POINTS
-    target = int(target)
-    return target if target >= 2 else PCHIP_CDF_POINTS
+    target = int(question.cdf_size)
+    if target < 2:
+        raise ValueError(f"NumericQuestion.cdf_size must be >= 2 to define a CDF grid, got {target}")
+    return target
 
 
 def _cdf_heights_on_canonical_grid(

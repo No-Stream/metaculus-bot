@@ -651,7 +651,12 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
                                     content_type=content_type or None,
                                     escalate_rendered=True,
                                 )
-                            text = html.strip()
+                            # Same allow-listed tag strip the Tier-1 raw-body branches run:
+                            # a Datawrapper poll CSV measured 69% `<a href=...>` markup, so
+                            # without it the driver's max_result_chars budget buys tags
+                            # instead of rows, and the inflated length also defeats the
+                            # short-content escalation heuristic below.
+                            text = resolution_source.strip_html_tags(html).strip()
                             if not text:
                                 return PlainFetchResult(
                                     status="empty",

@@ -560,6 +560,29 @@ async def test_fetch_pagination_second_call_uses_cache(monkeypatch: pytest.Monke
     assert fetch_plain.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_fetch_plain_textual_branch_strips_allowlisted_markup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The raw-text branch runs the same allow-listed tag strip as the Tier-1 CSV path:
+    a poll-tracker CSV's styled per-row anchors are markup the driver's result budget
+    should not buy, and inequality signs in data cells must survive untouched."""
+    csv_body = (
+        b"date,pollster,margin\n"
+        b"\"8/16 - 8/17, 2026\",<a href='https://poller.example/aug' style='color:#000'>Emerson College</a>,-12.8\n"
+        b"note,a < 5 and b > 3,0.0\n"
+    )
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/csv"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=csv_body))
+
+    result = await agentic_tools._fetch_plain("https://example.com/data.csv")
+
+    assert result.status == "ok"
+    assert "Emerson College" in result.text
+    assert "<a " not in result.text and "style=" not in result.text
+    assert "a < 5 and b > 3" in result.text
+
+
 def test_extract_links_caps_at_twenty_five() -> None:
     html = "".join(f'<a href="/{index}">link{index}</a>' for index in range(30))
 

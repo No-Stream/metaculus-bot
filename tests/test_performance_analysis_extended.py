@@ -25,6 +25,7 @@ from metaculus_bot.performance_analysis.analysis import (
     disagreement_predicts_error,
     financial_vs_nonfinancial_pit,
     max_step_clamp_screen,
+    mc_summary,
     no_bias_check,
     numeric_pit_analysis,
     per_model_binary_scores,
@@ -119,6 +120,37 @@ def _numeric_record(
 # ---------------------------------------------------------------------------
 # no_bias_check
 # ---------------------------------------------------------------------------
+
+
+class TestMcSummary:
+    def test_a_short_forecast_vector_is_dropped_from_mean_prob_correct(self, caplog):
+        """A forecast vector shorter than its option list cannot say what probability was
+        on the winner. The old ``else 0.0`` scored that PARSE gap as "we gave the correct
+        option zero", dragging mean_prob_correct down on a defect rather than a forecast;
+        the record must still count in count / mean_mc_log_score."""
+        normal = {
+            "type": "multiple_choice",
+            "mc_log_score": -0.5,
+            "resolution_parsed": "B",
+            "options": ["A", "B"],
+            "our_forecast_values": [0.3, 0.7],
+            "post_id": 1,
+        }
+        short = {
+            "type": "multiple_choice",
+            "mc_log_score": -0.9,
+            "resolution_parsed": "C",
+            "options": ["A", "B", "C"],
+            "our_forecast_values": [0.6, 0.4],
+            "post_id": 2,
+        }
+        with caplog.at_level("WARNING"):
+            summary = mc_summary([normal, short])
+        assert summary["count"] == 2
+        assert summary["mean_prob_correct"] == pytest.approx(0.7), "the short record contributes nothing"
+        assert summary["mean_mc_log_score"] == pytest.approx(-0.7)
+        assert summary["accuracy"] == pytest.approx(0.5)
+        assert "shorter than its option list" in caplog.text
 
 
 class TestNoBiasCheck:

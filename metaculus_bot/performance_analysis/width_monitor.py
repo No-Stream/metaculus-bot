@@ -556,23 +556,16 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "| era | n | excl | n_eff | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
         "| PIT std | mean PIT | med rel width (n) | band_miss (lo/hi) | OOB lo/hi |"
     )
-    sep = "|" + "|".join(["---"] * 14) + "|"
+    sep = "|" + "|".join(["---"] * (header.count("|") - 1)) + "|"
     lines.append(header)
     lines.append(sep)
     for m in metrics:
         rel = f"{m.median_rel_width:.3f} ({m.n_width})" if m.median_rel_width is not None else f"n/a ({m.n_width})"
-        if m.underpowered:
-            point_metrics = ["n/a"] * 5
-            band = "n/a"
-        else:
-            point_metrics = [
-                f"{m.cov_at_10:.3f}",
-                f"{m.cov_at_50:.3f}",
-                f"{m.cov_at_90:.3f}",
-                f"{m.pit_std:.3f}",
-                f"{m.mean_pit:.3f}",
-            ]
-            band = f"{m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f})"
+
+        def _point(value: float, *, underpowered: bool = m.underpowered) -> str:
+            return "n/a" if underpowered else f"{value:.3f}"
+
+        band = "n/a" if m.underpowered else f"{m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f})"
         cells = [
             m.label,
             str(m.n_pit),
@@ -580,7 +573,11 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
             f"{m.n_eff} ({'widened' if m.ci_clustered else '=n'})",
             _fmt_ci(m.cov80),
             _fmt_ci(m.cov50),
-            *point_metrics,
+            _point(m.cov_at_10),
+            _point(m.cov_at_50),
+            _point(m.cov_at_90),
+            _point(m.pit_std),
+            _point(m.mean_pit),
             rel,
             band,
             f"{m.n_oob_low}/{m.n_oob_high}",

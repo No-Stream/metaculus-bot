@@ -101,50 +101,30 @@ _PERCENTILE_KEY_TOLERANCE = 1e-6
 # rationale cut mid-decimal at "posterior_prob":0.72 leaves "0." behind, which
 # repairs to 0.0 and would publish as the binary clamp floor.
 _COMPLETE_NUMBER_RE = re.compile(r"^[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?$")
-# Chars that may START / CONTINUE a numeric-literal run in JSON value position.
-# The body set is deliberately loose (it swallows "1-2" into one token) so that
-# malformed runs surface as incomplete tokens rather than being split into two
-# plausible-looking numbers.
-_NUMBER_START_CHARS = "-+.0123456789"
-_NUMBER_BODY_CHARS = "0123456789.eE+-"
+# String literals in EITHER quote style: raw candidates are exactly the malformed
+# blocks the repair rung exists for, and single-quoted output is the most common
+# malformation, so a double-quote-only reader walks that prose as value position.
+# The trailing ``(?:"|\Z)`` keeps an unterminated final string (the truncated-payload
+# case this check exists for) inside the literal rather than spilling it outside.
+_JSON_STRING_RE = re.compile(
+    r'"(?:[^"\\]|\\.)*(?:"|\Z)' r"|'(?:[^'\\]|\\.)*(?:'|\Z)",
+    re.DOTALL,
+)
+# A numeric-literal run in JSON value position. The body set is deliberately loose
+# (it swallows "1-2" into one token) so that malformed runs surface as incomplete
+# tokens rather than being split into two plausible-looking numbers.
+_NUMBER_RUN_RE = re.compile(r"[-+.0-9][0-9.eE+-]*")
 
 
 def _numeric_tokens_outside_strings(text: str) -> list[str]:
-    """Numeric-literal runs sitting OUTSIDE JSON string literals, in order.
+    """Numeric-literal runs sitting OUTSIDE string literals, in order.
 
     String contents are skipped because structured blocks carry prose fields
-    (``ref_class``, evidence descriptions) where "3 of 4 cases." would otherwise
-    read as a truncated number.
+    (``ref_class``, evidence descriptions) where "3 of 4 cases." or "2019-2023"
+    would otherwise read as a truncated number. Substituting an empty quoted pair
+    keeps the tokens adjacent to a blanked string from merging into one run.
     """
-    tokens: list[str] = []
-    in_string = False
-    escaped = False
-    index = 0
-    length = len(text)
-    while index < length:
-        char = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            index += 1
-            continue
-        if char == '"':
-            in_string = True
-            index += 1
-            continue
-        if char in _NUMBER_START_CHARS:
-            start = index
-            index += 1
-            while index < length and text[index] in _NUMBER_BODY_CHARS:
-                index += 1
-            tokens.append(text[start:index])
-            continue
-        index += 1
-    return tokens
+    return _NUMBER_RUN_RE.findall(_JSON_STRING_RE.sub('""', text))
 
 
 def _repair_infidelity_reason(candidate: str, repaired: str) -> str | None:

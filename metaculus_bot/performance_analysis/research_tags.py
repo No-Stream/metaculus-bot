@@ -15,13 +15,17 @@ Detection rules (source-class-aware, per the 2026-08-24 research-archive-qa dim)
   transcript on the record even when it soft-fails and contributes NO section to
   the bundle, so payload-presence overstates treatment.
 * ``gfv2_loop_ran`` is TERNARY for the same reason the anchor read is qualified.
-  Only a schema-v2 ``artifact`` record can carry the ``gap_fill_v2`` payload at
-  all: the v2 writer omits the key when the loop didn't run, so on those records
-  its absence IS a measured False. Every other writer class — comment-backfill,
-  schema-v1 artifacts, an artifact with no ``schema_version`` — cannot carry the
-  key whatever happened, and reading those as False put 880 can't-carry records
-  in the untreated arm against 77 honest ones, which would have poisoned the v2
-  treated/untreated calibration split outright. Those now read None.
+  Only a schema-v2 ``artifact`` record written AFTER the payload-era boundary can
+  carry the ``gap_fill_v2`` payload at all: that writer omits the key when the
+  loop didn't run, so on those records its absence IS a measured False. Every
+  other writer class — comment-backfill, schema-v1 artifacts, an artifact with no
+  ``schema_version`` — cannot carry the key whatever happened, and reading those
+  as False put 880 can't-carry records in the untreated arm against 77 honest
+  ones, which would have poisoned the v2 treated/untreated calibration split
+  outright. Those read None. The era boundary matters because schema v2 predates
+  the payload by ~3 weeks (schema v2 landed 2026-06-28 in 1655c43; the
+  ``gap_fill_v2`` write only reached main 2026-07-21 in b4e9df0), so a schema-v2
+  artifact from that window is a can't-carry record too, not a confident False.
 * A ``False`` gfv2 read is qualified by ``gfv2_confidence`` the way the anchor
   read is by ``anchor_confidence``, and for a different corroborating source:
   gap-fill is not one of the orchestrator's providers, so it has no Provider
@@ -40,6 +44,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from metaculus_bot.performance_analysis.id_mapping import QuestionIds
@@ -74,17 +79,33 @@ _ABSENT_TAGS: dict[str, None] = {
 # The one writer class whose records can carry the ``gap_fill_v2`` payload: the
 # schema-v2 live-capture writer (``research/persistence.py``), which writes the key
 # only when the v2 loop actually ran. Comment-backfill and schema-v1 records never
-# carry it regardless, so their silence is not evidence.
+# carry it regardless, so their silence is not evidence — and neither is a schema-v2
+# artifact's from before the payload write landed on main (b4e9df0), since the schema
+# number predates the key by ~3 weeks (see the module docstring's ternary note).
 _GFV2_PAYLOAD_SCHEMA_VERSION = 2
 _GFV2_PAYLOAD_SOURCE = "artifact"
+_GFV2_PAYLOAD_ERA_START = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
 
 
 def _writer_can_carry_gfv2_payload(record: dict) -> bool:
-    """Whether this record's WRITER could have recorded a v2 loop, had one run."""
+    """Whether this record's WRITER could have recorded a v2 loop, had one run.
+
+    An undatable record (no parseable ``timestamp``) reads as can't-carry: the
+    conservative side, since the alternative stamps "the only confident untreated
+    read" on a record whose writer may physically lack the key.
+    """
     schema_version = record.get("schema_version")
     if not isinstance(schema_version, int):
         return False
-    return schema_version >= _GFV2_PAYLOAD_SCHEMA_VERSION and record.get("source") == _GFV2_PAYLOAD_SOURCE
+    if schema_version < _GFV2_PAYLOAD_SCHEMA_VERSION or record.get("source") != _GFV2_PAYLOAD_SOURCE:
+        return False
+    try:
+        written_at = datetime.fromisoformat(str(record.get("timestamp")))
+    except ValueError:
+        return False
+    if written_at.tzinfo is None:
+        written_at = written_at.replace(tzinfo=timezone.utc)
+    return written_at >= _GFV2_PAYLOAD_ERA_START
 
 
 def _timeseries_anchor_diag_status(record: dict) -> str | None:
@@ -153,7 +174,8 @@ def _gfv2_read(record: dict, gfv2_present: bool) -> tuple[bool | None, str]:
     * ``ambiguous_trimmed_no_payload``: a trimmed comment record, where the section
       could have been eaten by the middle-trim, and no payload can corroborate.
     * ``absent_no_payload``: an untrimmed record from a writer that cannot carry the
-      payload (schema-v1 artifact), so the header read stands uncorroborated.
+      payload (schema-v1 artifact, or a schema-v2 artifact predating the payload-era
+      boundary), so the header read stands uncorroborated.
     """
     if gfv2_present:
         return True, "header"

@@ -413,11 +413,10 @@ def is_anonymous_model_key(key: str) -> bool:
 # ranked LAST at -135.86 — a ~96-point artifact either way, which is what made "gemini was
 # catastrophically worse" a scoring-path artifact in that question's dossier.
 #
-# It lives HERE, beside the recovery that produces these curves, because three consumers in
-# two modules gate on it — ``ranking_cohort`` (which re-exports it), ``analysis``'s
-# ``max_step_clamp_screen``, and ``stacker_detection.exceeded_spread_threshold`` — and each
-# used to carry its own literal 9. ``analysis`` cannot import ``ranking_cohort`` (that module
-# imports ``analysis``), so a shared leaf is the only home that all three can reach.
+# It lives HERE, beside the recovery that produces these curves, because consumers across
+# several modules gate on it — ``ranking_cohort``, ``analysis``'s ``max_step_clamp_screen``,
+# ``stacker_detection.exceeded_spread_threshold``, and ``audit`` — and each used to carry
+# its own literal 9. A shared leaf is the one home every consumer can import without cycles.
 MIN_SCOREABLE_ANCHORS: int = 9
 
 
@@ -630,7 +629,7 @@ def _numeric_percentiles_from_block_tolerant(body_text: str) -> list[tuple[float
     A PARTIAL set is a legitimate return here, deliberately: recovering 3 of 13 anchors off
     an old-era block is the whole point of this rung, and whether 3 is enough depends on what
     the caller does with the curve. Completeness is therefore a CONSUMER gate — see
-    ``ranking_cohort.MIN_SCOREABLE_ANCHORS``, which drops sparse curves before they are
+    ``MIN_SCOREABLE_ANCHORS`` (this module), which drops sparse curves before they are
     PCHIP'd into a full CDF and log-scored beside 11-anchor members. A consumer that scores
     these without that gate is measuring interpolation, not the model.
     """

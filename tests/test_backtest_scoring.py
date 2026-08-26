@@ -91,6 +91,18 @@ class TestMcOptionCanonicalization:
         assert _canonicalize_mc_option(" 3 ") == "3"
         assert _canonicalize_mc_option("No Decision") == "No Decision"
 
+    def test_a_ballot_missing_a_question_option_is_unscoreable(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The inverse of the fallback case above: the QUESTION carries an option the
+        ballot omits, so there is no probability to score. The old ``.get(opt, 0.0)``
+        scored that parse gap as a confident zero — the worst value the scale has when
+        the omitted option is the one that resolved."""
+        report = _make_mc_report({"0": 0.5, "1": 0.3, "2": 0.2})
+        report.question.options = ["0", "1", "2", "3"]
+        with caplog.at_level("WARNING", logger="metaculus_bot.backtest.scoring"):
+            score = mc_log_score_from_report(report, correct_option="3")
+        assert score is None
+        assert any("missing question options ['3']" in record.message for record in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Brier score

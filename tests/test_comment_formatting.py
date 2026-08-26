@@ -23,6 +23,7 @@ from metaculus_bot.comment.markers import (
     STACKER_OUTCOME_PRIMARY,
     STACKER_OUTCOME_SKIPPED,
     STACKER_OUTCOME_SKIPPED_CONFIG_OFF,
+    STACKER_SKIP_REASONS,
     TOOLS_USED_MARKER_FALSE,
     TOOLS_USED_MARKER_TRUE,
 )
@@ -247,11 +248,10 @@ class TestBuildUnifiedExplanation:
         # STACKER_OUTCOME stays byte-stable for existing parsers.
         from metaculus_bot.comment.formatting import build_unified_explanation
 
-        for outcome, reason in (
-            ("skipped", "single_forecaster"),
-            ("skipped", "spread_below_threshold"),
-            ("skipped_config_off", "config_off"),
-        ):
+        # Every reason in the frozenset, not a hand-picked subset: the config-off
+        # reason rides the config-off outcome; every other reason rides plain "skipped".
+        for reason in sorted(STACKER_SKIP_REASONS):
+            outcome = "skipped_config_off" if reason == "config_off" else "skipped"
             result = build_unified_explanation(
                 base_text="# SUMMARY\nBody.",
                 question=self._make_question(),

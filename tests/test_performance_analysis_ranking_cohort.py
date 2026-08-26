@@ -28,12 +28,12 @@ from metaculus_bot.performance_analysis.audit import (
     rank_our_models_by_accuracy,
     ranking_caveats,
 )
-from metaculus_bot.performance_analysis.parsing import anonymous_model_key
-from metaculus_bot.performance_analysis.ranking_cohort import (
+from metaculus_bot.performance_analysis.parsing import (
     MIN_SCOREABLE_ANCHORS,
+    anonymous_model_key,
     declared_anchors,
-    per_model_ranking_cohort,
 )
+from metaculus_bot.performance_analysis.ranking_cohort import per_model_ranking_cohort
 from metaculus_bot.performance_analysis.stacker_detection import detect_stacker_fired
 from tests.test_performance_analysis_audit import _binary_record, _numeric_record
 
@@ -249,10 +249,24 @@ class TestDeclaredAnchors:
         assert anchors == {10.0: 7.0}  # last value wins, as the PCHIP build does
         assert conflicts == 1
 
+
+class TestQuestionTypeDispatch:
+    """Which question types have a per-model ranker at all (MC has none)."""
+
     def test_multiple_choice_record_has_no_ranking_cohort(self):
         cohort = per_model_ranking_cohort({"type": "multiple_choice", "per_model_forecasts": {"gpt-5.5": {"A": 0.5}}})
         assert cohort.entries == {}
         assert cohort.stacker_fired is False
+
+    @pytest.mark.parametrize("q_type", ["numeric", "discrete"])
+    def test_both_continuous_types_get_the_anchor_gate(self, q_type: str):
+        rec = _numeric_record(
+            9401,
+            resolution=50.0,
+            per_model_percentiles={"gpt-5.4": _sparse_curve(50.0), "gemini-3.1-pro": _dense_curve(50.0)},
+            q_type=q_type,
+        )
+        assert [r["model"] for r in rank_our_models_by_accuracy(rec)] == ["gemini-3.1-pro"]
 
 
 class TestSynthesisDeltaTable:
@@ -271,14 +285,3 @@ class TestSynthesisDeltaTable:
         assert "| 9302 |" not in delta_section
         assert "9302" in text  # named as omitted rather than silently dropped
         assert "0.000 | 0.010 | +0.000" not in text
-
-
-@pytest.mark.parametrize("q_type", ["numeric", "discrete"])
-def test_both_continuous_types_get_the_anchor_gate(q_type: str):
-    rec = _numeric_record(
-        9401,
-        resolution=50.0,
-        per_model_percentiles={"gpt-5.4": _sparse_curve(50.0), "gemini-3.1-pro": _dense_curve(50.0)},
-        q_type=q_type,
-    )
-    assert [r["model"] for r in rank_our_models_by_accuracy(rec)] == ["gemini-3.1-pro"]

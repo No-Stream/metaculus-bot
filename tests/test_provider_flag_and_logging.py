@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 import logging
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ import pytest
 from forecasting_tools import MetaculusQuestion
 
 from main import TemplateForecaster
+from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
 # Imported names referenced inside test bodies below; bind to module scope
 # so the auto-formatter doesn't strip them as "unused".
@@ -68,12 +70,79 @@ async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
         # This test used to assert that sentence plus the header; both were the defect,
         # since an empty AskNews read then arrived as `ok` with chars>0 and the summarizer
         # was asked to brief from prose that carried no facts.
-        with caplog.at_level(logging.INFO):
-            res = await bot.run_research(q)
+        with patch.object(ResearchOrchestrator, "_summarize_asknews", new_callable=AsyncMock) as summarize:
+            with caplog.at_level(logging.INFO):
+                res = await bot.run_research(q)
         assert "No articles were found for this query." not in res
         assert "## News Articles (AskNews)" not in res
+        # The spend-saving half of the empty-read fix: nothing to brief from, so the
+        # summarizer LLM call is skipped entirely rather than asked to invent one.
+        summarize.assert_not_awaited()
         assert any("ASKNEWS_NO_ARTICLES: question=" in rec.message for rec in caplog.records)
         assert any("Using research providers:" in rec.message for rec in caplog.records)
+
+
+@dataclasses.dataclass
+class _StubArticle:
+    """AskNews-Article-shaped stub: the fields _format_single_article/dedup read."""
+
+    eng_title: str
+    summary: str
+    language: str
+    pub_date: datetime
+    source_id: str
+    article_url: str
+
+
+@pytest.mark.asyncio
+async def test_a_nonempty_asknews_read_is_summarized_exactly_once(mock_os_getenv):
+    """The mirror of the empty-read skip above, so the skip cannot be silently widened
+    into "never summarize": articles in, summarizer awaited once, briefing in the bundle."""
+    mock_os_getenv.side_effect = lambda x, default=None: {
+        "RESEARCH_PROVIDER": "asknews",
+        "ASKNEWS_CLIENT_ID": "client",
+        "ASKNEWS_SECRET": "secret",
+    }.get(x, default)
+
+    bot = TemplateForecaster(
+        llms={
+            "default": "mock_default_model",
+            "parser": "mock_parser",
+            "researcher": "mock_researcher",
+            "summarizer": "mock_summarizer",
+        }
+    )
+    q = MetaculusQuestion(
+        question_text="Test",
+        page_url="http://example.com",
+        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    article = _StubArticle(
+        eng_title="Something happened",
+        summary="A decision-relevant fact.",
+        language="en",
+        pub_date=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        source_id="src",
+        article_url="http://example.com/article",
+    )
+    with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
+        mock_sdk = AsyncMock()
+        mock_response = AsyncMock()
+        mock_response.as_dicts = [article]
+        mock_sdk.news.search_news.return_value = mock_response
+        mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
+
+        with patch.object(
+            ResearchOrchestrator,
+            "_summarize_asknews",
+            new_callable=AsyncMock,
+            return_value="## News Analysis (AskNews)\n\nAnalyst briefing.",
+        ) as summarize:
+            res = await bot.run_research(q)
+
+    summarize.assert_awaited_once()
+    assert "Analyst briefing." in res
 
 
 @pytest.mark.asyncio

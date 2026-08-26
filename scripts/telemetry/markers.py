@@ -43,6 +43,23 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``NUMERIC_AGGREGATE_GRID_MISMATCH`` — ``metaculus_bot/numeric/utils.py``
   ``aggregate_numeric`` (per-MODEL CDF whose grid length disagreed with the
   question's; expect zero in prod, so any record means a length drifted)
+* ``PCHIP CDF construction failed`` (spec ``numeric_pchip_fallback``) —
+  ``metaculus_bot/numeric/diagnostics.py`` ``log_pchip_fallback`` (per-QUESTION
+  PCHIP build failure that fell back to forecasting-tools' own CDF builder; the
+  one numeric repair surface with a confirmed prod fire)
+
+NUMERIC REPAIR TIERS, DELIBERATELY UNHARVESTED (sentinel_value_audit M16 asked for
+one ``numeric_repair`` marker over five repair surfaces): the repair-tier WARNs in
+``numeric/bounds_clamping.py`` — ``Corrected numeric distribution``, ``Heavy bound
+clamping``, ``Cluster spread applied`` — never fire on real model output, because
+``generate_pchip_cdf``'s uniform-mixture construction pre-enforces the min-step
+before any repair tier is reached (0 of 1182 archived numeric forecasts; see
+AGENTS.md "Repair-tier WARN signals are effectively dead code"). Registering specs
+for them would archive permanently-empty files that read as signal, so the omission
+is a decision, not a miss. M16's incidence question is answered by the narrower
+markers above — ``NUMERIC_DEGENERATE_DECLARATION``, ``NUMERIC_AGGREGATE_GRID_MISMATCH``,
+``SPREAD_UNDEFINED`` — plus ``numeric_pchip_fallback`` for the surface that does fire;
+the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker.
 * ``SPREAD_UNDEFINED`` — ``metaculus_bot/spread_metrics.py``
   ``numeric_percentile_spread`` (per-QUESTION unmeasurable spread: the routing
   decision was made on no measurement at all)
@@ -97,7 +114,8 @@ and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
 types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
 ``CLOSE_MARGIN`` / ``MARKET_RANKING`` / ``MARKET_RANKING_DEGRADED`` /
 ``NUMERIC_DEGENERATE_DECLARATION`` / ``NUMERIC_AGGREGATE_GRID_MISMATCH`` /
-``SPREAD_UNDEFINED`` emit ``question.id_of_question`` (the QUESTION id) while
+``SPREAD_UNDEFINED`` / ``numeric_pchip_fallback`` emit ``question.id_of_question``
+(the QUESTION id) while
 ``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
 ``GHOST_FORECAST_JSON`` emit ``question.page_url`` (a POST id). Each :class:`MarkerSpec` therefore declares
 ``qid_kind`` and every harvested record carries it, so a residual join keyed on one
@@ -409,6 +427,21 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+expected_points=(?P<expected_points>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # numeric/utils.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "numeric_pchip_fallback",
+        # Per-question PCHIP CDF build failure (numeric/diagnostics.py log_pchip_fallback):
+        # the distribution the forecasters see came from forecasting-tools' fallback CDF
+        # builder, not our PCHIP pipeline. The one numeric repair surface with a confirmed
+        # prod fire (the repair-tier WARNs upstream of it are dead code on real output —
+        # see the module docstring's M16 note), so its absence from the archive was the
+        # one genuine blind spot in that family. The question ref is ``id_of_question``,
+        # rendered "N/A" when absent (a _NONE_SENTINELS member, coerces to None).
+        re.compile(
+            r"Question (?P<question>\S+): PCHIP CDF construction failed "
+            r"\((?P<error>.*)\), falling back to forecasting-tools default"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # numeric/diagnostics.py emits question.id_of_question
     ),
     MarkerSpec(
         "spread_undefined",

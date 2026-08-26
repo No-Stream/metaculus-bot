@@ -296,6 +296,15 @@ def declared_percentile_pit(
     two sets don't intersect in today's archive, so this is a latent fix — but the
     two sibling consumers of this field already filter, and one that didn't was how
     the 50-forecast mixture got in.
+
+    Sparse curves are NOT excluded here, deliberately — no ``MIN_SCOREABLE_ANCHORS``
+    gate, unlike the ranking/clamp-screen consumers. Their ~96-log-point artifact
+    comes from PCHIP-rebuilding a sparse curve onto a full CDF grid and log-scoring
+    it; this path only linearly interpolates the declared pairs in percentile space
+    for a single quantile, where a 3-anchor curve is coarse but not a fabricated
+    distribution, and its member PIT is then medianed against its siblings' rather
+    than scored on its own. Gating here would also delete the uniformly-sparse-era
+    records (fall-2025 comments declare 8-percentile sets) whose PITs are valid.
     """
     curves = {
         model: pairs for model, pairs in (per_model_percentiles or {}).items() if not is_anonymous_model_key(str(model))

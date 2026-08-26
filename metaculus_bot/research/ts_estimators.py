@@ -28,8 +28,8 @@ Freq = Literal["daily", "weekly", "monthly", "quarterly", "annual"]
 
 # Annualization / horizon-conversion bases (ported from the replay's run_replay.py).
 # THE package's single definition of these two facts — `financial_data` imports them for its
-# period-return step tables and vol annualization, so they are ints: consumers key, count,
-# and slice with them (`_PERIOD_TARGET_STEPS[...]`, `close.iloc[-n:]`), and the float
+# period-return slip grace and vol annualization, so they are ints: consumers key, count,
+# and slice with them (`_PERIOD_SLIP_GRACE_DAYS[...]`, `pd.Timedelta(days=n)`), and the float
 # arithmetic here is unchanged by int operands (true division and `round` don't care).
 TRADING_DAYS_PER_YEAR = 252
 CALENDAR_DAYS_PER_YEAR = 365

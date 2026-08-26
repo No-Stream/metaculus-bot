@@ -105,8 +105,11 @@ def detect_unit_mismatch(
     if not values:
         return True, "empty percentile values"
     values_sorted = sorted(values)
-    lower = float(getattr(question, "lower_bound", 0.0))
-    upper = float(getattr(question, "upper_bound", 0.0))
+    # Required NumericQuestion fields, read directly: a defaulted read here would
+    # fabricate a [0, 0] range and judge every forecast against it, which is the
+    # fail-open shape the docstring above says this guard no longer has.
+    lower = float(question.lower_bound)
+    upper = float(question.upper_bound)
     rng = max(upper - lower, 1e-12)
 
     # Span between lowest and highest declared percentiles (use indices of sorted by percentile, but we

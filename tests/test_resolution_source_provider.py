@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket as _socket
+import time
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -455,6 +456,20 @@ class TestStripHtmlTags:
         """The allow-list is closed: `<body>`/`<script>` never appear in a CSV cell, and matching
         every `<word>` is what makes the inequality cases above fail."""
         assert strip_html_tags("<body class='x'>hi</body>") == "<body class='x'>hi</body>"
+
+    def test_a_pathological_no_close_tag_body_strips_in_linear_time(self):
+        """The tag-body alternation must reach its first `=` exactly one way. With `[^<>]*` on
+        both sides of the `=`, a body holding one `<b ` lookalike followed by an angle-bracket-free
+        run of URL cells (query-string `=` signs, no closing `>`) backtracks quadratically: 3.4s at
+        200 KiB measured, ~35 minutes at the 5 MiB response cap — synchronously on the event loop,
+        wedging the sibling fetches past every wall timeout. The linear form is sub-millisecond
+        here, so the 1s bound has three orders of magnitude of slack on either side."""
+        body = "x <b " + ("url=https://example.test/p?q=1&r=2, " * 6000)
+        start = time.perf_counter()
+        out = strip_html_tags(body)
+        elapsed = time.perf_counter() - start
+        assert out == body, "`<b ` with no closing `>` names no tag — the body must be untouched"
+        assert elapsed < 1.0, f"quadratic backtracking regression: {elapsed:.2f}s on a ~220 KiB body"
 
 
 class TestLooksLikeCsvRows:

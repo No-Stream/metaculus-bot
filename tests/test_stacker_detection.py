@@ -326,6 +326,22 @@ class TestExceededSpreadThreshold:
         }
         assert exceeded_spread_threshold(record) is True
 
+    def test_numeric_restated_sparse_curve_does_not_clear_the_anchor_floor(self):
+        # MIN_SCOREABLE_ANCHORS counts DISTINCT labels everywhere else (via
+        # declared_anchors); gating on the raw PAIR count here let a 5-anchor curve
+        # restated twice (10 pairs — comment prose restates whole sets) pose as a
+        # scoreable member. With the sparse member excluded only one map remains, no
+        # spread is computable, and the verdict is None rather than a measured spread.
+        std = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
+        dense = [[p, v] for p, v in zip(std, [10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])]
+        sparse_once = [[10.0, 40.0], [25.0, 50.0], [50.0, 60.0], [75.0, 70.0], [90.0, 80.0]]
+        record = {
+            "type": "numeric",
+            "per_model_numeric_percentiles": {"a": dense, "b": sparse_once * 2},
+            "scaling": {"range_min": 0.0, "range_max": 100.0},
+        }
+        assert exceeded_spread_threshold(record) is None
+
     def test_numeric_spread_is_percentile_label_invariant(self):
         # Regression: the numeric spread must key P10/P50/P90 by LABEL, not by the
         # positional index [2, 5, 8]. Prepend P1 and append P99 (the future 13-set)

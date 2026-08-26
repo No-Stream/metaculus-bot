@@ -8,10 +8,12 @@ import numpy as np
 import pandas as pd
 import pytest
 from forecasting_tools import GeneralLlm
+from pandas.tseries.holiday import USFederalHolidayCalendar
 
 from metaculus_bot.constants import FINANCIAL_YFINANCE_LOOKBACK_DAYS, MAX_FINANCIAL_IDENTIFIERS
 from metaculus_bot.research.financial_data import (
-    _PERIOD_TARGET_STEPS,
+    _PERIOD_SLIP_GRACE_DAYS,
+    _PERIOD_TARGET_DAYS,
     CLASSIFIER_PROMPT,
     FRED_LABELS,
     KNOWN_FRED_SERIES,
@@ -269,9 +271,12 @@ class TestAnnualizationBasis:
         result = self._fetch_with_history(close)
         expected_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(252) * 100
         assert self._line_value(result, "- 30-trading-day annualized volatility") == f"{expected_vol:.1f}%"
-        expected_1y = (close.iloc[-1] / close.iloc[-253] - 1) * 100
+        # The 1y row and the 52-week band both read a true calendar year, not a
+        # 252-row count (which on a holiday-bearing exchange index spans ~50 weeks).
+        year_ago = close.index[-1] - pd.Timedelta(days=365)
+        expected_1y = (close.iloc[-1] / close.loc[:year_ago].iloc[-1] - 1) * 100
         assert self._line_value(result, "- 1y") == f"{expected_1y:+.2f}%"
-        year_slice = close.iloc[-252:]
+        year_slice = close[close.index >= year_ago]
         assert self._line_value(result, "- 52-week range") == f"{year_slice.min():.2f} - {year_slice.max():.2f}"
 
     def test_24_7_series_gets_calendar_basis_and_full_year_windows(self):
@@ -335,7 +340,11 @@ class TestAnnualizationBasis:
 
         result = self._fetch_with_history(close)
 
-        assert "- 1y" in result, "the 1y row must render off the window SPAN, not the bar count"
+        # Value-pinned, not presence-pinned: a lookup that lands weeks off target would
+        # still put a "- 1y" substring in the render.
+        start = close.loc[: close.index[-1] - pd.Timedelta(days=365)]
+        expected = (close.iloc[-1] / start.iloc[-1] - 1) * 100
+        assert self._line_value(result, "- 1y") == f"{expected:+.2f}%"
 
     def test_scattered_crypto_gaps_keep_the_1y_row(self):
         """Yahoo data holes on a 24/7 series subtract rows instead of extending the window
@@ -354,7 +363,9 @@ class TestAnnualizationBasis:
 
         result = self._fetch_with_history(close)
 
-        assert "- 1y" in result
+        start = close.loc[: close.index[-1] - pd.Timedelta(days=365)]
+        expected = (close.iloc[-1] / start.iloc[-1] - 1) * 100
+        assert self._line_value(result, "- 1y") == f"{expected:+.2f}%"
 
     def test_lookback_constant_covers_both_bases_with_headroom(self):
         """Both binding constraints, so no future trim can under-size either basis: the
@@ -368,21 +379,15 @@ class TestAnnualizationBasis:
         # 1y lookup wants on a gap-free frame.
         assert (FINANCIAL_YFINANCE_LOOKBACK_DAYS + 1) - 366 >= 24
 
-    def test_the_two_offset_tables_are_the_documented_conventions(self):
-        # The tables ARE the behavior: every period-return label on every financial snapshot is
+    def test_the_offset_table_is_the_documented_convention(self):
+        # The table IS the behavior: every period-return label on every financial snapshot is
         # only a true calendar period because of these numbers. Pinned verbatim so an edit is a
-        # deliberate act — the 252 row counts business days (the trading-day convention, 5/wk),
-        # the 365 row plain calendar days, each resolved to a target DATE and matched
-        # at-or-before; swapping one number silently mislabels one snapshot family.
-        assert _PERIOD_TARGET_STEPS[TRADING_DAYS_PER_YEAR] == [
-            ("1d", 1),
-            ("1w", 5),
-            ("1m", 21),
-            ("3m", 63),
-            ("6m", 126),
-            ("1y", 252),
-        ]
-        assert _PERIOD_TARGET_STEPS[CALENDAR_DAYS_PER_YEAR] == [
+        # deliberate act — ONE table of calendar days for both bases (business-day steps on the
+        # 252 basis silently landed ~10 trading days short of a year across market holidays),
+        # each resolved to a target DATE and matched at-or-before. What stays per-basis is the
+        # slip grace: 3 days absorbs a weekend-plus-holiday landing on the 252 basis, while a
+        # 24/7 series should print every date, so ANY slip there disclosves as a data gap.
+        assert _PERIOD_TARGET_DAYS == [
             ("1d", 1),
             ("1w", 7),
             ("1m", 30),
@@ -390,21 +395,21 @@ class TestAnnualizationBasis:
             ("6m", 182),
             ("1y", 365),
         ]
-        assert set(_PERIOD_TARGET_STEPS) == {TRADING_DAYS_PER_YEAR, CALENDAR_DAYS_PER_YEAR}
+        assert _PERIOD_SLIP_GRACE_DAYS == {TRADING_DAYS_PER_YEAR: 3, CALENDAR_DAYS_PER_YEAR: 0}
 
     @pytest.mark.parametrize("basis", [TRADING_DAYS_PER_YEAR, CALENDAR_DAYS_PER_YEAR])
-    def test_every_period_row_reads_its_bases_own_offset(self, basis: int):
-        # The two bases are pinned end-to-end above only on 1w/1y; walk ALL six labels so a
-        # mis-keyed intermediate offset (3m reading 63 rows on a 24/7 series = 9 calendar weeks
-        # under a "3m" label) can't hide between the two tested ones. Table-driven, so a new
-        # period label is covered the moment it lands. On a GAP-FREE index the date-based
-        # lookup must land on exactly the row the historical offsets read — the expected
-        # values below are computed via those row offsets, so this test IS the proof that
-        # the date-based rewrite left gap-free numbers unchanged, and the marker asserts at
-        # the bottom pin the delta to purely additive (no span disclosures, no staleness).
+    def test_every_period_row_reads_a_true_calendar_period_on_both_bases(self, basis: int):
+        # The bases are pinned end-to-end above only on 1w/1y; walk ALL six labels so a
+        # mis-keyed intermediate target (3m reading 63 days = 9 calendar weeks under a
+        # "3m" label) can't hide between the two tested ones. Table-driven, so a new
+        # period label is covered the moment it lands. The expected start is pandas' own
+        # at-or-before read of `last − days` — pinning the table plus the match semantics
+        # — and on the gap-free daily index the 365-basis reads are additionally asserted
+        # bit-identical to the historical row offsets, so the calendar-day rewrite
+        # provably left 24/7 numbers unchanged. The marker asserts at the bottom pin the
+        # render delta to purely additive (no span disclosures, no staleness).
         rng = np.random.default_rng(3)
-        # Enough rows for the longest offset plus the strictly-more-rows requirement, on an index
-        # whose observed density lands the series on the basis under test.
+        # Enough rows to cover the 365-day 1y target on either index density.
         index = (
             pd.bdate_range(end="2026-07-31", periods=400)
             if basis == TRADING_DAYS_PER_YEAR
@@ -417,10 +422,13 @@ class TestAnnualizationBasis:
         # not the bar's own date so no partial-bar marker fires.
         result = self._fetch_with_history(close, as_of=datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
 
-        for label, offset in _PERIOD_TARGET_STEPS[basis]:
-            expected = (close.iloc[-1] / close.iloc[-(offset + 1)] - 1) * 100
+        for label, days in _PERIOD_TARGET_DAYS:
+            start = close.loc[: close.index[-1] - pd.Timedelta(days=days)]
+            expected = (close.iloc[-1] / start.iloc[-1] - 1) * 100
             assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", (basis, label)
-        assert "(actual" not in result, "gap-free series must not disclose spans"
+            if basis == CALENDAR_DAYS_PER_YEAR:
+                assert start.iloc[-1] == close.iloc[-(days + 1)], (basis, label)
+        assert "(actual" not in result, "weekend slips stay inside the 252 grace; gap-free 365 has none"
         assert "⚠" not in result, "a fresh latest must not read as stale"
         assert "in progress" not in result
 
@@ -503,6 +511,18 @@ class TestDatedLatestAndStaleness:
         result = self._fetch_with_history(close, as_of=datetime(2026, 8, 23, 12, 0, tzinfo=UTC))
         assert "⚠" not in result
 
+    def test_a_tz_aware_exchange_index_ages_in_its_own_timezone(self):
+        # yfinance serves listed-asset bars on a tz-aware exchange-local index (ts_fetch
+        # normalizes the same frames), while window_end is UTC. Comparing dates across the
+        # two zones inflates a US-equity age by one for part of every day: a Friday close
+        # read at Wednesday 02:00 UTC (Tuesday 22:00 ET) is 4 ET days old — inside the
+        # 252-basis allowance — but 5 UTC days old, a false staleness warning.
+        rng = np.random.default_rng(5)
+        dates = pd.bdate_range(end="2026-08-21", periods=300, tz="America/New_York")
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 300))), index=dates)
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 2, 0, tzinfo=UTC))
+        assert "⚠" not in result
+
     def test_stale_helper_thresholds_per_basis(self):
         # The shared helper's exact boundaries: >2 days on the 365 basis, >4 on the 252.
         as_of = date(2026, 8, 26)
@@ -549,12 +569,67 @@ class TestDateBasedPeriodReturns:
             expected = (close.iloc[-1] / close.loc[last_ts - pd.Timedelta(days=days)] - 1) * 100
             assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", label
 
+    def test_a_nan_close_row_renders_identically_to_a_dropped_row(self):
+        """Yahoo's consolidation hole arrives in TWO representations: yfinance's
+        keepna=False default usually deletes the row, but a NaN close that does arrive
+        must not poison the tail-anchored stats — without the dropna, "Latest price:
+        nan" and NaN period returns go straight into a forecaster prompt."""
+        dropped = self._gapped_btc_shape()
+        as_nan_row = dropped.reindex(pd.date_range(end="2026-08-26", periods=400, freq="D"))
+        assert as_nan_row.isna().sum() == 1
+
+        as_of = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+        result_nan = self._fetch_with_history(as_nan_row, as_of=as_of)
+
+        assert result_nan == self._fetch_with_history(dropped, as_of=as_of)
+        assert "- 1d (actual 2d):" in result_nan
+        assert "nan" not in result_nan  # an f-string'd NaN renders exactly "nan"
+
+    def test_an_all_null_close_frame_renders_nothing(self, caplog: pytest.LogCaptureFixture):
+        idx = pd.date_range(end="2026-08-26", periods=40, freq="D")
+        all_nan = pd.Series(np.nan, index=idx)
+        with caplog.at_level("WARNING"):
+            result = self._fetch_with_history(all_nan, as_of=datetime(2026, 8, 26, 12, 0, tzinfo=UTC))
+        assert result == ""
+        assert "no non-null closes" in caplog.text
+
+    def test_a_holiday_bearing_exchange_index_still_reads_a_full_calendar_year(self):
+        """A real exchange index is missing every market HOLIDAY, not just weekends.
+
+        Resolving the 252-basis targets in business days (`pd.offsets.BDay`) landed the
+        "1y" match ~10 trading days short on a NYSE-shaped index — ~352 calendar days
+        back under a label that claims a year, with slip 0 so the `(actual Nd)`
+        disclosure never fired. Targets resolve in calendar days on BOTH bases, so a
+        holiday under the target is absorbed by the at-or-before match within the slip
+        grace instead of silently shortening every long horizon.
+        """
+
+        end = pd.Timestamp("2026-08-21")  # a Friday
+        idx = pd.bdate_range(start=end - pd.Timedelta(days=420), end=end)
+        holidays = USFederalHolidayCalendar().holidays(start=idx[0], end=idx[-1])
+        idx = idx.difference(holidays)
+        rng = np.random.default_rng(17)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)
+        assert observed_periods_per_year(close.index) == 252
+
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 22, 12, 0, tzinfo=UTC))
+
+        last_ts = close.index[-1]
+        for label, days in [("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365)]:
+            start = close.loc[: last_ts - pd.Timedelta(days=days)]
+            expected = (close.iloc[-1] / start.iloc[-1] - 1) * 100
+            assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", label
+            actual_span = (last_ts - start.index[-1]).days
+            assert days - 3 <= actual_span <= days, (label, actual_span)
+        assert "(actual" not in result, "weekend/holiday slip is routine on the 252 basis, not a mislabel"
+
     def test_a_holiday_under_a_trading_basis_target_stays_undisclosed(self):
         # A market holiday sitting exactly under the 1m target slips the match one
-        # business day over an adjacent weekend — routine on the 252 basis, so the label
-        # must stay plain AND still read the nearest prior observation.
+        # business day — routine on the 252 basis, so the label must stay plain AND
+        # still read the nearest prior observation.
         idx = pd.bdate_range(end="2026-08-21", periods=400)
-        holiday = idx[-22]  # the exact 21-business-day 1m target
+        holiday = pd.Timestamp("2026-07-22")  # the exact 30-calendar-day 1m target, a Wednesday
+        assert holiday in idx
         idx = idx.drop([holiday])
         rng = np.random.default_rng(9)
         close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)

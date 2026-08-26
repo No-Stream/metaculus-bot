@@ -262,8 +262,14 @@ def _asknews_provider() -> ResearchCallable:
                 formatted_articles = _format_asknews_dual_sections(
                     hot_articles=hot_articles,
                     historical_articles=historical_articles,
-                    qid=qid,
                 )
+                if not formatted_articles:
+                    logger.warning(
+                        f"ASKNEWS_NO_ARTICLES: question={qid} "
+                        f"hot={len(hot_articles)} historical={len(historical_articles)}"
+                    )
+                    record_provider_detail(qid, "asknews", {"sources": {"articles": "empty(no_articles)"}})
+                    return ""
 
                 logger.info(
                     f"AskNews: Success, got {len(formatted_articles)} chars from {len(hot_articles)} hot + {len(historical_articles)} historical articles"
@@ -286,8 +292,6 @@ def _format_single_article(article: Any) -> str:
 def _format_asknews_dual_sections(
     hot_articles: list[Any],
     historical_articles: list[Any],
-    *,
-    qid: int | None = None,
 ) -> str:
     """Format AskNews articles into two labeled sections: Historical Context and Recent Developments.
 
@@ -298,9 +302,12 @@ def _format_asknews_dual_sections(
     defeated every downstream empty guard: the orchestrator's ``has_output`` read chars>0
     and reported ``ok``, the summarizer LLM (whose prompt has no no-data escape) was asked
     to write a briefing from it, and the result rendered under the AskNews header as if it
-    were research. Gemini's grounded-chunk floor next door is the pattern — refuse, and
-    leave a ``lost=articles:...`` token so the ``empty`` status is distinguishable from a
-    provider that was never asked.
+    were research. Gemini's grounded-chunk floor next door is the pattern — refuse.
+
+    Pure: the ASKNEWS_NO_ARTICLES WARN and the ``lost=articles:...`` registry token
+    belong to ``_asknews_provider``, which owns the qid — a formatter writing the
+    module-global provider-detail registry raced ``_degraded_to_raw_articles``' write
+    for the same key only by accident of ordering.
     """
     hist_deduped = _dedup_articles_by_url(historical_articles) if historical_articles else []
     hot_deduped = _dedup_articles_by_url(hot_articles) if hot_articles else []
@@ -310,10 +317,6 @@ def _format_asknews_dual_sections(
         hot_deduped = [a for a in hot_deduped if _normalize_url_for_dedup(str(a.article_url)) not in hist_urls]
 
     if not hist_deduped and not hot_deduped:
-        logger.warning(
-            f"ASKNEWS_NO_ARTICLES: question={qid} hot={len(hot_articles)} historical={len(historical_articles)}"
-        )
-        record_provider_detail(qid, "asknews", {"sources": {"articles": "empty(no_articles)"}})
         return ""
 
     total_before = len(historical_articles) + len(hot_articles)

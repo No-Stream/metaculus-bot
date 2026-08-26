@@ -457,12 +457,16 @@ def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | 
     What it does NOT do is state a dollar figure with no price to convert by. With neither a
     book nor a last trade, ``volume_usd`` is None — the count is real but its dollar value is
     unknown, and the old ``price or 0.0`` turned that into a measured ``$0`` that reads as a
-    market nobody traded. Open interest is unaffected: it converts by notional, which has a
-    documented $1.00 default.
+    market nobody traded. That withholding deliberately covers a priceless ZERO count too (its
+    dollars are knowably $0, but one rule — no price, no dollar claim — beats a special case for
+    a market nobody has traded). Open interest is unaffected: it converts by notional, which has
+    a documented $1.00 default.
 
-    Three details here are UNPINNED by any test: the ``last_price_dollars`` fallback, the ``or 1.0``
-    notional default, and the ``if not price:`` truthiness (which routes a genuine 0.0 midpoint to
-    the last trade). "Simplifying" any of them blanks or misstates labels with a green suite.
+    Every detail above is pinned by
+    ``test_the_dollar_conversion_deliberately_does_not_take_the_no_price_rule``: the
+    ``last_price_dollars`` fallback, the ``or 1.0`` notional default, the ``if not price:``
+    truthiness (which routes a genuine 0.0 midpoint to the last trade), and the no-price
+    ``volume_usd is None`` arm. "Simplifying" any of them blanks or misstates labels.
     """
     volume = safe_float(market.get("volume_fp"))
     open_interest = safe_float(market.get("open_interest_fp"))

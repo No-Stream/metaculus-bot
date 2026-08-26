@@ -463,8 +463,15 @@ _HTML_TAG_NAMES: tuple[str, ...] = (
     "sub",
     "sup",
 )
+# The pre-`=` attribute region excludes `=` so there is exactly ONE way to reach the
+# first delimiter. With `[^<>]*` on both sides of the `=`, a non-matching body (an
+# allow-listed lookalike like `<b ` followed by an angle-bracket-free run of URL cells
+# carrying query-string `=` signs) backtracks quadratically: 3.4s at 200 KiB, ~35 min
+# at the 5 MiB response cap — synchronously on the event loop, wedging the sibling
+# fetches past every wall timeout. Same matched language: any match via a later `=`
+# is also a match via the first one, since the post-`=` region admits more `=`s.
 _HTML_TAG_RE = re.compile(
-    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s*/?>|\s+[^<>]*=[^<>]*>)",
+    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s*/?>|\s+[^<>=]*=[^<>]*>)",
     re.IGNORECASE,
 )
 
@@ -1219,9 +1226,14 @@ async def _fetch_datawrapper_dataset(
                 # body is a failed hop whatever its Last-Modified says, and
                 # `stale_data` is reported to diagnostics as the benign `none`
                 # (the freshness guard working as designed), which would hide it.
+                # Row-shape is decided on the PRE-strip text: looks_like_csv_rows
+                # rejects markup by its leading `<`, and stripping first would remove
+                # exactly the allow-listed fragment tags (`<p>`, `<div>`) a CDN
+                # soft-404 opens with, letting an error page carry the authoritative
+                # "Dataset published" lead if its prose holds a comma.
                 dataset_text, undecodable_ratio = decode_text_body(body, content_type)
-                dataset_text = strip_html_tags(dataset_text).strip()
                 vacuous = vacuous_body_status(dataset_text, undecodable_ratio, require_csv_rows=True)
+                dataset_text = strip_html_tags(dataset_text).strip()
                 if vacuous is not None:
                     logger.warning(
                         f"resolution_source datawrapper hop {chart.chart_id}: dataset body is not a usable "

@@ -529,6 +529,46 @@ class TestSalvageFidelity:
         assert outcome.value == 0.72
 
     @pytest.mark.asyncio
+    async def test_prose_numerals_do_not_veto_a_faithful_repair(self) -> None:
+        """Hyphenated numerals in prose fields ("2019-2023") are not truncated literals.
+
+        The fidelity check lexes numeric runs OUTSIDE string literals, and prose lives
+        inside them in EITHER quote style — single-quoted blocks are exactly what the
+        repair rung exists to fix (see TestRungRepair.test_single_quotes), so a
+        double-quote-only lexer read their prose as value position and refused a repair
+        json_repair performs value-identically.
+        """
+        double_quoted = (
+            '{"question_type": "binary", '
+            '"base_rate": {"k": 3, "n": 4, "ref_class": "cuts in 2019-2023"}, '
+            '"posterior_prob": 0.28,}'
+        )
+        single_quoted = (
+            "{'question_type': 'binary', "
+            "'base_rate': {'k': 3, 'n': 4, 'ref_class': 'cuts in 2019-2023'}, "
+            "'posterior_prob': 0.28}"
+        )
+        for candidate in (double_quoted, single_quoted):
+            with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+                outcome = await extract_binary(rationale_with(candidate), PARSER_LLM)
+            assert outcome.rung == "repair", f"candidate quoting style wrongly refused: {candidate[:40]}"
+            assert outcome.value == 0.28
+            llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_literal_still_refuses_in_a_single_quoted_block(self) -> None:
+        # The single-quote handling above must not blind the check to a genuinely
+        # truncated value-position literal — the digits after "0." are gone in any
+        # quoting style, so the rung refuses and falls through to the LLM salvage.
+        truncated = "{'question_type': 'binary', 'posterior_prob': 0.}"
+        llm_mock = AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.72))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_binary(rationale_with(truncated), PARSER_LLM)
+
+        assert outcome.rung == "llm"
+        assert outcome.value == 0.72
+
+    @pytest.mark.asyncio
     async def test_a_repair_may_drop_a_number_but_never_introduce_one(self) -> None:
         # Syntax-only repairs stay allowed: a trailing comma changes no value, so the
         # deterministic rung still handles the common malformed-block case (see

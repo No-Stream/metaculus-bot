@@ -414,19 +414,23 @@ async def route_after_forecasts(
                 qid,
             )
         bot._register_expected_base_combine(question)
+        # The skip reason is derived ONCE and both markers read it, so the
+        # outcome/reason pair cannot drift when a fourth cause lands.
         # "skipped_config_off" (spread exceeded the threshold but the per-type gate
-        # was off) vs plain "skipped" (spread at/below threshold) — keeps the
-        # suppression reason durable in the published marker instead of requiring git
-        # archaeology over workflow-yaml flag history. The skip_reason companion
-        # restates it in the one field shared with the single-forecaster path, so a
-        # consumer can read STACKER_SKIP_REASON alone.
-        bot._stacker_outcome[qid] = "skipped_config_off" if type_stacking_disabled else "skipped"
-        if spread_undefined:
-            bot._stacker_skip_reason[qid] = "spread_undefined"
-        elif type_stacking_disabled:
-            bot._stacker_skip_reason[qid] = "config_off"
-        else:
-            bot._stacker_skip_reason[qid] = "spread_below_threshold"
+        # was off) vs plain "skipped" — keeps the suppression reason durable in the
+        # published marker instead of requiring git archaeology over workflow-yaml
+        # flag history. The skip_reason companion restates it in the one field shared
+        # with the single-forecaster path, so a consumer can read STACKER_SKIP_REASON
+        # alone.
+        skip_reason = (
+            "spread_undefined"
+            if spread_undefined
+            else "config_off"
+            if type_stacking_disabled
+            else "spread_below_threshold"
+        )
+        bot._stacker_outcome[qid] = "skipped_config_off" if skip_reason == "config_off" else "skipped"
+        bot._stacker_skip_reason[qid] = skip_reason
         return base_predictions_collection()
 
     # Catch-all: a non-stacking strategy, OR a stacking strategy whose budget gate

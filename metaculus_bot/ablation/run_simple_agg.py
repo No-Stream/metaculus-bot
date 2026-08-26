@@ -98,7 +98,23 @@ async def _run_simple_agg_for_qid(
         aggregated: Any = aggregate_binary([float(v) for v in deserialized], method=method)
     elif isinstance(question, MultipleChoiceQuestion):
         per_option_values, option_order = _accumulate_mc_options(deserialized, question)
-        aggregated = aggregate_mc(per_option_values, option_order, method=method)
+        try:
+            aggregated = aggregate_mc(per_option_values, option_order, method=method)
+        except ValueError as exc:
+            # aggregate_mc raises rather than imputing a share no model declared. One
+            # degenerate ballot is that QUESTION's defect — cache an attributed error
+            # payload (the insufficient_forecasters pattern above) instead of aborting
+            # a stage whose other questions' forecaster calls are already paid for.
+            error_payload = make_error_payload(
+                arm=arm,
+                reason="degenerate_mc_ballot",
+                model_used=SIMPLE_AGGREGATION_LABEL,
+                n_forecasters=len(surviving),
+                errors=[str(exc)],
+            )
+            cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
+            await asyncio.sleep(0)
+            return error_payload
     elif isinstance(question, NumericQuestion):
         aggregated = aggregate_numeric(deserialized, question, method=method)
     else:

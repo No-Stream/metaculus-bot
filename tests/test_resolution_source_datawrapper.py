@@ -656,6 +656,18 @@ class TestDatawrapperHopFailureModes:
         assert result.status == "error"
         assert result.http_status is None
 
+    async def test_a_soft_404_fragment_is_rejected_before_tag_stripping(self):
+        """A CDN soft-404 served as 200 can arrive as an HTML FRAGMENT opening with
+        allow-listed tags (`<p>`), which strip_html_tags removes — so row-shape is
+        decided on the PRE-strip body, where looks_like_csv_rows rejects the leading
+        `<` outright. Stripped first, this body reads as two comma-bearing prose lines
+        and would ride out under the authoritative "Dataset published" lead."""
+        fragment = "<p>Sorry, this chart is unavailable</p>\n<p>Datawrapper, Inc.</p>\n"
+        session = FakeSession({DATASET_URL: _csv_response(fragment, last_modified=_fresh_last_modified())})
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+        assert result.status == "unsupported_type"
+        assert result.text == ""
+
     @pytest.mark.parametrize("body", ["", "   \n\n", "﻿"])
     async def test_an_empty_dataset_body_is_withheld_rather_than_stamped_live(self, body: str):
         """The lead asserts `Live "Get the data" dataset … Dataset published <ts>` off the

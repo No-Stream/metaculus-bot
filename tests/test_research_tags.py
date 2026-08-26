@@ -29,12 +29,15 @@ def _record(
     gap_fill_v2: dict | None = None,
     is_trimmed: bool | None = None,
     schema_version: int | None = 2,
+    timestamp: str | None = "2026-08-01T00:00:00+00:00",
 ) -> dict:
     """One archive record. Defaults to the modern schema-v2 artifact writer.
 
-    ``schema_version`` is load-bearing for the gfv2 tags: only a schema-v2 artifact
-    record can carry the ``gap_fill_v2`` payload, so on anything else the absence of
-    that payload is unrecorded rather than measured (see ``_writer_can_carry_gfv2_payload``).
+    ``schema_version`` AND ``timestamp`` are load-bearing for the gfv2 tags: only a
+    schema-v2 artifact record written after the payload-era boundary (the gap_fill_v2
+    key reached main 2026-07-21, three weeks after schema v2) can carry the payload,
+    so on anything else its absence is unrecorded rather than measured (see
+    ``_writer_can_carry_gfv2_payload``). The default timestamp sits past the boundary.
     """
     return {
         "research_text": text,
@@ -43,6 +46,7 @@ def _record(
         "provider_diagnostics_block": diagnostics_block,
         "gap_fill_v2": gap_fill_v2,
         "is_trimmed": is_trimmed,
+        "timestamp": timestamp,
     }
 
 
@@ -173,6 +177,22 @@ class TestGfv2LoopRanIsTernary:
         tags = research_tags_for_record(_record("## News Articles (AskNews)\n", gap_fill_v2=None))
         assert tags["gfv2_loop_ran"] is False
         assert tags["gfv2_confidence"] == "payload_confirms_absent"
+
+    def test_a_schema_v2_artifact_from_the_pre_payload_window_reads_none(self):
+        # Schema v2 landed 2026-06-28 but the gap_fill_v2 write only reached main
+        # 2026-07-21 (b4e9df0) — a v2 artifact from that ~3-week window physically
+        # cannot carry the key, so its silence is not "the only confident untreated
+        # read"; it is the same can't-carry silence as a schema-v1 record.
+        tags = research_tags_for_record(_record("## News Articles (AskNews)\n", timestamp="2026-07-05T12:00:00+00:00"))
+        assert tags["gfv2_loop_ran"] is None
+        assert tags["gfv2_confidence"] == "absent_no_payload"
+
+    def test_an_undatable_v2_artifact_reads_none_not_false(self):
+        # No parseable timestamp means the writer era is unknowable; the conservative
+        # read is can't-carry, never a confident False.
+        tags = research_tags_for_record(_record("## News Articles (AskNews)\n", timestamp=None))
+        assert tags["gfv2_loop_ran"] is None
+        assert tags["gfv2_confidence"] == "absent_no_payload"
 
 
 class TestAbsentArchiveRecord:
