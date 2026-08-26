@@ -51,6 +51,12 @@ against the ACTUAL emitted format strings (the source of truth):
   involved, and the branch/reject step — the marker that made anchor coverage
   queryable; before it, 27 of the triple era's 30 route-level misses were the
   silent ``kw_no_keyword_hit`` return and left no log line at all)
+* ``FINANCIAL_STALE_LATEST`` — ``metaculus_bot/research/financial_data.py``
+  ``_fetch_yfinance_data`` and ``metaculus_bot/research/ts_render.py``
+  ``_render_single`` (per-IDENTIFIER stale "latest" disclosure: the newest
+  observation is older than its own cadence explains, so the rendered latest
+  value — and anything anchored on it — was flagged stale to the forecaster;
+  informational data-quality signal, NOT alertable)
 * ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
   ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
   whether it counted toward the exit code)
@@ -450,6 +456,26 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+series=(?P<series>\S+)\s+step=(?P<step>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # ts_routing.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "financial_stale_latest",
+        # Stale "latest" observation behind a rendered anchor value, WARNING-level and
+        # informational — NOT alertable (the render already tells the forecaster to treat
+        # the value as stale; this line makes each surface's prod incidence a query
+        # instead of a guess). Two emitters share one shape because they share the
+        # estimator (``ts_estimators.stale_latest_age_days``): ``surface=financial_data``
+        # is financial_data.py's ``_fetch_yfinance_data``, ``surface=ts_anchor`` is
+        # ts_render.py's ``_render_single``.
+        #
+        # ``symbol`` is a ticker or FRED series id — carets and dots (^GSPC, BRK.B) are
+        # spaceless, so ``\S+`` takes it and coerce_value keeps it a string. ``cadence``
+        # is the daily-step unit the age was judged against (trading-day /
+        # calendar-day). No question ref — the fetch is per-identifier, and one
+        # question can fire several — so qid_kind stays None.
+        re.compile(
+            r"FINANCIAL_STALE_LATEST:\s*surface=(?P<surface>\S+)\s+symbol=(?P<symbol>\S+)"
+            r"\s+age_d=(?P<age_d>\S+)\s+cadence=(?P<cadence>\S+)"
+        ),
     ),
     MarkerSpec(
         "forecaster_drops",

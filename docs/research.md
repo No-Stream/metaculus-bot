@@ -240,22 +240,33 @@ load-bearing guarantee: even if the classifier misreads the question, the series
 the question actually resolves on still fires. The two sets are merged
 (extraction is additive), then fetched in parallel:
 
-- **yfinance** for tickers: current price, period returns, an annualized
-  volatility over the recent window (`FINANCIAL_YFINANCE_RECENT_DAYS` trailing
-  observations), a 52-week high/low range (a row-count slice of roughly one year
-  of bars — the fetch window `FINANCIAL_YFINANCE_LOOKBACK_DAYS` only bounds what
-  is downloaded), recent closes, and (live only) fundamentals.
-- **FRED** for economic series: latest/previous value, change from the previous
-  observation (a row step, whatever the series' cadence) and YoY change, recent
-  observations.
+- **yfinance** for tickers: the latest price, dated ("Latest price: X (as of
+  DATE)"), with " — today's bar, in progress" appended (live only) when the
+  newest bar is today's, and a stale-latest warning when the newest bar is older
+  than its own cadence explains (also logged as the `FINANCIAL_STALE_LATEST`
+  telemetry marker); period returns via date-based at-or-before lookups, where a
+  label whose match slips past the basis's grace discloses the actual span
+  ("1d (actual 2d)") and a label with no observation at or before its target is
+  omitted; an annualized volatility over the recent window
+  (`FINANCIAL_YFINANCE_RECENT_DAYS` trailing observations); a 52-week high/low
+  range (a row-count slice of roughly one year of bars on the series' own daily
+  basis); recent closes; and (live only) fundamentals.
+- **FRED** for economic series: latest value (dated), previous value, change from
+  the previous observation (a row step, whatever the series' cadence), a
+  date-based year-over-year change, recent observations.
 
-Under benchmarking every fetch is ceilinged to the question's `open_time`:
-yfinance uses a bounded history window and skips the leaky live `.info` call, and
-FRED routes through a keyless point-in-time path (`ts_fetch`, ALFRED vintages) so
-revised macro series return the vintage known at forecast time, not today's
-revisions. A forecaster-invisible HTML-comment routing marker records which
-identifiers fired, which came from extraction vs. the classifier, and any
-unrecognized (fetched-anyway-but-flagged) IDs.
+Both yfinance paths — live and backtest — fetch by explicit calendar start date,
+`as_of − FINANCIAL_YFINANCE_LOOKBACK_DAYS` (390 days; `as_of` defaults to now). A
+bare `period="Nd"` is deliberately avoided: Yahoo's chart API reads that custom
+range as N trading BARS for listed assets but ~N calendar DATES for 24/7 ones —
+one integer under two unit systems. Under benchmarking every fetch is
+additionally ceilinged to the question's `open_time`: yfinance sets an explicit
+`end` at `as_of` and skips the leaky live `.info` call, and FRED routes through a
+keyless point-in-time path (`ts_fetch`, ALFRED vintages) so revised macro series
+return the vintage known at forecast time, not today's revisions. A
+forecaster-invisible HTML-comment routing marker records which identifiers fired,
+which came from extraction vs. the classifier, and any unrecognized
+(fetched-anyway-but-flagged) IDs.
 
 ### Prediction-market snapshot — `PREDICTION_MARKETS_ENABLED`
 
@@ -410,9 +421,12 @@ content post-dates any backtest window).
 
 A deterministic empirical anchor for numeric questions whose resolution series is
 a fetchable FRED/yfinance series (`research/timeseries_anchor.py`). No LLM, no
-model selection — it renders the latest value, a multi-resolution history, a
-52-week range, and a horizon-matched empirical band built only from the series'
-own past. The Phase-A offline replay found CV-gated model picks beat naive
+model selection — it renders the latest value, dated ("as of DATE", with an
+in-progress marker when today's bar is still forming and a stale-latest warning —
+the same `FINANCIAL_STALE_LATEST` marker as the financial-data provider — when
+the newest observation is older than its cadence explains), a multi-resolution
+history, a 52-week range, and a horizon-matched empirical band built only from
+the series' own past. The Phase-A offline replay found CV-gated model picks beat naive
 out-of-sample only 43% of the time, while the naive empirical band was sharper and
 better tail-calibrated, so this ships the naive band on purpose.
 

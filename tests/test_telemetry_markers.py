@@ -130,6 +130,14 @@ TS_ANCHOR_ROUTE_NO_HIT_LINE = (
     PFX + "TS_ANCHOR_ROUTE: question=45193 decision=skipped series=none step=kw_no_keyword_hit"
 )
 TS_ANCHOR_ROUTE_SPREAD_LINE = PFX + "TS_ANCHOR_ROUTE: question=44700 decision=routed series=CL=F/^GSPC step=url_spread"
+# Copied from the two emitters sharing the shape: financial_data.py:_fetch_yfinance_data
+# and ts_render.py:_render_single (same stale_latest_age_days estimator behind both).
+FINANCIAL_STALE_LATEST_YFINANCE_LINE = (
+    PFX_WARN + "FINANCIAL_STALE_LATEST: surface=financial_data symbol=TEST age_d=3 cadence=calendar-day"
+)
+FINANCIAL_STALE_LATEST_TS_ANCHOR_LINE = (
+    PFX_WARN + "FINANCIAL_STALE_LATEST: surface=ts_anchor symbol=^DEAD age_d=9 cadence=trading-day"
+)
 CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=123.45 usage=4.16"
 CREDIT_BALANCE_SKIP_LINE = (
     PFX_WARN + "CREDIT_BALANCE: key=personal phase=start skipped (env var OPENROUTER_API_KEY not set)"
@@ -724,6 +732,38 @@ class TestTsAnchorRoute:
         rec = _parse_one(TS_ANCHOR_ROUTE_SPREAD_LINE)
         assert rec["series"] == "CL=F/^GSPC"
         assert rec["step"] == "url_spread"
+
+
+class TestFinancialStaleLatest:
+    """The stale-"latest" disclosure, one spec for both emitting surfaces.
+
+    Informational, not alertable: the render already tells the forecaster to treat the
+    value as stale. Harvesting it is what turns "how often does each surface serve a
+    stale anchor value" into a query — run logs expire from GHA at 90 days.
+    """
+
+    def test_yfinance_surface_fields(self):
+        rec = _parse_one(FINANCIAL_STALE_LATEST_YFINANCE_LINE)
+        assert rec["marker"] == "financial_stale_latest"
+        assert rec["surface"] == "financial_data"
+        assert rec["symbol"] == "TEST"
+        assert rec["age_d"] == 3
+        assert rec["cadence"] == "calendar-day"
+
+    def test_ts_anchor_surface_fields(self):
+        # A caret-prefixed Yahoo index symbol must survive as the string it is.
+        rec = _parse_one(FINANCIAL_STALE_LATEST_TS_ANCHOR_LINE)
+        assert rec["surface"] == "ts_anchor"
+        assert rec["symbol"] == "^DEAD"
+        assert rec["age_d"] == 9
+        assert rec["cadence"] == "trading-day"
+
+    def test_no_question_ref(self):
+        # Per-identifier, not per-question (one question can fire several), so the
+        # record carries no qid at all — same shape as the credit markers.
+        rec = _parse_one(FINANCIAL_STALE_LATEST_YFINANCE_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
 
 
 class TestCredit:
