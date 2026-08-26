@@ -221,10 +221,12 @@ the question actually resolves on still fires. The two sets are merged
 (extraction is additive), then fetched in parallel:
 
 - **yfinance** for tickers: current price, period returns, an annualized
-  volatility over the recent window (`FINANCIAL_YFINANCE_RECENT_DAYS`), a trailing
-  high/low range over the lookback window (`FINANCIAL_YFINANCE_LOOKBACK_DAYS`),
-  recent closes, and (live only) fundamentals.
-- **FRED** for economic series: latest/previous value, MoM and YoY change, recent
+  volatility over the recent window (`FINANCIAL_YFINANCE_RECENT_DAYS` trailing
+  observations), a 52-week high/low range (a row-count slice of roughly one year
+  of bars — the fetch window `FINANCIAL_YFINANCE_LOOKBACK_DAYS` only bounds what
+  is downloaded), recent closes, and (live only) fundamentals.
+- **FRED** for economic series: latest/previous value, change from the previous
+  observation (a row step, whatever the series' cadence) and YoY change, recent
   observations.
 
 Under benchmarking every fetch is ceilinged to the question's `open_time`:

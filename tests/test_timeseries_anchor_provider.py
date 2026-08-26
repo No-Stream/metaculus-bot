@@ -59,6 +59,8 @@ from metaculus_bot.research.ts_estimators import (
     _empirical_max_band,
     _horizon_end_date,
     _n_eff,
+    annualized_realized_vol_pct,
+    clock_matches_cadence,
     horizon_steps,
     observed_periods_per_year,
     series_clock,
@@ -718,6 +720,135 @@ class TestSeriesClockAndCalendarBases:
 
 
 # Row-wise month-over-month derivations are only "month-over-month" when one row is one month.
+def _quarterly_series(name: str, *, seed: int = 0, end: str = "2026-04-01", n: int = 60) -> pd.Series:
+    """A strictly-positive quarterly (quarter-start) series — the GDPC1 shape."""
+    idx = pd.date_range(end=pd.Timestamp(end), periods=n, freq="QS")
+    rng = np.random.default_rng(seed)
+    walk = 20000.0 + np.cumsum(rng.normal(50.0, 120.0, n))
+    return pd.Series(np.abs(walk) + 500.0, index=idx, name=name)
+
+
+def _semiannual_series(name: str, *, seed: int = 0, n: int = 40) -> pd.Series:
+    """~183-day cadence — the crack between the quarterly and annual buckets."""
+    idx = pd.date_range(end=pd.Timestamp("2026-04-01"), periods=n, freq="183D")
+    rng = np.random.default_rng(seed)
+    walk = 100.0 + np.cumsum(rng.normal(0.0, 2.0, n))
+    return pd.Series(np.abs(walk) + 10.0, index=idx, name=name)
+
+
+class TestCoarseCadenceClocks:
+    """Quarterly/annual series get real buckets with calendar-honest steps.
+
+    Before them, `_detect_freq` topped out at "monthly": a quarterly series (GDPC1, ~92-day
+    gaps) classified monthly and every horizon converted at 30.4375 days per step — a 3x-too-
+    wide band under false "monthly" labels ("series frequency: monthly", "Last monthly
+    observations", "3-month change windows" for what is a 3-QUARTER band), reachable through
+    any coarse FRED series cited by URL (`_single_url_route` builds a model-target level route
+    for every unregistered id). The same row-count-as-calendar defect class as the 24/7
+    sqrt(252), in the low-frequency direction.
+    """
+
+    def test_quarterly_and_annual_series_get_their_own_buckets(self):
+        quarterly = _quarterly_series("GDPC1")
+        annual = pd.Series(
+            np.linspace(100.0, 200.0, 30),
+            index=pd.date_range(end="2026-01-01", periods=30, freq="YS"),
+        )
+        q_clock = series_clock(pd.DatetimeIndex(quarterly.index))
+        a_clock = series_clock(pd.DatetimeIndex(annual.index))
+        assert (q_clock.freq, q_clock.step_unit) == ("quarterly", "quarter")
+        assert (a_clock.freq, a_clock.step_unit) == ("annual", "year")
+
+    def test_quarterly_horizons_convert_on_calendar_quarters(self):
+        clock = series_clock(pd.DatetimeIndex(_quarterly_series("GDPC1").index))
+        # A 90-day question is ONE quarterly step (the monthly bucket read it as 3 steps —
+        # a 276-day band presented as 90 days); a year is four.
+        assert horizon_steps(clock, 90) == 1
+        assert horizon_steps(clock, 365) == 4
+
+    def test_horizon_end_date_inverts_on_the_coarse_clocks_too(self):
+        as_of = pd.Timestamp("2026-06-30")
+        quarterly = series_clock(pd.DatetimeIndex(_quarterly_series("GDPC1").index))
+        assert abs((_horizon_end_date(as_of, quarterly, 1) - as_of).days - 91) <= 3
+        annual = SeriesClock(freq="annual", periods_per_year=TRADING_DAYS_PER_YEAR)
+        assert abs((_horizon_end_date(as_of, annual, 1) - as_of).days - 365) <= 1
+
+    def test_gdpc1_shape_renders_a_quarter_band_under_honest_labels(self, monkeypatch):
+        """End-to-end through the URL branch (the verified exposure): a quarterly FRED series
+        must render quarter-labelled history and a quarter-step band, not the monthly trio of
+        false statements."""
+        quarterly = _quarterly_series("GDPC1")
+        monkeypatch.setenv("TS_ANCHOR_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: quarterly)
+        q = _make_numeric_q(
+            qid=9451,
+            resolution_criteria="Resolves per https://fred.stlouisfed.org/series/GDPC1 for the quarter.",
+            scheduled_resolution_time=datetime(2026, 9, 28, tzinfo=UTC),
+            lower_bound=0.0,
+            upper_bound=100000.0,
+        )
+
+        out = build_anchor_section(q, datetime(2026, 6, 30, tzinfo=UTC))
+
+        assert "series frequency: quarterly" in out
+        assert "Last quarterly observations" in out
+        assert "-quarter change windows" in out
+        assert "monthly" not in out
+
+    def test_a_cadence_the_buckets_misdescribe_is_refused_a_band(self, monkeypatch, caplog):
+        """The fail-safe for the cracks: a ~183-day semiannual series lands in the annual
+        bucket, where one 365.25-day step spans TWO real observations — a band too narrow by
+        the same factor. `clock_matches_cadence` refuses it and the band-None guard drops the
+        section rather than serving a mis-converted quantity."""
+        semiannual = _semiannual_series("BOGUS1")
+        clock = series_clock(pd.DatetimeIndex(semiannual.index))
+        assert clock.freq == "annual"
+        assert clock_matches_cadence(clock, pd.DatetimeIndex(semiannual.index)) is False
+
+        monkeypatch.setenv("TS_ANCHOR_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: semiannual)
+        q = _make_numeric_q(
+            qid=9452,
+            resolution_criteria="Resolves per https://fred.stlouisfed.org/series/BOGUS1 on the date.",
+            scheduled_resolution_time=datetime(2026, 9, 28, tzinfo=UTC),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            out = build_anchor_section(q, datetime(2026, 6, 30, tzinfo=UTC))
+
+        assert out == ""
+        assert any("cadence" in record.getMessage() for record in caplog.records)
+
+    def test_matching_cadences_all_pass_the_guard(self):
+        for series in (
+            _daily_positive_series("^GSPC"),
+            _twenty_four_seven_series("BTC-USD"),
+            _monthly_series("CPIAUCSL"),
+            _quarterly_series("GDPC1"),
+        ):
+            index = pd.DatetimeIndex(series.index)
+            assert clock_matches_cadence(series_clock(index), index) is True, series.name
+
+
+class TestSharedVolEstimator:
+    """The one vol definition (`annualized_realized_vol_pct`), after the q44882 defect was
+    fixed in one of its two byte-identical copies weeks before the other."""
+
+    def test_matches_the_hand_computed_value(self):
+        series = _twenty_four_seven_series("BTC-USD")
+        expected = float(series.pct_change().dropna().tail(30).std() * np.sqrt(365) * 100.0)
+        assert annualized_realized_vol_pct(series, window=30, periods_per_year=365) == pytest.approx(expected)
+
+    def test_returns_none_below_the_window(self):
+        # 30 closes yield 29 returns — a "30-observation" vol computed on 29 would wear the
+        # window's label without its sample size.
+        short = pd.Series(
+            np.linspace(100.0, 110.0, 30),
+            index=pd.date_range(end="2026-06-30", periods=30, freq="D"),
+        )
+        assert annualized_realized_vol_pct(short, window=30, periods_per_year=365) is None
+
+
 class TestDerivationFrequencyInvariant:
     def test_mom_derivations_reject_a_non_monthly_source(self):
         weekly = pd.Series(

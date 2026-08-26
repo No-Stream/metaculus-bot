@@ -12,7 +12,6 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 from urllib.parse import unquote
 
-import numpy as np
 import pandas as pd
 import yfinance
 from forecasting_tools import GeneralLlm
@@ -34,6 +33,8 @@ from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.ts_estimators import (
     CALENDAR_DAYS_PER_YEAR,
     TRADING_DAYS_PER_YEAR,
+    annualized_realized_vol_pct,
+    daily_step_unit,
     observed_periods_per_year,
 )
 from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
@@ -392,15 +393,18 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
         if returns_section:
             parts.append(returns_section)
 
-        # Volatility (30-day annualized)
-        if len(close) >= FINANCIAL_YFINANCE_RECENT_DAYS:
-            daily_returns = close.pct_change().dropna()
-            recent_daily = daily_returns.iloc[-FINANCIAL_YFINANCE_RECENT_DAYS:]
-            annualized_vol = recent_daily.std() * np.sqrt(periods_per_year) * 100
+        # Volatility over the trailing FINANCIAL_YFINANCE_RECENT_DAYS observations — the
+        # shared estimator (ts_estimators), so this line and the anchor stack's vol note
+        # cannot drift apart again; None when the return sample is shorter than the window
+        # (a vol wearing the window's label without its sample size).
+        annualized_vol = annualized_realized_vol_pct(
+            close, window=FINANCIAL_YFINANCE_RECENT_DAYS, periods_per_year=periods_per_year
+        )
+        if annualized_vol is not None:
             # Name the step unit: FINANCIAL_YFINANCE_RECENT_DAYS is a ROW count, which is six
             # calendar weeks on an exchange-traded series and 30 calendar days on a 24/7 one, so
             # a bare "30-day" label was itself a row count posing as a calendar window.
-            unit = "trading-day" if periods_per_year == TRADING_DAYS_PER_YEAR else "calendar-day"
+            unit = daily_step_unit(periods_per_year)
             parts.append(f"- {FINANCIAL_YFINANCE_RECENT_DAYS}-{unit} annualized volatility: {annualized_vol:.1f}%")
 
         # 52-week range
@@ -514,7 +518,9 @@ def _render_fred_series(series_id: str, data: pd.Series, title: str) -> str:
         previous_value = data.iloc[-2]
         parts.append(f"- Previous value: {previous_value:.4g}")
 
-    # Month-over-month change (if monthly-ish frequency)
+    # Change from the previous OBSERVATION — a row step, whatever the series'
+    # cadence (monthly CPI, quarterly GDP, weekly claims) — which is exactly what
+    # the rendered "Change from previous" label claims and no more.
     if len(data) >= 2:
         mom_change = latest_value - data.iloc[-2]
         mom_pct = (mom_change / abs(float(data.iloc[-2]))) * 100 if data.iloc[-2] != 0 else 0

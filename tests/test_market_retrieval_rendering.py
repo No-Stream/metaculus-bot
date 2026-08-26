@@ -67,23 +67,23 @@ _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 # most of the total; the per-market cap never binds on a full 8-row slate.
 #
 # MAXED: 8 rows with every field simultaneously at its cap, EVERY row multi-outcome, every one of
-# its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too. Measured at 10,443 chars — and the slack is now
-# 157, so this budget has genuinely stopped being a formality. What the completeness change spent it
-# on, and why the ceiling itself did not move: naming every outcome instead of cutting the tail cost
-# +2,308 chars on this fixture at the old `MAX_CHILD_ROWS_PER_SNAPSHOT` of 24, and dropping that cap
-# to 16 plus a 1,400-char ladder section allowance bought it back to +145 (design §6 grids both
-# constants). The legend's two new sentences are the other +397.
+# its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too. Measured at 10,341 chars against the shipped
+# constants (`MAX_CHILD_ROWS_PER_SNAPSHOT` = 14 full sub-rows plus the 1,400-char ladder section
+# allowance — rendering.py's own comment explains why 14 beat the design's gridded 16), so the
+# slack is 259 and this budget has genuinely stopped being a formality. Naming every outcome
+# instead of cutting the tail is what spent it; the legend's added sentences are the rest.
 MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 10_600
 
 # REALISTIC: 8 rows of content shaped like live payloads rather than chosen — what a real question
-# renders. Measured at 7,471 chars, 483 BELOW the pre-change 7,954: a four-outcome family names all
-# four either way, and the lower full-row cap moves two of them from a full sub-row into the ladder.
+# renders. Measured at 7,499 chars, ~450 BELOW the pre-completeness-change figure: a four-outcome
+# family names all four either way, and the lower full-row cap moves two of them from a full
+# sub-row into the ladder.
 MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_050
 
 # Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
-# 2,179 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
+# 2,329 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
 # the only part with no data to justify it — the whole-snapshot budget has slack that would
-# otherwise absorb an added paragraph unnoticed. At 2,179 of 2,250 this is still the tightest
+# otherwise absorb an added paragraph unnoticed. At 2,329 of 2,400 this is still the tightest
 # budget in the file, which is the point: the next legend sentence has to earn a re-derivation.
 #
 # Re-derived twice, and both purchases are on the record. From 1,700 to 1,850: a `prob` cell may hold

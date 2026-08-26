@@ -640,21 +640,33 @@ class TestKalshiEventDerivations:
 
         assert (venues.kalshi_strike_price(market) is not None) is priced
 
-    def test_the_committed_live_books_all_stay_priced(self, multi_close_page: dict[str, Any]) -> None:
-        """The false-positive guard, over every live strike in every committed Kalshi capture: the
-        threshold must blank degenerate books and nothing else."""
-        live = [
-            market
-            for event in multi_close_page["events"]
-            for market in event["markets"]
-            if market["status"] == "active"
-        ]
-        assert len(live) >= 5, "the capture must actually contain live books"
+    def test_the_committed_live_books_all_stay_priced(self) -> None:
+        """The false-positive guard, over every live TWO-SIDED book in every committed Kalshi
+        capture (all three files, 11 books): the threshold must blank degenerate books and
+        nothing else. Iterating one capture proved 5 of the 11 the docstring claimed — a
+        threshold retune could have blanked a real book in the other two files with this green."""
+        capture_files = (
+            "kalshi_multi_close_event_2026_08_04.json",
+            "kalshi_live_markets_2026_08_03.json",
+            "kalshi_family_liquidity_2026_08_05.json",
+        )
+        live: list[dict[str, Any]] = []
+        for name in capture_files:
+            page = json.loads((Path(__file__).parent / "data" / name).read_text())
+            live.extend(
+                market
+                for event in page["events"]
+                for market in event.get("markets", [])
+                if market.get("status") == "active"
+                and market.get("yes_bid_dollars") is not None
+                and market.get("yes_ask_dollars") is not None
+            )
+        assert len(live) >= 11, "the committed captures must actually contain the 11 live books"
 
         for market in live:
             spread = float(market["yes_ask_dollars"]) - float(market["yes_bid_dollars"])
-            assert spread < venues.kalshi.KALSHI_NO_PRICE_SPREAD
-            assert venues.kalshi_strike_price(market) is not None, market["yes_sub_title"]
+            assert spread < venues.kalshi.KALSHI_NO_PRICE_SPREAD, market.get("yes_sub_title")
+            assert venues.kalshi_strike_price(market) is not None, market.get("yes_sub_title")
 
     def test_the_dollar_conversion_deliberately_does_not_take_the_no_price_rule(self) -> None:
         """`kalshi_usd_liquidity` still midpoints an empty book, and that is the intended asymmetry.
@@ -1503,6 +1515,40 @@ class TestManifoldMultiOutcome:
         assert by_label["no volume field"].implied_prob_yes == pytest.approx(0.5)
         assert by_label["ordinary rung"].implied_prob_yes == pytest.approx(0.27)
         assert [child.price_withheld for child in children] == [True, False, False, False]
+
+    def test_an_untouched_binary_market_reports_no_parent_price(self) -> None:
+        """The third same-class surface, missed by the answer-level sweep: a fresh BINARY
+        market is created at exactly 0.50 with zero volume, and that manufactured number
+        rendered as the PARENT `prob` cell — the one the prompt tells models to anchor on
+        (the archive holds a live specimen at 0.5 / volume 0.0). Same volume-gated blanking,
+        same `price_withheld` accounting as the answer surfaces."""
+        payload = [
+            {
+                "id": "m-fresh",
+                "question": "Fresh at the prior?",
+                "outcomeType": "BINARY",
+                "probability": 0.5,
+                "volume": 0.0,
+            },
+            {
+                "id": "m-coin",
+                "question": "Real coin flip?",
+                "outcomeType": "BINARY",
+                "probability": 0.5,
+                "volume": 900.0,
+            },
+            {"id": "m-thin", "question": "Ordinary?", "outcomeType": "BINARY", "probability": 0.27, "volume": 12.0},
+        ]
+
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None
+        by_title = {row.market_title: row for row in rows}
+        assert by_title["Fresh at the prior?"].implied_prob_yes is None
+        assert by_title["Fresh at the prior?"].price_withheld is True
+        assert by_title["Real coin flip?"].implied_prob_yes == pytest.approx(0.5)
+        assert by_title["Real coin flip?"].price_withheld is False
+        assert by_title["Ordinary?"].implied_prob_yes == pytest.approx(0.27)
 
     def test_an_answer_the_parser_cannot_read_is_skipped_without_losing_its_siblings(self) -> None:
         """The two guards inside the answer loop, which the 2026-08-25 price rewrite edited around: an

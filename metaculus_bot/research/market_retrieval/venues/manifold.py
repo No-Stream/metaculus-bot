@@ -190,8 +190,15 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | N
                 close_time = None
 
         # Either a probability or a scalar value, never both — the whole point of the allow-list.
+        raw_probability: float | None = None
         if market.get("outcomeType") == MANIFOLD_PRICED_OUTCOME_TYPE:
-            implied_prob_yes = safe_float(market.get("probability"))
+            # Same untouched-prior blanking the two ANSWER surfaces get: a fresh binary
+            # market is created at exactly 0.50 with zero volume, and that manufactured
+            # number would render in the PARENT `prob` cell — the one the prompt tells
+            # models to anchor on (the sweep's one missed same-class site; the archive
+            # holds a live specimen at 0.5 / volume 0.0).
+            raw_probability = safe_float(market.get("probability"))
+            implied_prob_yes = _priced_or_none(raw_probability, volume=safe_float(market.get("volume")))
             scalar_estimate = None
         else:
             implied_prob_yes = None
@@ -227,6 +234,10 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | N
                 venue_market_id=str(market.get("id") or ""),
                 retrieval_channel="venue_search",
                 scalar_estimate=scalar_estimate,
+                # Same contract as the Polymarket parent: withheld means "the venue
+                # published a number and this repo refused it", so the render's
+                # `withheld=` telemetry counts the blanked parent too.
+                price_withheld=implied_prob_yes is None and raw_probability is not None,
             )
         )
     return out

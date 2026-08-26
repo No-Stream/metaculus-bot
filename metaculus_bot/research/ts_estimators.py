@@ -23,7 +23,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-Freq = Literal["daily", "weekly", "monthly"]
+Freq = Literal["daily", "weekly", "monthly", "quarterly", "annual"]
 
 # Annualization / horizon-conversion bases (ported from the replay's run_replay.py).
 # THE package's single definition of these two facts — `financial_data` imports them for its
@@ -33,6 +33,10 @@ Freq = Literal["daily", "weekly", "monthly"]
 TRADING_DAYS_PER_YEAR = 252
 CALENDAR_DAYS_PER_YEAR = 365
 CALENDAR_DAYS_PER_MONTH = 30.4375
+# Mean calendar quarter/year for the coarse-cadence step conversions (Julian year / 4).
+# Distinct from the int CALENDAR_DAYS_PER_YEAR above, which is a daily-bar ROW basis.
+CALENDAR_DAYS_PER_QUARTER = 91.3125
+CALENDAR_DAYS_PER_ANNUM = 365.25
 
 QUANTILE_LEVELS = (0.10, 0.50, 0.90)
 
@@ -52,6 +56,14 @@ def _detect_freq(index: pd.DatetimeIndex) -> Freq:
     Median, so a business-day series' weekend gaps don't drag it out of "daily" — which also
     means it CANNOT tell 5-bars-a-week from 7 (both have a 1.0-day median gap). That
     distinction is ``observed_periods_per_year``'s job; use ``series_clock`` to get both.
+
+    The coarse buckets exist because "monthly" used to be the ceiling: a quarterly series
+    (GDPC1, ~92-day gaps) classified monthly and every horizon converted at 30.4375 days per
+    step — a 3x-too-wide band under a false "3-month" label, the same row-count-as-calendar
+    defect class the daily 252/365 fix removed, reachable through any coarse FRED series
+    cited by URL. Cadences the buckets still misdescribe (a ~183-day semiannual series lands
+    in "annual") are refused a band by the cadence guard (``clock_matches_cadence``) rather
+    than converted wrong.
     """
     if len(index) < 3:
         return "daily"
@@ -61,7 +73,11 @@ def _detect_freq(index: pd.DatetimeIndex) -> Freq:
         return "daily"
     if median_gap <= 10.0:
         return "weekly"
-    return "monthly"
+    if median_gap <= 45.0:
+        return "monthly"
+    if median_gap <= 135.0:
+        return "quarterly"
+    return "annual"
 
 
 def observed_periods_per_year(index: pd.Index) -> int:
@@ -97,6 +113,32 @@ def observed_periods_per_year(index: pd.Index) -> int:
     return CALENDAR_DAYS_PER_YEAR if rows_per_day > _TWENTY_FOUR_SEVEN_ROWS_PER_DAY else TRADING_DAYS_PER_YEAR
 
 
+def daily_step_unit(periods_per_year: int) -> str:
+    """Label noun for one daily-bar observation on the given annualization basis.
+
+    ONE definition of the ternary (``SeriesClock.step_unit`` and ``financial_data``'s
+    vol label both call it): the unit name and the basis must flip together, and a
+    second copy of the rule is where a correction goes missing.
+    """
+    return "trading-day" if periods_per_year == TRADING_DAYS_PER_YEAR else "calendar-day"
+
+
+def annualized_realized_vol_pct(series: pd.Series, *, window: int, periods_per_year: int) -> float | None:
+    """Annualized realized volatility (%) over the last ``window`` simple returns.
+
+    THE package's one vol estimator — ``ts_render._realized_vol_line`` and
+    ``financial_data``'s yfinance block previously carried byte-identical copies, and the
+    q44882 sqrt(252)-on-a-24/7-series defect was fixed in one copy weeks before the other
+    (e6ae276 vs c577231): same window, same formula, same basis, corrected separately.
+    ``None`` when fewer than ``window`` returns exist — a vol computed on a shorter sample
+    would wear the window's label without its sample size.
+    """
+    returns = series.pct_change().dropna()
+    if len(returns) < window:
+        return None
+    return float(returns.tail(window).std() * np.sqrt(periods_per_year) * 100.0)
+
+
 @dataclass(frozen=True)
 class SeriesClock:
     """A fetched series' observation clock: native resolution AND observed sampling density.
@@ -120,7 +162,30 @@ class SeriesClock:
             return "week"
         if self.freq == "monthly":
             return "month"
+        if self.freq == "quarterly":
+            return "quarter"
+        if self.freq == "annual":
+            return "year"
         return "trading-day" if self.periods_per_year == TRADING_DAYS_PER_YEAR else "calendar-day"
+
+    @property
+    def nominal_step_days(self) -> float:
+        """Calendar days one observation step is ASSUMED to span, per the freq bucket.
+
+        The other half of the cadence guard: ``horizon_steps`` converts on this assumption,
+        so a series whose real gap disagrees with it gets a band whose true span disagrees
+        by the same factor. Compared against the observed median gap in
+        ``clock_matches_cadence``.
+        """
+        if self.freq == "weekly":
+            return 7.0
+        if self.freq == "monthly":
+            return CALENDAR_DAYS_PER_MONTH
+        if self.freq == "quarterly":
+            return CALENDAR_DAYS_PER_QUARTER
+        if self.freq == "annual":
+            return CALENDAR_DAYS_PER_ANNUM
+        return CALENDAR_DAYS_PER_YEAR / self.periods_per_year
 
 
 # The clock of a DERIVED monthly target (MoM change / MoM % / monthly average). One step is
@@ -130,11 +195,35 @@ MONTHLY_CLOCK = SeriesClock(freq="monthly", periods_per_year=TRADING_DAYS_PER_YE
 
 def series_clock(index: pd.DatetimeIndex) -> SeriesClock:
     """Read both clock facts off a series' index. The density read only means anything for a
-    daily-bar series, so weekly/monthly carry the nominal trading-day basis unread (their own
-    horizon conversions are already calendar-honest: /7 and /30.4375)."""
+    daily-bar series, so the coarser buckets carry the nominal trading-day basis unread (their
+    own horizon conversions are already calendar-honest: /7, /30.4375, /91.3125, /365.25)."""
     freq = _detect_freq(index)
     periods_per_year = observed_periods_per_year(index) if freq == "daily" else TRADING_DAYS_PER_YEAR
     return SeriesClock(freq=freq, periods_per_year=periods_per_year)
+
+
+def clock_matches_cadence(clock: SeriesClock, index: pd.DatetimeIndex) -> bool:
+    """True when the series' observed cadence agrees with the clock's assumed step (within 1.5x).
+
+    The fail-safe for every cadence the freq buckets misdescribe: a ~183-day semiannual series
+    lands in "annual" and one 365.25-day step then spans two real observations (band too
+    narrow); a 2-4-day series lands in "daily" on the 252 basis (band too wide). Either
+    direction is a wrong quantity under a confident label, so a mismatched series gets NO band
+    — the render path's band-withheld → section-dropped guard — rather than a mis-converted
+    one. Checked in BOTH directions because the two failure modes sit on opposite sides.
+
+    Too-short-to-measure indexes pass: with fewer than 3 observations ``_detect_freq``
+    defaulted the bucket rather than reading the cadence, and the history-vs-horizon guard is
+    the one that fires on those.
+    """
+    if len(index) < 3:
+        return True
+    diffs = np.diff(index.values).astype("timedelta64[D]").astype("float64")
+    median_gap = float(np.median(diffs))
+    if median_gap <= 0.0:
+        return True  # intraday duplicates measure 0 days; the daily bucket is honest for them
+    step = clock.nominal_step_days
+    return step / 1.5 <= median_gap <= step * 1.5
 
 
 def horizon_steps(clock: SeriesClock, calendar_days: int) -> int:
@@ -149,8 +238,12 @@ def horizon_steps(clock: SeriesClock, calendar_days: int) -> int:
         h = round(calendar_days * clock.periods_per_year / CALENDAR_DAYS_PER_YEAR)
     elif clock.freq == "weekly":
         h = round(calendar_days / 7.0)
-    else:  # monthly
+    elif clock.freq == "monthly":
         h = round(calendar_days / CALENDAR_DAYS_PER_MONTH)
+    elif clock.freq == "quarterly":
+        h = round(calendar_days / CALENDAR_DAYS_PER_QUARTER)
+    else:  # annual
+        h = round(calendar_days / CALENDAR_DAYS_PER_ANNUM)
     return max(1, h)
 
 
@@ -168,6 +261,10 @@ def _horizon_end_date(as_of: pd.Timestamp, clock: SeriesClock, h: int) -> pd.Tim
         return as_of + pd.Timedelta(days=round(h * CALENDAR_DAYS_PER_YEAR / clock.periods_per_year))
     if clock.freq == "weekly":
         return as_of + pd.Timedelta(weeks=h)
+    if clock.freq == "quarterly":
+        return as_of + pd.DateOffset(months=3 * h)
+    if clock.freq == "annual":
+        return as_of + pd.DateOffset(years=h)
     return as_of + pd.DateOffset(months=h)
 
 

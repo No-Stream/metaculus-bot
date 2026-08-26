@@ -17,6 +17,7 @@ some derivation of the raw series, and the level case (scale 1.0) is the identit
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import numpy as np
@@ -39,10 +40,14 @@ from metaculus_bot.research.ts_estimators import (
     _empirical_change_band,
     _empirical_max_band,
     _n_eff,
+    annualized_realized_vol_pct,
+    clock_matches_cadence,
     horizon_steps,
     series_clock,
 )
 from metaculus_bot.research.ts_routing import Derivation, _Route
+
+logger = logging.getLogger(__name__)
 
 # Trailing OBSERVATIONS behind the annualized-vol note — a smoothing choice, not a calendar
 # window, which is why the rendered label names the step unit ("30 trading days" vs "30 days")
@@ -116,8 +121,10 @@ def _multi_res_history(series: pd.Series, freq: Freq, monthly_header: str = "Las
         blocks.append(_history_lines(series, TS_ANCHOR_WEEKLY_TABLE_ROWS, "Last weekly observations"))
         monthly = _downsample_last(series, "M")
         blocks.append(_history_lines(monthly, TS_ANCHOR_MONTHLY_TABLE_ROWS, "Monthly (last obs of month)"))
-    else:  # monthly
+    elif freq == "monthly":
         blocks.append(_history_lines(series, TS_ANCHOR_MONTHLY_TABLE_ROWS, monthly_header))
+    else:  # quarterly / annual: native rows only, honestly labelled — no finer resolution exists
+        blocks.append(_history_lines(series, TS_ANCHOR_MONTHLY_TABLE_ROWS, f"Last {freq} observations"))
     return blocks
 
 
@@ -198,15 +205,17 @@ def _realized_vol_line(series: pd.Series, clock: SeriesClock) -> str | None:
     Annualizes on the series' OBSERVED density, not a fixed sqrt(252): a 24/7 series prints
     ~365 bars a year, so the trading-day factor understated its volatility by
     sqrt(365/252) = 1.2035x — the q44882 (ETH-USD) defect, whose twin in ``financial_data`` was
-    fixed in e6ae276 while this copy kept the constant. The label names the step unit for the
-    same reason: 30 rows is six calendar weeks on an exchange-traded series, so calling it
+    fixed in e6ae276 while this copy kept the constant. The estimator now lives once in
+    ``ts_estimators.annualized_realized_vol_pct`` so the two surfaces cannot be corrected
+    separately again; only the sentence wording is local. The label names the step unit for
+    the same reason: 30 rows is six calendar weeks on an exchange-traded series, so calling it
     "30-day" was a row count masquerading as a calendar window.
     """
-    returns = series.pct_change().dropna()
-    if len(returns) < REALIZED_VOL_WINDOW:
+    annualized = annualized_realized_vol_pct(
+        series, window=REALIZED_VOL_WINDOW, periods_per_year=clock.periods_per_year
+    )
+    if annualized is None:
         return None
-    recent = returns.tail(REALIZED_VOL_WINDOW)
-    annualized = float(recent.std() * np.sqrt(clock.periods_per_year) * 100.0)
     return f"- {REALIZED_VOL_WINDOW}-{clock.step_unit} annualized realized volatility: {annualized:.1f}%"
 
 
@@ -285,7 +294,21 @@ def _render_single(
         parts.append(_fifty_two_week_line(derived, ceiling, last))
 
     band: tuple[float, float, float] | None = None
-    if route.model_target and y.size > h:
+    cadence_ok = clock_matches_cadence(clock, pd.DatetimeIndex(derived.index))
+    if not cadence_ok and route.model_target:
+        # A cadence the freq buckets misdescribe (a ~183-day semiannual series in the
+        # "annual" bucket, a 2-4-day series on the daily basis) would convert the horizon
+        # by the same wrong factor its gap disagrees by — a mis-sized band under a
+        # confident label. Withhold the band; the caller's band-None guard then drops the
+        # section rather than serving a wrong quantity.
+        logger.warning(
+            "ts_anchor: series cadence (median gap) disagrees >1.5x with the %s clock's %.1f-day step "
+            "for %s — withholding the empirical band rather than mis-converting the horizon",
+            clock.freq,
+            clock.nominal_step_days,
+            route.label,
+        )
+    if route.model_target and y.size > h and cadence_ok:
         n_eff = _n_eff(int(y.size), h)
         if is_max:
             band = _empirical_max_band(y, h, use_log=use_log, last=last)
