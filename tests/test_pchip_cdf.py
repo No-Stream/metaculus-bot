@@ -4,6 +4,8 @@ Tests for PCHIP-based CDF construction.
 Based on the panchul implementation with comprehensive validation.
 """
 
+from typing import cast
+
 import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
@@ -320,6 +322,76 @@ class TestGeneratePchipCdf:
 
         assert len(cdf) == 201
         assert all(a <= b for a, b in zip(cdf[:-1], cdf[1:]))
+
+    def test_non_finite_value_raises_instead_of_dropping_the_anchor(self):
+        """A non-finite VALUE fails the build instead of being silently skipped.
+
+        The old ``continue`` built a CDF from the surviving points while
+        ``declared_percentiles`` still advertised the full set — and NaN was
+        reachable end-to-end (``json.loads`` accepts a bare ``NaN``, and the
+        strictly-increasing check ``value <= prev`` is False for it). Every
+        caller handles the ValueError: ``build_numeric_distribution`` falls
+        back to forecasting-tools' builder, which re-validates.
+        """
+        for bad_value in (float("nan"), float("inf"), -float("inf")):
+            with pytest.raises(ValueError, match="non-finite value"):
+                generate_pchip_cdf(
+                    percentile_values={10.0: 1.0, 50.0: bad_value, 90.0: 9.0},
+                    open_upper_bound=False,
+                    open_lower_bound=False,
+                    upper_bound=10.0,
+                    lower_bound=0.0,
+                )
+
+    def test_non_numeric_value_raises(self):
+        percentiles = cast(dict[int | float, float], {10.0: 1.0, 50.0: "five-ish", 90.0: 9.0})
+        with pytest.raises(ValueError, match="non-numeric value"):
+            generate_pchip_cdf(
+                percentile_values=percentiles,
+                open_upper_bound=False,
+                open_lower_bound=False,
+                upper_bound=10.0,
+                lower_bound=0.0,
+            )
+
+    def test_non_numeric_label_raises(self):
+        percentiles = cast(dict[int | float, float], {10.0: 1.0, "p50": 5.0, 90.0: 9.0})
+        with pytest.raises(ValueError, match="non-numeric percentile label"):
+            generate_pchip_cdf(
+                percentile_values=percentiles,
+                open_upper_bound=False,
+                open_lower_bound=False,
+                upper_bound=10.0,
+                lower_bound=0.0,
+            )
+
+    def test_boundary_labels_stay_silently_filtered(self):
+        """0.0 / 100.0 KEYS are dropped by design, never raised on — values != keys.
+
+        ``_postprocess_ensemble_cdf``'s discrete branch feeds prob*100 labels that
+        legitimately include exactly 0.0 and 100.0 and relies on this filter
+        dropping them before the boundary points are re-added. The build with the
+        boundary labels present must be byte-identical to the build without them.
+        """
+        base: dict[int | float, float] = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
+        with_boundaries: dict[int | float, float] = {0.0: 0.0, **base, 100.0: 10.0}
+
+        cdf_base, _ = generate_pchip_cdf(
+            percentile_values=base,
+            open_upper_bound=False,
+            open_lower_bound=False,
+            upper_bound=10.0,
+            lower_bound=0.0,
+        )
+        cdf_with, _ = generate_pchip_cdf(
+            percentile_values=with_boundaries,
+            open_upper_bound=False,
+            open_lower_bound=False,
+            upper_bound=10.0,
+            lower_bound=0.0,
+        )
+
+        np.testing.assert_allclose(cdf_with, cdf_base)
 
     def test_error_handling_empty_percentiles(self):
         """Test error handling for empty percentiles."""

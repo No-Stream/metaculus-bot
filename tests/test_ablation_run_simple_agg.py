@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from metaculus_bot.ablation.aggregation_primitives import aggregate_mc
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.run_simple_agg import run_mean_for_qid, run_median_for_qid
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, ARM_MEAN, ARM_MEDIAN
@@ -238,6 +239,31 @@ class TestMultipleChoice:
         red_prob = next(o["probability"] for o in options if o["option_name"] == "Red")
         green_prob = next(o["probability"] for o in options if o["option_name"] == "Green")
         assert red_prob > green_prob
+
+
+class TestAggregateMcRefusesImputation:
+    """The primitive raises when an option has no declared values (H1's ablation sibling).
+
+    The old ``1.0 / n_options`` fallback averaged a uniform share NO model declared
+    into the ablation aggregate, indistinguishable from a real ballot — the same
+    defect the production ``build_mc_prediction`` stopped doing (f852f8a). Upstream
+    accumulation covers every option in ``option_order``, so an empty list means that
+    invariant broke and the run must say so.
+    """
+
+    def test_an_undeclared_option_raises_instead_of_imputing(self) -> None:
+        per_option = {"Red": [0.6, 0.5], "Blue": [0.4, 0.5]}  # nobody declared Green
+        with pytest.raises(ValueError, match="no model declared a probability for option 'Green'"):
+            aggregate_mc(per_option, ["Red", "Blue", "Green"], method="median")
+
+    def test_a_fully_declared_ballot_still_aggregates(self) -> None:
+        per_option = {"Red": [0.6, 0.4], "Blue": [0.3, 0.4], "Green": [0.1, 0.2]}
+
+        result = aggregate_mc(per_option, ["Red", "Blue", "Green"], method="mean")
+
+        probs = {o.option_name: o.probability for o in result.predicted_options}
+        assert math.isclose(sum(probs.values()), 1.0, abs_tol=1e-6)
+        assert probs["Red"] > probs["Green"]
 
 
 # ===========================================================================

@@ -634,9 +634,10 @@ class TestNumericDegenerateDeclaration:
         assert rec["qid_kind"] == "question_id"
 
     def test_unlabelled_model_stays_a_readable_string(self):
-        # "unknown" is what the line carries until the three sanitize_percentiles callers
-        # pass model_name. It is NOT in _NONE_SENTINELS, so it must survive as a string —
-        # a None here would be indistinguishable from a missing field.
+        # "unknown" is what the line carries when a caller doesn't pass model_name. All
+        # three production callers now do (8cccdaa), so it survives for historical lines
+        # and any future caller that forgets. It is NOT in _NONE_SENTINELS, so it must
+        # survive as a string — a None here would be indistinguishable from a missing field.
         rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_UNLABELLED_LINE)
         assert rec["model"] == "unknown"
         # %.6g renders a sub-epsilon span in exponent form; it must reach the archive as a

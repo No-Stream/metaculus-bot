@@ -981,6 +981,25 @@ class TestPolymarket:
         assert rows[0].volume_24h == pytest.approx(safe_float(event["volume24hr"]))
         assert rows[0].total_volume is not None and rows[0].total_volume > 4 * child_volume_sum
 
+    def test_an_absent_24h_volume_stays_none_rather_than_carrying_lifetime_volume(
+        self, captured_payloads: dict[str, Any]
+    ) -> None:
+        """`volume24hr` is optional on Gamma events (absent on 25 of 122 archived rows). The old
+        fallback silently substituted the LIFETIME `volume` — a recency field holding a number
+        with no recency, which is only harmless while nothing reads it. Absence must stay None."""
+        payload = copy.deepcopy(captured_payloads["polymarket_search"])
+        event = payload["events"][0]
+        del event["volume24hr"]
+        for market in event["markets"]:
+            market.pop("volume24hr", None)
+        assert safe_float(event["volume"]) is not None, "fixture must carry lifetime volume or this proves nothing"
+
+        rows = venues.parse_polymarket_matches(payload, width=60)
+
+        assert rows is not None
+        assert rows[0].volume_24h is None
+        assert rows[0].total_volume == pytest.approx(safe_float(event["volume"]))
+
     def test_a_single_market_event_is_unchanged_and_gains_no_children(self, captured_payloads: dict[str, Any]) -> None:
         """The superset half: event and market ask the same question when there is only one, so the
         price legs stay the market's and the row renders exactly as it always has."""

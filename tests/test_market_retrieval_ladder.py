@@ -405,6 +405,19 @@ class TestCompactionStages:
 
         assert "+2 settled at 0.00-1.00, last lost" in self._forced(children, stage=2)
 
+    def test_the_settled_span_refuses_an_unquoted_price_rather_than_fabricating_zero(self) -> None:
+        """`_quoted_price` raises when the ``implied_prob_yes is not None`` filter regresses.
+
+        Its predecessor ``or 0.0`` was dead code today (the settled list is pre-filtered),
+        but a regression in that filter would have rendered a fabricated 0.00 into the
+        settled span — the withheld-price-as-real-zero shape 58175a7 fixed at the venue
+        parsers. A loud failure beats a wrong span.
+        """
+        from metaculus_bot.research.market_retrieval.rendering import _quoted_price  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match="unquoted outcome reached price arithmetic"):
+            _quoted_price(MarketChild(title="unquoted", price_withheld=True))
+
     def test_open_outcomes_collapse_last_cheapest_first(self) -> None:
         """The floor escalates only after unquoted and settled are gone, and a collapsed open group
         states its summed price — the one figure a forecaster needs to know the tail's weight."""
@@ -668,6 +681,32 @@ class TestLadderSectionBudget:
         # across 160 outcomes when it was 78.50 across 157 — and on a settled ladder the same shape hid
         # rungs realized at 1.00.
         dropped_priced = stats.collapsed - 3
+        assert f"+{stats.collapsed} more ({dropped_priced} priced, {dropped_priced * 0.5:.2f} summed)" in title
+        assert stats.named + stats.collapsed == stats.outcomes
+
+    def test_a_mixed_open_settled_remainder_states_the_count_its_sum_covers(self) -> None:
+        """The M7 shape verbatim: settled rungs inflate the remainder's COUNT but not its SUM.
+
+        `_open_price_total` deliberately excludes settled members (a realized 1.00 is an outcome,
+        not a forecast), and `_ladder_content_key` sorts settled behind every open rung, so all
+        eight land in the dropped set. Before the denominator was stated, `+N more (S summed)`
+        read as S spread across N — hiding that eight of the N were realized at 1.00, an 8.00
+        difference between what the figure covered and what the count implied.
+        """
+        children = tuple(
+            MarketChild(title=f"rung {index:03d}", implied_prob_yes=0.50)
+            for index in range(200)  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        ) + tuple(MarketChild(title=f"Above {index}", implied_prob_yes=1.0, is_resolved=True) for index in range(8))
+
+        rendered, stats = render_snapshot_with_stats(
+            MarketSnapshot(matches=[_row(title="pathological", prob=None, children=children)])
+        )
+
+        title = _ladder_titles(rendered)[0]
+        assert stats.max_stage == LADDER_HARD_BOUND_STAGE
+        dropped_priced = stats.collapsed - 8
+        # The sum is dropped_priced * 0.50 exactly: had the settled 1.00s leaked in, it would
+        # read 8.00 higher against the same count.
         assert f"+{stats.collapsed} more ({dropped_priced} priced, {dropped_priced * 0.5:.2f} summed)" in title
         assert stats.named + stats.collapsed == stats.outcomes
 

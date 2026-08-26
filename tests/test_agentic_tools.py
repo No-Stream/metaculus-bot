@@ -991,6 +991,42 @@ async def test_fetch_plain_thin_extraction_is_ok_not_empty(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+async def test_fetch_plain_honors_declared_charset_on_textual_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A windows-1252 CSV with its charset declared decodes faithfully. The old
+    forced-UTF-8 read turned every high byte into U+FFFD and shipped the
+    mojibake to the driver as status="ok"."""
+    body = "date,séries\n2026-08-01,0.42\n".encode("windows-1252")
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/csv; charset=windows-1252"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
+
+    result = await agentic_tools._fetch_plain("https://example.com/data.csv")
+
+    assert result.status == "ok"
+    assert "séries" in result.text
+    assert "�" not in result.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_refuses_an_undecodable_textual_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A BOM-less UTF-16 body with no declared charset decodes to NUL-interleaved
+    garbage — a failed decode, not text we read. It must report "empty" (never
+    "ok") and escalate, so the rendered rung's browser sniffing gets a try."""
+    body = "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/plain"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
+
+    result = await agentic_tools._fetch_plain("https://example.com/data.txt")
+
+    assert result.status == "empty"
+    assert result.escalate_rendered is True
+    assert "could not decode" in result.text
+
+
+@pytest.mark.asyncio
 async def test_fetch_plain_redirect_to_empty_page_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     """A redirect chain that terminates on a 200-OK empty page is still empty —
     the final hop, not the redirect, decides the outcome."""

@@ -29,7 +29,14 @@ from metaculus_bot.constants import (
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
-from metaculus_bot.research.http_fetch import BROWSER_HEADERS, MAX_REDIRECTS, REDIRECT_STATUSES, read_body_capped
+from metaculus_bot.research.http_fetch import (
+    BROWSER_HEADERS,
+    MAX_REDIRECTS,
+    MAX_UNDECODABLE_CHAR_RATIO,
+    REDIRECT_STATUSES,
+    decode_text_body,
+    read_body_capped,
+)
 from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
 logger = logging.getLogger(__name__)
@@ -588,7 +595,14 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
                                 content_type=content_type or None,
                             )
 
-                        html = body.decode("utf-8", errors="replace")
+                        # Charset-honoring decode (BOM > declared charset > UTF-8), not a
+                        # forced UTF-8 read: a windows-1252 or UTF-16 body decoded that way
+                        # is `0�.�4�2�`-style mojibake that reached the driver as
+                        # status="ok". The ratio is the refusal signal on the textual
+                        # branch below; the HTML branch is unaffected because its main
+                        # text comes from `_extract_main_text`, which decodes the raw
+                        # bytes itself.
+                        html, undecodable_ratio = decode_text_body(body, content_type)
                         if any(token in content_type for token in _HTML_CONTENT_TYPE_TOKENS) or "<html" in html.lower():
                             extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, current_url)
                             text = extracted or ""
@@ -619,6 +633,24 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
                             )
 
                         if any(token in content_type for token in _TEXTUAL_CONTENT_TYPE_TOKENS) or not content_type:
+                            if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO:
+                                # The decode failed rather than the text being slightly
+                                # dirty (BOM-less UTF-16, an undeclared 8-bit codec):
+                                # what we hold is replacement chars and NULs, not the
+                                # page. Shipping it as "ok" would hand the driver
+                                # mojibake as a read source. "empty" keeps the ladder
+                                # escalating to the rendered rung — the browser's own
+                                # charset sniffing can rescue what a declared-charset
+                                # decode could not — while barring the tier grant.
+                                return PlainFetchResult(
+                                    status="empty",
+                                    method="plain",
+                                    text="Plain fetch could not decode the body as text.",
+                                    links=[],
+                                    url=current_url,
+                                    content_type=content_type or None,
+                                    escalate_rendered=True,
+                                )
                             text = html.strip()
                             if not text:
                                 return PlainFetchResult(
