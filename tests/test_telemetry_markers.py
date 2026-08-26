@@ -839,6 +839,15 @@ DEGRADATION_COUNTERS_LINE = (
     "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
     "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
     "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
+    "publish_attempt_failures=1, publish_skipped_closed=2, time_budget_fast_path=3"
+)
+# The shape emitted before the time-budget counter shipped: ends at
+# publish_skipped_closed. Same optional-group rationale as every tail before it.
+DEGRADATION_COUNTERS_NO_BUDGET_TAIL_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
     "publish_attempt_failures=1, publish_skipped_closed=2"
 )
 # The 2026-08-25-and-earlier shape: ends at publish_attempt_failures, i.e. no
@@ -884,9 +893,10 @@ DEGRADATION_COUNTERS_LEGACY_LINE = (
 
 
 class TestDegradationCounters:
-    def test_all_thirteen_current_keys_parse(self):
+    def test_all_fourteen_current_keys_parse(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
         assert rec["marker"] == "degradation_counters"
+        assert rec["time_budget_fast_path"] == 3
         assert rec["publish_skipped_closed"] == 2
         assert rec["forecasters_dropped"] == 2
         assert rec["questions_failed_to_publish"] == 0
@@ -901,6 +911,17 @@ class TestDegradationCounters:
         assert rec["provider_degradation"] == 1
         assert rec["publish_attempt_failures"] == 1
 
+    def test_line_without_the_budget_tail_still_harvests_everything_else(self):
+        """Every record archived before the time-budget counter shipped ends at
+        publish_skipped_closed, and that now-lazy group must still capture its full
+        value there rather than handing a digit to backtracking."""
+        rec = _parse_one(DEGRADATION_COUNTERS_NO_BUDGET_TAIL_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["publish_skipped_closed"] == 2
+        assert rec["publish_attempt_failures"] == 1
+        # Absent must read as "this era didn't emit it", never as a measured zero.
+        assert rec["time_budget_fast_path"] is None
+
     def test_line_without_the_skip_tail_still_harvests_everything_else(self):
         """Every record archived before 2026-08-25 ends at publish_attempt_failures,
         and that now-lazy group must still capture its full value there rather than
@@ -911,6 +932,7 @@ class TestDegradationCounters:
         assert rec["provider_degradation"] == 1
         # Absent must read as "this era didn't emit it", never as a measured zero.
         assert rec["publish_skipped_closed"] is None
+        assert rec["time_budget_fast_path"] is None
 
     def test_line_without_the_publish_tail_still_harvests_everything_else(self):
         """Every record archived before 2026-08-24 ends at provider_degradation, and
@@ -923,6 +945,7 @@ class TestDegradationCounters:
         # Absent must read as "this era didn't emit it", never as a measured zero.
         assert rec["publish_attempt_failures"] is None
         assert rec["publish_skipped_closed"] is None
+        assert rec["time_budget_fast_path"] is None
 
     def test_line_without_the_provider_degradation_tail_still_harvests_everything_else(self):
         """The load-bearing back-compat case. All 290 archived records end at
@@ -942,6 +965,7 @@ class TestDegradationCounters:
         assert rec["provider_degradation"] is None
         assert rec["publish_attempt_failures"] is None
         assert rec["publish_skipped_closed"] is None
+        assert rec["time_budget_fast_path"] is None
 
     def test_per_run_summary_carries_no_question_ref(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
@@ -1214,6 +1238,52 @@ class TestPublishSkippedClosed:
             "overdue_s=-54000 state=closed"
         )
         assert rec["overdue_s"] == -54000
+
+
+# The per-question budget grant INFO (time_budget.py). Emitted for EVERY question,
+# which is the point: CLOSE_MARGIN fires only after a SUCCESSFUL submission, so it is
+# censored on exactly the thin-window questions the budget exists for. Values below
+# are q45085's real close time against a 20-minutes-out fetch.
+TIME_BUDGET_THIN_LINE = (
+    PFX + "TIME_BUDGET: question=45085 budget_s=1140 close_time=2026-08-03T12:00:00+00:00 "
+    "close_limited=true fast_path=true"
+)
+TIME_BUDGET_ROOMY_LINE = (
+    PFX + "TIME_BUDGET: question=44870 budget_s=3510 close_time=2026-07-24T15:00:00+00:00 "
+    "close_limited=false fast_path=false"
+)
+
+
+class TestTimeBudget:
+    def test_thin_window_shape(self):
+        rec = _parse_one(TIME_BUDGET_THIN_LINE)
+        assert rec["marker"] == "time_budget"
+        assert rec["budget_s"] == 1140
+        assert rec["close_time"] == "2026-08-03T12:00:00+00:00"
+        assert rec["close_limited"] is True
+        assert rec["fast_path"] is True
+
+    def test_roomy_window_shape_reads_the_static_budget(self):
+        """The uncensored denominator: a roomy question emits this line too, so a later
+        round can measure how often a window is actually thin."""
+        rec = _parse_one(TIME_BUDGET_ROOMY_LINE)
+        assert rec["budget_s"] == 3510
+        assert rec["close_limited"] is False
+        assert rec["fast_path"] is False
+
+    def test_absent_close_time_reads_as_none(self):
+        rec = _parse_one(
+            PFX + "TIME_BUDGET: question=14333 budget_s=3510 close_time=n/a close_limited=false fast_path=false"
+        )
+        # n/a must read as absent, never as a parsed timestamp or a zero.
+        assert rec["close_time"] is None
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # time_budget emits question.id_of_question, so a residual join must not read it
+        # as a post id (the two share one integer space).
+        rec = _parse_one(TIME_BUDGET_THIN_LINE)
+        assert rec["qid"] == 45085
+        assert rec["qid_kind"] == "question_id"
 
 
 # The end-of-run alertable breakdown (cli.py). Emitted on BOTH exit paths — the

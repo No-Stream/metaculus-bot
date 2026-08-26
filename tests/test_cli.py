@@ -899,6 +899,7 @@ def _bot_with_real_alertable_count() -> _RealAlertableCountBot:
         "_stacker_primary_failed_count",
         "_stacker_fallback_used_count",
         "_stacker_fallback_failed_count",
+        "_time_budget_fast_path_count",
     ):
         setattr(stub_bot, counter, 0)
     return stub_bot

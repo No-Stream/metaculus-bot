@@ -36,7 +36,7 @@ def _bot(mock_general_llm, *, with_stacker: bool = False, **kwargs: Any) -> Temp
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum all twelve degradation counters. Using distinct powers of 2
+    """Property must sum all thirteen degradation counters. Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """
@@ -68,8 +68,11 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     # Twelfth term: a publish POST that exhausted the publish-hardening retry
     # budget (q45085's 405 shape) — the module global the bot property reads.
     monkeypatch.setattr(publish_hardening, "_PUBLISH_ATTEMPT_FAILURES", 2048)
+    # Thirteenth term: a question whose close time was too near for the full
+    # pipeline, so the optional research stages were dropped (time_budget.py).
+    bot._time_budget_fast_path_count = 4096
 
-    assert bot.alertable_count == 4095
+    assert bot.alertable_count == 8191
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):
@@ -124,10 +127,11 @@ async def test_provider_degradation_rides_the_run_summary(mock_general_llm, capl
     degradation = next(line for line in caplog.messages if line.startswith("Degradation counters:"))
     assert "provider_degradation=0" in degradation, degradation
     assert "publish_attempt_failures=0" in degradation, degradation
+    assert "publish_skipped_closed=0" in degradation, degradation
     # The newest key is the tail, and the tail is where the telemetry parser's optional
     # groups end — appending past it without extending that regex breaks the whole
     # line's harvest, because the pattern is $-anchored.
-    assert degradation.endswith("publish_skipped_closed=0"), degradation
+    assert degradation.endswith("time_budget_fast_path=0"), degradation
     assert any(line.startswith("PROVIDER_DEGRADATION:") for line in caplog.messages), caplog.messages
 
 

@@ -11,7 +11,11 @@ from forecasting_tools.data_models.numeric_report import Percentile as FTPercent
 
 from main import TemplateForecaster
 from metaculus_bot.comment.trimming import TRIM_NOTICE
-from metaculus_bot.constants import FORECASTS_SECTION_CHAR_LIMIT, RESEARCH_SECTION_CHAR_LIMIT
+from metaculus_bot.constants import (
+    FORECASTS_SECTION_CHAR_LIMIT,
+    PER_QUESTION_WALL_CLOCK_DEADLINE,
+    RESEARCH_SECTION_CHAR_LIMIT,
+)
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.research import timeseries_anchor as ts_anchor
 from metaculus_bot.value_extraction import ExtractionOutcome
@@ -159,7 +163,11 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
     result = await bot._research_and_make_predictions(mock_binary_question)
 
     bot._get_notepad.assert_called_once_with(mock_binary_question)
-    bot.run_research.assert_called_once_with(mock_binary_question)
+    # The question travels positionally; the per-question time budget rides alongside
+    # it as a keyword so the research phase can bound itself (time_budget.py).
+    (research_args, research_kwargs) = bot.run_research.call_args
+    assert research_args == (mock_binary_question,)
+    assert research_kwargs["time_budget"].total_s == PER_QUESTION_WALL_CLOCK_DEADLINE
     # Forecasters receive run_research output verbatim — there is no whole-corpus
     # summarization pass. AskNews-only summarization lives in the orchestrator
     # (see test_research_orchestrator.py).

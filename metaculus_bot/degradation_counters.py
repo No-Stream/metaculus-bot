@@ -44,6 +44,7 @@ def alertable_total(bot: "TemplateForecaster") -> int:
         + bot._provider_degradation_count
         + bot._publish_attempt_failures
         + bot._publish_skipped_closed_count
+        + bot._time_budget_fast_path_count
     )
 
 
@@ -57,11 +58,11 @@ def format_degradation_summary(bot: "TemplateForecaster") -> str:
     than implying them by an absent line.
 
     The tail keys (``provider_degradation``, then ``publish_attempt_failures``,
-    then ``publish_skipped_closed``) stay LAST and in that order: the telemetry
-    parser wraps each in an optional trailing group so archived records that
-    predate any of them still harvest their other counters on a replace-by-run
-    re-harvest. Appending a key here without extending that regex breaks the
-    whole line's harvest, because the pattern is ``$``-anchored.
+    then ``publish_skipped_closed``, then ``time_budget_fast_path``) stay LAST and
+    in that order: the telemetry parser wraps each in an optional trailing group so
+    archived records that predate any of them still harvest their other counters on
+    a replace-by-run re-harvest. Appending a key here without extending that regex
+    breaks the whole line's harvest, because the pattern is ``$``-anchored.
 
     The three publish-side counters mean three different things, which is why
     they are three keys. ``questions_failed_to_publish`` counts questions the
@@ -72,6 +73,13 @@ def format_degradation_summary(bot: "TemplateForecaster") -> str:
     close-time gate skipped before any POST, i.e. latency cost us the question.
     The oldest key's name is misleading but stays — renaming it would silently
     drop the field from every historical record the parser replays.
+
+    ``time_budget_fast_path`` is the fourth member of that family and the earliest
+    of them: it counts questions whose close time was too near for the full
+    pipeline's worst case, so the optional research stages were dropped to protect
+    the prediction POST. The three above fire once a publish has already failed or
+    been withheld; this one fires while the question is still savable, which is why
+    it is worth alerting on separately.
     """
     return (
         f"Degradation counters: forecasters_dropped={bot._forecasters_dropped_count}, "
@@ -86,7 +94,8 @@ def format_degradation_summary(bot: "TemplateForecaster") -> str:
         f"prediction_market_source_losses={bot._prediction_market_source_loss_count}, "
         f"provider_degradation={bot._provider_degradation_count}, "
         f"publish_attempt_failures={bot._publish_attempt_failures}, "
-        f"publish_skipped_closed={bot._publish_skipped_closed_count}"
+        f"publish_skipped_closed={bot._publish_skipped_closed_count}, "
+        f"time_budget_fast_path={bot._time_budget_fast_path_count}"
     )
 
 

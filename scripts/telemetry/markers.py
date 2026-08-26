@@ -411,7 +411,8 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+?)))?"
             r"(?:,\s*provider_degradation=(?P<provider_degradation>\S+?))?"
             r"(?:,\s*publish_attempt_failures=(?P<publish_attempt_failures>\S+?))?"
-            r"(?:,\s*publish_skipped_closed=(?P<publish_skipped_closed>\S+))?"
+            r"(?:,\s*publish_skipped_closed=(?P<publish_skipped_closed>\S+?))?"
+            r"(?:,\s*time_budget_fast_path=(?P<time_budget_fast_path>\S+))?"
             r"\s*$"
         ),
     ),
@@ -480,6 +481,27 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+overdue_s=(?P<overdue_s>\S+)\s+state=(?P<state>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # publish_gate.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "time_budget",
+        # Per-QUESTION budget grant INFO (metaculus_bot/time_budget.py), emitted for
+        # EVERY question including the roomy ones. That is the point: CLOSE_MARGIN,
+        # the only other close-time telemetry, is emitted after a SUCCESSFUL
+        # submission, so it is censored on exactly the thin-window questions the
+        # budget exists for (q45085 had 22 seconds of headroom and appears in no
+        # CLOSE_MARGIN record). This marker is the uncensored denominator: how often a
+        # window is actually thin, and how often the fast path fires.
+        #
+        # ``close_limited`` says the close time — not the static
+        # PER_QUESTION_WALL_CLOCK_DEADLINE — set the budget; ``fast_path`` says the
+        # optional research stages were dropped, and is the per-question detail behind
+        # the ``time_budget_fast_path`` counter in the degradation line.
+        re.compile(
+            r"TIME_BUDGET:\s*question=(?P<question>\S+)\s+budget_s=(?P<budget_s>\S+)"
+            r"\s+close_time=(?P<close_time>\S+)\s+close_limited=(?P<close_limited>\S+)"
+            r"\s+fast_path=(?P<fast_path>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # time_budget.py emits question.id_of_question
     ),
     MarkerSpec(
         "paid_personal_key_fallback",

@@ -661,6 +661,41 @@ PER_QUESTION_WALL_CLOCK_DEADLINE: int = 3510
 # PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1) — plus headroom.
 WALL_CLOCK_STACKING_MIN_BUDGET: int = 90
 
+# --- Close-aware per-question time budget (metaculus_bot/time_budget.py) ---
+# PER_QUESTION_WALL_CLOCK_DEADLINE above is sized against the CRON PERIOD, not
+# against a question's own deadline, so on its own it lets a question closing in
+# 20 minutes spend 58.5. These three size the close-derived budget that bounds it.
+#
+# Time held back from the budget so the PREDICTION POST can still land: ft's
+# _post_question_prediction opens with one _sleep_between_requests (3.5-4.5s)
+# before the POST, and publish_hardening bounds that POST at
+# PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1) = 40s. 60 leaves ~15s slack.
+# Deliberately SMALLER than WALL_CLOCK_STACKING_MIN_BUDGET, which reserves for
+# BOTH POSTs: only the prediction has to beat the close, and a comment posted a
+# few seconds late is still accepted.
+PUBLISH_RESERVE_SECONDS: int = 60
+
+# Below this effective budget, drop the OPTIONAL research stages (every provider
+# but the primary, plus both gap-fill passes) and publish on the fast path.
+# Sized at the full pipeline's configured worst case: research 1155s (provider
+# phase 600 = AskNews 300 + summarizer 300 sequential inside one provider; then
+# gap-fill 555 = analyzer 135 + resolver wave 420) + FORECASTER_SOFT_DEADLINE 600
+# + the publish tail ~= 1815s. So the rule reads: stop running the optional
+# stages once the full pipeline's worst case no longer fits the window. Measured
+# false-positive cost is zero — 0 of 99 published triple-era questions had less
+# than 54 minutes of headroom at run start (scratch/residual_2026-08-24/
+# time_budget_design.md), and the optional stages are worth 84s (gap-fill v2 p50)
+# to 183s (dropping the provider tail at its observed max).
+TIME_BUDGET_FAST_PATH_THRESHOLD: int = 1800
+
+# Fraction of the REMAINING budget the research phase may consume, enforced as a
+# deadline on the parallel-provider phase and on each gap-fill pass. A share of
+# what is left (not of the original total) so a slow intake cannot hand research
+# time the forecast needs. At the static budget this is ~1755s, well above
+# research's 1155s configured worst case, so it never fires on a roomy question;
+# at a 1200s budget it splits 600 research / 600 forecast-and-publish.
+RESEARCH_PHASE_BUDGET_SHARE: float = 0.5
+
 # Per-publish-POST timeout (post_binary/numeric/mc + post_question_comment).
 # Stock forecasting-tools uses synchronous `requests.post` with no timeout, so
 # a hung server can block the whole batch indefinitely. publish_hardening.py

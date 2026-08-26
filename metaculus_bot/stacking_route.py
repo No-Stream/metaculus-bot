@@ -43,12 +43,16 @@ from metaculus_bot.constants import (
     BINARY_STACKING_ENABLED_ENV,
     CRUX_SOFT_DEADLINE,
     MC_STACKING_ENABLED_ENV,
+    NATIVE_SEARCH_WALL_TIMEOUT,
     NUMERIC_STACKING_ENABLED_ENV,
+    STACKER_FALLBACK_SOFT_DEADLINE,
+    STACKER_SOFT_DEADLINE,
     WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
 from metaculus_bot.research.targeted import extract_disagreement_crux, run_targeted_search
 from metaculus_bot.spread_metrics import compute_spread
+from metaculus_bot.time_budget import QuestionTimeBudget
 
 if TYPE_CHECKING:
     from metaculus_bot.forecaster import TemplateForecaster
@@ -91,8 +95,36 @@ def _type_gate_enabled(question: MetaculusQuestion) -> bool:
     return True
 
 
+def _enrichment_timeout(soft_deadline_s: float, time_budget: QuestionTimeBudget) -> float:
+    """Clamp an enrichment stage's soft deadline to what the budget still affords.
+
+    Leaves ``WALL_CLOCK_STACKING_MIN_BUDGET`` behind for the publish, so even a
+    stage that runs to this clamp cannot consume the POST's reserve. Floored at a
+    positive value rather than 0 — ``asyncio.wait_for(coro, 0)`` cancels before the
+    coroutine gets a first step, which would report a stage failure that never
+    happened.
+    """
+    affordable = time_budget.remaining_s() - WALL_CLOCK_STACKING_MIN_BUDGET
+    return max(1.0, min(float(soft_deadline_s), affordable))
+
+
+def _stacking_budget_required_s(bot: "TemplateForecaster") -> float:
+    """Budget the stacking path can consume in the worst case, in seconds.
+
+    The ladder's own soft deadlines, summed: primary stacker, then the
+    different-vendor fallback. Under CONDITIONAL_STACKING a triggered stack first
+    extracts the disagreement crux and runs a targeted search, so those two bounds
+    join the sum — computed conservatively (before the spread is known), because the
+    gate has to decide whether the path is affordable before it starts walking it.
+    """
+    required = STACKER_SOFT_DEADLINE + STACKER_FALLBACK_SOFT_DEADLINE
+    if bot.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
+        required += CRUX_SOFT_DEADLINE + NATIVE_SEARCH_WALL_TIMEOUT
+    return float(required)
+
+
 def _skip_stacking_for_budget(
-    bot: "TemplateForecaster", question: MetaculusQuestion, qid: int, per_q_start: float
+    bot: "TemplateForecaster", question: MetaculusQuestion, qid: int, time_budget: QuestionTimeBudget
 ) -> bool:
     """Force the base-combine fallback when the per-Q wall clock is nearly spent.
 
@@ -102,11 +134,22 @@ def _skip_stacking_for_budget(
     on a single POST. The full worst case (both POSTs stalling for
     ``PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1)``) requires multi-POST
     stalling, which this skip already recovers.
+
+    On a CLOSE-LIMITED budget the floor rises to cover the stacking path's own worst
+    case (``_stacking_budget_required_s``), because the two overruns cost different
+    things. Against the static deadline an overrun costs nothing — the deadline is
+    sized against the cron period and the question's close is hours away — so the
+    90 s floor is exactly right and stays unchanged. Against a close-limited budget
+    an overrun forfeits the question, and the 90 s floor would happily start a
+    stacker that can legitimately run 800 s.
     """
     if bot.aggregation_strategy not in _STACKING_STRATEGIES:
         return False
-    remaining = bot._remaining_budget_seconds(per_q_start)
-    if remaining >= WALL_CLOCK_STACKING_MIN_BUDGET:
+    remaining = time_budget.remaining_s()
+    floor = WALL_CLOCK_STACKING_MIN_BUDGET
+    if time_budget.close_limited:
+        floor += _stacking_budget_required_s(bot)
+    if remaining >= floor:
         return False
 
     # F15: the base-combine re-entry uses MEAN under STACKING and MEDIAN under
@@ -136,6 +179,7 @@ async def _targeted_research_for_crux(
     question: MetaculusQuestion,
     analyzer_llm: GeneralLlm,
     valid_predictions: list[ReasonedPrediction[PredictionTypes]],
+    time_budget: QuestionTimeBudget,
 ) -> str:
     """Extract what the base models actually disagree about, then research it.
 
@@ -148,21 +192,29 @@ async def _targeted_research_for_crux(
 
     ``analyzer_llm`` is passed in already narrowed — the caller raises when it is
     unconfigured, before any research spend.
+
+    Both stages are additionally clamped to what the question's remaining budget
+    can afford, so an enrichment stage can never spend the time the stacker (and
+    behind it, the prediction POST) still needs. The clamp is the belt to
+    ``_skip_stacking_for_budget``'s braces: that gate refuses to enter this path
+    without the whole worst case in hand, and these clamps hold the line if a stage
+    overruns its own soft deadline anyway.
     """
     # Crux extraction under a soft deadline: without the wait_for the only bound is
     # the analyzer LLM's own litellm timeout (UTILITY_MODEL_CONFIG in
     # llm_configs.py), which is looser than CRUX_SOFT_DEADLINE on this critical path.
     base_texts = [stacking.strip_model_tag(pred.reasoning) for pred in valid_predictions]
+    crux_timeout = _enrichment_timeout(CRUX_SOFT_DEADLINE, time_budget)
     try:
         crux = await asyncio.wait_for(
             extract_disagreement_crux(analyzer_llm, question.question_text, base_texts),
-            timeout=CRUX_SOFT_DEADLINE,
+            timeout=crux_timeout,
         )
     except asyncio.TimeoutError:
         bot._conditional_stacking_crux_failures += 1
         logger.warning(
-            "CRUX_SOFT_DEADLINE: crux extraction exceeded %ds for Q %s; skipping targeted research",
-            CRUX_SOFT_DEADLINE,
+            "CRUX_SOFT_DEADLINE: crux extraction exceeded %.0fs for Q %s; skipping targeted research",
+            crux_timeout,
             question.id_of_question,
         )
         return ""
@@ -174,7 +226,10 @@ async def _targeted_research_for_crux(
     if not crux:
         return ""
     try:
-        return await run_targeted_search(crux, question.question_text, is_benchmarking=bot.is_benchmarking)
+        return await asyncio.wait_for(
+            run_targeted_search(crux, question.question_text, is_benchmarking=bot.is_benchmarking),
+            timeout=_enrichment_timeout(NATIVE_SEARCH_WALL_TIMEOUT, time_budget),
+        )
     except Exception:  # noqa: HARNESS-SCAN-EXEMPT-broad-except  # enrichment-only; degrade to base research
         bot._conditional_stacking_search_failures += 1
         logger.exception("Targeted search failed, proceeding with base research only")
@@ -191,7 +246,7 @@ async def route_after_forecasts(
     research: str,
     summary_report: str,
     diagnostics_block: str | None,
-    per_q_start: float,
+    time_budget: QuestionTimeBudget,
 ) -> ResearchWithPredictions[PredictionTypes]:
     """Pick the aggregation path for one question's surviving forecasts.
 
@@ -235,7 +290,7 @@ async def route_after_forecasts(
         bot._stacker_skip_reason[qid] = "single_forecaster"
         return base_predictions_collection()
 
-    skip_stacking_for_budget = _skip_stacking_for_budget(bot, question, qid, per_q_start)
+    skip_stacking_for_budget = _skip_stacking_for_budget(bot, question, qid, time_budget)
 
     if bot.aggregation_strategy == AggregationStrategy.STACKING and not skip_stacking_for_budget:
         if bot.research_reports_per_question != 1:
@@ -280,7 +335,9 @@ async def route_after_forecasts(
             if analyzer_llm is None:
                 raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
 
-            targeted_research_text = await _targeted_research_for_crux(bot, question, analyzer_llm, valid_predictions)
+            targeted_research_text = await _targeted_research_for_crux(
+                bot, question, analyzer_llm, valid_predictions, time_budget
+            )
             if targeted_research_text:
                 combined_research = (
                     f"{research}\n\n## Targeted Research (addressing model disagreement)\n{targeted_research_text}"

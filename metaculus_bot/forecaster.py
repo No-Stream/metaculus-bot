@@ -64,9 +64,19 @@ from metaculus_bot.research.providers import (
     ResearchCallable,
 )
 from metaculus_bot.stacking_route import route_after_forecasts
+from metaculus_bot.time_budget import (
+    QuestionTimeBudget,
+    build_question_time_budget,
+    format_time_budget_marker,
+)
+from metaculus_bot.time_utils import _as_utc
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
+
+# Sort sentinel for a question with no close time, so the tightest-close-first
+# ordering in forecast_questions never compares None against a datetime.
+_CLOSE_TIME_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 load_environment()
 
@@ -173,6 +183,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # path that keeps this list and the scalar in lockstep.
         self._forecaster_drops: list[ForecasterDrop] = []
         self._questions_failed_to_publish: int = 0
+        # Questions whose close time was too near for the full pipeline's worst case,
+        # so the optional research stages were dropped (see time_budget.py). A
+        # fast-path publish is a degraded publish — the forecasters saw a thinner
+        # research bundle — and reddens CI for the same reason a thinned ensemble
+        # does: it is a symptom of upstream latency, which is the thing the operator
+        # wants paged. The question still publishes.
+        self._time_budget_fast_path_count: int = 0
         # qid -> forecasters that contributed to the published value, recorded by
         # _research_and_make_predictions and drained by _create_unified_explanation
         # for the FORECASTERS_USED marker. Needed because the stacked path returns a
@@ -382,9 +399,26 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 logger.info(f"Skipping {len(questions) - len(unforecasted_questions)} previously forecasted questions")
             questions = unforecasted_questions
 
+        # Tightest close first. Questions all run under one asyncio.gather, so this
+        # is not a serialization order — it decides who wins the two contended
+        # resources: the shared max_concurrent_research semaphore (6 permits) and,
+        # below, the max_questions_per_run cap, which without this keeps whatever
+        # order the tournament fetch happened to return rather than the N questions
+        # closest to closing. Stable, so questions sharing a close time keep fetch
+        # order, and a missing close_time sorts LAST (no deadline, no urgency).
+        questions = sorted(
+            questions,
+            key=lambda q: (
+                q.close_time is None,
+                _as_utc(q.close_time) if q.close_time is not None else _CLOSE_TIME_MAX,
+            ),
+        )
+
         # Enforce max questions per run safety cap
         if self.max_questions_per_run is not None and len(questions) > self.max_questions_per_run:
-            logger.info(f"Limiting to first {self.max_questions_per_run} questions out of {len(questions)}")
+            logger.info(
+                f"Limiting to the {self.max_questions_per_run} soonest-closing questions out of {len(questions)}"
+            )
             questions = list(questions)[: self.max_questions_per_run]
 
         # Log question processing info with progress
@@ -506,27 +540,32 @@ class TemplateForecaster(CompactLoggingForecastBot):
             stacker_wall_timeout=stacker_wall_timeout,
         )
 
-    async def run_research(self, question: MetaculusQuestion) -> str:
-        return await self._research.run_research(question)
+    async def run_research(self, question: MetaculusQuestion, time_budget: QuestionTimeBudget | None = None) -> str:
+        return await self._research.run_research(question, time_budget=time_budget)
 
     def _select_research_providers(self) -> list[tuple[ResearchCallable, str]]:
         return self._research._select_research_providers()
 
-    def _remaining_budget_seconds(self, start_time: float) -> float:
-        """Return remaining per-Q wall-clock budget in seconds (can go negative).
+    def _build_time_budget(self, question: MetaculusQuestion) -> QuestionTimeBudget:
+        """Grant this question its wall-clock budget (see time_budget.py).
 
-        ``start_time`` is captured at the top of ``_research_and_make_predictions``
-        and represents this question's processing-start tick. Compared against
-        ``PER_QUESTION_WALL_CLOCK_DEADLINE``, which sits just inside the 60-min
-        Metaculus close window.
+        Close-derived only when we intend to publish: backtests and ablations
+        forecast RESOLVED questions whose close time is in the past, and deriving a
+        budget from that would hand every one a negative budget and skip the run.
+        ``PER_QUESTION_WALL_CLOCK_DEADLINE`` is read here, from this module's
+        globals, so it stays the single knob tests monkeypatch.
         """
-        return PER_QUESTION_WALL_CLOCK_DEADLINE - (time.time() - start_time)
+        return build_question_time_budget(
+            question,
+            close_aware=self.publish_reports_to_metaculus,
+            static_deadline_s=PER_QUESTION_WALL_CLOCK_DEADLINE,
+        )
 
     async def _gather_predictions_with_wall_clock(
         self,
         coros: list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
         qid_for_log: int,
-        per_q_start: float,
+        time_budget: QuestionTimeBudget,
     ) -> tuple[list[ReasonedPrediction[PredictionTypes]], list[str], ExceptionGroup | None]:
         """Run forecaster coroutines concurrently with a wall-clock cap.
 
@@ -551,7 +590,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             tasks.append(task)
             task_model[task] = self._forecaster_llms[idx].model if idx < len(self._forecaster_llms) else "unknown"
         n_total = len(tasks)
-        remaining = self._remaining_budget_seconds(per_q_start)
+        remaining = time_budget.remaining_s()
         wait_timeout = max(0.0, remaining)
         done_set, pending_set = await asyncio.wait(tasks, timeout=wait_timeout, return_when=asyncio.ALL_COMPLETED)
         if pending_set:
@@ -568,7 +607,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             logger.warning(
                 "WALLCLOCK_ABORT: qid=%s elapsed=%.1fs forecasters_completed=%d/%d cancelled=%d remaining_budget=%.1fs",
                 qid_for_log,
-                time.time() - per_q_start,
+                time_budget.elapsed_s(),
                 len(done_set),
                 n_total,
                 len(pending_set),
@@ -691,14 +730,43 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         assert question.id_of_question is not None, "id_of_question must not be None for stacking state-dict keying"
 
-        # Per-Q wall-clock cutoff: research, fan-out, aggregation, and publish
-        # all share the same budget. Recorded as early as possible so we don't
-        # overshoot from research-time alone.
-        per_q_start = time.time()
+        # Per-Q wall-clock cutoff: research, fan-out, aggregation, and publish all
+        # share the same budget, and it is the SMALLER of the static deadline and
+        # what this question's close time allows (see time_budget.py). Granted as
+        # early as possible so we don't overshoot from research-time alone.
+        time_budget = self._build_time_budget(question)
+        logger.info(format_time_budget_marker(question, time_budget))
+
+        # Arithmetically unpublishable: not even an instant forecast leaves room for
+        # the prediction POST. Raising here skips the question with the same counter
+        # and the same outcome the close gate would produce at publish time, minus a
+        # full ensemble's worth of spend on a question Metaculus will refuse (the
+        # q45085 shape: fetched 22 seconds before its close, forecast at 3/3, then
+        # rejected 405). The message names the close time so the run log says WHY
+        # rather than reporting a mysterious zero-forecaster question.
+        if time_budget.is_exhausted:
+            self._questions_failed_to_publish += 1
+            msg = (
+                f"Q {question.id_of_question} has no publishable time budget "
+                f"(close_time={time_budget.close_time}, budget={time_budget.total_s:.0f}s); "
+                "skipping before any research or forecaster spend."
+            )
+            logger.error(msg)
+            raise RuntimeError(msg)
+
+        if time_budget.fast_path:
+            self._time_budget_fast_path_count += 1
+            logger.warning(
+                "TIME_BUDGET_FAST_PATH: qid=%s budget=%.0fs close_time=%s; "
+                "dropping optional research stages to protect the prediction POST",
+                question.id_of_question,
+                time_budget.total_s,
+                time_budget.close_time,
+            )
 
         notepad = await self._get_notepad(question)
         notepad.total_research_reports_attempted += 1
-        research = await self.run_research(question)
+        research = await self.run_research(question, time_budget=time_budget)
 
         # Diagnostics seam: run_research returns forecaster-clean text (the
         # provider-diagnostics block is withheld so it never reaches forecaster
@@ -733,7 +801,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             valid_predictions,
             errors,
             exception_group,
-        ) = await self._gather_predictions_with_wall_clock(tasks, qid_for_log, per_q_start)
+        ) = await self._gather_predictions_with_wall_clock(tasks, qid_for_log, time_budget)
         if errors:
             logger.warning(f"Encountered errors while predicting: {errors}")
 
@@ -800,7 +868,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             research=research,
             summary_report=summary_report,
             diagnostics_block=diagnostics_block,
-            per_q_start=per_q_start,
+            time_budget=time_budget,
         )
 
     @classmethod
