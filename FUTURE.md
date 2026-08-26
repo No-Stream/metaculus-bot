@@ -838,6 +838,12 @@ because the honest fix is a new decision rather than a correction:
    costs the cited source outright. Forecasters can usually tell from the rendered text; the
    diagnostics side cannot, which is the actual gap to close.
 
+A fourth, smaller observation from the 2026-08-26 live-QA rerun (pre-existing, not from this
+wave): the agentic `_fetch_plain` textual allowlist (`text/plain`, `text/csv`,
+`application/json` — unchanged since 56c0d2f) refuses FRED's fredgraph CSVs, which are served
+as `Content-Type: application/csv`, with a clean "Unsupported content type" error, so such URLs
+ride the fetch ladder's later rungs. One allowlist entry if agentic FRED reads ever matter.
+
 ### Deterministic tail-consistency check on the numeric structured block (added 2026-08-24)
 
 From the q44453 dossier (July payrolls, peer −11.24; the whole field missed the −23k print, so the
