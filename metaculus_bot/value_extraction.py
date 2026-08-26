@@ -15,6 +15,19 @@ module extracts the value with a four-rung ladder:
 4. raise ``ValueExtractionError`` — the caller drops/soft-fails the
    forecaster, exactly as parser failures propagated before the ladder.
 
+**Every rung's output must be a value the rationale could have stated.** The
+LLM rung decodes under a schema, so handed a rationale with no forecast in it
+it *must* emit numbers — "absent" is not expressible. The post-rung validators
+are therefore FIDELITY checks, not just shape checks: a numeric set must be
+finite and ordered the way its labels say (a value-disordered salvage is
+fabrication, not a recoverable parse), an MC ballot must be non-empty and match
+the question's options, a binary probability must be finite and in bounds.
+Anything else fails the rung and falls through to the typed error, so the
+forecaster is DROPPED (alertable) rather than published on a manufactured
+number. The repair rung carries the same obligation in a different form: see
+``_repair_infidelity_reason`` for why a truncated numeric literal can never be
+repaired, only invented.
+
 The two deterministic rungs run CANDIDATE-major, not rung-major: for each
 candidate in selection order (position-last first, since the prompt asks for
 the block last) BOTH the strict parse and the repair are tried before a
@@ -35,6 +48,9 @@ list; numeric output feeds ``sanitize_percentiles`` unchanged.
 from __future__ import annotations
 
 import logging
+import math
+import re
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Generic, Literal, TypeVar
@@ -76,6 +92,91 @@ _TAIL_SCAN_CHARS = 4000
 # ``STANDARD_PERCENTILES`` (guards against 0.1 vs 0.10000000001 drift from JSON
 # round-trips).
 _PERCENTILE_KEY_TOLERANCE = 1e-6
+
+# --- Repair-rung fidelity ---------------------------------------------------
+# A numeric literal is COMPLETE when it is a full JSON number (optionally with a
+# leading-dot fraction, which json_repair fixes value-preservingly). Deliberately
+# rejects the truncated forms — "0.", ".", "1e", "1e-" — because those are the
+# shapes json_repair silently completes by INVENTING the missing digits: a
+# rationale cut mid-decimal at "posterior_prob":0.72 leaves "0." behind, which
+# repairs to 0.0 and would publish as the binary clamp floor.
+_COMPLETE_NUMBER_RE = re.compile(r"^[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?$")
+# Chars that may START / CONTINUE a numeric-literal run in JSON value position.
+# The body set is deliberately loose (it swallows "1-2" into one token) so that
+# malformed runs surface as incomplete tokens rather than being split into two
+# plausible-looking numbers.
+_NUMBER_START_CHARS = "-+.0123456789"
+_NUMBER_BODY_CHARS = "0123456789.eE+-"
+
+
+def _numeric_tokens_outside_strings(text: str) -> list[str]:
+    """Numeric-literal runs sitting OUTSIDE JSON string literals, in order.
+
+    String contents are skipped because structured blocks carry prose fields
+    (``ref_class``, evidence descriptions) where "3 of 4 cases." would otherwise
+    read as a truncated number.
+    """
+    tokens: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            index += 1
+            continue
+        if char in _NUMBER_START_CHARS:
+            start = index
+            index += 1
+            while index < length and text[index] in _NUMBER_BODY_CHARS:
+                index += 1
+            tokens.append(text[start:index])
+            continue
+        index += 1
+    return tokens
+
+
+def _repair_infidelity_reason(candidate: str, repaired: str) -> str | None:
+    """Why this ``json_repair`` output cannot be trusted, or None when it can.
+
+    ``json_repair`` fixes SYNTAX, but on a truncated payload it also completes
+    VALUES, and a completed value is indistinguishable from a declared one once
+    it parses. Two rules keep the repair rung a repairer rather than an author:
+
+    1. If the raw candidate contains an incomplete numeric literal, refuse
+       outright — the true digits are gone, so any repair is invention.
+    2. Every numeric value in the repaired payload must already appear (with at
+       least the same multiplicity) in the raw candidate. Repairs that only
+       DROP numbers stay allowed — the schema catches a missing field — but a
+       repair may never introduce one.
+    """
+    candidate_tokens = _numeric_tokens_outside_strings(candidate)
+    incomplete = [token for token in candidate_tokens if not _COMPLETE_NUMBER_RE.match(token)]
+    if incomplete:
+        return f"raw candidate carries truncated numeric literal(s) {incomplete}; repair would invent digits"
+
+    repaired_tokens = _numeric_tokens_outside_strings(repaired)
+    malformed = [token for token in repaired_tokens if not _COMPLETE_NUMBER_RE.match(token)]
+    if malformed:
+        return f"repaired payload carries malformed numeric literal(s) {malformed}"
+
+    candidate_values = Counter(float(token) for token in candidate_tokens)
+    repaired_values = Counter(float(token) for token in repaired_tokens)
+    invented = sorted(value for value, count in repaired_values.items() if count > candidate_values.get(value, 0))
+    if invented:
+        return f"repair introduced numeric value(s) {invented} absent from the raw candidate"
+    return None
 
 
 @dataclass
@@ -158,6 +259,10 @@ def _try_candidate(
     repaired = repair_json(candidate)
     if not (isinstance(repaired, str) and repaired.strip()):
         failures.append(f"repair: {label}: json_repair produced no usable output")
+        return None
+    infidelity = _repair_infidelity_reason(candidate, repaired)
+    if infidelity is not None:
+        failures.append(f"repair: {label}: {infidelity}")
         return None
     payload_model = parse_structured_payload(repaired, qtype, log_failures=False)
     if payload_model is None:
@@ -288,6 +393,8 @@ def _binary_from_block(block: StructuredBlock) -> float:
 
 def _validate_binary(value: float) -> float:
     value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"binary probability {value} is not finite")
     if not (0.0 <= value <= 1.0):
         raise ValueError(f"binary probability {value} outside [0, 1]")
     return value
@@ -336,7 +443,18 @@ def _numeric_from_block(block: StructuredBlock) -> list[Percentile]:
 
 
 def _validate_numeric(percentiles: list[Percentile]) -> list[Percentile]:
-    """Require every ``STANDARD_PERCENTILES`` entry; return exactly that set, never padded."""
+    """Require every ``STANDARD_PERCENTILES`` entry; return exactly that set, never padded.
+
+    Beyond presence, the values must be FINITE and ordered the way their labels
+    claim. Both checks exist because the sanitizer downstream cannot tell a bad
+    salvage from a concentrated forecast: ``sort_percentiles_by_value`` sorts by
+    LABEL, so a value-disordered set is never reordered — it is force-monotonized,
+    which on one out-of-place value pins most of the set at a bound and publishes
+    a distribution nobody declared. A strict DECREASE with rising percentile is
+    incoherent by construction, so it fails the rung instead. Ties are allowed:
+    a repeated value is a legitimate concentrated (often count-like) declaration,
+    and the cluster spreader exists to separate exactly those.
+    """
     matched: dict[float, Percentile] = {}
     for standard in STANDARD_PERCENTILES:
         for p in percentiles:
@@ -348,7 +466,18 @@ def _validate_numeric(percentiles: list[Percentile]) -> list[Percentile]:
         raise ValueError(
             f"missing standard percentiles {missing}; got {sorted(float(p.percentile) for p in percentiles)}"
         )
-    return [matched[s] for s in STANDARD_PERCENTILES]
+    ordered = [matched[s] for s in STANDARD_PERCENTILES]
+    non_finite = [(float(p.percentile), float(p.value)) for p in ordered if not math.isfinite(float(p.value))]
+    if non_finite:
+        raise ValueError(f"non-finite percentile value(s) {non_finite}")
+    for previous, current in zip(ordered, ordered[1:]):
+        if float(current.value) < float(previous.value):
+            raise ValueError(
+                f"value {float(current.value)} at percentile {float(current.percentile)} is below "
+                f"{float(previous.value)} at percentile {float(previous.percentile)}; "
+                "value-disordered percentiles cannot be trusted as a salvage"
+            )
+    return ordered
 
 
 async def extract_numeric(
