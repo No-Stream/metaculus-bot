@@ -18,6 +18,8 @@ import pytest
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.prompts import SUMMARIZER_SOFT_FAIL_BANNER
+from metaculus_bot.research.asknews_summarization import summarize_asknews
+from metaculus_bot.research.gap_fill_stages import run_gap_fill_passes
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import (
     _is_lost_source,
@@ -586,16 +588,16 @@ class TestProviderSelection:
         and any in-body h1/h2 subheadings are demoted so the whole snapshot is
         a well-formed section within the combined research doc.
         """
-        from metaculus_bot.research.orchestrator import ResearchOrchestrator as RO
         from metaculus_bot.research.orchestrator import _demote_inner_headings
+        from metaculus_bot.research.section_format import provider_header
 
         body = (
             "Caveat: only reproduces text as fetched; forecaster must judge relevance.\n\n"
             "### https://example.com/data\n"
             "Some extracted content.\n"
         )
-        # Simulate _run_providers_parallel's composition step (orchestrator.py ~L389-397).
-        header = RO._provider_header("resolution_source")
+        # Simulate assemble_provider_sections' composition step (section_format.py).
+        header = provider_header("resolution_source")
         composed = f"{header}\n{_demote_inner_headings(body)}"
 
         assert "## Resolution Source Snapshot" in composed
@@ -1188,3 +1190,65 @@ class TestDemoteInnerHeadings:
         # The first heading (provider header, h2) must be the minimum.
         assert heading_levels[0] == min(heading_levels)
         assert heading_levels[0] == 2
+
+
+class TestStagesReportTheirAccountingInsteadOfCounting:
+    """The split stages RETURN what happened; the orchestrator owns the counters.
+
+    This is the contract that replaced the mixin inheritance: ``summarize_asknews``
+    and ``run_gap_fill_passes`` are callable with no orchestrator at all, and they
+    touch no counter. If a future edit moves a ``+= 1`` back inside either module,
+    the orchestrator's own bump makes it a DOUBLE count — which reads as two
+    degradations where one happened, on exactly the counters that redden CI.
+    """
+
+    @pytest.mark.asyncio
+    async def test_summarize_asknews_reports_the_soft_fail_reason_without_a_counter(self, mock_llm, question) -> None:
+        with patch.object(mock_llm, "invoke", new_callable=AsyncMock, return_value="   "):
+            text, reason = await summarize_asknews(question, "raw asknews articles", summarizer_llm=mock_llm)
+
+        assert reason == "blank_output"
+        assert text.startswith(SUMMARIZER_SOFT_FAIL_BANNER)
+
+    @pytest.mark.asyncio
+    async def test_a_clean_summary_reports_no_reason(self, mock_llm, question) -> None:
+        with patch.object(mock_llm, "invoke", new_callable=AsyncMock, return_value="briefing"):
+            text, reason = await summarize_asknews(question, "raw asknews articles", summarizer_llm=mock_llm)
+
+        assert (text, reason) == ("briefing", None)
+
+    @pytest.mark.asyncio
+    async def test_run_gap_fill_passes_reports_a_budget_cut_without_a_counter(self, question, monkeypatch) -> None:
+        """The fast path skips both passes; the outcome says so rather than bumping.
+
+        ``budget_cut`` is one boolean for the whole question precisely so the
+        orchestrator's per-question dedup can't be defeated by two cut stages.
+        """
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        outcome = await run_gap_fill_passes(
+            question, "research prose", fast_path=True, is_benchmarking=False, time_budget=None
+        )
+
+        assert outcome.budget_cut is True
+        assert outcome.research == "research prose"
+        assert (outcome.v2_payload, outcome.v2_errors) == (None, 0)
+
+    @pytest.mark.asyncio
+    async def test_run_gap_fill_passes_reports_a_v2_crash_without_a_counter(self, question, monkeypatch) -> None:
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        with patch(
+            "metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("v2 escaped its own soft-fail"),
+        ):
+            outcome = await run_gap_fill_passes(
+                question, "research prose", fast_path=False, is_benchmarking=False, time_budget=None
+            )
+
+        assert outcome.v2_errors == 1
+        assert outcome.budget_cut is False
+        assert outcome.research == "research prose"

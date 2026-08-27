@@ -546,8 +546,8 @@ def _strong_evidence_market_clause(
     )
 
 
-# Header the timeseries_anchor research provider emits (research/orchestrator.py
-# _provider_header). The numeric prompt gates its anchor clause on this substring
+# Header the timeseries_anchor research provider emits (research/section_format.py
+# PROVIDER_SECTION_HEADERS). The numeric prompt gates its anchor clause on this substring
 # so the guidance only appears when an anchor section is actually present.
 TS_ANCHOR_SECTION_HEADER = "## Time Series Anchor"
 

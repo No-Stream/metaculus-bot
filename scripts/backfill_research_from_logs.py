@@ -13,6 +13,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The provider -> section-header map is the live pipeline's own; walking it backwards is
+# how a bundle is decoded, and a hand-copied inverse had already rotted two providers
+# (resolution_source, timeseries_anchor) out of every record this writer produced.
+from metaculus_bot.research.section_format import PROVIDER_SECTION_HEADERS
+
 # The archive's source-classification vocabulary lives with the merge stage that reads it,
 # so writer and classifier can't drift into disagreeing about this writer's name.
 from scripts.download_research import LOG_BACKFILL_RUN_MODE
@@ -37,20 +42,6 @@ APP_LOG_LINE = re.compile(
 
 GHA_PREFIX = re.compile(r"^forecast_job\t[^\t]*\t\d{4}-\d{2}-\d{2}T[\d:.]+Z\s*")
 
-# --- Provider header mapping ---
-
-PROVIDER_HEADERS = {
-    "## News Articles (AskNews)": "asknews",
-    "## Web Research (Native Search)": "native_search",
-    "## Web Research (Google Search via Gemini)": "gemini_search",
-    "## Financial & Economic Data": "financial_data",
-    "## Prediction Market Snapshot": "prediction_market",
-    "## Web Research (Exa)": "exa",
-    "## Web Research (Perplexity)": "perplexity",
-    "## Web Research (OpenRouter)": "openrouter",
-    "## Research (Custom)": "custom",
-}
-
 # --- QID extraction from Metaculus URLs ---
 
 QID_PATTERN = re.compile(r"metaculus\.com/(?:questions|c/[^/]+)/(\d+)")
@@ -72,9 +63,15 @@ def normalize_timestamp(gha_timestamp: str) -> str:
 
 
 def detect_providers(research_text: str) -> list[str]:
-    """Detect which research providers contributed based on ## headers in the text."""
+    """Detect which research providers contributed based on ## headers in the text.
+
+    Walks the live pipeline's own provider -> header map backwards. Nothing is
+    inverted into a second dict: a copy is what let ``resolution_source`` and
+    ``timeseries_anchor`` go unrecognized here for months while the pipeline had been
+    emitting both, so every future provider now self-propagates.
+    """
     providers = []
-    for header, provider_name in PROVIDER_HEADERS.items():
+    for provider_name, header in PROVIDER_SECTION_HEADERS.items():
         if header in research_text:
             providers.append(provider_name)
     return providers

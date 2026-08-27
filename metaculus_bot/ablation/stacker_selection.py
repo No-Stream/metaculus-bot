@@ -40,7 +40,7 @@ def _active_stacker_slug(args: argparse.Namespace) -> str:
     All three callers (``_stage_llm_stacker`` write/read, ``_stage_score`` read,
     ``_hydrate_working_set_from_cache`` read) route through here so they agree.
     """
-    use_prod_stacker = getattr(args, "plain_llm", False) and getattr(args, "lineup", "free") == "prod"
+    use_prod_stacker = args.plain_llm and args.lineup == "prod"
     model = PROD_STACKER_MODEL if use_prod_stacker else DEFAULT_STACKER_MODEL
     return model_slug_to_filename(model)
 
@@ -61,12 +61,12 @@ def _stacker_batch_kwargs(
     """
     stacker_llm_kwarg: GeneralLlm | None = None
     fallback_llm_kwarg: GeneralLlm | None = None
-    if getattr(args, "plain_llm", False):
-        if getattr(args, "lineup", "free") == "prod":
+    if args.plain_llm:
+        if args.lineup == "prod":
             stacker_llm_kwarg = GeneralLlm(model=PROD_STACKER_MODEL, **_PROD_STACKER_KWARGS)
         else:
             stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
-        if not getattr(args, "no_stacker_fallback", False):
+        if not args.no_stacker_fallback:
             fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_OPENAI_STACKER_KWARGS)
 
     batch_kwargs: dict[str, Any] = {
@@ -76,7 +76,7 @@ def _stacker_batch_kwargs(
     }
     if stacker_llm_kwarg is not None:
         batch_kwargs["stacker_llm"] = stacker_llm_kwarg
-    if getattr(args, "no_stacker_fallback", False):
+    if args.no_stacker_fallback:
         batch_kwargs["fallback_stacker_llm"] = None
     elif fallback_llm_kwarg is not None:
         batch_kwargs["fallback_stacker_llm"] = fallback_llm_kwarg

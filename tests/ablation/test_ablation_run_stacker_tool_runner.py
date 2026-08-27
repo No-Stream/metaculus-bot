@@ -5,7 +5,7 @@ here the synthetic forecaster rationales below carry genuine structured JSON blo
 ``run_tools_for_forecaster`` / ``build_cross_model_aggregation`` actually parse and compute.
 That is what proves arm B differs from arm A rather than silently degrading to it. The
 rationale builders stay in this module — it is their only consumer; question/payload factories
-come from ``tests/ablation_stacker_fakes.py``, fixtures from ``tests/ablation_stacker_fixtures.py``.
+come from ``tests/ablation_stacker_fakes.py``, fixtures from ``tests/ablation/conftest.py``.
 """
 
 from __future__ import annotations
@@ -19,19 +19,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.run_stacker import ARM_STACK, ARM_STACK_AUG, run_stacker_for_arm
-from tests import ablation_stacker_fixtures as _fixtures
 from tests.ablation_stacker_fakes import _make_binary_q, _make_mc_q, _make_numeric_q, _run
-
-# pytest registers a fixture under the module attribute name it finds it at, so the shared
-# fixtures are RE-BOUND here rather than imported: `import cache as _cache` would register
-# `_cache` and leave `cache` falling through to pytest's builtin cache fixture, while a
-# plain `import cache` trips ruff F811 against the same-named test-method parameters.
-cache = _fixtures.cache
-stacker_llm = _fixtures.stacker_llm
-fallback_stacker_llm = _fixtures.fallback_stacker_llm
-parser_llm = _fixtures.parser_llm
-_ensure_flag_unset = _fixtures._ensure_flag_unset
-
 
 # ===========================================================================
 # Real tool_runner integration — proves arm A vs arm B genuinely differ

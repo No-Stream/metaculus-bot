@@ -4,49 +4,22 @@ Split out of ``scoring_patches.py``, which had grown to hold three unrelated job
 monkey-patch installation into forecasting-tools, the baseline-score math, and this — the
 parsing layer that walks ``aggregations.recency_weighted.latest`` for community data and
 pulls probabilities/percentiles off a prediction object. Only the parsing lives here; the
-scoring formulas, the run-wide diagnostic counters and the patch installers all stay in
-``scoring_patches``, which re-exports every name below that outside callers import.
+scoring formulas and the patch installers stay in ``scoring_patches``, which re-exports
+every name below that outside callers import.
 
-The MC extractors bump ``scoring_patches``' ``_MC_MISSING_*`` counters. They reach back
-into that module at call time rather than binding the ints, so ``reset_scoring_path_stats``
-stays visible to them; the import has to be function-scoped because ``scoring_patches``
-imports this module.
+The MC extractors report each community-data miss through
+``scoring_diagnostics.record_mc_missing``. Those counters live in their own leaf module
+rather than in ``scoring_patches`` so that this module never has to import the module that
+imports it.
 """
 
 import logging
 from typing import Any
 
+from metaculus_bot import scoring_diagnostics
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-def validate_community_prediction_count(question: Any) -> bool:
-    """
-    Validate that a question has sufficient community predictions (minimum 10).
-
-    Args:
-        question: MetaculusQuestion object
-
-    Returns:
-        True if question has adequate community predictions, False otherwise
-    """
-    num_predictions = getattr(question, "num_predictions", None)
-    if num_predictions is not None:
-        logger.debug(f"Question {question.id_of_question}: {num_predictions} community predictions")
-        return num_predictions >= 10
-
-    prediction_count = getattr(question, "prediction_count", None)
-    if prediction_count is not None:
-        logger.debug(f"Question {question.id_of_question}: {prediction_count} community predictions")
-        return prediction_count >= 10
-
-    community_pred = getattr(question, "community_prediction_at_access_time", None)
-    if community_pred is not None:
-        logger.debug(f"Question {question.id_of_question}: has community prediction (assuming sufficient count)")
-        return True
-
-    logger.warning(f"Question {question.id_of_question}: cannot determine community prediction count")
-    return False
 
 
 def extract_multiple_choice_probabilities(
@@ -139,10 +112,9 @@ def _locate_mc_rw_latest(question: Any) -> tuple[dict | None, list | None, Any, 
 
     Returns ``(rw_latest, options, qid, reason)``. On success ``rw_latest`` is the dict and
     ``reason`` is ``""``; on failure ``rw_latest`` is None, ``reason`` names the miss, and the
-    matching breakdown counter plus ``_MC_MISSING_COMMUNITY`` have been bumped.
+    miss has been recorded against its breakdown counter plus the ``mc_missing_community``
+    rollup.
     """
-    from metaculus_bot import scoring_patches  # noqa: PLC0415  # cycle: it imports this module; counters live there
-
     # Basic fingerprint
     post_id = getattr(question, "id_of_post", None)
     qid = getattr(question, "id_of_question", None)
@@ -154,8 +126,7 @@ def _locate_mc_rw_latest(question: Any) -> tuple[dict | None, list | None, Any, 
             post_id,
             type(api_json).__name__,
         )
-        scoring_patches._MC_MISSING_API_JSON += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("api_json")
         return None, None, qid, "missing_api_json"
 
     # Detect the question node
@@ -169,8 +140,7 @@ def _locate_mc_rw_latest(question: Any) -> tuple[dict | None, list | None, Any, 
             api_has_question,
             type(question_obj).__name__,
         )
-        scoring_patches._MC_MISSING_QUESTION_NODE += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("question_node")
         return None, None, qid, "missing_question_node"
 
     qtype = question_obj.get("type")
@@ -186,8 +156,7 @@ def _locate_mc_rw_latest(question: Any) -> tuple[dict | None, list | None, Any, 
             qtype,
             list(question_obj.keys()),
         )
-        scoring_patches._MC_MISSING_AGGREGATIONS += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("aggregations")
         return None, options, qid, "missing_aggregations"
 
     rw = aggregations.get("recency_weighted")
@@ -201,8 +170,7 @@ def _locate_mc_rw_latest(question: Any) -> tuple[dict | None, list | None, Any, 
 
     if not isinstance(rw_latest, dict):
         logger.info("MC q=%s: recency_weighted.latest missing", qid)
-        scoring_patches._MC_MISSING_PROB_YES_PER_CATEGORY += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("prob_yes_per_category")
         return None, options, qid, "missing_rw_latest"
 
     return rw_latest, options, qid, ""
@@ -210,11 +178,9 @@ def _locate_mc_rw_latest(question: Any) -> tuple[dict | None, list | None, Any, 
 
 def _mc_probs_from_forecast_values(fv: list, options: Any, qid: Any) -> tuple[list[float] | None, str]:
     """Read ``rw.latest.forecast_values``, which is aligned by index with ``options``."""
-    from metaculus_bot import scoring_patches  # noqa: PLC0415  # cycle: it imports this module; counters live there
-
     if not options or not isinstance(options, list):
         logger.info("MC q=%s: options unavailable; cannot align forecast_values", qid)
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing()
         return None, "forecast_values_no_options"
     if len(fv) != len(options):
         logger.warning(
@@ -223,27 +189,23 @@ def _mc_probs_from_forecast_values(fv: list, options: Any, qid: Any) -> tuple[li
             len(fv),
             len(options),
         )
-        scoring_patches._MC_MISSING_PROB_YES_PER_CATEGORY += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("prob_yes_per_category")
         return None, "forecast_values_length_mismatch"
     try:
         probs = [float(x) for x in fv]
     except (TypeError, ValueError) as e:
         logger.warning("MC q=%s: forecast_values cast error: %s", qid, e)
-        scoring_patches._MC_MISSING_PROB_YES_PER_CATEGORY += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("prob_yes_per_category")
         return None, "forecast_values_cast_error"
     within = all(0.0 <= p <= 1.0 for p in probs)
     total = sum(probs)
     if not within:
         logger.warning("MC q=%s: forecast_values contain out-of-range probabilities", qid)
-        scoring_patches._MC_MISSING_PROB_YES_PER_CATEGORY += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("prob_yes_per_category")
         return None, "forecast_values_out_of_range"
     if abs(total - 1.0) > 1e-3:
         logger.warning("MC q=%s: forecast_values sum %.6f far from 1.0", qid, total)
-        scoring_patches._MC_MISSING_PROB_YES_PER_CATEGORY += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("prob_yes_per_category")
         return None, "forecast_values_bad_sum"
     if abs(total - 1.0) > 1e-6:
         logger.info("MC q=%s: normalizing forecast_values (sum=%.6f)", qid, total)
@@ -254,11 +216,9 @@ def _mc_probs_from_forecast_values(fv: list, options: Any, qid: Any) -> tuple[li
 
 def _mc_probs_from_pyc(pyc: dict, options: Any, qid: Any) -> tuple[list[float] | None, str]:
     """Read ``rw.latest.probability_yes_per_category``, aligning it to ``options`` order."""
-    from metaculus_bot import scoring_patches  # noqa: PLC0415  # cycle: it imports this module; counters live there
-
     if not (options and isinstance(options, list)):
         logger.info("MC q=%s: options unavailable; cannot align pyc", qid)
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing()
         return None, "pyc_no_options"
 
     keys = sorted(pyc.keys())
@@ -283,8 +243,7 @@ def _mc_probs_from_pyc(pyc: dict, options: Any, qid: Any) -> tuple[list[float] |
         probs = [p / total for p in probs]
     elif abs(total - 1.0) > 1e-3:
         logger.warning("MC q=%s: pyc sum %.6f far from 1.0", qid, total)
-        scoring_patches._MC_MISSING_PROB_YES_PER_CATEGORY += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("prob_yes_per_category")
         return None, "pyc_bad_sum"
     logger.debug("MC q=%s: using rw.latest.probability_yes_per_category", qid)
     return probs, "probability_yes_per_category"
@@ -297,8 +256,6 @@ def _extract_mc_community_probs(question: Any) -> tuple[list[float] | None, str]
     `probability_yes_per_category` under `aggregations.recency_weighted.latest`.
     We align the resulting vector to `question.options` order.
     """
-    from metaculus_bot import scoring_patches  # noqa: PLC0415  # cycle: it imports this module; counters live there
-
     try:
         rw_latest, options, qid, reason = _locate_mc_rw_latest(question)
         if rw_latest is None:
@@ -318,15 +275,14 @@ def _extract_mc_community_probs(question: Any) -> tuple[list[float] | None, str]
             qid,
             list(rw_latest.keys()),
         )
-        scoring_patches._MC_MISSING_PROB_YES_PER_CATEGORY += 1
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing("prob_yes_per_category")
         return None, "no_forecast_data"
 
     # Boundary: this extractor's contract is "never raise, report a reason" — the MC scorer
     # treats every reason as "no community data" and skips the question.
     except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         logger.warning(f"Failed to extract MC community probabilities: {e}")
-        scoring_patches._MC_MISSING_COMMUNITY += 1
+        scoring_diagnostics.record_mc_missing()
     return None, "exception"
 
 

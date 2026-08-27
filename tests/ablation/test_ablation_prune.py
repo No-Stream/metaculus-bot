@@ -70,11 +70,6 @@ def _make_ground_truth(
     )
 
 
-@pytest.fixture
-def cache(tmp_path: Path) -> AblationCache:
-    return AblationCache(tmp_path / "abl")
-
-
 def _patch_subprocess(monkeypatch: pytest.MonkeyPatch, stdout_payloads: list) -> AsyncMock:
     mock = AsyncMock(side_effect=stdout_payloads)
     monkeypatch.setattr("metaculus_bot.ablation.prune._invoke_claude_redactor", mock)
@@ -1194,3 +1189,45 @@ async def test_process_batch_failure_dump_write_error_degrades_gracefully(
     assert results == {7100: None}
     messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert any("(failed to write debug file)" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# F6: the headless `claude -p` driver is shared, not forked
+#
+# prune and qa_iterate used to carry byte-identical copies of the argv builder,
+# the timeout/orphan-reap block, and the stdout-envelope unwrapper. A knob added
+# to one copy never reached the other (qa_iterate's stage was pinned to the 600s
+# default for exactly that reason). These tests pin the single-source property so
+# a future edit re-forks loudly instead of silently.
+# ---------------------------------------------------------------------------
+
+
+def test_both_stages_share_one_claude_driver() -> None:
+    """prune and qa_iterate must resolve the driver to the SAME objects."""
+    from metaculus_bot.ablation import claude_cli, prune, qa_iterate
+
+    shared = (
+        "DEFAULT_CLAUDE_EXECUTABLE",
+        "DEFAULT_TIMEOUT_SECONDS",
+        "_build_argv",
+        "_extract_inner_result",
+        "_run_claude_subprocess",
+    )
+    for name in shared:
+        canonical = getattr(claude_cli, name)
+        assert getattr(prune, name) is canonical, f"prune.{name} is not claude_cli.{name}"
+        assert getattr(qa_iterate, name) is canonical, f"qa_iterate.{name} is not claude_cli.{name}"
+
+
+def test_prune_and_qa_iterate_argv_differ_only_in_system_prompt() -> None:
+    """The two stages differ in system prompt alone — every other flag is shared."""
+    from metaculus_bot.ablation.claude_cli import _build_argv
+    from metaculus_bot.ablation.prune import REDACTOR_SYSTEM_PROMPT
+    from metaculus_bot.ablation.qa_iterate import VERIFIER_SYSTEM_PROMPT
+
+    redactor_argv = _build_argv(REDACTOR_SYSTEM_PROMPT)
+    verifier_argv = _build_argv(VERIFIER_SYSTEM_PROMPT)
+
+    assert redactor_argv[:-1] == verifier_argv[:-1]
+    assert redactor_argv[-1] == REDACTOR_SYSTEM_PROMPT
+    assert verifier_argv[-1] == VERIFIER_SYSTEM_PROMPT

@@ -17,16 +17,12 @@ from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQue
 
 from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.backtest.question_prep import BacktestQuestionSet
-from tests import ablation_cli_fakes as _fakes
 from tests.ablation_cli_fakes import (
     _build_question_set,
     _install_full_stack_mocks,
     _make_binary_ground_truth,
     _make_binary_question,
 )
-
-# Fixture bound by assignment rather than imported: see the ablation_cli_fakes docstring.
-cache_dir = _fakes.cache_dir
 
 # ---------------------------------------------------------------------------
 # Schema strictness — defensive .get() / getattr() removed in favor of fail-fast

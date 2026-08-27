@@ -761,7 +761,7 @@ class TestGapFillV2CrashCounter:
     byte-identical to a legitimate idle run — nothing reddened CI. A genuine
     crash must now bump an alertable counter; an idle "found nothing" run and a
     deadline hit must NOT. Three mutually-exclusive crash paths, one bump each
-    (see orchestrator._count_gap_fill_v2_error). A dead-on-arrival bug bumps it
+    (see gap_fill_stages._run_gap_fill_v2). A dead-on-arrival bug bumps it
     on every question; a rare transient bumps it once (accepted false alarm).
     """
 

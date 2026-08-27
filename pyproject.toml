@@ -206,7 +206,8 @@ max-nested-blocks = 4
 "metaculus_bot/performance_analysis/cli.py" = ["T201"]
 # Monkey-patch modules: module-global state IS the design (patch flags, counters
 # whose bytecode-atomic increments are documented load-bearing in AGENTS.md).
-"metaculus_bot/scoring_patches.py" = ["PLW0603"]
+# scoring_patches.py is deliberately absent: its counters moved into the
+# scoring_diagnostics dataclass singleton, so it has no `global` statement left.
 "metaculus_bot/publish_hardening.py" = ["PLW0603"]
 "metaculus_bot/publish_gate.py" = ["PLW0603"]
 "metaculus_bot/ablation/window_patch.py" = ["PLW0603"]
@@ -320,8 +321,9 @@ DEP003 = ["urllib3", "httpx"]
 #     run alive, but because otherwise the flag renders no chart at all.
 DEP004 = ["matplotlib"]
 
-# Import-direction contracts. Every contract below was derived from the real graph
-# (grimp) and passes as written; none required a code change. Run via `make lint_imports`.
+# Import-direction contracts. Every contract below was derived from the real graph (grimp).
+# The first five passed as written, with no code change; the scoring one is the exception —
+# it was added together with the fix that made it pass. Run via `make lint_imports`.
 [tool.importlinter]
 root_packages = ["metaculus_bot", "scripts"]
 
@@ -441,3 +443,16 @@ forbidden_modules = [
     "metaculus_bot.ablation",
     "metaculus_bot.benchmark",
 ]
+
+# The scoring split cut through shared mutable state: scoring_patches imports the parsers in
+# scoring_extraction, and the parsers used to reach back into scoring_patches from inside four
+# function bodies to bump the diagnostic counters, which is a real cycle (hoisting any of those
+# imports raises ImportError on a partially initialized module). The counters now live in the
+# scoring_diagnostics leaf, which imports nothing from the package, so the back-edge is gone;
+# this contract is what stops it coming back. grimp resolves function-scoped imports, so a
+# relapse fails here whether the import sits at module scope or inside a function.
+[[tool.importlinter.contracts]]
+name = "the scoring parsers do not import the scoring patches back"
+type = "forbidden"
+source_modules = ["metaculus_bot.scoring_extraction"]
+forbidden_modules = ["metaculus_bot.scoring_patches"]

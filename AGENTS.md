@@ -357,7 +357,7 @@ The bot's published Metaculus comments are the durable per-model record: on non-
 - **Pre-commit**: `make precommit_install` then `make precommit` or `make precommit_all`.
 - **Typecheck**: `make typecheck` (basedpyright; `make typecheck_ty` for the secondary ty checker).
 - **Coverage**: `make cov` (branch coverage is on). **Audit**: `make audit` (osv-scanner over `uv.lock`; requires `brew install osv-scanner` locally — CI runs it via `google/osv-scanner-action`).
-- **Dependency hygiene**: `make deps` (deptry: undeclared/unused/transitive deps). **Import contracts**: `make lint_imports` (import-linter; the 5 contracts live in `pyproject.toml` `[tool.importlinter]`). Both free, both in CI's lint job and `make all`.
+- **Dependency hygiene**: `make deps` (deptry: undeclared/unused/transitive deps). **Import contracts**: `make lint_imports` (import-linter; the 6 contracts live in `pyproject.toml` `[tool.importlinter]`). Both free, both in CI's lint job and `make all`.
 - **Test single file**: `uv run pytest tests/test_specific.py`.
 
 **The full suite must pass before anything is pushed, and CI green is the real gate — not a local green run.** `make precommit_install` installs both hook types: the ruff hooks on commit, plus a `pytest-full-suite` pre-push hook running the same `uv run --frozen pytest --cov=metaculus_bot` that `.github/workflows/ci.yaml` runs. Per-push rather than per-commit — the suite takes ~105s, too much friction on every commit but the right price on the thing reviewers see.

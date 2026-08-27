@@ -16,52 +16,9 @@ from metaculus_bot.scoring_patches import (
     calculate_numeric_baseline_score,
     extract_multiple_choice_probabilities,
     extract_numeric_percentiles,
-    validate_community_prediction_count,
+    get_scoring_path_stats,
+    reset_scoring_path_stats,
 )
-
-
-class TestCommunityPredictionValidation:
-    """Test community prediction count validation."""
-
-    def test_validate_with_num_predictions(self):
-        """Test validation using num_predictions attribute."""
-        question = Mock()
-        question.id_of_question = 123
-        question.num_predictions = 15
-
-        assert validate_community_prediction_count(question) is True
-
-        question.num_predictions = 5
-        assert validate_community_prediction_count(question) is False
-
-    def test_validate_with_prediction_count(self):
-        """Test validation using prediction_count attribute."""
-        question = Mock()
-        question.id_of_question = 123
-        question.num_predictions = None
-        question.prediction_count = 25
-
-        assert validate_community_prediction_count(question) is True
-
-    def test_validate_with_community_prediction_exists(self):
-        """Test validation using community_prediction_at_access_time."""
-        question = Mock()
-        question.id_of_question = 123
-        question.num_predictions = None
-        question.prediction_count = None
-        question.community_prediction_at_access_time = 0.5
-
-        assert validate_community_prediction_count(question) is True
-
-    def test_validate_insufficient_data(self):
-        """Test validation when no adequate data is available."""
-        question = Mock()
-        question.id_of_question = 123
-        question.num_predictions = None
-        question.prediction_count = None
-        question.community_prediction_at_access_time = None
-
-        assert validate_community_prediction_count(question) is False
 
 
 class TestMultipleChoiceExtraction:
@@ -184,13 +141,19 @@ class TestMultipleChoiceScoring:
         # value for these fixed literals is 41.83.
         assert -200 <= score <= 100, f"MC baseline score off the Metaculus-like scale: {score}"
 
-    def test_mc_scoring_insufficient_predictions(self):
-        """Test MC scoring with insufficient community predictions."""
+    def test_mc_scoring_unreadable_report_scores_none(self):
+        """An unusable report scores None rather than raising out of the scorer.
+
+        ``report.prediction`` is left as a bare Mock, so ``predicted_options`` is a Mock
+        too and sorting it raises TypeError inside the scorer's outer boundary. That
+        boundary is what this pins: ``expected_baseline_score`` is read from a property
+        while a benchmark is being assembled, so a report it cannot read must degrade to
+        None. (This test used to be titled "insufficient_predictions" and set
+        ``num_predictions = 5``, asserting a community-count gate that 7fe4afe deleted in
+        2025-08 — it has been passing for this unrelated reason ever since.)
+        """
         question = Mock()
         question.id_of_question = 123
-        question.num_predictions = 5  # Below threshold
-        question.prediction_count = None
-        question.community_prediction_at_access_time = None
 
         report = Mock()
         report.question = question
@@ -324,19 +287,98 @@ class TestNumericScoring:
         score = calculate_numeric_baseline_score(report)
         assert score is None
 
-    def test_numeric_scoring_insufficient_predictions(self):
-        """Test numeric scoring with insufficient community predictions."""
+    def test_numeric_scoring_unreadable_report_scores_none(self):
+        """An unusable report scores None through the percentile fallback, not a raise.
+
+        With ``report.prediction`` a bare Mock there is no model CDF and no community CDF,
+        so scoring degrades to the declared-percentile fallback, whose own boundary catches
+        the TypeError from ``len(Mock())`` and returns None. Same history as the MC sibling
+        above: this asserted a community-count gate deleted in 7fe4afe.
+        """
         question = Mock()
         question.id_of_question = 456
-        question.num_predictions = 5  # Below threshold
-        question.prediction_count = None
-        question.community_prediction_at_access_time = None
 
         report = Mock()
         report.question = question
 
         score = calculate_numeric_baseline_score(report)
         assert score is None
+
+
+class _Percentile:
+    """Minimal stand-in for the ``.percentile``-bearing objects a model CDF is made of."""
+
+    def __init__(self, percentile):
+        self.percentile = percentile
+
+
+class TestNumericSuccessCountersByPath:
+    """Each numeric scoring path counts its OWN success.
+
+    ``_calculate_relative_numeric_score`` is shared by the PMF path and the declared-
+    percentile fallback, so the success bump cannot live inside it: it used to bump
+    ``numeric_pmf_successes`` for both, which let pmf_successes exceed pmf_attempts and left
+    ``numeric_fallback_successes`` at zero forever even though the run-log summary prints it.
+    """
+
+    @staticmethod
+    def _uniform_community_api_json(n_points):
+        return {
+            "question": {
+                "aggregations": {
+                    "recency_weighted": {"latest": {"forecast_values": np.linspace(0.0, 1.0, n_points).tolist()}}
+                }
+            }
+        }
+
+    def test_pmf_path_counts_a_pmf_success_only(self):
+        question = Mock()
+        question.id_of_question = 4321
+        question.lower_bound = 0.0
+        question.upper_bound = 100.0
+        question.api_json = self._uniform_community_api_json(11)
+
+        prediction = Mock()
+        prediction.cdf = [_Percentile(i / 10.0) for i in range(11)]
+
+        report = Mock()
+        report.question = question
+        report.prediction = prediction
+
+        reset_scoring_path_stats()
+        assert calculate_numeric_baseline_score(report) is not None
+
+        stats = get_scoring_path_stats()
+        assert stats["numeric_pmf_attempts"] == 1
+        assert stats["numeric_pmf_successes"] == 1
+        assert stats["numeric_fallback_attempts"] == 0
+        assert stats["numeric_fallback_successes"] == 0
+
+    def test_fallback_path_counts_a_fallback_success_only(self):
+        question = Mock()
+        question.id_of_question = 4322
+        question.lower_bound = 0.0
+        question.upper_bound = 100.0
+        # No community aggregations, so the scorer degrades to the declared percentiles.
+        question.api_json = {"question": {"aggregations": {}}}
+
+        declared = [_Percentile(p) for p in (5.0, 20.0, 40.0, 50.0, 60.0, 80.0, 95.0)]
+        prediction = Mock()
+        prediction.cdf = None
+        prediction.declared_percentiles = declared
+
+        report = Mock()
+        report.question = question
+        report.prediction = prediction
+
+        reset_scoring_path_stats()
+        assert calculate_numeric_baseline_score(report) is not None
+
+        stats = get_scoring_path_stats()
+        assert stats["numeric_fallback_attempts"] == 1
+        assert stats["numeric_fallback_successes"] == 1
+        assert stats["numeric_pmf_attempts"] == 0
+        assert stats["numeric_pmf_successes"] == 0
 
 
 class TestRelativeNumericScoring:

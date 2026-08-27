@@ -15,8 +15,10 @@ direct consumer of the classmethod.
 Import-order note: importing this module imports forecasting_tools, and so litellm.
 ``metaculus_bot/__init__`` must therefore keep its ``DISABLE_AIOHTTP_TRANSPORT``
 setdefault ABOVE the ``from metaculus_bot.question_patches import ...`` line (it does,
-with a comment saying so) — that env default only takes effect if it is set before
-litellm is first imported.
+with a comment saying so). The mechanism is not an import-time read: litellm re-reads
+the variable on every transport construction, but the handlers it builds during its own
+import freeze onto the aiohttp transport if the default arrives late.
+``tests/test_aiohttp_transport_flag.py`` asserts the source order.
 
 Upstream: forecasting_tools/data_models/questions.py, BoundedQuestionMixin.
 Follow-on: full retirement is viable (verified — Pydantic coerces zero_point

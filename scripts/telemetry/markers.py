@@ -664,7 +664,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "research_phase_deadline",
         # Research-phase deadline WARN (research/provider_fanout.py
-        # _await_providers_within_deadline): the outer budget bound cancelled
+        # await_providers_within_deadline): the outer budget bound cancelled
         # straggler providers. Carries no question ref — the line names counts and
         # provider names only — so qid_kind stays None; the cancelled providers also
         # survive as status="deadline" rows in the archive's provider_results, which

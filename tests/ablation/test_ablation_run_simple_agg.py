@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable, Coroutine
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -96,11 +95,6 @@ def _numeric_payload(model: str, median: float = 50.0) -> dict:
 # ---------------------------------------------------------------------------
 # Common fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def cache(tmp_path: Path) -> AblationCache:
-    return AblationCache(tmp_path / "abl")
 
 
 _REQUIRED_PAYLOAD_KEYS = {

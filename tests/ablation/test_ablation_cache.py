@@ -19,11 +19,6 @@ from metaculus_bot.ablation.cache import CACHE_SCHEMA_VERSION, AblationCache, mo
 _ = Any
 
 
-@pytest.fixture
-def cache(tmp_path: Path) -> AblationCache:
-    return AblationCache(tmp_path / "abl")
-
-
 # ---------------------------------------------------------------------------
 # Atomic writes / round-trips
 # ---------------------------------------------------------------------------

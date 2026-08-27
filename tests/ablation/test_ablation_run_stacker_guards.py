@@ -4,7 +4,7 @@ Split out of ``test_ablation_run_stacker.py``. Three screens live here: the
 minimum-forecaster guard that refuses to stack a single survivor, the NaN/inf screen on
 both forecaster payloads and stacker output, and the prompt-size guard that
 tail-truncates oversized rationales. Factories come from ``tests/ablation_stacker_fakes.py``,
-fixtures from ``tests/ablation_stacker_fixtures.py``.
+fixtures from ``tests/ablation/conftest.py``.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import pytest
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.run_stacker import ARM_STACK, run_stacker_for_arm
-from tests import ablation_stacker_fixtures as _fixtures
 from tests.ablation_stacker_fakes import (
     _binary_payload,
     _capture_base_texts,
@@ -27,17 +26,6 @@ from tests.ablation_stacker_fakes import (
     _run,
     _three_binary_forecasters,
 )
-
-# pytest registers a fixture under the module attribute name it finds it at, so the shared
-# fixtures are RE-BOUND here rather than imported: `import cache as _cache` would register
-# `_cache` and leave `cache` falling through to pytest's builtin cache fixture, while a
-# plain `import cache` trips ruff F811 against the same-named test-method parameters.
-cache = _fixtures.cache
-stacker_llm = _fixtures.stacker_llm
-fallback_stacker_llm = _fixtures.fallback_stacker_llm
-parser_llm = _fixtures.parser_llm
-_ensure_flag_unset = _fixtures._ensure_flag_unset
-
 
 # ===========================================================================
 # Insufficient forecasters

@@ -47,6 +47,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.publish_gate import reset_publish_skipped_closed
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail, record_provider_detail
+from metaculus_bot.research.provider_fanout import await_providers_within_deadline
 from metaculus_bot.stacking_route import (
     _enrichment_timeout,
     _skip_stacking_for_budget,
@@ -464,15 +465,12 @@ class TestResearchPhaseDeadline:
         """``_run_one`` converts every PROVIDER exception into a ProviderResult, so an
         exception escaping it is a bug in our own wrapper. Swallowing it into a
         synthesized result would hide that class of defect entirely."""
-        orchestrator = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
 
         async def exploding_run_one(_provider, _name):
             raise ValueError("wrapper bug")
 
         with pytest.raises(ValueError, match="wrapper bug"):
-            await orchestrator._await_providers_within_deadline(
-                [(AsyncMock(), "native_search")], exploding_run_one, None
-            )
+            await await_providers_within_deadline([(AsyncMock(), "native_search")], exploding_run_one, None)
 
     @pytest.mark.asyncio
     async def test_an_empty_provider_list_yields_no_results_instead_of_raising(self):
@@ -482,7 +480,7 @@ class TestResearchPhaseDeadline:
         caller gets an exception where it used to get ``[]``."""
         never_run = AsyncMock(side_effect=AssertionError("no provider should have been started"))
 
-        assert await ResearchOrchestrator._await_providers_within_deadline([], never_run, None) == []
+        assert await await_providers_within_deadline([], never_run, None) == []
         never_run.assert_not_awaited()
 
 

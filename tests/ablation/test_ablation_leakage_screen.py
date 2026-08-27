@@ -10,7 +10,6 @@ import asyncio
 import hashlib
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -60,11 +59,6 @@ def _make_ground_truth(qid: int, resolution_string: str = "Yes") -> GroundTruth:
         actual_resolution_time=datetime(2025, 6, 1),
         question_text="Will X happen?",
     )
-
-
-@pytest.fixture
-def cache(tmp_path: Path) -> AblationCache:
-    return AblationCache(tmp_path / "abl")
 
 
 @pytest.fixture(autouse=True)

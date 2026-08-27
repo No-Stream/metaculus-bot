@@ -23,8 +23,14 @@ from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQue
 from metaculus_bot.ablation.cache import AblationCache, atomic_write_text
 from metaculus_bot.ablation.forecaster_lineup import FREE_FORECASTER_MODELS, FREE_PARSER_MODEL
 from metaculus_bot.ablation.leakage_screen import DEFAULT_DETECTOR_MODEL
-from metaculus_bot.ablation.run_stacker import ARM_MEDIAN, ARM_PDF, ARM_STACK, ARM_STACK_AUG
+from metaculus_bot.ablation.run_pdf import ARM_PDF_MIN1, ARM_PDF_MIN1_MEAN, ARM_PDF_MIN2
+from metaculus_bot.ablation.run_stacker import ARM_MEDIAN, ARM_STACK, ARM_STACK_AUG
 from metaculus_bot.ablation.run_state import SpendReport, WorkingSet
+
+# The pdf stage counts cache hits per SUB-arm (``run_pdf_for_qid`` is the only reader), so
+# the spend report's ``pdf=`` column sums the sub-arms rather than reading a parent ``pdf``
+# key that nothing ever bumps.
+_PDF_SUB_ARMS = (ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_PDF_MIN1_MEAN)
 
 
 def _stage_qa_research_dump(
@@ -171,7 +177,7 @@ def _print_spend_report(spend: SpendReport, working: WorkingSet, summary_path: P
         f"screen={spend.cached_screen_hits}  forecast={spend.cached_forecaster_hits}  "
         f"stack={spend.cached_stacker_hits.get(ARM_STACK, 0)}  "
         f"stack_aug={spend.cached_stacker_hits.get(ARM_STACK_AUG, 0)}  "
-        f"pdf={spend.cached_stacker_hits.get(ARM_PDF, 0)}  "
+        f"pdf={sum(spend.cached_stacker_hits.get(arm, 0) for arm in _PDF_SUB_ARMS)}  "
         f"median={spend.cached_stacker_hits.get(ARM_MEDIAN, 0)}"
     )
     print()

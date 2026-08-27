@@ -1165,3 +1165,88 @@ class TestSurvivingFilter:
         )
         assert result["success"] is True
         assert result["n_forecasters_used"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: _stage_pdf cache keying (one cache read per SUB-arm, never the parent)
+# ---------------------------------------------------------------------------
+
+
+class TestStagePdfPerArmCacheKeying:
+    """The stage must route every qid through ``run_pdf_for_qid`` per sub-arm.
+
+    Regression guard for the parent-key read the stage used to do: a cache dir holding a
+    legacy ``arm_pdf.json`` had that single payload assigned to BOTH scoring arms, so the
+    per-arm payloads on disk went unread, the pdf_min1-vs-pdf_min2 comparison collapsed to
+    structurally-zero deltas, and the ``pdf_min1_mean`` diagnostic was never written.
+    """
+
+    def test_legacy_parent_cache_does_not_clobber_per_arm_payloads(self, tmp_path: Any) -> None:
+        from metaculus_bot.ablation.deterministic_arms import _stage_pdf
+        from metaculus_bot.ablation.run_pdf import ARM_PDF, ARM_PDF_MIN1, ARM_PDF_MIN2
+        from metaculus_bot.ablation.run_state import SpendReport, WorkingSet
+        from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
+
+        qid = 41585
+        cache = AblationCache(str(tmp_path))
+        # Legacy parent payload: a failure, as on the real qid 41585, while the min1 sibling
+        # on disk is a success. Reading the parent key loses that question for the min1 arm.
+        cache.write_stacker_output(
+            qid=qid,
+            arm=ARM_PDF,
+            payload=make_error_payload(
+                arm=ARM_PDF,
+                reason="insufficient_structured_forecasters",
+                model_used="structured_math",
+                n_forecasters=0,
+            ),
+        )
+        cache.write_stacker_output(
+            qid=qid,
+            arm=ARM_PDF_MIN1,
+            payload=make_success_payload(
+                arm=ARM_PDF_MIN1,
+                prediction={"type": "binary", "prob": 0.5339},
+                model_used="structured_math",
+                n_forecasters=1,
+            ),
+        )
+        cache.write_stacker_output(
+            qid=qid,
+            arm=ARM_PDF_MIN2,
+            payload=make_error_payload(
+                arm=ARM_PDF_MIN2,
+                reason="insufficient_structured_forecasters",
+                model_used="structured_math",
+                n_forecasters=1,
+            ),
+        )
+
+        working = WorkingSet()
+        working.questions[qid] = _make_binary_q(qid=qid)
+        working.forecaster_payloads[qid] = {
+            "model_a": _make_forecaster_payload(_binary_hazard_reasoning(rate=0.1)),
+            "model_b": _make_forecaster_payload(_binary_no_structure_reasoning()),
+        }
+        spend = SpendReport()
+
+        asyncio.run(_stage_pdf(working, cache, False, spend))
+
+        min1 = working.stacker_payloads[ARM_PDF_MIN1][qid]
+        min2 = working.stacker_payloads[ARM_PDF_MIN2][qid]
+        assert min1["arm"] == "pdf_min1"
+        assert min1["success"] is True
+        assert min1["stacker_prediction"]["prob"] == 0.5339
+        assert min2["arm"] == "pdf_min2"
+        assert min2["success"] is False
+        assert min1 is not min2
+
+        # The diagnostic sub-arm has no cache entry, so the stage must compute and write it.
+        mean_path = tmp_path / "stacker_outputs" / str(qid) / "arm_pdf_min1_mean.json"
+        assert mean_path.exists()
+        assert json.loads(mean_path.read_text(encoding="utf-8"))["arm"] == "pdf_min1_mean"
+
+        # Cache hits are counted per sub-arm, where the read happens — never under the parent.
+        assert spend.cached_stacker_hits.get(ARM_PDF_MIN1) == 1
+        assert spend.cached_stacker_hits.get(ARM_PDF_MIN2) == 1
+        assert ARM_PDF not in spend.cached_stacker_hits

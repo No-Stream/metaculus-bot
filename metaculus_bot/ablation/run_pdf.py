@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from forecasting_tools import (
@@ -68,6 +68,11 @@ from metaculus_bot.structured_output_schema import (
     NumericStructured,
     parse_structured_block,
 )
+
+if TYPE_CHECKING:
+    # run_state imports ARM_PDF_MIN1 / ARM_PDF_MIN2 from this module, so importing it back
+    # at runtime would be a cycle; SpendReport is only ever needed as an annotation.
+    from metaculus_bot.ablation.run_state import SpendReport
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -392,6 +397,7 @@ async def run_pdf_for_qid(
     min_forecasters: int = ABLATION_MIN_FORECASTERS,
     arm_label: str = ARM_PDF,
     aggregation: Literal["mean", "median"] = "median",
+    spend: SpendReport | None = None,
 ) -> dict:
     """Run the ARM_PDF deterministic structured-math arm for one question.
 
@@ -406,11 +412,19 @@ async def run_pdf_for_qid(
 
     The ``arm_label`` kwarg controls the arm name written to cache and to the
     output payload. Use ``ARM_PDF_MIN1`` / ``ARM_PDF_MIN2`` / ``ARM_PDF_MIN1_MEAN``
-    to write separate cache files for the dual-panel pdf analysis.
+    to write separate cache files for the dual-panel pdf analysis. This function is
+    the only cache authority for the pdf sub-arms: each label reads and writes its
+    own ``arm_<label>.json``, so no caller may read a pdf payload under another key.
+
+    ``spend`` is optional so the ~20 direct test call sites stay unaffected; when a
+    stage passes one, a cache hit bumps ``spend.cached_stacker_hits[arm_label]`` here,
+    where the read actually happens, so the reported hit counts cover every sub-arm.
     """
     if not force:
         cached = cache.read_stacker_output(qid=qid, arm=arm_label)
         if cached is not None:
+            if spend is not None:
+                spend.cached_stacker_hits[arm_label] = spend.cached_stacker_hits.get(arm_label, 0) + 1
             await asyncio.sleep(0)
             return cached
 

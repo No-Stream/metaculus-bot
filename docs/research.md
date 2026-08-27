@@ -27,7 +27,7 @@ Every question goes through `ResearchOrchestrator.run_research`
    recorded as a per-provider result and the rest proceed. Global concurrency is
    bounded by a semaphore sized by `DEFAULT_MAX_CONCURRENT_RESEARCH`.
 4. **Assembly.** Each provider's output is prefixed with a fixed `##` section
-   header (`_provider_header`, `research/orchestrator.py`) and the sections
+   header (`provider_header`, `research/section_format.py`) and the sections
    are joined with `---` rules. Any stray `#`/`##` heading inside a provider's
    body is demoted two levels so it never competes with the section headers.
 5. **Gap-fill.** Two second-pass gap-fill passes (v1 and v2) run concurrently on

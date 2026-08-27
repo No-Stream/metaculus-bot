@@ -16,7 +16,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
-from tests import ablation_cli_fakes as _fakes
 from tests.ablation_cli_fakes import (
     _binary_forecaster_payload,
     _binary_stacker_payload,
@@ -29,9 +28,6 @@ from tests.ablation_cli_fakes import (
     _numeric_forecaster_payload,
     _numeric_stacker_payload,
 )
-
-# Fixture bound by assignment rather than imported: see the ablation_cli_fakes docstring.
-cache_dir = _fakes.cache_dir
 
 # ---------------------------------------------------------------------------
 # Full pipeline happy path

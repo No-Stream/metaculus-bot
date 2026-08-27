@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -46,11 +45,6 @@ def _make_question(
         page_url=f"https://example.com/q/{qid}",
     )
     return cast(MetaculusQuestion, q)
-
-
-@pytest.fixture
-def cache(tmp_path: Path) -> AblationCache:
-    return AblationCache(tmp_path / "abl")
 
 
 def _install_mocks(

@@ -17,7 +17,6 @@ import pytest
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.backtest.scoring import GroundTruth
-from tests import ablation_cli_fakes as _fakes
 from tests.ablation_cli_fakes import (
     _binary_forecaster_payload,
     _binary_stacker_payload,
@@ -35,9 +34,6 @@ from tests.ablation_cli_fakes import (
     _numeric_stacker_payload,
     _populate_full_cache_for_qid,
 )
-
-# Fixture bound by assignment rather than imported: see the ablation_cli_fakes docstring.
-cache_dir = _fakes.cache_dir
 
 # ---------------------------------------------------------------------------
 # Task #23: forecast cache check is CONTENT-AWARE

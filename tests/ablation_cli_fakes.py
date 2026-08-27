@@ -3,9 +3,9 @@
 The CLI under test is ``metaculus_bot/ablation/cli.py``. It glues together every
 Wave 1-3 building block: question fetch, Gemini-only research, leakage screen,
 forecaster fan-out, two stacker arms, and paired-difference scoring. Eleven
-``tests/test_ablation_cli_*.py`` modules exercise one aspect each; every one of
-them builds questions, ground truths and stage payloads from this module, so one
-canonical copy keeps the shapes from drifting apart.
+``tests/ablation/test_ablation_cli_*.py`` modules exercise one aspect each; every
+one of them builds questions, ground truths and stage payloads from this module, so
+one canonical copy keeps the shapes from drifting apart.
 
 ``_install_full_stack_mocks`` is the reason no test here fires a live API call.
 It monkeypatches every wave-1/2/3 entry point ON ``metaculus_bot.ablation.cli``
@@ -17,18 +17,15 @@ by string target, so the CLI's own module attributes are what get replaced:
 * ``run_forecasters_batch`` (wave 3)
 * ``run_stacker_batch`` (wave 3)
 
-Not named ``test_*`` on purpose: pytest must import this module without
-collecting it. ``cache_dir`` is a fixture defined here and bound by ASSIGNMENT in
-each consumer (``cache_dir = _fakes.cache_dir``) rather than by import, because
-pyflakes reads a same-named fixture parameter as an F811 redefinition of an
-import.
+Not named ``test_*`` on purpose: pytest must import this module without collecting it.
+Holds no fixtures — the ``cache_dir`` these tests take lives in
+``tests/ablation/conftest.py`` alongside the rest of the directory's fixtures.
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -289,11 +286,6 @@ def _mc_stacker_payload(arm: str, p_red: float = 0.7) -> dict:
 # ---------------------------------------------------------------------------
 # Mock-installer helper for the full stack
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def cache_dir(tmp_path: Path) -> Path:
-    return tmp_path / "abl"
 
 
 def _build_question_set(questions_with_gt: list[tuple[Any, GroundTruth]]) -> BacktestQuestionSet:

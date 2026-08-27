@@ -37,7 +37,7 @@ lint:
 deps:
 	uv run deptry .
 
-# Import-direction contracts (import-linter). Five forbidden-direction contracts derived
+# Import-direction contracts (import-linter). Six forbidden-direction contracts derived
 # from the real grimp graph; see [tool.importlinter] in pyproject.toml for the rationale
 # on each. Sub-second, so it belongs in the normal loop rather than a pre-merge ritual.
 lint_imports:

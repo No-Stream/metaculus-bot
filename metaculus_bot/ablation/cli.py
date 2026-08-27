@@ -565,7 +565,7 @@ async def _stage_forecast(
     await asyncio.sleep(0)
     qids = sorted(working.research_blobs.keys())
 
-    lineup_name: str = getattr(args, "lineup", "free")
+    lineup_name: str = args.lineup
     forecaster_llms, lineup_models = get_lineup(lineup_name)
 
     cached_per_qid: dict[int, dict[str, dict]] = {}

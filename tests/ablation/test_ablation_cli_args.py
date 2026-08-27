@@ -13,11 +13,6 @@ from pathlib import Path
 
 import pytest
 
-from tests import ablation_cli_fakes as _fakes
-
-# Fixture bound by assignment rather than imported: see the ablation_cli_fakes docstring.
-cache_dir = _fakes.cache_dir
-
 # ---------------------------------------------------------------------------
 # Argparse tests
 # ---------------------------------------------------------------------------

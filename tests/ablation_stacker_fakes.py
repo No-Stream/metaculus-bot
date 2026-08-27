@@ -1,10 +1,10 @@
 """Shared fakes for the ablation stacker-runner test modules.
 
 Question factories, forecaster-payload factories and the coroutine driver shared by every
-``test_ablation_run_stacker*`` module. Split out of ``test_ablation_run_stacker.py``
-(3502 lines) so the per-aspect modules share one copy of the factories rather than
-redefining them. The common pytest fixtures live next door in
-``tests/ablation_stacker_fixtures.py``.
+``tests/ablation/test_ablation_run_stacker*`` module. Split out of
+``test_ablation_run_stacker.py`` (3502 lines) so the per-aspect modules share one copy of
+the factories rather than redefining them. Holds no fixtures — those live in
+``tests/ablation/conftest.py``, which covers the whole directory.
 """
 
 from __future__ import annotations

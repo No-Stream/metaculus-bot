@@ -13,9 +13,10 @@ Workflow per batch (default 10 questions per ``claude -p`` invocation):
 1. Build a single multi-question prompt describing the redactor's role,
    showing per-qid {question, resolution criteria, ground truth, raw blob},
    and demanding strict JSON output.
-2. Spawn ``claude -p`` via ``asyncio.create_subprocess_exec`` with flags
-   that disable hooks, plugins, and tools entirely (``--bare``, no
-   ``--allowedTools``, ``--max-turns 1``). Send the prompt on stdin.
+2. Spawn ``claude -p`` via the shared driver in ``ablation.claude_cli``
+   (``--max-turns 1``, and deliberately neither ``--bare`` nor
+   ``--allowedTools`` — see ``claude_cli._build_argv`` for why). Send the
+   prompt on stdin.
 3. Parse the JSON, validate per-qid:
    - qid must be in the input batch (drop unknowns with a warning).
    - sanitized_blob must be non-empty.
@@ -39,11 +40,17 @@ import re
 import secrets
 import subprocess
 from datetime import UTC, datetime
-from typing import Any, cast
 
 from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.ablation.cache import AblationCache
+from metaculus_bot.ablation.claude_cli import (
+    DEFAULT_CLAUDE_EXECUTABLE,
+    DEFAULT_TIMEOUT_SECONDS,
+    _build_argv,
+    _extract_inner_result,  # noqa: F401  # re-export: tests/test_ablation_prune.py imports prune._extract_inner_result
+    _run_claude_subprocess,
+)
 from metaculus_bot.backtest.scoring import GroundTruth
 
 __all__ = ["run_prune_for_qids", "verbatim_leak_check_passes"]
@@ -51,8 +58,6 @@ __all__ = ["run_prune_for_qids", "verbatim_leak_check_passes"]
 logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 10
-DEFAULT_TIMEOUT_SECONDS = 600
-DEFAULT_CLAUDE_EXECUTABLE = "claude"
 
 # Approximate cap on combined prompt + system-prompt characters before the
 # redactor invocation is expected to bust Claude's input context window. At
@@ -329,139 +334,15 @@ async def _invoke_claude_redactor(
 ) -> str:
     """Run ``claude -p`` headless with the redactor prompt on stdin; return stdout.
 
-    Flags:
-      -p / --print                 headless single-shot
-      --output-format text         plain text output (canonical pattern from a
-                                   sibling headless-Claude research harness; the
-                                   redactor's response IS JSON because we ask
-                                   for it in the prompt — we don't need an outer
-                                   JSON envelope wrapping it).
-      --max-turns 1                one shot
-      --permission-mode bypassPermissions   no permission prompts
-      --settings '{...}'           force-disable prompt-caching 1H beta (the
-                                   headless gateway rejects the
-                                   ``prompt-caching-2025-XX-XX`` beta header,
-                                   producing 400 invalid-beta-flag → exit 1).
-                                   Diagnosed 2026-05-06.
-      --append-system-prompt <s>   redactor system prompt
-
-    NOTE: we deliberately do NOT pass ``--bare``. The successful run #5 of this
-    pipeline DID use ``--bare`` but a follow-up run with the same flag set
-    failed — the precise cause is unclear, but the canonical pattern in that
-    sibling harness runs without ``--bare`` and is known to work for thousands
-    of headless invocations against the same gateway. Cargo-culting that
-    pattern.
-
-    Tools are NOT explicitly disabled here either — ``--max-turns 1`` already
-    constrains the model to one shot, and the system prompt instructs it to
-    output JSON only. Adding ``--allowedTools ""`` is a known-fragile flag in
-    non-interactive mode (per OpenRouter / Anthropic GitHub issues) and was the
-    only differing flag between run #5 (worked) and the latest failures —
-    dropping it.
+    Argv construction (including why we pass neither ``--bare`` nor
+    ``--allowedTools``) and the timeout/orphan-reap contract live in
+    ``ablation.claude_cli``.
 
     Raises ``subprocess.CalledProcessError`` on non-zero exit. Raises
     ``asyncio.TimeoutError`` if the subprocess exceeds ``timeout_seconds``.
     """
-    settings_json = json.dumps({"env": {"ENABLE_PROMPT_CACHING_1H": "0"}})
-    argv = [
-        claude_executable,
-        "-p",
-        "--output-format",
-        "text",
-        "--max-turns",
-        "1",
-        "--permission-mode",
-        "bypassPermissions",
-        "--settings",
-        settings_json,
-        "--append-system-prompt",
-        REDACTOR_SYSTEM_PROMPT,
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode("utf-8")),
-            timeout=timeout_seconds,
-        )
-    except TimeoutError:
-        # asyncio.wait_for cancels the awaitable but does NOT terminate the
-        # underlying OS subprocess. Without proc.kill(), the orphan keeps
-        # running until the model finishes on its own. At 50q x 3 iterations
-        # the leaked FDs + process slots compound until fork() starts failing.
-        logger.warning(
-            "claude -p subprocess timeout (%ss); killing pid=%s",
-            timeout_seconds,
-            proc.pid,
-        )
-        proc.kill()
-        try:
-            # await proc.wait() here to reap the killed child; the surrounding
-            # `raise` re-raises the original TimeoutError after cleanup. If the
-            # task itself is cancelled mid-await we still want the kill to have
-            # been issued (already done above), so the leak is bounded either
-            # way.
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except TimeoutError:
-            logger.error("claude -p subprocess pid=%s refused SIGKILL within 5s", proc.pid)
-        raise
-
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(
-            returncode=proc.returncode if proc.returncode is not None else -1,
-            cmd=argv,
-            output=stdout_bytes,
-            stderr=stderr_bytes,
-        )
-
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-    return _extract_inner_result(stdout_text)
-
-
-def _extract_inner_result(stdout_text: str) -> str:
-    """Pull the inner ``result`` field out of ``claude -p --output-format json``.
-
-    Empirically (``claude --version 2.1.140``), ``claude -p --output-format json``
-    emits a JSON ARRAY of stream events, the last of which is the result envelope:
-    ``[{"type":"system",...}, {"type":"assistant",...}, {"type":"result", "result":"<text>", ...}]``.
-    Older versions (or future revisions) may emit a single dict envelope. Handle both:
-
-    * list of events → find the last ``{"type":"result"}`` entry, return its ``result`` field.
-    * dict envelope → return its ``result`` field.
-    * anything else (e.g. test stubs returning raw redactor JSON) → pass through unchanged.
-    """
-    stripped = stdout_text.strip()
-    if not stripped:
-        return stripped
-    try:
-        envelope: Any = json.loads(stripped)
-    except json.JSONDecodeError:
-        # Passthrough preserved for backwards compat with raw-JSON test stubs;
-        # log a warning so a Claude-CLI envelope-shape change doesn't surface
-        # as a misleading downstream parser error.
-        logger.warning(
-            "claude -p stdout was not parseable JSON; returning raw (first 200 chars: %r)",
-            stripped[:200],
-        )
-        return stripped
-    if isinstance(envelope, list):
-        for raw_event in reversed(envelope):
-            if not isinstance(raw_event, dict):
-                continue
-            event = cast(dict[str, Any], raw_event)
-            if event.get("type") == "result" and isinstance(event.get("result"), str):
-                return event["result"]
-        return stripped
-    if isinstance(envelope, dict):
-        env_dict = cast(dict[str, Any], envelope)
-        if "result" in env_dict and isinstance(env_dict["result"], str):
-            return env_dict["result"]
-    return stripped
+    argv = _build_argv(REDACTOR_SYSTEM_PROMPT, claude_executable=claude_executable)
+    return await _run_claude_subprocess(argv, prompt, timeout_seconds=timeout_seconds)
 
 
 def _parse_redactor_response(

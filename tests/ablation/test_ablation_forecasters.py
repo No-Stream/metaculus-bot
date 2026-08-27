@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -94,11 +93,6 @@ def _make_numeric_question(qid: int = 3456) -> NumericQuestion:
         open_time=_OPEN,
         scheduled_resolution_time=_RESOLVE,
     )
-
-
-@pytest.fixture
-def cache(tmp_path: Path) -> AblationCache:
-    return AblationCache(tmp_path / "abl")
 
 
 def _make_forecaster_llms(count: int | None = None) -> list[GeneralLlm]:

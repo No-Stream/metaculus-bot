@@ -248,6 +248,34 @@ class TestProviderDetection:
         text = "## Web Research (Perplexity)\nPerplexity content"
         assert "perplexity" in detect_providers(text)
 
+    def test_resolution_source_header(self):
+        """Live in all four workflows since 2026-07-10, and unrecognized here until
+        the hand-copied header map was replaced by the pipeline's own."""
+        from scripts.backfill_research_from_logs import detect_providers
+
+        text = "## Resolution Source Snapshot\n### https://example.com\nfetched text"
+        assert "resolution_source" in detect_providers(text)
+
+    def test_timeseries_anchor_header(self):
+        """The other provider the hand-copied map had rotted out."""
+        from scripts.backfill_research_from_logs import detect_providers
+
+        text = "## Time Series Anchor\n**DGS10** — latest 4.20"
+        assert "timeseries_anchor" in detect_providers(text)
+
+    def test_every_provider_the_pipeline_can_render_is_decodable(self):
+        """The single-source-of-truth guard: this scan reads the pipeline's own
+        provider -> header map, so a provider added to the pipeline is decodable here
+        with no second edit. A re-introduced local copy fails this the moment the two
+        drift, which is exactly how resolution_source and timeseries_anchor went
+        missing from every record this writer produced."""
+        from metaculus_bot.research.section_format import PROVIDER_SECTION_HEADERS, provider_header
+        from scripts.backfill_research_from_logs import detect_providers
+
+        for provider_name in PROVIDER_SECTION_HEADERS:
+            rendered = f"{provider_header(provider_name)}\nbody text"
+            assert detect_providers(rendered) == [provider_name], provider_name
+
 
 class TestGapFillDetection:
     """Test detection of gap-fill usage from research text."""

@@ -4,7 +4,7 @@ Split out of ``test_ablation_run_stacker.py``. Covers primary→fallback hand-of
 raised error and a ``STACKER_SOFT_DEADLINE`` timeout), the ``--no-stacker-fallback``
 fail-fast contract, and the tertiary MEDIAN fallback that keeps a question publishable when
 both stackers fail. Factories come from ``tests/ablation_stacker_fakes.py``,
-fixtures from ``tests/ablation_stacker_fixtures.py``.
+fixtures from ``tests/ablation/conftest.py``.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from forecasting_tools import PredictedOptionList
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.run_stacker import ARM_STACK, run_stacker_for_arm
-from tests import ablation_stacker_fixtures as _fixtures
 from tests.ablation_stacker_fakes import (
     _binary_payload,
     _make_binary_q,
@@ -30,17 +29,6 @@ from tests.ablation_stacker_fakes import (
     _three_mc_forecasters,
     _three_numeric_forecasters,
 )
-
-# pytest registers a fixture under the module attribute name it finds it at, so the shared
-# fixtures are RE-BOUND here rather than imported: `import cache as _cache` would register
-# `_cache` and leave `cache` falling through to pytest's builtin cache fixture, while a
-# plain `import cache` trips ruff F811 against the same-named test-method parameters.
-cache = _fixtures.cache
-stacker_llm = _fixtures.stacker_llm
-fallback_stacker_llm = _fixtures.fallback_stacker_llm
-parser_llm = _fixtures.parser_llm
-_ensure_flag_unset = _fixtures._ensure_flag_unset
-
 
 # ===========================================================================
 # Primary -> fallback chain

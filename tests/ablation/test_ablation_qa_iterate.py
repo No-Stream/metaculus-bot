@@ -105,11 +105,6 @@ def _redactor_response(qid: int, sanitized_blob: str) -> str:
     return json.dumps(payload)
 
 
-@pytest.fixture
-def cache(tmp_path: Path) -> AblationCache:
-    return AblationCache(tmp_path / "abl")
-
-
 # ---------------------------------------------------------------------------
 # Per-qid loop behavior
 # ---------------------------------------------------------------------------
@@ -881,7 +876,11 @@ async def test_invoke_re_redactor_includes_verifier_notes_in_prompt(monkeypatch:
 
 def test_extract_inner_result_warns_on_unparseable_stdout(caplog: pytest.LogCaptureFixture) -> None:
     """When claude -p stdout is unparseable JSON, log a WARNING before
-    passing it through. Mirrors prune._extract_inner_result behavior.
+    passing it through.
+
+    The unwrapper itself now lives in ``ablation.claude_cli``; this exercises
+    it through the ``qa_iterate`` re-export, which is the name the stage's
+    other tests reach for.
     """
     import logging
 
@@ -1417,3 +1416,110 @@ class TestReRedactorVerbatimCheck:
 
         with pytest.raises(ValueError, match=r"66\.246"):
             _parse_re_redactor_response(raw, qid, gt)
+
+
+# ---------------------------------------------------------------------------
+# F6: the subprocess knobs reach the driver from a batch caller
+#
+# Before the driver was shared, ``run_qa_iterate_batch`` exposed neither
+# ``claude_executable`` nor ``timeout_seconds``, so ``_invoke_verifier``'s own
+# parameters were dead outside the test suite and the whole stage was pinned to
+# the 600s default while ``prune.run_prune_for_qids`` threaded both end-to-end.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_qa_iterate_batch_threads_subprocess_knobs(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``claude_executable`` / ``timeout_seconds`` must reach both invokers."""
+    from metaculus_bot.ablation import qa_iterate
+
+    qid = 990
+    verifier_calls: list[dict[str, Any]] = []
+    redactor_calls: list[dict[str, Any]] = []
+
+    async def _fake_verifier(prompt: str, **kwargs: Any) -> str:
+        verifier_calls.append(kwargs)
+        # leakage above threshold on iter 1 so the re-redactor also fires.
+        leakage = 0.9 if len(verifier_calls) == 1 else 0.05
+        return _verifier_response(qid, leakage_risk=leakage, forecastability=0.8, hallucination_risk=0.1)
+
+    async def _fake_redactor(prompt: str, **kwargs: Any) -> str:
+        redactor_calls.append(kwargs)
+        return _redactor_response(qid, "second-pass blob")
+
+    monkeypatch.setattr("metaculus_bot.ablation.qa_iterate._invoke_verifier", _fake_verifier)
+    monkeypatch.setattr("metaculus_bot.ablation.qa_iterate._invoke_re_redactor", _fake_redactor)
+
+    inputs = {
+        qid: {
+            "question": _make_question(qid),
+            "ground_truth": _make_ground_truth(qid),
+            "current_blob": "leaky blob",
+            "screen_verdict": _make_screen_verdict(is_leaked=False),
+        }
+    }
+
+    outcomes = await qa_iterate.run_qa_iterate_batch(
+        inputs,
+        cache=cache,
+        max_iterations=3,
+        claude_executable="/opt/custom/claude",
+        timeout_seconds=17,
+    )
+
+    assert outcomes[qid].final_status == "clean"
+    assert verifier_calls, "verifier never fired"
+    assert redactor_calls, "re-redactor never fired"
+    for kwargs in verifier_calls + redactor_calls:
+        assert kwargs["claude_executable"] == "/opt/custom/claude"
+        assert kwargs["timeout_seconds"] == 17
+
+
+@pytest.mark.asyncio
+async def test_invoke_verifier_honors_custom_executable_and_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The threaded knobs land on the argv and on the wait_for timeout."""
+    import asyncio
+
+    from metaculus_bot.ablation import qa_iterate
+
+    captured: dict[str, Any] = {}
+
+    async def fake_subproc(*args: Any, **kwargs: Any) -> Any:
+        captured["argv"] = list(args)
+        proc = SimpleNamespace()
+        proc.returncode = 0
+        proc.pid = 1
+
+        async def communicate(input: bytes | None = None) -> tuple[bytes, bytes]:  # noqa: A002  # mirrors asyncio subprocess communicate(input=...)
+            await asyncio.sleep(0)
+            return b'{"verdicts": []}', b""
+
+        proc.communicate = communicate
+        return proc
+
+    real_wait_for = asyncio.wait_for
+
+    # *args/**kwargs rather than a named `timeout=` parameter: ruff's ASYNC109
+    # rejects the latter on an async def, and this spy only needs to record
+    # whatever asyncio.wait_for was handed.
+    async def spying_wait_for(awaitable: Any, /, *args: Any, **kwargs: Any) -> Any:
+        captured.setdefault("timeouts", []).append(kwargs.get("timeout", args[0] if args else None))
+        return await real_wait_for(awaitable, *args, **kwargs)
+
+    monkeypatch.setattr("metaculus_bot.ablation.qa_iterate.asyncio.create_subprocess_exec", fake_subproc)
+    monkeypatch.setattr("metaculus_bot.ablation.qa_iterate.asyncio.wait_for", spying_wait_for)
+
+    result = await qa_iterate._invoke_verifier(
+        "a verifier prompt",
+        claude_executable="/opt/custom/claude",
+        timeout_seconds=23,
+    )
+
+    assert result == '{"verdicts": []}'
+    assert captured["argv"][0] == "/opt/custom/claude"
+    assert captured["timeouts"] == [23]

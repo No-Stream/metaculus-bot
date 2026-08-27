@@ -4,15 +4,18 @@ Encapsulates provider selection, the primary provider's fallback ladder, caching
 diagnostics seam, and the per-question time budget. The TemplateForecaster delegates
 run_research to an instance of this class.
 
-The stages that are self-contained live in sibling modules and are mixed back into
-``ResearchOrchestrator``, so every call form and patch surface is unchanged:
+The stages that are self-contained live in sibling modules as plain functions, called
+from here. The two that produce accounting RETURN it (a soft-fail reason, a
+``GapFillOutcome``) and this class owns the counters, which is what keeps the counters
+in one place while the stages stay callable without an orchestrator:
 
 * ``provider_fanout`` — running the selected providers under the research-phase deadline.
 * ``section_format`` — provider headers and heading levels in the assembled bundle.
 * ``asknews_summarization`` — the AskNews-only summarizer pass (it's the one provider
   that returns raw article text rather than LLM-written prose; all others pass through).
 * ``gap_fill_stages`` — the two optional gap-fill passes and their budget accounting.
-* ``degradation_views`` — read-only views onto the research side's module counters.
+* ``degradation_views`` — read-only views onto the research side's module counters,
+  re-exposed below as orchestrator attributes for the consumers that read them there.
 """
 
 import asyncio
@@ -46,9 +49,9 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
 from metaculus_bot.llm_retry import invoke_with_transient_retry
-from metaculus_bot.research.asknews_summarization import AskNewsSummarization
-from metaculus_bot.research.degradation_views import ResearchDegradationViews
-from metaculus_bot.research.gap_fill_stages import GapFillStages
+from metaculus_bot.research import degradation_views
+from metaculus_bot.research.asknews_summarization import summarize_asknews
+from metaculus_bot.research.gap_fill_stages import run_gap_fill_passes
 from metaculus_bot.research.provider_diagnostics import (
     SUCCEEDED_STATUSES,
     ProviderResult,
@@ -56,14 +59,14 @@ from metaculus_bot.research.provider_diagnostics import (
     pop_provider_detail,
     record_provider_detail,
 )
-from metaculus_bot.research.provider_fanout import ProviderFanout, _empty_provider
+from metaculus_bot.research.provider_fanout import _empty_provider, await_providers_within_deadline
 from metaculus_bot.research.providers import (
     ResearchCallable,
     choose_provider_with_name,
     is_asknews_subscription_error,
     native_search_provider,
 )
-from metaculus_bot.research.section_format import ResearchSectionFormatting, _demote_inner_headings
+from metaculus_bot.research.section_format import _demote_inner_headings, assemble_provider_sections
 from metaculus_bot.time_budget import QuestionTimeBudget
 
 # ``_demote_inner_headings`` moved to section_format but is still imported from this
@@ -76,13 +79,7 @@ _PROVIDER_ERROR_MESSAGE_MAX_CHARS = 300
 logger = logging.getLogger(__name__)
 
 
-class ResearchOrchestrator(
-    ProviderFanout,
-    ResearchSectionFormatting,
-    AskNewsSummarization,
-    GapFillStages,
-    ResearchDegradationViews,
-):
+class ResearchOrchestrator:
     """Manages research provider selection, parallel execution, caching, and gap-fill."""
 
     def __init__(
@@ -296,7 +293,7 @@ class ResearchOrchestrator(
         reached 292 s against the primary's 110 s measured worst case
         (scratch/residual_2026-08-24/time_budget_design.md). Anything still
         straggling past the research window is cancelled by
-        ``_await_providers_within_deadline`` with its partial bundle kept.
+        ``await_providers_within_deadline`` with its partial bundle kept.
         """
         providers: list[tuple[ResearchCallable, str]] = []
 
@@ -463,9 +460,48 @@ class ResearchOrchestrator(
                 latency_ms = int((time.monotonic() - started) * 1000)
                 return ("", self._failed_provider_result(name, e, latency_ms))
 
-        results = await self._await_providers_within_deadline(providers, _run_one, time_budget)
-        combined, provider_results = self._assemble_provider_sections(results)
+        results = await await_providers_within_deadline(providers, _run_one, time_budget)
+        combined, provider_results = assemble_provider_sections(results)
         return combined, provider_results, asknews_raw_holder.get("text", "")
+
+    async def _summarize_asknews(self, question: MetaculusQuestion, research: str) -> str:
+        """Summarize raw AskNews articles, counting a soft-fail on the way through.
+
+        ``summarize_asknews`` reports the degradation instead of counting it, so the
+        ``summarizer_failure_count`` the end-of-run degradation line reads is bumped
+        here. Kept as a method because it is the suite's class-level patch surface.
+        """
+        text, soft_fail_reason = await summarize_asknews(question, research, summarizer_llm=self._summarizer_llm)
+        if soft_fail_reason is not None:
+            self.summarizer_failure_count += 1
+        return text
+
+    async def _run_gap_fill_passes(
+        self,
+        question: MetaculusQuestion,
+        research: str,
+        *,
+        fast_path: bool,
+        time_budget: QuestionTimeBudget | None,
+    ) -> tuple[str, dict | None]:
+        """Run both gap-fill passes and absorb their accounting into this bot's counters.
+
+        ``gap_fill_stages`` returns what happened rather than counting it, so this is
+        the one place a v2 crash bumps ``gap_fill_v2_error_count`` and the one place a
+        budget cut reaches ``_record_research_budget_cut`` (whose per-question dedup and
+        fast-path suppression then apply once, however many stages were cut).
+        """
+        outcome = await run_gap_fill_passes(
+            question,
+            research,
+            fast_path=fast_path,
+            is_benchmarking=self._is_benchmarking,
+            time_budget=time_budget,
+        )
+        self.gap_fill_v2_error_count += outcome.v2_errors
+        if outcome.budget_cut:
+            self._record_research_budget_cut(question, fast_path=fast_path)
+        return outcome.research, outcome.v2_payload
 
     async def _fetch_research_with_fallback(
         self,
@@ -526,7 +562,7 @@ class ResearchOrchestrator(
         # expensive path). The primary selector orders by index quality, not cost,
         # which is why the two lists diverge by design.
         #
-        # The names returned here are the same keys ``_provider_header`` maps, so the
+        # The names returned here are the same keys ``provider_header`` maps, so the
         # section header follows the vendor automatically.
         try:
             if os.getenv(OPENROUTER_API_KEY_ENV):
@@ -609,3 +645,25 @@ class ResearchOrchestrator(
             f"\n\nThe question is: {question_text}"
         )
         return await searcher.invoke(prompt)
+
+    # The research side's degradation counters live in ``degradation_views``, along with
+    # their long "why is this alertable" rationales; these five one-liners are the
+    # orchestrator-attribute surface forecaster.py / cli.py / degradation_counters.py
+    # read them through.
+    @property
+    def prediction_market_degraded_count(self) -> int:
+        return degradation_views.prediction_market_degraded_count()
+
+    @property
+    def prediction_market_source_loss_count(self) -> int:
+        return degradation_views.prediction_market_source_loss_count()
+
+    @property
+    def provider_degradation_count(self) -> int:
+        return degradation_views.provider_degradation_count()
+
+    def log_provider_degradation_summary(self) -> None:
+        degradation_views.log_provider_degradation_summary()
+
+    def reset_run_degradation_counters(self) -> None:
+        degradation_views.reset_run_degradation_counters()

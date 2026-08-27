@@ -14,12 +14,14 @@ monkey-patch installation.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import Mock
 
 import pytest
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
 
+from metaculus_bot import scoring_diagnostics
+from metaculus_bot.scoring_diagnostics import McMissingKind
 from metaculus_bot.scoring_patches import (
     _extract_mc_community_probs,
     _extract_numeric_community_cdf,
@@ -55,7 +57,7 @@ def _question(api_json: Any, options: list[str] | None = None) -> Mock:
 
 @pytest.fixture(autouse=True)
 def _fresh_counters() -> None:
-    """The extractors bump module globals; every test starts from zero."""
+    """The extractors bump the process-wide counter singleton; every test starts from zero."""
     reset_scoring_path_stats()
 
 
@@ -332,3 +334,43 @@ class TestLogScoreScaleValidation:
             log_score_scale_validation([exploding])
 
         assert "Error in score scale validation" in caplog.text
+
+
+class TestScoringPathCounters:
+    """The ``scoring_diagnostics`` leaf both scoring halves bump.
+
+    These sit next to the extractor pins because the extractors are the heaviest caller of
+    ``record_mc_missing``, and because ``get_scoring_path_stats`` is the only thing that
+    ever reads the counters back.
+    """
+
+    def test_reset_zeroes_the_counters_in_place(self) -> None:
+        """Importers hold ``COUNTERS`` itself, so a rebind on reset would strand them all
+        on a stale object that nothing reports."""
+        held = scoring_diagnostics.COUNTERS
+        held.mc_attempts = 7
+        held.mc_missing_community = 3
+
+        reset_scoring_path_stats()
+
+        assert scoring_diagnostics.COUNTERS is held
+        stats = get_scoring_path_stats()
+        assert stats["mc_attempts"] == 0
+        assert stats["mc_missing_community"] == 0
+
+    @pytest.mark.parametrize("kind", get_args(McMissingKind))
+    def test_each_kind_bumps_its_own_breakdown_plus_the_rollup(self, kind: McMissingKind) -> None:
+        """``record_mc_missing`` maps ``kind`` onto ``mc_missing_<kind>`` by name, so every
+        member of the Literal has to correspond to a real counter field."""
+        scoring_diagnostics.record_mc_missing(kind)
+
+        stats = get_scoring_path_stats()
+        assert stats[f"mc_missing_{kind}"] == 1
+        assert stats["mc_missing_community"] == 1
+
+    def test_an_unattributed_miss_bumps_only_the_rollup(self) -> None:
+        scoring_diagnostics.record_mc_missing()
+
+        stats = get_scoring_path_stats()
+        assert stats["mc_missing_community"] == 1
+        assert all(stats[f"mc_missing_{kind}"] == 0 for kind in get_args(McMissingKind))

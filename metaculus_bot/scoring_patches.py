@@ -12,11 +12,10 @@ This module is used by ``community_benchmark.py`` AND the active
 Prefer ``backtest.py`` + ``metaculus_bot/backtest/scoring.py`` which score against
 actual question resolutions.
 
-Scope: the monkey-patch installers, the baseline-score math, and the run-wide diagnostic
-counters (the ``_MC_*`` / ``_NUMERIC_*`` globals that ``reset_scoring_path_stats`` clears
-and ``get_scoring_path_stats`` reports). The parsing layer that reads community forecasts
-off a question's ``api_json`` lives in ``metaculus_bot/scoring_extraction.py`` and is
-re-exported below; its MC extractors bump the counters here by name.
+Scope: the monkey-patch installers and the baseline-score math. The parsing layer that
+reads community forecasts off a question's ``api_json`` lives in
+``metaculus_bot/scoring_extraction.py``; the run-wide diagnostic counters both halves bump
+live in the ``metaculus_bot/scoring_diagnostics.py`` leaf. Both are re-exported below.
 """
 
 import logging
@@ -25,18 +24,24 @@ from typing import Any
 
 import numpy as np
 
+from metaculus_bot import scoring_diagnostics
+from metaculus_bot.scoring_diagnostics import (
+    get_scoring_path_stats,
+    log_scoring_path_stats,
+    reset_scoring_path_stats,
+)
 from metaculus_bot.scoring_extraction import (
     _extract_mc_community_probs,
     _extract_numeric_community_cdf,
     extract_multiple_choice_probabilities,
     extract_numeric_percentiles,
     log_mc_vector_mismatch,
-    validate_community_prediction_count,
 )
 
 # Re-exported for callers that have always imported them from this module path
 # (``community_benchmark``, ``analyze_correlations``, ``ensemble_simulator``, the test
-# suite). The parsing itself now lives in ``scoring_extraction``.
+# suite). The parsing itself now lives in ``scoring_extraction`` and the three
+# ``*_scoring_path_stats`` accessors in ``scoring_diagnostics``.
 __all__ = [
     "apply_scoring_patches",
     "calculate_multiple_choice_baseline_score",
@@ -51,102 +56,10 @@ __all__ = [
     "patch_multiple_choice_scoring",
     "patch_numeric_scoring",
     "reset_scoring_path_stats",
-    "validate_community_prediction_count",
 ]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-# Scoring path counters for diagnostics across a run
-_NUMERIC_PMF_ATTEMPTS = 0
-_NUMERIC_PMF_SUCCESSES = 0
-_NUMERIC_FALLBACK_ATTEMPTS = 0
-_NUMERIC_FALLBACK_SUCCESSES = 0
-_MC_ATTEMPTS = 0
-_MC_MISSING_COMMUNITY = 0
-_MC_SUCCESSES = 0
-# MC diagnostics breakdown
-_MC_MISSING_API_JSON = 0
-_MC_MISSING_QUESTION_NODE = 0
-_MC_MISSING_AGGREGATIONS = 0
-_MC_MISSING_PROB_YES_PER_CATEGORY = 0
-
-
-def reset_scoring_path_stats() -> None:
-    global _NUMERIC_PMF_ATTEMPTS, _NUMERIC_PMF_SUCCESSES
-    global _NUMERIC_FALLBACK_ATTEMPTS, _NUMERIC_FALLBACK_SUCCESSES
-    global _MC_ATTEMPTS, _MC_MISSING_COMMUNITY, _MC_SUCCESSES
-    global _MC_MISSING_API_JSON, _MC_MISSING_QUESTION_NODE, _MC_MISSING_AGGREGATIONS, _MC_MISSING_PROB_YES_PER_CATEGORY
-    _NUMERIC_PMF_ATTEMPTS = 0
-    _NUMERIC_PMF_SUCCESSES = 0
-    _NUMERIC_FALLBACK_ATTEMPTS = 0
-    _NUMERIC_FALLBACK_SUCCESSES = 0
-    _MC_ATTEMPTS = 0
-    _MC_MISSING_COMMUNITY = 0
-    _MC_SUCCESSES = 0
-    _MC_MISSING_API_JSON = 0
-    _MC_MISSING_QUESTION_NODE = 0
-    _MC_MISSING_AGGREGATIONS = 0
-    _MC_MISSING_PROB_YES_PER_CATEGORY = 0
-
-
-def get_scoring_path_stats() -> dict[str, float | int]:
-    total_numeric = _NUMERIC_PMF_ATTEMPTS + _NUMERIC_FALLBACK_ATTEMPTS
-    total_mc = _MC_ATTEMPTS
-    return {
-        "numeric_pmf_attempts": _NUMERIC_PMF_ATTEMPTS,
-        "numeric_pmf_successes": _NUMERIC_PMF_SUCCESSES,
-        "numeric_fallback_attempts": _NUMERIC_FALLBACK_ATTEMPTS,
-        "numeric_fallback_successes": _NUMERIC_FALLBACK_SUCCESSES,
-        "numeric_total": total_numeric,
-        "numeric_fallback_rate": ((_NUMERIC_FALLBACK_ATTEMPTS / total_numeric) if total_numeric > 0 else 0.0),
-        "mc_attempts": total_mc,
-        "mc_successes": _MC_SUCCESSES,
-        "mc_missing_community": _MC_MISSING_COMMUNITY,
-        "mc_missing_rate": ((_MC_MISSING_COMMUNITY / total_mc) if total_mc > 0 else 0.0),
-        # MC breakdown
-        "mc_missing_api_json": _MC_MISSING_API_JSON,
-        "mc_missing_question_node": _MC_MISSING_QUESTION_NODE,
-        "mc_missing_aggregations": _MC_MISSING_AGGREGATIONS,
-        "mc_missing_prob_yes_per_category": _MC_MISSING_PROB_YES_PER_CATEGORY,
-    }
-
-
-def log_scoring_path_stats() -> None:
-    stats = get_scoring_path_stats()
-    logger.info("=== SCORING PATH SUMMARY ===")
-    logger.info(
-        "Numeric: pmf_attempts=%d pmf_successes=%d fallback_attempts=%d fallback_successes=%d total=%d fallback_rate=%.2f",
-        stats["numeric_pmf_attempts"],
-        stats["numeric_pmf_successes"],
-        stats["numeric_fallback_attempts"],
-        stats["numeric_fallback_successes"],
-        stats["numeric_total"],
-        stats["numeric_fallback_rate"],
-    )
-    logger.info(
-        "MC: attempts=%d successes=%d missing_community=%d missing_rate=%.2f",
-        stats["mc_attempts"],
-        stats["mc_successes"],
-        stats["mc_missing_community"],
-        stats["mc_missing_rate"],
-    )
-    logger.info(
-        "MC missing breakdown: api_json=%d question_node=%d aggregations=%d prob_yes_per_category=%d",
-        stats["mc_missing_api_json"],
-        stats["mc_missing_question_node"],
-        stats["mc_missing_aggregations"],
-        stats["mc_missing_prob_yes_per_category"],
-    )
-
-    # Bright warnings when fallbacks dominate
-    if stats["numeric_total"] and stats["numeric_fallback_rate"] >= 0.8:
-        logger.warning(
-            "⚠️  ALERT: Numeric scoring fallback used for %.0f%% of items. Check that model predictions expose CDFs.",
-            100 * stats["numeric_fallback_rate"],
-        )
-    logger.info("=== END SCORING SUMMARY ===")
-
 
 _CACHE_MISS = object()
 
@@ -240,8 +153,6 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
     Returns:
         Baseline score or None if cannot be calculated
     """
-    global _MC_ATTEMPTS, _MC_SUCCESSES
-
     # Check cache first to avoid duplicate calculations
     q_id = getattr(report.question, "id_of_question", None)
     cached = _cached_baseline_score(cache, q_id, "multiple_choice", "MC")
@@ -249,7 +160,7 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
         return cached
 
     try:
-        _MC_ATTEMPTS += 1
+        scoring_diagnostics.COUNTERS.mc_attempts += 1
         # Extract bot prediction probabilities
         bot_probs, bot_option_names = extract_multiple_choice_probabilities(report.prediction)
         if not bot_probs:
@@ -278,7 +189,7 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
             return None
 
         final_score = _mc_expected_baseline_score(bot_probs, community_probs)
-        _MC_SUCCESSES += 1
+        scoring_diagnostics.COUNTERS.mc_successes += 1
 
         # Cache the result and log appropriately
         if cache is not None and q_id is not None:
@@ -378,9 +289,8 @@ def _score_numeric_from_declared_percentiles(
     report: Any, model_cdf_percentiles: Any, *, q_id: Any, cache: dict | None
 ) -> float | None:
     """Fallback path: approximate the bot PMF from declared percentiles, score vs uniform."""
-    global _NUMERIC_FALLBACK_ATTEMPTS
     try:
-        _NUMERIC_FALLBACK_ATTEMPTS += 1
+        scoring_diagnostics.COUNTERS.numeric_fallback_attempts += 1
         bounds = _numeric_bounds(report, "missing bounds, cannot calculate bins")
         if bounds is None:
             return None
@@ -409,9 +319,12 @@ def _score_numeric_from_declared_percentiles(
         # Create uniform community PMF (fallback when no community CDF)
         community_pmf = np.ones(len(bot_pmf)) / len(bot_pmf)
 
-        return _calculate_relative_numeric_score(
+        score = _calculate_relative_numeric_score(
             bot_pmf, community_pmf, total_range=upper_bound - lower_bound, q_id=q_id, cache=cache
         )
+        if score is not None:
+            scoring_diagnostics.COUNTERS.numeric_fallback_successes += 1
+        return score
 
     # Boundary: the fallback is already the degraded rung, so its own failure means
     # "no score for this question", never a failed benchmark run.
@@ -434,8 +347,7 @@ def _score_numeric_from_cdfs(
     report: Any, model_cdf_percentiles: Any, community_cdf: list[float], *, q_id: Any, cache: dict | None
 ) -> float | None:
     """Primary path: PMF-based relative scoring against the community distribution."""
-    global _NUMERIC_PMF_ATTEMPTS
-    _NUMERIC_PMF_ATTEMPTS += 1
+    scoring_diagnostics.COUNTERS.numeric_pmf_attempts += 1
 
     bounds = _numeric_bounds(report, "missing bounds for PMF scoring")
     if bounds is None:
@@ -453,9 +365,14 @@ def _score_numeric_from_cdfs(
     # Align lengths (guard, though both should be same length)
     m = min(len(bot_pmf), len(community_pmf))
 
-    return _calculate_relative_numeric_score(
+    score = _calculate_relative_numeric_score(
         bot_pmf[:m], community_pmf[:m], total_range=upper_bound - lower_bound, q_id=q_id, cache=cache
     )
+    # Each path owns its own success counter: ``_calculate_relative_numeric_score`` is shared,
+    # so a bump inside it lands on whichever counter it names and mis-attributes the other path.
+    if score is not None:
+        scoring_diagnostics.COUNTERS.numeric_pmf_successes += 1
+    return score
 
 
 def _calculate_relative_numeric_score(
@@ -497,9 +414,6 @@ def _calculate_relative_numeric_score(
         num_bins = max(2, len(bot_pmf))
         normalization = math.log(num_bins) / 1.5
         final_score = 100.0 * (expected_log_score / normalization + 1.0)
-
-        global _NUMERIC_PMF_SUCCESSES
-        _NUMERIC_PMF_SUCCESSES += 1
 
         # Cache the result and log appropriately
         if cache is not None and q_id is not None:
