@@ -4,6 +4,7 @@ import os
 import sys
 from typing import Any
 
+import litellm.exceptions
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.constants import (
@@ -502,8 +503,6 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     # 429 rate-limit: BYOK quotas are per-key, so primary being throttled does
     # NOT imply secondary is also throttled. Fall back immediately — litellm
     # already exhausted its internal retry budget before raising.
-    import litellm.exceptions  # noqa: PLC0415  # function-scoped: avoids formatter stripping unused top-level import
-
     if isinstance(exc, litellm.exceptions.RateLimitError):
         return True
 

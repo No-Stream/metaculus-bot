@@ -10,7 +10,8 @@ was one module; the per-venue design notes live in each submodule's docstring.
 below bind values, so ``setattr(venues, "KALSHI_PAGE_MAX_BYTES", 32)`` would rebind a copy nothing
 reads while the real bound stays live — patch ``venues.kalshi`` instead. Patching a FUNCTION on
 this package still works for callers that go through the package namespace, which is why
-``generation.py`` and ``prediction_market.py`` import the package and call ``venues.fn(...)``.
+``generation.py``, ``session_state.py`` and ``snapshot_stages.py`` import the package and call
+``venues.fn(...)``.
 
 Every path here serves a pipeline that hands its WHOLE candidate pool to one ranking call, which
 is what makes the per-venue decisions the shape they are. Recall is generation's job, selection

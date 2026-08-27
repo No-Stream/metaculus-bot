@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -61,9 +62,17 @@ from metaculus_bot.ablation.forecasters import (
 )
 from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
 from metaculus_bot.ablation.window_patch import patched_window_for_question
+from metaculus_bot.aggregation_strategies import (
+    AggregationStrategy,
+    combine_binary_predictions,
+    combine_multiple_choice_predictions,
+    combine_numeric_predictions,
+)
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
+from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.numeric.utils import bound_messages
+from metaculus_bot.numeric.validation import detect_unit_mismatch
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -259,8 +268,6 @@ def _is_finite_prediction(prediction_value: Any) -> bool:
     NaN/inf values explicitly so they don't poison the cross-model
     aggregator and bootstrap CIs downstream.
     """
-    import math  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # keep import resilient against formatter strip
-
     if not isinstance(prediction_value, dict):
         return False
     payload_type = prediction_value.get("type")
@@ -339,18 +346,14 @@ async def _dispatch_stacker(
             aggregated_tool_output=aggregated_tool_output,
         )
     if isinstance(question, NumericQuestion):
-        # Function-scoped imports survive Ruff's unused-import pass when added
-        # in the same edit as their usage; see AGENTS.md note on ``main.py``'s
-        # function-scoped imports for the same reason.
-        from metaculus_bot.exceptions import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            UnitMismatchError,  # HARNESS-SCAN-EXEMPT-function-level-import
-        )
-        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # function-scoped: see AGENTS.md
+        # Kept function-scoped for call-time lookup: tests patch
+        # ``metaculus_bot.numeric.pipeline.sanitize_percentiles`` on its SOURCE module and
+        # assert this dispatcher routes through it (test_ablation_run_stacker_dispatch.py,
+        # the "stacker numeric output goes through sanitize" case). A module-level from-import
+        # would bind the unpatched function at import time and the spy would never fire.
+        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # late import: tests patch numeric.pipeline.sanitize_percentiles at source
             build_numeric_distribution,
             sanitize_percentiles,
-        )
-        from metaculus_bot.numeric.validation import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # function-scoped: see AGENTS.md
-            detect_unit_mismatch,
         )
 
         upper_msg, lower_msg = bound_messages(question)
@@ -404,13 +407,6 @@ def _median_fallback_prediction(
     Marks the failure mode in the caller's logs; no internal logging
     here so the surrounding context (qid, arm) appears in one place.
     """
-    from metaculus_bot.aggregation_strategies import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # function-scoped: see AGENTS.md
-        AggregationStrategy,
-        combine_binary_predictions,
-        combine_multiple_choice_predictions,
-        combine_numeric_predictions,
-    )
-
     deserialized = [
         deserialize_prediction_value(payload["prediction_value"], question) for payload in surviving.values()
     ]

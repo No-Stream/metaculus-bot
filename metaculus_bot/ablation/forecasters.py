@@ -27,6 +27,7 @@ Design choices:
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import logging
 import random
 import re
@@ -59,6 +60,7 @@ from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import RESEARCHER_LLM, SUMMARIZER_LLM
 from metaculus_bot.llm_retry import llm_status_code
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 from metaculus_bot.question_types import question_type_of
 
 logger = logging.getLogger(__name__)
@@ -138,9 +140,6 @@ def _parse_retry_after_seconds(exc: BaseException) -> float | None:
       compute (target_time - now) clamped to >= 0 so a stale past-date sleeps
       nothing and retries immediately.
     """
-    import email.utils  # noqa: PLC0415  - keeps import resilient against ruff auto-strip during partial edits
-    from datetime import datetime  # noqa: PLC0415
-
     text = str(exc)
     match = _RETRY_AFTER_REGEX.search(text)
     if match is not None:
@@ -381,12 +380,6 @@ def deserialize_prediction_value(payload: dict[str, Any], question: MetaculusQue
                 "(missing 'cdf_probabilities' key). Re-run the forecaster stage "
                 "with --force-stages forecast to upgrade cached payloads."
             )
-        # Local import keeps pchip_processing out of the import-time graph for
-        # binary/MC paths (lighter cold-start when only those types are exercised).
-        from metaculus_bot.numeric.pchip_processing import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            create_pchip_numeric_distribution,
-        )
-
         declared = [
             Percentile(percentile=float(p["percentile"]), value=float(p["value"]))
             for p in payload["declared_percentiles"]

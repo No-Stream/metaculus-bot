@@ -1,58 +1,88 @@
+"""The four tools the gap-fill v2 driver calls, and the fetch ladder behind ``fetch``.
+
+This module owns the handlers (``search_news``, ``search_web``, ``fetch``,
+``read_document``), the ladder spine they run on — the plain hop loop with its redirect
+vetting, the headless-Chromium rendered rung with its DNS pinning, the window cache that
+serves ``start_char`` continuations — and ``build_gap_fill_tools``, whose list order is the
+order the driver sees.
+
+Support pieces live next door: ``tool_descriptions`` (driver-facing text + JSON schemas),
+``tool_backends`` (the AskNews / Exa / Gemini calls and their result formatting),
+``fetch_outcomes`` (classifying one plain HTTP response). The seams the suite monkeypatches
+— ``_read_response_body``, ``_fetch_plain``, ``_try_rendered_fetch``, ``_resolve_pinned_host``,
+``_run_document_read_sync``, ``read_document``, ``_READ_DOCUMENT_TIMEOUT_S``,
+``_RENDERED_FETCH_GLOBAL_SEMAPHORE`` — are attributes of THIS module and are resolved here at
+call time, so their callers stay here even where the callee moved out.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import ipaddress
 import logging
 import os
-import re
 from collections import OrderedDict
-from collections.abc import Mapping
-from dataclasses import dataclass
-from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import aiohttp
 
 from metaculus_bot.constants import (
-    ASKNEWS_BACKOFF_SECS,
+    ASKNEWS_BACKOFF_SECS,  # noqa: F401  # re-export: tests read the AskNews retry ladder's constants off this module
     ASKNEWS_CLIENT_ID_ENV,
-    ASKNEWS_MAX_TRIES,
+    ASKNEWS_MAX_TRIES,  # noqa: F401  # re-export: see ASKNEWS_BACKOFF_SECS above
     ASKNEWS_SECRET_ENV,
     EXA_API_KEY_ENV,
-    GAP_FILL_V2_MIN_CONTENT_CHARS,
-    GAP_FILL_V2_READER_MODEL,
     GOOGLE_API_KEY_ENV,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
-from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.agentic.fetch_outcomes import (
+    _DOCUMENT_NEEDED_MSG,
+    _HTML_CONTENT_TYPE_TOKENS,
+    _RETRYABLE_FETCH_BLOCK_STATUSES,
+    _TEXTUAL_CONTENT_TYPE_TOKENS,
+    PlainFetchResult,
+    _body_is_document,
+    _content_type_is_document,
+    _extract_links_from_html,
+    _fetch_plain_url_block,
+    _plain_html_outcome,
+    _plain_redirect_outcome,
+    _plain_textual_outcome,
+)
+from metaculus_bot.research.agentic.tool_backends import (
+    _call_asknews_search,
+    _call_exa_search,
+    _format_asknews_results,
+    _format_exa_results,
+    _run_document_read_sync,
+)
+from metaculus_bot.research.agentic.tool_descriptions import (
+    _FETCH_PARAMETERS,
+    _READ_DOCUMENT_PARAMETERS,
+    _SEARCH_NEWS_PARAMETERS,
+    _SEARCH_WEB_PARAMETERS,
+    FETCH_DESCRIPTION,
+    READ_DOCUMENT_DESCRIPTION,
+    SEARCH_NEWS_DESCRIPTION,
+    SEARCH_WEB_DESCRIPTION,
+)
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     MAX_REDIRECTS,
-    MAX_UNDECODABLE_CHAR_RATIO,
     REDIRECT_STATUSES,
     decode_text_body,
     read_body_capped,
 )
-from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
 logger = logging.getLogger(__name__)
 
 _FETCH_WINDOW_CHARS = 8000
 _FETCH_CACHE_MAX_ENTRIES = 50
-_FETCH_LINK_CAP = 25
-_FETCH_MIN_CONTENT_CHARS = GAP_FILL_V2_MIN_CONTENT_CHARS
 _RENDERED_FETCH_TIMEOUT_MS = 35_000
 _READ_DOCUMENT_TIMEOUT_S = 60.0
-# Client-side HTTP ceilings sized just UNDER the tools' loop budgets so the
-# underlying socket is torn down before the loop's asyncio.wait_for fires — a
-# hung endpoint then frees its slot instead of pinning it to the wall deadline.
-_EXA_HTTP_TIMEOUT_S = 18.0  # under search_web's ToolSpec timeout_s in build_gap_fill_tools
-_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # under _READ_DOCUMENT_TIMEOUT_S, read_document's own deadline
-_EXA_RETRY_DELAYS_S = (1.0, 4.0)
-_EXA_GLOBAL_SEMAPHORE = asyncio.Semaphore(4)
 # Process-global cap on concurrent headless Chromium launches. Module-level, so
 # the bound spans all questions running under the orchestrator's Semaphore(6):
 # each Chromium is ~100-300MB, the driver's parallel_tool_calls can request many
@@ -64,163 +94,6 @@ _FETCH_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 _FETCH_TEXT_CACHE: OrderedDict[str, str] = OrderedDict()
 _FETCH_LINKS_CACHE: OrderedDict[str, list[str]] = OrderedDict()
 _PLAYWRIGHT_WARNED = False
-
-SEARCH_NEWS_DESCRIPTION = (
-    "Search recent and historical NEWS coverage (AskNews). Use for: events,\n"
-    "announcements, things that happened, ongoing-situation updates. Query with a\n"
-    "short natural-language phrase, not keywords. Returns a digest of matching\n"
-    "articles with dates and URLs. Use search_web instead for: reports, datasets,\n"
-    "official documents, niche/technical facts, or anything where the best source\n"
-    "is not a news article.\n"
-    'Example: search_news(query="Nauru parliament treaty ratification vote")'
-)
-
-SEARCH_WEB_DESCRIPTION = (
-    "Semantic web search (Exa). Use for: official documents, datasets, reports,\n"
-    "organizational pages, technical/niche facts, finding a primary source you\n"
-    "believe exists. Returns results with URLs and relevant excerpts. Follow up\n"
-    "promising results with fetch(url) — excerpts are often not enough to verify\n"
-    "a claim. Use search_news instead for event/news coverage.\n"
-    'Example: search_web(query="IAEA safeguards report Iran enrichment June 2026 pdf")'
-)
-
-FETCH_DESCRIPTION = (
-    "Fetch a URL and return its main content as concise markdown, plus a list of\n"
-    "outbound links. Handles ordinary pages, JavaScript-heavy pages, PDFs, and\n"
-    "images automatically (the result's `method` field tells you how it was\n"
-    "read) — do NOT avoid a URL because of its format. Content over the size cap\n"
-    "is truncated, ending with `[truncated at N of M chars — call again with\n"
-    "start_char=N]`; pass start_char to read the next window (continuations are\n"
-    "served from cache — they are cheap and do not refetch). Links in the result\n"
-    "are leads you can fetch next.\n"
-    "Use read_document instead only when you need a specific question answered\n"
-    "from inside a long/complex document.\n"
-    "Do NOT fetch metaculus.com URLs — the question brief already reflects them.\n"
-    'Example: fetch(url="https://www.ons.gov.uk/releases/gdpquarterly")\n'
-    'Example: fetch(url="https://example.gov/long-report", start_char=12000)'
-)
-
-READ_DOCUMENT_DESCRIPTION = (
-    "Ask a specific question of a specific document (Gemini reads the URL —\n"
-    "handles PDFs, images, and JS pages natively). Slower and costlier than\n"
-    "fetch: use it when you need targeted extraction from a long or complex\n"
-    "document, or when fetch returned status=blocked/js_wall/error for a URL you\n"
-    "still need. Always pass a precise `ask`.\n"
-    'Example: read_document(url="https://example.gov/report-q2.pdf",\n'
-    '                       ask="What is the reported unemployment rate for May 2026, and what revision to April is stated?")'
-)
-
-_SEARCH_NEWS_PARAMETERS = {
-    "type": "object",
-    "properties": {"query": {"type": "string"}},
-    "required": ["query"],
-    "additionalProperties": False,
-}
-
-_SEARCH_WEB_PARAMETERS = {
-    "type": "object",
-    "properties": {
-        "query": {"type": "string"},
-        "end_published_date": {"type": ["string", "null"]},
-    },
-    "required": ["query"],
-    "additionalProperties": False,
-}
-
-_FETCH_PARAMETERS = {
-    "type": "object",
-    "properties": {
-        "url": {"type": "string"},
-        "start_char": {"type": "integer", "minimum": 0},
-    },
-    "required": ["url"],
-    "additionalProperties": False,
-}
-
-_READ_DOCUMENT_PARAMETERS = {
-    "type": "object",
-    "properties": {
-        "url": {"type": "string"},
-        "ask": {"type": "string"},
-    },
-    "required": ["url", "ask"],
-    "additionalProperties": False,
-}
-
-_PDF_CONTENT_TYPE_TOKENS = ("application/pdf",)
-_IMAGE_CONTENT_TYPE_PREFIXES = ("image/",)
-_RETRYABLE_FETCH_BLOCK_STATUSES = {403, 406, 429}
-_TEXTUAL_CONTENT_TYPE_TOKENS = ("text/plain", "text/csv", "application/json")
-_HTML_CONTENT_TYPE_TOKENS = ("text/html", "application/xhtml+xml")
-_RATE_LIMIT_RE = re.compile(r"\b(429|rate[\s-]?limit|too many requests|over limit|quota)\b", re.IGNORECASE)
-
-
-@dataclass(slots=True)
-class PlainFetchResult:
-    status: str
-    method: str
-    text: str
-    links: list[str]
-    url: str
-    content_type: str | None = None
-    escalate_rendered: bool = False
-
-
-class _LinkCollector(HTMLParser):
-    def __init__(self, *, base_url: str, cap: int) -> None:
-        super().__init__(convert_charrefs=True)
-        self._base_url = base_url
-        self._cap = cap
-        self._links: list[str] = []
-        self._seen: set[str] = set()
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if len(self._links) >= self._cap or tag.lower() != "a":
-            return
-        href = None
-        for name, value in attrs:
-            if name.lower() == "href":
-                href = value
-                break
-        if not href:
-            return
-        absolute = urljoin(self._base_url, href)
-        parsed = urlparse(absolute)
-        if parsed.scheme not in ("http", "https"):
-            return
-        if absolute in self._seen:
-            return
-        self._seen.add(absolute)
-        self._links.append(absolute)
-
-    @property
-    def links(self) -> list[str]:
-        return list(self._links)
-
-
-def _stringify(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if hasattr(value, "isoformat"):
-        try:
-            return str(value.isoformat())
-        except TypeError:
-            return str(value)
-    return str(value)
-
-
-def _mapping_or_attrs_get(item: object, *names: str) -> Any:
-    if isinstance(item, Mapping):
-        for name in names:
-            if name in item:
-                return item[name]
-        return None
-    for name in names:
-        if hasattr(item, name):
-            return getattr(item, name)
-    return None
 
 
 def _host_gate(url: str) -> asyncio.Semaphore:
@@ -257,80 +130,6 @@ def _fetch_from_cache(url: str, start_char: int) -> ToolOutcome | None:
     links = list(_FETCH_LINKS_CACHE.get(url, []))
     window, truncated = _slice_fetch_window(cached, start_char)
     return ToolOutcome(content_markdown=window, links=links, method="cache", truncated=truncated)
-
-
-def _content_type_is_document(content_type: str | None) -> bool:
-    if not content_type:
-        return False
-    lowered = content_type.lower()
-    if any(token in lowered for token in _PDF_CONTENT_TYPE_TOKENS):
-        return True
-    return any(lowered.startswith(prefix) for prefix in _IMAGE_CONTENT_TYPE_PREFIXES)
-
-
-def _body_is_document(body: bytes) -> bool:
-    stripped = body.lstrip()
-    if stripped.startswith(b"%PDF-"):
-        return True
-    return stripped.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a"))
-
-
-def _extract_links_from_html(html: str, base_url: str) -> list[str]:
-    parser = _LinkCollector(base_url=base_url, cap=_FETCH_LINK_CAP)
-    parser.feed(html)
-    parser.close()
-    return parser.links
-
-
-def _format_asknews_results(articles: list[Any]) -> str:
-    if not articles:
-        return "No AskNews articles found."
-    lines: list[str] = []
-    for article in articles:
-        title = _stringify(_mapping_or_attrs_get(article, "eng_title", "title")) or "Untitled article"
-        date = _stringify(_mapping_or_attrs_get(article, "pub_date"))
-        source = _stringify(_mapping_or_attrs_get(article, "source_id")) or "unknown"
-        url = _stringify(_mapping_or_attrs_get(article, "article_url"))
-        summary = _stringify(_mapping_or_attrs_get(article, "summary"))
-        lines.append(f"### {title}")
-        if date:
-            lines.append(f"Date: {date}")
-        lines.append(f"Source: {source}")
-        if url:
-            lines.append(f"URL: {url}")
-        if summary:
-            lines.append(f"Summary: {summary}")
-        lines.append("")
-    lines.pop()
-    return "\n".join(lines)
-
-
-def _format_exa_results(results: list[Any]) -> str:
-    if not results:
-        return "No Exa results found."
-    lines: list[str] = []
-    for result in results:
-        title = _stringify(_mapping_or_attrs_get(result, "title")) or "Untitled result"
-        url = _stringify(_mapping_or_attrs_get(result, "url"))
-        published = _stringify(_mapping_or_attrs_get(result, "published_date", "publishedDate"))
-        highlights_raw = _mapping_or_attrs_get(result, "highlights")
-        if isinstance(highlights_raw, str):
-            highlights = [highlights_raw]
-        elif isinstance(highlights_raw, list):
-            highlights = [_stringify(item) for item in highlights_raw if _stringify(item)]
-        else:
-            highlights = []
-        lines.append(f"### {title}")
-        if url:
-            lines.append(f"URL: {url}")
-        if published:
-            lines.append(f"Published: {published}")
-        if highlights:
-            lines.append("Highlights:")
-            lines.extend(f"- {highlight}" for highlight in highlights)
-        lines.append("")
-    lines.pop()
-    return "\n".join(lines)
 
 
 def _format_fetch_error(message: str, *, status: str = "error", method: str = "plain") -> ToolOutcome:
@@ -374,257 +173,8 @@ def _warn_playwright_unavailable_once(exc: BaseException) -> None:
     logger.warning("agentic fetch rendered rung unavailable: %s: %s", type(exc).__name__, exc)
 
 
-def _is_rate_limited_error(exc: BaseException) -> bool:
-    """Generic 429/rate-limit/quota classifier (Exa and AskNews retry paths)."""
-    return bool(_RATE_LIMIT_RE.search(str(exc)))
-
-
-async def _asknews_search_with_retry(sdk: Any, query: str, tries: int, backoff: float) -> list[Any]:
-    """Issue the AskNews search over an open SDK session, retrying only transient throttling.
-
-    Split out of :func:`_call_asknews_search` so the retry ladder is not nested
-    inside the semaphore + SDK context managers.
-    """
-    last_exc: Exception | None = None
-    for attempt in range(1, tries + 1):
-        try:
-            await research_providers.asknews_rate_gate()
-            response = await sdk.news.search_news(
-                query=query,
-                n_articles=6,
-                return_type="both",
-                strategy="news knowledge",
-            )
-            return list(response.as_dicts or [])
-        except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
-            last_exc = exc
-            # Transient-only retry, matching the primary provider's ``_is_retryable``
-            # (``providers.py``). The 403011 subscription-inactive error is PERMANENT —
-            # off-season billing, not throttling — so it must NOT be exempted here: re-rolling
-            # it burns the whole ``ASKNEWS_MAX_TRIES`` ladder of ``ASKNEWS_BACKOFF_SECS``
-            # sleeps (a double-digit fraction of GAP_FILL_V2_WALL_DEADLINE, since the sleep
-            # below grows as 3**attempt) on a call that can never succeed.
-            if not _is_rate_limited_error(exc) and "concurrency limit" not in str(exc).lower():
-                raise
-            if attempt >= tries:
-                raise
-            await asyncio.sleep(backoff * (10 + 3**attempt))
-    if last_exc is not None:
-        raise last_exc
-    return []
-
-
-async def _call_asknews_search(query: str) -> list[Any]:
-    from asknews_sdk import AsyncAskNewsSDK  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-
-    client_id = os.getenv(ASKNEWS_CLIENT_ID_ENV)
-    secret = os.getenv(ASKNEWS_SECRET_ENV)
-    if not client_id or not secret:
-        raise ValueError(f"Missing AskNews credentials: {ASKNEWS_CLIENT_ID_ENV} / {ASKNEWS_SECRET_ENV}")
-
-    tries = max(1, int(ASKNEWS_MAX_TRIES))
-    backoff = float(ASKNEWS_BACKOFF_SECS)
-    semaphore = research_providers.get_asknews_semaphore()
-
-    async with semaphore, AsyncAskNewsSDK(client_id=client_id, client_secret=secret, scopes={"news"}) as sdk:
-        return await _asknews_search_with_retry(sdk, query, tries, backoff)
-
-
-async def _run_exa_search(query: str, end_published_date: str | None) -> Any:
-    import httpx  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-    from exa_py import AsyncExa  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-
-    api_key = os.getenv(EXA_API_KEY_ENV)
-    if not api_key:
-        raise ValueError(f"Missing Exa API key: {EXA_API_KEY_ENV}")
-    client = AsyncExa(api_key=api_key)
-    # Inject a client-side-bounded httpx client (the SDK's default timeout is
-    # 600s): a hung Exa endpoint gives up at _EXA_HTTP_TIMEOUT_S instead of
-    # pinning the coroutine to the loop's wall deadline. The async client also
-    # means no worker thread to leak — the old to_thread path could strand a
-    # hung sync `requests` call in the shared ThreadPoolExecutor.
-    client._client = httpx.AsyncClient(base_url=client.base_url, headers=client.headers, timeout=_EXA_HTTP_TIMEOUT_S)
-    kwargs: dict[str, Any] = {
-        "query": query,
-        "type": "auto",
-        "num_results": 8,
-        "contents": {"highlights": True},
-    }
-    if end_published_date is not None:
-        kwargs["end_published_date"] = end_published_date
-    try:
-        return await client.search(**kwargs)
-    finally:
-        await client._client.aclose()
-
-
-async def _call_exa_search(query: str, end_published_date: str | None) -> list[Any]:
-    async with _EXA_GLOBAL_SEMAPHORE:
-        for attempt in range(len(_EXA_RETRY_DELAYS_S) + 1):
-            try:
-                response = await _run_exa_search(query, end_published_date)
-                results = _mapping_or_attrs_get(response, "results")
-                return list(results) if isinstance(results, list) else []
-            except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
-                if attempt >= len(_EXA_RETRY_DELAYS_S) or not _is_rate_limited_error(exc):
-                    raise
-                await asyncio.sleep(_EXA_RETRY_DELAYS_S[attempt])
-    return []
-
-
 async def _read_response_body(resp: aiohttp.ClientResponse, label: str) -> bytes | None:
     return await read_body_capped(resp, max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES, label=label)
-
-
-_METACULUS_FETCH_BLOCK_MSG = (
-    "Metaculus pages are already reflected in the question brief; do not fetch metaculus.com URLs."
-)
-
-
-def _fetch_plain_url_block(url: str) -> PlainFetchResult | None:
-    """Reject a URL the plain rung must not dial, or None when it is fetchable.
-
-    Runs on the caller-supplied URL and again on every redirect hop, so a 3xx
-    cannot walk into a target the initial check would have refused.
-    """
-    # Block metaculus.com from our runner IP. Question pages are a JS SPA whose
-    # near-empty plain fetch would auto-escalate to headless Chromium, whose
-    # route guard then permits the SPA's own XHR fan-out to the Metaculus API —
-    # all from our IP, on the same host the critical API calls use. Blocking here
-    # (before _get_session) kills both our-IP rungs; rendered only runs after a
-    # plain fetch. The brief already embeds the resolution criteria these URLs
-    # would yield. (read_document is Gemini's IP, not ours, so it is not gated.)
-    if resolution_source.is_metaculus_self_ref(url):
-        return PlainFetchResult(
-            status="blocked",
-            method="plain",
-            text=_METACULUS_FETCH_BLOCK_MSG,
-            links=[],
-            url=url,
-        )
-    return None
-
-
-async def _plain_redirect_outcome(
-    resp: aiohttp.ClientResponse, current_url: str, content_type: str
-) -> PlainFetchResult | str:
-    """Vet a 3xx hop: return the next URL to follow, or a terminal blocked/error result."""
-    location = resp.headers.get("Location") if resp.headers else None
-    if not location:
-        return PlainFetchResult(
-            status="error",
-            method="plain",
-            text=f"Malformed redirect from {current_url}",
-            links=[],
-            url=current_url,
-            content_type=content_type or None,
-        )
-    next_url = urljoin(current_url, location)
-    if not await resolution_source.is_public_http_url(next_url):
-        return PlainFetchResult(
-            status="blocked",
-            method="plain",
-            text="Blocked non-public redirect target.",
-            links=[],
-            url=next_url,
-            content_type=content_type or None,
-        )
-    # A 3xx to metaculus.com must not be followed either (same
-    # our-IP / no-new-info rationale as the initial-URL block).
-    blocked = _fetch_plain_url_block(next_url)
-    if blocked is not None:
-        return PlainFetchResult(
-            status=blocked.status,
-            method=blocked.method,
-            text=blocked.text,
-            links=[],
-            url=next_url,
-            content_type=content_type or None,
-        )
-    return next_url
-
-
-async def _plain_html_outcome(body: bytes, html: str, content_type: str, current_url: str) -> PlainFetchResult:
-    """Outcome for an HTML body: trafilatura main text plus the page's links."""
-    extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, current_url)
-    text = extracted or ""
-    links = _extract_links_from_html(html, current_url)
-    if not text.strip():
-        # No extractable text on a 200 OK (JS wall, consent
-        # gate, empty body). A distinct "empty" status keeps
-        # the ladder escalating to the rendered rung while
-        # barring this outcome from the status=="ok" tier
-        # grant — an unread page must never be "fetched".
-        return PlainFetchResult(
-            status="empty",
-            method="plain",
-            text="Plain fetch returned no extractable text.",
-            links=links,
-            url=current_url,
-            content_type=content_type or None,
-            escalate_rendered=True,
-        )
-    return PlainFetchResult(
-        status="ok",
-        method="plain",
-        text=text,
-        links=links,
-        url=current_url,
-        content_type=content_type or None,
-        escalate_rendered=len(text.strip()) < _FETCH_MIN_CONTENT_CHARS,
-    )
-
-
-def _plain_textual_outcome(
-    html: str, undecodable_ratio: float, content_type: str, current_url: str
-) -> PlainFetchResult:
-    """Outcome for a raw text/CSV/JSON body: tags stripped, no link extraction."""
-    if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO:
-        # The decode failed rather than the text being slightly
-        # dirty (BOM-less UTF-16, an undeclared 8-bit codec):
-        # what we hold is replacement chars and NULs, not the
-        # page. Shipping it as "ok" would hand the driver
-        # mojibake as a read source. "empty" keeps the ladder
-        # escalating to the rendered rung — the browser's own
-        # charset sniffing can rescue what a declared-charset
-        # decode could not — while barring the tier grant.
-        return PlainFetchResult(
-            status="empty",
-            method="plain",
-            text="Plain fetch could not decode the body as text.",
-            links=[],
-            url=current_url,
-            content_type=content_type or None,
-            escalate_rendered=True,
-        )
-    # Same allow-listed tag strip the Tier-1 raw-body branches run:
-    # a Datawrapper poll CSV measured 69% `<a href=...>` markup, so
-    # without it the driver's max_result_chars budget buys tags
-    # instead of rows, and the inflated length also defeats the
-    # short-content escalation heuristic below.
-    text = resolution_source.strip_html_tags(html).strip()
-    if not text:
-        return PlainFetchResult(
-            status="empty",
-            method="plain",
-            text="Plain fetch returned no extractable text.",
-            links=[],
-            url=current_url,
-            content_type=content_type or None,
-            escalate_rendered=True,
-        )
-    return PlainFetchResult(
-        status="ok",
-        method="plain",
-        text=text,
-        links=[],
-        url=current_url,
-        content_type=content_type or None,
-        escalate_rendered=len(text) < _FETCH_MIN_CONTENT_CHARS,
-    )
-
-
-_DOCUMENT_NEEDED_MSG = "This URL is a PDF or image — use read_document(url, ask) to read it."
 
 
 async def _plain_response_outcome(resp: aiohttp.ClientResponse, current_url: str) -> PlainFetchResult | str:
@@ -932,45 +482,6 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # top-level soft-fail for the rendered fetch rung: any browser failure falls back to plain / read_document
         _warn_playwright_unavailable_once(exc)
         return None
-
-
-def _build_document_prompt(ask: str) -> str:
-    return (
-        f"{ask}\n\n"
-        "Answer using verbatim quotes from the document whenever possible. Include the document's stated dates. "
-        "If the document does not address the ask, say that plainly."
-    )
-
-
-def _run_document_read_sync(url: str, ask: str) -> tuple[str, int]:
-    """Read ``url`` via Gemini url_context. Returns ``(text, n_url_retrievals_that_succeeded)``.
-
-    The retrieval count is returned, not discarded, because the text alone cannot tell a
-    real document read from a fluent answer out of parametric memory — Gemini produces
-    both happily, and ``read_document`` grants the highest verification tier the artifact
-    renderer has. Same reader the grounded-search provider uses for the same reason (see
-    ``research/url_context_telemetry``).
-    """
-    from google import genai  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-    from google.genai import types as genai_types  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-
-    api_key = os.getenv(GOOGLE_API_KEY_ENV)
-    if not api_key:
-        raise ValueError(f"Missing Google API key: {GOOGLE_API_KEY_ENV}")
-    # Client-side timeout (ms) so a hung Gemini endpoint returns the thread —
-    # read_document runs this sync call under asyncio.to_thread, and wait_for
-    # cancels the coroutine but can't cancel the thread; without this ceiling a
-    # stuck endpoint leaks the worker into the shared ThreadPoolExecutor.
-    client = genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=_READ_DOCUMENT_HTTP_TIMEOUT_MS))
-    tools: list[Any] = [{"url_context": {}}]
-    config = genai_types.GenerateContentConfig(tools=tools)
-    response = client.models.generate_content(
-        model=GAP_FILL_V2_READER_MODEL,
-        contents=f"{_build_document_prompt(ask)}\n\nURL: {url}",
-        config=config,
-    )
-    _, _, n_url_success, _ = extract_url_context_telemetry(response)
-    return (_stringify(getattr(response, "text", "")) or "", n_url_success)
 
 
 async def search_news(query: str) -> ToolOutcome:

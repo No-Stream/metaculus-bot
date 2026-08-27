@@ -200,6 +200,8 @@ max-nested-blocks = 4
 "community_benchmark.py" = ["T201"]
 "main.py" = ["T201"]
 "metaculus_bot/ablation/cli.py" = ["T201"]
+# The ablation CLI's end-of-run spend/results block, split out of cli.py.
+"metaculus_bot/ablation/reporting.py" = ["T201"]
 "metaculus_bot/check_openrouter_credits.py" = ["T201"]
 "metaculus_bot/performance_analysis/cli.py" = ["T201"]
 # Monkey-patch modules: module-global state IS the design (patch flags, counters

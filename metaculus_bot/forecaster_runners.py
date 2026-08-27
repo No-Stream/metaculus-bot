@@ -36,6 +36,7 @@ from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_
 from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc
 from metaculus_bot.numeric.validation import detect_unit_mismatch
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
+from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 from metaculus_bot.structured_parse import parse_structured
 from metaculus_bot.value_extraction import extract_binary, extract_mc, extract_numeric
 
@@ -251,11 +252,6 @@ async def _resolve_discrete_vote(
     Fall back to the OutcomeTypeResult parser call when the block is missing or doesn't
     declare outcome_type.
     """
-    from metaculus_bot.structured_output_schema import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # function-scoped: see AGENTS.md
-        NumericStructured,
-        parse_structured_block,
-    )
-
     discrete_vote: bool | None = None
     block = parse_structured_block(reasoning, "numeric")
     if isinstance(block, NumericStructured) and block.outcome_type is not None:

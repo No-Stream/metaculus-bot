@@ -38,6 +38,7 @@ from metaculus_bot.llm_configs import (
     SUMMARIZER_LLM,
 )
 from metaculus_bot.publish_hardening import apply_publish_hardening
+from metaculus_bot.research.persistence import ResearchPersistenceWriter
 
 logger = logging.getLogger(__name__)
 
@@ -166,10 +167,6 @@ def main() -> None:
     research_writer = None
     research_sink = None
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
-        from metaculus_bot.research.persistence import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-            ResearchPersistenceWriter,
-        )
-
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,
             tournament_id=str(TOURNAMENT_ID),

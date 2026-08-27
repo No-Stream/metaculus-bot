@@ -663,7 +663,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "research_phase_deadline",
-        # Research-phase deadline WARN (research/orchestrator.py
+        # Research-phase deadline WARN (research/provider_fanout.py
         # _await_providers_within_deadline): the outer budget bound cancelled
         # straggler providers. Carries no question ref — the line names counts and
         # provider names only — so qid_kind stays None; the cancelled providers also
@@ -676,7 +676,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "gap_fill_skipped_for_budget",
-        # Per-QUESTION gap-fill skip (research/orchestrator.py): both passes dropped
+        # Per-QUESTION gap-fill skip (research/gap_fill_stages.py): both passes dropped
         # up front, either on the fast path or because the research phase had no
         # budget left. ``research_phase_remaining`` is "n/a" (fast path — never
         # computed) or "NNNs".
@@ -688,7 +688,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "gap_fill_cut_for_budget",
-        # Per-QUESTION mid-phase gap-fill cut (research/orchestrator.py): the pass
+        # Per-QUESTION mid-phase gap-fill cut (research/gap_fill_stages.py): the pass
         # STARTED and was then cancelled at the research-phase deadline — the one
         # budget event recoverable from nothing else once GHA logs expire (the
         # up-front skip above and the fast path both have their own records).

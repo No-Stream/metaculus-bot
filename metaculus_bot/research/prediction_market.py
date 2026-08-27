@@ -3,8 +3,8 @@
 Retrieves markets from Polymarket + Kalshi + Manifold + PredictIt that bear on a Metaculus
 question, and returns a `MarketSnapshot` the forecaster reads as a peer cross-check. The
 retrieval machinery lives in `metaculus_bot.research.market_retrieval`; this module owns the
-provider seam, the per-session caches, the degradation counters, the aiohttp session factory,
-and the one retry-wrapped LLM invocation both LLM stages share.
+provider seam, the snapshot orchestrator, both telemetry markers, and the one retry-wrapped LLM
+invocation the two LLM stages share.
 
 Four stages per question:
 
@@ -14,6 +14,12 @@ Four stages per question:
     2.5 ENRICH        one Manifold detail GET per candidate, for the rules text
     3   POOL ASSEMBLY three channels unioned; channel order IS the ranking
     4   RANK          one LLM call over the whole pool, up to 8 rows, model's order
+
+The stages that make no LLM call live next door: `market_retrieval.session_state` holds the
+per-session caches, the degradation counters, the aiohttp session factory and the two catalogue
+prefetches, and `market_retrieval.snapshot_stages` holds the per-question context, the source
+ledger, venue search, pool assembly and the post-rank accounting. Both are re-exported here,
+because this module is the seam every outside consumer and every test patches against.
 
 Two measured facts shaped this, and both are things NOT to "improve" (the bake-off receipts
 are in `scratch/bakeoff_run_2026-08-03/results/`):
@@ -56,8 +62,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -78,15 +82,43 @@ from metaculus_bot.constants import (
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import MARKET_QUERY_AUTHOR_LLM_CONFIG, MARKET_RANKER_LLM_CONFIG
 from metaculus_bot.llm_retry import invoke_with_transient_retry
-from metaculus_bot.research.http_fetch import build_session
-from metaculus_bot.research.market_retrieval import generation, ranking, rendering, venues
+from metaculus_bot.research.market_retrieval import generation, ranking, rendering
 from metaculus_bot.research.market_retrieval.http import HTTP_RETRY_BACKOFF_SECS, PLATFORM_HTTP_TIMEOUT
 from metaculus_bot.research.market_retrieval.queries import (
     build_query_author_prompt,
     dedupe_queries,
     deterministic_queries,
     parse_query_author,
-    strip_dates_and_numbers,
+)
+
+# The process-scoped state lives in `session_state`, imported here because THIS module is the
+# patch surface: `prediction_market._get_session` is what tests replace and what
+# `fetch_market_snapshot` reads, and `prediction_market._KALSHI_CACHE` is the same dict object the
+# prefetches read. The names with no local caller are re-exports for the orchestrator's
+# degradation properties — which import them from HERE at call time, so a test patching them here
+# is still what the orchestrator sees — and for the test suite.
+from metaculus_bot.research.market_retrieval.session_state import (
+    _KALSHI_CACHE,  # noqa: F401  # re-export: tests assert on the cache's TTL-pinning behaviour
+    _PREDICTIT_CACHE,  # noqa: F401  # re-export
+    _SNAPSHOT_CACHE,
+    _bump_kalshi_catalogue_failure,  # noqa: F401  # re-export: tests seed the counter through the seam
+    _bump_source_loss,
+    _get_session,
+    _kalshi_catalogue,
+    _predictit_universe,
+    _reset_session_caches,  # noqa: F401  # re-export: the test-suite + session-start reset hook
+    kalshi_catalogue_fetch_failures,  # noqa: F401  # re-export: read by the orchestrator's alertable count
+    prediction_market_source_losses,  # noqa: F401  # re-export: read by the orchestrator's alertable count
+    reset_series_degradation_counter,  # noqa: F401  # re-export: called at run start by forecast_questions
+    reset_source_loss_counter,  # noqa: F401  # re-export: called at run start by forecast_questions
+)
+from metaculus_bot.research.market_retrieval.snapshot_stages import (
+    _assemble_pool_stage,
+    _pool_positions,
+    _PrefetchResult,
+    _record_venue_health,
+    _run_venue_search_stage,
+    _SnapshotContext,
 )
 
 # The row types and the liquidity vocabulary live in the market_retrieval package; this module
@@ -107,29 +139,11 @@ from metaculus_bot.research.market_retrieval.types import (
     _liquidity_label,  # noqa: F401  # re-export
 )
 from metaculus_bot.research.provider_diagnostics import is_lost_source, record_provider_detail
-from metaculus_bot.research.provider_health import (
-    VENUE_EXPECTED_LIQUIDITY_FIELDS,
-    VenueObservation,
-    record_catalogue_size,
-    record_venue_observation,
-)
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
 from metaculus_bot.time_utils import _as_utc
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Module constants
-# ---------------------------------------------------------------------------
-
-# Catalogue cache TTLs. Both venues are enumerated whole and re-enumerating them per question
-# would dominate the snapshot's budget, so the pull is once per process per 6h.
-KALSHI_CACHE_TTL_S = 6 * 60 * 60
-PREDICTIT_CACHE_TTL_S = 6 * 60 * 60
-
-# The venues whose own search index is the only way in, in the order stage 2 fans out.
-_SEARCH_VENUES: tuple[str, ...] = ("polymarket", "manifold")
 
 
 # Worst-case wall clock for one snapshot, computed from the same constants the stages use so a
@@ -152,129 +166,6 @@ SNAPSHOT_STAGE_BUDGET_S: float = (
     + generation.MANIFOLD_DETAIL_WALL_S
     + _llm_stage_worst(MARKET_RANKER_WALL_TIMEOUT, MARKET_RANKER_BACKOFFS)
 )
-
-
-# ---------------------------------------------------------------------------
-# Per-source diagnostics tokens
-# ---------------------------------------------------------------------------
-
-
-def _platform_source_token(matches: list[MarketMatch], tally: _FetchTally) -> str:
-    """Classify one platform's outcome as an `ok(N)` / `none` / loss source token.
-
-    `none` is reserved for "every sub-fetch succeeded and nothing matched" — the one benign
-    empty outcome `provider_diagnostics.is_lost_source` does not flag. So a lost sub-fetch has
-    to produce a loss token even when other sub-fetches returned matches: otherwise a total
-    outage reads as a healthy `none`, and a platform that lost one of two queries reads as a
-    clean `ok(N)`.
-    """
-    if tally.failed:
-        if tally.ok == 0:
-            return "error(all_queries_failed)"
-        return f"partial({tally.ok}/{tally.ok + tally.failed})"
-    return f"ok({len(matches)})" if matches else "none"
-
-
-# ---------------------------------------------------------------------------
-# Per-session caches (module-scoped; reset via `_reset_session_caches`)
-# ---------------------------------------------------------------------------
-
-# Kalshi projected-events catalogue: (timestamp_monotonic, events_list).
-_KALSHI_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-# PredictIt markets cache: (timestamp_monotonic, markets_list).
-_PREDICTIT_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-# Snapshot cache keyed by (qid, as_of_iso). The as_of leg keeps backtest runs at different
-# as-of instants from sharing a snapshot computed at one as-of; on the provider path as_of is
-# None, which is what finally makes this cache hittable (the old `datetime.now(utc)` branch
-# changed the key on every call).
-_SNAPSHOT_CACHE: dict[tuple[int, str], MarketSnapshot] = {}
-
-# Per-run count of failed Kalshi CATALOGUE pulls. The catalogue is the generation backbone —
-# it feeds both the settlement-source join and the fuzzy channel — and the provider soft-fails,
-# so without a counter a dead pull is INVISIBLE (the 2026-07-25 observability hole:
-# research_provider_failures=0 while a Kalshi path was dead). The orchestrator folds this into
-# alertable_count, so a catalogue that dies every question reddens CI. A one-off transient
-# bumps it once, an accepted rare false alarm mirroring gap_fill_v2_error_count.
-#
-# This counter and `_SOURCE_LOSSES` both bump on a failed pull, so one catalogue outage adds 2
-# to alertable_count. That is deliberate over-counting rather than a bug: the two counters
-# carry different marker fields, and the point of either is that CI goes red.
-#
-# Module-level like the caches => accumulates per run; reset between tests.
-_KALSHI_CATALOGUE_FETCH_FAILURES: int = 0
-
-
-def _bump_kalshi_catalogue_failure() -> None:
-    global _KALSHI_CATALOGUE_FETCH_FAILURES  # noqa: PLW0603  # per-run counter for a stateless provider; see the constant's comment
-    _KALSHI_CATALOGUE_FETCH_FAILURES += 1
-
-
-def kalshi_catalogue_fetch_failures() -> int:
-    """Per-run count of failed Kalshi catalogue pulls (folded into alertable_count)."""
-    return _KALSHI_CATALOGUE_FETCH_FAILURES
-
-
-def reset_series_degradation_counter() -> None:
-    """Zero the catalogue-degradation counter at run start.
-
-    The provider is a stateless callable, so the counter lives at module scope; without a
-    run-start reset it would leak across runs sharing one process (and across tests, polluting
-    every later alertable_count == 0 assertion). Called from forecast_questions alongside
-    reset_pchip_stats — same per-run cadence. The name is unchanged from when this counter
-    tracked the retired /series fetch, because the orchestrator imports it by name."""
-    global _KALSHI_CATALOGUE_FETCH_FAILURES  # noqa: PLW0603  # module-scoped counter needs a run-start reset; see docstring
-    _KALSHI_CATALOGUE_FETCH_FAILURES = 0
-
-
-# Per-run count of LOST prediction-market SOURCES: one per venue whose fan-out lost a
-# sub-fetch, one per whole-provider failure (snapshot timeout, outer-except), one when the
-# query author comes back unusable, and one when the ranking call does. Those last two are why
-# this counts SOURCES rather than venues: a dead ranker degrades every venue's contribution
-# without any venue failing. The causes are distinguished per-source in
-# `MarketSnapshot.sources` (`ranking:error(...)` vs `polymarket:error(...)`), which rides both
-# the published comment and the schema-v2 research archive.
-#
-# Operator decision 2026-07-25: alert on ANY source loss rather than only a total blackout —
-# maximum sensitivity, accepting that one flaky venue can redden most runs. The provider
-# soft-fails internally, so like the catalogue counter this is the only path by which an outage
-# reaches CI. Module-level like the caches => accumulates per run.
-_SOURCE_LOSSES: int = 0
-
-
-def _bump_source_loss() -> None:
-    global _SOURCE_LOSSES  # noqa: PLW0603  # per-run counter for a stateless provider; see the constant's comment
-    _SOURCE_LOSSES += 1
-
-
-def prediction_market_source_losses() -> int:
-    """Per-run count of lost prediction-market sources (folded into alertable_count)."""
-    return _SOURCE_LOSSES
-
-
-def reset_source_loss_counter() -> None:
-    """Zero the source-loss counter at run start (see
-    `reset_series_degradation_counter` for why module-scoped counters need this)."""
-    global _SOURCE_LOSSES  # noqa: PLW0603  # module-scoped counter needs a run-start reset; see docstring
-    _SOURCE_LOSSES = 0
-
-
-def _reset_session_caches() -> None:
-    """Clear all per-session caches. Called between tests and at session start."""
-    global _KALSHI_CATALOGUE_FETCH_FAILURES, _SOURCE_LOSSES  # noqa: PLW0603  # per-session caches/counters live at module scope; tests reset them here
-    _KALSHI_CACHE.clear()
-    _PREDICTIT_CACHE.clear()
-    _SNAPSHOT_CACHE.clear()
-    _KALSHI_CATALOGUE_FETCH_FAILURES = 0
-    _SOURCE_LOSSES = 0
-
-
-def _get_session() -> aiohttp.ClientSession:
-    """Construct a fresh aiohttp session. Patched in tests.
-
-    No headers arg: the JSON APIs get aiohttp's default UA (flipping to a browser UA is a
-    separate experiment — see the resolution-source plan).
-    """
-    return build_session(timeout_s=PLATFORM_HTTP_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -326,71 +217,6 @@ async def _invoke_market_llm(
 
 
 # ---------------------------------------------------------------------------
-# Stage 1a — catalogue prefetches
-# ---------------------------------------------------------------------------
-
-
-async def _kalshi_catalogue(session: Any, *, qid: int | None) -> tuple[list[dict[str, Any]], str]:
-    """The complete projected Kalshi open-events catalogue, cached ~6h.
-
-    Returns ``(events, source_token)``; the token is what says whether the pull succeeded, so
-    there is nothing for a separate boolean to disagree with. The completeness-gated write below
-    is the ONLY writer, deliberately: the read path checks the TTL and nothing else, so any
-    incremental warm would pin an error-truncated — often EMPTY — list carrying a fresh
-    timestamp, and every later question in the run would then read it back as a healthy
-    `ok(N)` with no HTTP and no counter bump. A partial pull is still returned to THIS question,
-    which is what keeps a lost page from costing the caller the pages that did arrive.
-    """
-    cached = _KALSHI_CACHE.get("events")
-    if cached is not None:
-        timestamp, events = cached
-        if (time.monotonic() - timestamp) < KALSHI_CACHE_TTL_S:
-            if qid is not None:
-                record_catalogue_size(qid=qid, source="kalshi_events", entries=len(events), fetch_ok=True)
-            return events, f"ok({len(events)})" if events else "none"
-
-    pull = await venues.kalshi_prefetch_events(session)
-    if pull.complete:
-        _KALSHI_CACHE["events"] = (time.monotonic(), pull.events)
-    else:
-        _bump_kalshi_catalogue_failure()
-
-    # A pull that reports SUCCESS and hands pool assembly an empty catalogue is a contradiction
-    # the pool size alone cannot show (it looks identical to "the venue had nothing to say"),
-    # and an empty catalogue now zeroes the settlement join AND the fuzzy channel.
-    if qid is not None:
-        record_catalogue_size(qid=qid, source="kalshi_events", entries=len(pull.events), fetch_ok=pull.complete)
-    if not pull.complete:
-        return pull.events, pull.token or "error(unknown)"
-    return pull.events, f"ok({len(pull.events)})" if pull.events else "none"
-
-
-async def _predictit_universe(session: Any, *, qid: int | None) -> tuple[list[dict[str, Any]], _FetchTally]:
-    """PredictIt's whole ~197-market dump, cached ~6h. One unpaginated GET.
-
-    The tally carries the None-vs-`[]` distinction forward: a failed fetch is a lost source,
-    while a successful fetch of an empty dump is Signal C's business.
-    """
-    cached = _PREDICTIT_CACHE.get("markets")
-    if cached is not None:
-        timestamp, markets = cached
-        if (time.monotonic() - timestamp) < PREDICTIT_CACHE_TTL_S:
-            if qid is not None:
-                record_catalogue_size(qid=qid, source="predictit_markets", entries=len(markets), fetch_ok=True)
-            return markets, _FetchTally(ok=1)
-
-    markets = await venues.predictit_prefetch(session)
-    if markets is None:
-        # A failed fetch is already the source-loss counter's business; recording a catalogue
-        # observation here too would double-count one outage (see provider_health Signal C).
-        return [], _FetchTally(failed=1)
-    if qid is not None:
-        record_catalogue_size(qid=qid, source="predictit_markets", entries=len(markets), fetch_ok=True)
-    _PREDICTIT_CACHE["markets"] = (time.monotonic(), markets)
-    return markets, _FetchTally(ok=1)
-
-
-# ---------------------------------------------------------------------------
 # Stage 1b — the query author (concurrent with 1a)
 # ---------------------------------------------------------------------------
 
@@ -419,27 +245,6 @@ async def _authored_queries(title: str, resolution_criteria: str) -> tuple[tuple
     if not extra:
         return (), "error(unusable)"
     return extra, f"ok({len(extra)})"
-
-
-# ---------------------------------------------------------------------------
-# Stage 2 — venue-native search
-# ---------------------------------------------------------------------------
-
-
-async def _search_venue(session: Any, venue: str, queries: list[str]) -> list[list[MarketMatch] | None | BaseException]:
-    """Every query against one venue's own index, in parallel, results in query order.
-
-    The per-result `None`-vs-`[]` contract is preserved all the way to pool assembly: `None`
-    means the fetch failed, `[]` means it parsed to nothing. That is what makes one venue's 403
-    on one long query degrade THAT QUERY and nothing else — not the venue's other queries, and
-    not the question. A raised query stays in the list for the same reason — `flatten_results`
-    counts it as one lost sub-query rather than letting it take the venue down.
-    """
-    fetcher = venues.polymarket_search if venue == "polymarket" else venues.manifold_search
-    width = generation.RETRIEVAL_WIDTH[venue]
-    return list(
-        await asyncio.gather(*(fetcher(session, query, width=width) for query in queries), return_exceptions=True)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -584,86 +389,6 @@ async def fetch_market_snapshot(
     return snapshot
 
 
-class _SourceLedger:
-    """Per-source outcome tokens for the provider-diagnostics line, plus the alertable losses.
-
-    Owns the ONE place a loss is counted, so no stage can report a source twice or
-    bump the counter without naming the source in the WARN.
-    """
-
-    def __init__(self) -> None:
-        # The four venues plus `manifold_detail`, `query_author` and `ranking`.
-        # Single-threaded asyncio => distinct keys, no race.
-        self.tokens: dict[str, str] = {}
-        self.lost: list[str] = []
-
-    def record_loss(self, name: str, token: str) -> None:
-        self.tokens[name] = token
-        self.lost.append(f"{name}={token}")
-        _bump_source_loss()
-
-    def report(self, name: str, token: str) -> None:
-        """Record one source's token, routing a loss through the counter.
-
-        Skips a source already reported: a stage that RAISED is one loss, and
-        recording its default token on top would either overwrite the diagnosis or bump twice.
-        """
-        if name in self.tokens:
-            return
-        if is_lost_source(token):
-            self.record_loss(name, token)
-        else:
-            self.tokens[name] = token
-
-
-@dataclass(frozen=True)
-class _SnapshotContext:
-    """Everything the four stages read off the question, resolved once up front."""
-
-    question: Any
-    session: aiohttp.ClientSession
-    platforms: tuple[str, ...]
-    as_of: datetime | None
-    # Every provider-health observation is keyed on the question, so a question with no id
-    # records nothing (matching record_provider_detail / record_raw_research).
-    qid: int | None
-    title: str
-    resolution_criteria: str
-    fine_print: str
-    ledger: _SourceLedger
-
-    @classmethod
-    def build(
-        cls,
-        question: Any,
-        *,
-        session: aiohttp.ClientSession,
-        platforms: tuple[str, ...],
-        as_of: datetime | None,
-    ) -> _SnapshotContext:
-        return cls(
-            question=question,
-            session=session,
-            platforms=platforms,
-            as_of=as_of,
-            qid=getattr(question, "id_of_question", None),
-            title=getattr(question, "title", None) or getattr(question, "question_text", "") or "",
-            resolution_criteria=getattr(question, "resolution_criteria", "") or "",
-            fine_print=getattr(question, "fine_print", "") or "",
-            ledger=_SourceLedger(),
-        )
-
-
-@dataclass(frozen=True)
-class _PrefetchResult:
-    """Stage-1 output: the LLM's extra queries plus the two enumerable catalogues."""
-
-    extra_queries: tuple[str, ...]
-    kalshi_events: list[Any]
-    predictit_markets: list[dict[str, Any]]
-    predictit_tally: _FetchTally
-
-
 async def _run_prefetch_stage(ctx: _SnapshotContext) -> _PrefetchResult:
     """Stage 1a PREFETCH ‖ stage 1b QUERY AUTHOR, concurrently."""
     stage_one: dict[str, asyncio.Task[Any]] = {
@@ -704,84 +429,6 @@ async def _run_prefetch_stage(ctx: _SnapshotContext) -> _PrefetchResult:
         predictit_markets=predictit_markets,
         predictit_tally=predictit_tally,
     )
-
-
-async def _run_venue_search_stage(
-    ctx: _SnapshotContext, all_queries: list[str]
-) -> dict[str, list[list[MarketMatch] | None | BaseException]]:
-    """Stage 2 VENUE SEARCH over the conjunctive venues, dropping any that raised.
-
-    The enumerable venues score against the RAW query set (a year is real signal against a
-    catalogue of dated market titles); the conjunctive venues get every query stripped of
-    digit-bearing tokens, because Manifold's `term` is a strict conjunction and one date
-    token no market's text carries returns [].
-    """
-    conjunctive_queries = dedupe_queries([strip_dates_and_numbers(query) for query in all_queries])
-    search_tasks = {
-        venue: asyncio.create_task(_search_venue(ctx.session, venue, conjunctive_queries))
-        for venue in _SEARCH_VENUES
-        if venue in ctx.platforms
-    }
-    search_outcomes = dict(
-        zip(search_tasks, await asyncio.gather(*search_tasks.values(), return_exceptions=True), strict=True)
-    )
-    venue_search_results: dict[str, list[list[MarketMatch] | None | BaseException]] = {}
-    for venue, outcome in search_outcomes.items():
-        if isinstance(outcome, BaseException):
-            logger.warning(f"Venue {venue} search raised (soft-fail): {type(outcome).__name__}: {outcome}")
-            ctx.ledger.record_loss(venue, f"error({type(outcome).__name__})")
-            continue
-        venue_search_results[venue] = outcome
-    return venue_search_results
-
-
-async def _assemble_pool_stage(
-    ctx: _SnapshotContext,
-    all_queries: list[str],
-    prefetch: _PrefetchResult,
-    venue_search_results: dict[str, list[list[MarketMatch] | None | BaseException]],
-) -> tuple[generation.PoolResult, dict[str, list[MarketMatch]]]:
-    """Stage 3 POOL ASSEMBLY (CPU-bound, off the event loop) plus stage 2.5 ENRICH.
-
-    Reports each venue's post-assembly token, then enriches Manifold: its search listing
-    carries no description, so without this every Manifold candidate reaches the ranker
-    title-only — and the prompt's stated "single most reliable cue" is the settlement/rules
-    text. Enrichment mutates the pool rows in place, so it MUST run before the prompt is
-    built and before apply_picks copies them.
-    """
-    # `resolution_criteria` + `fine_print` together, because the fine print is where a question
-    # often names the actual release page the settlement join keys on.
-    pool = await generation.build_pool(
-        criteria_text=f"{ctx.resolution_criteria}\n{ctx.fine_print}",
-        queries=all_queries,
-        kalshi_events=prefetch.kalshi_events,
-        predictit_markets=prefetch.predictit_markets,
-        venue_search_results=venue_search_results,
-        as_of=ctx.as_of,
-    )
-    pool_by_venue: dict[str, list[MarketMatch]] = {}
-    for row in pool.candidates:
-        pool_by_venue.setdefault(row.platform, []).append(row)
-
-    for venue in _SEARCH_VENUES:
-        if venue in venue_search_results:
-            tally = pool.per_venue_tally.get(venue, _FetchTally())
-            ctx.ledger.report(venue, _platform_source_token(pool_by_venue.get(venue, []), tally))
-    if "predictit" in ctx.platforms:
-        ctx.ledger.report(
-            "predictit", _platform_source_token(pool_by_venue.get("predictit", []), prefetch.predictit_tally)
-        )
-
-    enrichment = await generation.enrich_manifold(pool.candidates, ctx.session)
-    if enrichment.n_attempted == 0:
-        ctx.ledger.tokens["manifold_detail"] = "none"
-    elif enrichment.n_ok == 0:
-        # A lost detail GET costs rules text, never recall, so only a TOTAL loss is reported —
-        # a partial fan-out has nothing actionable to alert on.
-        ctx.ledger.record_loss("manifold_detail", "error(all_details_failed)")
-    else:
-        ctx.ledger.tokens["manifold_detail"] = f"ok({enrichment.n_ok})"
-    return pool, pool_by_venue
 
 
 async def _rank_stage(
@@ -843,81 +490,6 @@ def _log_ranking_telemetry(
         f"MARKET_RANKING: question={qid} pool={len(pool.candidates)} outcome={outcome} "
         f"rows={len(ranked_rows)} prompt_chars={prompt_chars} rendered={rendered or 'none'}"
     )
-
-
-def _pool_positions(pool: generation.PoolResult, ranked_rows: list[MarketMatch]) -> list[tuple[int, MarketMatch]]:
-    """Each rendered row paired with the pool index the ranker referred to it by.
-
-    `apply_picks` returns copies stamped with a rank, not with the index they came from, so the
-    index is recovered by identity of the venue-native id — which is exactly the pool's own
-    dedup key, so it is unique within the pool by construction.
-    """
-    index_of = {
-        (row.platform, row.venue_market_id or row.market_title): index for index, row in enumerate(pool.candidates)
-    }
-    return [(index_of.get((row.platform, row.venue_market_id or row.market_title), -1), row) for row in ranked_rows]
-
-
-def _record_venue_health(
-    qid: int | None,
-    pool: generation.PoolResult,
-    ranked_rows: list[MarketMatch],
-    *,
-    pool_by_venue: dict[str, list[MarketMatch]],
-    sources: dict[str, str],
-    platforms: tuple[str, ...],
-) -> None:
-    """Provider-health observations, recorded where the pool and the render are both in scope.
-
-    Field presence AND `candidates_pre_filter` are both measured over the venue's POOL rows,
-    which is the load-bearing choice and has to stay a matched pair: Signal A exists to catch a
-    PARSER whose field names went stale, so a legitimate 6-row ranked render that happens to
-    exclude Polymarket must not record a 100%-dead `open_interest` and redden CI on the ranker's
-    judgment — and equally must not go UNREPORTED because the ranker declined that venue.
-    `rows_post_filter` is the RENDERED count, recorded for the archive rather than for a rule;
-    nothing alerts on it (see `VenueObservation`).
-
-    `record_catalogue_size` (Signal C) is the two enumerable venues' only alarm for an EMPTY
-    catalogue, since a healthy one always reaches the pool — which is why the catalogue
-    observations in stage 1a must survive any future refactor of this function.
-
-    Pure module-state writes: no I/O, no await, cannot raise, cannot alter the snapshot.
-    """
-    if qid is None:
-        return
-    rendered_per_venue: dict[str, int] = {}
-    for row in ranked_rows:
-        rendered_per_venue[row.platform] = rendered_per_venue.get(row.platform, 0) + 1
-
-    for venue in generation.VENUE_ORDER:
-        if venue not in platforms:
-            continue
-        # A venue that lost its whole fan-out is already alertable via _bump_source_loss, so
-        # provider_health skips it rather than counting one outage twice (and "check the query
-        # construction" would be the wrong remedy for a 503 anyway). The skip is narrowed to
-        # TOTAL losses (error/timeout-class tokens, which leave no pool rows to measure): a
-        # partial(ok/total) venue still produced rows, and skipping it blinded Signal A for
-        # that venue on exactly the runs where one of its queries flaked — 3 of the 4 CI-red
-        # source-loss events in the 2026-08-24 residual round were partials, each of which
-        # suppressed the liquidity-field read over the ~59 rows that DID parse.
-        token = sources.get(venue, "")
-        if is_lost_source(token) and not token.startswith("partial("):
-            continue
-        rows = pool_by_venue.get(venue, [])
-        present = {
-            field_name
-            for field_name in VENUE_EXPECTED_LIQUIDITY_FIELDS.get(venue, ())
-            if any(getattr(row, field_name) is not None for row in rows)
-        }
-        record_venue_observation(
-            VenueObservation(
-                qid=qid,
-                venue=venue,
-                candidates_pre_filter=pool.per_venue_counts.get(venue, 0),
-                rows_post_filter=rendered_per_venue.get(venue, 0),
-                liquidity_fields_present=frozenset(present),
-            )
-        )
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,4 @@
+# HARNESS-SCAN-EXEMPT-monolithic-file-loc  # prompt-template registry; text length, not control flow — splitting fragments prompt review
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime

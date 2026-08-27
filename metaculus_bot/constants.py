@@ -1,3 +1,4 @@
+# HARNESS-SCAN-EXEMPT-monolithic-file-loc  # flat constants registry; one home for every knob is the design, a split scatters lookups
 """
 Central configuration constants to avoid magic numbers and strings.
 

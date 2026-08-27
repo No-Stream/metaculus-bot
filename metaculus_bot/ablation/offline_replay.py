@@ -18,8 +18,9 @@ The only inputs are on-disk cache files (forecaster outputs + qids manifest) rea
 :class:`AblationCache`. Nothing here *calls* the forecaster, a research/LLM provider, or
 ``main.py``: we consume cached predictions + ground truth and run pure aggregation math.
 
-Note on import vs. call: the question-shim + ground-truth + deserializer helpers we reuse
-live in modules (``ablation.cli`` / ``ablation.forecasters``) that transitively *import*
+Note on import vs. call: the question-shim + ground-truth helpers we reuse live in
+``ablation.manifest_serde``, which pulls in nothing heavier than forecasting-tools, but the
+prediction deserializer lives in ``ablation.forecasters``, which transitively *imports*
 ``metaculus_bot.forecaster`` at module load time. Importing a module is not a network
 call — instantiating a forecaster and calling ``.forecast()`` would be. So the load-bearing
 enforcement is :func:`no_network` — a context manager that monkeypatches ``socket`` so any
@@ -61,8 +62,11 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import OutOfBoundsResolution
 
 from metaculus_bot.ablation.cache import AblationCache
-from metaculus_bot.ablation.cli import _build_question_shim_from_manifest_entry, _deserialize_ground_truth
 from metaculus_bot.ablation.forecasters import deserialize_prediction_value
+from metaculus_bot.ablation.manifest_serde import (
+    _build_question_shim_from_manifest_entry,
+    _deserialize_ground_truth,
+)
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviving_forecasters
 from metaculus_bot.backtest.scoring import GroundTruth, _canonicalize_mc_option, numeric_crps
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN

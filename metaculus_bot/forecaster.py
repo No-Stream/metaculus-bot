@@ -26,6 +26,7 @@ from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
 )
 from metaculus_bot.close_margin import format_close_margin_marker
+from metaculus_bot.comment.formatting import build_unified_explanation
 from metaculus_bot.comment.trimming import trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
@@ -70,6 +71,7 @@ from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
     ResearchCallable,
 )
+from metaculus_bot.research.timeseries_anchor import _session_charts
 from metaculus_bot.stacking_route import route_after_forecasts
 from metaculus_bot.time_budget import (
     QuestionTimeBudget,
@@ -77,6 +79,7 @@ from metaculus_bot.time_budget import (
     format_time_budget_marker,
 )
 from metaculus_bot.time_utils import _as_utc
+from metaculus_bot.tool_runner import build_cross_model_aggregation, run_tools_for_forecaster
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
@@ -696,10 +699,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Probabilistic tools: deterministic cross-model math runs once per
         # question and rides at the top of the stacker prompt. No-ops when
         # PROBABILISTIC_TOOLS_ENABLED is unset.
-        from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            build_cross_model_aggregation,
-        )
-
         aggregated_tool_output = (
             build_cross_model_aggregation(
                 question=question,
@@ -952,11 +951,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         final_cost: float,
         time_spent_in_minutes: float,
     ) -> str:
-        # Kept function-scoped: comment.formatting imports tool_runner at module scope,
-        # so hoisting this would pull tool_runner + probabilistic_tools onto the
-        # cold-start path even when PROBABILISTIC_TOOLS_ENABLED is off.
-        from metaculus_bot.comment.formatting import build_unified_explanation  # noqa: PLC0415
-
         base_text = super()._create_unified_explanation(
             question,
             research_prediction_collections,
@@ -1079,10 +1073,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # the forecaster's structured JSON block (see tool_runner.py). The
         # tool runner no-ops when PROBABILISTIC_TOOLS_ENABLED is off or no
         # block was emitted; callers don't gate.
-        from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            run_tools_for_forecaster,
-        )
-
         computed_md = run_tools_for_forecaster(
             question=question,
             rationale=prediction.reasoning,
@@ -1124,16 +1114,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
         per-session cache and return the base64 PNG (or None).
 
         Popping keeps the provider cache from growing across a batch; the returned
-        value is handed straight down the fan-out. Gated on the chart flag so the
-        provider (and matplotlib) stays off the cold path when the feature is
-        disabled — the default in prod.
+        value is handed straight down the fan-out. The chart-flag gate short-circuits
+        the read when the feature is off (the default in prod), so a stale entry from
+        an earlier flag-on run is never attached. matplotlib is NOT on the import path
+        the module-level ``_session_charts`` import creates: it lives behind
+        ``ts_chart``, which ``timeseries_anchor`` imports inside its own render guard,
+        so a prod ``uv sync --no-dev`` install imports this fine.
         """
         if qid is None or not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
             return None
-        from metaculus_bot.research.timeseries_anchor import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # optional provider; matplotlib off the cold path
-            _session_charts,
-        )
-
         return _session_charts.pop(qid, None)
 
     async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call

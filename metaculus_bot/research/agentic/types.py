@@ -53,7 +53,7 @@ class Finding(BaseModel):
     # (a briefing-only URL is never seen through a tool, so it has no tier). A
     # discrepancy finding must be "fetched" to keep the supersede banner — a
     # snippet-tier discrepancy is demoted to "possible corrections" (the 131.3
-    # failure mode). See loop._stamp_verification_tier and artifact.render_findings.
+    # failure mode). See gates._stamp_verification_tier and artifact.render_findings.
     verification_tier: Literal["fetched", "snippet"] | None = None
 
 

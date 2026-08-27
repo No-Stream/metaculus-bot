@@ -49,8 +49,17 @@ from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.forecasters import question_type_for_serialization, serialize_prediction_value
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviving_forecasters
 from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
+from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 from metaculus_bot.prob_math_utils import sigmoid
 from metaculus_bot.probabilistic_tools.base_rate import beta_binomial_update
+from metaculus_bot.probabilistic_tools.distributions import (
+    FitType,
+    eval_cdf,
+    fit_normal_from_percentiles,
+    fit_student_t_from_percentiles,
+)
 from metaculus_bot.probabilistic_tools.survival import prob_event_before
 from metaculus_bot.question_types import question_type_of
 from metaculus_bot.structured_output_schema import (
@@ -174,8 +183,6 @@ def _resolve_numeric_cdf_size(surviving: dict[str, dict], question: NumericQuest
     (correct for manifests that persist it) only when no surviving numeric prediction carries a
     CDF — unreachable for a real numeric question, where every survivor is a numeric prediction.
     """
-    from metaculus_bot.numeric.config import PCHIP_CDF_POINTS  # noqa: PLC0415
-
     for payload in surviving.values():
         pv = payload.get("prediction_value")
         if not isinstance(pv, dict) or pv.get("type") != "numeric":
@@ -202,15 +209,6 @@ def _compute_numeric_prediction(
     201-point ones. At ``cdf_size == 201`` the constraints are exactly the historical
     constants, so that path is byte-identical to the pre-parameterization behavior.
     """
-    from metaculus_bot.numeric.config import grid_step_constraints  # noqa: PLC0415
-    from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds  # noqa: PLC0415
-    from metaculus_bot.probabilistic_tools.distributions import (  # noqa: PLC0415
-        FitType,
-        eval_cdf,
-        fit_normal_from_percentiles,
-        fit_student_t_from_percentiles,
-    )
-
     percentiles = block.declared_percentiles
     if not percentiles or len(percentiles) < 2:
         return None
@@ -483,7 +481,6 @@ async def _aggregate_numeric_predictions(
     Takes the pointwise median or mean, then wraps the result.
     """
     await asyncio.sleep(0)  # cooperative yield for flake8-async ASYNC910
-    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415
 
     n_points = len(predictions[0])
     prob_arrays = np.array([[p.percentile for p in perc_list] for perc_list in predictions], dtype=float)

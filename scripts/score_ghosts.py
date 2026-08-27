@@ -45,7 +45,12 @@ from pathlib import Path
 from statistics import mean
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
-from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
+from metaculus_bot.numeric.config import grid_step_constraints
+from metaculus_bot.performance_analysis.collector import (
+    build_performance_dataset,
+    load_dataset,
+    resolve_numeric_record_to_score_inputs,
+)
 from metaculus_bot.scoring_common import binary_log_score, mc_log_score, numeric_log_score
 from scripts.telemetry.archive import load_marker_records
 
@@ -247,12 +252,11 @@ def _paired_numeric_scores(
     Returns the scored fields WITHOUT ``qid`` (the caller stamps it), or a
     ``scoreable: False`` stub naming which of the two steps failed.
     """
-    # Lazy imports: the PCHIP builder pulls numpy/scipy. Keep the n=0 path
-    # dependency-light — numeric scoring only runs once real records join.
-    from metaculus_bot.numeric.config import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # lazy: pair the grid-step rule with the CDF builder it feeds
-        grid_step_constraints,
-    )
-    from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the n=0 path free of numpy/scipy
+    # Kept function-scoped for call-time lookup: test_score_ghosts patches
+    # ``metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf`` on its SOURCE module AFTER
+    # building the published CDF, so the spy sees only the ghost build. A module-level
+    # from-import would bind the unpatched builder and both sides would go unobserved.
+    from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # late import: tests patch numeric.pchip_cdf.generate_pchip_cdf at source
         generate_pchip_cdf,
     )
 
@@ -354,13 +358,6 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
     published_cdf = record.get("our_forecast_values")
     if not published_cdf or len(published_cdf) < 2:
         return {"qid": qid, "scoreable": False, "reason": "no_published_cdf"}
-
-    # Lazy import: the collector helper drags the collector's heavy import chain
-    # (requests, env loading). Keep the n=0 path dependency-light — numeric scoring only
-    # runs once real records join.
-    from metaculus_bot.performance_analysis.collector import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the pure scoring core decoupled from the collector's import chain
-        resolve_numeric_record_to_score_inputs,
-    )
 
     score_inputs = resolve_numeric_record_to_score_inputs(record)
     if score_inputs is None:
