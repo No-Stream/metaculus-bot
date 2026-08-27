@@ -76,7 +76,8 @@ Free / safe — run freely:
 
 - Gates and formatting: `make test`, `make test_fast`, `make test_e2e`,
   `make lint`, `make format`, `make typecheck`, `make typecheck_ty`, `make cov`,
-  `make audit`, `make precommit*`. The whole suite is self-contained: the `e2e`
+  `make audit`, `make deps` (deptry), `make lint_imports` (import-linter),
+  `make precommit*`. The whole suite is self-contained: the `e2e`
   marker means full-pipeline with MOCKED LLMs, and the autouse
   `_block_network_egress` fixture (`tests/conftest.py`) raises on any non-loopback
   connect, so no selected test can reach a paid API. `addopts` deselects only the
@@ -355,7 +356,8 @@ The bot's published Metaculus comments are the durable per-model record: on non-
 - **Format**: `make format` (Ruff format + autofix).
 - **Pre-commit**: `make precommit_install` then `make precommit` or `make precommit_all`.
 - **Typecheck**: `make typecheck` (basedpyright; `make typecheck_ty` for the secondary ty checker).
-- **Coverage**: `make cov`. **Audit**: `make audit` (osv-scanner over `uv.lock`; requires `brew install osv-scanner` locally — CI runs it via `google/osv-scanner-action`).
+- **Coverage**: `make cov` (branch coverage is on). **Audit**: `make audit` (osv-scanner over `uv.lock`; requires `brew install osv-scanner` locally — CI runs it via `google/osv-scanner-action`).
+- **Dependency hygiene**: `make deps` (deptry: undeclared/unused/transitive deps). **Import contracts**: `make lint_imports` (import-linter; the 5 contracts live in `pyproject.toml` `[tool.importlinter]`). Both free, both in CI's lint job and `make all`.
 - **Test single file**: `uv run pytest tests/test_specific.py`.
 
 **The full suite must pass before anything is pushed, and CI green is the real gate — not a local green run.** `make precommit_install` installs both hook types: the ruff hooks on commit, plus a `pytest-full-suite` pre-push hook running the same `uv run --frozen pytest --cov=metaculus_bot` that `.github/workflows/ci.yaml` runs. Per-push rather than per-commit — the suite takes ~105s, too much friction on every commit but the right price on the thing reviewers see.
