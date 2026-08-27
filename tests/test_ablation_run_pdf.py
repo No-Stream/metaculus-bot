@@ -509,7 +509,7 @@ class TestMultipleChoice:
 
     def test_a_degenerate_ballot_fails_that_question_not_the_stage(self, tmp_path: Any) -> None:
         """An option no forecaster declared errors THIS question, not the whole paid stage."""
-        from metaculus_bot.ablation.run_pdf import ARM_PDF, run_pdf_for_qid
+        from metaculus_bot.ablation.run_pdf import ARM_PDF, run_pdf_for_qid  # HARNESS-SCAN-EXEMPT-function-level-import
 
         cache = AblationCache(str(tmp_path))
         question = _make_mc_q(qid=502)
