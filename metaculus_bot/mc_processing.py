@@ -73,6 +73,18 @@ def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
         raise ValueError(_ZERO_MASS_MESSAGE.format(n=n))
     probs = [p / total for p in probs]
 
+    return _repair_bound_violations(probs)
+
+
+def _repair_bound_violations(probs: list[float]) -> list[float]:
+    """Pin out-of-bounds options at their bound and rescale only the still-free mass.
+
+    Iterates because pinning changes the free budget, which can push a previously in-bounds
+    option out. Mutates and returns ``probs``; the caller has already clamped + renormalized
+    once, so this only fires when the naive divide dragged a floored option back under
+    ``MC_PROB_MIN``.
+    """
+    n = len(probs)
     pinned = [False] * n
     for _ in range(n):
         violators = [i for i in range(n) if not pinned[i] and not (MC_PROB_MIN <= probs[i] <= MC_PROB_MAX)]

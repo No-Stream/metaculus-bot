@@ -7,6 +7,8 @@ whether a given historical record was stacked.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from metaculus_bot.performance_analysis.stacker_detection import (
@@ -593,3 +595,79 @@ class TestDetectStackerFired:
         }
         # spread = 0.72-0.70 = 0.02 < 0.15 → likely_median
         assert detect_stacker_fired(record) == "likely_median"
+
+
+class TestNumericSpreadDenominator:
+    """The numeric branch normalizes by the question range when it has one, and by the
+    members' own median P10-P90 span otherwise. Which denominator is used decides the
+    verdict, so both paths and the degenerate case are pinned."""
+
+    _LABELS: ClassVar[list[float]] = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
+
+    @classmethod
+    def _curve(cls, values: list[float]) -> list[list[float]]:
+        return [[p, v] for p, v in zip(cls._LABELS, values, strict=True)]
+
+    def test_open_bounds_normalize_by_the_member_median_span(self):
+        # Open bounds rule out the range denominator. Member spans are 60 each, so the
+        # median P90-P10 denominator is (median P90 80) - (median P10 20) = 60, and the
+        # P50 spread of 20 normalizes to 0.33 > 0.15.
+        record = {
+            "type": "numeric",
+            "per_model_numeric_percentiles": {
+                "a": self._curve([5, 8, 10, 15, 25, 30, 35, 45, 50, 55, 60]),
+                "b": self._curve([25, 28, 30, 35, 45, 50, 55, 65, 70, 75, 80]),
+            },
+            "open_lower_bound": True,
+            "open_upper_bound": True,
+            "scaling": {"range_min": 0.0, "range_max": 1000.0},
+        }
+        assert exceeded_spread_threshold(record) is True
+
+    def test_a_wide_range_denominator_shrinks_the_same_disagreement_below_threshold(self):
+        # Identical member curves as above, but closed bounds on a [0, 1000] range:
+        # the same 20-unit P50 gap normalizes to 0.02, under the threshold.
+        record = {
+            "type": "numeric",
+            "per_model_numeric_percentiles": {
+                "a": self._curve([5, 8, 10, 15, 25, 30, 35, 45, 50, 55, 60]),
+                "b": self._curve([25, 28, 30, 35, 45, 50, 55, 65, 70, 75, 80]),
+            },
+            "scaling": {"range_min": 0.0, "range_max": 1000.0},
+        }
+        assert exceeded_spread_threshold(record) is False
+
+    def test_a_non_positive_denominator_is_unmeasurable(self):
+        # Open bounds with every member declaring one value: median P90 == median P10,
+        # so the fallback denominator is 0 and no spread can be normalized.
+        flat = self._curve([50.0] * 11)
+        record = {
+            "type": "numeric",
+            "per_model_numeric_percentiles": {"a": flat, "b": flat},
+            "open_lower_bound": True,
+            "open_upper_bound": True,
+            "scaling": {},
+        }
+        assert exceeded_spread_threshold(record) is None
+
+    def test_fewer_than_two_member_curves_is_unmeasurable(self):
+        record = {
+            "type": "numeric",
+            "per_model_numeric_percentiles": {"a": self._curve([5, 8, 10, 15, 25, 30, 35, 45, 50, 55, 60])},
+            "scaling": {"range_min": 0.0, "range_max": 100.0},
+        }
+        assert exceeded_spread_threshold(record) is None
+
+    def test_discrete_is_treated_like_numeric(self):
+        record = {
+            "type": "discrete",
+            "per_model_numeric_percentiles": {
+                "a": self._curve([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70]),
+                "b": self._curve([30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90]),
+            },
+            "scaling": {"range_min": 0.0, "range_max": 100.0},
+        }
+        assert exceeded_spread_threshold(record) is True
+
+    def test_an_unrecognized_question_type_is_unmeasurable(self):
+        assert exceeded_spread_threshold({"type": "trinary"}) is None

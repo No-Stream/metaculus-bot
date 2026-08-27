@@ -42,7 +42,9 @@ def log_bot_lineup(bots: Sequence[ForecastBot]) -> None:
                     r,
                     p,
                 )
-        except Exception as be:
+        except (AttributeError, TypeError) as be:
+            # A bot object that doesn't expose the expected config attributes is a
+            # cosmetic lineup-logging problem, not a reason to abort a benchmark.
             logger.warning("Failed to log bot %d overview: %s", idx, be)
 
 

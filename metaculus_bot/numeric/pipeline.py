@@ -92,7 +92,10 @@ def build_numeric_distribution(
             zero_point,
         )
         prediction = create_pchip_numeric_distribution(pchip_cdf, percentile_list, question, zero_point)
-    except Exception as exc:
+    # Documented soft-fail boundary: ANY PCHIP build failure delegates the CDF to
+    # forecasting-tools' builder, which re-validates. Narrowing this would turn a
+    # recoverable build failure into a dropped forecast.
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         log_pchip_fallback(question, exc)
         prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point)
 
@@ -170,9 +173,9 @@ def _apply_jitter_and_clamp(
     modified_values, clusters_applied = apply_cluster_spreading(
         modified_values,
         question,
-        value_eps,
-        spread_delta,
-        range_size,
+        value_eps=value_eps,
+        spread_delta=spread_delta,
+        range_size=range_size,
     )
 
     modified_values = apply_jitter_for_duplicates(modified_values, question, range_size, percentile_list)
@@ -182,9 +185,9 @@ def _apply_jitter_and_clamp(
         modified_values,
         values,
         question,
-        clusters_applied,
-        spread_delta,
-        count_like,
+        clusters_applied=clusters_applied,
+        spread_delta=spread_delta,
+        count_like=count_like,
     )
     log_corrections_summary(modified_values, values, question, corrections_made)
     log_heavy_clamping_diagnostics(modified_values, values, question, buffer)

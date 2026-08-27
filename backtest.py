@@ -25,7 +25,7 @@ from metaculus_bot.backtest.analysis import (
 )
 from metaculus_bot.backtest.leakage import screen_research_for_leakage
 from metaculus_bot.backtest.question_prep import BacktestQuestionSet, fetch_resolved_questions
-from metaculus_bot.backtest.scoring import QuestionScore, score_report
+from metaculus_bot.backtest.scoring import GroundTruth, QuestionScore, score_report
 from metaculus_bot.benchmark.bot_factory import (
     BENCHMARK_BOT_CONFIG,
     DEFAULT_HELPER_LLMS,
@@ -196,6 +196,46 @@ def _load_research_from_archive(research_dir: str, questions: list) -> dict[int,
     return cache
 
 
+def _score_benchmark(benchmark: Any, ground_truths: dict[int, GroundTruth]) -> BacktestResult:
+    """Score one bot's reports against ground truth and log its per-metric means.
+
+    A report whose question has no ground truth, or whose scoring yields nothing, counts
+    as failed rather than aborting the bot — a partial result is still comparable.
+    """
+    bot_scores: list[QuestionScore] = []
+    num_scored = 0
+    num_failed = 0
+
+    for report in benchmark.forecast_reports:
+        qid = report.question.id_of_question
+        if qid not in ground_truths:
+            num_failed += 1
+            logger.warning(f"No ground truth for question {qid}, skipping")
+            continue
+
+        report_scores = score_report(report, ground_truths[qid])
+        if report_scores:
+            bot_scores.extend(report_scores)
+            num_scored += 1
+        else:
+            num_failed += 1
+
+    logger.info(f"Bot '{benchmark.name}': scored={num_scored}, failed={num_failed}")
+    for metric_name, agg in aggregate_scores(bot_scores).items():
+        community_str = ""
+        if agg.get("community_mean") is not None:
+            community_str = f" | Community: {agg['community_mean']:.4f}"
+        logger.info(f"  {metric_name}: Bot mean = {agg['bot_mean']:.4f} (n={agg['n']}){community_str}")
+
+    return BacktestResult(
+        bot_name=benchmark.name,
+        scores=bot_scores,
+        num_questions=len(benchmark.forecast_reports),
+        num_scored=num_scored,
+        num_failed=num_failed,
+    )
+
+
 async def run_backtest(args: argparse.Namespace) -> None:
     """Run the full backtest pipeline."""
     # Fetch resolved questions and extract ground truths
@@ -281,43 +321,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
         logger.info("Benchmarker completed, scoring against ground truth...")
         sys.stdout.flush()
 
-        # Score each bot's reports against ground truth
-        results: list[BacktestResult] = []
-        for benchmark in benchmarks:
-            bot_scores: list[QuestionScore] = []
-            num_scored = 0
-            num_failed = 0
-
-            for report in benchmark.forecast_reports:
-                qid = report.question.id_of_question
-                if qid not in clean_ground_truths:
-                    num_failed += 1
-                    logger.warning(f"No ground truth for question {qid}, skipping")
-                    continue
-
-                report_scores = score_report(report, clean_ground_truths[qid])
-                if report_scores:
-                    bot_scores.extend(report_scores)
-                    num_scored += 1
-                else:
-                    num_failed += 1
-
-            result = BacktestResult(
-                bot_name=benchmark.name,
-                scores=bot_scores,
-                num_questions=len(benchmark.forecast_reports),
-                num_scored=num_scored,
-                num_failed=num_failed,
-            )
-            results.append(result)
-
-            aggregated = aggregate_scores(bot_scores)
-            logger.info(f"Bot '{benchmark.name}': scored={num_scored}, failed={num_failed}")
-            for metric_name, agg in aggregated.items():
-                community_str = ""
-                if agg.get("community_mean") is not None:
-                    community_str = f" | Community: {agg['community_mean']:.4f}"
-                logger.info(f"  {metric_name}: Bot mean = {agg['bot_mean']:.4f} (n={agg['n']}){community_str}")
+        results = [_score_benchmark(benchmark, clean_ground_truths) for benchmark in benchmarks]
 
         # Generate report and save data
         report_text = generate_backtest_report(results, question_set, output_path="backtests/backtest_report.md")

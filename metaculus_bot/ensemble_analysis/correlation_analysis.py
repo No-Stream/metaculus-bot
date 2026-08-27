@@ -44,6 +44,144 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+def _any_token_in_idents(tokens: list[str], idents: list[str]) -> bool:
+    """Case-insensitive substring match of any token against any identifier."""
+    lowered = [s.lower() for s in idents]
+    return any(token.lower() in ident for token in tokens for ident in lowered)
+
+
+def _models_matching_tokens(
+    tokens: list[str],
+    name_to_idents: dict[str, list[str]],
+) -> tuple[set[str], dict[str, list[str]]]:
+    """Models any token matched, plus the per-token hit lists the summary reports.
+
+    A token with an empty hit list is what ``unmatched_includes`` /
+    ``unmatched_excludes`` surface, so a typo'd token reads as "matched nothing"
+    rather than silently filtering nothing.
+    """
+    matched_models: set[str] = set()
+    hits_by_token: dict[str, list[str]] = {token: [] for token in tokens}
+    for name, idents in name_to_idents.items():
+        if not _any_token_in_idents(tokens, idents):
+            continue
+        matched_models.add(name)
+        for token in tokens:
+            if _any_token_in_idents([token], idents):
+                hits_by_token[token].append(name)
+    return matched_models, hits_by_token
+
+
+def _filter_summary_lines(
+    include_hits: dict[str, list[str]],
+    exclude_hits: dict[str, list[str]],
+    final_allowed: list[str],
+) -> list[str]:
+    """Human-readable filter disclosure, rendered under "Filters Applied" in the report."""
+    lines: list[str] = []
+    for label, hits in (("Included", include_hits), ("Excluded", exclude_hits)):
+        if not hits:
+            continue
+        lines.append(f"{label} by tokens:")
+        lines.extend(f"- {t}: {', '.join(names) if names else '(no match)'}" for t, names in hits.items())
+    lines.append(f"Remaining models: {', '.join(final_allowed) if final_allowed else '(none)'}")
+    return lines
+
+
+def _component_correlation(
+    q_type: str,
+    components1: list[float],
+    components2: list[float],
+    *,
+    q_id: int,
+    model1: str,
+    model2: str,
+) -> float:
+    """Correlation between two models' component vectors on one question.
+
+    Binary is a 1/0 agreement indicator (a single scalar has no Pearson r); numeric
+    and multiple choice correlate their component vectors, with a constant vector
+    reported as 0.0 rather than NaN. Any shape we cannot correlate is 0.0.
+    """
+    if q_type == "binary":
+        if len(components1) == 1 and len(components2) == 1:
+            return 1.0 if components1[0] == components2[0] else 0.0
+        return 0.0
+
+    if q_type in ("numeric", "multiple_choice"):
+        if len(components1) != len(components2) or len(components1) <= 1:
+            return 0.0
+        try:
+            # Guard against constant vectors to avoid warnings and NaNs
+            if np.std(components1) < 1e-12 or np.std(components2) < 1e-12:
+                return 0.0
+            corr_val, _ = pearsonr(components1, components2)
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Pearson correlation failed for q={q_id} {model1} vs {model2}: {e}")
+            return 0.0
+        return float(corr_val) if not np.isnan(corr_val) else 0.0
+
+    return 0.0
+
+
+def _accumulate_question_correlations(
+    q_id: int,
+    model_data: dict[str, tuple[str, list[float]]],
+    *,
+    model_indices: dict[str, int],
+    correlation_sums: np.ndarray,
+    correlation_counts: np.ndarray,
+) -> None:
+    """Add one question's pairwise correlations into the running sum/count matrices.
+
+    Contributes nothing when fewer than two models answered the question, or when
+    the models disagree about its TYPE (a comparison across types is meaningless,
+    and the disagreement itself is worth a warning).
+    """
+    available_models = list(model_data.keys())
+    if len(available_models) < 2:
+        return
+
+    q_types = {data[0] for data in model_data.values()}
+    if len(q_types) > 1:
+        logger.warning(f"Question {q_id} has mixed types across models: {q_types}")
+        return
+    q_type = next(iter(q_types))
+
+    for i, model1 in enumerate(available_models):
+        for model2 in available_models[i + 1 :]:
+            corr = _component_correlation(
+                q_type,
+                model_data[model1][1],
+                model_data[model2][1],
+                q_id=q_id,
+                model1=model1,
+                model2=model2,
+            )
+            idx1 = model_indices[model1]
+            idx2 = model_indices[model2]
+            correlation_sums[idx1, idx2] += corr
+            correlation_sums[idx2, idx1] += corr  # Symmetric
+            correlation_counts[idx1, idx2] += 1
+            correlation_counts[idx2, idx1] += 1
+
+
+def _average_pairwise_correlations(
+    correlation_sums: np.ndarray,
+    correlation_counts: np.ndarray,
+    n_models: int,
+) -> np.ndarray:
+    """Mean correlation per model pair; self-correlation is 1.0, unobserved pairs 0.0."""
+    matrix = np.zeros((n_models, n_models))
+    for i in range(n_models):
+        matrix[i, i] = 1.0  # Self-correlation is 1
+        for j in range(i + 1, n_models):
+            avg_corr = correlation_sums[i, j] / correlation_counts[i, j] if correlation_counts[i, j] > 0 else 0.0
+            matrix[i, j] = avg_corr
+            matrix[j, i] = avg_corr
+    return matrix
+
+
 class CorrelationAnalyzer:
     """Analyzes correlations between forecasting models for ensemble optimization."""
 
@@ -158,87 +296,36 @@ class CorrelationAnalyzer:
             name = extract_model_name(b)
             name_to_idents[name] = identifiers_for_benchmark(b, name)
 
-        # Helpers for case-insensitive substring matching
-        def _any_token_in_idents(tokens: list[str], idents: list[str]) -> bool:
-            if not tokens:
-                return False
-            lowers = [s.lower() for s in idents]
-            for tok in tokens:
-                lt = tok.lower()
-                for s in lowers:
-                    if lt in s:
-                        return True
-            return False
+        matched_include_models, include_hits = _models_matching_tokens(tokens_inc, name_to_idents)
+        matched_exclude_models, exclude_hits = _models_matching_tokens(tokens_exc, name_to_idents)
 
-        # Determine included set
+        # Absent include tokens, every model is included; excludes then subtract.
         all_models: list[str] = list(name_to_idents.keys())
-        included_set = set(all_models)
-        matched_includes: dict[str, list[str]] = {t: [] for t in tokens_inc}
-        matched_excludes: dict[str, list[str]] = {t: [] for t in tokens_exc}
+        included_set = matched_include_models if tokens_inc else set(all_models)
+        final_allowed = [n for n in all_models if n in included_set and n not in matched_exclude_models]
 
-        if tokens_inc:
-            included_set = set()
-            for name, idents in name_to_idents.items():
-                if _any_token_in_idents(tokens_inc, idents):
-                    included_set.add(name)
-                    # Track which tokens matched this name
-                    for t in tokens_inc:
-                        if _any_token_in_idents([t], idents):
-                            matched_includes[t].append(name)
+        self._filter_summary_lines = _filter_summary_lines(include_hits, exclude_hits, final_allowed)
+        self._restrict_to_models(set(final_allowed))
 
-        # Apply excludes
-        to_exclude: set[str] = set()
-        if tokens_exc:
-            for name, idents in name_to_idents.items():
-                if _any_token_in_idents(tokens_exc, idents):
-                    to_exclude.add(name)
-                    for t in tokens_exc:
-                        if _any_token_in_idents([t], idents):
-                            matched_excludes[t].append(name)
+        return {
+            "included": final_allowed if tokens_inc else [],
+            "excluded": sorted(matched_exclude_models),
+            "unmatched_includes": [t for t, hits in include_hits.items() if not hits],
+            "unmatched_excludes": [t for t, hits in exclude_hits.items() if not hits],
+        }
 
-        final_allowed = (
-            [n for n in all_models if (n in included_set) and (n not in to_exclude)]
-            if tokens_inc
-            else [n for n in all_models if n not in to_exclude]
-        )
-
-        # Build summaries
-        unmatched_includes = [t for t, hits in matched_includes.items() if not hits]
-        unmatched_excludes = [t for t, hits in matched_excludes.items() if not hits]
-
-        if tokens_inc:
-            inc_lines = ["Included by tokens:"] + [
-                f"- {t}: {', '.join(hits) if hits else '(no match)'}" for t, hits in matched_includes.items()
-            ]
-            self._filter_summary_lines.extend(inc_lines)
-        if tokens_exc:
-            exc_lines = ["Excluded by tokens:"] + [
-                f"- {t}: {', '.join(hits) if hits else '(no match)'}" for t, hits in matched_excludes.items()
-            ]
-            self._filter_summary_lines.extend(exc_lines)
-        self._filter_summary_lines.append(
-            f"Remaining models: {', '.join(final_allowed) if final_allowed else '(none)'}"
-        )
-
-        # Apply filter to internal state
-        allowed_set = set(final_allowed)
+    def _restrict_to_models(self, allowed: set[str]) -> None:
+        """Drop every benchmark/prediction outside ``allowed`` and invalidate derived caches."""
         before_bench = len(self.benchmarks)
         before_preds = len(self.predictions)
-        self.benchmarks = [b for b in self.benchmarks if extract_model_name(b) in allowed_set]
-        self.predictions = [p for p in self.predictions if p.model_name in allowed_set]
-        self._model_name_to_benchmark = {k: v for k, v in self._model_name_to_benchmark.items() if k in allowed_set}
+        self.benchmarks = [b for b in self.benchmarks if extract_model_name(b) in allowed]
+        self.predictions = [p for p in self.predictions if p.model_name in allowed]
+        self._model_name_to_benchmark = {k: v for k, v in self._model_name_to_benchmark.items() if k in allowed}
         self._simulator.invalidate_caches()
 
         logger.info(
             f"Model filtering applied: {before_bench}→{len(self.benchmarks)} benchmarks, {before_preds}→{len(self.predictions)} predictions"
         )
-
-        return {
-            "included": final_allowed if tokens_inc else [],
-            "excluded": sorted(to_exclude),
-            "unmatched_includes": unmatched_includes,
-            "unmatched_excludes": unmatched_excludes,
-        }
 
     def calculate_correlation_matrix(self) -> CorrelationMatrix:
         """Calculate Pearson and Spearman correlations between all model pairs."""
@@ -272,6 +359,31 @@ class CorrelationAnalyzer:
             num_questions=len(pivot_df),
         )
 
+    def _find_report(self, question_id: int, model_name: str) -> Any | None:
+        """The forecast report ``model_name`` produced for ``question_id``, if any."""
+        for benchmark in self.benchmarks:
+            if extract_model_name(benchmark) != model_name:
+                continue
+            for report in benchmark.forecast_reports:
+                if (report.question.id_of_question or 0) == question_id:
+                    return report
+        return None
+
+    def _components_by_question(self) -> dict[int, dict[str, tuple[str, list[float]]]]:
+        """Per question, each model's ``(question_type, component vector)``.
+
+        A question whose report cannot be located still gets an (empty) entry, so it
+        counts toward the matrix's ``num_questions`` even though it contributes no
+        correlation — the same accounting the pre-extraction loop produced.
+        """
+        question_data: dict[int, dict[str, tuple[str, list[float]]]] = {}
+        for pred in self.predictions:
+            models_for_question = question_data.setdefault(pred.question_id, {})
+            report = self._find_report(pred.question_id, pred.model_name)
+            if report is not None:
+                models_for_question[pred.model_name] = self._extract_prediction_components(report)
+        return question_data
+
     def calculate_correlation_matrix_by_components(self) -> CorrelationMatrix:
         """Calculate correlations using component-wise analysis for mixed question types.
 
@@ -280,112 +392,24 @@ class CorrelationAnalyzer:
         - Numeric: Average correlation across percentiles (10, 20, 40, 60, 80, 90)
         - Multiple Choice: Average correlation across option probabilities
         """
-        # Group predictions by question and extract components
-        question_data = {}
+        question_data = self._components_by_question()
 
-        for pred in self.predictions:
-            q_id = pred.question_id
-            if q_id not in question_data:
-                question_data[q_id] = {}
-
-            # Get the full report to extract components
-            report = None
-            for benchmark in self.benchmarks:
-                for report_candidate in benchmark.forecast_reports:
-                    matches_question = (report_candidate.question.id_of_question or 0) == q_id
-                    if matches_question and extract_model_name(benchmark) == pred.model_name:
-                        report = report_candidate
-                        break
-                if report:
-                    break
-
-            if report:
-                q_type, components = self._extract_prediction_components(report)
-                question_data[q_id][pred.model_name] = (q_type, components)
-
-        # Calculate correlations for each question, then average
         model_names = list({pred.model_name for pred in self.predictions})
         n_models = len(model_names)
+        model_indices = {name: i for i, name in enumerate(model_names)}
 
-        # Initialize correlation matrices
         correlation_sums = np.zeros((n_models, n_models))
         correlation_counts = np.zeros((n_models, n_models))
-
         for q_id, model_data in question_data.items():
-            # Only process questions where we have data for multiple models
-            available_models = list(model_data.keys())
-            if len(available_models) < 2:
-                continue
+            _accumulate_question_correlations(
+                q_id,
+                model_data,
+                model_indices=model_indices,
+                correlation_sums=correlation_sums,
+                correlation_counts=correlation_counts,
+            )
 
-            # Group by question type
-            q_types = {data[0] for data in model_data.values()}
-            if len(q_types) > 1:
-                logger.warning(f"Question {q_id} has mixed types across models: {q_types}")
-                continue
-
-            q_type = next(iter(q_types))
-
-            # Calculate correlation for this question
-            model_indices = {name: i for i, name in enumerate(model_names)}
-
-            for i, model1 in enumerate(available_models):
-                for j, model2 in enumerate(available_models):
-                    if i >= j:  # Skip duplicates and self-correlation
-                        continue
-
-                    # Get components for both models
-                    _, components1 = model_data[model1]
-                    _, components2 = model_data[model2]
-
-                    # Calculate component-wise correlation
-                    if q_type == "binary":
-                        # Direct correlation for binary
-                        if len(components1) == 1 and len(components2) == 1:
-                            corr = 1.0 if components1[0] == components2[0] else 0.0
-                        else:
-                            corr = 0.0
-
-                    elif q_type in ["numeric", "multiple_choice"]:
-                        # Average correlation across components
-                        if len(components1) == len(components2) and len(components1) > 1:
-                            # Use scipy.stats.pearsonr for component pairs
-                            try:
-                                # Guard against constant vectors to avoid warnings and NaNs
-                                if np.std(components1) < 1e-12 or np.std(components2) < 1e-12:
-                                    corr_val = 0.0
-                                else:
-                                    corr_val, _ = pearsonr(components1, components2)
-                                corr = corr_val if not np.isnan(corr_val) else 0.0
-                            except (ValueError, TypeError) as e:
-                                logger.debug(f"Pearson correlation failed for q={q_id} {model1} vs {model2}: {e}")
-                                corr = 0.0
-                        else:
-                            corr = 0.0
-                    else:
-                        corr = 0.0
-
-                    # Add to correlation matrix
-                    idx1 = model_indices[model1]
-                    idx2 = model_indices[model2]
-                    correlation_sums[idx1, idx2] += corr
-                    correlation_sums[idx2, idx1] += corr  # Symmetric
-                    correlation_counts[idx1, idx2] += 1
-                    correlation_counts[idx2, idx1] += 1
-
-        # Calculate average correlations
-        correlation_matrix = np.zeros((n_models, n_models))
-        for i in range(n_models):
-            correlation_matrix[i, i] = 1.0  # Self-correlation is 1
-            for j in range(i + 1, n_models):
-                if correlation_counts[i, j] > 0:
-                    avg_corr = correlation_sums[i, j] / correlation_counts[i, j]
-                    correlation_matrix[i, j] = avg_corr
-                    correlation_matrix[j, i] = avg_corr
-                else:
-                    correlation_matrix[i, j] = 0.0
-                    correlation_matrix[j, i] = 0.0
-
-        # Convert to DataFrame
+        correlation_matrix = _average_pairwise_correlations(correlation_sums, correlation_counts, n_models)
         corr_df = pd.DataFrame(correlation_matrix, index=model_names, columns=model_names)
 
         logger.info(
@@ -448,7 +472,7 @@ class CorrelationAnalyzer:
         # Log numeric CDF fallback summary once per search to detect systemic issues
         try:
             self.log_numeric_cdf_summary()
-        except Exception:
+        except Exception:  # noqa: BLE001  # soft-fail boundary: end-of-search diagnostics must never lose a completed candidate search
             logger.debug("Failed to log numeric CDF summary")
         return candidates
 
@@ -590,6 +614,67 @@ class CorrelationAnalyzer:
         """Delegates to ``NumericCdfCache.log_numeric_cdf_summary``."""
         self._cdf_cache.log_numeric_cdf_summary()
 
+    def _question_type_section(self) -> list[str]:
+        """Type mix + the note that correlations came off component vectors."""
+        type_counts = self._get_question_type_breakdown()
+        lines = ["## Question Type Distribution"]
+        lines.extend(f"- **{q_type.title()}**: {count} questions" for q_type, count in sorted(type_counts.items()))
+        lines.append("- **Analysis Method**: Component-wise correlation\n")
+        return lines
+
+    @staticmethod
+    def _model_performance_section(model_stats: dict[str, dict[str, float]]) -> list[str]:
+        """Per-model score/cost/efficiency, best-performing first."""
+        lines = ["## Individual Model Performance"]
+        lines.extend(
+            f"- **{model}**: Score {stats['avg_performance']:.2f}, "
+            f"Cost ${stats['avg_cost']:.3f}/question, "
+            f"Efficiency {stats['efficiency_ratio']:.1f}"
+            for model, stats in sorted(model_stats.items(), key=lambda x: x[1]["avg_performance"], reverse=True)
+        )
+        return lines
+
+    @staticmethod
+    def _correlation_highlights_section(correlation_matrix: CorrelationMatrix) -> list[str]:
+        """The five least-correlated model pairs — the diversity candidates."""
+        lines = ["\n## Model Correlations (Pearson)", "**Most Independent Model Pairs:**"]
+        least_correlated = correlation_matrix.get_least_correlated_pairs(threshold=0.8)
+        lines.extend(f"- {model1} ↔ {model2}: r = {corr:.3f}" for model1, model2, corr in least_correlated[:5])
+        return lines
+
+    @staticmethod
+    def _recommended_ensembles_section(optimal_ensembles: list[EnsembleCandidate]) -> list[str]:
+        """Top five model combinations, each showing every aggregation strategy tried.
+
+        Grouping by model set (rather than listing candidates flat) is the point: it
+        puts mean and median for the same models side by side.
+        """
+        lines = ["\n## Recommended Ensembles (Both Aggregation Strategies)"]
+
+        ensemble_groups: dict[tuple[str, ...], list[EnsembleCandidate]] = {}
+        for ensemble in optimal_ensembles:
+            ensemble_groups.setdefault(tuple(sorted(ensemble.model_names)), []).append(ensemble)
+
+        ranked_groups = sorted(
+            ensemble_groups.items(),
+            key=lambda x: max(e.ensemble_score for e in x[1]),
+            reverse=True,
+        )
+        for combination_count, (models_key, ensembles) in enumerate(ranked_groups[:5]):
+            lines.append(f"\n**{combination_count + 1}. {' + '.join(models_key)}**")
+
+            # Sort by aggregation strategy for consistent ordering (mean first, then median)
+            ensembles.sort(key=lambda x: x.aggregation_strategy)
+            lines.extend(
+                f"   - **{ensemble.aggregation_strategy.upper()}**: "
+                f"Score {ensemble.avg_performance:.2f}, "
+                f"Cost ${ensemble.avg_cost:.3f}, "
+                f"Diversity {ensemble.diversity_score:.3f}, "
+                f"Overall {ensemble.ensemble_score:.3f}"
+                for ensemble in ensembles
+            )
+        return lines
+
     def generate_correlation_report(self, output_path: str | None = None) -> str:
         """Generate human-readable correlation analysis report."""
         if not self.predictions:
@@ -605,11 +690,10 @@ class CorrelationAnalyzer:
         model_stats = self._simulator.calculate_model_statistics()
         optimal_ensembles = self.find_optimal_ensembles(use_component_analysis=use_component_analysis)
 
-        report = []
-        report.append("# Model Correlation Analysis Report")
-        report.append(
-            f"Based on {correlation_matrix.num_questions} questions across {len(correlation_matrix.model_names)} models\n"
-        )
+        report = [
+            "# Model Correlation Analysis Report",
+            f"Based on {correlation_matrix.num_questions} questions across {len(correlation_matrix.model_names)} models\n",
+        ]
 
         # Note any filters applied
         if self._filter_summary_lines:
@@ -619,64 +703,11 @@ class CorrelationAnalyzer:
 
         # Add question type breakdown if mixed
         if use_component_analysis:
-            type_counts = self._get_question_type_breakdown()
-            report.append("## Question Type Distribution")
-            for q_type, count in sorted(type_counts.items()):
-                report.append(f"- **{q_type.title()}**: {count} questions")
-            report.append("- **Analysis Method**: Component-wise correlation\n")
+            report.extend(self._question_type_section())
 
-        # Model Performance Summary
-        report.append("## Individual Model Performance")
-        for model, stats in sorted(model_stats.items(), key=lambda x: x[1]["avg_performance"], reverse=True):
-            report.append(
-                f"- **{model}**: Score {stats['avg_performance']:.2f}, "
-                f"Cost ${stats['avg_cost']:.3f}/question, "
-                f"Efficiency {stats['efficiency_ratio']:.1f}"
-            )
-
-        # Correlation Highlights
-        report.append("\n## Model Correlations (Pearson)")
-        least_correlated = correlation_matrix.get_least_correlated_pairs(threshold=0.8)
-        report.append("**Most Independent Model Pairs:**")
-        for model1, model2, corr in least_correlated[:5]:
-            report.append(f"- {model1} ↔ {model2}: r = {corr:.3f}")
-
-        # Optimal Ensembles with Aggregation Strategy Comparison
-        report.append("\n## Recommended Ensembles (Both Aggregation Strategies)")
-
-        # Group ensembles by model combination to show mean vs median comparison
-        ensemble_groups = {}
-        for ensemble in optimal_ensembles:
-            models_key = tuple(sorted(ensemble.model_names))
-            if models_key not in ensemble_groups:
-                ensemble_groups[models_key] = []
-            ensemble_groups[models_key].append(ensemble)
-
-        # Show top 5 model combinations with both aggregation strategies
-        for combination_count, (models_key, ensembles) in enumerate(
-            sorted(
-                ensemble_groups.items(),
-                key=lambda x: max(e.ensemble_score for e in x[1]),
-                reverse=True,
-            )
-        ):
-            if combination_count >= 5:
-                break
-
-            models_str = " + ".join(models_key)
-            report.append(f"\n**{combination_count + 1}. {models_str}**")
-
-            # Sort by aggregation strategy for consistent ordering (mean first, then median)
-            ensembles.sort(key=lambda x: x.aggregation_strategy)
-
-            for ensemble in ensembles:
-                report.append(
-                    f"   - **{ensemble.aggregation_strategy.upper()}**: "
-                    f"Score {ensemble.avg_performance:.2f}, "
-                    f"Cost ${ensemble.avg_cost:.3f}, "
-                    f"Diversity {ensemble.diversity_score:.3f}, "
-                    f"Overall {ensemble.ensemble_score:.3f}"
-                )
+        report.extend(self._model_performance_section(model_stats))
+        report.extend(self._correlation_highlights_section(correlation_matrix))
+        report.extend(self._recommended_ensembles_section(optimal_ensembles))
 
         report_text = "\n".join(report)
 

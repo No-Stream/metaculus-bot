@@ -56,6 +56,45 @@ def _sse_for_fit(fit: FitType, declared: dict[float, float]) -> float:
     return sse
 
 
+def _fit_all_families(
+    declared_percentiles: dict[float, float],
+    df: float,
+) -> tuple[dict[str, float], dict[str, FitType]]:
+    """Fit normal / lognormal / Student-t, scoring an unfittable family as ``inf`` SSE.
+
+    A family that fails to fit is recorded in ``sse_by_family`` but absent from
+    ``fits_by_family``, so a downstream reader can tell "fit badly" from "could not fit".
+    """
+    sse_by_family: dict[str, float] = {}
+    fits_by_family: dict[str, FitType] = {}
+
+    try:
+        normal_fit = fit_normal_from_percentiles(declared_percentiles)
+        fits_by_family["normal"] = normal_fit
+        sse_by_family["normal"] = _sse_for_fit(normal_fit, declared_percentiles)
+    except ValueError:
+        sse_by_family["normal"] = math.inf
+
+    if all(v > 0 for v in declared_percentiles.values()):
+        try:
+            lognorm_fit = fit_lognormal_from_percentiles(declared_percentiles)
+            fits_by_family["lognormal"] = lognorm_fit
+            sse_by_family["lognormal"] = _sse_for_fit(lognorm_fit, declared_percentiles)
+        except ValueError:
+            sse_by_family["lognormal"] = math.inf
+    else:
+        sse_by_family["lognormal"] = math.inf
+
+    try:
+        t_fit = fit_student_t_from_percentiles(declared_percentiles, df=df)
+        fits_by_family["student_t"] = t_fit
+        sse_by_family["student_t"] = _sse_for_fit(t_fit, declared_percentiles)
+    except ValueError:
+        sse_by_family["student_t"] = math.inf
+
+    return sse_by_family, fits_by_family
+
+
 def percentile_family_consistency(
     declared_percentiles: dict[float, float],
     claimed_family: FamilyLiteral | None,
@@ -77,34 +116,7 @@ def percentile_family_consistency(
     if df <= 0:
         raise ValueError(f"student_t_df must be > 0 (got {df})")
 
-    sse_by_family: dict[str, float] = {}
-    fits_by_family: dict[str, FitType] = {}
-
-    try:
-        normal_fit = fit_normal_from_percentiles(declared_percentiles)
-        fits_by_family["normal"] = normal_fit
-        sse_by_family["normal"] = _sse_for_fit(normal_fit, declared_percentiles)
-    except ValueError:
-        sse_by_family["normal"] = math.inf
-
-    all_positive = all(v > 0 for v in declared_percentiles.values())
-    if all_positive:
-        try:
-            lognorm_fit = fit_lognormal_from_percentiles(declared_percentiles)
-            fits_by_family["lognormal"] = lognorm_fit
-            sse_by_family["lognormal"] = _sse_for_fit(lognorm_fit, declared_percentiles)
-        except ValueError:
-            sse_by_family["lognormal"] = math.inf
-    else:
-        sse_by_family["lognormal"] = math.inf
-
-    try:
-        t_fit = fit_student_t_from_percentiles(declared_percentiles, df=df)
-        fits_by_family["student_t"] = t_fit
-        sse_by_family["student_t"] = _sse_for_fit(t_fit, declared_percentiles)
-    except ValueError:
-        sse_by_family["student_t"] = math.inf
-
+    sse_by_family, fits_by_family = _fit_all_families(declared_percentiles, df)
     best_family = min(sse_by_family.items(), key=lambda kv: kv[1])[0]
 
     details = {

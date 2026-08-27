@@ -114,7 +114,7 @@ class TestProcessSingleQuestion:
         gt = _make_ground_truth(42)
 
         qid, research_text, is_leaked = await _process_single_question(
-            question, gt, research_provider, detector_llm, semaphore
+            question, gt, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
         )
 
         assert qid == 42
@@ -132,7 +132,7 @@ class TestProcessSingleQuestion:
         gt = _make_ground_truth(42)
 
         qid, research_text, is_leaked = await _process_single_question(
-            question, gt, research_provider, detector_llm, semaphore
+            question, gt, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
         )
 
         assert qid == 42
@@ -149,7 +149,7 @@ class TestProcessSingleQuestion:
         gt = _make_ground_truth(42)
 
         qid, research_text, is_leaked = await _process_single_question(
-            question, gt, research_provider, detector_llm, semaphore
+            question, gt, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
         )
 
         assert qid == 42
@@ -174,7 +174,9 @@ class TestProcessSingleQuestion:
         question = _make_question(42, text="Will X resolve?")
         gt = _make_ground_truth(42)
 
-        await _process_single_question(question, gt, recording_provider, detector_llm, semaphore)
+        await _process_single_question(
+            question, gt, research_provider=recording_provider, detector_llm=detector_llm, semaphore=semaphore
+        )
 
         assert received == [question]  # the object itself, not question.question_text
         assert received[0].question_text == "Will X resolve?"  # attribute access works on it
@@ -200,8 +202,12 @@ class TestProcessSingleQuestion:
         gt2 = _make_ground_truth(2)
 
         await asyncio.gather(
-            _process_single_question(q1, gt1, research_provider, detector_llm, semaphore),
-            _process_single_question(q2, gt2, research_provider, detector_llm, semaphore),
+            _process_single_question(
+                q1, gt1, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
+            ),
+            _process_single_question(
+                q2, gt2, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
+            ),
         )
 
         assert call_order == ["start", "end", "start", "end"]

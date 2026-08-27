@@ -817,7 +817,11 @@ class TestStackingGateUnderACloseLimitedBudget:
             ),
         ):
             text = await _targeted_research_for_crux(
-                bot, make_real_binary_question(qid=7304), analyzer_llm, predictions, budget
+                bot,
+                make_real_binary_question(qid=7304),
+                analyzer_llm=analyzer_llm,
+                valid_predictions=predictions,
+                time_budget=budget,
             )
 
         assert text == "targeted findings"
@@ -858,7 +862,11 @@ class TestStackingGateUnderACloseLimitedBudget:
             caplog.at_level(logging.WARNING, logger="metaculus_bot.stacking_route"),
         ):
             text = await _targeted_research_for_crux(
-                bot, make_real_binary_question(qid=7305), analyzer_llm, predictions, budget
+                bot,
+                make_real_binary_question(qid=7305),
+                analyzer_llm=analyzer_llm,
+                valid_predictions=predictions,
+                time_budget=budget,
             )
 
         assert text == ""

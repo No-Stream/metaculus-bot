@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from metaculus_bot.config import load_environment
+from metaculus_bot.time_utils import _as_utc
 
 # =============================================================================
 # TOURNAMENT IDs - UPDATE THESE EACH QUARTER/SEASON
@@ -71,13 +72,17 @@ def check_tournament_dates(logger: logging.Logger | None = None) -> None:
     """
     log = logger or logging.getLogger(__name__)
 
+    # Both operands go through _as_utc so the comparison is tz-aware on the same side of
+    # the clock. Only the wall-clock reference moves (local -> UTC): the tournament close
+    # date is a Metaculus (UTC) date, and prod runs on UTC GitHub Actions runners, so this
+    # shifts nothing in prod and at most a few hours of a staleness warning locally.
     try:
-        end_date = datetime.strptime(TOURNAMENT_END_DATE, "%Y-%m-%d")
+        end_date = _as_utc(datetime.strptime(TOURNAMENT_END_DATE, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
     except ValueError:
         log.warning(f"Invalid TOURNAMENT_END_DATE format: {TOURNAMENT_END_DATE}")
         return
 
-    today = datetime.now()
+    today = _as_utc(datetime.now(UTC))
     hard_stop_date = end_date + timedelta(weeks=TOURNAMENT_HARD_STOP_WEEKS)
 
     if today > hard_stop_date:
@@ -143,10 +148,10 @@ TEST_QUESTIONS_OVERRIDE_ENV: str = "TEST_QUESTIONS_OVERRIDE"
 OPENROUTER_API_KEY_ENV: str = "OPENROUTER_API_KEY"
 OAI_ANTH_OPENROUTER_KEY_ENV: str = "OAI_ANTH_OPENROUTER_KEY"
 ASKNEWS_CLIENT_ID_ENV: str = "ASKNEWS_CLIENT_ID"
-ASKNEWS_SECRET_ENV: str = "ASKNEWS_SECRET"
+ASKNEWS_SECRET_ENV: str = "ASKNEWS_SECRET"  # noqa: S105  # env var NAME, not a credential
 EXA_API_KEY_ENV: str = "EXA_API_KEY"
 PERPLEXITY_API_KEY_ENV: str = "PERPLEXITY_API_KEY"
-METACULUS_TOKEN_ENV: str = "METACULUS_TOKEN"
+METACULUS_TOKEN_ENV: str = "METACULUS_TOKEN"  # noqa: S105  # env var NAME, not a credential
 
 
 def env_flag_enabled(env_name: str, *, default: bool = False) -> bool:
@@ -258,7 +263,12 @@ def credit_alerts_active(today: date | None = None) -> bool:
     import), so a long-lived process crosses the resume date without a redeploy
     and tests can inject a fixed date instead of depending on the wall clock.
     """
-    return (today or date.today()) >= CREDIT_ALERT_RESUME_DATE
+
+    # Local calendar day is deliberate: this gates a sys.exit(1) and the resume date is an
+    # operator-facing lever read in the operator's own calendar day. Prod runs on UTC GitHub
+    # Actions runners, so local == UTC there; datetime.now(UTC).date() would only move the
+    # boundary in a local dev shell.
+    return (today or date.today()) >= CREDIT_ALERT_RESUME_DATE  # noqa: DTZ011  # see comment above
 
 
 # Prediction-market venues (or prefetch catalogues) whose degradation is KNOWN and
@@ -286,7 +296,9 @@ def provider_degradation_alerts_active(venue: str, today: date | None = None) ->
     entry is always alertable.
     """
     resume = PROVIDER_DEGRADATION_SUPPRESSED_UNTIL.get(venue)
-    return resume is None or (today or date.today()) >= resume
+    # Same contract as credit_alerts_active above: local calendar day is deliberate on an
+    # operator-facing dated lever, and prod (UTC runners) sees no difference.
+    return resume is None or (today or date.today()) >= resume  # noqa: DTZ011  # see comment above
 
 
 # --- Forecasting clamps and numeric smoothing ---

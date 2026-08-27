@@ -366,7 +366,13 @@ class TestRankNumericOwnGrid:
             num_points=num_points,
         )
         return numeric_log_score(
-            cdf, 1.0, record["scaling"]["range_min"], record["scaling"]["range_max"], False, False, None
+            cdf,
+            1.0,
+            record["scaling"]["range_min"],
+            record["scaling"]["range_max"],
+            open_lower_bound=False,
+            open_upper_bound=False,
+            zero_point=None,
         )
 
     def test_coarse_discrete_scores_on_its_own_grid(self):

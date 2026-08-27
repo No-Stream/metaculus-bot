@@ -13,6 +13,7 @@ import asyncio
 import functools
 import logging
 import os
+from collections.abc import Sequence
 from typing import Any
 
 from forecasting_tools.data_models.questions import MetaculusQuestion
@@ -122,6 +123,65 @@ def _format_source_label(web: object) -> str:
     return title or domain
 
 
+def _splice_inline_citations(text: str, supports: Sequence[Any] | None) -> str:
+    """Insert ``[N]`` citation markers into ``text`` at each support's segment boundary.
+
+    Google's ``segment.end_index`` is a UTF-8 BYTE offset into the response text, so
+    we splice on the encoded bytes rather than the Python str (which is indexed by
+    codepoint). Indexing the str by a byte offset shifts every marker left by the
+    count of multi-byte chars (em-dashes, smart quotes) before it, landing markers
+    mid-word ("civilization. T[1]hese" instead of "civilization.[1] These").
+    Iterating right-to-left keeps earlier byte offsets valid as we mutate the buffer.
+
+    Returns ``text`` unchanged when there are no supports, and falls back to the
+    ORIGINAL text (never a half-spliced buffer) if the splice fails.
+    """
+    if not supports:
+        return text
+    try:
+        sorted_supports = sorted(
+            supports,
+            key=lambda s: s.segment.end_index if s.segment and s.segment.end_index is not None else 0,
+            reverse=True,
+        )
+        annotated_bytes = text.encode("utf-8")
+        for support in sorted_supports:
+            segment = support.segment
+            if segment is None or segment.end_index is None:
+                continue
+            chunk_indices = support.grounding_chunk_indices
+            if not chunk_indices:
+                continue
+            # Convert to 1-indexed markers, dedup, sort for readability.
+            markers = sorted({int(i) + 1 for i in chunk_indices})
+            marker_str = "[" + ", ".join(str(m) for m in markers) + "]"
+            end_index = segment.end_index
+            annotated_bytes = annotated_bytes[:end_index] + marker_str.encode("utf-8") + annotated_bytes[end_index:]
+        return annotated_bytes.decode("utf-8")
+    except (AttributeError, TypeError, ValueError, UnicodeDecodeError) as exc:
+        # Malformed supports (or a byte offset that lands mid-codepoint) shouldn't kill the response.
+        logger.warning(f"GeminiSearch: could not splice inline citations ({type(exc).__name__}): {exc}")
+        return text
+
+
+def _render_sources_section(chunks: Sequence[Any]) -> str:
+    """Render the trailing ``### Sources`` block, or ``""`` when no chunk carries a label.
+
+    Renders the real source domain, NOT the opaque
+    vertexaisearch.cloud.google.com/grounding-api-redirect/<~250-char blob> URI. The
+    domain carries all the signal a text-only forecaster can use, and the redirect
+    blobs were ~5% of the whole research bundle. Entries stay 1:1 with the grounding
+    chunks so the inline [N] markers keep pointing at the right source (deduping
+    would misalign them).
+    """
+    sources_lines = ["", "", "### Sources"]
+    for idx, chunk in enumerate(chunks, start=1):
+        label = _format_source_label(chunk.web)
+        if label:
+            sources_lines.append(f"[{idx}] {label}")
+    return "\n".join(sources_lines) if len(sources_lines) > _SOURCES_HEADER_LEN else ""
+
+
 def _format_grounded_response(
     response: genai_types.GenerateContentResponse,
     *,
@@ -191,57 +251,8 @@ def _format_grounded_response(
         # caller appends the url_context fetch marker.
         return text
 
-    chunks = metadata.grounding_chunks
-    supports = metadata.grounding_supports
-
-    # Insert inline citation markers based on supports. Google's
-    # segment.end_index is a UTF-8 BYTE offset into the response text, so we
-    # splice on the encoded bytes rather than the Python str (which is indexed by
-    # codepoint). Indexing the str by a byte offset shifts every marker left by
-    # the count of multi-byte chars (em-dashes, smart quotes) before it, landing
-    # markers mid-word ("civilization. T[1]hese" instead of "civilization.[1]
-    # These"). Iterating right-to-left keeps earlier byte offsets valid as we
-    # mutate the buffer.
-    annotated = text
-    if supports:
-        try:
-            sorted_supports = sorted(
-                supports,
-                key=lambda s: s.segment.end_index if s.segment and s.segment.end_index is not None else 0,
-                reverse=True,
-            )
-            annotated_bytes = text.encode("utf-8")
-            for support in sorted_supports:
-                segment = support.segment
-                if segment is None or segment.end_index is None:
-                    continue
-                chunk_indices = support.grounding_chunk_indices
-                if not chunk_indices:
-                    continue
-                # Convert to 1-indexed markers, dedup, sort for readability.
-                markers = sorted({int(i) + 1 for i in chunk_indices})
-                marker_str = "[" + ", ".join(str(m) for m in markers) + "]"
-                end_index = segment.end_index
-                annotated_bytes = annotated_bytes[:end_index] + marker_str.encode("utf-8") + annotated_bytes[end_index:]
-            annotated = annotated_bytes.decode("utf-8")
-        except (AttributeError, TypeError, ValueError, UnicodeDecodeError) as exc:
-            # Malformed supports (or a byte offset that lands mid-codepoint) shouldn't kill the response.
-            logger.warning(f"GeminiSearch: could not splice inline citations ({type(exc).__name__}): {exc}")
-            annotated = text
-
-    # Append a Sources section rendering the real source domain, NOT the opaque
-    # vertexaisearch.cloud.google.com/grounding-api-redirect/<~250-char blob>
-    # URI. The domain carries all the signal a text-only forecaster can use, and
-    # the redirect blobs were ~5% of the whole research bundle. Entries stay 1:1
-    # with the grounding chunks so the inline [N] markers spliced above keep
-    # pointing at the right source (deduping would misalign them).
-    sources_lines = ["", "", "### Sources"]
-    for idx, chunk in enumerate(chunks, start=1):
-        label = _format_source_label(chunk.web)
-        if label:
-            sources_lines.append(f"[{idx}] {label}")
-
-    return annotated + "\n".join(sources_lines) if len(sources_lines) > _SOURCES_HEADER_LEN else annotated
+    annotated = _splice_inline_citations(text, metadata.grounding_supports)
+    return annotated + _render_sources_section(metadata.grounding_chunks)
 
 
 async def invoke_gemini_grounded(

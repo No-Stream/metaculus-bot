@@ -144,7 +144,9 @@ async def parse_structured[T](
         else:
             return schema_model.model_validate_json(raw_response)  # type: ignore[return-value]
 
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # intentional: catch-all → graceful fallback
+    # Boundary: constrained decoding is an optimization, so ANY failure here must degrade to
+    # the structure_output fallback below rather than fail the forecast.
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # intentional: catch-all → graceful fallback
         logger.info(
             "Constrained parse failed (%s: %s); falling back to structure_output",
             type(exc).__name__,

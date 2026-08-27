@@ -46,6 +46,7 @@ def resolution_to_bucket_index(
     resolution: float,
     lower_bound: float,
     upper_bound: float,
+    *,
     n_inbound: int,
     zero_point: float | None = None,
 ) -> int:
@@ -81,6 +82,7 @@ def numeric_log_score(
     resolution: float,
     lower_bound: float,
     upper_bound: float,
+    *,
     open_lower_bound: bool,
     open_upper_bound: bool,
     zero_point: float | None = None,
@@ -105,7 +107,9 @@ def numeric_log_score(
         pmf.append(cdf_values[i] - cdf_values[i - 1])
     pmf.append(1.0 - cdf_values[-1])
 
-    bucket = resolution_to_bucket_index(resolution, lower_bound, upper_bound, n_inbound, zero_point)
+    bucket = resolution_to_bucket_index(
+        resolution, lower_bound, upper_bound, n_inbound=n_inbound, zero_point=zero_point
+    )
 
     n_open_bounds = int(open_lower_bound) + int(open_upper_bound)
     if bucket in (0, len(pmf) - 1):

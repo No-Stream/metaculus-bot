@@ -99,12 +99,15 @@ def _pchip_cdf(
     open_upper=False,
     zero_point=None,
 ) -> list[float]:
-    """Build a 201-point CDF from percent-keyed percentiles (test helper).
-
-    generate_pchip_cdf takes the open-bound flags as (open_upper, open_lower); pass them
-    in that order so the published CDF matches the record's declared bounds/scaling.
-    """
-    cdf, _ = generate_pchip_cdf(percent_percentiles, open_upper, open_lower, upper, lower, zero_point)
+    """Build a 201-point CDF from percent-keyed percentiles (test helper)."""
+    cdf, _ = generate_pchip_cdf(
+        percent_percentiles,
+        open_upper_bound=open_upper,
+        open_lower_bound=open_lower,
+        upper_bound=upper,
+        lower_bound=lower,
+        zero_point=zero_point,
+    )
     return cdf
 
 
@@ -468,8 +471,10 @@ class TestNumericPairedScoring:
         assert "numeric: n=1" in report
 
     def test_open_lower_bound_numeric_scored(self):
-        # open_lower_bound threads to generate_pchip_cdf and numeric_log_score in different
-        # positional slots; exercise the open-lower wiring end to end (both scores finite).
+        # generate_pchip_cdf declares the flags as (open_upper, open_lower) and
+        # numeric_log_score as (open_lower, open_upper); both are keyword-only now, so a
+        # transposition can no longer typecheck. This still exercises the wiring end to
+        # end — that the open-lower flag reaches BOTH destinations (scores stay finite).
         published_cdf = _pchip_cdf({5: 20, 50: 50, 95: 90}, open_lower=True)
         record = _numeric_record(1, 50.0, published_cdf, open_lower=True)
         json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": {0.05: 25, 0.5: 55, 0.95: 85}})]
@@ -482,7 +487,7 @@ class TestNumericPairedScoring:
         assert math.isfinite(row["delta"])
 
     def test_open_upper_bound_numeric_scored(self):
-        # Same wiring check for the open-upper flag (the other positional slot).
+        # Same wiring check for the other flag.
         published_cdf = _pchip_cdf({5: 20, 50: 50, 95: 90}, open_upper=True)
         record = _numeric_record(1, 50.0, published_cdf, open_upper=True)
         json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": {0.05: 15, 0.5: 45, 0.95: 95}})]
@@ -547,7 +552,14 @@ class TestNumericPairedScoring:
         # _score_numeric docstring.)
         min_step = round(0.01 / 20, 9)
         published_cdf, _ = generate_pchip_cdf(
-            {5: 5, 50: 10, 95: 15}, False, False, 20.0, 0.0, None, min_step=min_step, num_points=21
+            {5: 5, 50: 10, 95: 15},
+            open_upper_bound=False,
+            open_lower_bound=False,
+            upper_bound=20.0,
+            lower_bound=0.0,
+            zero_point=None,
+            min_step=min_step,
+            num_points=21,
         )
         assert len(published_cdf) == 21  # reduced grid, not the continuous 201
         record = _numeric_record(1, 10.0, published_cdf, lower=0.0, upper=20.0)
@@ -581,7 +593,15 @@ class TestGhostGridScaledMaxStep:
         # Any valid 9-point published CDF fixes num_points=9; its shape only feeds the
         # published log score, not the ghost CDF whose bins we assert on.
         published_cdf, _ = generate_pchip_cdf(
-            {5: 1, 50: 3, 95: 6}, True, False, 7.5, -0.5, None, min_step=min_step, max_step=max_step, num_points=9
+            {5: 1, 50: 3, 95: 6},
+            open_upper_bound=True,
+            open_lower_bound=False,
+            upper_bound=7.5,
+            lower_bound=-0.5,
+            zero_point=None,
+            min_step=min_step,
+            max_step=max_step,
+            num_points=9,
         )
         assert len(published_cdf) == 9
 
@@ -623,7 +643,15 @@ class TestGhostGridScaledMaxStep:
         concentrated_pct = {20.0: 0.30, 40.0: 0.65, 50.0: 0.90, 80.0: 2.20, 90.0: 3.20, 99.0: 6.60}
         min_step, max_step = grid_step_constraints(9)
         published_cdf, _ = generate_pchip_cdf(
-            concentrated_pct, True, False, 7.5, -0.5, None, min_step=min_step, max_step=max_step, num_points=9
+            concentrated_pct,
+            open_upper_bound=True,
+            open_lower_bound=False,
+            upper_bound=7.5,
+            lower_bound=-0.5,
+            zero_point=None,
+            min_step=min_step,
+            max_step=max_step,
+            num_points=9,
         )
         record = _numeric_record(1, 0.0, published_cdf, lower=-0.5, upper=7.5, open_upper=True)
         record["type"] = "discrete"

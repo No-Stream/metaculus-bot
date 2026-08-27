@@ -37,6 +37,11 @@ from metaculus_bot.tool_runner import _feature_enabled as _tool_runner_feature_e
 
 logger = logging.getLogger(__name__)
 
+# Mirrors tool_runner._feature_enabled's question_type argument. A module-level alias rather
+# than an inline Literal in the return annotation: ruff's quoted-annotation autofix strips the
+# quotes off an inline `Literal["binary", ...]` under `from __future__ import annotations`.
+_QuestionTypeKey = Literal["binary", "numeric", "multiple_choice"]
+
 
 def format_research_summary_with_models(
     base_text: str,
@@ -78,6 +83,44 @@ def _forecasters_used_suffix(n_used: int | None, n_configured: int | None) -> st
     return f"\n{format_forecasters_used_marker(n_used, n_configured)}"
 
 
+def _stacker_outcome_markers(stacker_outcome: str) -> tuple[str, str]:
+    """The (STACKER_OUTCOME, legacy STACKED) marker pair for one outcome.
+
+    Raises on an unknown outcome rather than defaulting: a new outcome that silently
+    published as ``STACKED: false`` would misreport whether the stacker ran.
+    """
+    match stacker_outcome:
+        case "primary":
+            return STACKER_OUTCOME_PRIMARY, STACKED_MARKER_TRUE
+        case "fallback_llm":
+            return STACKER_OUTCOME_FALLBACK_LLM, STACKED_MARKER_TRUE
+        case "fallback_median":
+            return STACKER_OUTCOME_FALLBACK_MEDIAN, STACKED_MARKER_FALSE
+        case "fallback_mean":
+            return STACKER_OUTCOME_FALLBACK_MEAN, STACKED_MARKER_FALSE
+        case "skipped":
+            return STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
+        case "skipped_config_off":
+            return STACKER_OUTCOME_SKIPPED_CONFIG_OFF, STACKED_MARKER_FALSE
+        case other:
+            raise ValueError(f"Unknown stacker outcome {other!r}")
+
+
+def _question_type_key(question: object) -> _QuestionTypeKey | None:
+    """The per-type key the tool-runner flag lookup uses, or None for an unhandled type.
+
+    BinaryQuestion and MultipleChoiceQuestion are matched before NumericQuestion because
+    DiscreteQuestion subclasses the latter and must read the numeric key.
+    """
+    if isinstance(question, BinaryQuestion):
+        return "binary"
+    if isinstance(question, NumericQuestion):
+        return "numeric"
+    if isinstance(question, MultipleChoiceQuestion):
+        return "multiple_choice"
+    return None
+
+
 def build_unified_explanation(
     base_text: str,
     question: object,
@@ -111,30 +154,8 @@ def build_unified_explanation(
         "every reachable code path in _aggregate_predictions sets it. Missing entry = real bug."
     )
 
-    match stacker_outcome:
-        case "primary":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_PRIMARY, STACKED_MARKER_TRUE
-        case "fallback_llm":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_LLM, STACKED_MARKER_TRUE
-        case "fallback_median":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEDIAN, STACKED_MARKER_FALSE
-        case "fallback_mean":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEAN, STACKED_MARKER_FALSE
-        case "skipped":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
-        case "skipped_config_off":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED_CONFIG_OFF, STACKED_MARKER_FALSE
-        case other:
-            raise ValueError(f"Unknown stacker outcome {other!r}")
-
-    if isinstance(question, BinaryQuestion):
-        qtype: Literal["binary", "numeric", "multiple_choice"] | None = "binary"
-    elif isinstance(question, NumericQuestion):
-        qtype = "numeric"
-    elif isinstance(question, MultipleChoiceQuestion):
-        qtype = "multiple_choice"
-    else:
-        qtype = None
+    outcome_marker, legacy_marker = _stacker_outcome_markers(stacker_outcome)
+    qtype = _question_type_key(question)
 
     skip_reason_suffix = "" if skip_reason is None else f"\n{format_stacker_skip_reason_marker(skip_reason)}"
     tools_marker = TOOLS_USED_MARKER_TRUE if _tool_runner_feature_enabled(qtype) else TOOLS_USED_MARKER_FALSE

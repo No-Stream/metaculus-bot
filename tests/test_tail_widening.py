@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from itertools import pairwise
 from types import SimpleNamespace
-from typing import cast
+from typing import ClassVar, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -189,6 +189,339 @@ class TestTailWideningUnit:
         assert (_get(out, 0.975) - _get(out, 0.95)) >= (_get(out, 0.95) - _get(out, 0.90)) - 1e-12
         vals = [pp.value for pp in out]
         assert all(b > a for a, b in pairwise(vals)), vals
+
+
+class TestTailWideningGoldenOutputs:
+    """Exact-output pins across every bound configuration and both knobs.
+
+    ``widen_declared_percentiles`` chains a transform-space stretch, two span-floor
+    passes, an outer-span guard, two strict-ordering passes, an open-bound nudge and a
+    forward/backward spacing schedule. The property tests above cover each rule in
+    isolation; these goldens pin the composition, so the chain can be restructured
+    without silently moving a published percentile. Values captured from the
+    implementation as of 2026-08-26.
+    """
+
+    SHAPES: ClassVar[dict[str, list[float]]] = {
+        "smooth": [4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99],
+        "compressed": [6, 10, 10.4, 12.0, 16.0, 30.0, 50.0, 70.0, 85.0, 92.0, 95.0, 96.0, 99],
+        "skewed": [0.5, 1, 2, 5, 15, 30, 45, 60, 78, 88, 93, 97, 98],
+    }
+
+    # (case, shape) -> expected values, in percentile order.
+    GOLDEN: ClassVar[dict[tuple[str, str], list[float]]] = {
+        ("closed_k13", "smooth"): [
+            1.65643538848544,
+            2.322604160398969,
+            3.322604160398969,
+            5.685589966598779,
+            12.000000000000002,
+            20.0,
+            50.0,
+            80.0,
+            89.99999999999999,
+            95.94671612068684,
+            98.60499083895746,
+            99.60499083895746,
+            99.72808931532293,
+        ],
+        ("closed_k13", "compressed"): [
+            2.8312719268432827,
+            5.874566459780891,
+            6.672637348931135,
+            9.184650187299086,
+            16.0,
+            30.0,
+            50.0,
+            70.0,
+            85.0,
+            94.31441003340122,
+            97.3582033231971,
+            98.3582033231971,
+            99.72808931532293,
+        ],
+        ("closed_k13", "skewed"): [
+            0.11757112979876375,
+            0.11767112979876375,
+            0.8816026014045131,
+            3.3699097521928727,
+            15.0,
+            30.0,
+            44.99999999999999,
+            60.0,
+            78.0,
+            91.06335548628063,
+            96.13519908313177,
+            99.9999,
+            100.0,
+        ],
+        ("closed_k13_g1", "smooth"): [
+            1.65643538848544,
+            1.65653538848544,
+            3.322604160398969,
+            5.685589966598779,
+            12.000000000000002,
+            20.0,
+            50.0,
+            80.0,
+            89.99999999999999,
+            95.94671612068684,
+            98.60499083895746,
+            99.9999,
+            100.0,
+        ],
+        ("closed_k13_g1", "compressed"): [
+            2.8312719268432827,
+            4.160624510563183,
+            6.672637348931135,
+            9.184650187299086,
+            16.0,
+            30.0,
+            50.0,
+            70.0,
+            85.0,
+            94.31441003340122,
+            97.3582033231971,
+            99.9999,
+            100.0,
+        ],
+        ("closed_k13_g1", "skewed"): [
+            0.11757112979876375,
+            0.11767112979876375,
+            0.8816026014045131,
+            3.3699097521928727,
+            15.0,
+            30.0,
+            44.99999999999999,
+            60.0,
+            78.0,
+            91.06335548628063,
+            96.13519908313177,
+            99.9999,
+            100.0,
+        ],
+        ("lower_bounded", "smooth"): [
+            1.9473348564889912,
+            2.7236343738867212,
+            3.7236343738867212,
+            6.077262343444526,
+            12.0,
+            20.0,
+            50.0,
+            80.00000000000001,
+            90.0,
+            99.99969999999999,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("lower_bounded", "compressed"): [
+            3.2788224913488286,
+            6.554210325824594,
+            7.304619354433183,
+            9.687527142102299,
+            16.000000000000004,
+            30.000000000000004,
+            50.0,
+            70.0,
+            84.99999999999997,
+            99.99969999999999,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("lower_bounded", "skewed"): [
+            0.1386790599048518,
+            0.1387790599048518,
+            0.9926335025786523,
+            3.596115466605833,
+            15.0,
+            30.000000000000004,
+            44.99999999999999,
+            60.00000000000001,
+            78.00000000000003,
+            97.31352310911664,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("upper_bounded", "smooth"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            0.00039999999999999996,
+            12.0,
+            19.999999999999986,
+            50.0,
+            80.0,
+            90.0,
+            95.63455584082577,
+            98.40703847614559,
+            99.40703847614559,
+            99.6720606370437,
+        ],
+        ("upper_bounded", "compressed"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            4.212338163131406,
+            15.999999999999972,
+            30.0,
+            50.0,
+            70.0,
+            85.0,
+            93.92273765655547,
+            97.02168928238332,
+            98.02168928238332,
+            99.6720606370437,
+        ],
+        ("upper_bounded", "skewed"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            0.00039999999999999996,
+            15.000000000000028,
+            30.0,
+            44.99999999999999,
+            59.99999999999999,
+            78.0,
+            90.44998553195363,
+            95.5978636115771,
+            99.5978636115771,
+            99.5979636115771,
+        ],
+        ("both_open", "smooth"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            0.00039999999999999996,
+            8.959999999999994,
+            20.0,
+            50.0,
+            80.0,
+            93.2,
+            99.99969999999999,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("both_open", "compressed"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            2.8800000000000026,
+            13.280000000000001,
+            30.0,
+            50.0,
+            70.0,
+            87.80000000000001,
+            99.99969999999999,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("both_open", "skewed"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            0.00039999999999999996,
+            12.599999999999994,
+            30.0,
+            45.0,
+            60.0,
+            80.64,
+            98.32,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("floor_only", "smooth"): [
+            3.9999999999999996,
+            4.0001,
+            6.0,
+            8.0,
+            12.0,
+            20.0,
+            50.0,
+            80.0,
+            90.0,
+            94.0,
+            97.0,
+            99.9999,
+            100.0,
+        ],
+        ("floor_only", "compressed"): [
+            6.0,
+            8.8,
+            10.4,
+            12.0,
+            16.0,
+            30.0,
+            50.0,
+            70.0,
+            85.0,
+            92.0,
+            95.0,
+            98.0,
+            99.0,
+        ],
+        ("floor_only", "skewed"): [
+            0.5,
+            0.5001,
+            2.0,
+            5.0,
+            15.0,
+            30.0,
+            45.0,
+            60.0,
+            78.0,
+            88.0,
+            93.0,
+            98.0,
+            98.0001,
+        ],
+    }
+
+    CASES: ClassVar[dict[str, tuple[dict[str, bool], dict[str, float]]]] = {
+        "closed_k13": (
+            {"open_lower": False, "open_upper": False},
+            {"k_tail": 1.3, "tail_start": 0.2, "span_floor_gamma": 0.0},
+        ),
+        "closed_k13_g1": (
+            {"open_lower": False, "open_upper": False},
+            {"k_tail": 1.3, "tail_start": 0.2, "span_floor_gamma": 1.0},
+        ),
+        "lower_bounded": (
+            {"open_lower": False, "open_upper": True},
+            {"k_tail": 1.3, "tail_start": 0.2, "span_floor_gamma": 0.0},
+        ),
+        "upper_bounded": (
+            {"open_lower": True, "open_upper": False},
+            {"k_tail": 1.3, "tail_start": 0.2, "span_floor_gamma": 0.0},
+        ),
+        "both_open": (
+            {"open_lower": True, "open_upper": True},
+            {"k_tail": 1.4, "tail_start": 0.25, "span_floor_gamma": 0.0},
+        ),
+        "floor_only": (
+            {"open_lower": False, "open_upper": False},
+            {"k_tail": 1.0, "tail_start": 0.2, "span_floor_gamma": 1.0},
+        ),
+    }
+
+    @pytest.mark.parametrize("case_name", list(CASES))
+    @pytest.mark.parametrize("shape_name", list(SHAPES))
+    def test_golden_output(self, case_name: str, shape_name: str):
+        question_kwargs, widen_kwargs = self.CASES[case_name]
+        question = _make_question(0.0, 100.0, **question_kwargs)
+        base = _standard_percentiles(self.SHAPES[shape_name])
+
+        out = widen_declared_percentiles(base, question, **widen_kwargs)
+
+        assert [p.percentile for p in out] == [p.percentile for p in base]
+        expected = self.GOLDEN[case_name, shape_name]
+        for got, want in zip((p.value for p in out), expected, strict=True):
+            assert got == pytest.approx(want, rel=1e-12, abs=1e-12)
 
 
 class TestTailWideningIntegration:

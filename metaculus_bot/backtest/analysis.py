@@ -61,6 +61,63 @@ def aggregate_scores(scores: list[QuestionScore]) -> dict[str, dict]:
     return aggregated
 
 
+_METRIC_TABLE_HEADER: tuple[str, str] = (
+    "| Metric | Bot Mean | Bot Std | Community Mean | Bot - Community | N |",
+    "|--------|----------|---------|----------------|-----------------|---|",
+)
+
+
+def _metric_table_lines(aggregated: dict[str, dict]) -> list[str]:
+    """Markdown table of per-metric bot/community stats; empty list when nothing aggregated.
+
+    Community columns render "N/A" rather than a number when Metaculus published no
+    comparable community score for that metric (numeric log score, notably).
+    """
+    if not aggregated:
+        return []
+    lines = list(_METRIC_TABLE_HEADER)
+    for metric_name, stats in aggregated.items():
+        community_mean_str = f"{stats['community_mean']:.4f}" if stats["community_mean"] is not None else "N/A"
+        bot_minus_str = f"{stats['bot_minus_community']:.4f}" if stats["bot_minus_community"] is not None else "N/A"
+        lines.append(
+            f"| {metric_name} "
+            f"| {stats['bot_mean']:.4f} "
+            f"| {stats['bot_std']:.4f} "
+            f"| {community_mean_str} "
+            f"| {bot_minus_str} "
+            f"| {stats['n']} |"
+        )
+    return lines
+
+
+def _question_set_summary_lines(question_set: Any) -> list[str]:
+    """Question count + type distribution bullets, when the question set carries metadata."""
+    if question_set is None or not hasattr(question_set, "fetch_metadata"):
+        return []
+    metadata = question_set.fetch_metadata
+    lines = [f"- Questions: {metadata.get('total_clean', '?')}"]
+    type_dist = metadata.get("type_distribution")
+    if type_dist:
+        dist_parts = [f"{qtype}: {count}" for qtype, count in type_dist.items()]
+        lines.append(f"- Type distribution: {', '.join(dist_parts)}")
+    return lines
+
+
+def _per_type_breakdown_lines(results: list[BacktestResult]) -> list[str]:
+    """One metric table per (bot, question type), question types in sorted order."""
+    lines: list[str] = []
+    for result in results:
+        by_type: dict[str, list[QuestionScore]] = {}
+        for score in result.scores:
+            by_type.setdefault(score.question_type, []).append(score)
+
+        for question_type, type_scores in sorted(by_type.items()):
+            lines.append("")
+            lines.append(f"### {result.bot_name} - {question_type}")
+            lines.extend(_metric_table_lines(aggregate_scores(type_scores)))
+    return lines
+
+
 def generate_backtest_report(
     results: list[BacktestResult],
     question_set: Any = None,
@@ -71,7 +128,9 @@ def generate_backtest_report(
     If output_path is provided, writes the report to that file (creating parent dirs).
     Returns the markdown string.
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # astimezone() attaches the local zone without shifting the wall clock, so the
+    # rendered stamp stays local-time (what the operator reads) and tz-aware.
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     lines: list[str] = []
 
     lines.append("# Backtest Report")
@@ -80,16 +139,7 @@ def generate_backtest_report(
 
     lines.append("## Summary")
     lines.append(f"- {len(results)} bots evaluated")
-
-    if question_set is not None and hasattr(question_set, "fetch_metadata"):
-        metadata = question_set.fetch_metadata
-        total_clean = metadata.get("total_clean", "?")
-        lines.append(f"- Questions: {total_clean}")
-        type_dist = metadata.get("type_distribution")
-        if type_dist:
-            dist_parts = [f"{qtype}: {count}" for qtype, count in type_dist.items()]
-            lines.append(f"- Type distribution: {', '.join(dist_parts)}")
-
+    lines.extend(_question_set_summary_lines(question_set))
     lines.append("")
 
     lines.append("## Results by Bot")
@@ -98,54 +148,11 @@ def generate_backtest_report(
         lines.append(f"### {result.bot_name}")
         lines.append(f"- Questions scored: {result.num_scored}/{result.num_questions} (failed: {result.num_failed})")
         lines.append("")
-
-        agg = aggregate_scores(result.scores)
-        if agg:
-            lines.append("| Metric | Bot Mean | Bot Std | Community Mean | Bot - Community | N |")
-            lines.append("|--------|----------|---------|----------------|-----------------|---|")
-            for metric_name, stats in agg.items():
-                community_mean_str = f"{stats['community_mean']:.4f}" if stats["community_mean"] is not None else "N/A"
-                bot_minus_str = (
-                    f"{stats['bot_minus_community']:.4f}" if stats["bot_minus_community"] is not None else "N/A"
-                )
-                lines.append(
-                    f"| {metric_name} "
-                    f"| {stats['bot_mean']:.4f} "
-                    f"| {stats['bot_std']:.4f} "
-                    f"| {community_mean_str} "
-                    f"| {bot_minus_str} "
-                    f"| {stats['n']} |"
-                )
+        lines.extend(_metric_table_lines(aggregate_scores(result.scores)))
         lines.append("")
 
     lines.append("## Per-Type Breakdown")
-    for result in results:
-        by_type: dict[str, list[QuestionScore]] = {}
-        for s in result.scores:
-            by_type.setdefault(s.question_type, []).append(s)
-
-        for question_type, type_scores in sorted(by_type.items()):
-            lines.append("")
-            lines.append(f"### {result.bot_name} - {question_type}")
-            type_agg = aggregate_scores(type_scores)
-            if type_agg:
-                lines.append("| Metric | Bot Mean | Bot Std | Community Mean | Bot - Community | N |")
-                lines.append("|--------|----------|---------|----------------|-----------------|---|")
-                for metric_name, stats in type_agg.items():
-                    community_mean_str = (
-                        f"{stats['community_mean']:.4f}" if stats["community_mean"] is not None else "N/A"
-                    )
-                    bot_minus_str = (
-                        f"{stats['bot_minus_community']:.4f}" if stats["bot_minus_community"] is not None else "N/A"
-                    )
-                    lines.append(
-                        f"| {metric_name} "
-                        f"| {stats['bot_mean']:.4f} "
-                        f"| {stats['bot_std']:.4f} "
-                        f"| {community_mean_str} "
-                        f"| {bot_minus_str} "
-                        f"| {stats['n']} |"
-                    )
+    lines.extend(_per_type_breakdown_lines(results))
 
     lines.append("")
     lines.append("## Notes")
@@ -192,7 +199,9 @@ def save_backtest_data(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # Local-time stamp (tz-aware via astimezone, same wall clock) so the filename
+    # matches what the operator sees in the report header.
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
     filepath = output_path / f"backtest_data_{timestamp}.json"
 
     ground_truths_serialized: dict[str, dict] = {}
@@ -215,7 +224,7 @@ def save_backtest_data(
         )
 
     data = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now().astimezone().isoformat(),
         "fetch_metadata": question_set.fetch_metadata if hasattr(question_set, "fetch_metadata") else {},
         "ground_truths": ground_truths_serialized,
         "results": results_serialized,

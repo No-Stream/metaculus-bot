@@ -28,7 +28,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import openai
@@ -256,6 +256,7 @@ def _research_blob_sha(research_blob: str) -> str:
 
 
 def _build_verdict(
+    *,
     is_leaked: bool,
     detector_response: str,
     detector_model: str,
@@ -267,7 +268,7 @@ def _build_verdict(
         "detector_response": detector_response,
         "detector_model": detector_model,
         "detector_failed": detector_failed,
-        "screened_at": datetime.now().isoformat(),
+        "screened_at": datetime.now(UTC).isoformat(),
         "research_blob_sha": _research_blob_sha(research_blob),
     }
 
@@ -371,6 +372,7 @@ async def _screen_under_semaphore(
     ground_truth: GroundTruth,
     research_blob: str,
     cache: AblationCache,
+    *,
     detector_llm: Any,
     detector_model: str,
     force: bool,
@@ -439,10 +441,10 @@ async def screen_batch(
                 ground_truths[qid],
                 research_cache_payloads[qid],
                 cache,
-                detector_llm,
-                detector_model,
-                force,
-                semaphore,
+                detector_llm=detector_llm,
+                detector_model=detector_model,
+                force=force,
+                semaphore=semaphore,
             )
         )
     results = await asyncio.gather(*tasks)

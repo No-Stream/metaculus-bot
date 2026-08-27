@@ -24,7 +24,7 @@ import json
 import logging
 import subprocess
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -321,6 +321,7 @@ def _build_verifier_prompt(
 def _build_re_redactor_prompt(
     qid: int,
     question: MetaculusQuestion,
+    *,
     ground_truth: GroundTruth,
     sanitized_blob: str,
     verifier_notes: str,
@@ -506,7 +507,9 @@ async def run_qa_iterate_for_qid(
             break
 
         re_redactor_raw = await _invoke_re_redactor(
-            _build_re_redactor_prompt(qid, question, ground_truth, blob, score.notes),
+            _build_re_redactor_prompt(
+                qid, question, ground_truth=ground_truth, sanitized_blob=blob, verifier_notes=score.notes
+            ),
             timeout_seconds=timeout_seconds,
         )
         new_blob = _parse_re_redactor_response(re_redactor_raw, qid, ground_truth)
@@ -520,7 +523,7 @@ async def run_qa_iterate_for_qid(
                 "sanitized_chars": len(blob),
                 "redactions": [],
                 "redactor_invocation_id": f"qa_iterate_iter_{iteration}",
-                "pruned_at": datetime.now().isoformat(),
+                "pruned_at": datetime.now(UTC).isoformat(),
                 "qa_iterate_iteration": iteration,
             },
         )
@@ -646,7 +649,7 @@ def write_manual_rejects(outcomes: list[IterateOutcome], path: Path) -> None:
         if outcome.qid in existing:
             continue
         existing[outcome.qid] = {
-            "rejected_at": datetime.now().isoformat(),
+            "rejected_at": datetime.now(UTC).isoformat(),
             "reason": outcome.reject_reason or outcome.final_status,
             "verifier_scores": [asdict(s) for s in outcome.verifier_scores],
             "iterations": outcome.iterations,

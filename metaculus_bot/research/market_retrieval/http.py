@@ -15,6 +15,7 @@ import json
 import logging
 import math
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -157,6 +158,43 @@ async def read_json_capped(resp: Any, label: str) -> Any | None:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class _RetryableStatus:
+    """One attempt's verdict when the status says "ask again": the status, and nothing else.
+
+    A sentinel rather than ``None`` because ``None`` is already the *give-up* answer a decoded
+    body can legitimately be, so the retry decision has to be a distinct type or the two collapse.
+    """
+
+    status: int
+
+
+async def _read_one_attempt(
+    session: Any,
+    url: str,
+    params: dict[str, str],
+    *,
+    client_timeout: aiohttp.ClientTimeout,
+    retryable: set[int],
+    label: str,
+) -> Any | None | _RetryableStatus:
+    """One GET: the parsed body, ``None`` on a non-retryable outcome, or a ``_RetryableStatus``.
+
+    Split out of ``http_get_with_backoff`` so the retry bookkeeping and the response reading are
+    each one level of nesting deep. One incidental improvement falls out: the response is released
+    when this returns, so a retryable status no longer holds it open across the backoff sleep.
+    """
+    async with session.get(url, params=params, timeout=client_timeout) as resp:
+        status = resp.status
+        if status in retryable or status >= 500:
+            return _RetryableStatus(status)
+        if status != 200:
+            snippet = await read_body_snippet(resp)
+            logger.warning(f"{label} HTTP {status} non-retryable: {snippet}")
+            return None
+        return await read_json_capped(resp, label)
+
+
 async def http_get_with_backoff(
     session: Any,
     url: str,
@@ -184,23 +222,9 @@ async def http_get_with_backoff(
 
     for attempt in range(max_attempts):
         try:
-            async with session.get(url, params=params, timeout=timeout) as resp:
-                status = resp.status
-                if status in retryable or status >= 500:
-                    if attempt + 1 >= max_attempts:
-                        logger.warning(f"{label} HTTP {status} after {attempt + 1} attempts; giving up")
-                        return None
-                    logger.warning(
-                        f"{label} HTTP {status}; retry {attempt + 2}/{max_attempts} "
-                        f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
-                    )
-                    await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
-                    continue
-                if status != 200:
-                    snippet = await read_body_snippet(resp)
-                    logger.warning(f"{label} HTTP {status} non-retryable: {snippet}")
-                    return None
-                return await read_json_capped(resp, label)
+            outcome = await _read_one_attempt(
+                session, url, params, client_timeout=timeout, retryable=retryable, label=label
+            )
         except (TimeoutError, aiohttp.ClientError) as exc:
             if attempt + 1 >= max_attempts:
                 logger.warning(f"{label} transient error after {attempt + 1} attempts: {exc}")
@@ -210,6 +234,16 @@ async def http_get_with_backoff(
                 f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
             )
             await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
+            continue
+        if not isinstance(outcome, _RetryableStatus):
+            return outcome
+        if attempt + 1 >= max_attempts:
+            logger.warning(f"{label} HTTP {outcome.status} after {attempt + 1} attempts; giving up")
+            return None
+        logger.warning(
+            f"{label} HTTP {outcome.status}; retry {attempt + 2}/{max_attempts} after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
+        )
+        await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
     return None
 
 

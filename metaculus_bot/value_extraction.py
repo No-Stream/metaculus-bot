@@ -179,6 +179,7 @@ class _DeterministicHit[T]:
 def _log_extraction(
     qtype: QuestionTypeStr,
     rung: Rung,
+    *,
     block_present: bool,
     question_id: int | None,
     model_name: str,
@@ -332,7 +333,7 @@ async def _run_ladder[T](
                 hit.rung,
                 " | ".join(failures),
             )
-        _log_extraction(qtype, hit.rung, block_present, question_id, model_name)
+        _log_extraction(qtype, hit.rung, block_present=block_present, question_id=question_id, model_name=model_name)
         return ExtractionOutcome(value=hit.value, rung=hit.rung, block_present=block_present)
 
     # --- Rung 3: LLM parser salvage ---------------------------------------
@@ -350,7 +351,7 @@ async def _run_ladder[T](
             block_present,
             " | ".join(failures),
         )
-        _log_extraction(qtype, "llm", block_present, question_id, model_name)
+        _log_extraction(qtype, "llm", block_present=block_present, question_id=question_id, model_name=model_name)
         return ExtractionOutcome(value=value, rung="llm", block_present=block_present)
 
     # --- Rung 4: typed failure --------------------------------------------

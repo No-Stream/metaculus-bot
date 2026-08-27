@@ -28,7 +28,9 @@ def configure_benchmark_logging(log_dir: str = "benchmarks") -> Path:
     """
 
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    log_path = Path(log_dir) / f"log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    # astimezone() attaches the local zone without shifting the wall clock, so the
+    # filename stamp stays local-time (what the operator reads) and tz-aware.
+    log_path = Path(log_dir) / f"log_{datetime.now().astimezone().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 

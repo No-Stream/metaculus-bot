@@ -30,6 +30,15 @@ jobs:
       - run: uv run --frozen ruff check .
       - run: uv run --frozen ruff format --check .
       - run: uv run --frozen basedpyright
+      # Dependency hygiene. This job is the only place the misplaced-dev-dependency class
+      # can be caught: the job installs --dev, the bot workflows install --no-dev, so a
+      # dev-only package imported by metaculus_bot/ is green in every test here and a
+      # ModuleNotFoundError on the next scheduled run. Per-rule ignores and their
+      # justifications live in [tool.deptry] in pyproject.toml.
+      - run: uv run --frozen deptry .
+      # Import-direction contracts ([tool.importlinter] in pyproject.toml). Both steps are
+      # sub-second, so neither moves this job's timeout-minutes budget.
+      - run: uv run --frozen lint-imports
 
   test:
     runs-on: ubuntu-latest

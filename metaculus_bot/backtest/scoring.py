@@ -156,7 +156,13 @@ def numeric_log_score_from_report(report: NumericReport, resolution: NumericReso
             resolution_float = float(resolution)
 
         return numeric_log_score(
-            cdf_values, resolution_float, lower_bound, upper_bound, open_lower, open_upper, zero_point
+            cdf_values,
+            resolution_float,
+            lower_bound,
+            upper_bound,
+            open_lower_bound=open_lower,
+            open_upper_bound=open_upper,
+            zero_point=zero_point,
         )
 
     except Exception:
@@ -245,62 +251,81 @@ def score_report(report: ForecastReport, ground_truth: GroundTruth) -> list[Ques
     Also computes community scores using ground_truth.community_prediction.
     """
 
-    scores: list[QuestionScore] = []
-    qid = ground_truth.question_id
-
     if isinstance(report, BinaryReport):
-        outcome = ground_truth.resolution
-        if not isinstance(outcome, bool):
-            logger.warning(f"Q{qid}: expected bool resolution for binary, got {type(outcome)}")
-            return scores
+        return _score_binary_report(report, ground_truth)
+    if isinstance(report, NumericReport):
+        return _score_numeric_report(report, ground_truth)
+    if isinstance(report, MultipleChoiceReport):
+        return _score_mc_report(report, ground_truth)
+    logger.warning(f"Q{ground_truth.question_id}: unsupported report type {type(report).__name__}")
+    return []
 
-        bot_prob = float(report.prediction)
 
-        # Brier score
-        bot_brier = brier_score(bot_prob, outcome)
-        community_brier = None
-        if isinstance(ground_truth.community_prediction, (int, float)):
-            community_brier = brier_score(float(ground_truth.community_prediction), outcome)
-        scores.append(QuestionScore(qid, "binary", bot_brier, community_brier, "brier"))
+def _score_binary_report(report: BinaryReport, ground_truth: GroundTruth) -> list[QuestionScore]:
+    """Brier + log score for a binary report, each paired with the community's own score."""
+    qid = ground_truth.question_id
+    outcome = ground_truth.resolution
+    if not isinstance(outcome, bool):
+        logger.warning(f"Q{qid}: expected bool resolution for binary, got {type(outcome)}")
+        return []
 
-        # Log score
-        bot_log = binary_log_score(bot_prob, outcome)
-        community_log = None
-        if isinstance(ground_truth.community_prediction, (int, float)):
-            community_log = binary_log_score(float(ground_truth.community_prediction), outcome)
-        scores.append(QuestionScore(qid, "binary", bot_log, community_log, "log_score"))
+    bot_prob = float(report.prediction)
+    community_prob = (
+        float(ground_truth.community_prediction)
+        if isinstance(ground_truth.community_prediction, (int, float))
+        else None
+    )
+    return [
+        QuestionScore(
+            qid,
+            "binary",
+            brier_score(bot_prob, outcome),
+            brier_score(community_prob, outcome) if community_prob is not None else None,
+            "brier",
+        ),
+        QuestionScore(
+            qid,
+            "binary",
+            binary_log_score(bot_prob, outcome),
+            binary_log_score(community_prob, outcome) if community_prob is not None else None,
+            "log_score",
+        ),
+    ]
 
-    elif isinstance(report, NumericReport):
-        resolution = ground_truth.resolution
-        # ``bool`` is a subclass of ``int`` in Python, so it would slip through the
-        # ``isinstance(..., int)`` check and be silently coerced to 1.0/0.0; exclude it
-        # explicitly so a boolean resolution is reported as the type error it is.
-        if isinstance(resolution, bool) or not isinstance(resolution, (float, int, OutOfBoundsResolution)):
-            logger.warning(f"Q{qid}: expected numeric resolution for numeric, got {type(resolution)}")
-            return scores
-        resolution_value: NumericResolutionValue = (
-            resolution if isinstance(resolution, OutOfBoundsResolution) else float(resolution)
-        )
-        bot_log = numeric_log_score_from_report(report, resolution_value)
-        if bot_log is not None:
-            community_log = _compute_community_numeric_log_score(ground_truth, report)
-            scores.append(QuestionScore(qid, "numeric", bot_log, community_log, "numeric_log_score"))
 
-    elif isinstance(report, MultipleChoiceReport):
-        correct_option = ground_truth.resolution
-        if not isinstance(correct_option, str):
-            logger.warning(f"Q{qid}: expected str resolution for MC, got {type(correct_option)}")
-            return scores
+def _score_numeric_report(report: NumericReport, ground_truth: GroundTruth) -> list[QuestionScore]:
+    """PMF-bucket log score for a numeric report; empty when the resolution isn't scoreable."""
+    qid = ground_truth.question_id
+    resolution = ground_truth.resolution
+    # ``bool`` is a subclass of ``int`` in Python, so it would slip through the
+    # ``isinstance(..., int)`` check and be silently coerced to 1.0/0.0; exclude it
+    # explicitly so a boolean resolution is reported as the type error it is.
+    if isinstance(resolution, bool) or not isinstance(resolution, (float, int, OutOfBoundsResolution)):
+        logger.warning(f"Q{qid}: expected numeric resolution for numeric, got {type(resolution)}")
+        return []
+    resolution_value: NumericResolutionValue = (
+        resolution if isinstance(resolution, OutOfBoundsResolution) else float(resolution)
+    )
+    bot_log = numeric_log_score_from_report(report, resolution_value)
+    if bot_log is None:
+        return []
+    community_log = _compute_community_numeric_log_score(ground_truth, report)
+    return [QuestionScore(qid, "numeric", bot_log, community_log, "numeric_log_score")]
 
-        bot_mc_log = mc_log_score_from_report(report, correct_option)
-        if bot_mc_log is not None:
-            community_mc_log = _compute_community_mc_log_score(ground_truth, report)
-            scores.append(QuestionScore(qid, "multiple_choice", bot_mc_log, community_mc_log, "mc_log_score"))
 
-    else:
-        logger.warning(f"Q{qid}: unsupported report type {type(report).__name__}")
+def _score_mc_report(report: MultipleChoiceReport, ground_truth: GroundTruth) -> list[QuestionScore]:
+    """MC log score for a multiple-choice report; empty when the resolution isn't scoreable."""
+    qid = ground_truth.question_id
+    correct_option = ground_truth.resolution
+    if not isinstance(correct_option, str):
+        logger.warning(f"Q{qid}: expected str resolution for MC, got {type(correct_option)}")
+        return []
 
-    return scores
+    bot_mc_log = mc_log_score_from_report(report, correct_option)
+    if bot_mc_log is None:
+        return []
+    community_mc_log = _compute_community_mc_log_score(ground_truth, report)
+    return [QuestionScore(qid, "multiple_choice", bot_mc_log, community_mc_log, "mc_log_score")]
 
 
 def _compute_community_numeric_log_score(ground_truth: GroundTruth, report: NumericReport) -> float | None:
@@ -342,7 +367,13 @@ def _compute_community_numeric_log_score(ground_truth: GroundTruth, report: Nume
     try:
         cdf_values = [float(v) for v in community_cdf]
         return numeric_log_score(
-            cdf_values, resolution_float, lower_bound, upper_bound, open_lower, open_upper, zero_point
+            cdf_values,
+            resolution_float,
+            lower_bound,
+            upper_bound,
+            open_lower_bound=open_lower,
+            open_upper_bound=open_upper,
+            zero_point=zero_point,
         )
     except (ValueError, TypeError):
         return None

@@ -11,7 +11,9 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 import requests
 
@@ -81,7 +83,13 @@ def fetch_all_comments(token: str) -> list[dict]:
 
 
 def get_question_id_for_post(post_id: int, token: str) -> int | None:
-    """Resolve a post_id to a question_id via the posts API."""
+    """Resolve a post_id to a question_id via the posts API.
+
+    Soft-fails per post: one unreachable/404/malformed post must not abandon the rest of
+    the backfill. Scoped to ``requests.RequestException``, which covers every transport,
+    HTTP-status and JSON-decode failure of the call — a shape violation in a 200 body
+    (say ``question`` arriving as a list) is a contract break and still crashes.
+    """
     try:
         data = api_get(f"/posts/{post_id}/", token)
         question = data.get("question")
@@ -90,7 +98,7 @@ def get_question_id_for_post(post_id: int, token: str) -> int | None:
         if isinstance(question, int):
             return question
         return None
-    except Exception as e:
+    except requests.RequestException as e:
         logger.warning(f"Failed to resolve post {post_id} to question: {e}")
         return None
 
@@ -166,6 +174,74 @@ def build_record(comment: dict, question_id: int | None) -> dict | None:
     }
 
 
+def load_existing_post_ids(output_file: Path) -> set[int]:
+    """Post ids already written to the backfill file, so a re-run appends only new ones."""
+    existing_post_ids: set[int] = set()
+    if not output_file.exists():
+        return existing_post_ids
+    with open(output_file) as f:
+        for line in f:
+            if line.strip():
+                record = json.loads(line)
+                if "on_post" in record:
+                    existing_post_ids.add(record["on_post"])
+    return existing_post_ids
+
+
+@dataclass
+class BackfillTally:
+    """What one pass over the fetched comments produced, for the closing summary line."""
+
+    records_written: int = 0
+    trimmed: int = 0
+    no_research: int = 0
+
+
+def append_backfill_records(
+    comments: list[dict],
+    token: str,
+    out_handle: TextIO,
+    existing_post_ids: set[int],
+    *,
+    dry_run: bool,
+) -> BackfillTally:
+    """Write a JSONL record for every not-yet-captured comment carrying a research section.
+
+    ``existing_post_ids`` is read AND extended, so a duplicate post inside one fetch is
+    skipped the same way a re-run skips what a previous run wrote. The post_id ->
+    question_id lookup is cached and rate-gated (one sleep per uncached post).
+    """
+    post_to_qid: dict[int, int | None] = {}
+    tally = BackfillTally()
+
+    for idx, comment in enumerate(comments, 1):
+        post_id: int | None = comment.get("on_post")
+        if post_id is None or post_id in existing_post_ids:
+            continue
+
+        if post_id not in post_to_qid:
+            post_to_qid[post_id] = get_question_id_for_post(post_id, token)
+            time.sleep(FETCH_DELAY)
+
+        record = build_record(comment, question_id=post_to_qid[post_id])
+        if record is None:
+            tally.no_research += 1
+            continue
+
+        if record["is_trimmed"]:
+            tally.trimmed += 1
+
+        if not dry_run:
+            out_handle.write(json.dumps(record) + "\n")
+            existing_post_ids.add(post_id)
+        tally.records_written += 1
+
+        if idx % 50 == 0:
+            logger.info(f"Processed {idx}/{len(comments)} comments, {tally.records_written} records written")
+
+    return tally
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backfill research archive from Metaculus bot comments.")
     parser.add_argument("--output-dir", default="backtests/research_archive/backfill", help="Output directory")
@@ -192,56 +268,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "comments_backfill.jsonl"
 
-    # Load existing post IDs to deduplicate
-    existing_post_ids: set[int] = set()
-    if output_file.exists():
-        with open(output_file) as f:
-            for line in f:
-                if line.strip():
-                    record = json.loads(line)
-                    if "on_post" in record:
-                        existing_post_ids.add(record["on_post"])
-
-    # Cache for post_id -> question_id mapping
-    post_to_qid: dict[int, int | None] = {}
-
-    records_written = 0
-    trimmed_count = 0
-    no_research_count = 0
-
+    existing_post_ids = load_existing_post_ids(output_file)
     with open(output_file, "a") as f:
-        for idx, comment in enumerate(comments, 1):
-            post_id: int | None = comment.get("on_post")
-            if post_id is None:
-                continue
-            if post_id in existing_post_ids:
-                continue
-
-            # Resolve post_id -> question_id (cached)
-            if post_id not in post_to_qid:
-                post_to_qid[post_id] = get_question_id_for_post(post_id, token)
-                time.sleep(FETCH_DELAY)
-
-            qid = post_to_qid[post_id]
-
-            record = build_record(comment, question_id=qid)
-            if record is None:
-                no_research_count += 1
-                continue
-
-            if record["is_trimmed"]:
-                trimmed_count += 1
-
-            if not args.dry_run:
-                f.write(json.dumps(record) + "\n")
-                existing_post_ids.add(post_id)
-            records_written += 1
-
-            if idx % 50 == 0:
-                logger.info(f"Processed {idx}/{len(comments)} comments, {records_written} records written")
+        tally = append_backfill_records(comments, token, f, existing_post_ids, dry_run=args.dry_run)
 
     logger.info(
-        f"Done. {records_written} new records, {trimmed_count} trimmed, {no_research_count} without research section"
+        f"Done. {tally.records_written} new records, {tally.trimmed} trimmed, "
+        f"{tally.no_research} without research section"
     )
 
 

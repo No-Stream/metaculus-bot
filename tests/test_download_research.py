@@ -38,6 +38,7 @@ from scripts.download_research import (
     record_source,
 )
 from scripts.download_research import main as download_research_main
+from scripts.research_sync import verify_completeness
 from scripts.research_sync.verify_completeness import (
     classify_gap_or_empty,
     unpersisted_artifacts,
@@ -637,6 +638,141 @@ class TestCompletenessCheckWatchesThePersistedStore:
 
         assert dl_mock.call_count == 1
         assert ([a["name"] for a in gaps], empties) == (["research-100"], [])
+
+
+class TestCompletenessCheckVerdict:
+    """How the gate's four signals become the operator's PASS/FAIL and exit status.
+
+    The helpers above are unit-covered one at a time; ``main`` is where their answers turn
+    into the printed verdict and the exit code the launchd job reads, and nothing pinned
+    that translation. Each case here drives the real CLI over a real on-disk archive and
+    store, stubbing only the GitHub enumeration.
+    """
+
+    LIVE_RUN_ID = int(ARTIFACT_RUN_ID)
+
+    def _live(self, name: str = "research-1", run_id: int | None = None) -> dict:
+        return {
+            "name": name,
+            "run_id": self.LIVE_RUN_ID if run_id is None else run_id,
+            "created_at": "2026-07-01T13:13:00Z",
+            "expired": False,
+        }
+
+    def _persist(self, store: Path, name: str, *, research: bool, run_id: int | None = None) -> None:
+        run_dir = store / name
+        run_dir.mkdir(parents=True)
+        resolved_run_id = self.LIVE_RUN_ID if run_id is None else run_id
+        (run_dir / "_meta.json").write_text(
+            json.dumps(
+                {
+                    "artifact_id": "1",
+                    "name": name,
+                    "created_at": "2026-07-01T13:13:00Z",
+                    "run_id": str(resolved_run_id),
+                }
+            )
+        )
+        if research:
+            (run_dir / f"research_{resolved_run_id}.jsonl").write_text(json.dumps(_artifact()) + "\n")
+
+    def _run(self, monkeypatch, capsys, *, artifacts: list[dict], archive: Path, store: Path):
+        """Run the CLI; return ``(exit_code_or_None, stdout)``."""
+        monkeypatch.setattr(verify_completeness, "verify_gh_cli", lambda: None)
+        monkeypatch.setattr(verify_completeness, "list_research_artifacts", lambda repo: artifacts)
+        monkeypatch.setattr("sys.argv", ["verify", "--output-dir", str(archive), "--store-dir", str(store)])
+        code = None
+        try:
+            verify_completeness.main()
+        except SystemExit as exit_call:
+            code = exit_call.code
+        return code, capsys.readouterr().out
+
+    def test_a_captured_and_persisted_artifact_passes(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        archive, store = tmp_path / "archive", tmp_path / "store"
+        build_archive([_artifact()], archive)
+        self._persist(store, "research-1", research=True)
+
+        code, out = self._run(monkeypatch, capsys, artifacts=[self._live()], archive=archive, store=store)
+
+        assert code is None
+        assert "PASS: all 1 live artifacts represented in archive" in out
+        assert "FAIL" not in out
+
+    def test_an_unpersisted_artifact_fails_on_the_store_check(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        archive, store = tmp_path / "archive", tmp_path / "store"
+        build_archive([_artifact()], archive)
+        store.mkdir()
+
+        code, out = self._run(monkeypatch, capsys, artifacts=[self._live()], archive=archive, store=store)
+
+        assert code == 1
+        assert "NOT persisted (at 90-day risk)     : 1" in out
+        assert "UNPERSISTED: research-1" in out
+        assert "FAIL: 1 live artifact(s) are not in the local store" in out
+
+    def test_an_unrepresented_artifact_holding_records_is_a_gap(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        archive, store = tmp_path / "archive", tmp_path / "store"
+        build_archive([_backfill()], archive)  # archive knows the comment run, not the artifact run
+        self._persist(store, "research-1", research=True)
+
+        code, out = self._run(monkeypatch, capsys, artifacts=[self._live()], archive=archive, store=store)
+
+        assert code == 1
+        assert "Genuine gaps (records NOT captured): 1" in out
+        assert f"GAP: research-1 (run_id={self.LIVE_RUN_ID}" in out
+
+    def test_a_logs_only_artifact_is_empty_not_a_gap(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        archive, store = tmp_path / "archive", tmp_path / "store"
+        build_archive([_backfill()], archive)
+        self._persist(store, "research-1", research=False)
+
+        code, out = self._run(monkeypatch, capsys, artifacts=[self._live()], archive=archive, store=store)
+
+        assert code is None
+        assert "Empty artifacts (no records, OK)   : 1" in out
+        assert "EMPTY: research-1" in out
+        assert "PASS: all 1 live artifacts represented in archive" in out
+
+    def test_an_expired_artifact_is_named_but_does_not_fail(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        archive, store = tmp_path / "archive", tmp_path / "store"
+        build_archive([_artifact()], archive)
+        self._persist(store, "research-1", research=True)
+        expired = {"name": "research-9", "run_id": 9, "created_at": "2026-01-01T00:00:00Z", "expired": True}
+
+        code, out = self._run(monkeypatch, capsys, artifacts=[self._live(), expired], archive=archive, store=store)
+
+        assert code is None
+        assert "LOST: research-9 (created_at=2026-01-01T00:00:00Z)" in out
+        assert "NOTE: 1 artifact(s) already expired before any pull" in out
+
+    def test_a_demoted_artifact_question_fails_the_merge_check(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        archive, store = tmp_path / "archive", tmp_path / "store"
+        build_archive([_artifact()], archive)
+        self._persist(store, "research-1", research=True)
+        # Rewrite the manifest into the pre-fix state: the artifact is in the history but a
+        # comment record serves latest/.
+        manifest_path = archive / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest[str(QID)]["sources"] = [SOURCE_ARTIFACT, SOURCE_COMMENT_BACKFILL]
+        manifest[str(QID)]["latest_source"] = SOURCE_COMMENT_BACKFILL
+        manifest_path.write_text(json.dumps(manifest))
+
+        code, out = self._run(monkeypatch, capsys, artifacts=[self._live()], archive=archive, store=store)
+
+        assert code == 1
+        assert f"DEMOTED: qid={QID} (latest_source={SOURCE_COMMENT_BACKFILL})" in out
+        assert "FAIL: the merge stage demoted captured artifact research" in out
+
+    def test_a_missing_manifest_exits_before_any_verdict(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        archive, store = tmp_path / "archive", tmp_path / "store"
+        (archive / "by_qid").mkdir(parents=True)
+        store.mkdir()
+
+        code, out = self._run(monkeypatch, capsys, artifacts=[], archive=archive, store=store)
+
+        assert code == 1
+        assert "RESEARCH ARCHIVE COMPLETENESS CHECK" not in out
 
 
 class TestTruncationGuard:

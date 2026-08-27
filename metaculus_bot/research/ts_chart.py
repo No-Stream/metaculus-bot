@@ -92,14 +92,14 @@ def render_anchor_chart(
     )
     ax.plot([as_of_ts, horizon_ts], [p50, p50], color=P50_COLOR, lw=1.4, ls=":", label="anchor P50")
 
-    _finish_axes(ax, fig, recent, band, title)
+    _finish_axes(ax, fig, recent, band=band, title=title)
 
     buf = io.BytesIO()
     canvas.print_png(buf)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _finish_axes(ax, fig: Figure, recent: pd.Series, band: tuple[float, float, float], title: str) -> None:
+def _finish_axes(ax, fig: Figure, recent: pd.Series, *, band: tuple[float, float, float], title: str) -> None:
     ax.set_title(_truncate_title(title), fontsize=9, loc="left")
     ax.tick_params(axis="both", labelsize=8)
     ax.grid(visible=True, alpha=0.25, lw=0.5)

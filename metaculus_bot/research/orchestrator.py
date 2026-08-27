@@ -290,6 +290,195 @@ class ResearchOrchestrator:
         reset_source_loss_counter()
         reset_provider_health()
 
+    async def _run_gap_fill_v1(
+        self,
+        question: MetaculusQuestion,
+        research: str,
+        *,
+        active: bool,
+        fast_path: bool,
+        time_budget: QuestionTimeBudget | None,
+    ) -> str:
+        """v1's targeted gap-fill addendum, or ``""`` when inactive, cut, or failed.
+
+        Its own failure guard (v2 has a separate one) so a v1 defect can never zero
+        v2's findings, and vice versa.
+        """
+        if not active:
+            return ""
+        try:
+            from metaculus_bot.research.targeted import (  # noqa: PLC0415  # import stays inside failure guard
+                run_gap_fill_pass,
+            )
+
+            # Bounded by whatever the research phase has left, so a pass
+            # that overruns its own internal deadlines still cannot spend
+            # the forecast's time.
+            return await asyncio.wait_for(
+                run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking),
+                timeout=_remaining_research_phase_s(time_budget),
+            )
+        except TimeoutError:
+            # Its own branch (like v2's below) because it is not a failure:
+            # falling into the generic except would log a traceback under
+            # "stage failed" for a deliberate budget cut.
+            logger.warning(
+                "GAP_FILL_V1_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
+                getattr(question, "id_of_question", None),
+            )
+            self._record_research_budget_cut(question, fast_path=fast_path)
+            return ""
+        except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
+            logger.exception("Gap-fill v1 stage failed; proceeding without it")
+            return ""
+
+    def _count_gap_fill_v2_error(self, _exc: BaseException) -> None:
+        # Bumped ONLY on a genuine v2 crash, never on an idle
+        # "found nothing" run or a deadline hit. Three
+        # mutually-exclusive crash paths, one bump each (no
+        # double-count): (a) the loop-internal soft-fail — detected
+        # post-gather via the archive payload's telemetry["error"];
+        # (b) this seam's construction-error soft-fail — via
+        # run_gap_fill_v2's on_error callback; (c) the import/escape
+        # error in _run_gap_fill_v2's except — counted directly there. (a) and
+        # (b) are exclusive because (b)'s error means the loop never
+        # ran (no payload), and (c) is exclusive of both because the
+        # seam swallows all Exception, so nothing escapes it once
+        # construction succeeds.
+        self.gap_fill_v2_error_count += 1
+
+    async def _run_gap_fill_v2(
+        self,
+        question: MetaculusQuestion,
+        research: str,
+        *,
+        active: bool,
+        fast_path: bool,
+        time_budget: QuestionTimeBudget | None,
+        archive_sink: Callable[[dict], None],
+    ) -> str:
+        """v2's agentic findings section, or ``""`` when inactive, cut, or failed."""
+        if not active:
+            return ""
+        try:
+            from metaculus_bot.research.agentic_gap_fill import (  # noqa: PLC0415  # import stays inside failure guard
+                run_gap_fill_v2,
+            )
+
+            # Same research-phase bound as v1 above, on top of v2's own
+            # GAP_FILL_V2_WALL_DEADLINE (which measures as never binding:
+            # 0 of 103 triple-era records report deadline_hit).
+            return await asyncio.wait_for(
+                run_gap_fill_v2(
+                    question,
+                    research,
+                    is_benchmarking=self._is_benchmarking,
+                    archive_sink=archive_sink,
+                    on_error=self._count_gap_fill_v2_error,
+                ),
+                timeout=_remaining_research_phase_s(time_budget),
+            )
+        except TimeoutError:
+            # NOT a v2 crash: we cut it to protect the prediction POST, so
+            # this must not bump gap_fill_v2_error_count (which exists to
+            # redden CI on a dead v2 feature) — the budget decision is
+            # alertable via research_budget_cut_count (fast-path questions
+            # never reach here; gap-fill is skipped upstream for them).
+            logger.warning(
+                "GAP_FILL_V2_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
+                getattr(question, "id_of_question", None),
+            )
+            self._record_research_budget_cut(question, fast_path=fast_path)
+            return ""
+        except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
+            logger.exception("Gap-fill v2 stage failed; proceeding without it")
+            # Path (c): an import failure (or any escape past the
+            # seam's own soft-fail) is a crash — count it directly
+            # here since no payload/on_error fires on this path.
+            self.gap_fill_v2_error_count += 1
+            return ""
+
+    async def _run_gap_fill_passes(
+        self,
+        question: MetaculusQuestion,
+        research: str,
+        *,
+        fast_path: bool,
+        time_budget: QuestionTimeBudget | None,
+    ) -> tuple[str, dict | None]:
+        """Append both gap-fill passes' sections to ``research``; return it plus v2's archive payload.
+
+        Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
+        CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
+        is max(v1, v2), not the sum — v2's GAP_FILL_V2_WALL_DEADLINE fits
+        inside v1's worst-case envelope only under this parallelism).
+        Consequence: the v2 driver's brief sees the bundle WITHOUT v1's
+        addendum. v2's section appends after v1's.
+
+        Both are OPTIONAL, and they are the research phase's largest optional
+        cost: v1's configured worst case is 555s (analyzer 135 + resolver wave
+        420) and v2 measures 84s at p50 / 293s at its observed max. So the
+        fast path drops both — that is where the time for a thin window comes
+        from, far more than provider selection.
+        """
+        gap_fill_budget_s = _remaining_research_phase_s(time_budget)
+        skip_optional_gap_fill = fast_path or (gap_fill_budget_s is not None and gap_fill_budget_s <= 0.0)
+        gap_fill_v1_active = (
+            env_flag_enabled(GAP_FILL_ENABLED_ENV)
+            and not skip_optional_gap_fill
+            and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
+        )
+        gap_fill_v2_active = env_flag_enabled(GAP_FILL_V2_ENABLED_ENV) and not skip_optional_gap_fill
+        if skip_optional_gap_fill and (
+            env_flag_enabled(GAP_FILL_ENABLED_ENV) or env_flag_enabled(GAP_FILL_V2_ENABLED_ENV)
+        ):
+            logger.warning(
+                "GAP_FILL_SKIPPED_FOR_BUDGET: question=%s fast_path=%s research_phase_remaining=%s",
+                getattr(question, "id_of_question", None),
+                str(fast_path).lower(),
+                "n/a" if gap_fill_budget_s is None else f"{gap_fill_budget_s:.0f}s",
+            )
+            self._record_research_budget_cut(question, fast_path=fast_path)
+        if not (gap_fill_v1_active or gap_fill_v2_active):
+            return research, None
+
+        gap_fill_v2_payload: dict | None = None
+
+        def _capture_gap_fill_v2(payload: dict) -> None:
+            nonlocal gap_fill_v2_payload
+            gap_fill_v2_payload = payload
+
+        addendum, v2_findings = await asyncio.gather(
+            self._run_gap_fill_v1(
+                question, research, active=gap_fill_v1_active, fast_path=fast_path, time_budget=time_budget
+            ),
+            self._run_gap_fill_v2(
+                question,
+                research,
+                active=gap_fill_v2_active,
+                fast_path=fast_path,
+                time_budget=time_budget,
+                archive_sink=_capture_gap_fill_v2,
+            ),
+        )
+        # Path (a): the loop ran but hit its catch-all soft-fail. The
+        # loop swallows the crash and returns findings normally, so the
+        # only crash signal is the stamped telemetry["error"] on the
+        # archive payload. Checked here (not in _run_gap_fill_v2) so it can't
+        # double-count with the on_error/except paths above — those
+        # produce no payload with a non-None telemetry error.
+        if gap_fill_v2_payload is not None:
+            v2_telemetry = gap_fill_v2_payload.get("telemetry")
+            if isinstance(v2_telemetry, dict) and v2_telemetry.get("error") is not None:
+                self.gap_fill_v2_error_count += 1
+        if addendum:
+            research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
+        if v2_findings:
+            # v2_findings carries its own "## Agentic Research Findings"
+            # header (render_findings) — distinct from v1's section.
+            research = f"{research}\n\n---\n\n{v2_findings}"
+        return research, gap_fill_v2_payload
+
     async def run_research(self, question: MetaculusQuestion, time_budget: QuestionTimeBudget | None = None) -> str:
         """Build one question's research bundle, inside its time budget if it has one.
 
@@ -325,150 +514,9 @@ class ResearchOrchestrator:
                 # _record_research_budget_cut).
                 self._record_research_budget_cut(question, fast_path=fast_path)
 
-            # Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
-            # CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
-            # is max(v1, v2), not the sum — v2's GAP_FILL_V2_WALL_DEADLINE fits
-            # inside v1's worst-case envelope only under this parallelism).
-            # Consequence: the v2 driver's brief sees the bundle WITHOUT v1's
-            # addendum. v2's section appends after v1's.
-            #
-            # Both are OPTIONAL, and they are the research phase's largest optional
-            # cost: v1's configured worst case is 555s (analyzer 135 + resolver wave
-            # 420) and v2 measures 84s at p50 / 293s at its observed max. So the
-            # fast path drops both — that is where the time for a thin window comes
-            # from, far more than provider selection.
-            gap_fill_budget_s = _remaining_research_phase_s(time_budget)
-            skip_optional_gap_fill = fast_path or (gap_fill_budget_s is not None and gap_fill_budget_s <= 0.0)
-            gap_fill_v1_active = (
-                env_flag_enabled(GAP_FILL_ENABLED_ENV)
-                and not skip_optional_gap_fill
-                and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
+            research, gap_fill_v2_payload = await self._run_gap_fill_passes(
+                question, research, fast_path=fast_path, time_budget=time_budget
             )
-            gap_fill_v2_active = env_flag_enabled(GAP_FILL_V2_ENABLED_ENV) and not skip_optional_gap_fill
-            if skip_optional_gap_fill and (
-                env_flag_enabled(GAP_FILL_ENABLED_ENV) or env_flag_enabled(GAP_FILL_V2_ENABLED_ENV)
-            ):
-                logger.warning(
-                    "GAP_FILL_SKIPPED_FOR_BUDGET: question=%s fast_path=%s research_phase_remaining=%s",
-                    getattr(question, "id_of_question", None),
-                    str(fast_path).lower(),
-                    "n/a" if gap_fill_budget_s is None else f"{gap_fill_budget_s:.0f}s",
-                )
-                self._record_research_budget_cut(question, fast_path=fast_path)
-            gap_fill_v2_payload: dict | None = None
-
-            if gap_fill_v1_active or gap_fill_v2_active:
-                # v1 and v2 import + run inside their own guards so each pass
-                # degrades independently: a v2 code defect (import error in the
-                # agentic package, unhandled raise) must never zero v1's
-                # addendum in prod, and vice versa. The single gather keeps the
-                # research-phase wall-clock at max(v1, v2), not the sum.
-                def _capture_gap_fill_v2(payload: dict) -> None:
-                    nonlocal gap_fill_v2_payload
-                    gap_fill_v2_payload = payload
-
-                async def _run_v1() -> str:
-                    if not gap_fill_v1_active:
-                        return ""
-                    try:
-                        from metaculus_bot.research.targeted import (  # noqa: PLC0415  # import stays inside failure guard
-                            run_gap_fill_pass,
-                        )
-
-                        # Bounded by whatever the research phase has left, so a pass
-                        # that overruns its own internal deadlines still cannot spend
-                        # the forecast's time.
-                        return await asyncio.wait_for(
-                            run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking),
-                            timeout=_remaining_research_phase_s(time_budget),
-                        )
-                    except TimeoutError:
-                        # Its own branch (like v2's below) because it is not a failure:
-                        # falling into the generic except would log a traceback under
-                        # "stage failed" for a deliberate budget cut.
-                        logger.warning(
-                            "GAP_FILL_V1_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
-                            getattr(question, "id_of_question", None),
-                        )
-                        self._record_research_budget_cut(question, fast_path=fast_path)
-                        return ""
-                    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
-                        logger.exception("Gap-fill v1 stage failed; proceeding without it")
-                        return ""
-
-                def _count_gap_fill_v2_error(_exc: BaseException) -> None:
-                    # Bumped ONLY on a genuine v2 crash, never on an idle
-                    # "found nothing" run or a deadline hit. Three
-                    # mutually-exclusive crash paths, one bump each (no
-                    # double-count): (a) the loop-internal soft-fail — detected
-                    # post-gather via the archive payload's telemetry["error"];
-                    # (b) this seam's construction-error soft-fail — via
-                    # run_gap_fill_v2's on_error callback; (c) the import/escape
-                    # error in _run_v2's except — counted directly there. (a) and
-                    # (b) are exclusive because (b)'s error means the loop never
-                    # ran (no payload), and (c) is exclusive of both because the
-                    # seam swallows all Exception, so nothing escapes it once
-                    # construction succeeds.
-                    self.gap_fill_v2_error_count += 1
-
-                async def _run_v2() -> str:
-                    if not gap_fill_v2_active:
-                        return ""
-                    try:
-                        from metaculus_bot.research.agentic_gap_fill import (  # noqa: PLC0415  # import stays inside failure guard
-                            run_gap_fill_v2,
-                        )
-
-                        # Same research-phase bound as v1 above, on top of v2's own
-                        # GAP_FILL_V2_WALL_DEADLINE (which measures as never binding:
-                        # 0 of 103 triple-era records report deadline_hit).
-                        return await asyncio.wait_for(
-                            run_gap_fill_v2(
-                                question,
-                                research,
-                                is_benchmarking=self._is_benchmarking,
-                                archive_sink=_capture_gap_fill_v2,
-                                on_error=_count_gap_fill_v2_error,
-                            ),
-                            timeout=_remaining_research_phase_s(time_budget),
-                        )
-                    except TimeoutError:
-                        # NOT a v2 crash: we cut it to protect the prediction POST, so
-                        # this must not bump gap_fill_v2_error_count (which exists to
-                        # redden CI on a dead v2 feature) — the budget decision is
-                        # alertable via research_budget_cut_count (fast-path questions
-                        # never reach here; gap-fill is skipped upstream for them).
-                        logger.warning(
-                            "GAP_FILL_V2_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
-                            getattr(question, "id_of_question", None),
-                        )
-                        self._record_research_budget_cut(question, fast_path=fast_path)
-                        return ""
-                    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
-                        logger.exception("Gap-fill v2 stage failed; proceeding without it")
-                        # Path (c): an import failure (or any escape past the
-                        # seam's own soft-fail) is a crash — count it directly
-                        # here since no payload/on_error fires on this path.
-                        self.gap_fill_v2_error_count += 1
-                        return ""
-
-                addendum, v2_findings = await asyncio.gather(_run_v1(), _run_v2())
-                # Path (a): the loop ran but hit its catch-all soft-fail. The
-                # loop swallows the crash and returns findings normally, so the
-                # only crash signal is the stamped telemetry["error"] on the
-                # archive payload. Checked here (not in _run_v2) so it can't
-                # double-count with the on_error/except paths above — those
-                # produce no payload with a non-None telemetry error.
-                if gap_fill_v2_payload is not None:
-                    v2_telemetry = gap_fill_v2_payload.get("telemetry")
-                    if isinstance(v2_telemetry, dict) and v2_telemetry.get("error") is not None:
-                        self.gap_fill_v2_error_count += 1
-                if addendum:
-                    research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
-                if v2_findings:
-                    # v2_findings carries its own "## Agentic Research Findings"
-                    # header (render_findings) — distinct from v1's section.
-                    research = f"{research}\n\n---\n\n{v2_findings}"
 
             gap_fill_used = "## Targeted Gap-Fill (second pass)" in research
 
@@ -704,6 +752,39 @@ class ResearchOrchestrator:
 
         return providers
 
+    def _failed_provider_result(self, name: str, exc: Exception, latency_ms: int) -> ProviderResult:
+        """Classify a provider that raised: ``inactive`` for expected off-season AskNews, else ``errored``.
+
+        Only ``errored`` bumps ``provider_failure_count`` (which reddens CI) and
+        feeds the deprecation matcher; an inactive subscription is a known
+        off-season state, not degradation.
+        """
+        if name == "asknews" and is_asknews_subscription_error(exc):
+            status = "inactive"
+            logger.info(
+                "Research provider %s inactive (expected off-season): %s: %s",
+                name,
+                type(exc).__name__,
+                exc,
+            )
+        else:
+            status = "errored"
+            self.provider_failure_count += 1
+            logger.warning(f"Research provider {name} failed ({type(exc).__name__}): {exc}")
+            from metaculus_bot.fallback_openrouter import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                _record_deprecation_if_matched,
+            )
+
+            _record_deprecation_if_matched(f"<provider:{name}>", str(exc))
+        return ProviderResult(
+            name=name,
+            status=status,
+            chars=0,
+            latency_ms=latency_ms,
+            error_type=type(exc).__name__,
+            error_message=str(exc)[:_PROVIDER_ERROR_MESSAGE_MAX_CHARS],
+        )
+
     async def _run_providers_parallel(
         self,
         question: MetaculusQuestion,
@@ -771,38 +852,13 @@ class ResearchOrchestrator:
                 # the cancellation as status="deadline".
                 pop_provider_detail(qid, name)
                 raise
-            except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
+            except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
                 # Drain-and-discard any partial detail the provider recorded before
                 # raising: an errored result carries the error, not source detail,
                 # and a stale entry must not leak into a later same-key call.
                 pop_provider_detail(qid, name)
                 latency_ms = int((time.monotonic() - started) * 1000)
-                if name == "asknews" and is_asknews_subscription_error(e):
-                    status = "inactive"
-                    logger.info(
-                        "Research provider %s inactive (expected off-season): %s: %s",
-                        name,
-                        type(e).__name__,
-                        e,
-                    )
-                else:
-                    status = "errored"
-                    self.provider_failure_count += 1
-                    logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
-                    from metaculus_bot.fallback_openrouter import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-                        _record_deprecation_if_matched,
-                    )
-
-                    _record_deprecation_if_matched(f"<provider:{name}>", str(e))
-                result = ProviderResult(
-                    name=name,
-                    status=status,
-                    chars=0,
-                    latency_ms=latency_ms,
-                    error_type=type(e).__name__,
-                    error_message=str(e)[:_PROVIDER_ERROR_MESSAGE_MAX_CHARS],
-                )
-                return ("", result)
+                return ("", self._failed_provider_result(name, e, latency_ms))
 
         results = await self._await_providers_within_deadline(providers, _run_one, time_budget)
 
@@ -991,7 +1047,7 @@ class ResearchOrchestrator:
             if os.getenv(EXA_API_KEY_ENV):
                 logger.info("Falling back to Exa search for research")
                 return (await self._call_exa_smart_searcher(question_text), "exa")
-        except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except — best-effort fallback; logs and returns None so the primary error propagates
+        except Exception as fallback_exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except — best-effort fallback; logs and returns None so the primary error propagates
             logger.warning(f"Fallback research provider also failed: {type(fallback_exc).__name__}: {fallback_exc}")
         return (None, None)
 

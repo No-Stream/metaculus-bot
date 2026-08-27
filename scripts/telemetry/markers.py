@@ -847,6 +847,7 @@ MARKER_SPECS: list[MarkerSpec] = [
 def _build_record(
     spec: MarkerSpec,
     match: re.Match[str],
+    *,
     line: str,
     seq: int,
     meta: dict[str, str],
@@ -910,7 +911,7 @@ def parse_log_text(
         for spec in MARKER_SPECS:
             match = spec.regex.search(line)
             if match:
-                harvested[spec.name].append(_build_record(spec, match, line, counters[spec.name], meta))
+                harvested[spec.name].append(_build_record(spec, match, line=line, seq=counters[spec.name], meta=meta))
                 counters[spec.name] += 1
                 break  # marker tokens are mutually exclusive — one marker per line
     return harvested

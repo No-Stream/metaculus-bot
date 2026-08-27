@@ -61,6 +61,7 @@ class BacktestQuestionSet:
 
 async def fetch_resolved_questions(
     total_questions: int,
+    *,
     resolved_after: str = BACKTEST_DEFAULT_RESOLVED_AFTER,
     tournament: str = BACKTEST_DEFAULT_TOURNAMENT,
     min_forecasters: int = BACKTEST_DEFAULT_MIN_FORECASTERS,
@@ -86,8 +87,10 @@ async def fetch_resolved_questions(
     # ft 0.2.92 coerces question datetimes (incl. actual_resolution_time) to tz-aware
     # UTC at construction. The strptime boundaries are naive, so normalize them to UTC
     # too — otherwise the naive/aware ordering comparisons in _filter_and_extract raise.
-    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))
-    resolved_before_dt = _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None
+    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
+    resolved_before_dt = (
+        _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None  # noqa: DTZ007  # stamped UTC by _as_utc
+    )
 
     overfetch_count = total_questions * BACKTEST_OVERFETCH_RATIO
     logger.info(
@@ -207,10 +210,133 @@ def _filter_and_extract(
     return filtered_questions, ground_truths, skip_counts
 
 
+@dataclass
+class _CollectedQuestions:
+    """Deduped questions + ground truths from a stratified multi-tournament fetch."""
+
+    questions: list[MetaculusQuestion]
+    ground_truths: dict[int, GroundTruth]
+    per_tournament_raw_counts: dict[str, int]
+    skip_totals: dict[str, int]
+
+
+async def _collect_deduped_questions(
+    tournaments: list[str],
+    *,
+    overfetch_count: int,
+    min_forecasters: int,
+    resolved_after_dt: datetime,
+    resolved_before_dt: datetime | None,
+) -> _CollectedQuestions:
+    """Fetch + filter each tournament serially, deduping by qid (first tournament wins).
+
+    Tournaments are walked serially rather than in parallel: the fetch is over-fetched
+    and rate-limited upstream, so there is nothing to gain from fanning out. The
+    unconditional checkpoint guarantees this coroutine yields control even when
+    ``tournaments`` is empty (defensive — the defaults always populate it).
+    """
+    await asyncio.sleep(0)
+
+    seen_qids: set[int] = set()
+    collected = _CollectedQuestions(
+        questions=[],
+        ground_truths={},
+        per_tournament_raw_counts={},
+        skip_totals={"no_resolution_time": 0, "too_early": 0, "too_late": 0, "canceled": 0},
+    )
+
+    for tournament in tournaments:
+        raw_questions = await _fetch_with_retries(
+            tournament=tournament,
+            count=overfetch_count,
+            min_forecasters=min_forecasters,
+        )
+        collected.per_tournament_raw_counts[tournament] = len(raw_questions)
+        logger.info(f"Tournament '{tournament}': API returned {len(raw_questions)} resolved questions")
+
+        filtered_q, ground_truths, skip_counts = _filter_and_extract(
+            raw_questions=raw_questions,
+            resolved_after_dt=resolved_after_dt,
+            resolved_before_dt=resolved_before_dt,
+        )
+        for reason, count in skip_counts.items():
+            collected.skip_totals[reason] += count
+        logger.info(
+            f"Tournament '{tournament}': {len(filtered_q)} usable after filtering "
+            f"(skipped: {skip_counts['no_resolution_time']} no resolution time, "
+            f"{skip_counts['too_early']} too early, "
+            f"{skip_counts['too_late']} too late, "
+            f"{skip_counts['canceled']} canceled/ambiguous)"
+        )
+
+        for question in filtered_q:
+            qid = question.id_of_question
+            if qid is None or qid in seen_qids:
+                continue
+            seen_qids.add(qid)
+            collected.questions.append(question)
+            collected.ground_truths[qid] = ground_truths[qid]
+
+    return collected
+
+
+def _group_by_question_type(questions: list[MetaculusQuestion]) -> dict[str, list[MetaculusQuestion]]:
+    """Bucket questions into the three scoreable types, WARNing on anything else."""
+    by_type: dict[str, list[MetaculusQuestion]] = {"binary": [], "multiple_choice": [], "numeric": []}
+    for question in questions:
+        if isinstance(question, BinaryQuestion):
+            by_type["binary"].append(question)
+        elif isinstance(question, MultipleChoiceQuestion):
+            by_type["multiple_choice"].append(question)
+        elif isinstance(question, NumericQuestion):
+            by_type["numeric"].append(question)
+        else:
+            logger.warning(f"Q{question.id_of_question}: unsupported question type {type(question).__name__}")
+    return by_type
+
+
+def _sample_per_type(
+    by_type: dict[str, list[MetaculusQuestion]],
+    per_type_targets: dict[str, int],
+) -> tuple[list[MetaculusQuestion], dict[str, int]]:
+    """Sample each type down to its target, WARNing when a bucket is undersaturated.
+
+    An undersaturated bucket contributes everything it has rather than failing, so the
+    returned per-type counts can be below the requested targets.
+    """
+    sampled_questions: list[MetaculusQuestion] = []
+    per_type_actual: dict[str, int] = {}
+    for q_type, target in per_type_targets.items():
+        bucket = by_type[q_type]
+        if target == 0:
+            per_type_actual[q_type] = 0
+            continue
+        if len(bucket) < target:
+            logger.warning(
+                f"Only {len(bucket)} {q_type} questions available after filtering "
+                f"(requested {target}). Proceeding with what's available."
+            )
+            chosen = bucket
+        else:
+            chosen = random.sample(bucket, target)
+        sampled_questions.extend(chosen)
+        per_type_actual[q_type] = len(chosen)
+    return sampled_questions, per_type_actual
+
+
+def _type_distribution(questions: list[MetaculusQuestion]) -> dict[str, int]:
+    """Count of questions per concrete ft question class."""
+    type_counts: dict[str, int] = {}
+    for question in questions:
+        type_counts[type(question).__name__] = type_counts.get(type(question).__name__, 0) + 1
+    return type_counts
+
+
 async def fetch_resolved_questions_stratified(
     num_binary: int,
     num_multiple_choice: int,
     num_numeric: int,
+    *,
     resolved_after: str = BACKTEST_DEFAULT_RESOLVED_AFTER,
     resolved_before: str | None = None,
     tournaments: list[str] | None = None,
@@ -243,16 +369,16 @@ async def fetch_resolved_questions_stratified(
     # ft 0.2.92 coerces question datetimes (incl. actual_resolution_time) to tz-aware
     # UTC at construction. The strptime boundaries are naive, so normalize them to UTC
     # too — otherwise the naive/aware ordering comparisons in _filter_and_extract raise.
-    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))
-    resolved_before_dt = _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None
+    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
+    resolved_before_dt = (
+        _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None  # noqa: DTZ007  # stamped UTC by _as_utc
+    )
 
     per_type_targets = {
         "binary": num_binary,
         "multiple_choice": num_multiple_choice,
         "numeric": num_numeric,
     }
-    total_target = num_binary + num_multiple_choice + num_numeric
-    overfetch_count = total_target * BACKTEST_OVERFETCH_RATIO
 
     logger.info(
         f"Stratified fetch across {len(tournaments)} tournament(s) "
@@ -260,97 +386,28 @@ async def fetch_resolved_questions_stratified(
         f"resolved {resolved_after} < t < {resolved_before})"
     )
 
-    # Unconditional checkpoint guarantees the function yields control even if
-    # `tournaments` is empty (defensive — defaults always populate it).
-    await asyncio.sleep(0)
+    collected = await _collect_deduped_questions(
+        tournaments,
+        overfetch_count=sum(per_type_targets.values()) * BACKTEST_OVERFETCH_RATIO,
+        min_forecasters=min_forecasters,
+        resolved_after_dt=resolved_after_dt,
+        resolved_before_dt=resolved_before_dt,
+    )
 
-    # Walk tournaments serially. _fetch_with_retries is async; awaiting each is fine —
-    # we don't need parallelism here.
-    seen_qids: set[int] = set()
-    deduped_questions: list[MetaculusQuestion] = []
-    deduped_ground_truths: dict[int, GroundTruth] = {}
-    per_tournament_raw_counts: dict[str, int] = {}
-    skip_totals = {"no_resolution_time": 0, "too_early": 0, "too_late": 0, "canceled": 0}
-
-    for tournament in tournaments:
-        raw_questions = await _fetch_with_retries(
-            tournament=tournament,
-            count=overfetch_count,
-            min_forecasters=min_forecasters,
-        )
-        per_tournament_raw_counts[tournament] = len(raw_questions)
-        logger.info(f"Tournament '{tournament}': API returned {len(raw_questions)} resolved questions")
-
-        filtered_q, ground_truths, skip_counts = _filter_and_extract(
-            raw_questions=raw_questions,
-            resolved_after_dt=resolved_after_dt,
-            resolved_before_dt=resolved_before_dt,
-        )
-        for k, v in skip_counts.items():
-            skip_totals[k] += v
-        logger.info(
-            f"Tournament '{tournament}': {len(filtered_q)} usable after filtering "
-            f"(skipped: {skip_counts['no_resolution_time']} no resolution time, "
-            f"{skip_counts['too_early']} too early, "
-            f"{skip_counts['too_late']} too late, "
-            f"{skip_counts['canceled']} canceled/ambiguous)"
-        )
-
-        # Cross-tournament dedup: first tournament wins.
-        for q in filtered_q:
-            qid = q.id_of_question
-            if qid is None or qid in seen_qids:
-                continue
-            seen_qids.add(qid)
-            deduped_questions.append(q)
-            deduped_ground_truths[qid] = ground_truths[qid]
-
-    # Group by type
-    by_type: dict[str, list[MetaculusQuestion]] = {"binary": [], "multiple_choice": [], "numeric": []}
-    for q in deduped_questions:
-        if isinstance(q, BinaryQuestion):
-            by_type["binary"].append(q)
-        elif isinstance(q, MultipleChoiceQuestion):
-            by_type["multiple_choice"].append(q)
-        elif isinstance(q, NumericQuestion):
-            by_type["numeric"].append(q)
-        else:
-            logger.warning(f"Q{q.id_of_question}: unsupported question type {type(q).__name__}")
-
+    by_type = _group_by_question_type(collected.questions)
     logger.info(
         f"Pre-sample buckets: binary={len(by_type['binary'])}, "
         f"mc={len(by_type['multiple_choice'])}, numeric={len(by_type['numeric'])}"
     )
 
-    # Per-type sampling with undersaturation warnings
-    sampled_questions: list[MetaculusQuestion] = []
-    per_type_actual: dict[str, int] = {}
-    for q_type, target in per_type_targets.items():
-        bucket = by_type[q_type]
-        if target == 0:
-            per_type_actual[q_type] = 0
-            continue
-        if len(bucket) < target:
-            logger.warning(
-                f"Only {len(bucket)} {q_type} questions available after filtering "
-                f"(requested {target}). Proceeding with what's available."
-            )
-            chosen = bucket
-        else:
-            chosen = random.sample(bucket, target)
-        sampled_questions.extend(chosen)
-        per_type_actual[q_type] = len(chosen)
-
+    sampled_questions, per_type_actual = _sample_per_type(by_type, per_type_targets)
     sampled_ids = {q.id_of_question for q in sampled_questions}
-    final_ground_truths = {qid: gt for qid, gt in deduped_ground_truths.items() if qid in sampled_ids}
+    final_ground_truths = {qid: gt for qid, gt in collected.ground_truths.items() if qid in sampled_ids}
 
     clean_questions = [_prepare_question_for_backtest(q) for q in sampled_questions]
     random.shuffle(clean_questions)
 
-    type_counts: dict[str, int] = {}
-    for q in clean_questions:
-        q_type = type(q).__name__
-        type_counts[q_type] = type_counts.get(q_type, 0) + 1
+    type_counts = _type_distribution(clean_questions)
     logger.info(f"Final stratified backtest question distribution: {type_counts}")
 
     return BacktestQuestionSet(
@@ -360,15 +417,15 @@ async def fetch_resolved_questions_stratified(
             "tournaments": list(tournaments),
             "resolved_after": resolved_after,
             "resolved_before": resolved_before,
-            "per_tournament_raw_counts": per_tournament_raw_counts,
+            "per_tournament_raw_counts": collected.per_tournament_raw_counts,
             "per_type_targets": per_type_targets,
             "per_type_actual": per_type_actual,
             "total_clean": len(clean_questions),
             "type_distribution": type_counts,
-            "skipped_no_resolution_time": skip_totals["no_resolution_time"],
-            "skipped_too_early": skip_totals["too_early"],
-            "skipped_too_late": skip_totals["too_late"],
-            "skipped_canceled": skip_totals["canceled"],
+            "skipped_no_resolution_time": collected.skip_totals["no_resolution_time"],
+            "skipped_too_early": collected.skip_totals["too_early"],
+            "skipped_too_late": collected.skip_totals["too_late"],
+            "skipped_canceled": collected.skip_totals["canceled"],
         },
     )
 
@@ -532,6 +589,23 @@ def _extract_numeric_community_cdf(question: MetaculusQuestion) -> list[float] |
     return None
 
 
+def _renormalized_probs(raw_values: list[Any]) -> list[float] | None:
+    """Coerce to floats and renormalize to sum 1, or None when a value isn't numeric.
+
+    Metaculus publishes MC aggregations that occasionally sum slightly off 1; a
+    non-numeric entry means this aggregation shape isn't usable and the caller should
+    fall through to the next one.
+    """
+    try:
+        probs = [float(value) for value in raw_values]
+    except (TypeError, ValueError):
+        return None
+    total = sum(probs)
+    if abs(total - 1.0) > 1e-6 and total > 0:
+        probs = [p / total for p in probs]
+    return probs
+
+
 def _extract_mc_community_probs(question: MetaculusQuestion) -> list[float] | None:
     """Extract MC community probabilities from api_json (same path as scoring_patches.py)."""
     api_json = getattr(question, "api_json", None)
@@ -558,26 +632,16 @@ def _extract_mc_community_probs(question: MetaculusQuestion) -> list[float] | No
     # Try forecast_values first
     fv = rw_latest.get("forecast_values")
     if isinstance(fv, list) and options and isinstance(options, list) and len(fv) == len(options):
-        try:
-            probs = [float(x) for x in fv]
-            total = sum(probs)
-            if abs(total - 1.0) > 1e-6 and total > 0:
-                probs = [p / total for p in probs]
+        probs = _renormalized_probs(fv)
+        if probs is not None:
             return probs
-        except (TypeError, ValueError):
-            pass
 
     # Try probability_yes_per_category
     pyc = rw_latest.get("probability_yes_per_category")
     if isinstance(pyc, dict) and options and isinstance(options, list):
-        try:
-            probs = [float(pyc.get(opt, 0.0)) for opt in options]
-            total = sum(probs)
-            if abs(total - 1.0) > 1e-6 and total > 0:
-                probs = [p / total for p in probs]
+        probs = _renormalized_probs([pyc.get(opt, 0.0) for opt in options])
+        if probs is not None:
             return probs
-        except (TypeError, ValueError):
-            pass
 
     return None
 

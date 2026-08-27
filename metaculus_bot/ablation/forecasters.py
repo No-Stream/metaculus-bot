@@ -197,7 +197,9 @@ _WINDOW_PATCH_LOCK: asyncio.Lock | None = None
 
 
 def _get_window_patch_lock() -> asyncio.Lock:
-    global _WINDOW_PATCH_LOCK
+    # The lock guards a MODULE-level monkey-patch, so it has to be module-scoped too,
+    # and it must be built lazily inside a running loop.
+    global _WINDOW_PATCH_LOCK  # noqa: PLW0603  # deliberate module-global: lazily-built lock for a module-level monkey-patch
     if _WINDOW_PATCH_LOCK is None:
         _WINDOW_PATCH_LOCK = asyncio.Lock()
     return _WINDOW_PATCH_LOCK
@@ -464,13 +466,163 @@ def _build_bot(
 # ---------------------------------------------------------------------------
 
 
+async def _predict_with_rate_limit_retries(
+    bot: TemplateForecaster,
+    question: MetaculusQuestion,
+    research_blob: str,
+    *,
+    forecaster_llm: GeneralLlm,
+    parser_llm: GeneralLlm,
+    qid: int,
+    max_retries: int,
+) -> tuple[ReasonedPrediction | None, list[str]]:
+    """Call ``_make_prediction``, retrying 429s, and return (prediction, errors).
+
+    Attempt budget: 1 initial attempt + ``max_retries`` retries on 429. Non-429
+    errors fall through after a single attempt. ``errors`` accumulates EVERY failed
+    attempt's stringified exception so a postmortem can see the full sequence; on a
+    success that follows transient 429s it is cleared, so downstream consumers can
+    treat ``len(errors) == 0`` as "this forecaster delivered" without false positives
+    from recovered retries. ``prediction`` is None iff every attempt failed.
+    """
+    prediction: ReasonedPrediction | None = None
+    errors: list[str] = []
+    for attempt in range(max_retries + 1):
+        try:
+            # Soft deadline mirrors production at main.py:1063: a single stuck
+            # forecaster used to be able to hold a question for litellm
+            # timeout(480) * allowed_tries(3) ≈ 24 min. Bound each attempt at
+            # FORECASTER_SOFT_DEADLINE (10 min in prod); the asyncio.TimeoutError is
+            # treated as a non-rate-limit failure below so it doesn't retry.
+            prediction = await asyncio.wait_for(
+                bot._make_prediction(question, research_blob, forecaster_llm),
+                timeout=FORECASTER_SOFT_DEADLINE,
+            )
+            errors = []
+            break
+        except Exception as exc:  # noqa: BLE001  # soft-fail boundary: any forecaster failure is recorded in the payload, never raised into the batch
+            errors.append(f"{type(exc).__name__}: {exc}")
+            if not _is_rate_limit_error(exc):
+                # Not a rate limit — log with stage heuristic and stop. Original
+                # misdirection cost (parser 404 mis-tagged as forecaster) was the
+                # whole reason ``_infer_failure_stage`` exists.
+                stage = _infer_failure_stage(exc, forecaster_llm.model)
+                logger.warning(
+                    "ablation forecaster failed | qid=%s | forecaster_model=%s | "
+                    "likely_stage=%s | parser_model=%s | %s: %s",
+                    qid,
+                    forecaster_llm.model,
+                    stage,
+                    parser_llm.model,
+                    type(exc).__name__,
+                    exc,
+                )
+                break
+            # Rate-limited path. If we've exhausted retries, log + give up.
+            if attempt >= max_retries:
+                logger.warning(
+                    "ablation forecaster rate-limited (retries exhausted) | qid=%s | "
+                    "forecaster_model=%s | attempts=%d | %s: %s",
+                    qid,
+                    forecaster_llm.model,
+                    attempt + 1,
+                    type(exc).__name__,
+                    exc,
+                )
+                break
+            await _sleep_before_rate_limit_retry(
+                exc,
+                forecaster_llm=forecaster_llm,
+                qid=qid,
+                attempt=attempt,
+                max_retries=max_retries,
+            )
+    return prediction, errors
+
+
+async def _sleep_before_rate_limit_retry(
+    exc: Exception,
+    *,
+    forecaster_llm: GeneralLlm,
+    qid: int,
+    attempt: int,
+    max_retries: int,
+) -> None:
+    """Sleep out a 429 before the next attempt, logging the wait.
+
+    Honors ``retry_after_seconds`` when the exception carries it; jitter prevents a
+    thundering-herd wake when many forecasters share an upstream provider (Venice,
+    OpenInference) and all hit the same window. Capped at
+    ``_MAX_RATE_LIMIT_SLEEP_SECONDS`` to bound a misbehaving upstream that signals an
+    unreasonably long Retry-After (3600s / one hour observed on hot-tail throttles).
+    """
+    retry_after = _parse_retry_after_seconds(exc)
+    if retry_after is not None:
+        sleep_seconds = min(retry_after + random.uniform(0.1, 0.5), _MAX_RATE_LIMIT_SLEEP_SECONDS)  # noqa: S311  # non-cryptographic backoff jitter
+    else:
+        sleep_seconds = _backoff_seconds(attempt)
+    logger.info(
+        "ablation forecaster rate-limited (retrying) | qid=%s | "
+        "forecaster_model=%s | provider=%s | attempt=%d/%d | sleep=%.2fs",
+        qid,
+        forecaster_llm.model,
+        _parse_provider_name(exc) or "unknown",
+        attempt + 1,
+        max_retries,
+        sleep_seconds,
+    )
+    await asyncio.sleep(sleep_seconds)
+
+
+def _serialize_prediction_or_record_error(
+    prediction: ReasonedPrediction | None,
+    question: MetaculusQuestion,
+    *,
+    errors: list[str],
+    forecaster_llm: GeneralLlm,
+    parser_llm: GeneralLlm,
+    qid: int,
+) -> tuple[Any, str]:
+    """Serialize ``prediction`` for the cache payload, or record the failure in ``errors``.
+
+    Serialization is isolated from the caller so a single forecaster's
+    post-prediction failure (e.g. the ``tuple`` AttributeError that started this
+    whole exercise) cannot cascade through ``asyncio.gather``'s default
+    ``return_exceptions=False`` and wipe out every other forecaster's already-cached
+    output for this qid. Each forecaster's payload — success or failure — must reach
+    disk independently, so a failure appends to ``errors`` (in place) and yields the
+    empty ``(None, "")`` pair.
+    """
+    if prediction is None:
+        return None, ""
+    try:
+        qtype = question_type_for_serialization(question)
+        return serialize_prediction_value(prediction.prediction_value, qtype), prediction.reasoning
+    except Exception as exc:  # noqa: BLE001  # soft-fail boundary: serialization failure must still persist a diagnostic payload for this forecaster
+        errors.append(f"{type(exc).__name__}: {exc}")
+        # We know the stage here — no heuristic needed. The original tuple bug
+        # surfaced as ``AttributeError: 'tuple' object has no attribute 'percentile'``
+        # in this exact code path, and tagging it ``serialize`` saves the operator the
+        # 30-minute detour of grep-ing through forecaster vs. parser code.
+        logger.warning(
+            "ablation forecaster failed | qid=%s | forecaster_model=%s | "
+            "likely_stage=serialize | parser_model=%s | %s: %s",
+            qid,
+            forecaster_llm.model,
+            parser_llm.model,
+            type(exc).__name__,
+            exc,
+        )
+        return None, ""
+
+
 async def _run_one_forecaster(
     question: MetaculusQuestion,
     research_blob: str,
     forecaster_llm: GeneralLlm,
     parser_llm: GeneralLlm,
-    cache: AblationCache,
     *,
+    cache: AblationCache,
     semaphore: asyncio.Semaphore,
     max_retries: int = _DEFAULT_MAX_RETRIES,
 ) -> tuple[str, dict[str, Any]]:
@@ -502,8 +654,6 @@ async def _run_one_forecaster(
 
         logger.info("ablation forecaster start | qid=%s | model=%s", qid, forecaster_llm.model)
         start = time.monotonic()
-        prediction: ReasonedPrediction | None = None
-        errors: list[str] = []
         # Mirror the framework's notepad lifecycle from
         # ``ForecastBot._run_individual_question`` (lines 352-354 + 414): every
         # call to ``_make_prediction`` first reads ``_get_notepad(question)``,
@@ -515,124 +665,35 @@ async def _run_one_forecaster(
         async with bot._note_pad_lock:
             bot._note_pads.append(notepad)
         try:
-            # Attempt budget: 1 initial attempt + ``max_retries`` retries on 429.
-            # Non-429 errors fall through after a single attempt. ``errors``
-            # accumulates EVERY failed attempt's stringified exception so a
-            # postmortem can see the full sequence. On a success that follows
-            # transient 429s, we clear ``errors`` (after ``break`` below) so
-            # downstream consumers can treat ``len(errors) == 0`` as "this
-            # forecaster delivered" without false positives from recovered retries.
-            for attempt in range(max_retries + 1):
-                try:
-                    # Soft deadline mirrors production at main.py:1063: a single
-                    # stuck forecaster used to be able to hold a question for
-                    # litellm timeout(480) * allowed_tries(3) ≈ 24 min. Bound
-                    # each attempt at FORECASTER_SOFT_DEADLINE (10 min in prod);
-                    # the asyncio.TimeoutError is treated as a non-rate-limit
-                    # failure below so it doesn't trigger the retry loop.
-                    prediction = await asyncio.wait_for(
-                        bot._make_prediction(question, research_blob, forecaster_llm),
-                        timeout=FORECASTER_SOFT_DEADLINE,
-                    )
-                    errors = []
-                    break
-                except Exception as exc:
-                    errors.append(f"{type(exc).__name__}: {exc}")
-                    if not _is_rate_limit_error(exc):
-                        # Not a rate limit — log with stage heuristic (mirrors the
-                        # original error path) and stop. Original misdirection
-                        # cost (parser 404 mis-tagged as forecaster) was the
-                        # whole reason ``_infer_failure_stage`` exists.
-                        stage = _infer_failure_stage(exc, forecaster_llm.model)
-                        logger.warning(
-                            "ablation forecaster failed | qid=%s | forecaster_model=%s | "
-                            "likely_stage=%s | parser_model=%s | %s: %s",
-                            qid,
-                            forecaster_llm.model,
-                            stage,
-                            parser_llm.model,
-                            type(exc).__name__,
-                            exc,
-                        )
-                        break
-                    # Rate-limited path. If we've exhausted retries, log + give up.
-                    if attempt >= max_retries:
-                        logger.warning(
-                            "ablation forecaster rate-limited (retries exhausted) | qid=%s | "
-                            "forecaster_model=%s | attempts=%d | %s: %s",
-                            qid,
-                            forecaster_llm.model,
-                            attempt + 1,
-                            type(exc).__name__,
-                            exc,
-                        )
-                        break
-                    # Honor ``retry_after_seconds`` when present; jitter prevents
-                    # thundering-herd wake when many forecasters share an upstream
-                    # provider (Venice, OpenInference) and all hit the same window.
-                    # Cap at ``_MAX_RATE_LIMIT_SLEEP_SECONDS`` to bound a misbehaving
-                    # upstream that signals an unreasonably long Retry-After
-                    # (3600s / one hour observed in the wild on hot-tail throttles).
-                    retry_after = _parse_retry_after_seconds(exc)
-                    if retry_after is not None:
-                        sleep_seconds = min(retry_after + random.uniform(0.1, 0.5), _MAX_RATE_LIMIT_SLEEP_SECONDS)  # noqa: S311  # non-cryptographic backoff jitter
-                    else:
-                        sleep_seconds = _backoff_seconds(attempt)
-                    provider_name = _parse_provider_name(exc) or "unknown"
-                    logger.info(
-                        "ablation forecaster rate-limited (retrying) | qid=%s | "
-                        "forecaster_model=%s | provider=%s | attempt=%d/%d | sleep=%.2fs",
-                        qid,
-                        forecaster_llm.model,
-                        provider_name,
-                        attempt + 1,
-                        max_retries,
-                        sleep_seconds,
-                    )
-                    await asyncio.sleep(sleep_seconds)
+            prediction, errors = await _predict_with_rate_limit_retries(
+                bot,
+                question,
+                research_blob,
+                forecaster_llm=forecaster_llm,
+                parser_llm=parser_llm,
+                qid=qid,
+                max_retries=max_retries,
+            )
         finally:
             await bot._remove_notepad(question)
 
         duration = time.monotonic() - start
 
-        # Wrap serialize + cache-write in its own try/except so a single forecaster's
-        # post-prediction failure (e.g., the ``tuple`` AttributeError that started
-        # this whole exercise) cannot cascade through ``asyncio.gather``'s default
-        # ``return_exceptions=False`` and wipe out every other forecaster's already-
-        # cached output for this qid. Each forecaster's payload — success or
-        # failure — must reach disk independently.
-        prediction_value: Any = None
-        reasoning: str = ""
-        try:
-            if prediction is not None:
-                qtype = question_type_for_serialization(question)
-                prediction_value = serialize_prediction_value(prediction.prediction_value, qtype)
-                reasoning = prediction.reasoning
-        except Exception as exc:
-            errors.append(f"{type(exc).__name__}: {exc}")
-            # We know the stage here — no heuristic needed. The original tuple bug
-            # surfaced as ``AttributeError: 'tuple' object has no attribute 'percentile'``
-            # in this exact code path, and tagging it ``serialize`` saves the
-            # operator the 30-minute detour of grep-ing through forecaster vs.
-            # parser code.
-            logger.warning(
-                "ablation forecaster failed | qid=%s | forecaster_model=%s | "
-                "likely_stage=serialize | parser_model=%s | %s: %s",
-                qid,
-                forecaster_llm.model,
-                parser_llm.model,
-                type(exc).__name__,
-                exc,
-            )
-            prediction_value = None
-            reasoning = ""
+        prediction_value, reasoning = _serialize_prediction_or_record_error(
+            prediction,
+            question,
+            errors=errors,
+            forecaster_llm=forecaster_llm,
+            parser_llm=parser_llm,
+            qid=qid,
+        )
 
         payload = {
             "model": forecaster_llm.model,
             "prediction_value": prediction_value,
             "reasoning": reasoning,
             "errors": errors,
-            "ran_at": datetime.now().isoformat(),
+            "ran_at": datetime.now(UTC).isoformat(),
             "duration_seconds": float(duration),
         }
         # Even on serialize failure, persist the (failure) payload so partial-success
@@ -721,7 +782,7 @@ async def run_forecasters_for_question(
                         research_blob,
                         llm,
                         parser_llm,
-                        cache,
+                        cache=cache,
                         semaphore=semaphore,
                         max_retries=max_retries,
                     )
@@ -788,7 +849,7 @@ async def run_forecasters_batch(
                     max_retries=max_retries,
                 )
                 return qid, per_model
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  # soft-fail boundary: one question failing entirely must not abort the batch
                 logger.warning(
                     "ablation forecaster batch | qid=%s failed entirely | %s: %s",
                     qid,

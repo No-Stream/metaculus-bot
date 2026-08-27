@@ -89,3 +89,110 @@ async def test_asknews_calls_both_endpoints():
             # downstream as research; this test's subject is the two-endpoint call pattern
             # above, which is unchanged.
             assert result == ""
+
+
+class TestAskNewsPhaseRetryBudget:
+    """Behavior pins for the two-phase retry ladder and its shared attempt budget.
+
+    Both phases retry only transient rate/concurrency errors, and the HISTORICAL
+    phase's budget is what the HOT phase left over — so a HOT call that burned two
+    attempts leaves HISTORICAL fewer. Those are the rules a reader of the phase
+    helper has to preserve, so they are pinned directly here.
+    """
+
+    @staticmethod
+    async def _run(search_news, *, tries: int = 3) -> str:
+        """Drive the provider against a scripted ``sdk.news.search_news``, sleeps stubbed out."""
+        with (
+            patch("os.getenv") as mock_getenv,
+            patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class,
+            patch("metaculus_bot.research.providers.ASKNEWS_MAX_TRIES", tries),
+            patch("metaculus_bot.research.providers.ASKNEWS_BACKOFF_SECS", 0.0),
+            patch("asyncio.sleep", new=AsyncMock()),
+        ):
+            mock_getenv.side_effect = lambda key, default=None: {
+                "ASKNEWS_CLIENT_ID": "test_client_id",
+                "ASKNEWS_SECRET": "test_secret",
+            }.get(key, default)
+            mock_sdk = AsyncMock()
+            mock_sdk.news.search_news = search_news
+            mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
+            return await _asknews_provider()(_make_q("test question"))
+
+    @staticmethod
+    def _empty_response() -> AsyncMock:
+        response = AsyncMock()
+        response.as_dicts = []
+        return response
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_hot_call_retries_then_succeeds(self) -> None:
+        attempts: list[str] = []
+
+        async def search_news(*_args, **kwargs):
+            strategy = kwargs["strategy"]
+            attempts.append(strategy)
+            if strategy == "latest news" and attempts.count("latest news") == 1:
+                raise RuntimeError("429 rate limit exceeded")
+            return TestAskNewsPhaseRetryBudget._empty_response()
+
+        assert await self._run(search_news) == ""
+        assert attempts == ["latest news", "latest news", "news knowledge"]
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_hot_error_raises_on_the_first_attempt(self) -> None:
+        attempts: list[str] = []
+
+        async def search_news(*_args, **kwargs):
+            attempts.append(kwargs["strategy"])
+            raise RuntimeError("400 malformed query")
+
+        with pytest.raises(RuntimeError, match="malformed query"):
+            await self._run(search_news)
+        assert attempts == ["latest news"]
+
+    @pytest.mark.asyncio
+    async def test_exhausted_hot_retries_reraise_the_last_error(self) -> None:
+        attempts: list[str] = []
+
+        async def search_news(*_args, **kwargs):
+            attempts.append(kwargs["strategy"])
+            raise RuntimeError(f"concurrency limit hit #{len(attempts)}")
+
+        with pytest.raises(RuntimeError, match="#3"):
+            await self._run(search_news, tries=3)
+        assert attempts == ["latest news"] * 3
+
+    @pytest.mark.asyncio
+    async def test_historical_budget_is_what_hot_left_over(self) -> None:
+        """HOT burning 2 of 3 attempts leaves HISTORICAL 2 (``tries - (hot_used - 1)``)."""
+        attempts: list[str] = []
+
+        async def search_news(*_args, **kwargs):
+            strategy = kwargs["strategy"]
+            attempts.append(strategy)
+            if strategy == "latest news" and attempts.count("latest news") == 1:
+                raise RuntimeError("429 rate limit")
+            if strategy == "news knowledge":
+                raise RuntimeError("429 rate limit")
+            return TestAskNewsPhaseRetryBudget._empty_response()
+
+        with pytest.raises(RuntimeError, match="429"):
+            await self._run(search_news, tries=3)
+        assert attempts.count("latest news") == 2
+        assert attempts.count("news knowledge") == 2
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_historical_error_raises_on_the_first_attempt(self) -> None:
+        attempts: list[str] = []
+
+        async def search_news(*_args, **kwargs):
+            strategy = kwargs["strategy"]
+            attempts.append(strategy)
+            if strategy == "news knowledge":
+                raise RuntimeError("500 upstream exploded")
+            return TestAskNewsPhaseRetryBudget._empty_response()
+
+        with pytest.raises(RuntimeError, match="upstream exploded"):
+            await self._run(search_news)
+        assert attempts == ["latest news", "news knowledge"]

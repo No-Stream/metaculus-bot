@@ -31,7 +31,10 @@ _pchip_stats: dict[str, int] = {
 
 def reset_pchip_stats() -> None:
     """Reset PCHIP statistics counters (call at start of each run)."""
-    global _pchip_stats
+    # Deliberate module-global run counter (same pattern as the fallback counters in
+    # fallback_openrouter). The reset REBINDS rather than mutates, so `global` is required;
+    # readers get a copy from get_pchip_stats(), so nothing holds the old dict.
+    global _pchip_stats  # noqa: PLW0603
     _pchip_stats = {
         "total_attempts": 0,
         "successful_without_enforcement": 0,

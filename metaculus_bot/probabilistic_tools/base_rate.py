@@ -81,6 +81,31 @@ def laplace_rule_of_succession(k: int, n: int) -> float:
     return (k + 1) / (n + 2)
 
 
+def _inverse_variance_blend(
+    rates: list[float],
+    weights: list[float] | None,
+    variances: list[float] | None,
+) -> float:
+    """Precision-weighted mean. ``weights`` is accepted only to reject it explicitly —
+    passing both weighting schemes is a caller bug, not something to silently pick from."""
+    if variances is None:
+        raise ValueError("variances must be provided when method='inverse_variance'")
+    if weights is not None:
+        raise ValueError(
+            "base_rate_blend(method='inverse_variance') uses variances for weighting; "
+            "pass either weights OR variances, not both"
+        )
+    if len(variances) != len(rates):
+        raise ValueError(f"variances length {len(variances)} must match rates length {len(rates)}")
+    for v in variances:
+        if v <= 0:
+            raise ValueError(f"all variances must be > 0 (got {v})")
+
+    inv = np.array([1.0 / v for v in variances])
+    arr = np.array(rates, dtype=float)
+    return float(np.sum(inv * arr) / np.sum(inv))
+
+
 def base_rate_blend(
     rates: list[float],
     weights: list[float] | None = None,
@@ -94,21 +119,7 @@ def base_rate_blend(
             raise ValueError(f"all rates must be in [0, 1] (got {r})")
 
     if method == "inverse_variance":
-        if variances is None:
-            raise ValueError("variances must be provided when method='inverse_variance'")
-        if weights is not None:
-            raise ValueError(
-                "base_rate_blend(method='inverse_variance') uses variances for weighting; "
-                "pass either weights OR variances, not both"
-            )
-        if len(variances) != len(rates):
-            raise ValueError(f"variances length {len(variances)} must match rates length {len(rates)}")
-        for v in variances:
-            if v <= 0:
-                raise ValueError(f"all variances must be > 0 (got {v})")
-        inv = np.array([1.0 / v for v in variances])
-        arr = np.array(rates, dtype=float)
-        return float(np.sum(inv * arr) / np.sum(inv))
+        return _inverse_variance_blend(rates, weights, variances)
 
     w = resolve_weights(weights, len(rates))
 

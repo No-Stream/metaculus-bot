@@ -1408,10 +1408,10 @@ class TestQuestionTypeDispatch:
             Percentile(percentile=0.975, value=80.0),
             Percentile(percentile=0.99, value=85.0),
         ]
-        captured_args: list[Any] = []
+        captured_kwargs: dict[str, Any] = {}
 
-        def _fake_numeric(*args: Any, **_kwargs: Any) -> tuple[Any, str]:
-            captured_args.extend(args)
+        def _fake_numeric(*_args: Any, **kwargs: Any) -> tuple[Any, str]:
+            captured_kwargs.update(kwargs)
             return _percentiles, "meta"
 
         with (
@@ -1444,11 +1444,11 @@ class TestQuestionTypeDispatch:
                     parser_llm=parser_llm,
                 )
             )
-        # Position 5 = lower_bound_message; position 6 = upper_bound_message (per stacking.run_stacking_numeric
-        # signature: stacker_llm, parser_llm, question, research, base_texts, lower_bound_message, upper_bound_message)
-        assert len(captured_args) >= 7, f"expected >=7 positional args, got {len(captured_args)}"
-        lower_msg = captured_args[5]
-        upper_msg = captured_args[6]
+        # ``stacking.run_stacking_numeric`` takes the bound messages keyword-only, so the
+        # dispatcher must name them rather than rely on their slot.
+        assert {"lower_bound_message", "upper_bound_message"} <= captured_kwargs.keys(), captured_kwargs.keys()
+        lower_msg = captured_kwargs["lower_bound_message"]
+        upper_msg = captured_kwargs["upper_bound_message"]
         assert isinstance(lower_msg, str)
         assert isinstance(upper_msg, str)
         # Validate bound messages mention the bounds

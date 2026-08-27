@@ -5,7 +5,7 @@ Based on the panchul implementation with comprehensive validation.
 """
 
 from itertools import pairwise
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 import pytest
@@ -535,6 +535,118 @@ class TestGeneratePchipCdf:
         assert cdf[0] == 0.0
         assert cdf[-1] == 1.0
         assert all(a <= b for a, b in pairwise(cdf))
+
+
+class TestAggressiveMinStepEnforcement:
+    """Pin the LAST repair tier: the rebuild that fires when the min-step is still
+    violated after ``safe_cdf_bounds``.
+
+    AGENTS.md records that this tier never fires on real forecasts (0 of 1182
+    archived numeric forecasts), and it is unreachable on the 201-point grid at the
+    production ``min_step``. It IS reachable on a coarse grid whose range is exactly
+    saturated by ``(num_points - 1) * min_step``, which is what these cases use. The
+    exact-value assertions exist so the tier can be restructured without silently
+    changing what it emits.
+    """
+
+    SIMPLE_PERCENTILES: ClassVar[dict[int | float, float]] = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
+    CONCENTRATED_PERCENTILES: ClassVar[dict[int | float, float]] = {
+        2.5: 111.0,
+        5.0: 114.0,
+        10.0: 117.0,
+        20.0: 121.0,
+        40.0: 126.0,
+        50.0: 130.0,
+        60.0: 134.0,
+        80.0: 143.0,
+        90.0: 152.0,
+        95.0: 161.0,
+        97.5: 172.0,
+    }
+
+    def test_saturated_coarse_grid_rebuilds_to_exactly_uniform(self):
+        cdf, aggressive_enforcement = generate_pchip_cdf(
+            percentile_values=self.SIMPLE_PERCENTILES,
+            open_upper_bound=False,
+            open_lower_bound=False,
+            upper_bound=10.0,
+            lower_bound=0.0,
+            zero_point=None,
+            min_step=0.1,
+            max_step=1.0,
+            num_points=11,
+        )
+
+        assert aggressive_enforcement is True
+        np.testing.assert_allclose(cdf, np.linspace(0.0, 1.0, 11), atol=1e-12)
+
+    def test_saturated_grid_rebuild_on_concentrated_declaration(self):
+        cdf, aggressive_enforcement = generate_pchip_cdf(
+            percentile_values=self.CONCENTRATED_PERCENTILES,
+            open_upper_bound=False,
+            open_lower_bound=False,
+            upper_bound=200.0,
+            lower_bound=0.0,
+            zero_point=None,
+            min_step=0.05,
+            max_step=1.0,
+            num_points=21,
+        )
+
+        assert aggressive_enforcement is True
+        np.testing.assert_allclose(cdf, np.linspace(0.0, 1.0, 21), atol=1e-12)
+
+    def test_rebuild_emits_the_documented_warn_and_completion_lines(self, caplog):
+        with caplog.at_level("INFO", logger="metaculus_bot.numeric.pchip_cdf"):
+            generate_pchip_cdf(
+                percentile_values=self.SIMPLE_PERCENTILES,
+                open_upper_bound=False,
+                open_lower_bound=False,
+                upper_bound=10.0,
+                lower_bound=0.0,
+                zero_point=None,
+                min_step=0.1,
+                max_step=1.0,
+                num_points=11,
+                question_id=4242,
+                question_url="https://ex/q/4242",
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("PCHIP minimum step enforcement required for Q 4242" in m for m in messages)
+        assert any("PCHIP aggressive enforcement completed for Q 4242" in m for m in messages)
+
+    def test_range_too_small_for_min_steps_raises(self):
+        with pytest.raises(ValueError, match="Cannot satisfy minimum step requirement"):
+            generate_pchip_cdf(
+                percentile_values=self.SIMPLE_PERCENTILES,
+                open_upper_bound=False,
+                open_lower_bound=False,
+                upper_bound=10.0,
+                lower_bound=0.0,
+                zero_point=None,
+                min_step=0.3,
+                max_step=1.0,
+                num_points=5,
+            )
+
+    def test_two_point_grid_needs_no_rebuild(self):
+        """``num_points=2`` is the only grid where the rebuild's shape-preserving
+        allocation degenerates to plain linear spacing; pin that it stays legal."""
+        cdf, aggressive_enforcement = generate_pchip_cdf(
+            percentile_values=self.SIMPLE_PERCENTILES,
+            open_upper_bound=False,
+            open_lower_bound=False,
+            upper_bound=10.0,
+            lower_bound=0.0,
+            zero_point=None,
+            min_step=0.6,
+            max_step=1.0,
+            num_points=2,
+        )
+
+        assert aggressive_enforcement is False
+        assert cdf == [0.0, 1.0]
 
 
 if __name__ == "__main__":

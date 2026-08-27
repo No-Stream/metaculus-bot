@@ -138,6 +138,41 @@ def weighted_quantile(values: Any, weights: Any, q: float = 0.5) -> float:
     return float(np.interp(q, plotting, vs))
 
 
+def _normalized_model_weights(weights: Any, n_models: int) -> np.ndarray:
+    """Per-model weights normalized to sum 1, defaulting to uniform when ``weights`` is None."""
+    if weights is None:
+        return np.full(n_models, 1.0 / n_models, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    if w.shape != (n_models,):
+        raise ValueError(f"weights shape {w.shape} must be ({n_models},)")
+    if np.any(w < 0):
+        raise ValueError("weights must be non-negative")
+    total = float(w.sum())
+    if total <= 0:
+        raise ValueError("weights must sum to a positive value")
+    return w / total
+
+
+def _interp_at_median_per_column(plotting: np.ndarray, vs: np.ndarray) -> np.ndarray:
+    """Vectorized ``np.interp(0.5, plotting[:, g], vs[:, g])`` over every column ``g``.
+
+    Reproduces ``np.interp``'s endpoint-clamp semantics: ``q`` at or below the first
+    plotting position yields ``vs[0]``, and ``q`` above the last yields ``vs[-1]``.
+    Both inputs are ``(n_models, n_grid)`` with ``plotting`` ascending down each column.
+    """
+    cols = np.arange(plotting.shape[1])
+    reaches_half = plotting >= 0.5
+    idx_upper = reaches_half.argmax(axis=0)  # first row reaching 0.5 (0 if none reach it)
+    none_reach = ~reaches_half.any(axis=0)  # 0.5 above the whole column -> clamp to top
+    idx_lower = np.maximum(idx_upper - 1, 0)
+    p_lo = plotting[idx_lower, cols]
+    span = plotting[idx_upper, cols] - p_lo
+    v_lo = vs[idx_lower, cols]
+    t = np.where(span > 0, (0.5 - p_lo) / np.where(span > 0, span, 1.0), 0.0)
+    out = np.where(idx_upper == 0, vs[0, cols], v_lo + t * (vs[idx_upper, cols] - v_lo))
+    return np.where(none_reach, vs[-1, cols], out)
+
+
 def weighted_cdf_median(prob_matrix: np.ndarray, weights: Any) -> list[float]:
     """Weighted vertical median of a per-model CDF-probability matrix.
 
@@ -152,40 +187,15 @@ def weighted_cdf_median(prob_matrix: np.ndarray, weights: Any) -> list[float]:
     mat = np.asarray(prob_matrix, dtype=float)
     if mat.ndim != 2:
         raise ValueError(f"prob_matrix must be 2-D (n_models, n_grid), got {mat.shape}")
-    n_models, n_grid = mat.shape
-    if weights is None:
-        w = np.full(n_models, 1.0 / n_models, dtype=float)
-    else:
-        w = np.asarray(weights, dtype=float)
-        if w.shape != (n_models,):
-            raise ValueError(f"weights shape {w.shape} must be ({n_models},)")
-        if np.any(w < 0):
-            raise ValueError("weights must be non-negative")
-        total = float(w.sum())
-        if total <= 0:
-            raise ValueError("weights must sum to a positive value")
-        w = w / total
+    n_models = mat.shape[0]
+    w = _normalized_model_weights(weights, n_models)
 
     order = np.argsort(mat, axis=0, kind="stable")  # (M, G)
     vs = np.take_along_axis(mat, order, axis=0)  # sorted probs per column
     ws = w[order]  # weights reordered per column (M, G); each column already sums to 1
     plotting = np.cumsum(ws, axis=0) - ws / 2.0  # Hazen midpoint positions (M, G)
 
-    # Vectorized np.interp(0.5, plotting[:, g], vs[:, g]) per column g, with the same
-    # endpoint-clamp semantics as np.interp (q below p[0] -> vs[0]; above p[-1] -> vs[-1]).
-    cols = np.arange(n_grid)
-    idx_upper = (plotting >= 0.5).argmax(axis=0)  # first row reaching 0.5 (0 if none reach it)
-    none_reach = ~(plotting >= 0.5).any(axis=0)  # 0.5 above the whole column -> clamp to top
-    idx_lower = np.maximum(idx_upper - 1, 0)
-    p_lo = plotting[idx_lower, cols]
-    p_hi = plotting[idx_upper, cols]
-    v_lo = vs[idx_lower, cols]
-    v_hi = vs[idx_upper, cols]
-    span = p_hi - p_lo
-    t = np.where(span > 0, (0.5 - p_lo) / np.where(span > 0, span, 1.0), 0.0)
-    out = np.where(idx_upper == 0, vs[0, cols], v_lo + t * (v_hi - v_lo))  # q at/below first position
-    out = np.where(none_reach, vs[-1, cols], out)  # q above last position
-
+    out = _interp_at_median_per_column(plotting, vs)
     out = np.clip(out, 0.0, 1.0)
     out = np.maximum.accumulate(out)
     return list(map(float, out))
@@ -832,9 +842,9 @@ def score_numeric(record: NumericRecord, cdf_values: list[float]) -> tuple[float
         record.resolution_value,
         float(q.lower_bound),
         float(q.upper_bound),
-        bool(q.open_lower_bound),
-        bool(q.open_upper_bound),
-        float(q.zero_point) if q.zero_point is not None else None,
+        open_lower_bound=bool(q.open_lower_bound),
+        open_upper_bound=bool(q.open_upper_bound),
+        zero_point=float(q.zero_point) if q.zero_point is not None else None,
     )
     # CRPS x-values must be the SAME grid the production CDF lives on: geometric for
     # zero_point (log-scaled) questions, linear otherwise. A linear grid here would

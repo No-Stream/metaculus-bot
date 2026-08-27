@@ -67,7 +67,7 @@ _POLITENESS_LAST_CALL_TS: float = 0.0
 
 def _reset_politeness_clock() -> None:
     """Clear the pacing clock so a test's first fetch doesn't wait on a previous test's."""
-    global _POLITENESS_LAST_CALL_TS
+    global _POLITENESS_LAST_CALL_TS  # noqa: PLW0603  # process-wide pacing clock shared by two providers' to_thread calls
     with _POLITENESS_LOCK:
         _POLITENESS_LAST_CALL_TS = 0.0
 
@@ -99,7 +99,7 @@ def _politeness_gate() -> None:
     itself is sync and shared by two providers' ``to_thread`` calls; a thread lock is
     what both can hold correctly.
     """
-    global _POLITENESS_LAST_CALL_TS
+    global _POLITENESS_LAST_CALL_TS  # noqa: PLW0603  # process-wide pacing clock shared by two providers' to_thread calls
     if POLITENESS_SLEEP_S <= 0:
         return
     with _POLITENESS_LOCK:

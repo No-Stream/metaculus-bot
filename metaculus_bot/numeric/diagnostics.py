@@ -46,7 +46,7 @@ def log_cdf_diagnostics_on_error(prediction: NumericDistribution, question: Nume
             deltas_pct,
         )
     # Caller re-raises the ORIGINAL error; a crash in diagnostics logging must not mask it.
-    except Exception as log_e:  # HARNESS-SCAN-EXEMPT-broad-except
+    except Exception as log_e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         logger.error("Failed logging numeric CDF diagnostics: %s", log_e)
 
 

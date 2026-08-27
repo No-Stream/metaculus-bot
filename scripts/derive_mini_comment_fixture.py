@@ -268,7 +268,9 @@ def render_expectations(fixture: list[dict]) -> str:
     source = f"{EXPECTATIONS_VARIABLE} = {table!r}\n"
     # Formatted by the repo's own formatter so the emitted block can be pasted in
     # without a follow-up `make format` reflowing it into a different diff.
-    formatted = subprocess.run(
+    # S603: fixed argv, no shell. The executable is this interpreter (``sys.executable``)
+    # and the only interpolation is the module-level ``TEST_MODULE_PATH`` constant.
+    formatted = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "ruff", "format", "--stdin-filename", str(TEST_MODULE_PATH), "-"],
         input=source,
         capture_output=True,

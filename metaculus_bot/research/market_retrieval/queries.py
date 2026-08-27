@@ -57,8 +57,9 @@ _DIGIT_RE = re.compile(r"\d")
 _MANIFOLD_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'À-ɏ&.\-]*")
 
 # `has_date_like_token`'s vocabulary. A day number carries an optional ordinal suffix so
-# "June 30th" reads as a date rather than as an identifier ending in letters.
-_TOKEN_EDGE_PUNCTUATION = "\"'“”‘’.,;:!?()[]{}"  # noqa: RUF001  # curly quotes are data: edge punctuation to strip
+# "June 30th" reads as a date rather than as an identifier ending in letters. The "TOKEN" in
+# the name is a TEXT token — this is the punctuation stripped off a word, not a credential.
+_TOKEN_EDGE_PUNCTUATION = "\"'“”‘’.,;:!?()[]{}"  # noqa: RUF001, S105  # curly quotes are data to strip
 _DIGIT_GROUP_RE = re.compile(r"\d+")
 _DAY_NUMBER_RE = re.compile(r"\d{1,2}(?:st|nd|rd|th)?", re.IGNORECASE)
 _PLAUSIBLE_YEARS = range(1900, 2100)

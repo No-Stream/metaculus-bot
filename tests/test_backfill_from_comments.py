@@ -1,5 +1,7 @@
 """Tests for backfill_research_from_comments.py — extracting research from bot comments."""
 
+import json
+
 # --- Sample comment bodies mimicking real bot output ---
 
 SAMPLE_COMMENT_FULL = """\
@@ -436,3 +438,90 @@ class TestBuildRecord:
         record = build_record(comment, question_id=55555)
         assert record is not None
         assert record["is_trimmed"] is True
+
+
+def _run_main(tmp_path, monkeypatch, comments, *, extra_argv=()):
+    """Drive the CLI end to end with the network, token load and rate-gate stubbed out.
+
+    Everything below the API boundary is real: argument parsing, the post_id -> question_id
+    cache, the dedup read of an existing output file, record building and the JSONL write.
+    Returns the parsed records the run appended to the output file.
+    """
+    import scripts.backfill_research_from_comments as mod
+
+    resolved: list[int] = []
+
+    monkeypatch.setattr(mod, "get_token", lambda: "token")
+    monkeypatch.setattr(mod, "verify_metaculus_api_identity", lambda: None)
+    monkeypatch.setattr(mod, "fetch_all_comments", lambda token: comments)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    def _resolve(post_id: int, token: str) -> int | None:
+        resolved.append(post_id)
+        return post_id + 1000 if post_id != 777 else None
+
+    monkeypatch.setattr(mod, "get_question_id_for_post", _resolve)
+    monkeypatch.setattr("sys.argv", ["backfill", "--output-dir", str(tmp_path), *[str(a) for a in extra_argv]])
+
+    mod.main()
+
+    output_file = tmp_path / "comments_backfill.jsonl"
+    written = (
+        [json.loads(line) for line in output_file.read_text().splitlines() if line.strip()]
+        if output_file.exists()
+        else []
+    )
+    return written, resolved
+
+
+class TestMainWritesTheBackfillFile:
+    """End-to-end CLI behavior: what lands in comments_backfill.jsonl and what is skipped.
+
+    ``main`` carries the parts no unit test reaches — the dedup read, the post->question
+    cache, the dry-run gate and the per-record counters — so these pin them before any
+    restructuring of the function.
+    """
+
+    def _comments(self):
+        return [
+            {"id": 1, "on_post": 101, "text": SAMPLE_COMMENT_FULL, "created_at": "2026-05-20T15:48:05Z"},
+            {"id": 2, "on_post": 102, "text": SAMPLE_COMMENT_NO_RESEARCH, "created_at": "2026-05-21T00:00:00Z"},
+            {"id": 3, "on_post": None, "text": SAMPLE_COMMENT_FULL, "created_at": "2026-05-22T00:00:00Z"},
+            {"id": 4, "on_post": 777, "text": SAMPLE_COMMENT_TRIMMED, "created_at": "2026-05-23T00:00:00Z"},
+        ]
+
+    def test_writes_one_record_per_comment_with_research(self, tmp_path, monkeypatch):
+        written, resolved = _run_main(tmp_path, monkeypatch, self._comments())
+
+        assert [r["on_post"] for r in written] == [101, 777]
+        assert written[0]["qid"] == 1101
+        assert written[0]["run_id"] == "comment-1"
+        assert written[0]["is_trimmed"] is False
+        # An unresolvable post still gets a record, with qid None and an empty page_url.
+        assert written[1]["qid"] is None
+        assert written[1]["page_url"] == ""
+        assert written[1]["is_trimmed"] is True
+        # The comment with no research section and the one with no post_id are both skipped,
+        # and only real post_ids are ever resolved.
+        assert resolved == [101, 102, 777]
+
+    def test_rerun_deduplicates_against_the_existing_file(self, tmp_path, monkeypatch):
+        _run_main(tmp_path, monkeypatch, self._comments())
+        written, resolved = _run_main(tmp_path, monkeypatch, self._comments())
+
+        assert [r["on_post"] for r in written] == [101, 777]  # unchanged: nothing appended
+        # Dedup keys on what was WRITTEN, so only the research-bearing posts are skipped;
+        # a comment with no research section is re-resolved on every re-run.
+        assert resolved == [102]
+
+    def test_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        written, resolved = _run_main(tmp_path, monkeypatch, self._comments(), extra_argv=["--dry-run"])
+
+        assert written == []
+        assert resolved == [101, 102, 777]
+
+    def test_limit_truncates_the_comment_list(self, tmp_path, monkeypatch):
+        written, resolved = _run_main(tmp_path, monkeypatch, self._comments(), extra_argv=["--limit", 1])
+
+        assert [r["on_post"] for r in written] == [101]
+        assert resolved == [101]

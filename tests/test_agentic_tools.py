@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 from playwright.async_api import Error as _PlaywrightError
 
@@ -1050,6 +1051,108 @@ async def test_fetch_plain_refuses_an_undecodable_textual_body(monkeypatch: pyte
     assert result.status == "empty"
     assert result.escalate_rendered is True
     assert "could not decode" in result.text
+
+
+class TestFetchPlainTerminalStatuses:
+    """Behavior pins for the non-content exit paths of the plain rung.
+
+    Each branch here decides whether the ladder escalates, retries, or hands the
+    driver a refusal, and each was previously only covered transitively through
+    ``fetch``. They are pinned directly so the status/method/text triple a
+    caller keys on cannot drift.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", sorted(agentic_tools._RETRYABLE_FETCH_BLOCK_STATUSES))
+    async def test_anti_bot_status_is_blocked(self, status: int, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=status, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/gated")
+
+        assert result.status == "blocked"
+        assert result.method == "plain"
+        assert result.text == f"Fetch blocked with HTTP {status}."
+        assert result.url == "https://example.com/gated"
+
+    @pytest.mark.asyncio
+    async def test_server_error_status_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=503, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/down")
+
+        assert result.status == "error"
+        assert result.text == "Fetch failed with HTTP 503."
+
+    @pytest.mark.asyncio
+    async def test_pdf_content_type_asks_for_read_document(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/report.pdf")
+
+        assert result.status == "ok"
+        assert result.method == "document_needed"
+        assert "read_document" in result.text
+
+    @pytest.mark.asyncio
+    async def test_pdf_magic_bytes_behind_html_content_type_ask_for_read_document(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A mislabeled body is classified off its bytes, not its Content-Type."""
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"%PDF-1.7\nbinary"))
+
+        result = await agentic_tools._fetch_plain("https://example.com/mislabeled")
+
+        assert result.method == "document_needed"
+
+    @pytest.mark.asyncio
+    async def test_oversized_body_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=None))
+
+        result = await agentic_tools._fetch_plain("https://example.com/huge")
+
+        assert result.status == "error"
+        assert result.text == "Fetch body exceeded the size limit."
+
+    @pytest.mark.asyncio
+    async def test_unsupported_content_type_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/zip"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"PK\x03\x04payload"))
+
+        result = await agentic_tools._fetch_plain("https://example.com/bundle.zip")
+
+        assert result.status == "error"
+        assert result.text == "Unsupported content type: application/zip"
+        assert result.content_type == "application/zip"
+
+    @pytest.mark.asyncio
+    async def test_transport_error_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _RaisingSession(_FakeSession):
+            def get(self, url: str, *, allow_redirects: bool = False):  # type: ignore[override]
+                self.calls.append((url, allow_redirects))
+                raise aiohttp.ClientConnectorError(MagicMock(), OSError("refused"))
+
+        session = _RaisingSession(_FakeResponse(status=200))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/unreachable")
+
+        assert result.status == "error"
+        assert result.text.startswith("Fetch error: ClientConnectorError")
 
 
 @pytest.mark.asyncio

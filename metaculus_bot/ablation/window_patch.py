@@ -113,7 +113,10 @@ def patched_gap_fill_year_for_question(question: MetaculusQuestion | Any) -> Ite
 
     def _patched(*args: Any, **kwargs: Any) -> str:
         rendered = original(*args, **kwargs)
-        pattern = rf"\bno {datetime.now().year} data\b"
+        # The year must match whatever ``prompts.gap_fill_analyzer_prompt`` interpolated,
+        # which is the LOCAL current year; astimezone() makes it tz-aware without
+        # shifting the wall clock, so the pattern keeps matching.
+        pattern = rf"\bno {datetime.now().astimezone().year} data\b"
         return re.sub(pattern, f"no {replacement_year} data", rendered)
 
     prompts_module.gap_fill_analyzer_prompt = _patched

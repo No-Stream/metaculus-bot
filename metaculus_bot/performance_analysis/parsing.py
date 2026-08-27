@@ -1044,6 +1044,33 @@ _PROBABILITY_LINE_RE: re.Pattern[str] = re.compile(
 )
 
 
+def _base_model_probability(body_text: str) -> float | None:
+    """One base-model block's binary probability, strict block → prose → tolerant salvage."""
+    prob = _binary_prob_from_block(body_text)
+    if prob is None:
+        prob = _extract_last_probability_from_body(body_text)
+    if prob is None:
+        # Tolerant salvage for historical strict-invalid blocks with
+        # no prose value lines (see the salvage-rung comment above).
+        prob = _binary_prob_from_block_tolerant(body_text)
+    return prob
+
+
+def _base_model_option_probs(body_text: str) -> dict[str, float]:
+    """One base-model block's MC option probabilities; empty when none can be read."""
+    options = _mc_option_probs_from_block(body_text)
+    if options is None:
+        options = {
+            opt_match.group(1).strip(): float(opt_match.group(2)) / 100.0
+            for opt_match in _MC_OPTION_LINE_RE.finditer(body_text)
+        }
+    if not options:
+        # Tolerant salvage, e.g. blocks with concentration=0.0 that
+        # the strict validator rejects wholesale.
+        options = _mc_option_probs_from_block_tolerant(body_text) or {}
+    return options
+
+
 def parse_per_base_model_forecasts(
     comment_text: str,
     q_type: str,
@@ -1073,28 +1100,12 @@ def parse_per_base_model_forecasts(
             continue
 
         if q_type == "binary":
-            prob = _binary_prob_from_block(body_text)
-            if prob is None:
-                prob = _extract_last_probability_from_body(body_text)
-            if prob is None:
-                # Tolerant salvage for historical strict-invalid blocks with
-                # no prose value lines (see the salvage-rung comment above).
-                prob = _binary_prob_from_block_tolerant(body_text)
+            prob = _base_model_probability(body_text)
             if prob is not None:
                 result[model_name] = f"{prob * 100:.1f}%"
 
         elif q_type == "multiple_choice":
-            options = _mc_option_probs_from_block(body_text)
-            if options is None:
-                options = {}
-                for opt_match in _MC_OPTION_LINE_RE.finditer(body_text):
-                    option_name = opt_match.group(1).strip()
-                    prob_pct = float(opt_match.group(2))
-                    options[option_name] = prob_pct / 100.0
-            if not options:
-                # Tolerant salvage, e.g. blocks with concentration=0.0 that
-                # the strict validator rejects wholesale.
-                options = _mc_option_probs_from_block_tolerant(body_text) or {}
+            options = _base_model_option_probs(body_text)
             if options:
                 result[model_name] = options
 

@@ -187,6 +187,30 @@ class TestKalshiEventProjection:
         ]
 
     @pytest.mark.asyncio
+    async def test_a_ticketless_event_is_dropped_as_the_page_streams(self) -> None:
+        """The projection's one ROW-level drop, and the only branch in it nothing else guards.
+
+        The event ticker is the pool's dedup key and the settlement index's key, so a ticketless
+        event is unreferenceable downstream: it would take a Kalshi width slot and a dedup slot
+        while nothing could point at it, and `kalshi_event_match` would build it a URL-less row.
+        The sibling event is what makes this a per-row drop rather than a lost page — a projection
+        that bailed on the whole body would satisfy an assertion about the bad event alone.
+        """
+        page = {
+            "events": [
+                {"event_ticker": "", "title": "no ticker at all", "markets": [{"status": "active"}]},
+                {"event_ticker": "KEEPER", "title": "has a ticker", "markets": [{"status": "active"}]},
+            ],
+            "cursor": "",
+        }
+        session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=page)})
+
+        pull = await venues.kalshi_prefetch_events(session)
+
+        assert [event["event_ticker"] for event in pull.events] == ["KEEPER"]
+        assert (pull.token, pull.complete) == ("", True), "one unusable row is not a degraded pull"
+
+    @pytest.mark.asyncio
     async def test_a_200_carrying_a_null_events_array_is_a_lost_catalogue(self) -> None:
         """The failure this check exists for: a 200 whose body has no ``events`` array yields
         zero items exactly like an empty exchange, and caching that pins an empty index for

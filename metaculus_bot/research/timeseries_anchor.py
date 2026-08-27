@@ -148,12 +148,15 @@ def _maybe_stash_single_chart(
     use_log = bool(np.all(y > 0.0))
     band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
 
-    from metaculus_bot.research.ts_chart import (  # noqa: PLC0415  # matplotlib kept off the cold path
-        render_anchor_chart,
-    )
-
     as_of_ts = pd.Timestamp(as_of).tz_localize(None) if pd.Timestamp(as_of).tzinfo else pd.Timestamp(as_of)
     try:
+        # Import inside the guard: matplotlib is a dev-only dependency, and the bot
+        # workflows install with --no-dev, so flipping the chart flag on in prod must
+        # degrade to the text-only anchor rather than kill the provider.
+        from metaculus_bot.research.ts_chart import (  # noqa: PLC0415  # matplotlib kept off the cold path
+            render_anchor_chart,
+        )
+
         _session_charts[qid] = render_anchor_chart(
             charted,
             as_of=as_of_ts,
@@ -161,7 +164,7 @@ def _maybe_stash_single_chart(
             band=band,
             title=route.label,
         )
-    except (ValueError, RuntimeError) as exc:
+    except (ImportError, ValueError, RuntimeError) as exc:  # HARNESS-SCAN-EXEMPT-defensive-fallback
         logger.warning("ts_anchor: chart render failed for qid=%s (%s): %s", qid, type(exc).__name__, exc)
 
 
@@ -231,7 +234,7 @@ def build_anchor_section(question: NumericQuestion, as_of: datetime) -> str:
 
     if route.kind == "spread":
         return _build_spread_anchor_section(question, route, ceiling, calendar_days)
-    return _build_single_anchor_section(question, route, as_of, ceiling, calendar_days)
+    return _build_single_anchor_section(question, route, as_of, ceiling=ceiling, calendar_days=calendar_days)
 
 
 def _build_spread_anchor_section(question: NumericQuestion, route: _Route, ceiling: date, calendar_days: int) -> str:
@@ -261,7 +264,7 @@ def _build_spread_anchor_section(question: NumericQuestion, route: _Route, ceili
 
 
 def _build_single_anchor_section(
-    question: NumericQuestion, route: _Route, as_of: datetime, ceiling: date, calendar_days: int
+    question: NumericQuestion, route: _Route, as_of: datetime, *, ceiling: date, calendar_days: int
 ) -> str:
     """Fetch one series, render it, and apply both no-payload-no-section guards."""
     series = fetch_series(route.spec, ceiling, lookback_years=TS_ANCHOR_LOOKBACK_YEARS)

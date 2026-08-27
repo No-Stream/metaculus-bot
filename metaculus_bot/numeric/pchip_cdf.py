@@ -16,6 +16,10 @@ from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
 
 logger = logging.getLogger(__name__)
 
+# Headroom on the uniform-mixture weight so the blended CDF clears the min-step
+# constraint rather than landing exactly on it (mirrors ``discrete_snap``).
+_ALPHA_SAFETY_MARGIN: float = 1.1
+
 
 def _redistribute_excess_probability(cdf: np.ndarray, max_step: float) -> np.ndarray:
     """
@@ -139,10 +143,10 @@ def enforce_strict_increasing(
     new_dict = {}
 
     for p, v in sorted_items:
-        if v <= last_val:
-            v = last_val + 1e-8  # Add a tiny epsilon
-        new_dict[p] = v
-        last_val = v
+        # A tiny epsilon above the previous value when the declaration repeats or dips.
+        adjusted = last_val + 1e-8 if v <= last_val else v
+        new_dict[p] = adjusted
+        last_val = adjusted
 
     return new_dict
 
@@ -210,14 +214,313 @@ def build_cdf_value_grid(
     return lower_bound + (upper_bound - lower_bound) * ((ratio**t - 1) / (ratio - 1))
 
 
+def _validate_pchip_bounds(
+    percentile_values: dict[int | float, float],
+    lower_bound: float,
+    upper_bound: float,
+    zero_point: float | None,
+) -> None:
+    """Reject inputs the interpolation cannot be built on at all."""
+    if not percentile_values:
+        raise ValueError("Empty percentile values dictionary")
+
+    if upper_bound <= lower_bound:
+        raise ValueError(f"Upper bound ({upper_bound}) must be greater than lower bound ({lower_bound})")
+
+    if zero_point is not None and (abs(zero_point - lower_bound) < 1e-6 or abs(zero_point - upper_bound) < 1e-6):
+        raise ValueError(f"zero_point ({zero_point}) too close to bounds [{lower_bound}, {upper_bound}]")
+
+
+def _clean_percentile_values(percentile_values: dict[int | float, float]) -> dict[float, float]:
+    """Drop out-of-range percentile LABELS and reject unusable percentile VALUES.
+
+    The KEY filter is a genuine filter and must stay one: ``_postprocess_ensemble_cdf``'s
+    discrete branch deliberately passes labels of 0.0 and 100.0 (prob*100 over a 0..1
+    span) and relies on them being dropped here before the boundary points are re-added.
+    Raising on those would break every discrete question.
+
+    A bad VALUE is the opposite case and raises. Silently skipping it built a
+    12-of-13-point CDF while ``declared_percentiles`` still advertised 13 — a distribution
+    missing an anchor the model declared, with nothing recording the loss. It is
+    reachable: ``json.loads`` accepts a bare ``NaN``, and the strictly-increasing check
+    (``value <= prev``) is False for NaN, so NaN used to pass the block schema and publish.
+    Every caller already handles ValueError (``build_numeric_distribution`` falls back to
+    forecasting-tools' builder, which re-validates), and the extraction ladder's own
+    finiteness check now closes the upstream path.
+    """
+    cleaned: dict[float, float] = {}
+    for label, raw_value in percentile_values.items():
+        try:
+            label_float = float(label)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"non-numeric percentile label {label!r} in declared percentiles") from exc
+        if not (0 < label_float < 100):
+            continue  # Boundary/out-of-range labels: dropped by design (see above).
+        try:
+            value_float = float(raw_value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"non-numeric value {raw_value!r} at percentile {label_float}") from exc
+        if not np.isfinite(value_float):
+            raise ValueError(f"non-finite value {value_float} at percentile {label_float}")
+        cleaned[label_float] = value_float
+
+    if len(cleaned) < 2:
+        raise ValueError(f"Need at least 2 valid percentile points (got {len(cleaned)})")
+    return cleaned
+
+
+def _nudge_duplicate_values_apart(percentile_values: dict[float, float]) -> dict[float, float]:
+    """Offset repeated values by 1e-9 so PCHIP sees a strictly increasing x-axis."""
+    sorted_items = sorted(percentile_values.items())
+    last_value = -float("inf")
+
+    for label, value in sorted_items:
+        adjusted = last_value + 1e-9 if value <= last_value else value
+        percentile_values[label] = adjusted
+        last_value = adjusted
+
+    return percentile_values
+
+
+def _percentile_arrays_with_boundaries(
+    percentile_values: dict[float, float],
+    *,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+    lower_bound: float,
+    upper_bound: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split the declaration into (percentile fractions, values), adding closed-bound anchors."""
+    percentile_labels, declared_values = zip(*sorted(percentile_values.items()), strict=False)
+    percentiles = np.array(percentile_labels) / 100.0  # Convert to [0,1] range
+    values = np.array(declared_values)
+
+    if np.any(np.diff(values) <= 0):
+        raise ValueError("Percentile values must be strictly increasing after de-duplication")
+
+    if not open_lower_bound and lower_bound < values[0] - 1e-9:
+        percentiles = np.insert(percentiles, 0, 0.0)
+        values = np.insert(values, 0, lower_bound)
+
+    if not open_upper_bound and upper_bound > values[-1] + 1e-9:
+        percentiles = np.append(percentiles, 1.0)
+        values = np.append(values, upper_bound)
+
+    return percentiles, values
+
+
+def _evaluate_pchip_on_grid(
+    percentiles: np.ndarray,
+    values: np.ndarray,
+    *,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+    lower_bound: float,
+    upper_bound: float,
+    zero_point: float | None,
+    num_points: int,
+) -> np.ndarray:
+    """Interpolate the declaration onto the submission grid and pin closed bounds."""
+    # Log scaling is appropriate when all values are positive and the lower bound is too.
+    use_log = np.all(values > 0) and zero_point is None and lower_bound > 0
+    x_vals = np.log(values) if use_log else values
+
+    try:
+        spline = PchipInterpolator(x_vals, percentiles, extrapolate=True)
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # intentional: logged fallback to linear interp
+        logger.warning("PchipInterpolator failed, falling back to linear interpolation", exc_info=True)
+
+        def spline(x):
+            return np.interp(x, x_vals, percentiles)
+
+    # Generate the grid (linear, or geometric when zero_point is set) and evaluate,
+    # clamping the evaluation points to avoid extrapolation issues.
+    cdf_x = build_cdf_value_grid(lower_bound, upper_bound, zero_point, num_points)
+    eval_x = np.log(cdf_x) if use_log else cdf_x
+    eval_x_clamped = np.clip(eval_x, x_vals[0], x_vals[-1])
+
+    cdf_y = spline(eval_x_clamped).clip(0.0, 1.0)
+    cdf_y = np.maximum.accumulate(cdf_y)
+
+    if not open_lower_bound:
+        cdf_y[0] = 0.0
+    if not open_upper_bound:
+        cdf_y[-1] = 1.0
+
+    return cdf_y
+
+
+def _blend_with_uniform(cdf_y: np.ndarray, min_step: float, num_points: int) -> np.ndarray:
+    """Mix in just enough of a uniform CDF to pre-satisfy the min-step constraint.
+
+    This is the mechanism that keeps every downstream repair tier off real forecasts
+    (same approach as ``discrete_snap``); the tiers below it are pathological-input
+    guards, not routine passes.
+    """
+    total_range = float(cdf_y[-1] - cdf_y[0])
+    min_alpha = min_step * num_points / total_range * _ALPHA_SAFETY_MARGIN if total_range > 1e-12 else 1.0
+    alpha = min(1.0, min_alpha)
+    uniform_cdf = np.linspace(float(cdf_y[0]), float(cdf_y[-1]), num_points)
+    return (1.0 - alpha) * cdf_y + alpha * uniform_cdf
+
+
+def _ramp_tail_to_one(cdf_y: np.ndarray, overflow_idx: int) -> None:
+    """Replace the saturated tail with a uniform ramp up to 1.0, in place."""
+    steps_remaining = len(cdf_y) - overflow_idx
+    for i in range(overflow_idx, len(cdf_y)):
+        t = (i - overflow_idx) / max(1, steps_remaining - 1)
+        cdf_y[i] = min(1.0, cdf_y[overflow_idx - 1] + (1.0 - cdf_y[overflow_idx - 1]) * t)
+
+
+def _pull_earlier_points_down(cdf_y: np.ndarray, from_idx: int, floor_idx: int, min_step: float) -> None:
+    """Walk backwards from ``from_idx`` making room for ``min_step`` above each point."""
+    for j in range(from_idx - 1, floor_idx - 1, -1):
+        max_allowed = cdf_y[j + 1] - min_step
+        if cdf_y[j] > max_allowed:
+            cdf_y[j] = max_allowed
+
+
+def _reenforce_min_steps_from(cdf_y: np.ndarray, start_idx: int, min_step: float) -> None:
+    """Lift each point after ``start_idx`` to ``prev + min_step``, back-filling on overflow."""
+    for i in range(start_idx + 1, len(cdf_y)):
+        if cdf_y[i] >= cdf_y[i - 1] + min_step:
+            continue
+        cdf_y[i] = cdf_y[i - 1] + min_step
+        if cdf_y[i] <= 1.0:
+            continue
+        cdf_y[i] = 1.0
+        _pull_earlier_points_down(cdf_y, i, start_idx, min_step)
+
+
+def _redistribute_saturated_tail(cdf_y: np.ndarray, min_step: float) -> None:
+    """Legacy panchul redistribution for a CDF that overshot 1.0 before the grid end.
+
+    Kept as its own pass because the ramp shape is specific to the PCHIP path.
+    ``enforce_min_steps``' ``upper_cap=1.0`` already caps the forward sweep, so on the
+    current pipeline this is a no-op guard rather than a live repair tier.
+    """
+    if cdf_y[-1] <= 1.0:
+        return
+
+    overflow_indices = np.where(cdf_y > 1.0)[0]
+    if len(overflow_indices) == 0:
+        return
+
+    overflow_idx = int(overflow_indices[0])
+    _ramp_tail_to_one(cdf_y, overflow_idx)
+    _reenforce_min_steps_from(cdf_y, overflow_idx, min_step)
+
+
+def _rebuild_with_min_steps(
+    cdf_y: np.ndarray,
+    min_step: float,
+    *,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+    question_id: int | str | None,
+    question_url: str | None,
+) -> np.ndarray:
+    """Last repair tier: rebuild the CDF from its own step SHAPE with min-step floors.
+
+    Fires only when the min-step is still violated after ``safe_cdf_bounds``. AGENTS.md
+    records zero fires across 1182 archived numeric forecasts — on the production
+    201-point grid ``_blend_with_uniform`` gets there first. It stays reachable on a
+    coarse grid whose available range is exactly saturated by the min-step.
+
+    Raises:
+        ValueError: the CDF range cannot hold one ``min_step`` per bin.
+        RuntimeError: the rebuild itself failed to satisfy the min-step.
+    """
+    steps = np.diff(cdf_y)
+    violated_steps = np.sum(steps < min_step)
+    logger.warning(
+        "PCHIP minimum step enforcement required for Q %s | URL %s | violated_steps=%d/%d (%.1f%%) | min_step_found=%.8f | min_step_required=%.8f | available_range=%.6f | required_range=%.6f",
+        question_id or "N/A",
+        question_url or "N/A",
+        violated_steps,
+        len(steps),
+        100.0 * violated_steps / len(steps),
+        np.min(steps),
+        min_step,
+        cdf_y[-1] - cdf_y[0],
+        (len(cdf_y) - 1) * min_step,
+    )
+
+    # Create a strictly monotonic sequence over the legal endpoint range.
+    start_val = cdf_y[0] if open_lower_bound else 0.0
+    end_val = min(cdf_y[-1], 1.0) if open_upper_bound else 1.0
+
+    available_range = end_val - start_val
+    required_range = (len(cdf_y) - 1) * min_step
+
+    if required_range > available_range:
+        raise ValueError(
+            f"Cannot satisfy minimum step requirement: need {required_range:.6f} "
+            f"but only have {available_range:.6f} available in CDF range"
+        )
+
+    new_cdf = np.zeros_like(cdf_y)
+    new_cdf[0] = start_val
+
+    if len(cdf_y) > 2:
+        # Keep the original shape but floor every step, then hand out what is left over.
+        orig_shape = np.diff(cdf_y)
+        orig_shape = np.maximum(orig_shape, min_step)
+        orig_shape = orig_shape / np.sum(orig_shape)
+
+        extra_steps = (available_range - required_range) * orig_shape
+        for i in range(1, len(new_cdf)):
+            new_cdf[i] = new_cdf[i - 1] + min_step + extra_steps[i - 1]
+    else:
+        # Simple linear spacing if original shape is unavailable
+        for i in range(1, len(new_cdf)):
+            new_cdf[i] = new_cdf[i - 1] + (available_range / (len(new_cdf) - 1))
+
+    if np.any(np.diff(new_cdf) < min_step - 1e-10):
+        raise RuntimeError("Internal error: Step size enforcement failed")
+
+    new_steps = np.diff(new_cdf)
+    logger.info(
+        "PCHIP aggressive enforcement completed for Q %s | URL %s | new_min_step=%.8f | new_max_step=%.8f | total_range_redistributed=%.6f | shape_preserved=True",
+        question_id or "N/A",
+        question_url or "N/A",
+        np.min(new_steps),
+        np.max(new_steps),
+        available_range,
+    )
+    return new_cdf
+
+
+def _assert_pchip_constraints(
+    cdf_y: np.ndarray,
+    min_step: float,
+    *,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+) -> None:
+    """Fail loudly rather than submit a CDF the Metaculus validators would reject."""
+    if np.any(np.diff(cdf_y) < min_step - 1e-10):
+        problematic_indices = np.where(np.diff(cdf_y) < min_step - 1e-10)[0]
+        raise RuntimeError(
+            f"Failed to enforce minimum step size at indices: {problematic_indices}, "
+            f"values: {np.diff(cdf_y)[problematic_indices]}"
+        )
+
+    if not open_lower_bound and abs(cdf_y[0]) > 1e-10:
+        raise RuntimeError(f"Failed to enforce lower bound: {cdf_y[0]}")
+
+    if not open_upper_bound and abs(cdf_y[-1] - 1.0) > 1e-10:
+        raise RuntimeError(f"Failed to enforce upper bound: {cdf_y[-1]}")
+
+
 def generate_pchip_cdf(
     percentile_values: dict[int | float, float],
+    *,
     open_upper_bound: bool,
     open_lower_bound: bool,
     upper_bound: float,
     lower_bound: float,
     zero_point: float | None = None,
-    *,
     min_step: float = 5.0e-5,
     max_step: float = NUM_MAX_STEP,
     num_points: int = 201,
@@ -243,255 +546,52 @@ def generate_pchip_cdf(
         ValueError: If input validation fails
         RuntimeError: If constraint enforcement fails
     """
-    # Validate inputs
-    if not percentile_values:
-        raise ValueError("Empty percentile values dictionary")
+    _validate_pchip_bounds(percentile_values, lower_bound, upper_bound, zero_point)
+    cleaned = _nudge_duplicate_values_apart(_clean_percentile_values(percentile_values))
 
-    if upper_bound <= lower_bound:
-        raise ValueError(f"Upper bound ({upper_bound}) must be greater than lower bound ({lower_bound})")
+    percentiles, values = _percentile_arrays_with_boundaries(
+        cleaned,
+        open_lower_bound=open_lower_bound,
+        open_upper_bound=open_upper_bound,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+    )
 
-    if zero_point is not None and (abs(zero_point - lower_bound) < 1e-6 or abs(zero_point - upper_bound) < 1e-6):
-        raise ValueError(f"zero_point ({zero_point}) too close to bounds [{lower_bound}, {upper_bound}]")
+    cdf_y = _evaluate_pchip_on_grid(
+        percentiles,
+        values,
+        open_lower_bound=open_lower_bound,
+        open_upper_bound=open_upper_bound,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        zero_point=zero_point,
+        num_points=num_points,
+    )
 
-    # Clean and validate percentile values.
-    #
-    # The KEY filter is a genuine filter and must stay one: `_postprocess_ensemble_cdf`'s
-    # discrete branch deliberately passes labels of 0.0 and 100.0 (prob*100 over a 0..1
-    # span) and relies on them being dropped here before the boundary points are re-added.
-    # Raising on those would break every discrete question.
-    #
-    # A bad VALUE is the opposite case and now raises. Silently skipping it built a
-    # 12-of-13-point CDF while `declared_percentiles` still advertised 13 — a distribution
-    # missing an anchor the model declared, with nothing recording the loss. It is
-    # reachable: `json.loads` accepts a bare `NaN`, and the strictly-increasing check
-    # (`value <= prev`) is False for NaN, so NaN used to pass the block schema and publish.
-    # Every caller already handles ValueError (`build_numeric_distribution` falls back to
-    # forecasting-tools' builder, which re-validates), and the extraction ladder's own
-    # finiteness check now closes the upstream path.
-    pv = {}
-    for k, v in percentile_values.items():
-        try:
-            k_float = float(k)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"non-numeric percentile label {k!r} in declared percentiles") from exc
-        if not (0 < k_float < 100):
-            continue  # Boundary/out-of-range labels: dropped by design (see above).
-        try:
-            v_float = float(v)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"non-numeric value {v!r} at percentile {k_float}") from exc
-        if not np.isfinite(v_float):
-            raise ValueError(f"non-finite value {v_float} at percentile {k_float}")
-        pv[k_float] = v_float
-
-    if len(pv) < 2:
-        raise ValueError(f"Need at least 2 valid percentile points (got {len(pv)})")
-
-    # Handle duplicate values by adding small offsets
-    # First, sort all items to process in order
-    sorted_items = sorted(pv.items())
-    last_value = -float("inf")
-
-    for k, v in sorted_items:
-        if v <= last_value:
-            # Add a small epsilon to ensure strictly increasing
-            v = last_value + 1e-9
-        pv[k] = v
-        last_value = v
-
-    # Create arrays of percentiles and values
-    percentiles, values = zip(*sorted(pv.items()), strict=False)
-    percentiles = np.array(percentiles) / 100.0  # Convert to [0,1] range
-    values = np.array(values)
-
-    # Check if values are strictly increasing after de-duplication
-    if np.any(np.diff(values) <= 0):
-        raise ValueError("Percentile values must be strictly increasing after de-duplication")
-
-    # Add boundary points if needed
-    if not open_lower_bound and lower_bound < values[0] - 1e-9:
-        percentiles = np.insert(percentiles, 0, 0.0)
-        values = np.insert(values, 0, lower_bound)
-
-    if not open_upper_bound and upper_bound > values[-1] + 1e-9:
-        percentiles = np.append(percentiles, 1.0)
-        values = np.append(values, upper_bound)
-
-    # Determine if log scaling is appropriate (all values positive and lower bound > 0)
-    use_log = np.all(values > 0) and zero_point is None and lower_bound > 0
-    x_vals = np.log(values) if use_log else values
-
-    # Create interpolator with fallback
-    try:
-        spline = PchipInterpolator(x_vals, percentiles, extrapolate=True)
-    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # intentional: logged fallback to linear interp
-        logger.warning("PchipInterpolator failed, falling back to linear interpolation", exc_info=True)
-
-        def spline(x):
-            return np.interp(x, x_vals, percentiles)
-
-    # Generate the grid (linear, or geometric when zero_point is set) and evaluate.
-    cdf_x = build_cdf_value_grid(lower_bound, upper_bound, zero_point, num_points)
-
-    # Handle log transformation for evaluation
-    eval_x = np.log(cdf_x) if use_log else cdf_x
-
-    # Clamp values to avoid extrapolation issues
-    eval_x_clamped = np.clip(eval_x, x_vals[0], x_vals[-1])
-
-    # Generate initial CDF values and clamp to [0,1]
-    cdf_y = spline(eval_x_clamped).clip(0.0, 1.0)
-
-    # Ensure monotonicity (non-decreasing)
-    cdf_y = np.maximum.accumulate(cdf_y)
-
-    # Set boundary values if bounds are closed
-    if not open_lower_bound:
-        cdf_y[0] = 0.0
-    if not open_upper_bound:
-        cdf_y[-1] = 1.0
-
-    # Uniform mixture for min-step compliance (same approach as discrete_snap.py)
-    _ALPHA_SAFETY_MARGIN = 1.1
-    total_range = float(cdf_y[-1] - cdf_y[0])
-    min_alpha = min_step * num_points / total_range * _ALPHA_SAFETY_MARGIN if total_range > 1e-12 else 1.0
-    alpha = min(1.0, min_alpha)
-    uniform_cdf = np.linspace(float(cdf_y[0]), float(cdf_y[-1]), num_points)
-    cdf_y = (1.0 - alpha) * cdf_y + alpha * uniform_cdf
-
-    # First pass: enforce min-step via the shared module-level helper.
+    # Repair ladder, cheapest first: uniform pre-mix, min-step sweep, saturated-tail
+    # ramp, then boundary + max-step enforcement.
+    cdf_y = _blend_with_uniform(cdf_y, min_step, num_points)
     cdf_y = enforce_min_steps(cdf_y, min_step, upper_cap=1.0, lower_cap=0.0)
-
-    # Second pass (legacy panchul redistribution): if the CDF saturated to 1.0
-    # before the grid endpoint, ramp the remaining points uniformly back up to
-    # 1.0 then re-enforce min-step with a back-fill on overflow. Kept inline
-    # because the shape of the redistribution is specific to the PCHIP path.
-    if cdf_y[-1] > 1.0:
-        overflow_idx_arr = np.where(cdf_y > 1.0)[0]
-        if len(overflow_idx_arr) > 0:
-            overflow_idx = overflow_idx_arr[0]
-            steps_remaining = len(cdf_y) - overflow_idx
-
-            for i in range(overflow_idx, len(cdf_y)):
-                t = (i - overflow_idx) / max(1, steps_remaining - 1)
-                cdf_y[i] = min(
-                    1.0,
-                    cdf_y[overflow_idx - 1] + (1.0 - cdf_y[overflow_idx - 1]) * t,
-                )
-
-            for i in range(overflow_idx, len(cdf_y)):
-                if i > overflow_idx and cdf_y[i] < cdf_y[i - 1] + min_step:
-                    cdf_y[i] = cdf_y[i - 1] + min_step
-                    if cdf_y[i] > 1.0:
-                        cdf_y[i] = 1.0
-                        for j in range(i - 1, overflow_idx - 1, -1):
-                            max_allowed = cdf_y[j + 1] - min_step
-                            if cdf_y[j] > max_allowed:
-                                cdf_y[j] = max_allowed
-
-    # Apply boundary constraints and max jump rules (grid-scaled on discrete grids)
+    _redistribute_saturated_tail(cdf_y, min_step)
     cdf_y = safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound, min_step=min_step, max_step=max_step)
 
-    # Check if we have enough room for minimum steps
-    required_range = (len(cdf_y) - 1) * min_step
-    available_range = cdf_y[-1] - cdf_y[0]
-
-    # Double-check minimum step size requirement
-    steps = np.diff(cdf_y)
-    aggressive_enforcement_used = False
-    if np.any(steps < min_step):
-        aggressive_enforcement_used = True
-        # Log detailed context before aggressive enforcement
-        violated_steps = np.sum(steps < min_step)
-        min_violated_step = np.min(steps)
-        violation_percentage = 100.0 * violated_steps / len(steps)
-
-        logger.warning(
-            "PCHIP minimum step enforcement required for Q %s | URL %s | violated_steps=%d/%d (%.1f%%) | min_step_found=%.8f | min_step_required=%.8f | available_range=%.6f | required_range=%.6f",
-            question_id or "N/A",
-            question_url or "N/A",
-            violated_steps,
-            len(steps),
-            violation_percentage,
-            min_violated_step,
+    aggressive_enforcement_used = bool(np.any(np.diff(cdf_y) < min_step))
+    if aggressive_enforcement_used:
+        cdf_y = _rebuild_with_min_steps(
+            cdf_y,
             min_step,
-            available_range,
-            required_range,
+            open_lower_bound=open_lower_bound,
+            open_upper_bound=open_upper_bound,
+            question_id=question_id,
+            question_url=question_url,
         )
 
-        # Create a strictly monotonic sequence
-        start_val = 0.0 if not open_lower_bound else cdf_y[0]
-        end_val = 1.0 if not open_upper_bound else min(cdf_y[-1], 1.0)
-
-        available_range = end_val - start_val
-        # Ensure we have enough room for all steps
-        required_range = (len(cdf_y) - 1) * min_step
-
-        if required_range > available_range:
-            # We don't have enough room for minimum steps
-            raise ValueError(
-                f"Cannot satisfy minimum step requirement: need {required_range:.6f} "
-                f"but only have {available_range:.6f} available in CDF range"
-            )
-
-        # Create a new CDF with exactly min_step between points where needed
-        # and distribute remaining range proportionally
-        new_cdf = np.zeros_like(cdf_y)
-        new_cdf[0] = start_val
-
-        # Get the shape from original CDF but enforce minimum steps
-        if len(cdf_y) > 2:
-            # Calculate normalized shape from original CDF
-            orig_shape = np.diff(cdf_y)
-            orig_shape = np.maximum(orig_shape, min_step)  # Enforce minimum
-            orig_shape = orig_shape / np.sum(orig_shape)  # Normalize
-
-            # Allocate the available range according to shape but ensure minimum steps
-            remaining = available_range - (len(cdf_y) - 1) * min_step
-            extra_steps = remaining * orig_shape
-
-            for i in range(1, len(new_cdf)):
-                new_cdf[i] = new_cdf[i - 1] + min_step + extra_steps[i - 1]
-        else:
-            # Simple linear spacing if original shape is unavailable
-            for i in range(1, len(new_cdf)):
-                new_cdf[i] = new_cdf[i - 1] + (available_range / (len(new_cdf) - 1))
-
-        # Final validation
-        if np.any(np.diff(new_cdf) < min_step - 1e-10):
-            raise RuntimeError("Internal error: Step size enforcement failed")
-
-        cdf_y = new_cdf
-
-        # Log successful aggressive enforcement
-        new_steps = np.diff(cdf_y)
-        new_min_step = np.min(new_steps)
-        new_max_step = np.max(new_steps)
-        total_range_redistributed = available_range
-
-        logger.info(
-            "PCHIP aggressive enforcement completed for Q %s | URL %s | new_min_step=%.8f | new_max_step=%.8f | total_range_redistributed=%.6f | shape_preserved=True",
-            question_id or "N/A",
-            question_url or "N/A",
-            new_min_step,
-            new_max_step,
-            total_range_redistributed,
-        )
-
-    # Final checks
-    if np.any(np.diff(cdf_y) < min_step - 1e-10):
-        problematic_indices = np.where(np.diff(cdf_y) < min_step - 1e-10)[0]
-        error_msg = (
-            f"Failed to enforce minimum step size at indices: {problematic_indices}, "
-            f"values: {np.diff(cdf_y)[problematic_indices]}"
-        )
-        raise RuntimeError(error_msg)
-
-    if not open_lower_bound and abs(cdf_y[0]) > 1e-10:
-        raise RuntimeError(f"Failed to enforce lower bound: {cdf_y[0]}")
-
-    if not open_upper_bound and abs(cdf_y[-1] - 1.0) > 1e-10:
-        raise RuntimeError(f"Failed to enforce upper bound: {cdf_y[-1]}")
+    _assert_pchip_constraints(
+        cdf_y,
+        min_step,
+        open_lower_bound=open_lower_bound,
+        open_upper_bound=open_upper_bound,
+    )
 
     return cdf_y.tolist(), aggressive_enforcement_used
 

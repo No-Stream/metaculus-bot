@@ -1092,7 +1092,7 @@ async def test_run_one_forecaster_removes_notepad_after_make_prediction_raises(
         patch("metaculus_bot.ablation.forecasters._build_bot", return_value=bot),
         patch.object(TemplateForecaster, "_run_forecast_on_binary", new=boom),
     ):
-        _slug, payload = await _run_one_forecaster(q, "research", one_llm, parser_llm, cache, semaphore=semaphore)
+        _slug, payload = await _run_one_forecaster(q, "research", one_llm, parser_llm, cache=cache, semaphore=semaphore)
 
     # The forecast raised, so prediction_value is None and errors is populated.
     assert payload["prediction_value"] is None
@@ -1172,7 +1172,7 @@ async def test_run_one_forecaster_retries_on_rate_limit_then_succeeds(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )
@@ -1210,7 +1210,7 @@ async def test_run_one_forecaster_honors_retry_after_seconds(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )
@@ -1248,7 +1248,7 @@ async def test_run_one_forecaster_falls_back_to_exponential_when_retry_after_mis
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )
@@ -1286,7 +1286,7 @@ async def test_run_one_forecaster_exhausts_retries_records_errors_no_raise(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )
@@ -1323,7 +1323,7 @@ async def test_run_one_forecaster_non_rate_limit_error_not_retried(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )
@@ -1479,7 +1479,7 @@ async def test_run_one_forecaster_enforces_soft_deadline_timeout(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=0,
         )
@@ -1520,7 +1520,7 @@ async def test_run_one_forecaster_soft_deadline_does_not_retry_after_timeout(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )
@@ -1624,7 +1624,7 @@ async def test_max_sleep_cap_honors_retry_after_90s(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )
@@ -1667,7 +1667,7 @@ async def test_max_sleep_cap_bounds_runaway_retry_after(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )
@@ -1715,7 +1715,7 @@ async def test_retry_log_includes_provider_name_and_attempt(
             "research blob",
             one_llm,
             parser_llm,
-            cache,
+            cache=cache,
             semaphore=semaphore,
             max_retries=3,
         )

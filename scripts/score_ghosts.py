@@ -40,6 +40,7 @@ import json
 import logging
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 
@@ -233,6 +234,86 @@ def _score_mc(ghost: dict, record: dict) -> dict | None:
     }
 
 
+def _paired_numeric_scores(
+    percentiles: dict[float, float],
+    published_cdf: list[float],
+    score_inputs: tuple[float, float, float, float | None],
+    *,
+    open_lower: bool,
+    open_upper: bool,
+) -> dict:
+    """Rebuild the ghost CDF on the published grid, then log-score both sides.
+
+    Returns the scored fields WITHOUT ``qid`` (the caller stamps it), or a
+    ``scoreable: False`` stub naming which of the two steps failed.
+    """
+    # Lazy imports: the PCHIP builder pulls numpy/scipy. Keep the n=0 path
+    # dependency-light — numeric scoring only runs once real records join.
+    from metaculus_bot.numeric.config import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: pair the grid-step rule with the CDF builder it feeds
+        grid_step_constraints,
+    )
+    from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the n=0 path free of numpy/scipy
+        generate_pchip_cdf,
+    )
+
+    res_float, lower, upper, zero_point = score_inputs
+
+    # generate_pchip_cdf expects percentile keys in (0, 100); ghosts carry fraction
+    # keys in [0, 1]. Match the ghost grid to the published grid length so both score
+    # with identical PMF bucketing; grid_step_constraints scales BOTH the min and max
+    # per-bin step to that length, so on a native-discrete grid (num_points < 201) the
+    # ghost isn't clipped by the 201-grid 0.2 max-step while the (prod-built) published
+    # side stays uncapped — that asymmetry biases the paired score against the ghost.
+    pct_values = {frac * 100.0: value for frac, value in percentiles.items()}
+    num_points = len(published_cdf)
+    min_step, max_step = grid_step_constraints(num_points)
+    try:
+        ghost_cdf, _ = generate_pchip_cdf(
+            pct_values,
+            open_upper_bound=open_upper,
+            open_lower_bound=open_lower,
+            upper_bound=upper,
+            lower_bound=lower,
+            zero_point=zero_point,
+            min_step=min_step,
+            max_step=max_step,
+            num_points=num_points,
+        )
+    except (ValueError, RuntimeError):
+        return {"scoreable": False, "reason": "cdf_build_failed"}
+
+    try:
+        ghost_ls = numeric_log_score(
+            ghost_cdf,
+            res_float,
+            lower,
+            upper,
+            open_lower_bound=open_lower,
+            open_upper_bound=open_upper,
+            zero_point=zero_point,
+        )
+        published_ls = numeric_log_score(
+            published_cdf,
+            res_float,
+            lower,
+            upper,
+            open_lower_bound=open_lower,
+            open_upper_bound=open_upper,
+            zero_point=zero_point,
+        )
+    except (ValueError, ZeroDivisionError):
+        return {"scoreable": False, "reason": "score_failed"}
+
+    return {
+        "scoreable": True,
+        "reason": None,
+        "resolution": res_float,
+        "ghost_log_score": ghost_ls,
+        "published_log_score": published_ls,
+        "delta": ghost_ls - published_ls,
+    }
+
+
 def _score_numeric(ghost: dict, record: dict) -> dict:
     """Attempt a paired numeric log-score (ghost vs published).
 
@@ -274,15 +355,9 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
     if not published_cdf or len(published_cdf) < 2:
         return {"qid": qid, "scoreable": False, "reason": "no_published_cdf"}
 
-    # Lazy imports: the PCHIP builder pulls numpy/scipy and the collector helper drags
-    # the collector's heavy import chain (requests, env loading). Keep the n=0 path
-    # dependency-light — numeric scoring only runs once real records join.
-    from metaculus_bot.numeric.config import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: pair the grid-step rule with the CDF builder it feeds
-        grid_step_constraints,
-    )
-    from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the n=0 path free of numpy/scipy
-        generate_pchip_cdf,
-    )
+    # Lazy import: the collector helper drags the collector's heavy import chain
+    # (requests, env loading). Keep the n=0 path dependency-light — numeric scoring only
+    # runs once real records join.
     from metaculus_bot.performance_analysis.collector import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the pure scoring core decoupled from the collector's import chain
         resolve_numeric_record_to_score_inputs,
     )
@@ -290,51 +365,15 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
     score_inputs = resolve_numeric_record_to_score_inputs(record)
     if score_inputs is None:
         return {"qid": qid, "scoreable": False, "reason": "no_score_inputs"}
-    res_float, lower, upper, zero_point = score_inputs
-    open_lower = bool(record.get("open_lower_bound", False))
-    open_upper = bool(record.get("open_upper_bound", False))
 
-    # generate_pchip_cdf expects percentile keys in (0, 100); ghosts carry fraction
-    # keys in [0, 1]. Match the ghost grid to the published grid length so both score
-    # with identical PMF bucketing; grid_step_constraints scales BOTH the min and max
-    # per-bin step to that length, so on a native-discrete grid (num_points < 201) the
-    # ghost isn't clipped by the 201-grid 0.2 max-step while the (prod-built) published
-    # side stays uncapped — that asymmetry biases the paired score against the ghost.
-    pct_values = {frac * 100.0: value for frac, value in percentiles.items()}
-    num_points = len(published_cdf)
-    min_step, max_step = grid_step_constraints(num_points)
-    try:
-        ghost_cdf, _ = generate_pchip_cdf(
-            pct_values,
-            open_upper,
-            open_lower,
-            upper,
-            lower,
-            zero_point,
-            min_step=min_step,
-            max_step=max_step,
-            num_points=num_points,
-        )
-    except (ValueError, RuntimeError):
-        return {"qid": qid, "scoreable": False, "reason": "cdf_build_failed"}
-
-    try:
-        ghost_ls = numeric_log_score(ghost_cdf, res_float, lower, upper, open_lower, open_upper, zero_point)
-        published_ls = numeric_log_score(
-            list(published_cdf), res_float, lower, upper, open_lower, open_upper, zero_point
-        )
-    except (ValueError, ZeroDivisionError):
-        return {"qid": qid, "scoreable": False, "reason": "score_failed"}
-
-    return {
-        "qid": qid,
-        "scoreable": True,
-        "reason": None,
-        "resolution": res_float,
-        "ghost_log_score": ghost_ls,
-        "published_log_score": published_ls,
-        "delta": ghost_ls - published_ls,
-    }
+    outcome = _paired_numeric_scores(
+        percentiles,
+        list(published_cdf),
+        score_inputs,
+        open_lower=bool(record.get("open_lower_bound", False)),
+        open_upper=bool(record.get("open_upper_bound", False)),
+    )
+    return {"qid": qid, **outcome}
 
 
 def _summarize_rows(rows: list[dict]) -> dict:
@@ -372,6 +411,78 @@ def _split_bucket(pre_identical: bool | None) -> str:
     return "pre_identical" if pre_identical else "loop_moved"
 
 
+def _pre_ghosts_by_qid(pre_ghosts: list[dict] | None) -> dict[int, dict]:
+    """Latest ``GHOST_PRE_JSON`` per qid, normalized to payloads the split can compare.
+
+    Same post-id space as the concluding ghosts — both markers carry the same log_prefix
+    ref. A malformed pre-marker is dropped, leaving that qid with nothing to compare.
+    """
+    pre_by_qid: dict[int, dict] = {}
+    for qid, record in _latest_ghost_per_qid(pre_ghosts or []).items():
+        normalized = _normalize_json_ghost(record)
+        if normalized is not None:
+            pre_by_qid[qid] = normalized
+    return pre_by_qid
+
+
+def _count_sources(selected: dict[int, dict]) -> dict[str, int]:
+    """How many of the ghosts to score came from each marker source."""
+    source_counts: dict[str, int] = {"json": 0, "legacy": 0}
+    for ghost in selected.values():
+        source_counts[ghost["source"]] = source_counts.get(ghost["source"], 0) + 1
+    return source_counts
+
+
+@dataclass
+class _GhostScoreTally:
+    """Per-type row buckets plus the pre-identity split, filled one ghost/record pair at a time.
+
+    Every scored row is appended to BOTH its question-type bucket and its pre-identity
+    bucket — the same dict object in each, so ``split_by_pre_identity`` partitions exactly
+    the rows the per-type blocks report.
+    """
+
+    pre_by_qid: dict[int, dict]
+    binary_rows: list[dict] = field(default_factory=list)
+    mc_rows: list[dict] = field(default_factory=list)
+    numeric_rows: list[dict] = field(default_factory=list)
+    numeric_joined: int = 0
+    numeric_unscoreable: dict[str, int] = field(default_factory=dict)
+    split_rows: dict[str, list[dict]] = field(
+        default_factory=lambda: {"pre_identical": [], "loop_moved": [], "no_pre_marker": []}
+    )
+
+    def add(self, ghost: dict, record: dict) -> None:
+        """Score one joined ghost/record pair into the buckets its question type feeds."""
+        qtype = ghost.get("qtype")
+        if qtype == "binary":
+            self._add_row(self.binary_rows, ghost, _score_binary(ghost, record))
+        elif qtype == "multiple_choice":
+            self._add_row(self.mc_rows, ghost, _score_mc(ghost, record))
+        elif qtype == "numeric":
+            self._add_numeric(ghost, record)
+
+    def _add_row(self, bucket: list[dict], ghost: dict, row: dict | None) -> None:
+        if row is None:
+            return
+        bucket.append(row)
+        row["pre_identical"] = _pre_identity(ghost, self.pre_by_qid)
+        self.split_rows[_split_bucket(row["pre_identical"])].append(row)
+
+    def _add_numeric(self, ghost: dict, record: dict) -> None:
+        self.numeric_joined += 1
+        outcome = _score_numeric(ghost, record)
+        if outcome["scoreable"]:
+            self._add_row(self.numeric_rows, ghost, outcome)
+        else:
+            reason = outcome["reason"]
+            self.numeric_unscoreable[reason] = self.numeric_unscoreable.get(reason, 0) + 1
+
+    @property
+    def n_scored(self) -> int:
+        return len(self.binary_rows) + len(self.mc_rows) + len(self.numeric_rows)
+
+
 def join_and_score(
     json_ghosts: list[dict],
     legacy_ghosts: list[dict],
@@ -397,68 +508,28 @@ def join_and_score(
     """
     records_by_post_id = {r.get("post_id"): r for r in records}
     selected = _select_ghost_per_qid(json_ghosts, legacy_ghosts)
-    # Latest GHOST_PRE_JSON per qid (same post-id space as the concluding ghosts —
-    # both markers carry the same log_prefix ref), normalized to comparable payloads.
-    pre_by_qid: dict[int, dict] = {}
-    for qid, record in _latest_ghost_per_qid(pre_ghosts or []).items():
-        normalized = _normalize_json_ghost(record)
-        if normalized is not None:
-            pre_by_qid[qid] = normalized
+    tally = _GhostScoreTally(pre_by_qid=_pre_ghosts_by_qid(pre_ghosts))
 
-    source_counts: dict[str, int] = {"json": 0, "legacy": 0}
-    for ghost in selected.values():
-        source_counts[ghost["source"]] = source_counts.get(ghost["source"], 0) + 1
-
-    binary_rows: list[dict] = []
-    mc_rows: list[dict] = []
-    numeric_rows: list[dict] = []
-    numeric_unscoreable: dict[str, int] = {}
-    numeric_joined = 0
     n_joined = 0
-    split_rows: dict[str, list[dict]] = {"pre_identical": [], "loop_moved": [], "no_pre_marker": []}
-
-    def _record_scored_row(ghost: dict, row: dict) -> None:
-        row["pre_identical"] = _pre_identity(ghost, pre_by_qid)
-        split_rows[_split_bucket(row["pre_identical"])].append(row)
-
     for qid, ghost in selected.items():
         record = records_by_post_id.get(qid)
         if record is None:
             continue
         n_joined += 1
-        qtype = ghost.get("qtype")
-        if qtype == "binary":
-            row = _score_binary(ghost, record)
-            if row is not None:
-                binary_rows.append(row)
-                _record_scored_row(ghost, row)
-        elif qtype == "multiple_choice":
-            row = _score_mc(ghost, record)
-            if row is not None:
-                mc_rows.append(row)
-                _record_scored_row(ghost, row)
-        elif qtype == "numeric":
-            numeric_joined += 1
-            outcome = _score_numeric(ghost, record)
-            if outcome["scoreable"]:
-                numeric_rows.append(outcome)
-                _record_scored_row(ghost, outcome)
-            else:
-                reason = outcome["reason"]
-                numeric_unscoreable[reason] = numeric_unscoreable.get(reason, 0) + 1
+        tally.add(ghost, record)
 
     return {
         "n_ghosts": len(selected),
         "n_joined": n_joined,
-        "n_scored": len(binary_rows) + len(mc_rows) + len(numeric_rows),
-        "source_counts": source_counts,
-        "binary": _summarize_rows(binary_rows),
-        "multiple_choice": _summarize_rows(mc_rows),
+        "n_scored": tally.n_scored,
+        "source_counts": _count_sources(selected),
+        "binary": _summarize_rows(tally.binary_rows),
+        "multiple_choice": _summarize_rows(tally.mc_rows),
         "numeric": {
-            **_summarize_rows(numeric_rows),
-            "n_joined": numeric_joined,
-            "n_unscoreable": sum(numeric_unscoreable.values()),
-            "unscoreable_reasons": numeric_unscoreable,
+            **_summarize_rows(tally.numeric_rows),
+            "n_joined": tally.numeric_joined,
+            "n_unscoreable": sum(tally.numeric_unscoreable.values()),
+            "unscoreable_reasons": tally.numeric_unscoreable,
         },
         # Pooled across types, keyed on whether the concluding ghost equals the
         # pre-research dry run. The identical bucket measures the driver's PRIOR
@@ -466,7 +537,7 @@ def join_and_score(
         # bucket says anything about v2's research — see the module docstring.
         "split_by_pre_identity": {
             bucket: {"n": len(rows), "mean_delta": mean(r["delta"] for r in rows) if rows else None}
-            for bucket, rows in split_rows.items()
+            for bucket, rows in tally.split_rows.items()
         },
     }
 

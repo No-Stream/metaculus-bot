@@ -156,7 +156,7 @@ def get_donated_404_fallback_count() -> int:
 
 def reset_donated_404_fallback_count() -> None:
     """Reset the counter to zero. Used by tests; not for production code."""
-    global _donated_404_fallback_count
+    global _donated_404_fallback_count  # noqa: PLW0603  # module-global run counter is the design (AGENTS.md)
     _donated_404_fallback_count = 0
 
 
@@ -177,7 +177,7 @@ def get_generic_key_fallback_count() -> int:
 
 def reset_generic_key_fallback_count() -> None:
     """Reset the counter to zero. Used by tests; not for production code."""
-    global _generic_key_fallback_count
+    global _generic_key_fallback_count  # noqa: PLW0603  # module-global run counter is the design (AGENTS.md)
     _generic_key_fallback_count = 0
 
 
@@ -199,7 +199,7 @@ def get_credit_key_fallback_count() -> int:
 
 def reset_credit_key_fallback_count() -> None:
     """Reset the counter to zero. Used by tests; not for production code."""
-    global _credit_key_fallback_count
+    global _credit_key_fallback_count  # noqa: PLW0603  # module-global run counter is the design (AGENTS.md)
     _credit_key_fallback_count = 0
 
 
@@ -653,13 +653,13 @@ async def record_donated_key_fallback(model: str, exc: Exception) -> None:
     # forecasters failing on one dry key — the exact 2026-07-26 shape — race the
     # increment, undercount the generic total, and take a degraded run GREEN. That is the
     # failure this whole change exists to prevent.
-    global _generic_key_fallback_count
+    global _generic_key_fallback_count  # noqa: PLW0603  # bytecode-atomic increment is load-bearing, see block comment
     _generic_key_fallback_count += 1
     if suppressible:
-        global _credit_key_fallback_count
+        global _credit_key_fallback_count  # noqa: PLW0603  # bytecode-atomic increment is load-bearing, see block comment
         _credit_key_fallback_count += 1
     if _is_donated_404(exc):
-        global _donated_404_fallback_count
+        global _donated_404_fallback_count  # noqa: PLW0603  # bytecode-atomic increment is load-bearing, see block comment
         _donated_404_fallback_count += 1
         logger.warning(
             "Donated OpenRouter key returned 404 'no allowed providers' for model=%s; "

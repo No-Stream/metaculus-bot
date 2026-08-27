@@ -202,8 +202,16 @@ async def is_public_http_url(url: str) -> bool:
     if ip is not None:
         return not _ip_is_disallowed(ip)
 
-    # Hostname branch: resolve via getaddrinfo off the event loop. Reject if
-    # ANY address is disallowed (DNS rebinding defense).
+    return await _every_resolved_address_is_public(host)
+
+
+async def _every_resolved_address_is_public(host: str) -> bool:
+    """True iff ``host`` resolves and EVERY resolved address is publicly routable.
+
+    Resolves via getaddrinfo off the event loop. Any disallowed address rejects the
+    whole hostname (DNS rebinding defense); a resolution failure rejects too, since
+    an unfetchable host should reach the caller as one uniform ``ssrf_blocked``.
+    """
     try:
         infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
     except (socket.gaierror, OSError):
@@ -214,9 +222,8 @@ async def is_public_http_url(url: str) -> bool:
         sockaddr = info[4] if len(info) >= 5 else None
         if not sockaddr:
             return False
-        ip_str = sockaddr[0]
         try:
-            resolved = ipaddress.ip_address(ip_str)
+            resolved = ipaddress.ip_address(sockaddr[0])
         except ValueError:
             return False
         if _ip_is_disallowed(resolved):
@@ -690,6 +697,44 @@ def _render_fetch_failures(failures: list[FetchResult]) -> str:
     return ", ".join(parts)
 
 
+def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -> tuple[list[str], int]:
+    """Render the success sections inside the two partitioned budgets; returns ``(sections, dropped)``.
+
+    Cited pages and Tier-2 datasets draw on separate allowances, so a chart's rows can
+    never evict the page text the section exists to serve.
+    """
+    sections: list[str] = []
+    page_remaining = RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+    dataset_remaining = RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS * RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS
+    dropped = 0
+    for r in successes:
+        # Cheap per-section budget accounting on the text body only. Section
+        # overhead (URL heading + fetched-date line) is negligible relative to
+        # the RESOLUTION_SOURCE_TOTAL_MAX_CHARS total budget; if the caller
+        # tightens it dramatically for a test, we still cut the text
+        # conservatively.
+        is_dataset = r.chart_id is not None
+        remaining = dataset_remaining if is_dataset else page_remaining
+        if remaining <= 0:
+            dropped += 1
+            continue
+        body = r.text
+        if len(body) > remaining:
+            # Through the marker-emitting truncator, not a bare slice. A bare slice cut
+            # mid-sentence AND could eat the per-URL `[truncated at N chars ...]` marker the
+            # fetch already appended at the end — leaving an already-truncated page rendering
+            # as complete. Reachable on prod constants (5 x 6000 per-URL against an 18000
+            # total). The CSV variant keeps both ends, which is what makes a dataset's newest
+            # rows survive whichever direction it runs.
+            body = (_truncate_csv_middle if is_dataset else _truncate_with_marker)(body, remaining, r.url)
+        if is_dataset:
+            dataset_remaining -= len(body)
+        else:
+            page_remaining -= len(body)
+        sections.append(f"### {r.url}\n(fetched {fetched_iso})\n\n{body}")
+    return sections, dropped
+
+
 def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
     """Render fetch results as a markdown body block (orchestrator adds the ``##`` header).
 
@@ -751,36 +796,7 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
     fetched_iso = fetched_at.strftime("%Y-%m-%d")
     caveat = f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence."
 
-    sections: list[str] = []
-    page_remaining = RESOLUTION_SOURCE_TOTAL_MAX_CHARS
-    dataset_remaining = RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS * RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS
-    dropped = 0
-    for r in successes:
-        # Cheap per-section budget accounting on the text body only. Section
-        # overhead (URL heading + fetched-date line) is negligible relative to
-        # the RESOLUTION_SOURCE_TOTAL_MAX_CHARS total budget; if the caller
-        # tightens it dramatically for a test, we still cut the text
-        # conservatively.
-        is_dataset = r.chart_id is not None
-        remaining = dataset_remaining if is_dataset else page_remaining
-        if remaining <= 0:
-            dropped += 1
-            continue
-        body = r.text
-        if len(body) > remaining:
-            # Through the marker-emitting truncator, not a bare slice. A bare slice cut
-            # mid-sentence AND could eat the per-URL `[truncated at N chars ...]` marker the
-            # fetch already appended at the end — leaving an already-truncated page rendering
-            # as complete. Reachable on prod constants (5 x 6000 per-URL against an 18000
-            # total). The CSV variant keeps both ends, which is what makes a dataset's newest
-            # rows survive whichever direction it runs.
-            body = (_truncate_csv_middle if is_dataset else _truncate_with_marker)(body, remaining, r.url)
-        if is_dataset:
-            dataset_remaining -= len(body)
-        else:
-            page_remaining -= len(body)
-        section = f"### {r.url}\n(fetched {fetched_iso})\n\n{body}"
-        sections.append(section)
+    sections, dropped = _budgeted_success_sections(successes, fetched_iso)
 
     rendered = caveat + "\n\n" + "\n\n".join(sections)
     if dropped:
@@ -869,6 +885,240 @@ def _sem_for_host(host_sems: dict[str, asyncio.Semaphore], url: str) -> asyncio.
     return sem
 
 
+async def _resolution_redirect_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult | str:
+    """Vet a 3xx hop: the next URL to follow, or a terminal error/blocked result."""
+    status = resp.status
+    location = resp.headers.get("Location") if resp.headers else None
+    if not location:
+        # Malformed redirect — no Location header.
+        logger.info(f"resolution_source fetched {urlparse(current_url).netloc} (error http={status} no Location)")
+        return FetchResult(
+            url=current_url,
+            status="error",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    next_url = urljoin(current_url, location)
+    if not await is_public_http_url(next_url):
+        logger.warning(
+            f"resolution_source ssrf_blocked (redirect): {urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
+        )
+        return FetchResult(
+            url=next_url,
+            status="ssrf_blocked",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    if is_metaculus_self_ref(next_url):
+        # The URL pre-filter drops metaculus self-refs, but a 3xx can
+        # still land on metaculus.com; don't follow it (no new info,
+        # and keeps our IP off the same host the critical API uses).
+        logger.info(
+            f"resolution_source metaculus_self_ref (redirect): "
+            f"{urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
+        )
+        return FetchResult(
+            url=next_url,
+            status="blocked",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    return next_url
+
+
+def _resolution_status_outcome(status: int, current_url: str, content_type: str) -> FetchResult | None:
+    """Terminal result for a non-200 status, or None when the body should be read."""
+    netloc = urlparse(current_url).netloc
+    if status in (403, 406, 429):
+        logger.info(f"resolution_source fetched {netloc} (blocked http={status})")
+        return FetchResult(
+            url=current_url,
+            status="blocked",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    if status in (404, 410):
+        logger.info(f"resolution_source fetched {netloc} (not_found http={status})")
+        return FetchResult(
+            url=current_url,
+            status="not_found",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    if status != 200:
+        logger.info(f"resolution_source fetched {netloc} (error http={status})")
+        return FetchResult(
+            url=current_url,
+            status="error",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    return None
+
+
+async def _resolution_html_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult:
+    """Trafilatura extraction plus the JS-wall check, carrying any Datawrapper embeds along."""
+    status = resp.status
+    netloc = urlparse(current_url).netloc
+    body = await read_body_capped(
+        resp,
+        max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+        label=f"resolution_source {netloc}",
+    )
+    if body is None:
+        return FetchResult(
+            url=current_url,
+            status="error",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    # Datawrapper embeds are only visible in the RAW HTML —
+    # trafilatura drops iframes and embed scripts at every
+    # setting — so the scan runs on the raw body, before
+    # (and regardless of) main-text extraction. Decoded
+    # through the shared helper so a BOM'd / non-UTF-8 page's
+    # embeds are still findable; the page's main text is
+    # trafilatura's to decode, which is why no vacuity check
+    # runs on this branch (an empty extraction is `js_wall`).
+    charts = extract_datawrapper_charts(decode_text_body(body, content_type)[0])
+    extracted = await asyncio.to_thread(_extract_main_text, body, current_url)
+    # An empty extraction on a 200 OK is a JS-wall (SPA that
+    # rendered client-side, cookie/consent gate, etc.) —
+    # exactly the Tier-2 candidate signal. Treat identically
+    # to short-but-nonempty extractions. A walled page still
+    # exposes its embeds, so the charts ride along.
+    if extracted is None or looks_like_js_wall(extracted):
+        logger.info(f"resolution_source fetched {netloc} (js_wall)")
+        return FetchResult(
+            url=current_url,
+            status="js_wall",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+            datawrapper_charts=charts,
+        )
+    logger.info(f"resolution_source fetched {netloc} (success)")
+    return FetchResult(
+        url=current_url,
+        status="success",
+        text=_truncate_with_marker(extracted, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, current_url),
+        http_status=status,
+        content_type=content_type or None,
+        datawrapper_charts=charts,
+    )
+
+
+async def _resolution_text_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult:
+    """Capped raw body for a JSON / plain-text / CSV response, refusing a vacuous one."""
+    status = resp.status
+    netloc = urlparse(current_url).netloc
+    body = await read_body_capped(
+        resp,
+        max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+        label=f"resolution_source {netloc}",
+    )
+    if body is None:
+        return FetchResult(
+            url=current_url,
+            status="error",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    raw, undecodable_ratio = decode_text_body(body, content_type)
+    # Markup stripping on the text branches only: a CSV or
+    # plain-text body carrying `<a href=…>` per row spends the
+    # per-URL budget on tags (see `strip_html_tags`), while a
+    # JSON body's angle brackets sit inside string values that
+    # are the data. Both text types get it because the labels
+    # are demonstrably unreliable here — Datawrapper's own
+    # versioned route serves CSV as application/octet-stream.
+    if any(ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES):
+        raw = strip_html_tags(raw)
+    vacuous = vacuous_body_status(raw, undecodable_ratio, require_csv_rows=False)
+    if vacuous is not None:
+        logger.info(
+            f"resolution_source fetched {netloc} ({vacuous}: 200 with no usable content, "
+            f"{len(body)} bytes, undecodable={undecodable_ratio:.2f})"
+        )
+        return FetchResult(
+            url=current_url,
+            status=vacuous,
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    logger.info(f"resolution_source fetched {netloc} (success)")
+    return FetchResult(
+        url=current_url,
+        status="success",
+        text=_truncate_with_marker(raw, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, current_url),
+        http_status=status,
+        content_type=content_type or None,
+    )
+
+
+async def _resolution_response_outcome(resp: Any, current_url: str) -> FetchResult | str:
+    """Classify one response: a terminal FetchResult, or the next URL on a vetted 3xx."""
+    status = resp.status
+    content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
+
+    if status in REDIRECT_STATUSES:
+        return await _resolution_redirect_outcome(resp, current_url, content_type)
+
+    # Non-redirect response — same status routing as before.
+    non_ok = _resolution_status_outcome(status, current_url, content_type)
+    if non_ok is not None:
+        return non_ok
+
+    # 200 OK: route on content type.
+    if any(ct in content_type for ct in _HTML_CONTENT_TYPES):
+        return await _resolution_html_outcome(resp, current_url, content_type)
+    if any(ct in content_type for ct in _JSON_CONTENT_TYPES) or any(
+        ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES
+    ):
+        return await _resolution_text_outcome(resp, current_url, content_type)
+
+    # Anything else — PDF, images, etc. Do NOT read the body.
+    # INTENDED limitation: a 200 OK with a missing/empty Content-Type header
+    # also lands here (ct='') and is dropped unread. Real resolution sources
+    # send Content-Type; content-sniffing would re-open the don't-read-unknown-
+    # bodies posture for a case that mostly can't happen. The per-URL
+    # FetchStatus is the Tier-2 seam if logs ever show `unsupported_type ct=''`.
+    logger.info(f"resolution_source fetched {urlparse(current_url).netloc} (unsupported_type ct={content_type!r})")
+    return FetchResult(
+        url=current_url,
+        status="unsupported_type",
+        text="",
+        http_status=status,
+        content_type=content_type or None,
+    )
+
+
+async def _fetch_one_hop(session: Any, current_url: str, host_sems: dict[str, asyncio.Semaphore]) -> FetchResult | str:
+    """ONE GET against ``current_url`` under its host semaphore: terminal result or next URL."""
+    async with _sem_for_host(host_sems, current_url):
+        try:
+            async with session.get(current_url, allow_redirects=False) as resp:
+                return await _resolution_response_outcome(resp, current_url)
+        except (TimeoutError, aiohttp.ClientError) as e:
+            logger.info(f"resolution_source fetch error for {current_url}: {type(e).__name__}: {e}")
+            return FetchResult(
+                url=current_url,
+                status="error",
+                text="",
+                http_status=None,
+                content_type=None,
+            )
+
+
 async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaphore]) -> FetchResult:
     """Fetch a single URL, holding the per-host politeness semaphore hop by hop.
 
@@ -911,221 +1161,15 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
     current_url = url
     # Bounded redirect loop. Each iteration issues ONE GET with
     # allow_redirects=False under the current hop's host semaphore; a redirect
-    # status resolves the Location, re-guards, and loops (`continue` unwinds
-    # both context managers, releasing the semaphore before the next hop
-    # acquires its own — no nesting, so no self-deadlock on revisited hosts).
+    # status resolves the Location, re-guards, and loops (each hop releases its
+    # semaphore before the next acquires its own — no nesting, so no
+    # self-deadlock on revisited hosts).
     # Non-redirect responses fall through to the content-type routing below.
     for _hop in range(MAX_REDIRECTS + 1):
-        async with _sem_for_host(host_sems, current_url):
-            try:
-                async with session.get(current_url, allow_redirects=False) as resp:
-                    netloc = urlparse(current_url).netloc
-                    status = resp.status
-                    content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
-
-                    if status in REDIRECT_STATUSES:
-                        location = resp.headers.get("Location") if resp.headers else None
-                        if not location:
-                            # Malformed redirect — no Location header.
-                            logger.info(f"resolution_source fetched {netloc} (error http={status} no Location)")
-                            return FetchResult(
-                                url=current_url,
-                                status="error",
-                                text="",
-                                http_status=status,
-                                content_type=content_type or None,
-                            )
-                        next_url = urljoin(current_url, location)
-                        if not await is_public_http_url(next_url):
-                            logger.warning(
-                                f"resolution_source ssrf_blocked (redirect): "
-                                f"{urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
-                            )
-                            return FetchResult(
-                                url=next_url,
-                                status="ssrf_blocked",
-                                text="",
-                                http_status=status,
-                                content_type=content_type or None,
-                            )
-                        if is_metaculus_self_ref(next_url):
-                            # The URL pre-filter drops metaculus self-refs, but a 3xx can
-                            # still land on metaculus.com; don't follow it (no new info,
-                            # and keeps our IP off the same host the critical API uses).
-                            logger.info(
-                                f"resolution_source metaculus_self_ref (redirect): "
-                                f"{urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
-                            )
-                            return FetchResult(
-                                url=next_url,
-                                status="blocked",
-                                text="",
-                                http_status=status,
-                                content_type=content_type or None,
-                            )
-                        current_url = next_url
-                        continue  # next hop
-
-                    # Non-redirect response — same status routing as before.
-                    if status == 403 or status == 406 or status == 429:
-                        logger.info(f"resolution_source fetched {netloc} (blocked http={status})")
-                        return FetchResult(
-                            url=current_url,
-                            status="blocked",
-                            text="",
-                            http_status=status,
-                            content_type=content_type or None,
-                        )
-                    if status in (404, 410):
-                        logger.info(f"resolution_source fetched {netloc} (not_found http={status})")
-                        return FetchResult(
-                            url=current_url,
-                            status="not_found",
-                            text="",
-                            http_status=status,
-                            content_type=content_type or None,
-                        )
-                    if status != 200:
-                        logger.info(f"resolution_source fetched {netloc} (error http={status})")
-                        return FetchResult(
-                            url=current_url,
-                            status="error",
-                            text="",
-                            http_status=status,
-                            content_type=content_type or None,
-                        )
-
-                    # 200 OK: route on content type.
-                    if any(ct in content_type for ct in _HTML_CONTENT_TYPES):
-                        body = await read_body_capped(
-                            resp,
-                            max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
-                            label=f"resolution_source {netloc}",
-                        )
-                        if body is None:
-                            return FetchResult(
-                                url=current_url,
-                                status="error",
-                                text="",
-                                http_status=status,
-                                content_type=content_type or None,
-                            )
-                        # Datawrapper embeds are only visible in the RAW HTML —
-                        # trafilatura drops iframes and embed scripts at every
-                        # setting — so the scan runs on the raw body, before
-                        # (and regardless of) main-text extraction. Decoded
-                        # through the shared helper so a BOM'd / non-UTF-8 page's
-                        # embeds are still findable; the page's main text is
-                        # trafilatura's to decode, which is why no vacuity check
-                        # runs on this branch (an empty extraction is `js_wall`).
-                        charts = extract_datawrapper_charts(decode_text_body(body, content_type)[0])
-                        extracted = await asyncio.to_thread(_extract_main_text, body, current_url)
-                        # An empty extraction on a 200 OK is a JS-wall (SPA that
-                        # rendered client-side, cookie/consent gate, etc.) —
-                        # exactly the Tier-2 candidate signal. Treat identically
-                        # to short-but-nonempty extractions. A walled page still
-                        # exposes its embeds, so the charts ride along.
-                        if extracted is None or looks_like_js_wall(extracted):
-                            logger.info(f"resolution_source fetched {netloc} (js_wall)")
-                            return FetchResult(
-                                url=current_url,
-                                status="js_wall",
-                                text="",
-                                http_status=status,
-                                content_type=content_type or None,
-                                datawrapper_charts=charts,
-                            )
-                        truncated = _truncate_with_marker(
-                            extracted,
-                            RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
-                            current_url,
-                        )
-                        logger.info(f"resolution_source fetched {netloc} (success)")
-                        return FetchResult(
-                            url=current_url,
-                            status="success",
-                            text=truncated,
-                            http_status=status,
-                            content_type=content_type or None,
-                            datawrapper_charts=charts,
-                        )
-
-                    if any(ct in content_type for ct in _JSON_CONTENT_TYPES) or any(
-                        ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES
-                    ):
-                        body = await read_body_capped(
-                            resp,
-                            max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
-                            label=f"resolution_source {netloc}",
-                        )
-                        if body is None:
-                            return FetchResult(
-                                url=current_url,
-                                status="error",
-                                text="",
-                                http_status=status,
-                                content_type=content_type or None,
-                            )
-                        raw, undecodable_ratio = decode_text_body(body, content_type)
-                        # Markup stripping on the text branches only: a CSV or
-                        # plain-text body carrying `<a href=…>` per row spends the
-                        # per-URL budget on tags (see `strip_html_tags`), while a
-                        # JSON body's angle brackets sit inside string values that
-                        # are the data. Both text types get it because the labels
-                        # are demonstrably unreliable here — Datawrapper's own
-                        # versioned route serves CSV as application/octet-stream.
-                        if any(ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES):
-                            raw = strip_html_tags(raw)
-                        vacuous = vacuous_body_status(raw, undecodable_ratio, require_csv_rows=False)
-                        if vacuous is not None:
-                            logger.info(
-                                f"resolution_source fetched {netloc} ({vacuous}: 200 with no usable content, "
-                                f"{len(body)} bytes, undecodable={undecodable_ratio:.2f})"
-                            )
-                            return FetchResult(
-                                url=current_url,
-                                status=vacuous,
-                                text="",
-                                http_status=status,
-                                content_type=content_type or None,
-                            )
-                        truncated = _truncate_with_marker(
-                            raw,
-                            RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
-                            current_url,
-                        )
-                        logger.info(f"resolution_source fetched {netloc} (success)")
-                        return FetchResult(
-                            url=current_url,
-                            status="success",
-                            text=truncated,
-                            http_status=status,
-                            content_type=content_type or None,
-                        )
-
-                    # Anything else — PDF, images, etc. Do NOT read the body.
-                    # INTENDED limitation: a 200 OK with a missing/empty Content-Type header
-                    # also lands here (ct='') and is dropped unread. Real resolution sources
-                    # send Content-Type; content-sniffing would re-open the don't-read-unknown-
-                    # bodies posture for a case that mostly can't happen. The per-URL
-                    # FetchStatus is the Tier-2 seam if logs ever show `unsupported_type ct=''`.
-                    logger.info(f"resolution_source fetched {netloc} (unsupported_type ct={content_type!r})")
-                    return FetchResult(
-                        url=current_url,
-                        status="unsupported_type",
-                        text="",
-                        http_status=status,
-                        content_type=content_type or None,
-                    )
-            except (TimeoutError, aiohttp.ClientError) as e:
-                logger.info(f"resolution_source fetch error for {current_url}: {type(e).__name__}: {e}")
-                return FetchResult(
-                    url=current_url,
-                    status="error",
-                    text="",
-                    http_status=None,
-                    content_type=None,
-                )
+        outcome = await _fetch_one_hop(session, current_url, host_sems)
+        if isinstance(outcome, FetchResult):
+            return outcome
+        current_url = outcome
 
     # Fell out of the loop -> exceeded MAX_REDIRECTS.
     logger.info(f"resolution_source redirect chain exceeded {MAX_REDIRECTS} hops (final={current_url})")
@@ -1135,6 +1179,163 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
         text="",
         http_status=None,
         content_type=None,
+    )
+
+
+def _datawrapper_hop_status(status: int) -> FetchStatus:
+    """Map the CDN's HTTP status onto a FetchStatus (200 -> ``success``)."""
+    if status in (404, 410):
+        return "not_found"
+    if status in (403, 406, 429):
+        return "blocked"
+    if status != 200:
+        return "error"
+    return "success"
+
+
+def _datawrapper_last_modified(resp: Any) -> datetime | None:
+    """The dataset's parsed ``Last-Modified``, or None when absent or unparseable."""
+    raw = resp.headers.get("Last-Modified") if resp.headers else None
+    return parse_http_last_modified(raw) if raw else None
+
+
+def _datawrapper_freshness_failure(last_modified: datetime | None) -> str | None:
+    """Why ``last_modified`` fails the freshness guard, or None when it passes.
+
+    Two-sided, deliberately. The lead this stamp authorizes asserts a
+    publication date, and a FUTURE one means a broken clock or a misparse on
+    one side — so it is unusable as a freshness claim, not maximally fresh.
+    The old one-sided check let any future date through as the freshest
+    possible dataset.
+    """
+    if last_modified is None:
+        return "no parseable Last-Modified"
+    now = datetime.now(UTC)
+    if last_modified - now > _DATAWRAPPER_CLOCK_SKEW_TOLERANCE:
+        return f"published {last_modified.isoformat()}, which is in the FUTURE"
+    if now - last_modified > timedelta(days=RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS):
+        return (
+            f"published {last_modified.isoformat()}, age {(now - last_modified).days}d "
+            f"> {RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS}d bound"
+        )
+    return None
+
+
+def _datawrapper_success_text(
+    chart: DatawrapperChartRef, parent_url: str, url: str, *, dataset_text: str, published: datetime
+) -> str:
+    """The liveness lead plus the budgeted CSV rows."""
+    # Every claim in this lead is now checked: the timestamp by the
+    # freshness guard above, and "dataset" itself by the row-shape
+    # check — an authoritative `published <ts>` stamp over an empty or
+    # soft-404 body was the same defect class as a manufactured price.
+    title_part = f" ({chart.title!r})" if chart.title else ""
+    lead = (
+        f'Live "Get the data" dataset for Datawrapper chart {chart.chart_id}{title_part} '
+        f"embedded in {parent_url}. Dataset published {published.isoformat()}."
+    )
+    # The DATASET cap, not the page cap: datasets budget against their own
+    # section allowance so a chart's rows can never evict cited page text.
+    # Tags are stripped BEFORE truncation so the budget buys rows, not markup.
+    csv_budget = RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS - len(lead) - 2
+    return f"{lead}\n\n{_truncate_csv_middle(dataset_text, csv_budget, url)}"
+
+
+async def _datawrapper_dataset_outcome(resp: Any, chart: DatawrapperChartRef, parent_url: str, url: str) -> FetchResult:
+    """Turn the CDN response into a FetchResult, serving the dataset live or not at all."""
+    status = resp.status
+    content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
+    hop_status = _datawrapper_hop_status(status)
+    if hop_status != "success":
+        logger.info(f"resolution_source datawrapper hop {chart.chart_id} ({hop_status} http={status})")
+        return FetchResult(
+            url=url,
+            status=hop_status,
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+            chart_id=chart.chart_id,
+            chart_title=chart.title,
+            parent_url=parent_url,
+        )
+
+    body = await read_body_capped(
+        resp,
+        max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+        label=f"resolution_source datawrapper {chart.chart_id}",
+    )
+    if body is None:
+        return FetchResult(
+            url=url,
+            status="error",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+            chart_id=chart.chart_id,
+            chart_title=chart.title,
+            parent_url=parent_url,
+        )
+
+    # Content BEFORE freshness, deliberately: an empty or non-CSV CDN
+    # body is a failed hop whatever its Last-Modified says, and
+    # `stale_data` is reported to diagnostics as the benign `none`
+    # (the freshness guard working as designed), which would hide it.
+    # Row-shape is decided on the PRE-strip text: looks_like_csv_rows
+    # rejects markup by its leading `<`, and stripping first would remove
+    # exactly the allow-listed fragment tags (`<p>`, `<div>`) a CDN
+    # soft-404 opens with, letting an error page carry the authoritative
+    # "Dataset published" lead if its prose holds a comma.
+    dataset_text, undecodable_ratio = decode_text_body(body, content_type)
+    vacuous = vacuous_body_status(dataset_text, undecodable_ratio, require_csv_rows=True)
+    dataset_text = strip_html_tags(dataset_text).strip()
+    if vacuous is not None:
+        logger.warning(
+            f"resolution_source datawrapper hop {chart.chart_id}: dataset body is not a usable "
+            f"dataset ({vacuous}: {len(body)} bytes, undecodable={undecodable_ratio:.2f}) — "
+            f"withheld rather than stamped live"
+        )
+        return FetchResult(
+            url=url,
+            status=vacuous,
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+            chart_id=chart.chart_id,
+            chart_title=chart.title,
+            parent_url=parent_url,
+        )
+
+    last_modified = _datawrapper_last_modified(resp)
+    freshness_failure = _datawrapper_freshness_failure(last_modified)
+    if freshness_failure is not None:
+        logger.warning(
+            f"resolution_source datawrapper hop {chart.chart_id}: dataset failed the "
+            f"freshness guard ({freshness_failure}) — withheld, not served as live"
+        )
+        return FetchResult(
+            url=url,
+            status="stale_data",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+            chart_id=chart.chart_id,
+            chart_title=chart.title,
+            parent_url=parent_url,
+            data_last_modified=last_modified.isoformat() if last_modified else None,
+        )
+
+    assert last_modified is not None  # a passing freshness guard implies a parsed timestamp
+    logger.info(f"resolution_source datawrapper hop {chart.chart_id} (success, published {last_modified.isoformat()})")
+    return FetchResult(
+        url=url,
+        status="success",
+        text=_datawrapper_success_text(chart, parent_url, url, dataset_text=dataset_text, published=last_modified),
+        http_status=status,
+        content_type=content_type or None,
+        chart_id=chart.chart_id,
+        chart_title=chart.title,
+        parent_url=parent_url,
+        data_last_modified=last_modified.isoformat(),
     )
 
 
@@ -1182,142 +1383,7 @@ async def _fetch_datawrapper_dataset(
     async with _sem_for_host(host_sems, url):
         try:
             async with session.get(url, allow_redirects=False) as resp:
-                status = resp.status
-                content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
-                if status in (404, 410):
-                    hop_status: FetchStatus = "not_found"
-                elif status in (403, 406, 429):
-                    hop_status = "blocked"
-                elif status != 200:
-                    hop_status = "error"
-                else:
-                    hop_status = "success"
-                if hop_status != "success":
-                    logger.info(f"resolution_source datawrapper hop {chart.chart_id} ({hop_status} http={status})")
-                    return FetchResult(
-                        url=url,
-                        status=hop_status,
-                        text="",
-                        http_status=status,
-                        content_type=content_type or None,
-                        chart_id=chart.chart_id,
-                        chart_title=chart.title,
-                        parent_url=parent_url,
-                    )
-
-                body = await read_body_capped(
-                    resp,
-                    max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
-                    label=f"resolution_source datawrapper {chart.chart_id}",
-                )
-                if body is None:
-                    return FetchResult(
-                        url=url,
-                        status="error",
-                        text="",
-                        http_status=status,
-                        content_type=content_type or None,
-                        chart_id=chart.chart_id,
-                        chart_title=chart.title,
-                        parent_url=parent_url,
-                    )
-
-                # Content BEFORE freshness, deliberately: an empty or non-CSV CDN
-                # body is a failed hop whatever its Last-Modified says, and
-                # `stale_data` is reported to diagnostics as the benign `none`
-                # (the freshness guard working as designed), which would hide it.
-                # Row-shape is decided on the PRE-strip text: looks_like_csv_rows
-                # rejects markup by its leading `<`, and stripping first would remove
-                # exactly the allow-listed fragment tags (`<p>`, `<div>`) a CDN
-                # soft-404 opens with, letting an error page carry the authoritative
-                # "Dataset published" lead if its prose holds a comma.
-                dataset_text, undecodable_ratio = decode_text_body(body, content_type)
-                vacuous = vacuous_body_status(dataset_text, undecodable_ratio, require_csv_rows=True)
-                dataset_text = strip_html_tags(dataset_text).strip()
-                if vacuous is not None:
-                    logger.warning(
-                        f"resolution_source datawrapper hop {chart.chart_id}: dataset body is not a usable "
-                        f"dataset ({vacuous}: {len(body)} bytes, undecodable={undecodable_ratio:.2f}) — "
-                        f"withheld rather than stamped live"
-                    )
-                    return FetchResult(
-                        url=url,
-                        status=vacuous,
-                        text="",
-                        http_status=status,
-                        content_type=content_type or None,
-                        chart_id=chart.chart_id,
-                        chart_title=chart.title,
-                        parent_url=parent_url,
-                    )
-
-                last_modified_raw = resp.headers.get("Last-Modified") if resp.headers else None
-                last_modified = parse_http_last_modified(last_modified_raw) if last_modified_raw else None
-                now = datetime.now(UTC)
-                # Two-sided, deliberately. The lead this stamp authorizes asserts a
-                # publication date, and a FUTURE one means a broken clock or a misparse on
-                # one side — so it is unusable as a freshness claim, not maximally fresh.
-                # The old one-sided check let any future date through as the freshest
-                # possible dataset.
-                if (
-                    last_modified is None
-                    or now - last_modified > timedelta(days=RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS)
-                    or last_modified - now > _DATAWRAPPER_CLOCK_SKEW_TOLERANCE
-                ):
-                    if last_modified is None:
-                        age_desc = "no parseable Last-Modified"
-                    elif last_modified > now:
-                        age_desc = f"published {last_modified.isoformat()}, which is in the FUTURE"
-                    else:
-                        age_desc = (
-                            f"published {last_modified.isoformat()}, age {(now - last_modified).days}d "
-                            f"> {RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS}d bound"
-                        )
-                    logger.warning(
-                        f"resolution_source datawrapper hop {chart.chart_id}: dataset failed the "
-                        f"freshness guard ({age_desc}) — withheld, not served as live"
-                    )
-                    return FetchResult(
-                        url=url,
-                        status="stale_data",
-                        text="",
-                        http_status=status,
-                        content_type=content_type or None,
-                        chart_id=chart.chart_id,
-                        chart_title=chart.title,
-                        parent_url=parent_url,
-                        data_last_modified=last_modified.isoformat() if last_modified else None,
-                    )
-
-                # Every claim in this lead is now checked: the timestamp by the
-                # freshness guard above, and "dataset" itself by the row-shape
-                # check — an authoritative `published <ts>` stamp over an empty or
-                # soft-404 body was the same defect class as a manufactured price.
-                title_part = f" ({chart.title!r})" if chart.title else ""
-                lead = (
-                    f'Live "Get the data" dataset for Datawrapper chart {chart.chart_id}{title_part} '
-                    f"embedded in {parent_url}. Dataset published {last_modified.isoformat()}."
-                )
-                # The DATASET cap, not the page cap: datasets budget against their own
-                # section allowance so a chart's rows can never evict cited page text.
-                # Tags are stripped BEFORE truncation so the budget buys rows, not markup.
-                csv_budget = RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS - len(lead) - 2
-                csv_text = _truncate_csv_middle(dataset_text, csv_budget, url)
-                logger.info(
-                    f"resolution_source datawrapper hop {chart.chart_id} "
-                    f"(success, published {last_modified.isoformat()})"
-                )
-                return FetchResult(
-                    url=url,
-                    status="success",
-                    text=f"{lead}\n\n{csv_text}",
-                    http_status=status,
-                    content_type=content_type or None,
-                    chart_id=chart.chart_id,
-                    chart_title=chart.title,
-                    parent_url=parent_url,
-                    data_last_modified=last_modified.isoformat(),
-                )
+                return await _datawrapper_dataset_outcome(resp, chart, parent_url, url)
         except (TimeoutError, aiohttp.ClientError) as e:
             logger.info(f"resolution_source datawrapper hop {chart.chart_id} error: {type(e).__name__}: {e}")
             return FetchResult(

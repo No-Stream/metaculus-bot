@@ -174,7 +174,11 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
     assert bot._forecaster_with_soft_deadline.call_count == 2  # Called once for each forecaster
     # Trailing chart_b64 is None here (TS_ANCHOR_CHART_ENABLED off in the test env).
     bot._forecaster_with_soft_deadline.assert_any_call(
-        mock_binary_question, "mock research", mock_general_llm, mock_binary_question.id_of_question, None
+        mock_binary_question,
+        "mock research",
+        mock_general_llm,
+        qid=mock_binary_question.id_of_question,
+        chart_b64=None,
     )
     assert isinstance(result, ResearchWithPredictions)
     assert len(result.predictions) == 2
@@ -466,7 +470,7 @@ async def test_forecaster_with_soft_deadline_times_out_and_bumps_counter(
     assert bot._forecasters_dropped_count == 0
     with pytest.raises(asyncio.TimeoutError):
         await bot._forecaster_with_soft_deadline(
-            mock_binary_question, "research", mock_general_llm, mock_binary_question.id_of_question
+            mock_binary_question, "research", mock_general_llm, qid=mock_binary_question.id_of_question
         )
     assert bot._forecasters_dropped_count == 1
 

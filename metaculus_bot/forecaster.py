@@ -183,36 +183,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             discrete_integer_votes=self._discrete_integer_votes,
         )
 
-        # --- Alerting counters (consumed by cli.py to decide sys.exit status) ---
-        self._forecasters_dropped_count: int = 0
-        # Per-model drop attribution (same lifecycle as the scalar above — one
-        # bot instance == one run). _record_forecaster_drop is the single write
-        # path that keeps this list and the scalar in lockstep.
-        self._forecaster_drops: list[ForecasterDrop] = []
-        self._questions_failed_to_publish: int = 0
-        # Questions whose close time was too near for the full pipeline's worst case,
-        # so the optional research stages were dropped (see time_budget.py). A
-        # fast-path publish is a degraded publish — the forecasters saw a thinner
-        # research bundle — and reddens CI for the same reason a thinned ensemble
-        # does: it is a symptom of upstream latency, which is the thing the operator
-        # wants paged. The question still publishes.
-        self._time_budget_fast_path_count: int = 0
-        # qid -> forecasters that contributed to the published value, recorded by
-        # _research_and_make_predictions and drained by _create_unified_explanation
-        # for the FORECASTERS_USED marker. Needed because the stacked path returns a
-        # single aggregated prediction, so the published collection can't be counted.
-        self._contributing_forecasters: defaultdict[int, int] = defaultdict(int)
-
-        self._conditional_stacking_triggered_count: int = 0
-        self._conditional_stacking_skipped_count: int = 0
-        # Skips from the single-forecaster short-circuit, kept in their own bucket so
-        # the two skip reasons stay separable (mirroring the STACKER_OUTCOME split of
-        # "skipped_config_off" out of "skipped"). That branch returns above both
-        # increment sites below, so it has to bump its own counter or the per-question
-        # "SKIPPED: single forecaster survived" logs would end the run at "skipped=0".
-        self._conditional_stacking_skipped_single_forecaster_count: int = 0
-        self._conditional_stacking_crux_failures: int = 0
-        self._conditional_stacking_search_failures: int = 0
+        self._init_alerting_counters()
 
         if max_concurrent_research <= 0:
             raise ValueError("max_concurrent_research must be a positive integer")
@@ -263,36 +234,80 @@ class TemplateForecaster(CompactLoggingForecastBot):
             research_sink=research_sink,
         )
 
-        # Log ensemble + aggregation configuration once on init
+        self._log_ensemble_configuration()
+
+    def _init_alerting_counters(self) -> None:
+        """Zero the run-level counters cli.py reads to decide the process exit status.
+
+        One bot instance == one run, so these are per-run totals rather than per-question.
+        """
+        self._forecasters_dropped_count: int = 0
+        # Per-model drop attribution (same lifecycle as the scalar above).
+        # _record_forecaster_drop is the single write path that keeps this list and the
+        # scalar in lockstep.
+        self._forecaster_drops: list[ForecasterDrop] = []
+        self._questions_failed_to_publish: int = 0
+        # Questions whose close time was too near for the full pipeline's worst case,
+        # so the optional research stages were dropped (see time_budget.py). A
+        # fast-path publish is a degraded publish — the forecasters saw a thinner
+        # research bundle — and reddens CI for the same reason a thinned ensemble
+        # does: it is a symptom of upstream latency, which is the thing the operator
+        # wants paged. The question still publishes.
+        self._time_budget_fast_path_count: int = 0
+        # qid -> forecasters that contributed to the published value, recorded by
+        # _research_and_make_predictions and drained by _create_unified_explanation
+        # for the FORECASTERS_USED marker. Needed because the stacked path returns a
+        # single aggregated prediction, so the published collection can't be counted.
+        self._contributing_forecasters: defaultdict[int, int] = defaultdict(int)
+
+        self._conditional_stacking_triggered_count: int = 0
+        self._conditional_stacking_skipped_count: int = 0
+        # Skips from the single-forecaster short-circuit, kept in their own bucket so
+        # the two skip reasons stay separable (mirroring the STACKER_OUTCOME split of
+        # "skipped_config_off" out of "skipped"). That branch returns above both of
+        # stacking_route's increment sites, so it has to bump its own counter or the
+        # per-question "SKIPPED: single forecaster survived" logs would end the run at
+        # "skipped=0".
+        self._conditional_stacking_skipped_single_forecaster_count: int = 0
+        self._conditional_stacking_crux_failures: int = 0
+        self._conditional_stacking_search_failures: int = 0
+
+    def _log_ensemble_configuration(self) -> None:
+        """Log the ensemble + aggregation configuration once on init."""
         num_models = len(self._forecaster_llms) if self._forecaster_llms else 1
         logger.info(
             "Ensemble configured: %s model(s) | Aggregation: %s",
             num_models,
             self.aggregation_strategy.value,
         )
+        if self.aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
+            return
+
+        stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
+        base_models = [m.model for m in self._forecaster_llms]
+        # Display truncation for one log line, not a computation over a sample.
+        short_list = (
+            base_models if len(base_models) <= 6 else [*base_models[:6], "..."]
+        )  # HARNESS-SCAN-EXEMPT-subsampling
+
         if self.aggregation_strategy == AggregationStrategy.STACKING:
-            stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
-            base_models = [m.model for m in self._forecaster_llms]
-            short_list = base_models if len(base_models) <= 6 else [*base_models[:6], "..."]
             logger.info(
                 "STACKING config | stacker=%s | base_forecasters(%d)=%s | final_outputs_per_question=1",
                 stacker_name,
                 len(base_models),
                 short_list,
             )
-        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
-            stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
-            analyzer_name = self._analyzer_llm.model if self._analyzer_llm else "<missing>"
-            base_models = [m.model for m in self._forecaster_llms]
-            short_list = base_models if len(base_models) <= 6 else [*base_models[:6], "..."]
-            logger.info(
-                "CONDITIONAL_STACKING config | stacker=%s | analyzer=%s | base_forecasters(%d)=%s | thresholds=%s",
-                stacker_name,
-                analyzer_name,
-                len(base_models),
-                short_list,
-                self._stacking_spread_thresholds,
-            )
+            return
+
+        analyzer_name = self._analyzer_llm.model if self._analyzer_llm else "<missing>"
+        logger.info(
+            "CONDITIONAL_STACKING config | stacker=%s | analyzer=%s | base_forecasters(%d)=%s | thresholds=%s",
+            stacker_name,
+            analyzer_name,
+            len(base_models),
+            short_list,
+            self._stacking_spread_thresholds,
+        )
 
     def _get_threshold_for_question(self, question: MetaculusQuestion) -> float:
         return self._pipeline.get_threshold_for_question(question)
@@ -535,6 +550,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         question: MetaculusQuestion,
         research: str,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
+        *,
         stacker_llm_override: GeneralLlm | None = None,
         aggregated_tool_output: str | None = None,
         stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
@@ -654,6 +670,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self,
         question: MetaculusQuestion,
         valid_predictions: list[ReasonedPrediction[PredictionTypes]],
+        *,
         research_for_stacking: str,
         research_report: str,
         summary_report: str,
@@ -806,7 +823,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         tasks = cast(
             list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
             [
-                self._forecaster_with_soft_deadline(question, research, llm_instance, qid_for_log, chart_b64)
+                self._forecaster_with_soft_deadline(
+                    question, research, llm_instance, qid=qid_for_log, chart_b64=chart_b64
+                )
                 for llm_instance in self._forecaster_llms
             ],
         )
@@ -920,7 +939,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
         text = super()._format_forecaster_rationales(report_number, researched_predictions).lstrip()
         return trim_section(text, f"report_{report_number}_rationales")
 
-    def _create_unified_explanation(
+    # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
+    # ForecastBot._create_unified_explanation, which forecasting-tools calls POSITIONALLY
+    # (forecast_bot.py: "self._create_unified_explanation(question, valid_prediction_set,
+    # aggregated_prediction, final_cost, time_spent_in_minutes)"). Making any of these
+    # keyword-only would break the framework's own call.
+    def _create_unified_explanation(  # noqa: PLR0917  # signature is fixed by the ft base class, see comment above
         self,
         question: MetaculusQuestion,
         research_prediction_collections: list[ResearchWithPredictions],
@@ -983,6 +1007,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         question: MetaculusQuestion,
         research: str,
         llm: GeneralLlm,
+        *,
         qid: int | None,
         chart_b64: str | None = None,
     ) -> ReasonedPrediction[PredictionTypes]:
@@ -1074,7 +1099,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
         return prediction  # type: ignore[return-value]
 
-    async def _aggregate_predictions(
+    # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
+    # ForecastBot._aggregate_predictions, which forecasting-tools calls POSITIONALLY
+    # (forecast_bot.py: "await self._aggregate_predictions(all_predictions, question)"). The params
+    # past ``question`` are ours, but narrowing the first two would break the framework's call.
+    async def _aggregate_predictions(  # noqa: PLR0917  # signature is fixed by the ft base class, see comment above
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
@@ -1083,7 +1112,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
         return await self._pipeline.aggregate(
-            predictions, question, research, reasoned_predictions, aggregated_tool_output
+            predictions,
+            question,
+            research=research,
+            reasoned_predictions=reasoned_predictions,
+            aggregated_tool_output=aggregated_tool_output,
         )
 
     def _pull_research_chart(self, qid: int | None) -> str | None:

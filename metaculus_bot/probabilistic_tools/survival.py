@@ -84,6 +84,7 @@ def poisson_at_least_one(lambda_t: float) -> float:
 def base_rate_to_hazard(
     k: int,
     n: int,
+    *,
     years_per_ref_period: float = 1.0,
     prior_rate: float | None = None,
     prior_strength: float = 1.0,

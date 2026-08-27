@@ -106,6 +106,7 @@ def log_cluster_spreading_summary(
     modified_values: list[float],
     original_values: list[float],
     question: NumericQuestion,
+    *,
     clusters_applied: int,
     spread_delta: float,
     count_like: bool,

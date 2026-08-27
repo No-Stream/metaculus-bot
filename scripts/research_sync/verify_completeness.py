@@ -49,6 +49,7 @@ import json
 import logging
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 # Reuse the puller's authoritative enumeration + download + parse helpers so the QA
@@ -69,6 +70,10 @@ from scripts.gha_artifacts import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How many examples each capped list names before collapsing the rest into a count. The
+# summary counts are always exact; these lists exist to name a few instances.
+_SAMPLE_PRINT_LIMIT = 20
 
 
 def archived_run_ids(output_dir: Path) -> set[str]:
@@ -129,7 +134,7 @@ def classify_gap_or_empty(
     return genuine_gaps, empty_artifacts
 
 
-def _print_artifact_sample(header: str, artifacts: list[dict], label: str, limit: int = 20) -> None:
+def _print_artifact_sample(header: str, artifacts: list[dict], label: str, limit: int = _SAMPLE_PRINT_LIMIT) -> None:
     """Print an oldest-first artifact list, capped, with the remainder counted.
 
     The counts in the summary block above are always exact; these lists exist to name
@@ -161,6 +166,172 @@ def unpromoted_artifact_questions(manifest: dict) -> list[str]:
     )
 
 
+@dataclass
+class CompletenessFindings:
+    """Everything the check measured, gathered before any of it is printed."""
+
+    live: list[dict]
+    expired: list[dict]
+    unpersisted: list[dict]
+    missing: list[dict]
+    genuine_gaps: list[dict]
+    empty_artifacts: list[dict]
+    unpromoted: list[str]
+    manifest: dict
+
+    @property
+    def represented(self) -> int:
+        """Live artifacts whose originating run appears in the archive."""
+        return len(self.live) - len(self.missing)
+
+    @property
+    def failed(self) -> bool:
+        """The three FAIL conditions. An EMPTY artifact is deliberately not one of them."""
+        return bool(self.genuine_gaps or self.unpromoted or self.unpersisted)
+
+
+def load_manifest(output_dir: Path) -> dict:
+    """Read the rebuilt archive's manifest, exiting loudly when the sync hasn't run."""
+    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.exists():
+        logger.error(f"No manifest at {manifest_path} — run `make sync_research` first.")
+        sys.exit(1)
+    return json.loads(manifest_path.read_text())
+
+
+def unrepresented_artifacts(live: list[dict], archived_ids: set[str]) -> list[dict]:
+    """Live artifacts whose ``workflow_run.id`` is absent from the archive's recorded run_ids.
+
+    "Represented" is run-id presence only, so an artifact that legitimately carried no
+    research lands here too — ``classify_gap_or_empty`` is what tells the two apart.
+    """
+    return [art for art in live if art.get("run_id") is None or str(art.get("run_id")) not in archived_ids]
+
+
+def gather_findings(repo: str, output_dir: Path, store_dir: Path) -> CompletenessFindings:
+    """Measure GitHub's live artifact set against the persisted store and the merged archive."""
+    verify_gh_cli()
+
+    all_artifacts = list_research_artifacts(repo)
+    research = [a for a in all_artifacts if str(a.get("name", "")).startswith(RESEARCH_ARTIFACT_PREFIX)]
+    live = [a for a in research if not a.get("expired")]
+    expired = [a for a in research if a.get("expired")]
+
+    logger.info(f"GitHub: {len(research)} research-* artifacts ({len(live)} live, {len(expired)} expired)")
+
+    unpersisted = unpersisted_artifacts(live, store_dir)
+
+    manifest = load_manifest(output_dir)
+    archived_ids = archived_run_ids(output_dir)
+    logger.info(f"Archive: {len(manifest)} questions, {len(archived_ids)} distinct run_ids across by_qid/ versions")
+
+    missing = unrepresented_artifacts(live, archived_ids)
+
+    # Distinguish genuine gaps (records exist on GitHub but not locally) from empty
+    # artifacts (the run produced no research records, so nothing to capture).
+    empty_artifacts: list[dict] = []
+    genuine_gaps: list[dict] = []
+    if missing:
+        logger.info(f"Classifying {len(missing)} unrepresented live artifact(s) as gap vs empty...")
+        with tempfile.TemporaryDirectory(prefix="verify_dl_") as tmpdir:
+            genuine_gaps, empty_artifacts = classify_gap_or_empty(missing, repo, store_dir, Path(tmpdir))
+
+    return CompletenessFindings(
+        live=live,
+        expired=expired,
+        unpersisted=unpersisted,
+        missing=missing,
+        genuine_gaps=genuine_gaps,
+        empty_artifacts=empty_artifacts,
+        unpromoted=unpromoted_artifact_questions(manifest),
+        manifest=manifest,
+    )
+
+
+def _print_counts(findings: CompletenessFindings) -> None:
+    print("\n" + "=" * 72)
+    print("RESEARCH ARCHIVE COMPLETENESS CHECK")
+    print("=" * 72)
+    print(f"Live research artifacts on GitHub : {len(findings.live)}")
+    print(f"Persisted in the local store       : {len(findings.live) - len(findings.unpersisted)}")
+    print(f"NOT persisted (at 90-day risk)     : {len(findings.unpersisted)}")
+    print(f"Represented in local archive       : {findings.represented}")
+    print(f"Empty artifacts (no records, OK)   : {len(findings.empty_artifacts)}")
+    print(f"Genuine gaps (records NOT captured): {len(findings.genuine_gaps)}")
+    print(f"Expired (unrecoverable, lost)      : {len(findings.expired)}")
+    print(f"Captured but not promoted to latest: {len(findings.unpromoted)}")
+
+
+def _print_expired(expired: list[dict]) -> None:
+    """Name every expired artifact, deliberately UNCAPPED unlike the sampled lists.
+
+    This is the one section reporting permanent data loss, so the operator needs every name.
+    """
+    if not expired:
+        return
+    print("\nEXPIRED / LOST FOREVER (past 90-day retention):")
+    for art in sorted(expired, key=lambda a: a.get("created_at", "")):
+        print(f"  LOST: {art.get('name')} (created_at={art.get('created_at')})")
+
+
+def _print_unpromoted(unpromoted: list[str], manifest: dict) -> None:
+    if not unpromoted:
+        return
+    print("\nNOT PROMOTED — questions with an artifact record that latest/ does not serve:")
+    # Report truncation, not analysis: the count above is exact and the tail is named.
+    for qid in unpromoted[:_SAMPLE_PRINT_LIMIT]:  # HARNESS-SCAN-EXEMPT-subsampling
+        print(f"  DEMOTED: qid={qid} (latest_source={manifest[qid].get('latest_source')})")
+    if len(unpromoted) > _SAMPLE_PRINT_LIMIT:
+        print(f"  ... and {len(unpromoted) - _SAMPLE_PRINT_LIMIT} more")
+
+
+def _print_failures(findings: CompletenessFindings, store_dir: Path) -> None:
+    """Name each FAIL condition that fired; every one of them exits non-zero."""
+    if findings.unpersisted:
+        print(
+            f"\nFAIL: {len(findings.unpersisted)} live artifact(s) are not in the local store "
+            f"({store_dir}) — run `make sync_all` to grab them before they expire."
+        )
+    if findings.genuine_gaps:
+        print("\nGAPS — live artifacts with research records NOT in the archive:")
+        for art in sorted(findings.genuine_gaps, key=lambda a: a.get("created_at", "")):
+            print(f"  GAP: {art.get('name')} (run_id={art.get('run_id')}, created_at={art.get('created_at')})")
+        print("\nFAIL: archive is missing capturable research from the artifacts above.")
+    if findings.unpromoted:
+        print("\nFAIL: the merge stage demoted captured artifact research on the questions above.")
+
+
+def _print_pass(findings: CompletenessFindings) -> None:
+    print(f"\nPASS: all {findings.represented + len(findings.empty_artifacts)} live artifacts represented in archive")
+    print(f"      ({findings.represented} with records, {len(findings.empty_artifacts)} legitimately empty).")
+    if findings.expired:
+        print(f"NOTE: {len(findings.expired)} artifact(s) already expired before any pull — see LOST list above.")
+
+
+def print_report(findings: CompletenessFindings, store_dir: Path) -> None:
+    """Print the whole verdict block; ``findings.failed`` carries the exit decision."""
+    _print_counts(findings)
+    _print_expired(findings.expired)
+    if findings.empty_artifacts:
+        _print_artifact_sample(
+            "Empty live artifacts (harvested fine but held no research records):",
+            findings.empty_artifacts,
+            "EMPTY",
+        )
+    _print_unpromoted(findings.unpromoted, findings.manifest)
+    if findings.unpersisted:
+        _print_artifact_sample(
+            "NOT PERSISTED — live artifacts whose only copy is still on GitHub's 90-day clock:",
+            findings.unpersisted,
+            "UNPERSISTED",
+        )
+    if findings.failed:
+        _print_failures(findings, store_dir)
+    else:
+        _print_pass(findings)
+    print("=" * 72)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verify the research archive captures every live GHA artifact.")
     parser.add_argument("--repo", default="No-Stream/metaculus-bot", help="GitHub repo")
@@ -177,107 +348,12 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-    output_dir = Path(args.output_dir)
     store_dir = Path(args.store_dir)
 
-    verify_gh_cli()
-
-    all_artifacts = list_research_artifacts(args.repo)
-    research = [a for a in all_artifacts if str(a.get("name", "")).startswith(RESEARCH_ARTIFACT_PREFIX)]
-    live = [a for a in research if not a.get("expired")]
-    expired = [a for a in research if a.get("expired")]
-
-    logger.info(f"GitHub: {len(research)} research-* artifacts ({len(live)} live, {len(expired)} expired)")
-
-    unpersisted = unpersisted_artifacts(live, store_dir)
-
-    manifest_path = output_dir / "manifest.json"
-    if not manifest_path.exists():
-        logger.error(f"No manifest at {manifest_path} — run `make sync_research` first.")
+    findings = gather_findings(args.repo, Path(args.output_dir), store_dir)
+    print_report(findings, store_dir)
+    if findings.failed:
         sys.exit(1)
-    manifest = json.loads(manifest_path.read_text())
-    archived_ids = archived_run_ids(output_dir)
-    logger.info(f"Archive: {len(manifest)} questions, {len(archived_ids)} distinct run_ids across by_qid/ versions")
-
-    # A live artifact is "represented" if its workflow_run id appears among archived run_ids.
-    missing: list[dict] = []
-    for art in live:
-        run_id = art.get("run_id")
-        if run_id is None or str(run_id) not in archived_ids:
-            missing.append(art)
-
-    # Distinguish genuine gaps (records exist on GitHub but not locally) from empty
-    # artifacts (the run produced no research records, so nothing to capture).
-    empty_artifacts: list[dict] = []
-    genuine_gaps: list[dict] = []
-    if missing:
-        logger.info(f"Classifying {len(missing)} unrepresented live artifact(s) as gap vs empty...")
-        with tempfile.TemporaryDirectory(prefix="verify_dl_") as tmpdir:
-            genuine_gaps, empty_artifacts = classify_gap_or_empty(missing, args.repo, store_dir, Path(tmpdir))
-
-    unpromoted = unpromoted_artifact_questions(manifest)
-
-    represented = len(live) - len(missing)
-    print("\n" + "=" * 72)
-    print("RESEARCH ARCHIVE COMPLETENESS CHECK")
-    print("=" * 72)
-    print(f"Live research artifacts on GitHub : {len(live)}")
-    print(f"Persisted in the local store       : {len(live) - len(unpersisted)}")
-    print(f"NOT persisted (at 90-day risk)     : {len(unpersisted)}")
-    print(f"Represented in local archive       : {represented}")
-    print(f"Empty artifacts (no records, OK)   : {len(empty_artifacts)}")
-    print(f"Genuine gaps (records NOT captured): {len(genuine_gaps)}")
-    print(f"Expired (unrecoverable, lost)      : {len(expired)}")
-    print(f"Captured but not promoted to latest: {len(unpromoted)}")
-
-    if expired:
-        # Deliberately UNCAPPED, unlike the lists below: this is the one section that
-        # reports permanent data loss, and the operator needs every name.
-        print("\nEXPIRED / LOST FOREVER (past 90-day retention):")
-        for art in sorted(expired, key=lambda a: a.get("created_at", "")):
-            print(f"  LOST: {art.get('name')} (created_at={art.get('created_at')})")
-
-    if empty_artifacts:
-        _print_artifact_sample(
-            "Empty live artifacts (harvested fine but held no research records):", empty_artifacts, "EMPTY"
-        )
-
-    if unpromoted:
-        print("\nNOT PROMOTED — questions with an artifact record that latest/ does not serve:")
-        # Report truncation, not analysis: the count above is exact and the tail is named.
-        for qid in unpromoted[:20]:  # HARNESS-SCAN-EXEMPT-subsampling
-            print(f"  DEMOTED: qid={qid} (latest_source={manifest[qid].get('latest_source')})")
-        if len(unpromoted) > 20:
-            print(f"  ... and {len(unpromoted) - 20} more")
-
-    if unpersisted:
-        _print_artifact_sample(
-            "NOT PERSISTED — live artifacts whose only copy is still on GitHub's 90-day clock:",
-            unpersisted,
-            "UNPERSISTED",
-        )
-
-    if genuine_gaps or unpromoted or unpersisted:
-        if unpersisted:
-            print(
-                f"\nFAIL: {len(unpersisted)} live artifact(s) are not in the local store "
-                f"({store_dir}) — run `make sync_all` to grab them before they expire."
-            )
-        if genuine_gaps:
-            print("\nGAPS — live artifacts with research records NOT in the archive:")
-            for art in sorted(genuine_gaps, key=lambda a: a.get("created_at", "")):
-                print(f"  GAP: {art.get('name')} (run_id={art.get('run_id')}, created_at={art.get('created_at')})")
-            print("\nFAIL: archive is missing capturable research from the artifacts above.")
-        if unpromoted:
-            print("\nFAIL: the merge stage demoted captured artifact research on the questions above.")
-        print("=" * 72)
-        sys.exit(1)
-
-    print(f"\nPASS: all {represented + len(empty_artifacts)} live artifacts represented in archive")
-    print(f"      ({represented} with records, {len(empty_artifacts)} legitimately empty).")
-    if expired:
-        print(f"NOTE: {len(expired)} artifact(s) already expired before any pull — see LOST list above.")
-    print("=" * 72)
 
 
 if __name__ == "__main__":

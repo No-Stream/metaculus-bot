@@ -17,6 +17,35 @@ class DirichletCI:
     ci_80_high: float
 
 
+def _validated_dirichlet_means(
+    option_probs: dict[str, float],
+    other_mass: float | None,
+) -> dict[str, float]:
+    """The full mean vector (options plus the ``Other`` bucket), validated as a ballot.
+
+    Every probability must be in [0, 1] and the whole ballot must sum to 1.0 within
+    0.02 — a ballot that does not sum to one is a caller bug, not something to renormalise
+    silently, because the renormalisation would move every option's mean.
+    """
+    total = 0.0
+    for k, v in option_probs.items():
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"option_probs[{k!r}]={v} not in [0,1]")
+        total += v
+
+    means_full = dict(option_probs)
+    if other_mass is not None:
+        if not (0.0 <= other_mass <= 1.0):
+            raise ValueError(f"other_mass must be in [0,1] (got {other_mass})")
+        total += other_mass
+        means_full["__OTHER__"] = other_mass
+
+    if abs(total - 1.0) > 0.02:
+        raise ValueError(f"option_probs (+ other_mass if present) must sum to 1.0 ± 0.02 (got {total})")
+
+    return means_full
+
+
 def dirichlet_with_other(
     option_probs: dict[str, float],
     other_mass: float | None,
@@ -27,25 +56,9 @@ def dirichlet_with_other(
     if concentration <= 0:
         raise ValueError(f"concentration must be > 0 (got {concentration})")
 
-    total = 0.0
-    for k, v in option_probs.items():
-        if not (0.0 <= v <= 1.0):
-            raise ValueError(f"option_probs[{k!r}]={v} not in [0,1]")
-        total += v
-
-    if other_mass is not None:
-        if not (0.0 <= other_mass <= 1.0):
-            raise ValueError(f"other_mass must be in [0,1] (got {other_mass})")
-        total += other_mass
-
-    if abs(total - 1.0) > 0.02:
-        raise ValueError(f"option_probs (+ other_mass if present) must sum to 1.0 ± 0.02 (got {total})")
+    means_full = _validated_dirichlet_means(option_probs, other_mass)
 
     # Build the alpha vector for the full Dirichlet with the means as given.
-    means_full = dict(option_probs)
-    if other_mass is not None:
-        means_full["__OTHER__"] = other_mass
-
     alphas = {k: concentration * m for k, m in means_full.items()}
     alpha_total = sum(alphas.values())
 

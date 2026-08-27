@@ -1319,6 +1319,7 @@ def stacking_numeric_prompt(
     question: NumericQuestion,
     research: str,
     base_predictions: list[str],
+    *,
     lower_bound_message: str,
     upper_bound_message: str,
     aggregated_tool_output: str | None = None,
@@ -1537,7 +1538,7 @@ def gap_fill_analyzer_prompt(
         7. Missing expert opinion — first pass asserts a claim that should have a
            named expert or institution behind it but does not cite one.
         8. Stale first-pass info — first pass appears drawn from training data rather
-           than current search (e.g., no {datetime.now().year} data on a near-term question).
+           than current search (e.g., no {datetime.now(UTC).year} data on a near-term question).
         9. Missing counter-evidence — first pass is one-sided; a "consider the
            opposite" search would strengthen the forecast.
 

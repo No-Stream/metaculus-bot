@@ -91,6 +91,7 @@ from metaculus_bot.ablation.run_stacker import (
 )
 from metaculus_bot.ablation.scoring import (
     PairedScore,
+    PairedStats,
     aggregate_paired,
     score_arm_for_qid,
 )
@@ -760,30 +761,43 @@ async def _stage_fetch(args: argparse.Namespace, cache: AblationCache, working: 
     """
     await asyncio.sleep(0)
     if args.qids:
-        existing = cache.read_qids_manifest()
-        # If every qid already in manifest, no fetch needed — load shims from manifest.
-        if all(qid in existing for qid in args.qids):
-            for qid in args.qids:
-                entry = existing[qid]
-                question = _build_question_shim_from_manifest_entry(qid, entry)
-                working.questions[qid] = question
-                working.ground_truths[qid] = _deserialize_ground_truth(entry["ground_truth"])
-            return
+        await _fetch_explicit_qids(args, cache, working)
+    else:
+        await _fetch_tournament_delta(args, cache, working)
 
-        # Some qids missing from manifest: fetch them via the per-qid loader.
-        questions, ground_truths = await load_questions_by_qids(args.qids)
-        new_entries: dict[int, dict] = {}
-        tournament = args.tournaments[0] if args.tournaments else DEFAULT_TOURNAMENTS[0]
-        for question in questions:
-            qid = question.id_of_question
-            gt = ground_truths[qid]
+
+async def _fetch_explicit_qids(args: argparse.Namespace, cache: AblationCache, working: WorkingSet) -> None:
+    """Hydrate ``args.qids`` from the manifest, fetching only the ones missing from it."""
+    existing = cache.read_qids_manifest()
+    # If every qid already in manifest, no fetch needed — load shims from manifest.
+    if all(qid in existing for qid in args.qids):
+        for qid in args.qids:
+            entry = existing[qid]
+            question = _build_question_shim_from_manifest_entry(qid, entry)
             working.questions[qid] = question
-            working.ground_truths[qid] = gt
-            new_entries[qid] = _build_manifest_entry(question, gt, tournament)
-        cache.append_qids_manifest(new_entries)
+            working.ground_truths[qid] = _deserialize_ground_truth(entry["ground_truth"])
         return
 
-    # No --qids: tournament fetch with append-extend semantics.
+    # Some qids missing from manifest: fetch them via the per-qid loader.
+    questions, ground_truths = await load_questions_by_qids(args.qids)
+    new_entries: dict[int, dict] = {}
+    tournament = args.tournaments[0] if args.tournaments else DEFAULT_TOURNAMENTS[0]
+    for question in questions:
+        qid = question.id_of_question
+        gt = ground_truths[qid]
+        working.questions[qid] = question
+        working.ground_truths[qid] = gt
+        new_entries[qid] = _build_manifest_entry(question, gt, tournament)
+    cache.append_qids_manifest(new_entries)
+
+
+async def _fetch_tournament_delta(args: argparse.Namespace, cache: AblationCache, working: WorkingSet) -> None:
+    """Tournament fetch with append-extend semantics.
+
+    Hydrates every already-known qid from the manifest, then fetches only the per-type
+    shortfall against the requested counts, dropping anything the manifest already has.
+    """
+    await asyncio.sleep(0)
     existing = cache.read_qids_manifest()
     existing_per_type = {"binary": 0, "multiple_choice": 0, "numeric": 0}
     for entry in existing.values():
@@ -856,6 +870,7 @@ async def _stage_research(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -914,6 +929,7 @@ async def _stage_prune(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -971,10 +987,41 @@ async def _stage_prune(
 # ---------------------------------------------------------------------------
 
 
+def _partition_screen_cache(
+    cache: AblationCache,
+    research_blobs: dict[int, str],
+    *,
+    force: bool,
+    spend: SpendReport,
+) -> tuple[dict[int, dict], list[int]]:
+    """Split the qids into (reusable cached verdicts, qids needing a fresh screen).
+
+    A cached verdict only counts when its ``research_blob_sha`` still matches the blob
+    on hand: a pre-C3 entry carrying no sha, or a stale sha after a re-prune, re-screens.
+    Bumps ``spend.cached_screen_hits`` for each reuse.
+    """
+    if force:
+        return {}, list(research_blobs.keys())
+
+    cached_verdicts: dict[int, dict] = {}
+    qids_needing_screen: list[int] = []
+    for qid, blob in research_blobs.items():
+        cached = cache.read_leakage_screen(qid)
+        if cached is not None and cached.get("research_blob_sha") == _research_blob_sha(blob):
+            cached_verdicts[qid] = cached
+            spend.cached_screen_hits += 1
+        else:
+            if cached is not None:
+                logger.info("screen | qid=%d cache stale (blob changed); re-screening", qid)
+            qids_needing_screen.append(qid)
+    return cached_verdicts, qids_needing_screen
+
+
 async def _stage_screen(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -990,21 +1037,7 @@ async def _stage_screen(
     ground_truths = {qid: working.ground_truths[qid] for qid in working.research_blobs if qid in working.ground_truths}
     research_blobs = dict(working.research_blobs)
 
-    cached_verdicts: dict[int, dict] = {}
-    qids_needing_screen: list[int] = []
-    if not force:
-        for qid in research_blobs:
-            cached = cache.read_leakage_screen(qid)
-            if cached is not None and cached.get("research_blob_sha") == _research_blob_sha(research_blobs[qid]):
-                cached_verdicts[qid] = cached
-                spend.cached_screen_hits += 1
-            else:
-                # Cache miss, missing sha (pre-C3 entry), or stale sha — re-screen.
-                if cached is not None:
-                    logger.info("screen | qid=%d cache stale (blob changed); re-screening", qid)
-                qids_needing_screen.append(qid)
-    else:
-        qids_needing_screen = list(research_blobs.keys())
+    cached_verdicts, qids_needing_screen = _partition_screen_cache(cache, research_blobs, force=force, spend=spend)
 
     fresh_verdicts: dict[int, dict] = {}
     if qids_needing_screen:
@@ -1154,6 +1187,7 @@ async def _stage_forecast(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -1263,6 +1297,7 @@ async def _stage_simple_agg(
     arm: str,
     working: WorkingSet,
     cache: AblationCache,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -1359,88 +1394,80 @@ async def _stage_pdf(
     working.stacker_payloads[ARM_PDF_MIN2] = {**cached_payloads, **results_min2}
 
 
-async def _stage_llm_stacker(
-    arm: str,
-    args: argparse.Namespace,
-    working: WorkingSet,
+def _partition_stacker_cache(
     cache: AblationCache,
+    qids: list[int],
+    arm: str,
+    *,
+    stacker_slug: str | None,
     force: bool,
     spend: SpendReport,
-) -> None:
-    """LLM stacker dispatch (stack/stack_aug). Uses run_stacker_batch."""
-    await asyncio.sleep(0)
-    qids = sorted(working.forecaster_payloads.keys())
-
-    # Per-stacker cache keying: stack/stack_aug payloads are slugged by the active
-    # stacker so a swap never clobbers another stacker's results.
-    stacker_slug = _active_stacker_slug(args)
+) -> tuple[dict[int, dict], list[int]]:
+    """Split the qids into (cached arm payloads, qids needing a stacker run)."""
+    if force:
+        return {}, list(qids)
 
     cached_payloads: dict[int, dict] = {}
     needs_run: list[int] = []
     for qid in qids:
-        if not force:
-            cached = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=stacker_slug)
-            if cached is not None:
-                cached_payloads[qid] = cached
-                spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
-                continue
-        needs_run.append(qid)
+        cached = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=stacker_slug)
+        if cached is not None:
+            cached_payloads[qid] = cached
+            spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
+        else:
+            needs_run.append(qid)
+    return cached_payloads, needs_run
 
-    fresh_results: dict[int, dict] = {}
-    if needs_run:
-        qid_to_data = {
-            qid: {
-                "question": working.questions[qid],
-                "research": working.research_blobs.get(qid, ""),
-                "forecaster_payloads": working.forecaster_payloads[qid],
-            }
-            for qid in needs_run
-        }
-        # Wire --plain-llm and --no-stacker-fallback into stacker construction.
-        # --lineup prod uses the opus-4.8 prod stacker (mirrors the prod-ish
-        # forecaster posture); other lineups keep the opus-4.5 default.
-        stacker_llm_kwarg: GeneralLlm | None = None
-        fallback_llm_kwarg: GeneralLlm | None = None
-        if getattr(args, "plain_llm", False):
-            from metaculus_bot.ablation.run_stacker import (  # noqa: PLC0415
-                _OPENAI_STACKER_KWARGS,
-                _OPUS_STACKER_KWARGS,
-                _PROD_STACKER_KWARGS,
-                DEFAULT_STACKER_FALLBACK_MODEL,
-                DEFAULT_STACKER_MODEL,
-                PROD_STACKER_MODEL,
-            )
 
-            if getattr(args, "lineup", "free") == "prod":
-                stacker_llm_kwarg = GeneralLlm(model=PROD_STACKER_MODEL, **_PROD_STACKER_KWARGS)
-            else:
-                stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
-            if not getattr(args, "no_stacker_fallback", False):
-                fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_OPENAI_STACKER_KWARGS)
-        elif getattr(args, "no_stacker_fallback", False):
-            # No fallback but still use the donated-key wrapper for primary.
-            fallback_llm_kwarg = None
+def _stacker_batch_kwargs(
+    args: argparse.Namespace,
+    *,
+    stacker_slug: str | None,
+    force: bool,
+) -> dict[str, Any]:
+    """Wire --plain-llm and --no-stacker-fallback into ``run_stacker_batch``'s kwargs.
 
-        batch_kwargs: dict[str, Any] = {
-            "stacker_slug": stacker_slug,
-            "force": force,
-            "concurrency": args.concurrency,
-        }
-        if stacker_llm_kwarg is not None:
-            batch_kwargs["stacker_llm"] = stacker_llm_kwarg
-        if getattr(args, "no_stacker_fallback", False):
-            batch_kwargs["fallback_stacker_llm"] = None
-        elif fallback_llm_kwarg is not None:
-            batch_kwargs["fallback_stacker_llm"] = fallback_llm_kwarg
-
-        fresh_results = await run_stacker_batch(
-            qid_to_data,
-            arm,
-            cache,
-            **batch_kwargs,
+    An omitted ``stacker_llm`` / ``fallback_stacker_llm`` key leaves the runner on its
+    own donated-key-wrapped defaults, which is why the keys are added conditionally
+    rather than passed as None: an explicit None means "no fallback chain".
+    ``--lineup prod`` uses the prod stacker (mirroring the prod-ish forecaster posture);
+    other lineups keep the opus default.
+    """
+    stacker_llm_kwarg: GeneralLlm | None = None
+    fallback_llm_kwarg: GeneralLlm | None = None
+    if getattr(args, "plain_llm", False):
+        from metaculus_bot.ablation.run_stacker import (  # noqa: PLC0415
+            _OPENAI_STACKER_KWARGS,
+            _OPUS_STACKER_KWARGS,
+            _PROD_STACKER_KWARGS,
+            DEFAULT_STACKER_FALLBACK_MODEL,
+            DEFAULT_STACKER_MODEL,
+            PROD_STACKER_MODEL,
         )
 
-    # Count LLM calls and fallback usage from fresh results.
+        if getattr(args, "lineup", "free") == "prod":
+            stacker_llm_kwarg = GeneralLlm(model=PROD_STACKER_MODEL, **_PROD_STACKER_KWARGS)
+        else:
+            stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
+        if not getattr(args, "no_stacker_fallback", False):
+            fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_OPENAI_STACKER_KWARGS)
+
+    batch_kwargs: dict[str, Any] = {
+        "stacker_slug": stacker_slug,
+        "force": force,
+        "concurrency": args.concurrency,
+    }
+    if stacker_llm_kwarg is not None:
+        batch_kwargs["stacker_llm"] = stacker_llm_kwarg
+    if getattr(args, "no_stacker_fallback", False):
+        batch_kwargs["fallback_stacker_llm"] = None
+    elif fallback_llm_kwarg is not None:
+        batch_kwargs["fallback_stacker_llm"] = fallback_llm_kwarg
+    return batch_kwargs
+
+
+def _record_stacker_spend(fresh_results: dict[int, dict], arm: str, spend: SpendReport) -> None:
+    """Count stacker + parser LLM calls and fallback usage from this arm's fresh results."""
     is_arm_a = arm == ARM_STACK
     for payload in fresh_results.values():
         used = payload["stacker_model_used"]
@@ -1456,6 +1483,46 @@ async def _stage_llm_stacker(
             else:
                 spend.fallback_stacker_stack_aug += 1
 
+
+async def _stage_llm_stacker(
+    arm: str,
+    args: argparse.Namespace,
+    working: WorkingSet,
+    cache: AblationCache,
+    *,
+    force: bool,
+    spend: SpendReport,
+) -> None:
+    """LLM stacker dispatch (stack/stack_aug). Uses run_stacker_batch."""
+    await asyncio.sleep(0)
+    qids = sorted(working.forecaster_payloads.keys())
+
+    # Per-stacker cache keying: stack/stack_aug payloads are slugged by the active
+    # stacker so a swap never clobbers another stacker's results.
+    stacker_slug = _active_stacker_slug(args)
+
+    cached_payloads, needs_run = _partition_stacker_cache(
+        cache, qids, arm, stacker_slug=stacker_slug, force=force, spend=spend
+    )
+
+    fresh_results: dict[int, dict] = {}
+    if needs_run:
+        qid_to_data = {
+            qid: {
+                "question": working.questions[qid],
+                "research": working.research_blobs.get(qid, ""),
+                "forecaster_payloads": working.forecaster_payloads[qid],
+            }
+            for qid in needs_run
+        }
+        fresh_results = await run_stacker_batch(
+            qid_to_data,
+            arm,
+            cache,
+            **_stacker_batch_kwargs(args, stacker_slug=stacker_slug, force=force),
+        )
+
+    _record_stacker_spend(fresh_results, arm, spend)
     working.stacker_payloads[arm] = {**cached_payloads, **fresh_results}
 
 
@@ -1463,17 +1530,18 @@ async def _stage_stack(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     arm: str,
     force: bool,
     spend: SpendReport,
 ) -> None:
     """Dispatcher for stacker arms. Routes to per-type implementation."""
     if arm in (ARM_MEDIAN, ARM_MEAN):
-        await _stage_simple_agg(arm, working, cache, force, spend)
+        await _stage_simple_agg(arm, working, cache, force=force, spend=spend)
     elif arm == ARM_PDF:
         await _stage_pdf(working, cache, force, spend)
     else:
-        await _stage_llm_stacker(arm, args, working, cache, force, spend)
+        await _stage_llm_stacker(arm, args, working, cache, force=force, spend=spend)
 
 
 # ---------------------------------------------------------------------------
@@ -1625,32 +1693,57 @@ def _build_report_shim(qid: int, question: Any, payload: dict) -> Any:
     raise ValueError(f"Unknown prediction type {pred_type} for qid {qid}")
 
 
-def _stage_score(
-    args: argparse.Namespace,
-    cache: AblationCache,
-    working: WorkingSet,
-) -> Path:
-    """Build paired scores, aggregate, render summary, write run + summary files.
+# Which cache arm each scoring-arm label reads from, in the canonical order
+# ``score_arm_for_qid`` requires its ``arm_reports`` list to arrive in.
+_SCORING_ARM_CACHE_KEYS: dict[str, str] = {
+    "stack": ARM_STACK,
+    "stack_aug": ARM_STACK_AUG,
+    "pdf_min1": ARM_PDF_MIN1,
+    "pdf_min2": ARM_PDF_MIN2,
+    "median": ARM_MEDIAN,
+    "mean": ARM_MEAN,
+}
+_SCORING_ARM_LABELS_6: tuple[str, ...] = ("stack", "stack_aug", "pdf_min1", "pdf_min2", "median", "mean")
+_SCORING_ARM_LABELS_5: tuple[str, ...] = ("stack", "stack_aug", "pdf_min1", "pdf_min2", "median")
+_SCORING_ARM_LABELS_3: tuple[str, ...] = ("stack", "stack_aug", "median")
 
-    Uses per-comparison N: each pairwise comparison only requires the two arms in
-    that comparison to have succeeded for a qid. A qid is included if at least 2
-    arms succeeded (enabling at least one comparison). This avoids collapsing N to
-    the 5-way intersection of all arms.
+
+def _scoring_arm_labels(*, has_pdf_arms: bool, has_mean_arm: bool) -> tuple[str, ...]:
+    """Which arms enter the paired comparison for this cache directory.
+
+    6-arm adds the deterministic mean arm on top of the 5-arm set, and is used only
+    when BOTH pdf AND mean payloads are present. Old free-tier cache dirs (pdf, no
+    mean) stay on the 5-arm path; pre-pdf data stays on the 3-arm path.
+    """
+    if has_pdf_arms and has_mean_arm:
+        return _SCORING_ARM_LABELS_6
+    if has_pdf_arms:
+        return _SCORING_ARM_LABELS_5
+    return _SCORING_ARM_LABELS_3
+
+
+def _arm_score_inputs(working: WorkingSet, qid: int, question: Any) -> dict[str, tuple[Any, dict | None]]:
+    """(report, payload) per scoring-arm label; report is None when the arm is missing or failed."""
+    inputs: dict[str, tuple[Any, dict | None]] = {}
+    for label, arm_key in _SCORING_ARM_CACHE_KEYS.items():
+        payload = working.stacker_payloads.get(arm_key, {}).get(qid)
+        report = _build_report_shim(qid, question, payload) if payload is not None and payload.get("success") else None
+        inputs[label] = (report, payload)
+    return inputs
+
+
+def _build_paired_scores(
+    working: WorkingSet,
+    qids: list[int],
+    arm_labels: tuple[str, ...],
+) -> tuple[list[PairedScore], int]:
+    """Score every qid that has at least 2 present arms; returns (rows, n_scored).
+
+    The 2-arm floor is counted over EVERY arm, not just the ones in ``arm_labels``,
+    so which qids clear the gate doesn't move when the cache directory gains an arm.
+    ``n_scored`` counts the qids that produced at least one comparison row.
     """
     paired_scores: list[PairedScore] = []
-    # Union of all qids that have ANY arm payload.
-    all_arm_keys = [ARM_STACK, ARM_STACK_AUG, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN, ARM_MEAN]
-    qid_set: set[int] = set()
-    for arm_key in all_arm_keys:
-        qid_set.update(working.stacker_payloads.get(arm_key, {}).keys())
-    qids = sorted(qid_set)
-    # Determine scoring mode. 5-arm is active when pdf payloads are present;
-    # 6-arm adds the deterministic mean arm on top, used only when BOTH pdf AND
-    # mean payloads are present. Old free-tier cache dirs (pdf, no mean) stay on
-    # the 5-arm path; pre-pdf data stays on the 3-arm path.
-    has_pdf_arms = bool(working.stacker_payloads.get(ARM_PDF_MIN1)) or bool(working.stacker_payloads.get(ARM_PDF_MIN2))
-    has_mean_arm = bool(working.stacker_payloads.get(ARM_MEAN))
-
     n_scored = 0
     for qid in qids:
         question = working.questions.get(qid)
@@ -1658,83 +1751,24 @@ def _stage_score(
         if question is None or gt is None:
             continue
 
-        # Build report for each arm: None if the arm is missing or failed.
-        def _report_or_none(payload: dict | None) -> Any:
-            if payload is None or not payload.get("success"):
-                return None
-            return _build_report_shim(qid, question, payload)
-
-        payload_stack = working.stacker_payloads.get(ARM_STACK, {}).get(qid)
-        payload_stack_aug = working.stacker_payloads.get(ARM_STACK_AUG, {}).get(qid)
-        payload_pdf_min1 = working.stacker_payloads.get(ARM_PDF_MIN1, {}).get(qid)
-        payload_pdf_min2 = working.stacker_payloads.get(ARM_PDF_MIN2, {}).get(qid)
-        payload_median = working.stacker_payloads.get(ARM_MEDIAN, {}).get(qid)
-        payload_mean = working.stacker_payloads.get(ARM_MEAN, {}).get(qid)
-
-        report_stack = _report_or_none(payload_stack)
-        report_stack_aug = _report_or_none(payload_stack_aug)
-        report_pdf_min1 = _report_or_none(payload_pdf_min1)
-        report_pdf_min2 = _report_or_none(payload_pdf_min2)
-        report_median = _report_or_none(payload_median)
-        report_mean = _report_or_none(payload_mean)
-
-        # Count present arms — need at least 2 for any comparison.
-        n_present = sum(
-            1
-            for r in [report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median, report_mean]
-            if r is not None
-        )
-        if n_present < 2:
+        arm_inputs = _arm_score_inputs(working, qid, question)
+        if sum(1 for report, _payload in arm_inputs.values() if report is not None) < 2:
             continue
 
-        if has_pdf_arms and has_mean_arm:
-            scores = score_arm_for_qid(
-                [
-                    ("stack", report_stack, payload_stack),
-                    ("stack_aug", report_stack_aug, payload_stack_aug),
-                    ("pdf_min1", report_pdf_min1, payload_pdf_min1),
-                    ("pdf_min2", report_pdf_min2, payload_pdf_min2),
-                    ("median", report_median, payload_median),
-                    ("mean", report_mean, payload_mean),
-                ],
-                gt,
-            )
-        elif has_pdf_arms:
-            scores = score_arm_for_qid(
-                [
-                    ("stack", report_stack, payload_stack),
-                    ("stack_aug", report_stack_aug, payload_stack_aug),
-                    ("pdf_min1", report_pdf_min1, payload_pdf_min1),
-                    ("pdf_min2", report_pdf_min2, payload_pdf_min2),
-                    ("median", report_median, payload_median),
-                ],
-                gt,
-            )
-        else:
-            scores = score_arm_for_qid(
-                [
-                    ("stack", report_stack, payload_stack),
-                    ("stack_aug", report_stack_aug, payload_stack_aug),
-                    ("median", report_median, payload_median),
-                ],
-                gt,
-            )
+        scores = score_arm_for_qid([(label, *arm_inputs[label]) for label in arm_labels], gt)
         if scores:
             n_scored += 1
         paired_scores.extend(scores)
+    return paired_scores, n_scored
 
-    stats = aggregate_paired(paired_scores, n_bootstrap=5000, seed=args.seed)
 
-    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    metadata = {
-        "timestamp": timestamp,
-        "n_questions": n_scored,
-        "tournaments": ", ".join(args.tournaments),
-        "resolved_after": args.resolved_after,
-    }
-    summary_md = render_summary_markdown(stats, paired_scores, metadata)
-
-    run_payload = {
+def _score_run_payload(
+    metadata: dict,
+    stats: list[PairedStats],
+    paired_scores: list[PairedScore],
+) -> dict:
+    """The machine-readable score-run record written alongside the markdown summary."""
+    return {
         "metadata": metadata,
         "stats": [
             {
@@ -1765,13 +1799,114 @@ def _stage_score(
             for s in paired_scores
         ],
     }
-    cache.write_score_run(timestamp, run_payload)
+
+
+def _stage_score(
+    args: argparse.Namespace,
+    cache: AblationCache,
+    working: WorkingSet,
+) -> Path:
+    """Build paired scores, aggregate, render summary, write run + summary files.
+
+    Uses per-comparison N: each pairwise comparison only requires the two arms in
+    that comparison to have succeeded for a qid. A qid is included if at least 2
+    arms succeeded (enabling at least one comparison). This avoids collapsing N to
+    the 5-way intersection of all arms.
+    """
+    # Union of all qids that have ANY arm payload.
+    qid_set: set[int] = set()
+    for arm_key in _SCORING_ARM_CACHE_KEYS.values():
+        qid_set.update(working.stacker_payloads.get(arm_key, {}).keys())
+
+    arm_labels = _scoring_arm_labels(
+        has_pdf_arms=bool(working.stacker_payloads.get(ARM_PDF_MIN1))
+        or bool(working.stacker_payloads.get(ARM_PDF_MIN2)),
+        has_mean_arm=bool(working.stacker_payloads.get(ARM_MEAN)),
+    )
+    paired_scores, n_scored = _build_paired_scores(working, sorted(qid_set), arm_labels)
+
+    stats = aggregate_paired(paired_scores, n_bootstrap=5000, seed=args.seed)
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    metadata = {
+        "timestamp": timestamp,
+        "n_questions": n_scored,
+        "tournaments": ", ".join(args.tournaments),
+        "resolved_after": args.resolved_after,
+    }
+    summary_md = render_summary_markdown(stats, paired_scores, metadata)
+    cache.write_score_run(timestamp, _score_run_payload(metadata, stats, paired_scores))
     return cache.write_score_summary(timestamp, summary_md)
 
 
 # ---------------------------------------------------------------------------
 # Top-level orchestrator
 # ---------------------------------------------------------------------------
+
+
+def _hydrate_research_artifacts(
+    cache: AblationCache,
+    working: WorkingSet,
+    qid: int,
+    *,
+    spend: SpendReport | None,
+) -> None:
+    """Load one qid's research + pruned-research artifacts into the working set.
+
+    Only the SANITIZED blob flows downstream — the raw blob stays on disk for QA-dump
+    inspection only. A qid whose prune failed (no cached pruned blob) must NOT be
+    eligible for forecast or later stages even when those stages are requested without
+    ``--stages prune``; the prune stage drops such qids from ``research_blobs``, and
+    leaving them out here mirrors that, so re-running downstream stages from cache
+    produces the same working set.
+    """
+    if cache.read_research(qid) is not None and spend is not None:
+        spend.cached_research_hits += 1
+    cached_pruned = cache.read_pruned_research(qid)
+    if cached_pruned is not None:
+        working.research_blobs[qid] = cached_pruned[0]
+        working.prune_metas[qid] = cached_pruned[1]
+        if spend is not None:
+            spend.cached_prune_hits += 1
+
+
+def _hydrate_screen_and_forecasters(
+    cache: AblationCache,
+    working: WorkingSet,
+    qid: int,
+    *,
+    spend: SpendReport | None,
+) -> None:
+    """Load one qid's leakage verdict + per-model forecaster payloads."""
+    verdict = cache.read_leakage_screen(qid)
+    if verdict is not None:
+        working.leakage_verdicts[qid] = verdict
+        if spend is not None:
+            spend.cached_screen_hits += 1
+    forecaster_payloads = cache.list_forecaster_outputs(qid)
+    if forecaster_payloads:
+        working.forecaster_payloads[qid] = forecaster_payloads
+        if spend is not None:
+            spend.cached_forecaster_hits += len(forecaster_payloads)
+
+
+def _hydrate_stacker_arms(
+    cache: AblationCache,
+    working: WorkingSet,
+    qid: int,
+    *,
+    spend: SpendReport | None,
+    stacker_slug: str | None,
+) -> None:
+    """Load one qid's payload for every arm that has one on disk."""
+    for arm in (ARM_STACK, ARM_STACK_AUG, ARM_PDF, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN, ARM_MEAN):
+        # Only the LLM-stacker arms are slugged; deterministic arms stay shared.
+        arm_slug = stacker_slug if arm in (ARM_STACK, ARM_STACK_AUG) else None
+        payload = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=arm_slug)
+        if payload is not None:
+            working.stacker_payloads.setdefault(arm, {})[qid] = payload
+            if spend is not None:
+                spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
 
 
 async def _hydrate_working_set_from_cache(
@@ -1794,47 +1929,13 @@ async def _hydrate_working_set_from_cache(
     untouched.
     """
     await asyncio.sleep(0)
-    manifest = cache.read_qids_manifest()
-    for qid_raw, entry in manifest.items():
+    for qid_raw, entry in cache.read_qids_manifest().items():
         qid = int(qid_raw)
-        question = _build_question_shim_from_manifest_entry(qid, entry)
-        gt = _deserialize_ground_truth(entry["ground_truth"])
-        working.questions[qid] = question
-        working.ground_truths[qid] = gt
-        cached_research = cache.read_research(qid)
-        if cached_research is not None and spend is not None:
-            spend.cached_research_hits += 1
-        cached_pruned = cache.read_pruned_research(qid)
-        if cached_pruned is not None:
-            # Only the sanitized blob flows downstream — the raw blob is kept
-            # on disk for QA-dump inspection only. If pruning failed for a qid
-            # (no cached pruned blob), it must NOT be eligible for forecast or
-            # later stages even when those stages are requested without
-            # ``--stages prune``. The original prune stage drops such qids
-            # from ``research_blobs``; we mirror that here so re-running
-            # downstream stages from cache produces the same working set.
-            working.research_blobs[qid] = cached_pruned[0]
-            working.prune_metas[qid] = cached_pruned[1]
-            if spend is not None:
-                spend.cached_prune_hits += 1
-        verdict = cache.read_leakage_screen(qid)
-        if verdict is not None:
-            working.leakage_verdicts[qid] = verdict
-            if spend is not None:
-                spend.cached_screen_hits += 1
-        forecaster_payloads = cache.list_forecaster_outputs(qid)
-        if forecaster_payloads:
-            working.forecaster_payloads[qid] = forecaster_payloads
-            if spend is not None:
-                spend.cached_forecaster_hits += len(forecaster_payloads)
-        for arm in (ARM_STACK, ARM_STACK_AUG, ARM_PDF, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN, ARM_MEAN):
-            # Only the LLM-stacker arms are slugged; deterministic arms stay shared.
-            arm_slug = stacker_slug if arm in (ARM_STACK, ARM_STACK_AUG) else None
-            payload = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=arm_slug)
-            if payload is not None:
-                working.stacker_payloads.setdefault(arm, {})[qid] = payload
-                if spend is not None:
-                    spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
+        working.questions[qid] = _build_question_shim_from_manifest_entry(qid, entry)
+        working.ground_truths[qid] = _deserialize_ground_truth(entry["ground_truth"])
+        _hydrate_research_artifacts(cache, working, qid, spend=spend)
+        _hydrate_screen_and_forecasters(cache, working, qid, spend=spend)
+        _hydrate_stacker_arms(cache, working, qid, spend=spend, stacker_slug=stacker_slug)
 
 
 def _filter_working_set_to_qids(working: WorkingSet, qids: list[int]) -> set[int]:
@@ -1943,6 +2044,228 @@ def _print_spend_report(spend: SpendReport, working: WorkingSet, summary_path: P
     print(border)
 
 
+@dataclass(frozen=True)
+class _StagePlan:
+    """Which stages this invocation runs, which are forced, and the inter-stage pause."""
+
+    requested: set[str]
+    forced: set[str]
+    sleep_seconds: float
+
+    def wants(self, stage: str) -> bool:
+        return stage in self.requested
+
+    def is_forced(self, stage: str) -> bool:
+        return stage in self.forced
+
+
+@dataclass(frozen=True)
+class _ArmStage:
+    """One aggregation arm's stage: how to announce it and where its payloads land."""
+
+    name: str  # --stages token and log label
+    arm: str  # ARM_* key handed to _stage_stack
+    report_arm: str  # arm whose payload count the DONE line reports
+    # Deterministic arms do zero API work: fixed ~1 min estimate, no inter-stage sleep.
+    # None marks the LLM-backed arms, which get a question-count estimate and a pause.
+    deterministic_note: str | None
+
+
+_ARM_STAGES: tuple[_ArmStage, ...] = (
+    _ArmStage("stack", ARM_STACK, ARM_STACK, None),
+    _ArmStage("stack_aug", ARM_STACK_AUG, ARM_STACK_AUG, None),
+    _ArmStage("pdf", ARM_PDF, ARM_PDF_MIN2, "deterministic structured-math"),
+    _ArmStage("median", ARM_MEDIAN, ARM_MEDIAN, "deterministic aggregation"),
+    _ArmStage("mean", ARM_MEAN, ARM_MEAN, "deterministic aggregation"),
+)
+
+
+def _qids_with_any_arm_payload(working: WorkingSet) -> set[int]:
+    """Union of qids carrying a payload for ANY arm.
+
+    Per-comparison N means scoring only needs SOME qids with >= 2 arm payloads, so the
+    gate is "any arm at all", not the intersection across arms.
+    """
+    all_arm_qids: set[int] = set()
+    for arm_payloads in working.stacker_payloads.values():
+        all_arm_qids.update(arm_payloads.keys())
+    return all_arm_qids
+
+
+def _apply_qids_filter(working: WorkingSet, qids: list[int] | None) -> None:
+    """Restrict the working set to ``qids``, logging any the manifest didn't have."""
+    if not qids:
+        return
+    missing = _filter_working_set_to_qids(working, qids)
+    if missing:
+        logger.error("--qids filter: %d qids not in working set: %s", len(missing), sorted(missing))
+
+
+async def _run_score_only(
+    args: argparse.Namespace, cache: AblationCache, working: WorkingSet, spend: SpendReport
+) -> int:
+    """``--stages score``: hydrate every artifact from disk and score, without spending.
+
+    Returns the process exit code — 2 when no qid has any arm payload at all, since
+    there is nothing to score and the operator asked for exactly that.
+    """
+    await _hydrate_working_set_from_cache(cache, working, spend=spend, stacker_slug=_active_stacker_slug(args))
+    _apply_qids_filter(working, args.qids)
+    if not _qids_with_any_arm_payload(working):
+        arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
+        logger.error(
+            "Cannot run 'score': zero qids have any stacker outputs %s.",
+            arm_counts,
+        )
+        print("ERROR: --stages score: zero qids have any arm payloads.")
+        return 2
+    summary_path = _stage_score(args, cache, working)
+    _print_spend_report(spend, working, summary_path)
+    return 0
+
+
+async def _run_research_stages(
+    args: argparse.Namespace,
+    cache: AblationCache,
+    working: WorkingSet,
+    *,
+    spend: SpendReport,
+    plan: _StagePlan,
+) -> None:
+    """Run the requested research / prune / screen stages in order."""
+    if plan.wants("research"):
+        n = len(working.questions)
+        # Gemini grounded search ~30s/qid, parallelism = args.concurrency.
+        est_seconds = max(30, n * 30 // max(1, args.concurrency))
+        logger.info("stage=research START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
+        await _stage_research(args, cache, working, force=plan.is_forced("research"), spend=spend)
+        logger.info("stage=research DONE | qids_with_blob=%d", len(working.research_blobs))
+        await asyncio.sleep(plan.sleep_seconds)
+
+    if plan.wants("prune"):
+        n = len(working.research_blobs)
+        # Redactor: ~30s/batch × ceil(n/batch_size).
+        n_batches = (n + PRUNE_DEFAULT_BATCH_SIZE - 1) // max(1, PRUNE_DEFAULT_BATCH_SIZE) if n else 0
+        est_seconds = max(30, n_batches * 30)
+        logger.info(
+            "stage=prune START | est wall-clock ~%d min (n=%d, batches=%d)", est_seconds // 60 + 1, n, n_batches
+        )
+        await _stage_prune(args, cache, working, force=plan.is_forced("prune"), spend=spend)
+        logger.info(
+            "stage=prune DONE | qids_with_sanitized_blob=%d | validation_failures=%d",
+            len(working.research_blobs),
+            spend.prune_validation_failures,
+        )
+        await asyncio.sleep(plan.sleep_seconds)
+
+    if plan.wants("screen"):
+        n = len(working.research_blobs)
+        est_seconds = max(15, n * 10 // max(1, args.concurrency))
+        logger.info("stage=screen START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
+        await _stage_screen(args, cache, working, force=plan.is_forced("screen"), spend=spend)
+        # Verdict dicts have a fixed schema; ``is_leaked`` always present.
+        n_leaked = sum(1 for v in working.leakage_verdicts.values() if v["is_leaked"])
+        logger.info("stage=screen DONE | leaked=%d clean=%d", n_leaked, len(working.research_blobs))
+        await asyncio.sleep(plan.sleep_seconds)
+
+
+async def _run_qa_iterate_stage(
+    args: argparse.Namespace,
+    cache: AblationCache,
+    working: WorkingSet,
+    *,
+    plan: _StagePlan,
+) -> None:
+    """Run the QA-iterate stage, raising in halt mode so the operator reviews first.
+
+    The inter-stage sleep happens BEFORE the halt-mode raise so the pause symmetry
+    matches advisory mode and the operator's preferred backoff is honored even when
+    halting right after the verifier batch. Halt is strict — it always blocks, even on
+    a fully-clean batch, so the QA summary is read before any forecast spend.
+    """
+    logger.info("stage=qa_iterate START mode=%s", args.qa_iterate_mode)
+    outcomes, qa_summary_path = await _stage_qa_iterate(args, cache, working, force=plan.is_forced("qa_iterate"))
+    n_clean = sum(1 for o in outcomes.values() if o.final_status == "clean")
+    n_rejected = len(outcomes) - n_clean
+    await asyncio.sleep(plan.sleep_seconds)
+    if args.qa_iterate_mode == "halt" and qa_summary_path is not None:
+        raise RuntimeError(
+            f"QA iteration halted: {n_rejected} rejects + {n_clean} clean qids. "
+            f"Review {qa_summary_path}. To resume after review:\n"
+            f"  1. (Optional) edit {cache.root}/manual_rejects.json to override rejects.\n"
+            f"  2. Run: --stages forecast,stack,stack_aug,pdf,median,score (note: this skips qa_iterate; "
+            f"manual_rejects is only consulted when qa_iterate is in --stages)."
+        )
+
+
+async def _run_forecast_stage(
+    args: argparse.Namespace,
+    cache: AblationCache,
+    working: WorkingSet,
+    *,
+    spend: SpendReport,
+    plan: _StagePlan,
+) -> None:
+    """Run the forecaster fan-out stage."""
+    n = len(working.research_blobs)
+    n_forecasters = len(FREE_FORECASTER_MODELS)
+    rl_kwargs = _rate_limit_mode_kwargs(args.rate_limit_mode)
+    per_forecaster_concurrency = max(1, rl_kwargs["per_forecaster_concurrency"])
+    # Forecaster: ~30s/call serially per question, parallelism =
+    # (per_question_concurrency × per_forecaster_concurrency).
+    per_question_seconds = (n_forecasters * 30) // per_forecaster_concurrency
+    global_parallel = max(1, args.concurrency)
+    est_seconds = max(60, n * per_question_seconds // global_parallel)
+    logger.info(
+        "stage=forecast START | est wall-clock ~%d min (n=%d × n_forecasters=%d / "
+        "per_forecaster_concurrency=%d / question_concurrency=%d)",
+        est_seconds // 60 + 1,
+        n,
+        n_forecasters,
+        per_forecaster_concurrency,
+        global_parallel,
+    )
+    await _stage_forecast(args, cache, working, force=plan.is_forced("forecast"), spend=spend)
+    logger.info("stage=forecast DONE | qids=%d", len(working.forecaster_payloads))
+    await asyncio.sleep(plan.sleep_seconds)
+
+
+async def _run_arm_stages(
+    args: argparse.Namespace,
+    cache: AblationCache,
+    working: WorkingSet,
+    *,
+    spend: SpendReport,
+    plan: _StagePlan,
+) -> None:
+    """Run each requested aggregation arm, in ``_ARM_STAGES`` order."""
+    for stage in _ARM_STAGES:
+        if not plan.wants(stage.name):
+            continue
+        n = len(working.forecaster_payloads)
+        if stage.deterministic_note is None:
+            est_seconds = max(30, n * 30 // max(1, args.concurrency))
+            logger.info("stage=%s START | est wall-clock ~%d min (n=%d)", stage.name, est_seconds // 60 + 1, n)
+        else:
+            logger.info("stage=%s START | est wall-clock ~1 min (n=%d, %s)", stage.name, n, stage.deterministic_note)
+        await _stage_stack(args, cache, working, arm=stage.arm, force=plan.is_forced(stage.name), spend=spend)
+        logger.info("stage=%s DONE | qids=%d", stage.name, len(working.stacker_payloads.get(stage.report_arm, {})))
+        if stage.deterministic_note is None:
+            await asyncio.sleep(plan.sleep_seconds)
+
+
+def _run_score_stage(args: argparse.Namespace, cache: AblationCache, working: WorkingSet) -> Path | None:
+    """Score the run, or return None (after a WARN) when no arm produced any payload."""
+    logger.info("stage=score START")
+    if not _qids_with_any_arm_payload(working):
+        arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
+        logger.warning("score | no qids have any arm payloads %s; skipping", arm_counts)
+        return None
+    summary_path = _stage_score(args, cache, working)
+    logger.info("stage=score DONE | summary=%s", summary_path)
+    return summary_path
+
+
 async def run_ablation(args: argparse.Namespace) -> int:
     """Top-level orchestrator. Returns process exit code (0 OK, 1 partial, 2 fatal config)."""
     if args.rate_limit_mode == "patient" and args.concurrency > 1:
@@ -1961,86 +2284,25 @@ async def run_ablation(args: argparse.Namespace) -> int:
     working = WorkingSet()
     spend = SpendReport()
 
-    requested = set(args.stages)
     forced_explicit = set(args.force_stages)
     forced = _expand_forced_stages(forced_explicit)
     if forced != forced_explicit:
         logger.info("forced stages (after cascade): %s", sorted(forced))
+    plan = _StagePlan(requested=set(args.stages), forced=forced, sleep_seconds=args.per_question_sleep)
 
-    sleep_seconds = args.per_question_sleep
-    score_only = requested == {"score"}
-
-    if score_only:
-        await _hydrate_working_set_from_cache(cache, working, spend=spend, stacker_slug=_active_stacker_slug(args))
-        if args.qids:
-            missing = _filter_working_set_to_qids(working, args.qids)
-            if missing:
-                logger.error("--qids filter: %d qids not in working set: %s", len(missing), sorted(missing))
-        # Per-comparison N: only need at least some qids with >= 2 arm payloads.
-        all_arm_qids: set[int] = set()
-        for arm_payloads in working.stacker_payloads.values():
-            all_arm_qids.update(arm_payloads.keys())
-        if not all_arm_qids:
-            arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
-            logger.error(
-                "Cannot run 'score': zero qids have any stacker outputs %s.",
-                arm_counts,
-            )
-            print("ERROR: --stages score: zero qids have any arm payloads.")
-            return 2
-        summary_path = _stage_score(args, cache, working)
-        _print_spend_report(spend, working, summary_path)
-        return 0
+    if plan.requested == {"score"}:
+        return await _run_score_only(args, cache, working, spend)
 
     # Full pipeline (or any subset that includes upstream stages).
-    if "fetch" in requested:
+    if plan.wants("fetch"):
         logger.info("stage=fetch START")
         await _stage_fetch(args, cache, working)
         logger.info("stage=fetch DONE | qids=%d", len(working.questions))
     else:
         await _hydrate_working_set_from_cache(cache, working, stacker_slug=_active_stacker_slug(args))
-        if args.qids:
-            missing = _filter_working_set_to_qids(working, args.qids)
-            if missing:
-                logger.error("--qids filter: %d qids not in working set: %s", len(missing), sorted(missing))
+        _apply_qids_filter(working, args.qids)
 
-    if "research" in requested:
-        n = len(working.questions)
-        # Gemini grounded search ~30s/qid, parallelism = args.concurrency.
-        est_seconds = max(30, n * 30 // max(1, args.concurrency))
-        logger.info("stage=research START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
-        force = "research" in forced
-        await _stage_research(args, cache, working, force=force, spend=spend)
-        logger.info("stage=research DONE | qids_with_blob=%d", len(working.research_blobs))
-        await asyncio.sleep(sleep_seconds)
-
-    if "prune" in requested:
-        n = len(working.research_blobs)
-        # Redactor: ~30s/batch × ceil(n/batch_size).
-        n_batches = (n + PRUNE_DEFAULT_BATCH_SIZE - 1) // max(1, PRUNE_DEFAULT_BATCH_SIZE) if n else 0
-        est_seconds = max(30, n_batches * 30)
-        logger.info(
-            "stage=prune START | est wall-clock ~%d min (n=%d, batches=%d)", est_seconds // 60 + 1, n, n_batches
-        )
-        force = "prune" in forced
-        await _stage_prune(args, cache, working, force=force, spend=spend)
-        logger.info(
-            "stage=prune DONE | qids_with_sanitized_blob=%d | validation_failures=%d",
-            len(working.research_blobs),
-            spend.prune_validation_failures,
-        )
-        await asyncio.sleep(sleep_seconds)
-
-    if "screen" in requested:
-        n = len(working.research_blobs)
-        est_seconds = max(15, n * 10 // max(1, args.concurrency))
-        logger.info("stage=screen START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
-        force = "screen" in forced
-        await _stage_screen(args, cache, working, force=force, spend=spend)
-        # Verdict dicts have a fixed schema; ``is_leaked`` always present.
-        n_leaked = sum(1 for v in working.leakage_verdicts.values() if v["is_leaked"])
-        logger.info("stage=screen DONE | leaked=%d clean=%d", n_leaked, len(working.research_blobs))
-        await asyncio.sleep(sleep_seconds)
+    await _run_research_stages(args, cache, working, spend=spend, plan=plan)
 
     if args.qa_research:
         qa_path = _stage_qa_research_dump(args, cache, working)
@@ -2048,106 +2310,15 @@ async def run_ablation(args: argparse.Namespace) -> int:
         _print_spend_report(spend, working, summary_path=None)
         return 0
 
-    if "qa_iterate" in requested:
-        logger.info("stage=qa_iterate START mode=%s", args.qa_iterate_mode)
-        outcomes, qa_summary_path = await _stage_qa_iterate(args, cache, working, force="qa_iterate" in forced)
-        n_clean = sum(1 for o in outcomes.values() if o.final_status == "clean")
-        n_rejected = len(outcomes) - n_clean
-        # Sleep BEFORE the halt-mode raise so the inter-stage pause symmetry
-        # matches advisory mode and so the operator's preferred backoff time
-        # is honored even when halting after the verifier batch.
-        await asyncio.sleep(sleep_seconds)
-        # Strict halt: always block in halt mode so the operator reviews the QA
-        # summary before forecast spend, even on a fully-clean batch. Resume with
-        # --stages forecast,stack,stack_aug,pdf,median,score after review.
-        if args.qa_iterate_mode == "halt" and qa_summary_path is not None:
-            raise RuntimeError(
-                f"QA iteration halted: {n_rejected} rejects + {n_clean} clean qids. "
-                f"Review {qa_summary_path}. To resume after review:\n"
-                f"  1. (Optional) edit {cache.root}/manual_rejects.json to override rejects.\n"
-                f"  2. Run: --stages forecast,stack,stack_aug,pdf,median,score (note: this skips qa_iterate; "
-                f"manual_rejects is only consulted when qa_iterate is in --stages)."
-            )
+    if plan.wants("qa_iterate"):
+        await _run_qa_iterate_stage(args, cache, working, plan=plan)
 
-    if "forecast" in requested:
-        n = len(working.research_blobs)
-        n_forecasters = len(FREE_FORECASTER_MODELS)
-        rl_kwargs = _rate_limit_mode_kwargs(args.rate_limit_mode)
-        per_forecaster_concurrency = max(1, rl_kwargs["per_forecaster_concurrency"])
-        # Forecaster: ~30s/call serially per question, parallelism =
-        # (per_question_concurrency × per_forecaster_concurrency).
-        per_question_seconds = (n_forecasters * 30) // per_forecaster_concurrency
-        global_parallel = max(1, args.concurrency)
-        est_seconds = max(60, n * per_question_seconds // global_parallel)
-        logger.info(
-            "stage=forecast START | est wall-clock ~%d min (n=%d × n_forecasters=%d / "
-            "per_forecaster_concurrency=%d / question_concurrency=%d)",
-            est_seconds // 60 + 1,
-            n,
-            n_forecasters,
-            per_forecaster_concurrency,
-            global_parallel,
-        )
-        force = "forecast" in forced
-        await _stage_forecast(args, cache, working, force=force, spend=spend)
-        logger.info("stage=forecast DONE | qids=%d", len(working.forecaster_payloads))
-        await asyncio.sleep(sleep_seconds)
+    if plan.wants("forecast"):
+        await _run_forecast_stage(args, cache, working, spend=spend, plan=plan)
 
-    if "stack" in requested:
-        n = len(working.forecaster_payloads)
-        est_seconds = max(30, n * 30 // max(1, args.concurrency))
-        logger.info("stage=stack START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
-        force = "stack" in forced
-        await _stage_stack(args, cache, working, arm=ARM_STACK, force=force, spend=spend)
-        logger.info("stage=stack DONE | qids=%d", len(working.stacker_payloads.get(ARM_STACK, {})))
-        await asyncio.sleep(sleep_seconds)
+    await _run_arm_stages(args, cache, working, spend=spend, plan=plan)
 
-    if "stack_aug" in requested:
-        n = len(working.forecaster_payloads)
-        est_seconds = max(30, n * 30 // max(1, args.concurrency))
-        logger.info("stage=stack_aug START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
-        force = "stack_aug" in forced
-        await _stage_stack(args, cache, working, arm=ARM_STACK_AUG, force=force, spend=spend)
-        logger.info("stage=stack_aug DONE | qids=%d", len(working.stacker_payloads.get(ARM_STACK_AUG, {})))
-        await asyncio.sleep(sleep_seconds)
-
-    if "pdf" in requested:
-        n = len(working.forecaster_payloads)
-        logger.info("stage=pdf START | est wall-clock ~1 min (n=%d, deterministic structured-math)", n)
-        force = "pdf" in forced
-        await _stage_stack(args, cache, working, arm=ARM_PDF, force=force, spend=spend)
-        logger.info("stage=pdf DONE | qids=%d", len(working.stacker_payloads.get(ARM_PDF_MIN2, {})))
-        # No inter-stage sleep — ARM_PDF does zero API work.
-
-    if "median" in requested:
-        n = len(working.forecaster_payloads)
-        logger.info("stage=median START | est wall-clock ~1 min (n=%d, deterministic aggregation)", n)
-        force = "median" in forced
-        await _stage_stack(args, cache, working, arm=ARM_MEDIAN, force=force, spend=spend)
-        logger.info("stage=median DONE | qids=%d", len(working.stacker_payloads.get(ARM_MEDIAN, {})))
-        # No inter-stage sleep — ARM_MEDIAN does zero API work.
-
-    if "mean" in requested:
-        n = len(working.forecaster_payloads)
-        logger.info("stage=mean START | est wall-clock ~1 min (n=%d, deterministic aggregation)", n)
-        force = "mean" in forced
-        await _stage_stack(args, cache, working, arm=ARM_MEAN, force=force, spend=spend)
-        logger.info("stage=mean DONE | qids=%d", len(working.stacker_payloads.get(ARM_MEAN, {})))
-        # No inter-stage sleep — ARM_MEAN does zero API work.
-
-    summary_path: Path | None = None
-    if "score" in requested:
-        logger.info("stage=score START")
-        all_arm_qids = set()
-        for arm_payloads in working.stacker_payloads.values():
-            all_arm_qids.update(arm_payloads.keys())
-        if not all_arm_qids:
-            arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
-            logger.warning("score | no qids have any arm payloads %s; skipping", arm_counts)
-        else:
-            summary_path = _stage_score(args, cache, working)
-            logger.info("stage=score DONE | summary=%s", summary_path)
-
+    summary_path = _run_score_stage(args, cache, working) if plan.wants("score") else None
     _print_spend_report(spend, working, summary_path)
     return 0
 
@@ -2172,7 +2343,9 @@ def _configure_logging(args: argparse.Namespace, cache_dir: Path) -> Path:
     """
     logs_dir = cache_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # astimezone() attaches the local zone without shifting the wall clock, so the
+    # run-log filename stays local-time (what the operator greps) and tz-aware.
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     log_path = logs_dir / f"run_{timestamp}.log"
 
     level = getattr(logging, args.log_level.upper())

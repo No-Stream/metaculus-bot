@@ -247,10 +247,10 @@ def _band_line(
     kind: str,
     clock: SeriesClock,
     h: int,
+    *,
     lookback_years: int,
     band: tuple[float, float, float],
     last: float,
-    *,
     n_windows: int,
     n_eff: int,
 ) -> str:
@@ -264,22 +264,15 @@ def _band_line(
     )
 
 
-def _render_single(
-    series: pd.Series,
-    *,
+def _latest_value_lines(
     route: _Route,
+    series: pd.Series,
+    derived: pd.Series,
+    *,
+    clock: SeriesClock,
     ceiling: date,
-    calendar_days: int,
-    window_start: date | None = None,
-) -> tuple[str, tuple[float, float, float] | None]:
-    """Return the rendered section text and the P10/P50/P90 band actually rendered (the
-    floor-lifted band for a max-window question), or ``None`` when no band was emitted
-    (not a model target, or the horizon exceeds available history). The caller uses the
-    band for the bounds-overlap backstop so it checks exactly what the forecaster sees."""
-    # Everything downstream operates on the DERIVED quantity the question resolves on
-    # (level×scale for plain/unit-converted levels; MoM change / MoM % / monthly average
-    # for the derived shapes). For plain level (scale=1.0) `derived` IS `series`, so the
-    # level path is byte-identical to before.
+) -> list[str]:
+    """Header line (latest value + as-of date), the route note, and the stale-latest warning."""
     raw_last = float(series.iloc[-1])
     raw_last_ts = pd.DatetimeIndex(series.index)[-1]
     raw_last_date = raw_last_ts.strftime("%Y-%m-%d")
@@ -288,25 +281,9 @@ def _render_single(
     # ceiling matches a completed historical bar, which _today_utc keeps unmarked). The
     # empirical band anchors on this value, so the reader is told it can still move.
     partial_suffix = " — today's bar, in progress" if raw_last_ts.date() == ceiling == _today_utc() else ""
-    derived = _apply_derivation(series, route.derivation, route.scale)
-    is_derived = route.derivation != "level"
-    # MoM change / MoM % / monthly-average all collapse to a monthly effective clock (enforced
-    # in `_apply_derivation`, which refuses a non-monthly source for the row-wise mom_* shapes);
-    # the horizon and band are computed on that, matching the replay's build_target_series.
-    # Everything else reads BOTH clock facts off the series: `freq` alone can't tell a
-    # business-day series from a 24/7 one, and the horizon conversion needs that (see
-    # `SeriesClock`).
-    clock = MONTHLY_CLOCK if is_derived else series_clock(pd.DatetimeIndex(derived.index))
-    freq: Freq = clock.freq
     last = float(derived.iloc[-1])
-    h = horizon_steps(clock, calendar_days)
-    y = derived.to_numpy(dtype="float64")
-    use_log = bool(np.all(y > 0.0))
-    # A forward-window-max question (from title framing OR a High-column yfinance spec)
-    # resolves on the max over the window, not the period-end level.
-    is_max = route.is_max or route.spec.column == "High"
-
-    if is_derived:
+    freq: Freq = clock.freq
+    if route.derivation != "level":
         parts: list[str] = [
             f"**{route.label}** — latest derived value {_fmt(last)} "
             f"({_DERIVED_TARGET_DESC[route.derivation]}; from raw level {_fmt(raw_last)} "
@@ -318,7 +295,7 @@ def _render_single(
         ]
     if route.note:
         parts.append(f"- Note: {route.note}")
-    if clock.freq == "daily":
+    if freq == "daily":
         stale_age = stale_latest_age_days(raw_last_ts.date(), ceiling, clock.periods_per_year)
         if stale_age is not None:
             parts.append(
@@ -329,13 +306,30 @@ def _render_single(
                 f"FINANCIAL_STALE_LATEST: surface=ts_anchor symbol={route.spec.series_id} "
                 f"age_d={stale_age} cadence={clock.step_unit}"
             )
+    return parts
 
-    if is_derived:
-        parts.extend(_multi_res_history(derived, freq, monthly_header=_DERIVED_HISTORY_HEADER[route.derivation]))
-    else:
-        parts.extend(_multi_res_history(derived, freq))
-        parts.append(_fifty_two_week_line(derived, ceiling, last))
 
+def _band_section_lines(
+    derived: pd.Series,
+    route: _Route,
+    *,
+    clock: SeriesClock,
+    h: int,
+    use_log: bool,
+    ceiling: date,
+    window_start: date | None,
+) -> tuple[list[str], tuple[float, float, float] | None]:
+    """The empirical-band lines plus the band actually rendered (floor-lifted on a max window).
+
+    The band is ``None`` when none was emitted: not a model target, a series cadence the
+    freq buckets misdescribe, or a horizon longer than the available history.
+    """
+    parts: list[str] = []
+    last = float(derived.iloc[-1])
+    y = derived.to_numpy(dtype="float64")
+    # A forward-window-max question (from title framing OR a High-column yfinance spec)
+    # resolves on the max over the window, not the period-end level.
+    is_max = route.is_max or route.spec.column == "High"
     band: tuple[float, float, float] | None = None
     cadence_ok = clock_matches_cadence(clock, pd.DatetimeIndex(derived.index))
     if not cadence_ok and route.model_target:
@@ -363,35 +357,73 @@ def _render_single(
                     f"(the resolution window has already started; a forward max can only rise from here)."
                 )
             # sliding_window_view over length-(h+1) windows yields y.size - h forward windows.
-            parts.append(
-                _band_line(
-                    "forward-max",
-                    clock,
-                    h,
-                    TS_ANCHOR_LOOKBACK_YEARS,
-                    band,
-                    last,
-                    n_windows=int(y.size) - h,
-                    n_eff=n_eff,
-                )
-            )
+            kind = "forward-max"
         else:
             band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
             # y[:-h] vs y[h:] pairs yield y.size - h overlapping h-step changes.
-            parts.append(
-                _band_line(
-                    "change",
-                    clock,
-                    h,
-                    TS_ANCHOR_LOOKBACK_YEARS,
-                    band,
-                    last,
-                    n_windows=int(y.size) - h,
-                    n_eff=n_eff,
-                )
+            kind = "change"
+        parts.append(
+            _band_line(
+                kind,
+                clock,
+                h,
+                lookback_years=TS_ANCHOR_LOOKBACK_YEARS,
+                band=band,
+                last=last,
+                n_windows=int(y.size) - h,
+                n_eff=n_eff,
             )
+        )
     elif route.model_target:
         parts.append(f"- (Horizon {h} exceeds available history; empirical band withheld.)")
+    return parts, band
+
+
+def _render_single(
+    series: pd.Series,
+    *,
+    route: _Route,
+    ceiling: date,
+    calendar_days: int,
+    window_start: date | None = None,
+) -> tuple[str, tuple[float, float, float] | None]:
+    """Return the rendered section text and the P10/P50/P90 band actually rendered (the
+    floor-lifted band for a max-window question), or ``None`` when no band was emitted
+    (not a model target, or the horizon exceeds available history). The caller uses the
+    band for the bounds-overlap backstop so it checks exactly what the forecaster sees."""
+    # Everything downstream operates on the DERIVED quantity the question resolves on
+    # (level×scale for plain/unit-converted levels; MoM change / MoM % / monthly average
+    # for the derived shapes). For plain level (scale=1.0) `derived` IS `series`, so the
+    # level path is byte-identical to before.
+    derived = _apply_derivation(series, route.derivation, route.scale)
+    is_derived = route.derivation != "level"
+    # MoM change / MoM % / monthly-average all collapse to a monthly effective clock (enforced
+    # in `_apply_derivation`, which refuses a non-monthly source for the row-wise mom_* shapes);
+    # the horizon and band are computed on that, matching the replay's build_target_series.
+    # Everything else reads BOTH clock facts off the series: `freq` alone can't tell a
+    # business-day series from a 24/7 one, and the horizon conversion needs that (see
+    # `SeriesClock`).
+    clock = MONTHLY_CLOCK if is_derived else series_clock(pd.DatetimeIndex(derived.index))
+    h = horizon_steps(clock, calendar_days)
+    use_log = bool(np.all(derived.to_numpy(dtype="float64") > 0.0))
+
+    parts = _latest_value_lines(route, series, derived, clock=clock, ceiling=ceiling)
+    if is_derived:
+        parts.extend(_multi_res_history(derived, clock.freq, monthly_header=_DERIVED_HISTORY_HEADER[route.derivation]))
+    else:
+        parts.extend(_multi_res_history(derived, clock.freq))
+        parts.append(_fifty_two_week_line(derived, ceiling, float(derived.iloc[-1])))
+
+    band_lines, band = _band_section_lines(
+        derived,
+        route,
+        clock=clock,
+        h=h,
+        use_log=use_log,
+        ceiling=ceiling,
+        window_start=window_start,
+    )
+    parts.extend(band_lines)
 
     if clock.freq == "daily" and use_log:
         vol_line = _realized_vol_line(derived, clock)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 
@@ -40,7 +40,7 @@ def make_success_payload(
         "cross_model_aggregation": cross_model_aggregation,
         "stacker_model_used": model_used,
         "n_forecasters_used": n_forecasters,
-        "ran_at": datetime.now().isoformat(),
+        "ran_at": datetime.now(UTC).isoformat(),
         "tools_enabled_at_runtime": tools_enabled,
         "errors": errors or [],
     }
@@ -69,7 +69,7 @@ def make_error_payload(
         "cross_model_aggregation": cross_model_aggregation,
         "stacker_model_used": model_used,
         "n_forecasters_used": n_forecasters,
-        "ran_at": datetime.now().isoformat(),
+        "ran_at": datetime.now(UTC).isoformat(),
         "tools_enabled_at_runtime": tools_enabled,
         "errors": errors or [],
     }

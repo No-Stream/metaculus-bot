@@ -151,6 +151,127 @@ def compute_production_vs_median_delta(record: dict) -> float | None:
     return None
 
 
+# Percentile LABELS (raw 0-100 numbers as parsed from comments) at which numeric
+# disagreement is measured: the 10th, 50th, and 90th. Looked up by label so growing the
+# standard percentile set can't shift them.
+_NUMERIC_KEY_LABELS: tuple[float, ...] = (10.0, 50.0, 90.0)
+
+
+def _base_or_per_model_forecasts(record: dict) -> dict:
+    """Per-base-model forecasts when present, else the (possibly collapsed) per-model ones.
+
+    On a stacked record ``per_model_forecasts`` holds only the stacker's single
+    aggregate, so the base-model field is preferred wherever it was recovered.
+    """
+    per_base_model = record.get("per_base_model_forecasts") or {}
+    return per_base_model if per_base_model else (record.get("per_model_forecasts") or {})
+
+
+def _binary_spread_exceeded(record: dict) -> bool | None:
+    """Whether the members' binary probability RANGE clears the production threshold."""
+    probs = [p for p in (_parse_probability(v) for v in _base_or_per_model_forecasts(record).values()) if p is not None]
+    if len(probs) < 2:
+        return None
+    return (max(probs) - min(probs)) > CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD
+
+
+def _mc_spread_exceeded(record: dict) -> bool | None:
+    """Whether the widest PER-OPTION spread clears the production threshold.
+
+    The collector emits MC option vectors as {model: {option: prob}}. A non-dict value
+    means the MC option parser found nothing and the collector fell back to single-string
+    forecasts — no option vectors, so nothing to measure.
+    """
+    model_option_dicts = [v for v in _base_or_per_model_forecasts(record).values() if isinstance(v, dict)]
+    if len(model_option_dicts) < 2:
+        return None
+
+    option_probs: dict[str, list[float]] = {}
+    for model_options in model_option_dicts:
+        for name, prob in model_options.items():
+            if prob is not None:
+                option_probs.setdefault(name, []).append(float(prob))
+
+    spreads = [max(probs) - min(probs) for probs in option_probs.values() if len(probs) >= 2]
+    if not spreads:
+        return None
+    return max(spreads) > CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD
+
+
+def _scoreable_label_maps(record: dict) -> list[dict[float, float]]:
+    """Member label→value maps dense enough to measure, and carrying every key label.
+
+    This branch consumes lenient historical data (>= MIN_SCOREABLE_ANCHORS percentiles,
+    possibly non-standard), so a per-model label dict is used rather than the strict
+    PercentileSet value object. The floor is the shared constant in ``parsing``, counted
+    the way its docstring defines it — DISTINCT labels via ``declared_anchors``, exactly
+    as ``ranking_cohort`` and ``analysis.max_step_clamp_screen`` count it. Comment prose
+    can restate a member's whole set, so the raw pair count overstates density.
+    """
+    model_maps: list[dict[float, float]] = []
+    for model_pcts in (record.get("per_model_numeric_percentiles") or {}).values():
+        anchors, _ = declared_anchors(model_pcts)
+        if len(anchors) < MIN_SCOREABLE_ANCHORS:
+            continue
+        label_to_value = {round(label, 6): value for label, value in anchors.items()}
+        if all(round(label, 6) in label_to_value for label in _NUMERIC_KEY_LABELS):
+            model_maps.append(label_to_value)
+    return model_maps
+
+
+def _closed_question_width(scaling: dict, *, open_lower: object, open_upper: object) -> float | None:
+    """The question's own finite width, or None when a bound is open, absent, or infinite."""
+    if open_lower or open_upper:
+        return None
+    range_min = scaling.get("range_min")
+    range_max = scaling.get("range_max")
+    if range_min is None or range_max is None:
+        return None
+    if not math.isfinite(range_min) or not math.isfinite(range_max):
+        return None
+    return range_max - range_min
+
+
+def _numeric_spread_denominator(record: dict, model_maps: list[dict[float, float]]) -> float:
+    """What the raw percentile spread is normalized by: the question range, else the
+    members' own median P10-P90 span (the only scale available on an open bound).
+    """
+    scaling = record.get("scaling") or {}
+    question_width = _closed_question_width(
+        scaling,
+        open_lower=record.get("open_lower_bound", scaling.get("open_lower_bound", False)),
+        open_upper=record.get("open_upper_bound", scaling.get("open_upper_bound", False)),
+    )
+    if question_width is not None:
+        return question_width
+
+    p10_values = [m[round(10.0, 6)] for m in model_maps]
+    p90_values = [m[round(90.0, 6)] for m in model_maps]
+    return statistics.median(p90_values) - statistics.median(p10_values)
+
+
+def _numeric_spread_exceeded(record: dict) -> bool | None:
+    """Whether the widest NORMALIZED percentile spread clears the production threshold."""
+    if len(record.get("per_model_numeric_percentiles") or {}) < 2:
+        return None
+
+    model_maps = _scoreable_label_maps(record)
+    if len(model_maps) < 2:
+        return None
+
+    denominator = _numeric_spread_denominator(record, model_maps)
+    if denominator <= 0:
+        return None
+
+    max_normalized_spread = 0.0
+    for label in _NUMERIC_KEY_LABELS:
+        values_at_pct = [m[round(label, 6)] for m in model_maps]
+        normalized = (max(values_at_pct) - min(values_at_pct)) / denominator
+        max_normalized_spread = max(max_normalized_spread, normalized)
+
+    return max_normalized_spread > CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD
+
+
 def exceeded_spread_threshold(record: dict) -> bool | None:
     """Check whether per-model spread exceeds the production trigger threshold.
 
@@ -164,104 +285,11 @@ def exceeded_spread_threshold(record: dict) -> bool | None:
     question_type = record.get("type", "")
 
     if question_type == "binary":
-        per_base_model = record.get("per_base_model_forecasts") or {}
-        per_model = per_base_model if per_base_model else (record.get("per_model_forecasts") or {})
-        probs = [_parse_probability(v) for v in per_model.values()]
-        probs = [p for p in probs if p is not None]
-        if len(probs) < 2:
-            return None
-        spread = max(probs) - min(probs)
-        return spread > CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD
-
+        return _binary_spread_exceeded(record)
     if question_type == "multiple_choice":
-        # The collector emits MC option vectors as {model: {option: prob}} in
-        # per_model_forecasts (collector._process_post), and per-base-model
-        # vectors in per_base_model_forecasts for stacked records (where
-        # per_model_forecasts collapses to the stacker's single aggregate) —
-        # prefer the base-model field, mirroring the binary branch.
-        per_base_model = record.get("per_base_model_forecasts") or {}
-        per_model_mc = per_base_model if per_base_model else (record.get("per_model_forecasts") or {})
-        # Non-dict values mean the MC option parser found nothing and the
-        # collector fell back to single-string forecasts — no option vectors.
-        model_option_dicts = [v for v in per_model_mc.values() if isinstance(v, dict)]
-        if len(model_option_dicts) < 2:
-            return None
-
-        # Collect per-option probabilities across models
-        option_probs: dict[str, list[float]] = {}
-        for model_options in model_option_dicts:
-            for name, prob in model_options.items():
-                if prob is not None:
-                    option_probs.setdefault(name, []).append(float(prob))
-
-        spreads = [max(probs) - min(probs) for probs in option_probs.values() if len(probs) >= 2]
-        if not spreads:
-            return None
-
-        return max(spreads) > CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD
-
+        return _mc_spread_exceeded(record)
     if question_type in ("numeric", "discrete"):
-        # Reuse the normalized percentile spread approach from the residual script
-        pnp = record.get("per_model_numeric_percentiles") or {}
-        if len(pnp) < 2:
-            return None
-
-        # Key percentile LABELS (raw 0-100 numbers as parsed from comments) at
-        # which numeric disagreement is measured: the 10th, 50th, and 90th. Looked
-        # up by label so growing the standard percentile set can't shift them.
-        # This branch consumes lenient historical data (>= MIN_SCOREABLE_ANCHORS
-        # percentiles, possibly non-standard), so a per-model label dict is used here
-        # rather than the strict PercentileSet value object. The floor is the shared
-        # constant in ``parsing``, counted the way its docstring defines it — DISTINCT
-        # labels via ``declared_anchors``, exactly as ``ranking_cohort`` and
-        # ``analysis.max_step_clamp_screen`` count it. Comment prose can restate a
-        # member's whole set, so the raw pair count overstates density.
-        key_labels = [10.0, 50.0, 90.0]
-        model_maps: list[dict[float, float]] = []
-        for model_pcts in pnp.values():
-            anchors, _ = declared_anchors(model_pcts)
-            if len(anchors) < MIN_SCOREABLE_ANCHORS:
-                continue
-            label_to_value = {round(label, 6): value for label, value in anchors.items()}
-            if all(round(label, 6) in label_to_value for label in key_labels):
-                model_maps.append(label_to_value)
-        if len(model_maps) < 2:
-            return None
-
-        scaling = record.get("scaling") or {}
-        open_lower = record.get("open_lower_bound", scaling.get("open_lower_bound", False))
-        open_upper = record.get("open_upper_bound", scaling.get("open_upper_bound", False))
-        range_min = scaling.get("range_min")
-        range_max = scaling.get("range_max")
-
-        has_finite_range = (
-            not open_lower
-            and not open_upper
-            and range_min is not None
-            and range_max is not None
-            and math.isfinite(range_min)
-            and math.isfinite(range_max)
-        )
-
-        if has_finite_range and range_max is not None and range_min is not None:
-            denominator = range_max - range_min
-        else:
-            p10_values = [m[round(10.0, 6)] for m in model_maps]
-            p90_values = [m[round(90.0, 6)] for m in model_maps]
-            denominator = statistics.median(p90_values) - statistics.median(p10_values)
-
-        if denominator <= 0:
-            return None
-
-        max_normalized_spread = 0.0
-        for label in key_labels:
-            values_at_pct = [m[round(label, 6)] for m in model_maps]
-            raw_spread = max(values_at_pct) - min(values_at_pct)
-            normalized = raw_spread / denominator
-            max_normalized_spread = max(max_normalized_spread, normalized)
-
-        return max_normalized_spread > CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD
-
+        return _numeric_spread_exceeded(record)
     return None
 
 
@@ -289,8 +317,16 @@ def detect_stacker_fired(record: dict, *, default_threshold: float = 0.05) -> De
     DetectorVerdict
         One of: confirmed_stacker, confirmed_median, likely_stacker, likely_median, unknown.
     """
-    # Signal 1: explicit was_stacked flag (authoritative)
     was_stacked = has_was_stacked_flag(record)
+    explicit = _verdict_from_explicit_signals(record, was_stacked)
+    if explicit is not None:
+        return explicit
+    return _verdict_from_spread_signals(record, was_stacked, default_threshold)
+
+
+def _verdict_from_explicit_signals(record: dict, was_stacked: bool | None) -> DetectorVerdict | None:
+    """Signals 1-3 (flag, outcome field, body marker). None = none of them decided."""
+    # Signal 1: explicit was_stacked flag (authoritative)
     if was_stacked is True:
         return "confirmed_stacker"
 
@@ -302,41 +338,39 @@ def detect_stacker_fired(record: dict, *, default_threshold: float = 0.05) -> De
         if stacker_outcome in _STACKER_MEDIAN_OUTCOMES:
             return "confirmed_median"
 
-    # Signal 3: body markers
+    # Signal 3: body markers. A marker saying the stacker did NOT fire is confirmation on
+    # its own, whatever ``was_stacked`` holds (True was already returned above).
     body_marker = has_stacker_body_marker(record)
     if body_marker is True:
         return "confirmed_stacker"
     if body_marker is False:
-        # Body says no stacker — but check if was_stacked was explicitly False
-        # (already handled above if True). If was_stacked is False, confirmed_median.
-        if was_stacked is False:
-            return "confirmed_median"
-        # Body marker says no stacker, treat as confirmed_median
         return "confirmed_median"
 
-    # If was_stacked is explicitly False but no body marker found, still factor it in
-    # Combined with spread signal below for the verdict.
+    # An explicitly-False was_stacked with no body marker is not decisive on its own —
+    # it is combined with the spread signals by the caller.
+    return None
 
-    # Signals 4 & 5: spread threshold + production-vs-median delta
+
+def _verdict_from_spread_signals(
+    record: dict,
+    was_stacked: bool | None,
+    default_threshold: float,
+) -> DetectorVerdict:
+    """Signals 4-5: per-model spread plus how far production sits from the members' median."""
     spread_exceeded = exceeded_spread_threshold(record)
     delta = compute_production_vs_median_delta(record)
+    production_differs = spread_exceeded is True and delta is not None and delta > default_threshold
 
     if was_stacked is False:
         # Explicit flag says no stacking. But check if evidence contradicts.
-        if spread_exceeded is True and delta is not None and delta > default_threshold:
-            # Flag says no, but evidence suggests stacker actually fired
-            return "likely_stacker"
-        return "confirmed_median"
+        return "likely_stacker" if production_differs else "confirmed_median"
 
     # No explicit flags or body markers from here on — rely on spread + delta
     if spread_exceeded is False:
         return "likely_median"
-
     if spread_exceeded is True:
-        if delta is not None and delta > default_threshold:
-            return "likely_stacker"
         # High spread but production matches median — stacker may have failed/fallen back
-        return "likely_median"
+        return "likely_stacker" if production_differs else "likely_median"
 
     # spread_exceeded is None (cannot compute) and no other signals
     return "unknown"

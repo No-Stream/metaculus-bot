@@ -70,6 +70,7 @@ _P10_P90_Z_GAP: float = 2.5631
 def _fit_cdf_lsq(
     cdf_fn: CdfFn,
     items: list[tuple[float, float]],
+    *,
     initial_loc: float,
     initial_scale: float,
     label: str,
@@ -115,9 +116,9 @@ def _fit_normal_lsq(items: list[tuple[float, float]], initial_mu: float, initial
     return _fit_cdf_lsq(
         lambda v, mu, s: stats.norm.cdf(v, loc=mu, scale=s),
         items,
-        initial_mu,
-        initial_sigma,
-        "normal",
+        initial_loc=initial_mu,
+        initial_scale=initial_sigma,
+        label="normal",
     )
 
 
@@ -170,9 +171,9 @@ def fit_student_t_from_percentiles(percentile_values: dict[float, float], df: fl
     loc, scale = _fit_cdf_lsq(
         lambda v, loc, s: stats.t.cdf(v, df=df, loc=loc, scale=s),
         items,
-        loc0,
-        scale0,
-        f"student_t(df={df:.3g})",
+        initial_loc=loc0,
+        initial_scale=scale0,
+        label=f"student_t(df={df:.3g})",
     )
     return StudentTFit(loc=loc, scale=scale, df=float(df), method="least_squares_cdf")
 
@@ -230,6 +231,7 @@ def percentiles_to_metaculus_cdf(
     percentile_values: dict[float, float],
     lower_bound: float,
     upper_bound: float,
+    *,
     open_lower: bool,
     open_upper: bool,
     zero_point: float | None = None,

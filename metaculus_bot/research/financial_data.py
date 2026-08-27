@@ -8,8 +8,8 @@ import asyncio
 import logging
 import os
 import re
-from datetime import UTC, datetime, timedelta
-from typing import cast
+from datetime import UTC, date, datetime, timedelta
+from typing import Any, cast
 from urllib.parse import unquote
 
 import pandas as pd
@@ -318,8 +318,8 @@ async def _classify_financial_question(
 def _parse_classifier_response(response: str) -> dict[str, list[str]] | None:
     """Parse the structured 3-line classifier response into a dict or None."""
     lines: dict[str, str] = {}
-    for line in response.strip().splitlines():
-        line = line.strip()
+    for raw_line in response.strip().splitlines():
+        line = raw_line.strip()
         if ":" in line:
             key, _, value = line.partition(":")
             lines[key.strip().upper()] = value.strip().upper()
@@ -346,6 +346,108 @@ def _parse_csv_field(raw: str) -> list[str]:
     return [item for item in items if item and item != "NONE"]
 
 
+def _yfinance_history(ticker_obj: Any, window_end: datetime, *, is_benchmarking: bool) -> pd.DataFrame:
+    """Daily bars from ``FINANCIAL_YFINANCE_LOOKBACK_DAYS`` before ``window_end``.
+
+    Benchmarking additionally ceilings the window at ``window_end``; live leaves
+    ``end`` unset so yfinance includes today's partial bar.
+    """
+    start = (window_end - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
+    if is_benchmarking:
+        end = (window_end + timedelta(days=1)).date()  # yfinance end is EXCLUSIVE → +1d makes as_of inclusive
+        return ticker_obj.history(start=start.isoformat(), end=end.isoformat())
+    return ticker_obj.history(start=start.isoformat())
+
+
+def _yfinance_latest_lines(
+    ticker: str,
+    close: pd.Series,
+    reference_date: date,
+    *,
+    name: str,
+    periods_per_year: int,
+    is_benchmarking: bool,
+) -> list[str]:
+    """Header, optional name, the dated latest price, and the stale-observation warning."""
+    parts = [f"### {ticker}"]
+    if name:
+        parts.append(f"**{name}**")
+    current_price = close.iloc[-1]
+    latest_obs_date = cast(pd.Timestamp, close.index[-1]).date()
+    # Every "latest" carries its observation date: an undated headline reads as live
+    # even when Yahoo's newest bar is days old (a weekend Friday close, or a
+    # null-close hole silently dropped from the frame).
+    latest_line = f"- Latest price: {current_price:.2f} (as of {latest_obs_date.isoformat()})"
+    if not is_benchmarking and latest_obs_date == reference_date:
+        latest_line += " — today's bar, in progress"
+    parts.append(latest_line)
+
+    stale_age = stale_latest_age_days(latest_obs_date, reference_date, periods_per_year)
+    if stale_age is not None:
+        unit = daily_step_unit(periods_per_year)
+        parts.append(
+            f"- ⚠ Latest observation is {stale_age} days old — beyond what a {unit} cadence "
+            "explains; treat the latest price as stale."
+        )
+        logger.warning(
+            f"FINANCIAL_STALE_LATEST: surface=financial_data symbol={ticker} age_d={stale_age} cadence={unit}"
+        )
+    return parts
+
+
+def _yfinance_stats_lines(close: pd.Series, periods_per_year: int) -> list[str]:
+    """Period returns, annualized volatility, and the 52-week range."""
+    parts: list[str] = []
+    # Period returns
+    returns_section = _compute_period_returns(close, periods_per_year)
+    if returns_section:
+        parts.append(returns_section)
+
+    # Volatility over the trailing FINANCIAL_YFINANCE_RECENT_DAYS observations — the
+    # shared estimator (ts_estimators), so this line and the anchor stack's vol note
+    # cannot drift apart again; None when the return sample is shorter than the window
+    # (a vol wearing the window's label without its sample size).
+    annualized_vol = annualized_realized_vol_pct(
+        close, window=FINANCIAL_YFINANCE_RECENT_DAYS, periods_per_year=periods_per_year
+    )
+    if annualized_vol is not None:
+        # Name the step unit: FINANCIAL_YFINANCE_RECENT_DAYS is a ROW count, which is six
+        # calendar weeks on an exchange-traded series and 30 calendar days on a 24/7 one, so
+        # a bare "30-day" label was itself a row count posing as a calendar window.
+        unit = daily_step_unit(periods_per_year)
+        parts.append(f"- {FINANCIAL_YFINANCE_RECENT_DAYS}-{unit} annualized volatility: {annualized_vol:.1f}%")
+
+    # 52-week range, windowed by DATE like the period returns: a row-count slice
+    # under a fixed "52-week" label spans ~13 months on a gapped 24/7 series and
+    # over a year on a holiday-bearing exchange index. Never empty — the last
+    # observation is always inside its own trailing year.
+    year_slice = close[close.index >= close.index[-1] - pd.Timedelta(days=CALENDAR_DAYS_PER_YEAR)]
+    low_52w = year_slice.min()
+    high_52w = year_slice.max()
+    parts.append(f"- 52-week range: {low_52w:.2f} - {high_52w:.2f}")
+    return parts
+
+
+def _yfinance_fundamentals_lines(close: pd.Series, info: dict, *, is_benchmarking: bool) -> list[str]:
+    """The .info fundamentals block (live only) and the last five closes."""
+    parts: list[str] = []
+    # Optional fundamentals from .info (live only; `info` is {} under benchmarking).
+    if is_benchmarking:
+        parts.append("- Fundamentals: [omitted under backtest — .info has no historical mode]")
+    else:
+        fundamentals = _format_fundamentals(info)
+        if fundamentals:
+            parts.append(fundamentals)
+
+    # Last 5 closing prices
+    last_5 = close.tail(5)
+    closing_lines = [
+        f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {price:.2f}" for date, price in last_5.items()
+    ]
+    parts.append("- Last 5 closes:\n" + "\n".join(closing_lines))
+    return parts
+
+
 def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_benchmarking: bool = False) -> str:
     """Fetch price data and key metrics for a single ticker via yfinance.
 
@@ -370,12 +472,7 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
         if is_benchmarking:
             assert as_of is not None, "benchmarking yfinance fetch requires as_of"
         window_end = as_of if as_of is not None else datetime.now(UTC)
-        start = (window_end - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
-        if is_benchmarking:
-            end = (window_end + timedelta(days=1)).date()  # yfinance end is EXCLUSIVE → +1d makes as_of inclusive
-            history = ticker_obj.history(start=start.isoformat(), end=end.isoformat())
-        else:
-            history = ticker_obj.history(start=start.isoformat())
+        history = _yfinance_history(ticker_obj, window_end, is_benchmarking=is_benchmarking)
 
         if history.empty:
             logger.warning(f"yfinance returned empty history for {ticker=}")
@@ -390,8 +487,6 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
         if close.empty:
             logger.warning(f"yfinance returned no non-null closes for {ticker=}")
             return ""
-        current_price = close.iloc[-1]
-        latest_obs_date = cast(pd.Timestamp, close.index[-1]).date()
         # yfinance serves listed-asset bars on a tz-aware exchange-local index while
         # window_end is UTC; the two dates disagree for part of every day, so age and
         # the partial-bar check compare in the index's own timezone (a 00:03 UTC cron
@@ -399,77 +494,17 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
         index_tz = cast(pd.DatetimeIndex, close.index).tz
         reference_date = window_end.astimezone(index_tz).date() if index_tz is not None else window_end.date()
 
-        parts = [f"### {ticker}"]
-        name = info.get("shortName", "")
-        if name:
-            parts.append(f"**{name}**")
-        # Every "latest" carries its observation date: an undated headline reads as live
-        # even when Yahoo's newest bar is days old (a weekend Friday close, or a
-        # null-close hole silently dropped from the frame).
-        latest_line = f"- Latest price: {current_price:.2f} (as of {latest_obs_date.isoformat()})"
-        if not is_benchmarking and latest_obs_date == reference_date:
-            latest_line += " — today's bar, in progress"
-        parts.append(latest_line)
-
-        # 252 for exchange-traded assets, 365 for 24/7 markets (crypto) — the basis
-        # drives the annualization factor, the staleness allowance, and the period-return
-        # slip grace (the period/52-week windows themselves are date-based on both bases).
         periods_per_year = observed_periods_per_year(close.index)
-
-        stale_age = stale_latest_age_days(latest_obs_date, reference_date, periods_per_year)
-        if stale_age is not None:
-            unit = daily_step_unit(periods_per_year)
-            parts.append(
-                f"- ⚠ Latest observation is {stale_age} days old — beyond what a {unit} cadence "
-                "explains; treat the latest price as stale."
-            )
-            logger.warning(
-                f"FINANCIAL_STALE_LATEST: surface=financial_data symbol={ticker} age_d={stale_age} cadence={unit}"
-            )
-
-        # Period returns
-        returns_section = _compute_period_returns(close, periods_per_year)
-        if returns_section:
-            parts.append(returns_section)
-
-        # Volatility over the trailing FINANCIAL_YFINANCE_RECENT_DAYS observations — the
-        # shared estimator (ts_estimators), so this line and the anchor stack's vol note
-        # cannot drift apart again; None when the return sample is shorter than the window
-        # (a vol wearing the window's label without its sample size).
-        annualized_vol = annualized_realized_vol_pct(
-            close, window=FINANCIAL_YFINANCE_RECENT_DAYS, periods_per_year=periods_per_year
+        parts = _yfinance_latest_lines(
+            ticker,
+            close,
+            reference_date,
+            name=info.get("shortName", ""),
+            periods_per_year=periods_per_year,
+            is_benchmarking=is_benchmarking,
         )
-        if annualized_vol is not None:
-            # Name the step unit: FINANCIAL_YFINANCE_RECENT_DAYS is a ROW count, which is six
-            # calendar weeks on an exchange-traded series and 30 calendar days on a 24/7 one, so
-            # a bare "30-day" label was itself a row count posing as a calendar window.
-            unit = daily_step_unit(periods_per_year)
-            parts.append(f"- {FINANCIAL_YFINANCE_RECENT_DAYS}-{unit} annualized volatility: {annualized_vol:.1f}%")
-
-        # 52-week range, windowed by DATE like the period returns: a row-count slice
-        # under a fixed "52-week" label spans ~13 months on a gapped 24/7 series and
-        # over a year on a holiday-bearing exchange index. Never empty — the last
-        # observation is always inside its own trailing year.
-        year_slice = close[close.index >= close.index[-1] - pd.Timedelta(days=CALENDAR_DAYS_PER_YEAR)]
-        low_52w = year_slice.min()
-        high_52w = year_slice.max()
-        parts.append(f"- 52-week range: {low_52w:.2f} - {high_52w:.2f}")
-
-        # Optional fundamentals from .info (live only; `info` is {} under benchmarking).
-        if is_benchmarking:
-            parts.append("- Fundamentals: [omitted under backtest — .info has no historical mode]")
-        else:
-            fundamentals = _format_fundamentals(info)
-            if fundamentals:
-                parts.append(fundamentals)
-
-        # Last 5 closing prices
-        last_5 = close.tail(5)
-        closing_lines = [
-            f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {price:.2f}" for date, price in last_5.items()
-        ]
-        parts.append("- Last 5 closes:\n" + "\n".join(closing_lines))
-
+        parts.extend(_yfinance_stats_lines(close, periods_per_year))
+        parts.extend(_yfinance_fundamentals_lines(close, info, is_benchmarking=is_benchmarking))
         return "\n".join(parts)
 
     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # provider soft-fail boundary, logged
@@ -686,6 +721,84 @@ def _fetch_fred_data_ceiling(series_id: str, as_of: datetime) -> str:
         return ""
 
 
+def _resolve_fetch_as_of(question: MetaculusQuestion, *, is_benchmarking: bool) -> datetime | None:
+    """The window ceiling for every fetch, or None when benchmarking cannot be made leakage-safe.
+
+    Ceiling every fetch to open_time under benchmarking (leakage-safe, mirrors
+    timeseries_anchor). A missing open_time can't be ceilinged, so we bail rather
+    than risk fetching today's data into a resolved question.
+    """
+    if not is_benchmarking:
+        return datetime.now(UTC)
+    open_time = getattr(question, "open_time", None)
+    if not isinstance(open_time, datetime):
+        logger.warning(
+            "financial_data: is_benchmarking but qid=%s has no open_time; skipping (leakage-safe)",
+            getattr(question, "id_of_question", None),
+        )
+        return None
+    return open_time
+
+
+def _build_financial_fetch_jobs(
+    tickers: list[str],
+    fred_series: list[str],
+    *,
+    as_of: datetime,
+    is_benchmarking: bool,
+) -> list[tuple[str, asyncio.Task]]:
+    """Spawn one fetch task per identifier, each paired with the ticker/FRED id it fetches."""
+    jobs: list[tuple[str, asyncio.Task]] = [
+        (
+            ticker,
+            asyncio.ensure_future(
+                asyncio.to_thread(_fetch_yfinance_data, ticker, as_of=as_of, is_benchmarking=is_benchmarking)
+            ),
+        )
+        for ticker in tickers
+    ]
+    if is_benchmarking:
+        # Keyless ceilinged path — no FRED_API_KEY needed, works in CI, and returns
+        # point-in-time vintages instead of today's revisions.
+        jobs.extend(
+            (series_id, asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data_ceiling, series_id, as_of)))
+            for series_id in fred_series
+        )
+        return jobs
+    fred_api_key = os.getenv(FRED_API_KEY_ENV)
+    if fred_api_key:
+        jobs.extend(
+            (series_id, asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data, series_id, fred_api_key)))
+            for series_id in fred_series
+        )
+    elif fred_series:
+        logger.info(f"FRED_API_KEY not set, skipping {len(fred_series)} FRED series fetches")
+    return jobs
+
+
+async def _gather_financial_results(jobs: list[tuple[str, asyncio.Task]]) -> tuple[list[str], dict[str, str]]:
+    """Await every fetch, returning the non-empty sections plus a per-identifier outcome map.
+
+    Per-identifier outcome for the diagnostics block: a requested ticker/FRED
+    series that errored or returned no data is a lost source, so a partial
+    financial fetch stays visible even when other identifiers succeed.
+    """
+    results = await asyncio.gather(*(task for _, task in jobs), return_exceptions=True)
+    non_empty_results: list[str] = []
+    sources: dict[str, str] = {}
+    for (identifier, _), result in zip(jobs, results, strict=True):
+        if isinstance(result, Exception):
+            logger.warning(f"Financial data fetch task failed: {result}")
+            sources[identifier] = "error"
+            continue
+        if isinstance(result, str) and result.strip():
+            non_empty_results.append(result)
+            sources[identifier] = "ok"
+        else:
+            sources[identifier] = "empty"
+    return non_empty_results, sources
+
+
 def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
     """Factory function returning an async research callable for financial/economic data.
 
@@ -721,23 +834,13 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
     )
 
     async def _fetch(question: MetaculusQuestion) -> str:
-        # Ceiling every fetch to open_time under benchmarking (leakage-safe, mirrors
-        # timeseries_anchor). A missing open_time can't be ceilinged, so we bail rather
-        # than risk fetching today's data into a resolved question.
-        if is_benchmarking:
-            open_time = getattr(question, "open_time", None)
-            if not isinstance(open_time, datetime):
-                logger.warning(
-                    "financial_data: is_benchmarking but qid=%s has no open_time; skipping (leakage-safe)",
-                    getattr(question, "id_of_question", None),
-                )
-                return ""
-            as_of = open_time
-        else:
-            as_of = datetime.now(UTC)
+        as_of = _resolve_fetch_as_of(question, is_benchmarking=is_benchmarking)
+        if as_of is None:
+            return ""
 
-        criteria_text = f"{question.resolution_criteria or ''}\n{question.fine_print or ''}"
-        extracted = extract_financial_identifiers_from_criteria(criteria_text)
+        extracted = extract_financial_identifiers_from_criteria(
+            f"{question.resolution_criteria or ''}\n{question.fine_print or ''}"
+        )
 
         classification, classifier_error = await _classify_financial_question(
             question.question_text,
@@ -786,60 +889,17 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         # a valid-but-unlisted series shouldn't be dropped, just made visible.
         unknown = _flag_unknown_classifier_ids(classifier_tickers, classifier_fred, extracted)
 
-        tasks: list[asyncio.Task] = []
-        identifiers: list[str] = []  # the ticker/FRED id each task fetches, parallel to tasks
-
-        for ticker in tickers:
-            tasks.append(
-                asyncio.ensure_future(
-                    asyncio.to_thread(_fetch_yfinance_data, ticker, as_of=as_of, is_benchmarking=is_benchmarking)
-                )
-            )
-            identifiers.append(ticker)
-
-        if is_benchmarking:
-            # Keyless ceilinged path — no FRED_API_KEY needed, works in CI, and returns
-            # point-in-time vintages instead of today's revisions.
-            for series_id in fred_series:
-                tasks.append(asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data_ceiling, series_id, as_of)))
-                identifiers.append(series_id)
-        else:
-            fred_api_key = os.getenv(FRED_API_KEY_ENV)
-            if fred_api_key:
-                for series_id in fred_series:
-                    tasks.append(asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data, series_id, fred_api_key)))
-                    identifiers.append(series_id)
-            elif fred_series:
-                logger.info(f"FRED_API_KEY not set, skipping {len(fred_series)} FRED series fetches")
-
-        if not tasks:
+        jobs = _build_financial_fetch_jobs(tickers, fred_series, as_of=as_of, is_benchmarking=is_benchmarking)
+        if not jobs:
             return ""
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        non_empty_results = []
-        # Per-identifier outcome for the diagnostics block: a requested ticker/FRED
-        # series that errored or returned no data is a lost source, so a partial
-        # financial fetch stays visible even when other identifiers succeed.
-        sources: dict[str, str] = {}
-        for identifier, result in zip(identifiers, results, strict=True):
-            if isinstance(result, Exception):
-                logger.warning(f"Financial data fetch task failed: {result}")
-                sources[identifier] = "error"
-                continue
-            if isinstance(result, str) and result.strip():
-                non_empty_results.append(result)
-                sources[identifier] = "ok"
-            else:
-                sources[identifier] = "empty"
-
+        non_empty_results, sources = await _gather_financial_results(jobs)
         record_provider_detail(qid, "financial_data", {"sources": sources})
 
         if not non_empty_results:
             return ""
 
-        marker = _build_routing_marker(fred_series, tickers, extracted, unknown)
-        return "\n\n".join(non_empty_results) + marker
+        return "\n\n".join(non_empty_results) + _build_routing_marker(fred_series, tickers, extracted, unknown)
 
     return _fetch
 

@@ -99,6 +99,7 @@ class AggregationPipeline:
         question: MetaculusQuestion,
         research: str,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
+        *,
         stacker_llm_override: GeneralLlm | None = None,
         aggregated_tool_output: str | None = None,
         stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
@@ -134,8 +135,8 @@ class AggregationPipeline:
                 stacker_llm,
                 self.parser_llm,
                 question,
-                research,
-                base_predictions,
+                research=research,
+                base_texts=base_predictions,
                 aggregated_tool_output=aggregated_tool_output,
                 stacker_wall_timeout=stacker_wall_timeout,
             )
@@ -147,8 +148,8 @@ class AggregationPipeline:
                 stacker_llm,
                 self.parser_llm,
                 question,
-                research,
-                base_predictions,
+                research=research,
+                base_texts=base_predictions,
                 aggregated_tool_output=aggregated_tool_output,
                 stacker_wall_timeout=stacker_wall_timeout,
             )
@@ -156,42 +157,67 @@ class AggregationPipeline:
             logger.info(f"Stacked multiple choice prediction for {page_url}: {pol}")
             return pol
         if isinstance(question, NumericQuestion):
-            upper_msg, lower_msg = bound_messages(question)
-            perc_list, meta_text = await stacking.run_stacking_numeric(
-                stacker_llm,
-                self.parser_llm,
+            return await self._run_stacking_numeric(
                 question,
                 research,
                 base_predictions,
-                lower_msg,
-                upper_msg,
+                stacker_llm=stacker_llm,
+                qid=qid,
+                page_url=page_url,
                 aggregated_tool_output=aggregated_tool_output,
                 stacker_wall_timeout=stacker_wall_timeout,
             )
-            self.meta_reasoning[qid] = meta_text
-
-            percentile_list, zero_point = sanitize_percentiles(list(perc_list), question, model_name=stacker_llm.model)
-
-            mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
-            if mismatch:
-                logger.error(
-                    f"Unit mismatch likely for Q {qid} | URL {page_url} | reason={reason}. Withholding prediction."
-                )
-                raise UnitMismatchError(
-                    f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
-                )
-
-            prediction = build_numeric_distribution(percentile_list, question, zero_point)
-            log_open_bound_piling_diagnostics(prediction, question, stacker_llm.model, percentile_list)
-            log_final_prediction(prediction, question)
-            logger.info(f"Stacked numeric prediction for {page_url}")
-            return prediction
         raise ValueError(f"Unsupported question type for stacking: {type(question)}")
+
+    async def _run_stacking_numeric(
+        self,
+        question: NumericQuestion,
+        research: str,
+        base_predictions: list[str],
+        *,
+        stacker_llm: GeneralLlm,
+        qid: int,
+        page_url: str,
+        aggregated_tool_output: str | None,
+        stacker_wall_timeout: float,
+    ) -> PredictionTypes:
+        """Stack a numeric question: percentiles -> sanitize -> unit guard -> PCHIP CDF."""
+        upper_msg, lower_msg = bound_messages(question)
+        perc_list, meta_text = await stacking.run_stacking_numeric(
+            stacker_llm,
+            self.parser_llm,
+            question,
+            research=research,
+            base_texts=base_predictions,
+            lower_bound_message=lower_msg,
+            upper_bound_message=upper_msg,
+            aggregated_tool_output=aggregated_tool_output,
+            stacker_wall_timeout=stacker_wall_timeout,
+        )
+        self.meta_reasoning[qid] = meta_text
+
+        percentile_list, zero_point = sanitize_percentiles(list(perc_list), question, model_name=stacker_llm.model)
+
+        mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
+        if mismatch:
+            logger.error(
+                f"Unit mismatch likely for Q {qid} | URL {page_url} | reason={reason}. Withholding prediction."
+            )
+            raise UnitMismatchError(
+                f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
+            )
+
+        prediction = build_numeric_distribution(percentile_list, question, zero_point)
+        log_open_bound_piling_diagnostics(prediction, question, stacker_llm.model, percentile_list)
+        log_final_prediction(prediction, question)
+        logger.info(f"Stacked numeric prediction for {page_url}")
+        return prediction
 
     async def aggregate(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
+        *,
         research: str | None = None,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]] | None = None,
         aggregated_tool_output: str | None = None,
@@ -211,7 +237,11 @@ class AggregationPipeline:
         # Stacking path
         if self.strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
             return await self._stacking_aggregate(
-                predictions, question, research, reasoned_predictions, aggregated_tool_output
+                predictions,
+                question,
+                research=research,
+                reasoned_predictions=reasoned_predictions,
+                aggregated_tool_output=aggregated_tool_output,
             )
 
         # Simple MEAN/MEDIAN path
@@ -251,18 +281,7 @@ class AggregationPipeline:
             else AggregationStrategy.MEAN
         )
         strategy_name = base_combine_strategy.value
-        if expected:
-            logger.info(
-                "STACKING base combine: %d pre-stacked outputs; aggregating by %s for final output",
-                len(predictions),
-                strategy_name,
-            )
-        else:
-            logger.warning(
-                "Unexpected STACKING combine: %d inputs without stacking context; aggregating by %s",
-                len(predictions),
-                strategy_name,
-            )
+        self._log_base_combine_strategy(len(predictions), strategy_name, expected=expected)
 
         apply_platt_after_combine = self.strategy == AggregationStrategy.CONDITIONAL_STACKING
 
@@ -288,6 +307,25 @@ class AggregationPipeline:
             return self._apply_platt_calibration(combined, question)
         return combined
 
+    def _log_base_combine_strategy(self, n_predictions: int, strategy_name: str, *, expected: bool) -> None:
+        """One line naming how many pre-stacked outputs are being combined, and by what.
+
+        An UNEXPECTED combine is the interesting case: it means the parent class re-entered
+        aggregate without stacking context, so it logs at WARNING.
+        """
+        if expected:
+            logger.info(
+                "STACKING base combine: %d pre-stacked outputs; aggregating by %s for final output",
+                n_predictions,
+                strategy_name,
+            )
+        else:
+            logger.warning(
+                "Unexpected STACKING combine: %d inputs without stacking context; aggregating by %s",
+                n_predictions,
+                strategy_name,
+            )
+
     def _get_stacking_fn(self) -> Callable[..., Awaitable[PredictionTypes]]:
         if self.run_stacking_fn is not None:
             return self.run_stacking_fn
@@ -297,6 +335,7 @@ class AggregationPipeline:
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
+        *,
         research: str | None,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]] | None,
         aggregated_tool_output: str | None,
@@ -359,8 +398,10 @@ class AggregationPipeline:
                 )
                 self.outcomes[qid_for_outcome] = "fallback_llm"
                 return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
-            # Last rung of the ladder: fallback-stacker failure degrades to MEDIAN, never drops.
-            except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except
+            # Boundary, last rung of the ladder: fallback-stacker failure degrades to MEDIAN,
+            # never drops the question. Narrowing here would turn an unexpected stacker
+            # failure into a lost forecast.
+            except Exception as fallback_exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
                 self.counters.stacker_fallback_failed_count += 1
                 self.counters.stacking_fallback_count += 1
                 logger.error(

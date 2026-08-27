@@ -143,7 +143,7 @@ def parse_research_blocks(log_text: str, run_id: str) -> list[dict]:
     return records
 
 
-def list_qualifying_runs(workflow: str, limit: int, status: str, since: str, repo: str) -> list[dict]:
+def list_qualifying_runs(workflow: str, *, limit: int, status: str, since: str, repo: str) -> list[dict]:
     """List qualifying GHA runs via the gh CLI."""
     cmd = [
         "gh",
@@ -160,7 +160,9 @@ def list_qualifying_runs(workflow: str, limit: int, status: str, since: str, rep
         "--json",
         "databaseId,createdAt,conclusion,status",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    # S603: fixed `gh run list` argv, no shell. Every interpolation is an operator-supplied
+    # CLI flag value occupying its own argv slot, so nothing can inject a flag or a command.
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
     if result.returncode != 0:
         logger.error(f"gh run list failed: {result.stderr}")
         sys.exit(1)
@@ -176,7 +178,9 @@ def list_qualifying_runs(workflow: str, limit: int, status: str, since: str, rep
 def download_run_log(run_id: int, repo: str) -> str | None:
     """Download the full log for a GHA run. Returns None on failure."""
     cmd = ["gh", "run", "view", str(run_id), "--repo", repo, "--log"]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    # S603: fixed `gh run view` argv, no shell; run_id comes from GitHub's own run listing
+    # and repo from the operator's --repo, each in its own argv slot.
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)  # noqa: S603
     if result.returncode != 0:
         logger.warning(f"Failed to download log for run {run_id}: {result.stderr.strip()}")
         return None
@@ -190,8 +194,8 @@ def existing_records(output_dir: Path) -> set[tuple[int, str]]:
         return seen
     for jsonl_file in output_dir.glob("*.jsonl"):
         with open(jsonl_file) as f:
-            for line in f:
-                line = line.strip()
+            for raw_line in f:
+                line = raw_line.strip()
                 if not line:
                     continue
                 record = json.loads(line)
@@ -218,9 +222,10 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
-    # Verify gh CLI is available
+    # Verify gh CLI is available. `gh` is resolved off PATH on purpose: FileNotFoundError
+    # IS the "not installed" branch below, which a shutil.which() preflight would restate.
     try:
-        subprocess.run(["gh", "--version"], capture_output=True, check=True)
+        subprocess.run(["gh", "--version"], capture_output=True, check=True)  # noqa: S607
     except FileNotFoundError:
         logger.error("gh CLI not found. Install from https://cli.github.com/")
         sys.exit(1)
@@ -228,7 +233,7 @@ def main():
         logger.error("gh CLI is installed but returned an error. Check authentication with 'gh auth status'.")
         sys.exit(1)
 
-    runs = list_qualifying_runs(args.workflow, args.limit, args.status, args.since, args.repo)
+    runs = list_qualifying_runs(args.workflow, limit=args.limit, status=args.status, since=args.since, repo=args.repo)
     logger.info(f"Found {len(runs)} qualifying runs (status={args.status}, since={args.since})")
 
     if args.dry_run:

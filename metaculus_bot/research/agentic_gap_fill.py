@@ -15,7 +15,7 @@ for the research-archive trace requirement.
 import dataclasses
 import logging
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from forecasting_tools.data_models.questions import MetaculusQuestion
@@ -98,7 +98,10 @@ async def run_gap_fill_v2(
         )
         return ""
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        # UTC so the driver's "today" agrees with the forecaster prompt bundle's
+        # "Today:" line (``prompts._forecasting_window_str`` normalizes to UTC),
+        # regardless of host timezone. Prod runs on UTC hosts, so unchanged there.
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         system_prompt = build_system_prompt(today)
         user_brief = build_user_brief(question, bundle_markdown)
         tools = build_gap_fill_tools(question.question_text)

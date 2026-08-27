@@ -169,6 +169,107 @@ class CataloguePull:
     complete: bool
 
 
+@dataclass(slots=True)
+class _PageProjection:
+    """The projecting state machine an ``/events`` page streams through, one parse event at a time.
+
+    Three objects are open at once at the deepest point — the event, its current nested market, and
+    its current settlement source — so this holds them as fields and ``feed`` dispatches to a method
+    per segment. As one loop it was a ~60-statement, 24-branch state machine whose segments could
+    only be read by tracing which ``continue`` they fell through.
+
+    ``kept`` collects the projected events; ``state`` carries ``saw_events_array`` and ``cursor``
+    back out, because the caller needs both after the stream has closed.
+    """
+
+    kept: list[dict[str, Any]]
+    state: dict[str, Any]
+    event: dict[str, Any] | None = None
+    market: dict[str, Any] | None = None
+    source: dict[str, Any] | None = None
+
+    def feed(self, prefix: str, parse_event: str, value: Any) -> None:
+        """Route one ``(prefix, parse_event, value)`` triple. Segment order IS the dispatch — an
+        open source shadows the market segment, and both shadow the event's own scalars."""
+        if prefix == "events":
+            if parse_event == "start_array":
+                self.state["saw_events_array"] = True
+            return
+        if prefix == "cursor" and parse_event == "string":
+            self.state["cursor"] = value
+            return
+        if prefix == "events.item":
+            self._event_boundary(parse_event)
+            return
+        event = self.event
+        if event is None:
+            return
+        if prefix == "events.item.settlement_sources.item":
+            self._source_boundary(parse_event, event)
+            return
+        if self.source is not None:
+            self._source_scalar(prefix, value, self.source)
+            return
+        if prefix == "events.item.markets.item":
+            self._market_boundary(parse_event, event)
+            return
+        if self.market is not None:
+            self._market_scalar(prefix, parse_event, value, self.market)
+            return
+        self._event_scalar(prefix, parse_event, value, event)
+
+    def _event_boundary(self, parse_event: str) -> None:
+        if parse_event == "start_map":
+            event = dict.fromkeys(KALSHI_EVENT_FIELDS)
+            event["settlement_sources"] = []
+            event["markets"] = []
+            self.event = event
+        elif parse_event == "end_map":
+            # A ticketless event is unusable downstream — the ticker is the pool's
+            # dedup key and the settlement index's key — so it is dropped here
+            # rather than carried as a row nothing can reference.
+            if self.event is not None and self.event.get("event_ticker"):
+                self.kept.append(self.event)
+            self.event = None
+
+    def _source_boundary(self, parse_event: str, event: dict[str, Any]) -> None:
+        if parse_event == "start_map":
+            self.source = {"name": None, "url": None}
+        elif parse_event == "end_map":
+            if self.source is not None:
+                event["settlement_sources"].append(self.source)
+            self.source = None
+
+    def _source_scalar(self, prefix: str, value: Any, source: dict[str, Any]) -> None:
+        if prefix == "events.item.settlement_sources.item.name":
+            source["name"] = value
+        elif prefix == "events.item.settlement_sources.item.url":
+            source["url"] = value
+
+    def _market_boundary(self, parse_event: str, event: dict[str, Any]) -> None:
+        if parse_event == "start_map":
+            # Tiered off the list already being built, which reads the index for free:
+            # the first nested market gets the full set, every later one the tail.
+            fields = KALSHI_MARKET_FIELDS if not event["markets"] else KALSHI_NESTED_TAIL_FIELDS
+            self.market = dict.fromkeys(fields)
+        elif parse_event == "end_map":
+            if self.market is not None:
+                event["markets"].append(self.market)
+            self.market = None
+
+    def _market_scalar(self, prefix: str, parse_event: str, value: Any, market: dict[str, Any]) -> None:
+        key = prefix.removeprefix("events.item.markets.item.")
+        # The pre-seeded dict IS the membership set, so the tier decided at `start_map`
+        # decides what this market retains without a second tuple lookup.
+        if key in market and parse_event not in _IJSON_CONTAINER_EVENTS:
+            market[key] = value
+
+    def _event_scalar(self, prefix: str, parse_event: str, value: Any, event: dict[str, Any]) -> None:
+        key = prefix.removeprefix("events.item.")
+        if key in KALSHI_EVENT_FIELDS and parse_event not in _IJSON_CONTAINER_EVENTS:
+            event[key] = value
+
+
 def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) -> Any:
     """An ijson push target that projects an ``/events`` page down as it streams.
 
@@ -179,76 +280,47 @@ def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) ->
     items, exactly like a legitimately empty catalogue, and without ``saw_events_array`` that
     lands in the 6h cache as a valid empty index.
 
-    ``state`` carries ``saw_events_array`` and ``cursor`` back out, because the caller needs
-    both after the stream has closed.
+    The projection itself is ``_PageProjection``; this is only the push-parser plumbing around it.
     """
+    projection = _PageProjection(kept=kept, state=state)
 
     @ijson.coroutine
     def _collect():  # untyped ijson push-parser target
-        event: dict[str, Any] | None = None
-        market: dict[str, Any] | None = None
-        source: dict[str, Any] | None = None
         while True:
             prefix, parse_event, value = yield
-            if prefix == "events":
-                if parse_event == "start_array":
-                    state["saw_events_array"] = True
-                continue
-            if prefix == "cursor" and parse_event == "string":
-                state["cursor"] = value
-                continue
-            if prefix == "events.item":
-                if parse_event == "start_map":
-                    event = dict.fromkeys(KALSHI_EVENT_FIELDS)
-                    event["settlement_sources"] = []
-                    event["markets"] = []
-                elif parse_event == "end_map":
-                    # A ticketless event is unusable downstream — the ticker is the pool's
-                    # dedup key and the settlement index's key — so it is dropped here
-                    # rather than carried as a row nothing can reference.
-                    if event is not None and event.get("event_ticker"):
-                        kept.append(event)
-                    event = None
-                continue
-            if event is None:
-                continue
-            if prefix == "events.item.settlement_sources.item":
-                if parse_event == "start_map":
-                    source = {"name": None, "url": None}
-                elif parse_event == "end_map":
-                    if source is not None:
-                        event["settlement_sources"].append(source)
-                    source = None
-                continue
-            if source is not None:
-                if prefix == "events.item.settlement_sources.item.name":
-                    source["name"] = value
-                elif prefix == "events.item.settlement_sources.item.url":
-                    source["url"] = value
-                continue
-            if prefix == "events.item.markets.item":
-                if parse_event == "start_map":
-                    # Tiered off the list already being built, which reads the index for free:
-                    # the first nested market gets the full set, every later one the tail.
-                    fields = KALSHI_MARKET_FIELDS if not event["markets"] else KALSHI_NESTED_TAIL_FIELDS
-                    market = dict.fromkeys(fields)
-                elif parse_event == "end_map":
-                    if market is not None:
-                        event["markets"].append(market)
-                    market = None
-                continue
-            if market is not None:
-                key = prefix.removeprefix("events.item.markets.item.")
-                # The pre-seeded dict IS the membership set, so the tier decided at `start_map`
-                # decides what this market retains without a second tuple lookup.
-                if key in market and parse_event not in _IJSON_CONTAINER_EVENTS:
-                    market[key] = value
-                continue
-            key = prefix.removeprefix("events.item.")
-            if key in KALSHI_EVENT_FIELDS and parse_event not in _IJSON_CONTAINER_EVENTS:
-                event[key] = value
+            projection.feed(prefix, parse_event, value)
 
     return _collect()
+
+
+async def _stream_projected_page(resp: Any, kept: list[dict[str, Any]], state: dict[str, Any]) -> tuple[str, int]:
+    """Stream one ``/events`` body through the projection. Returns ``(reason, bytes_read)``.
+
+    ``reason`` is empty when the whole body streamed in, and otherwise names the guard that stopped
+    it. Both guards are NON-retryable, which is why they live together: a second identical request
+    returns a body just as oversized or just as malformed, so retrying only burns the pull's wall
+    against an exchange that rate-limits.
+
+    Transport failures are deliberately not caught here — they belong to the caller's ``except``,
+    which reports them retryable.
+    """
+    parser = ijson.parse_coro(_kalshi_page_collector(kept, state))
+    total = 0
+    try:
+        async for chunk in resp.content.iter_chunked(_KALSHI_READ_CHUNK_BYTES):
+            total += len(chunk)
+            if total > KALSHI_PAGE_MAX_BYTES:
+                logger.warning(
+                    f"Kalshi events page exceeded safety ceiling "
+                    f"({total} bytes read > {KALSHI_PAGE_MAX_BYTES}); aborting stream"
+                )
+                return "dropped(size_cap)", total
+            parser.send(chunk)
+        parser.close()
+    except ijson.JSONError as exc:
+        logger.warning(f"Kalshi events stream parse failed: {type(exc).__name__}: {exc}")
+        return "error(parse)", total
+    return "", total
 
 
 async def _kalshi_fetch_events_page(
@@ -275,21 +347,9 @@ async def _kalshi_fetch_events_page(
                 logger.warning(f"Kalshi events HTTP {resp.status}: {snippet}")
                 retryable = resp.status != 429 and (resp.status in _KALSHI_RETRYABLE_STATUSES or resp.status >= 500)
                 return None, None, f"error(http_{resp.status})", retryable
-            parser = ijson.parse_coro(_kalshi_page_collector(kept, state))
-            try:
-                async for chunk in resp.content.iter_chunked(_KALSHI_READ_CHUNK_BYTES):
-                    total += len(chunk)
-                    if total > KALSHI_PAGE_MAX_BYTES:
-                        logger.warning(
-                            f"Kalshi events page exceeded safety ceiling "
-                            f"({total} bytes read > {KALSHI_PAGE_MAX_BYTES}); aborting stream"
-                        )
-                        return None, None, "dropped(size_cap)", False
-                    parser.send(chunk)
-                parser.close()
-            except ijson.JSONError as exc:
-                logger.warning(f"Kalshi events stream parse failed: {type(exc).__name__}: {exc}")
-                return None, None, "error(parse)", False
+            reason, total = await _stream_projected_page(resp, kept, state)
+            if reason:
+                return None, None, reason, False
     except (TimeoutError, aiohttp.ClientError) as exc:
         logger.warning(f"Kalshi events transient error: {type(exc).__name__}: {exc}")
         return None, None, f"error({type(exc).__name__})", True
@@ -301,6 +361,40 @@ async def _kalshi_fetch_events_page(
         )
         return None, None, "error(no_events_array)", True
     return kept, state["cursor"], "", False
+
+
+async def _kalshi_fetch_page_with_retries(
+    session: Any, page_params: dict[str, str], *, deadline: float
+) -> tuple[list[dict[str, Any]] | None, str | None, str]:
+    """One page, retried inside the pull's wall. Returns ``(events, cursor, reason)``.
+
+    ``events is None`` means the page was lost and ``reason`` is the token to report; the caller
+    stops paginating on that. Every attempt's timeout is whatever the wall has LEFT, so retries
+    can never overrun it, and a retry whose backoff alone would not fit gives up rather than
+    sleeping into the wall.
+    """
+    events: list[dict[str, Any]] | None = None
+    reason = "error(unknown)"
+    for attempt in range(KALSHI_PAGE_MAX_ATTEMPTS):
+        attempt_budget = deadline - time.monotonic()
+        if attempt_budget <= 0.0:
+            return None, None, "error(wall_timeout)"
+        events, cursor_value, reason, retryable = await _kalshi_fetch_events_page(
+            session, page_params, timeout_s=attempt_budget
+        )
+        if events is not None:
+            return events, cursor_value, reason
+        if not retryable or attempt + 1 >= KALSHI_PAGE_MAX_ATTEMPTS:
+            break
+        if deadline - time.monotonic() <= HTTP_RETRY_BACKOFF_SECS:
+            logger.warning(f"Kalshi events {reason}: retry budget exhausted; giving up")
+            break
+        logger.warning(
+            f"Kalshi events {reason}; retry {attempt + 2}/{KALSHI_PAGE_MAX_ATTEMPTS} "
+            f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
+        )
+        await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
+    return None, None, reason
 
 
 async def kalshi_prefetch_events(
@@ -352,34 +446,12 @@ async def kalshi_prefetch_events(
         if cursor:
             page_params["cursor"] = cursor
 
-        events: list[dict[str, Any]] | None = None
-        reason = "error(unknown)"
-        for attempt in range(KALSHI_PAGE_MAX_ATTEMPTS):
-            attempt_budget = deadline - time.monotonic()
-            if attempt_budget <= 0.0:
-                reason = "error(wall_timeout)"
-                break
-            events, cursor_value, reason, retryable = await _kalshi_fetch_events_page(
-                session, page_params, timeout_s=attempt_budget
-            )
-            if events is not None:
-                cursor = cursor_value
-                break
-            if not retryable or attempt + 1 >= KALSHI_PAGE_MAX_ATTEMPTS:
-                break
-            if deadline - time.monotonic() <= HTTP_RETRY_BACKOFF_SECS:
-                logger.warning(f"Kalshi events {reason}: retry budget exhausted; giving up")
-                break
-            logger.warning(
-                f"Kalshi events {reason}; retry {attempt + 2}/{KALSHI_PAGE_MAX_ATTEMPTS} "
-                f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
-            )
-            await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
-
+        events, cursor_value, reason = await _kalshi_fetch_page_with_retries(session, page_params, deadline=deadline)
         if events is None:
             token, complete = reason or "error(unknown)", False
             pages_failed += 1
             break
+        cursor = cursor_value
 
         pages_ok += 1
         all_events.extend(events)

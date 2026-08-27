@@ -6,6 +6,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -293,3 +294,205 @@ def test_timestamped_output_filename():
 
     expected_filename = "correlation_analysis_2025-08-10_15-04-51.md"
     assert filename == expected_filename
+
+
+# ---------------------------------------------------------------------------
+# _ensemble_per_type — per-question-type aggregation
+#
+# These pin the aggregation ARITHMETIC (which is what the ensemble diagnostic
+# actually asserts), not the downstream baseline scorers: the MC and numeric
+# scorers are patched so the test can read back exactly what got handed to them.
+# ---------------------------------------------------------------------------
+
+
+def _stub_analyzer(qtype: str, cdfs_by_model: dict[str, list] | None = None) -> Any:
+    """A _StubAnalyzer typed as Any: only the three hooks below are ever exercised."""
+    return cast("Any", _StubAnalyzer(qtype, cdfs_by_model))
+
+
+class _StubAnalyzer:
+    """Minimal stand-in exposing only the three analyzer hooks _ensemble_per_type calls."""
+
+    def __init__(self, qtype: str, cdfs_by_model: dict[str, list] | None = None) -> None:
+        self._qtype = qtype
+        self._cdfs_by_model = cdfs_by_model or {}
+
+    def _extract_model_name(self, benchmark):
+        return benchmark.model_name
+
+    def _is_stacking_benchmark(self, benchmark):
+        return False
+
+    def _get_question_type(self, report):
+        return self._qtype
+
+    def _get_safe_numeric_cdf(self, model, question, prediction):
+        return self._cdfs_by_model.get(model)
+
+
+def _bench(model_name: str, reports: list) -> SimpleNamespace:
+    return SimpleNamespace(model_name=model_name, forecast_reports=reports)
+
+
+def _report(qid: int, question, prediction) -> SimpleNamespace:
+    question.id_of_question = qid
+    return SimpleNamespace(question=question, prediction=prediction)
+
+
+def test_ensemble_per_type_binary_scores_the_aggregated_probability():
+    """Binary aggregation feeds the inline community log score, mean vs median differing."""
+    from analyze_correlations import _ensemble_per_type
+
+    question = SimpleNamespace(id_of_question=1, community_prediction_at_access_time=0.6)
+    benches = [
+        _bench("m1", [_report(1, question, 0.2)]),
+        _bench("m2", [_report(1, question, 0.4)]),
+        _bench("m3", [_report(1, question, 0.9)]),
+    ]
+    analyzer = _stub_analyzer("binary")
+
+    mean_stats = _ensemble_per_type(analyzer, benches, ["m1", "m2", "m3"], "mean")
+    median_stats = _ensemble_per_type(analyzer, benches, ["m1", "m2", "m3"], "median")
+
+    assert mean_stats["binary"]["n"] == 1
+    assert median_stats["binary"]["n"] == 1
+
+    def expected(p: float) -> float:
+        import numpy as np
+
+        c = 0.6
+        return 100.0 * (c * (np.log2(p) + 1.0) + (1.0 - c) * (np.log2(1.0 - p) + 1.0))
+
+    assert mean_stats["binary"]["mean"] == pytest.approx(expected(0.5), abs=1e-9)
+    assert median_stats["binary"]["mean"] == pytest.approx(expected(0.4), abs=1e-9)
+
+
+def test_ensemble_per_type_binary_skips_question_without_community_prediction():
+    """No community prediction means the question can't be scored at all."""
+    from analyze_correlations import _ensemble_per_type
+
+    question = SimpleNamespace(id_of_question=1, community_prediction_at_access_time=None)
+    benches = [_bench("m1", [_report(1, question, 0.2)]), _bench("m2", [_report(1, question, 0.4)])]
+
+    assert _ensemble_per_type(_stub_analyzer("binary"), benches, ["m1", "m2"], "mean") == {}
+
+
+def test_ensemble_per_type_skips_questions_missing_a_model():
+    """Every model in the list must have answered the question."""
+    from analyze_correlations import _ensemble_per_type
+
+    q1 = SimpleNamespace(id_of_question=1, community_prediction_at_access_time=0.5)
+    q2 = SimpleNamespace(id_of_question=2, community_prediction_at_access_time=0.5)
+    benches = [_bench("m1", [_report(1, q1, 0.3), _report(2, q2, 0.3)]), _bench("m2", [_report(1, q1, 0.7)])]
+
+    stats = _ensemble_per_type(_stub_analyzer("binary"), benches, ["m1", "m2"], "mean")
+    assert stats["binary"]["n"] == 1, "only q1 has both models"
+
+
+def test_ensemble_per_type_mc_renormalizes_aggregated_option_probabilities():
+    """MC option probs are matched BY NAME across models, aggregated, then renormalized to 1."""
+    import analyze_correlations
+    from analyze_correlations import _ensemble_per_type
+
+    def _pred(pairs):
+        return SimpleNamespace(
+            predicted_options=[SimpleNamespace(option_name=name, probability=prob) for name, prob in pairs]
+        )
+
+    question = SimpleNamespace(id_of_question=7)
+    benches = [
+        # Deliberately different option ORDER on the second model: aggregation must
+        # match on the name, not the position.
+        _bench("m1", [_report(7, question, _pred([("a", 0.2), ("b", 0.3), ("c", 0.5)]))]),
+        _bench("m2", [_report(7, question, _pred([("c", 0.1), ("b", 0.5), ("a", 0.4)]))]),
+    ]
+
+    captured = []
+
+    def _fake_score_mc(fake):
+        captured.append([(o.option_name, o.probability) for o in fake.prediction.predicted_options])
+        return -12.5
+
+    with patch.object(analyze_correlations, "_score_mc", _fake_score_mc):
+        stats = _ensemble_per_type(_stub_analyzer("multiple_choice"), benches, ["m1", "m2"], "mean")
+
+    assert stats["multiple_choice"]["n"] == 1
+    assert stats["multiple_choice"]["mean"] == pytest.approx(-12.5)
+    assert len(captured) == 1
+    names = [name for name, _ in captured[0]]
+    probs = [prob for _, prob in captured[0]]
+    assert names == ["a", "b", "c"], "option order follows the first model's ballot"
+    assert probs == pytest.approx([0.3, 0.4, 0.3], abs=1e-9)
+    assert sum(probs) == pytest.approx(1.0)
+
+
+def test_ensemble_per_type_mc_skips_prediction_without_options():
+    from analyze_correlations import _ensemble_per_type
+
+    question = SimpleNamespace(id_of_question=7)
+    empty = SimpleNamespace(predicted_options=[])
+    benches = [_bench("m1", [_report(7, question, empty)]), _bench("m2", [_report(7, question, empty)])]
+
+    assert _ensemble_per_type(_stub_analyzer("multiple_choice"), benches, ["m1", "m2"], "mean") == {}
+
+
+def test_ensemble_per_type_numeric_aggregates_cdfs_on_the_shortest_grid():
+    """Numeric CDFs are truncated to the shortest grid, then averaged percentile-wise."""
+    import analyze_correlations
+    from analyze_correlations import _ensemble_per_type
+
+    def _cdf(pairs):
+        return [SimpleNamespace(value=value, percentile=perc) for value, perc in pairs]
+
+    cdfs = {
+        "m1": _cdf([(0.0, 0.1), (1.0, 0.5), (2.0, 0.9)]),
+        # Longer grid: the extra point must be dropped, not zero-padded.
+        "m2": _cdf([(0.0, 0.3), (1.0, 0.7), (2.0, 0.95), (3.0, 0.99)]),
+    }
+    question = SimpleNamespace(id_of_question=9)
+    benches = [_bench("m1", [_report(9, question, object())]), _bench("m2", [_report(9, question, object())])]
+
+    captured = []
+
+    def _fake_score_num(fake):
+        captured.append([(pt.value, pt.percentile) for pt in fake.prediction.cdf])
+        return -30.0
+
+    with patch.object(analyze_correlations, "_score_num", _fake_score_num):
+        stats = _ensemble_per_type(_stub_analyzer("numeric", cdfs), benches, ["m1", "m2"], "mean")
+
+    assert stats["numeric"]["n"] == 1
+    assert stats["numeric"]["mean"] == pytest.approx(-30.0)
+    assert captured[0] == pytest.approx([(0.0, 0.2), (1.0, 0.6), (2.0, 0.925)])
+
+
+def test_ensemble_per_type_numeric_drops_question_when_any_cdf_is_unavailable():
+    """One unrecoverable CDF disqualifies the whole question, not just that model."""
+    import analyze_correlations
+    from analyze_correlations import _ensemble_per_type
+
+    cdfs = {"m1": [SimpleNamespace(value=0.0, percentile=0.5)], "m2": None}
+    question = SimpleNamespace(id_of_question=9)
+    benches = [_bench("m1", [_report(9, question, object())]), _bench("m2", [_report(9, question, object())])]
+
+    with patch.object(analyze_correlations, "_score_num", lambda _fake: -1.0):
+        assert _ensemble_per_type(_stub_analyzer("numeric", cdfs), benches, ["m1", "m2"], "mean") == {}
+
+
+def test_load_benchmarks_from_path_returns_empty_on_malformed_json():
+    """A malformed file logs and yields no benchmarks rather than raising."""
+    from analyze_correlations import load_benchmarks_from_path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bad = Path(tmpdir) / "benchmarks_bad.json"
+        bad.write_text("{not valid json")
+        assert load_benchmarks_from_path(str(bad)) == []
+
+
+def test_load_benchmarks_from_directory_skips_correlation_outputs():
+    """Directory loads must not try to parse the report files this script itself writes."""
+    from analyze_correlations import load_benchmarks_from_path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "correlation_analysis_2026-01-01_00-00-00.json").write_text("{not valid json")
+        assert load_benchmarks_from_path(tmpdir) == []

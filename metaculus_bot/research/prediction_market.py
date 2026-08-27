@@ -57,6 +57,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -204,7 +205,7 @@ _KALSHI_CATALOGUE_FETCH_FAILURES: int = 0
 
 
 def _bump_kalshi_catalogue_failure() -> None:
-    global _KALSHI_CATALOGUE_FETCH_FAILURES
+    global _KALSHI_CATALOGUE_FETCH_FAILURES  # noqa: PLW0603  # per-run counter for a stateless provider; see the constant's comment
     _KALSHI_CATALOGUE_FETCH_FAILURES += 1
 
 
@@ -221,7 +222,7 @@ def reset_series_degradation_counter() -> None:
     every later alertable_count == 0 assertion). Called from forecast_questions alongside
     reset_pchip_stats — same per-run cadence. The name is unchanged from when this counter
     tracked the retired /series fetch, because the orchestrator imports it by name."""
-    global _KALSHI_CATALOGUE_FETCH_FAILURES
+    global _KALSHI_CATALOGUE_FETCH_FAILURES  # noqa: PLW0603  # module-scoped counter needs a run-start reset; see docstring
     _KALSHI_CATALOGUE_FETCH_FAILURES = 0
 
 
@@ -241,7 +242,7 @@ _SOURCE_LOSSES: int = 0
 
 
 def _bump_source_loss() -> None:
-    global _SOURCE_LOSSES
+    global _SOURCE_LOSSES  # noqa: PLW0603  # per-run counter for a stateless provider; see the constant's comment
     _SOURCE_LOSSES += 1
 
 
@@ -253,13 +254,13 @@ def prediction_market_source_losses() -> int:
 def reset_source_loss_counter() -> None:
     """Zero the source-loss counter at run start (see
     `reset_series_degradation_counter` for why module-scoped counters need this)."""
-    global _SOURCE_LOSSES
+    global _SOURCE_LOSSES  # noqa: PLW0603  # module-scoped counter needs a run-start reset; see docstring
     _SOURCE_LOSSES = 0
 
 
 def _reset_session_caches() -> None:
     """Clear all per-session caches. Called between tests and at session start."""
-    global _KALSHI_CATALOGUE_FETCH_FAILURES, _SOURCE_LOSSES
+    global _KALSHI_CATALOGUE_FETCH_FAILURES, _SOURCE_LOSSES  # noqa: PLW0603  # per-session caches/counters live at module scope; tests reset them here
     _KALSHI_CACHE.clear()
     _PREDICTIT_CACHE.clear()
     _SNAPSHOT_CACHE.clear()
@@ -583,45 +584,98 @@ async def fetch_market_snapshot(
     return snapshot
 
 
-async def _fetch_market_snapshot_impl(
-    question: Any,
-    *,
-    session: aiohttp.ClientSession,
-    platforms: tuple[str, ...],
-    as_of: datetime | None,
-) -> MarketSnapshot:
-    """The four stages. See the module docstring for the shape and why it is that shape."""
-    # Every provider-health observation is keyed on the question, so a question with no id
-    # records nothing (matching record_provider_detail / record_raw_research).
-    qid: int | None = getattr(question, "id_of_question", None)
-    title = getattr(question, "title", None) or getattr(question, "question_text", "") or ""
-    resolution_criteria = getattr(question, "resolution_criteria", "") or ""
-    fine_print = getattr(question, "fine_print", "") or ""
+class _SourceLedger:
+    """Per-source outcome tokens for the provider-diagnostics line, plus the alertable losses.
 
-    # Per-source outcome tokens for the provider-diagnostics line: the four venues plus
-    # `manifold_detail`, `query_author` and `ranking`. Single-threaded asyncio => distinct
-    # keys, no race.
-    sources: dict[str, str] = {}
-    lost_sources: list[str] = []
+    Owns the ONE place a loss is counted, so no stage can report a source twice or
+    bump the counter without naming the source in the WARN.
+    """
 
-    def _record_loss(name: str, token: str) -> None:
-        sources[name] = token
-        lost_sources.append(f"{name}={token}")
+    def __init__(self) -> None:
+        # The four venues plus `manifold_detail`, `query_author` and `ranking`.
+        # Single-threaded asyncio => distinct keys, no race.
+        self.tokens: dict[str, str] = {}
+        self.lost: list[str] = []
+
+    def record_loss(self, name: str, token: str) -> None:
+        self.tokens[name] = token
+        self.lost.append(f"{name}={token}")
         _bump_source_loss()
 
-    # --- stage 1a PREFETCH ‖ stage 1b QUERY AUTHOR (concurrent) ------------
-    stage_one: dict[str, asyncio.Task[Any]] = {
-        "query_author": asyncio.create_task(_authored_queries(title, resolution_criteria))
-    }
-    if "kalshi" in platforms:
-        stage_one["kalshi"] = asyncio.create_task(_kalshi_catalogue(session, qid=qid))
-    if "predictit" in platforms:
-        stage_one["predictit"] = asyncio.create_task(_predictit_universe(session, qid=qid))
-    stage_one_results = dict(
-        zip(stage_one, await asyncio.gather(*stage_one.values(), return_exceptions=True), strict=True)
-    )
+    def report(self, name: str, token: str) -> None:
+        """Record one source's token, routing a loss through the counter.
 
-    def _stage_one(name: str, default: Any) -> Any:
+        Skips a source already reported: a stage that RAISED is one loss, and
+        recording its default token on top would either overwrite the diagnosis or bump twice.
+        """
+        if name in self.tokens:
+            return
+        if is_lost_source(token):
+            self.record_loss(name, token)
+        else:
+            self.tokens[name] = token
+
+
+@dataclass(frozen=True)
+class _SnapshotContext:
+    """Everything the four stages read off the question, resolved once up front."""
+
+    question: Any
+    session: aiohttp.ClientSession
+    platforms: tuple[str, ...]
+    as_of: datetime | None
+    # Every provider-health observation is keyed on the question, so a question with no id
+    # records nothing (matching record_provider_detail / record_raw_research).
+    qid: int | None
+    title: str
+    resolution_criteria: str
+    fine_print: str
+    ledger: _SourceLedger
+
+    @classmethod
+    def build(
+        cls,
+        question: Any,
+        *,
+        session: aiohttp.ClientSession,
+        platforms: tuple[str, ...],
+        as_of: datetime | None,
+    ) -> _SnapshotContext:
+        return cls(
+            question=question,
+            session=session,
+            platforms=platforms,
+            as_of=as_of,
+            qid=getattr(question, "id_of_question", None),
+            title=getattr(question, "title", None) or getattr(question, "question_text", "") or "",
+            resolution_criteria=getattr(question, "resolution_criteria", "") or "",
+            fine_print=getattr(question, "fine_print", "") or "",
+            ledger=_SourceLedger(),
+        )
+
+
+@dataclass(frozen=True)
+class _PrefetchResult:
+    """Stage-1 output: the LLM's extra queries plus the two enumerable catalogues."""
+
+    extra_queries: tuple[str, ...]
+    kalshi_events: list[Any]
+    predictit_markets: list[dict[str, Any]]
+    predictit_tally: _FetchTally
+
+
+async def _run_prefetch_stage(ctx: _SnapshotContext) -> _PrefetchResult:
+    """Stage 1a PREFETCH ‖ stage 1b QUERY AUTHOR, concurrently."""
+    stage_one: dict[str, asyncio.Task[Any]] = {
+        "query_author": asyncio.create_task(_authored_queries(ctx.title, ctx.resolution_criteria))
+    }
+    if "kalshi" in ctx.platforms:
+        stage_one["kalshi"] = asyncio.create_task(_kalshi_catalogue(ctx.session, qid=ctx.qid))
+    if "predictit" in ctx.platforms:
+        stage_one["predictit"] = asyncio.create_task(_predictit_universe(ctx.session, qid=ctx.qid))
+    outcomes = dict(zip(stage_one, await asyncio.gather(*stage_one.values(), return_exceptions=True), strict=True))
+
+    def _outcome(name: str, default: Any) -> Any:
         """One stage-one outcome, converting a residual raised error into a lost source.
 
         The helpers each soft-fail on the errors their transports raise, so anything landing
@@ -629,46 +683,44 @@ async def _fetch_market_snapshot_impl(
         source's loss rather than letting it kill the snapshot matches what the old per-platform
         narrow catch did, and keeps one broken venue from silencing the other three.
         """
-        outcome = stage_one_results.get(name, default)
+        outcome = outcomes.get(name, default)
         if isinstance(outcome, BaseException):
             logger.warning(f"Market stage {name} raised (soft-fail): {type(outcome).__name__}: {outcome}")
-            _record_loss(name, f"error({type(outcome).__name__})")
+            ctx.ledger.record_loss(name, f"error({type(outcome).__name__})")
             return default
         return outcome
 
-    extra_queries, author_token = _stage_one("query_author", ((), "error(unusable)"))
-    kalshi_events, kalshi_token = _stage_one("kalshi", ([], "none"))
-    predictit_markets, predictit_tally = _stage_one("predictit", ([], _FetchTally()))
+    extra_queries, author_token = _outcome("query_author", ((), "error(unusable)"))
+    kalshi_events, kalshi_token = _outcome("kalshi", ([], "none"))
+    predictit_markets, predictit_tally = _outcome("predictit", ([], _FetchTally()))
 
-    def _report(name: str, token: str) -> None:
-        """Record one source's token, routing a loss through the counter.
+    ctx.ledger.report("query_author", author_token)
+    if "kalshi" in ctx.platforms:
+        ctx.ledger.report("kalshi", kalshi_token)
 
-        Skips a source `_stage_one` already reported: a stage that RAISED is one loss, and
-        recording its default token on top would either overwrite the diagnosis or bump twice.
-        """
-        if name in sources:
-            return
-        if is_lost_source(token):
-            _record_loss(name, token)
-        else:
-            sources[name] = token
+    return _PrefetchResult(
+        extra_queries=extra_queries,
+        kalshi_events=kalshi_events,
+        predictit_markets=predictit_markets,
+        predictit_tally=predictit_tally,
+    )
 
-    _report("query_author", author_token)
-    if "kalshi" in platforms:
-        _report("kalshi", kalshi_token)
 
-    # --- stage 2 VENUE SEARCH ---------------------------------------------
-    # The enumerable venues score against the RAW query set (a year is real signal against a
-    # catalogue of dated market titles); the conjunctive venues get every query stripped of
-    # digit-bearing tokens, because Manifold's `term` is a strict conjunction and one date
-    # token no market's text carries returns [].
-    all_queries = dedupe_queries([*deterministic_queries(title), *extra_queries])
+async def _run_venue_search_stage(
+    ctx: _SnapshotContext, all_queries: list[str]
+) -> dict[str, list[list[MarketMatch] | None | BaseException]]:
+    """Stage 2 VENUE SEARCH over the conjunctive venues, dropping any that raised.
+
+    The enumerable venues score against the RAW query set (a year is real signal against a
+    catalogue of dated market titles); the conjunctive venues get every query stripped of
+    digit-bearing tokens, because Manifold's `term` is a strict conjunction and one date
+    token no market's text carries returns [].
+    """
     conjunctive_queries = dedupe_queries([strip_dates_and_numbers(query) for query in all_queries])
-
     search_tasks = {
-        venue: asyncio.create_task(_search_venue(session, venue, conjunctive_queries))
+        venue: asyncio.create_task(_search_venue(ctx.session, venue, conjunctive_queries))
         for venue in _SEARCH_VENUES
-        if venue in platforms
+        if venue in ctx.platforms
     }
     search_outcomes = dict(
         zip(search_tasks, await asyncio.gather(*search_tasks.values(), return_exceptions=True), strict=True)
@@ -677,20 +729,35 @@ async def _fetch_market_snapshot_impl(
     for venue, outcome in search_outcomes.items():
         if isinstance(outcome, BaseException):
             logger.warning(f"Venue {venue} search raised (soft-fail): {type(outcome).__name__}: {outcome}")
-            _record_loss(venue, f"error({type(outcome).__name__})")
+            ctx.ledger.record_loss(venue, f"error({type(outcome).__name__})")
             continue
         venue_search_results[venue] = outcome
+    return venue_search_results
 
-    # --- stage 3 POOL ASSEMBLY (CPU-bound, off the event loop) -------------
+
+async def _assemble_pool_stage(
+    ctx: _SnapshotContext,
+    all_queries: list[str],
+    prefetch: _PrefetchResult,
+    venue_search_results: dict[str, list[list[MarketMatch] | None | BaseException]],
+) -> tuple[generation.PoolResult, dict[str, list[MarketMatch]]]:
+    """Stage 3 POOL ASSEMBLY (CPU-bound, off the event loop) plus stage 2.5 ENRICH.
+
+    Reports each venue's post-assembly token, then enriches Manifold: its search listing
+    carries no description, so without this every Manifold candidate reaches the ranker
+    title-only — and the prompt's stated "single most reliable cue" is the settlement/rules
+    text. Enrichment mutates the pool rows in place, so it MUST run before the prompt is
+    built and before apply_picks copies them.
+    """
     # `resolution_criteria` + `fine_print` together, because the fine print is where a question
     # often names the actual release page the settlement join keys on.
     pool = await generation.build_pool(
-        criteria_text=f"{resolution_criteria}\n{fine_print}",
+        criteria_text=f"{ctx.resolution_criteria}\n{ctx.fine_print}",
         queries=all_queries,
-        kalshi_events=kalshi_events,
-        predictit_markets=predictit_markets,
+        kalshi_events=prefetch.kalshi_events,
+        predictit_markets=prefetch.predictit_markets,
         venue_search_results=venue_search_results,
-        as_of=as_of,
+        as_of=ctx.as_of,
     )
     pool_by_venue: dict[str, list[MarketMatch]] = {}
     for row in pool.candidates:
@@ -699,37 +766,60 @@ async def _fetch_market_snapshot_impl(
     for venue in _SEARCH_VENUES:
         if venue in venue_search_results:
             tally = pool.per_venue_tally.get(venue, _FetchTally())
-            _report(venue, _platform_source_token(pool_by_venue.get(venue, []), tally))
-    if "predictit" in platforms:
-        _report("predictit", _platform_source_token(pool_by_venue.get("predictit", []), predictit_tally))
+            ctx.ledger.report(venue, _platform_source_token(pool_by_venue.get(venue, []), tally))
+    if "predictit" in ctx.platforms:
+        ctx.ledger.report(
+            "predictit", _platform_source_token(pool_by_venue.get("predictit", []), prefetch.predictit_tally)
+        )
 
-    # --- stage 2.5 ENRICH (between assembly and ranking) -------------------
-    # Manifold's search listing carries no description, so without this every Manifold
-    # candidate reaches the ranker title-only — and the prompt's stated "single most reliable
-    # cue" is the settlement/rules text. It mutates the pool rows in place, so it MUST run
-    # before the prompt is built and before apply_picks copies them.
-    enrichment = await generation.enrich_manifold(pool.candidates, session)
+    enrichment = await generation.enrich_manifold(pool.candidates, ctx.session)
     if enrichment.n_attempted == 0:
-        sources["manifold_detail"] = "none"
+        ctx.ledger.tokens["manifold_detail"] = "none"
     elif enrichment.n_ok == 0:
         # A lost detail GET costs rules text, never recall, so only a TOTAL loss is reported —
         # a partial fan-out has nothing actionable to alert on.
-        _record_loss("manifold_detail", "error(all_details_failed)")
+        ctx.ledger.record_loss("manifold_detail", "error(all_details_failed)")
     else:
-        sources["manifold_detail"] = f"ok({enrichment.n_ok})"
+        ctx.ledger.tokens["manifold_detail"] = f"ok({enrichment.n_ok})"
+    return pool, pool_by_venue
 
-    # --- stage 4 RANK ------------------------------------------------------
-    ranked_rows, ranking_token, outcome, prompt_chars = await _rank_pool(question, pool)
-    _report("ranking", ranking_token)
 
-    if lost_sources:
+async def _rank_stage(
+    ctx: _SnapshotContext,
+    pool: generation.PoolResult,
+    pool_by_venue: dict[str, list[MarketMatch]],
+) -> list[MarketMatch]:
+    """Stage 4 RANK, then emit the degradation WARN and both telemetry markers."""
+    ranked_rows, ranking_token, outcome, prompt_chars = await _rank_pool(ctx.question, pool)
+    ctx.ledger.report("ranking", ranking_token)
+
+    if ctx.ledger.lost:
         # One WARN naming every degraded source: this counter reddens CI, and a red run whose
         # cause isn't named in the log is what teaches people to ignore alerts.
-        logger.warning(f"Prediction-market sources degraded (alertable): {', '.join(lost_sources)}")
+        logger.warning(f"Prediction-market sources degraded (alertable): {', '.join(ctx.ledger.lost)}")
 
-    _log_ranking_telemetry(qid, pool, ranked_rows, outcome=outcome, prompt_chars=prompt_chars)
-    _record_venue_health(qid, pool, ranked_rows, pool_by_venue=pool_by_venue, sources=sources, platforms=platforms)
-    return MarketSnapshot(matches=ranked_rows, sources=sources, pool_size=len(pool.candidates))
+    _log_ranking_telemetry(ctx.qid, pool, ranked_rows, outcome=outcome, prompt_chars=prompt_chars)
+    _record_venue_health(
+        ctx.qid, pool, ranked_rows, pool_by_venue=pool_by_venue, sources=ctx.ledger.tokens, platforms=ctx.platforms
+    )
+    return ranked_rows
+
+
+async def _fetch_market_snapshot_impl(
+    question: Any,
+    *,
+    session: aiohttp.ClientSession,
+    platforms: tuple[str, ...],
+    as_of: datetime | None,
+) -> MarketSnapshot:
+    """The four stages. See the module docstring for the shape and why it is that shape."""
+    ctx = _SnapshotContext.build(question, session=session, platforms=platforms, as_of=as_of)
+    prefetch = await _run_prefetch_stage(ctx)
+    all_queries = dedupe_queries([*deterministic_queries(ctx.title), *prefetch.extra_queries])
+    venue_search_results = await _run_venue_search_stage(ctx, all_queries)
+    pool, pool_by_venue = await _assemble_pool_stage(ctx, all_queries, prefetch, venue_search_results)
+    ranked_rows = await _rank_stage(ctx, pool, pool_by_venue)
+    return MarketSnapshot(matches=ranked_rows, sources=ctx.ledger.tokens, pool_size=len(pool.candidates))
 
 
 def _log_ranking_telemetry(

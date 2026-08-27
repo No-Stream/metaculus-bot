@@ -21,6 +21,7 @@ class ResearchPersistenceWriter:
 
     def record(
         self,
+        *,
         qid: int,
         page_url: str,
         question_text: str,

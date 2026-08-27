@@ -197,6 +197,7 @@ def _skip_stacking_for_budget(
 async def _targeted_research_for_crux(
     bot: "TemplateForecaster",
     question: MetaculusQuestion,
+    *,
     analyzer_llm: GeneralLlm,
     valid_predictions: list[ReasonedPrediction[PredictionTypes]],
     time_budget: QuestionTimeBudget,
@@ -256,6 +257,84 @@ async def _targeted_research_for_crux(
         bot._conditional_stacking_search_failures += 1
         logger.exception("Targeted search failed, proceeding with base research only")
         return ""
+
+
+def _conditional_stacking_verdict(
+    bot: "TemplateForecaster",
+    question: MetaculusQuestion,
+    valid_predictions: list[ReasonedPrediction[PredictionTypes]],
+) -> tuple[float, float, str | None]:
+    """Measure disagreement and decide whether the stacker fires.
+
+    Returns ``(spread, threshold, skip_reason)`` where ``skip_reason`` is None iff the
+    stacker should run. Deriving the reason HERE, once, is what keeps the
+    ``_stacker_outcome`` / ``STACKER_SKIP_REASON`` pair from drifting when a fourth cause
+    lands: both markers read this one value.
+    """
+    spread = compute_spread(question, [pred.prediction_value for pred in valid_predictions])
+    threshold = bot._get_threshold_for_question(question)
+
+    # An UNMEASURABLE spread reports inf (spread_metrics' SPREAD_UNDEFINED: a
+    # non-positive normalizing denominator), and inf > threshold would fire the stacker —
+    # crux extraction, a targeted search and a stacker call — off no measurement at all.
+    # It used to report 0.0 and skip while the marker claimed the models AGREED, which is
+    # the affirmative reading this whole finding is about. Skipping is the conservative
+    # route (MEDIAN, no spend), and the reason names what actually happened so residual
+    # analysis can find these questions.
+    if math.isinf(spread):
+        return spread, threshold, "spread_undefined"
+    if spread <= threshold:
+        return spread, threshold, "spread_below_threshold"
+    # Disagreement was high enough to trigger stacking, but the per-type gate is
+    # off, so we deliberately bypass it.
+    if not _type_gate_enabled(question):
+        return spread, threshold, "config_off"
+    return spread, threshold, None
+
+
+def _record_conditional_skip(
+    bot: "TemplateForecaster",
+    question: MetaculusQuestion,
+    qid: int,
+    *,
+    skip_reason: str,
+    spread: float,
+    threshold: float,
+) -> None:
+    """Log the skip, bump the counter, and stamp both stacker markers.
+
+    "skipped_config_off" (spread exceeded the threshold but the per-type gate was off) vs
+    plain "skipped" keeps the suppression reason durable in the published marker instead of
+    requiring git archaeology over workflow-yaml flag history. The skip_reason companion
+    restates it in the one field shared with the single-forecaster path, so a consumer can
+    read STACKER_SKIP_REASON alone.
+    """
+    bot._conditional_stacking_skipped_count += 1
+    if skip_reason == "spread_undefined":
+        logger.warning(
+            "Conditional stacking SKIPPED: spread was UNMEASURABLE for question %s "
+            "(see the SPREAD_UNDEFINED warning above); routing to MEDIAN without a "
+            "disagreement measurement",
+            qid,
+        )
+    elif skip_reason == "config_off":
+        logger.info(
+            "Conditional stacking SKIPPED: stacking disabled for this question type "
+            "(spread=%.3f, threshold=%.3f) for question %s",
+            spread,
+            threshold,
+            qid,
+        )
+    else:
+        logger.info(
+            "Conditional stacking SKIPPED: spread=%.3f <= threshold=%.3f for question %s",
+            spread,
+            threshold,
+            qid,
+        )
+    bot._register_expected_base_combine(question)
+    bot._stacker_outcome[qid] = "skipped_config_off" if skip_reason == "config_off" else "skipped"
+    bot._stacker_skip_reason[qid] = skip_reason
 
 
 async def route_after_forecasts(
@@ -332,25 +411,9 @@ async def route_after_forecasts(
         )
 
     if bot.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING and not skip_stacking_for_budget:
-        spread = compute_spread(question, [pred.prediction_value for pred in valid_predictions])
-        threshold = bot._get_threshold_for_question(question)
+        spread, threshold, skip_reason = _conditional_stacking_verdict(bot, question, valid_predictions)
 
-        # An UNMEASURABLE spread reports inf (spread_metrics' SPREAD_UNDEFINED: a
-        # non-positive normalizing denominator), and inf > threshold would fire the stacker —
-        # crux extraction, a targeted search and a stacker call — off no measurement at all.
-        # It used to report 0.0 and skip while the marker claimed the models AGREED, which is
-        # the affirmative reading this whole finding is about. Skipping is the conservative
-        # route (MEDIAN, no spend), and the reason names what actually happened so residual
-        # analysis can find these questions.
-        spread_undefined = math.isinf(spread)
-        spread_exceeds_threshold = not spread_undefined and spread > threshold
-        # Disagreement was high enough to trigger stacking, but the per-type gate is
-        # off, so we deliberately bypass it.
-        type_stacking_disabled = spread_exceeds_threshold and not _type_gate_enabled(question)
-        if type_stacking_disabled:
-            spread_exceeds_threshold = False
-
-        if spread_exceeds_threshold:
+        if skip_reason is None:
             bot._conditional_stacking_triggered_count += 1
             logger.info(
                 "Conditional stacking TRIGGERED: spread=%.3f > threshold=%.3f for question %s",
@@ -366,7 +429,11 @@ async def route_after_forecasts(
                 raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
 
             targeted_research_text = await _targeted_research_for_crux(
-                bot, question, analyzer_llm, valid_predictions, time_budget
+                bot,
+                question,
+                analyzer_llm=analyzer_llm,
+                valid_predictions=valid_predictions,
+                time_budget=time_budget,
             )
             if targeted_research_text:
                 combined_research = (
@@ -390,47 +457,7 @@ async def route_after_forecasts(
                 ),
             )
 
-        bot._conditional_stacking_skipped_count += 1
-        if spread_undefined:
-            logger.warning(
-                "Conditional stacking SKIPPED: spread was UNMEASURABLE for question %s "
-                "(see the SPREAD_UNDEFINED warning above); routing to MEDIAN without a "
-                "disagreement measurement",
-                qid,
-            )
-        elif type_stacking_disabled:
-            logger.info(
-                "Conditional stacking SKIPPED: stacking disabled for this question type "
-                "(spread=%.3f, threshold=%.3f) for question %s",
-                spread,
-                threshold,
-                qid,
-            )
-        else:
-            logger.info(
-                "Conditional stacking SKIPPED: spread=%.3f <= threshold=%.3f for question %s",
-                spread,
-                threshold,
-                qid,
-            )
-        bot._register_expected_base_combine(question)
-        # The skip reason is derived ONCE and both markers read it, so the
-        # outcome/reason pair cannot drift when a fourth cause lands.
-        # "skipped_config_off" (spread exceeded the threshold but the per-type gate
-        # was off) vs plain "skipped" — keeps the suppression reason durable in the
-        # published marker instead of requiring git archaeology over workflow-yaml
-        # flag history. The skip_reason companion restates it in the one field shared
-        # with the single-forecaster path, so a consumer can read STACKER_SKIP_REASON
-        # alone.
-        skip_reason = (
-            "spread_undefined"
-            if spread_undefined
-            else "config_off"
-            if type_stacking_disabled
-            else "spread_below_threshold"
-        )
-        bot._stacker_outcome[qid] = "skipped_config_off" if skip_reason == "config_off" else "skipped"
-        bot._stacker_skip_reason[qid] = skip_reason
+        _record_conditional_skip(bot, question, qid, skip_reason=skip_reason, spread=spread, threshold=threshold)
         return base_predictions_collection()
 
     # Catch-all: a non-stacking strategy, OR a stacking strategy whose budget gate

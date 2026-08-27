@@ -27,8 +27,8 @@ def load_jsonl_records(path: Path) -> list[dict]:
         return []
     records: list[dict] = []
     with open(path) as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
+        for line_num, raw_line in enumerate(f, 1):
+            line = raw_line.strip()
             if not line:
                 continue
             try:

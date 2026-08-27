@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from metaculus_bot.research.market_retrieval.http import http_get_with_backoff, parse_iso, safe_float
@@ -141,26 +142,14 @@ def polymarket_event_children(markets: Sequence[dict[str, Any]]) -> tuple[Market
     return tuple(children)
 
 
-def _polymarket_event_match(event: dict[str, Any], rank: int) -> MarketMatch:
-    """One Gamma event as a candidate row: a single-outcome event's own price, or its children's.
+@dataclass(frozen=True, slots=True)
+class _EventLegs:
+    """The price, money and children columns one Gamma event contributes.
 
-    A MULTI-market event quotes no price of its own — see the module docstring for the mislabelled
-    anchor that came of reading ``markets[0]`` — and its money columns come from the EVENT rather
-    than from a sum over the children. That is not a stylistic preference: Gamma's public-search
-    response TRUNCATES the nested markets list, so on the committed fixture the event reports
-    $46.2M of volume against $9.1M across the two children it shipped. Summing the visible subset
-    would understate the family by 5x.
-
-    A single-market event is unchanged, deliberately: event and market ask the same question there,
-    so the price legs are the market's and the row renders exactly as it always has.
+    One return value for the three mutually-exclusive shapes an event can have (a family, a
+    single market, no markets at all), so ``_polymarket_event_match`` reads the shape once and
+    cannot end up with half of one shape's legs and half of another's.
     """
-    title = event.get("title") or event.get("question") or ""
-    slug = str(event.get("slug") or "")
-    volume = safe_float(event.get("volume"))
-    # Gamma carries `openInterest` on the EVENT, not the nested market (5/5 live events vs
-    # 0/42 nested, verified 2026-08-03) — reading it only at the market level left the
-    # rendered OI column blank on every Polymarket row ever archived.
-    event_open_interest = safe_float(event.get("openInterest"))
 
     implied: float | None = None
     bid: float | None = None
@@ -169,48 +158,96 @@ def _polymarket_event_match(event: dict[str, Any], rank: int) -> MarketMatch:
     total_volume: float | None = None
     liquidity: float | None = None
     open_interest: float | None = None
-    price_withheld = False
+    price_withheld: bool = False
     children: tuple[MarketChild, ...] = ()
+
+
+def _polymarket_single_market_legs(
+    market: dict[str, Any], *, event_volume: float | None, event_open_interest: float | None
+) -> _EventLegs:
+    """The legs of a ONE-market event, read off that market with the event as the fallback.
+
+    Event and market ask the same question here, so the price legs are the market's own — the
+    shape that predates the 2026-08-05 family split and renders exactly as it always has.
+    """
+    bid = safe_float(market.get("bestBid"))
+    ask = safe_float(market.get("bestAsk"))
+    # volumeNum is Gamma's all-time total; fall back to the event-level or market-level
+    # `volume` when it is absent.
+    total_volume = safe_float(market.get("volumeNum"))
+    if total_volume is None:
+        total_volume = event_volume if event_volume is not None else safe_float(market.get("volume"))
+    liquidity = safe_float(market.get("liquidityNum"))
+    if liquidity is None:
+        liquidity = safe_float(market.get("liquidity"))
+    # Market-level first (more specific when present), event-level as the fallback that
+    # actually populates on today's payloads.
+    open_interest = safe_float(market.get("openInterest"))
+    if open_interest is None:
+        open_interest = event_open_interest
+    # AFTER the money legs, because the untouched-default guard reads them — and it reads the
+    # legs as finally resolved (event-level fallbacks included) rather than the market's own
+    # fields, so a placeholder leg inside a genuinely traded event keeps its price.
+    raw_price = _prob_from_prices(market.get("outcomePrices"))
+    implied = _priced_or_none(raw_price, total_volume=total_volume, open_interest=open_interest)
+    return _EventLegs(
+        implied=implied,
+        bid=bid,
+        ask=ask,
+        vol_24h=safe_float(market.get("volume24hr")),
+        total_volume=total_volume,
+        liquidity=liquidity,
+        open_interest=open_interest,
+        price_withheld=implied is None and raw_price is not None,
+    )
+
+
+def _polymarket_event_legs(event: dict[str, Any]) -> _EventLegs:
+    """Which of the three event shapes this is, and the legs that shape publishes.
+
+    A MULTI-market event quotes no price of its own — see the module docstring for the mislabelled
+    anchor that came of reading ``markets[0]`` — and its money columns come from the EVENT rather
+    than from a sum over the children. That is not a stylistic preference: Gamma's public-search
+    response TRUNCATES the nested markets list, so on the committed fixture the event reports
+    $46.2M of volume against $9.1M across the two children it shipped. Summing the visible subset
+    would understate the family by 5x.
+    """
+    volume = safe_float(event.get("volume"))
+    # Gamma carries `openInterest` on the EVENT, not the nested market (5/5 live events vs
+    # 0/42 nested, verified 2026-08-03) — reading it only at the market level left the
+    # rendered OI column blank on every Polymarket row ever archived.
+    event_open_interest = safe_float(event.get("openInterest"))
     markets = [market for market in (event.get("markets") or []) if isinstance(market, dict)]
+
     if len(markets) > 1:
-        children = polymarket_event_children(markets)
-        vol_24h = safe_float(event.get("volume24hr"))
-        total_volume = volume
-        liquidity = safe_float(event.get("liquidity"))
-        open_interest = event_open_interest
-    elif markets:
-        first = markets[0]
-        bid = safe_float(first.get("bestBid"))
-        ask = safe_float(first.get("bestAsk"))
-        vol_24h = safe_float(first.get("volume24hr"))
-        # volumeNum is Gamma's all-time total; fall back to the event-level or market-level
-        # `volume` when it is absent.
-        total_volume = safe_float(first.get("volumeNum"))
-        if total_volume is None:
-            total_volume = volume if volume is not None else safe_float(first.get("volume"))
-        liquidity = safe_float(first.get("liquidityNum"))
-        if liquidity is None:
-            liquidity = safe_float(first.get("liquidity"))
-        # Market-level first (more specific when present), event-level as the fallback that
-        # actually populates on today's payloads.
-        open_interest = safe_float(first.get("openInterest"))
-        if open_interest is None:
-            open_interest = event_open_interest
-        # AFTER the money legs, because the untouched-default guard reads them — and it reads the
-        # legs as finally resolved (event-level fallbacks included) rather than the market's own
-        # fields, so a placeholder leg inside a genuinely traded event keeps its price.
-        raw_price = _prob_from_prices(first.get("outcomePrices"))
-        implied = _priced_or_none(raw_price, total_volume=total_volume, open_interest=open_interest)
-        price_withheld = implied is None and raw_price is not None
-    else:
-        total_volume = volume
-        open_interest = event_open_interest
+        return _EventLegs(
+            vol_24h=safe_float(event.get("volume24hr")),
+            total_volume=volume,
+            liquidity=safe_float(event.get("liquidity")),
+            open_interest=event_open_interest,
+            children=polymarket_event_children(markets),
+        )
+    if markets:
+        return _polymarket_single_market_legs(markets[0], event_volume=volume, event_open_interest=event_open_interest)
+    return _EventLegs(total_volume=volume, open_interest=event_open_interest)
+
+
+def _polymarket_event_match(event: dict[str, Any], rank: int) -> MarketMatch:
+    """One Gamma event as a candidate row: a single-outcome event's own price, or its children's.
+
+    Which legs the row carries is ``_polymarket_event_legs``' decision; everything here is the
+    event-level fields every shape shares.
+    """
+    title = event.get("title") or event.get("question") or ""
+    slug = str(event.get("slug") or "")
+    legs = _polymarket_event_legs(event)
+    bid, ask = legs.bid, legs.ask
 
     return MarketMatch(
         platform="polymarket",
         market_title=title,
         market_url=f"https://polymarket.com/event/{slug}" if slug else "",
-        implied_prob_yes=implied,
+        implied_prob_yes=legs.implied,
         bid=bid,
         ask=ask,
         spread=(ask - bid) if (bid is not None and ask is not None) else None,
@@ -218,18 +255,18 @@ def _polymarket_event_match(event: dict[str, Any], rank: int) -> MarketMatch:
         # carrying all-time volume on 25 of 122 archived rows — a recency field holding a
         # number with no recency, which is only harmless while nothing reads it. None says
         # "the venue didn't publish a 24h figure", which is what happened.
-        volume_24h=vol_24h,
+        volume_24h=legs.vol_24h,
         close_time=parse_iso(event.get("endDate") or event.get("end_date_iso") or ""),
         is_resolved=bool(event.get("closed")) or bool(event.get("resolved")),
         match_confidence=100.0 - rank,
         raw_rules=(event.get("description") or "")[:RULES_TEXT_MAX_CHARS],
-        total_volume=total_volume,
-        liquidity=liquidity,
-        open_interest=open_interest,
+        total_volume=legs.total_volume,
+        liquidity=legs.liquidity,
+        open_interest=legs.open_interest,
         venue_market_id=slug,
         retrieval_channel="venue_search",
-        children=children,
-        price_withheld=price_withheld,
+        children=legs.children,
+        price_withheld=legs.price_withheld,
     )
 
 

@@ -38,7 +38,7 @@ import logging
 import re
 import secrets
 import subprocess
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from forecasting_tools import MetaculusQuestion
@@ -531,7 +531,7 @@ def _build_meta(
         "sanitized_chars": sanitized_chars,
         "redactions": redactions,
         "redactor_invocation_id": redactor_invocation_id,
-        "pruned_at": datetime.now().isoformat(),
+        "pruned_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -555,7 +555,7 @@ async def _write_redactor_failure_dump(
     artifact alongside the rest of the run's diagnostic output.
     """
     qid_label = str(qids[0]) if qids else "empty"
-    ts = int(datetime.now().timestamp())
+    ts = int(datetime.now(UTC).timestamp())
     failures_dir = cache.root / "redactor_failures"
     debug_path = failures_dir / f"batch_{qid_label}_{ts}.log"
 
@@ -576,6 +576,71 @@ async def _write_redactor_failure_dump(
         await asyncio.sleep(0)
         return "(failed to write debug file)"
     return str(debug_path)
+
+
+def _exception_stream_bytes(stream: bytes | str | None) -> bytes:
+    """Normalize a ``CalledProcessError`` stdout/stderr field to bytes."""
+    if stream is None:
+        return b""
+    return stream if isinstance(stream, bytes) else str(stream).encode()
+
+
+async def _report_redactor_subprocess_failure(
+    cache: AblationCache,
+    qids: list[int],
+    exc: subprocess.CalledProcessError,
+) -> None:
+    """Dump the full redactor output to disk and log the truncated streams.
+
+    ``CalledProcessError`` captures stderr in ``exc.stderr`` but Python's default
+    ``__str__`` only renders the argv. Surface the actual stderr bytes (decoded,
+    truncated) in the log AND dump the full stdout/stderr to a debug file under
+    the cache root so the result envelope (which often carries the real failure
+    detail) is diagnosable without re-running the subprocess.
+    """
+    stderr_bytes = _exception_stream_bytes(exc.stderr)
+    stdout_bytes = _exception_stream_bytes(exc.output)
+
+    debug_path = await _write_redactor_failure_dump(cache, qids, stderr_bytes, stdout_bytes)
+
+    logger.error(
+        "Redactor subprocess failed for qids=%s: exit=%s\n"
+        "(full output dumped to %s)\n"
+        "stderr (truncated): %s\nstdout (truncated): %s",
+        qids,
+        exc.returncode,
+        debug_path,
+        stderr_bytes.decode("utf-8", errors="replace")[:2000],
+        stdout_bytes.decode("utf-8", errors="replace")[:2000],
+    )
+
+
+def _persist_parsed_batch(
+    cache: AblationCache,
+    parsed: dict[int, tuple[str, list[dict]] | None],
+    raw_blobs: dict[int, str],
+) -> dict[int, tuple[str, dict]]:
+    """Write each successfully-redacted blob to cache and build its return entry.
+
+    One ``redactor_invocation_id`` is shared across the batch so a cached meta
+    record can be traced back to the ``claude -p`` call that produced it.
+    """
+    invocation_id = secrets.token_hex(8)
+    persisted: dict[int, tuple[str, dict]] = {}
+    for qid, result in parsed.items():
+        if result is None:
+            continue
+        sanitized_blob, redactions = result
+        meta = _build_meta(
+            qid=qid,
+            original_chars=len(raw_blobs[qid]),
+            sanitized_chars=len(sanitized_blob),
+            redactions=redactions,
+            redactor_invocation_id=invocation_id,
+        )
+        cache.write_pruned_research(qid=qid, sanitized_blob=sanitized_blob, meta=meta)
+        persisted[qid] = (sanitized_blob, {**meta, "cache_schema_version": 1})
+    return persisted
 
 
 async def _process_batch(
@@ -643,32 +708,7 @@ async def _process_batch(
             timeout_seconds=timeout_seconds,
         )
     except subprocess.CalledProcessError as exc:
-        # CalledProcessError captures stderr in `exc.stderr` but Python's default
-        # __str__ only renders the argv. Surface the actual stderr bytes (decoded,
-        # truncated) in the log AND dump the full stdout/stderr to a debug file
-        # under the cache root so the result envelope (which often carries the
-        # real failure detail) is diagnosable without re-running the subprocess.
-        stderr_bytes = b""
-        if exc.stderr is not None:
-            stderr_bytes = exc.stderr if isinstance(exc.stderr, bytes) else str(exc.stderr).encode()
-        stdout_bytes = b""
-        if exc.output is not None:
-            stdout_bytes = exc.output if isinstance(exc.output, bytes) else str(exc.output).encode()
-
-        debug_path = await _write_redactor_failure_dump(cache, qids, stderr_bytes, stdout_bytes)
-
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:2000]
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")[:2000]
-        logger.error(
-            "Redactor subprocess failed for qids=%s: exit=%s\n"
-            "(full output dumped to %s)\n"
-            "stderr (truncated): %s\nstdout (truncated): %s",
-            qids,
-            exc.returncode,
-            debug_path,
-            stderr_text,
-            stdout_text,
-        )
+        await _report_redactor_subprocess_failure(cache, qids, exc)
         return out
     except TimeoutError as exc:
         logger.exception("Redactor subprocess timed out for qids=%s: %s", qids, exc)
@@ -691,22 +731,7 @@ async def _process_batch(
         )
         return out
 
-    invocation_id = secrets.token_hex(8)
-    for qid, result in parsed.items():
-        if result is None:
-            continue
-        sanitized_blob, redactions = result
-        original_chars = len(raw_blobs[qid])
-        meta = _build_meta(
-            qid=qid,
-            original_chars=original_chars,
-            sanitized_chars=len(sanitized_blob),
-            redactions=redactions,
-            redactor_invocation_id=invocation_id,
-        )
-        cache.write_pruned_research(qid=qid, sanitized_blob=sanitized_blob, meta=meta)
-        out[qid] = (sanitized_blob, {**meta, "cache_schema_version": 1})
-
+    out.update(_persist_parsed_batch(cache, parsed, raw_blobs))
     return out
 
 

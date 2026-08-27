@@ -1103,3 +1103,94 @@ async def test_process_batch_singleton_oversized_fails_loud(
     assert any("too large" in r.getMessage().lower() and "qid=6000" in r.getMessage() for r in error_records), (
         "expected an ERROR log naming the over-limit single qid"
     )
+
+
+@pytest.mark.asyncio
+async def test_process_batch_subprocess_failure_dumps_full_output(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A CalledProcessError must dump full stdout+stderr under the cache root.
+
+    Pins the diagnostic contract: every qid in the batch comes back None, a
+    ``redactor_failures/batch_<qid0>_<ts>.log`` file holds both delimited
+    streams verbatim, and the ERROR log names the exit code, the dump path and
+    the (truncated) stream text so the operator can find the artifact.
+    """
+    import logging
+    import subprocess
+
+    from metaculus_bot.ablation.prune import _process_batch
+
+    triples: list[tuple[MetaculusQuestion, GroundTruth, str]] = [
+        (_make_question(7001), _make_ground_truth(7001), "raw blob 7001"),
+        (_make_question(7002), _make_ground_truth(7002), "raw blob 7002"),
+    ]
+    failure = subprocess.CalledProcessError(
+        returncode=42,
+        cmd=["claude"],
+        output=b"partial stdout envelope",
+        stderr=b"the real failure reason",
+    )
+    _patch_subprocess(monkeypatch, [failure])
+
+    with caplog.at_level(logging.ERROR, logger="metaculus_bot.ablation.prune"):
+        results = await _process_batch(
+            triples,
+            cache,
+            claude_executable="claude",
+            timeout_seconds=30,
+        )
+
+    assert results == {7001: None, 7002: None}
+
+    dumps = sorted((cache.root / "redactor_failures").glob("batch_7001_*.log"))
+    assert len(dumps) == 1, f"expected exactly one failure dump, got {dumps}"
+    dumped = dumps[0].read_bytes()
+    assert dumped == (b"=== STDERR ===\nthe real failure reason\n=== STDOUT ===\npartial stdout envelope")
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(messages) == 1
+    message = messages[0]
+    assert "exit=42" in message
+    assert str(dumps[0]) in message
+    assert "the real failure reason" in message
+    assert "partial stdout envelope" in message
+    assert "7001" in message
+    assert "7002" in message
+
+
+@pytest.mark.asyncio
+async def test_process_batch_failure_dump_write_error_degrades_gracefully(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unwritable dump path must not turn a batch failure into a crash."""
+    import logging
+    import subprocess
+
+    from metaculus_bot.ablation.prune import _process_batch
+
+    triples: list[tuple[MetaculusQuestion, GroundTruth, str]] = [
+        (_make_question(7100), _make_ground_truth(7100), "raw blob 7100")
+    ]
+    _patch_subprocess(monkeypatch, [subprocess.CalledProcessError(returncode=1, cmd=["claude"], stderr=b"boom")])
+
+    def _explode(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(Path, "mkdir", _explode)
+
+    with caplog.at_level(logging.ERROR, logger="metaculus_bot.ablation.prune"):
+        results = await _process_batch(
+            triples,
+            cache,
+            claude_executable="claude",
+            timeout_seconds=30,
+        )
+
+    assert results == {7100: None}
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("(failed to write debug file)" in m for m in messages)

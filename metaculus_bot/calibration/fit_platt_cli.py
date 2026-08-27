@@ -461,6 +461,7 @@ def _format_section(outcome: FitOutcome | None, title: str) -> str:
 def _write_report(
     binary_outcome: FitOutcome | None,
     mc_outcome: FitOutcome | None,
+    *,
     plot_skip_note: str | None,
     path: Path,
     version: str,
@@ -564,7 +565,13 @@ def run(args: argparse.Namespace) -> int:
         _write_json(mc_outcome, output_dir / "mc_fit.json", version)
 
     plot_skip_note = _try_plot(binary_outcome, mc_outcome, output_dir / "calibration_curves_pre_post.png")
-    _write_report(binary_outcome, mc_outcome, plot_skip_note, output_dir / "report.md", version)
+    _write_report(
+        binary_outcome,
+        mc_outcome,
+        plot_skip_note=plot_skip_note,
+        path=output_dir / "report.md",
+        version=version,
+    )
     return 0
 
 

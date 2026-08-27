@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -1088,44 +1088,27 @@ async def _conclude_tool(
     return ToolOutcome(content_markdown="\n".join(lines), method="internal")
 
 
-async def _execute_one_tool_call(
+def _tool_error_result(tool_call: _ToolCall, message: str, max_result_chars: int) -> _ToolExecutionResult:
+    """Synthesize the error tool-response for a call that never reached its handler."""
+    outcome = ToolOutcome(content_markdown=message, method="internal", status="error")
+    return _ToolExecutionResult(
+        tool_call_id=tool_call.id,
+        tool_name=tool_call.name,
+        content=_format_tool_content(tool_call.name, outcome, max_result_chars),
+    )
+
+
+async def _run_tool_handler(
     tool_call: _ToolCall,
+    arguments: dict[str, Any],
+    timeout_s: float,
+    *,
     tools_by_name: dict[str, ToolSpec],
     state: _LoopState,
     config: LoopConfig,
     now: Callable[[], float],
-) -> _ToolExecutionResult:
-    try:
-        arguments = _parse_arguments(tool_call.arguments)
-    except (json.JSONDecodeError, ValueError) as exc:
-        outcome = ToolOutcome(
-            content_markdown=f"Invalid tool arguments: {exc}",
-            method="internal",
-            status="error",
-        )
-        return _ToolExecutionResult(
-            tool_call_id=tool_call.id,
-            tool_name=tool_call.name,
-            content=_format_tool_content(tool_call.name, outcome, config.max_result_chars),
-        )
-
-    if tool_call.name in _INTERNAL_TOOL_NAMES:
-        timeout_s = _INTERNAL_TOOL_TIMEOUT_S
-    else:
-        spec = tools_by_name.get(tool_call.name)
-        if spec is None:
-            outcome = ToolOutcome(
-                content_markdown=f"Unknown tool: {tool_call.name}",
-                method="internal",
-                status="error",
-            )
-            return _ToolExecutionResult(
-                tool_call_id=tool_call.id,
-                tool_name=tool_call.name,
-                content=_format_tool_content(tool_call.name, outcome, config.max_result_chars),
-            )
-        timeout_s = spec.timeout_s
-
+) -> ToolOutcome:
+    """Dispatch one tool call under its timeout, folding every failure into an outcome."""
     try:
         # Instantiate the handler coroutine INSIDE the boundary. External-tool
         # handlers have concrete signatures, and async-def binds kwargs eagerly:
@@ -1144,25 +1127,57 @@ async def _execute_one_tool_call(
         else:
             handler = tools_by_name[tool_call.name].handler(**arguments)
         raw_outcome = await asyncio.wait_for(handler, timeout=timeout_s)
-        outcome = ToolOutcome.model_validate(raw_outcome)
+        return ToolOutcome.model_validate(raw_outcome)
     except TimeoutError:
-        outcome = ToolOutcome(
+        return ToolOutcome(
             content_markdown=f"Tool timed out after {timeout_s:.2f}s.",
             method="internal",
             status="timeout",
         )
     except ValidationError as exc:
-        outcome = ToolOutcome(
+        return ToolOutcome(
             content_markdown=f"Tool returned invalid outcome: {exc.errors()[0]['msg']}",
             method="internal",
             status="error",
         )
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # tool-execution boundary: any tool failure becomes an error outcome, never a loop crash
-        outcome = ToolOutcome(
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # tool-execution boundary: any tool failure becomes an error outcome, never a loop crash
+        return ToolOutcome(
             content_markdown=f"{type(exc).__name__}: {exc}",
             method="internal",
             status="error",
         )
+
+
+async def _execute_one_tool_call(
+    tool_call: _ToolCall,
+    tools_by_name: dict[str, ToolSpec],
+    state: _LoopState,
+    config: LoopConfig,
+    *,
+    now: Callable[[], float],
+) -> _ToolExecutionResult:
+    try:
+        arguments = _parse_arguments(tool_call.arguments)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return _tool_error_result(tool_call, f"Invalid tool arguments: {exc}", config.max_result_chars)
+
+    if tool_call.name in _INTERNAL_TOOL_NAMES:
+        timeout_s = _INTERNAL_TOOL_TIMEOUT_S
+    else:
+        spec = tools_by_name.get(tool_call.name)
+        if spec is None:
+            return _tool_error_result(tool_call, f"Unknown tool: {tool_call.name}", config.max_result_chars)
+        timeout_s = spec.timeout_s
+
+    outcome = await _run_tool_handler(
+        tool_call,
+        arguments,
+        timeout_s,
+        tools_by_name=tools_by_name,
+        state=state,
+        config=config,
+        now=now,
+    )
 
     provenance_urls, provenance_text = _harvest_provenance(tool_call.name, arguments, outcome)
     provenance_tiers = _harvest_verification_tiers(tool_call.name, arguments, outcome)
@@ -1286,18 +1301,26 @@ def _plan_rejected_content(tool_name: str, config: LoopConfig) -> str:
     return _format_tool_content(tool_name, outcome, config.max_result_chars)
 
 
-async def _execute_tool_batch(
-    tool_calls: list[_ToolCall],
-    *,
-    tools_by_name: dict[str, ToolSpec],
-    state: _LoopState,
-    config: LoopConfig,
-    now: Callable[[], float],
-) -> None:
-    duplicate_call_ids: set[str] = set()
-    rejected_call_ids: set[str] = set()
-    plan_rejected_call_ids: set[str] = set()
-    accepted: list[_ToolCall] = []
+@dataclass
+class _AdmittedCalls:
+    """Which calls in one batch run, and why each of the rest was refused."""
+
+    accepted: list[_ToolCall]
+    duplicate_call_ids: set[str]
+    rejected_call_ids: set[str]
+    plan_rejected_call_ids: set[str]
+
+
+def _admit_tool_calls(tool_calls: list[_ToolCall], state: _LoopState, config: LoopConfig) -> _AdmittedCalls:
+    """Apply the plan gate, the call budget, and duplicate detection to one batch.
+
+    Mutates ``state`` exactly as the inline version did — the accepted calls'
+    counters are bumped here, before any handler runs, and the plan nudge is
+    recorded once per gated batch.
+    """
+    admitted = _AdmittedCalls(
+        accepted=[], duplicate_call_ids=set(), rejected_call_ids=set(), plan_rejected_call_ids=set()
+    )
 
     # Plan gate (W1): external tool calls are rejected until set_research_plan
     # has run. Checked once per batch (before gather), so a parallel batch of
@@ -1318,10 +1341,10 @@ async def _execute_tool_batch(
     for tool_call in tool_calls:
         is_internal = tool_call.name in _INTERNAL_TOOL_NAMES
         if not is_internal and plan_gate_active:
-            plan_rejected_call_ids.add(tool_call.id)
+            admitted.plan_rejected_call_ids.add(tool_call.id)
             continue
         if not is_internal and state.telemetry.tool_calls >= config.max_tool_calls:
-            rejected_call_ids.add(tool_call.id)
+            admitted.rejected_call_ids.add(tool_call.id)
             continue
 
         state.telemetry.tool_calls += 1
@@ -1329,22 +1352,23 @@ async def _execute_tool_batch(
         call_key = _normalized_call_key(tool_call)
         if call_key in state.seen_tool_calls:
             state.telemetry.dup_tool_calls += 1
-            duplicate_call_ids.add(tool_call.id)
+            admitted.duplicate_call_ids.add(tool_call.id)
         else:
             state.seen_tool_calls.add(call_key)
-        accepted.append(tool_call)
+        admitted.accepted.append(tool_call)
 
     # Record the plan nudge (once per gated batch) and flip to soft-continue
     # once the cap is hit, so the NEXT batch's external calls run un-gated.
-    if plan_rejected_call_ids:
+    if admitted.plan_rejected_call_ids:
         state.plan_nudges += 1
         if state.plan_nudges >= config.max_plan_nudges:
             state.plan_skipped = True
             state.telemetry.plan_skipped = True
+    return admitted
 
-    results = await asyncio.gather(
-        *[_execute_one_tool_call(tool_call, tools_by_name, state, config, now) for tool_call in accepted]
-    )
+
+def _absorb_tool_results(state: _LoopState, results: Sequence[_ToolExecutionResult]) -> None:
+    """Fold one batch's provenance, verification tiers, and counters into loop state."""
     provenance_texts: list[str] = []
     for result in results:
         if result.method == "rendered":
@@ -1366,20 +1390,31 @@ async def _execute_tool_batch(
         state.tool_content_normalized = _normalize_quote_text(
             f"{state.tool_content_normalized} {' '.join(provenance_texts)}"
         )
-    results_by_id = {result.tool_call_id: result for result in results}
 
-    # Exactly one tool message per tool_call_id, in the assistant's original
-    # order, or the next LLM turn 400s. Rejected calls get a synthetic
-    # budget-exhausted error response.
-    budget_line = _budget_line(state, config, now)
+
+def _append_tool_messages(
+    tool_calls: list[_ToolCall],
+    admitted: _AdmittedCalls,
+    results: Sequence[_ToolExecutionResult],
+    *,
+    state: _LoopState,
+    config: LoopConfig,
+    budget_line: str,
+) -> None:
+    """Emit exactly one tool message per tool_call_id, in the assistant's original order.
+
+    Anything else and the next LLM turn 400s. Rejected calls get a synthetic
+    plan-gate / budget-exhausted error response.
+    """
+    results_by_id = {result.tool_call_id: result for result in results}
     for tool_call in tool_calls:
-        if tool_call.id in plan_rejected_call_ids:
+        if tool_call.id in admitted.plan_rejected_call_ids:
             content = _plan_rejected_content(tool_call.name, config)
-        elif tool_call.id in rejected_call_ids:
+        elif tool_call.id in admitted.rejected_call_ids:
             content = _budget_rejected_content(tool_call.name, config)
         else:
             result = results_by_id[tool_call.id]
-            content = result.content + (_DUPLICATE_CALL_WARNING if tool_call.id in duplicate_call_ids else "")
+            content = result.content + (_DUPLICATE_CALL_WARNING if tool_call.id in admitted.duplicate_call_ids else "")
         state.messages.append(
             {
                 "role": "tool",
@@ -1388,6 +1423,29 @@ async def _execute_tool_batch(
                 "content": content + budget_line,
             }
         )
+
+
+async def _execute_tool_batch(
+    tool_calls: list[_ToolCall],
+    *,
+    tools_by_name: dict[str, ToolSpec],
+    state: _LoopState,
+    config: LoopConfig,
+    now: Callable[[], float],
+) -> None:
+    admitted = _admit_tool_calls(tool_calls, state, config)
+    results = await asyncio.gather(
+        *[_execute_one_tool_call(tool_call, tools_by_name, state, config, now=now) for tool_call in admitted.accepted]
+    )
+    _absorb_tool_results(state, results)
+    _append_tool_messages(
+        tool_calls,
+        admitted,
+        results,
+        state=state,
+        config=config,
+        budget_line=_budget_line(state, config, now),
+    )
 
 
 def _freeze_result(state: _LoopState, findings_markdown: str, ghost: GhostForecast | None) -> LoopResult:
@@ -1533,7 +1591,7 @@ async def _run_ghost_phase(
     except TimeoutError:
         logger.warning("%sGhost phase timed out after 60s", log_prefix)
         return None
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # telemetry-only phase
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # telemetry-only phase: a failed ghost must never cost the run its banked findings
         logger.warning("%sGhost phase failed: %s: %s", log_prefix, type(exc).__name__, exc)
         return None
 
@@ -1619,9 +1677,9 @@ async def run_agentic_loop(
     user_brief: str,
     tools: list[ToolSpec],
     config: LoopConfig,
+    *,
     llm_call: LlmCall | None = None,
     ghost_prompt: str | None = None,
-    *,
     log_prefix: str = "",
     now: Callable[[], float] | None = None,
 ) -> LoopResult:

@@ -338,7 +338,7 @@ def _format_fetch_error(message: str, *, status: str = "error", method: str = "p
     return ToolOutcome(content_markdown=message, method=method, status=status)
 
 
-def _render_fetch_outcome(url: str, text: str, links: list[str], method: str, start_char: int) -> ToolOutcome:
+def _render_fetch_outcome(url: str, text: str, links: list[str], *, method: str, start_char: int) -> ToolOutcome:
     _cache_fetch_result(url, text, links)
     window, truncated = _slice_fetch_window(text, start_char)
     return ToolOutcome(content_markdown=window, links=links, method=method, truncated=truncated)
@@ -368,7 +368,7 @@ def _empty_fetch_outcome(url: str) -> ToolOutcome:
 
 
 def _warn_playwright_unavailable_once(exc: BaseException) -> None:
-    global _PLAYWRIGHT_WARNED
+    global _PLAYWRIGHT_WARNED  # noqa: PLW0603  # one-shot process-wide warn latch so the rendered rung logs once per run
     if _PLAYWRIGHT_WARNED:
         return
     _PLAYWRIGHT_WARNED = True
@@ -378,6 +378,41 @@ def _warn_playwright_unavailable_once(exc: BaseException) -> None:
 def _is_rate_limited_error(exc: BaseException) -> bool:
     """Generic 429/rate-limit/quota classifier (Exa and AskNews retry paths)."""
     return bool(_RATE_LIMIT_RE.search(str(exc)))
+
+
+async def _asknews_search_with_retry(sdk: Any, query: str, tries: int, backoff: float) -> list[Any]:
+    """Issue the AskNews search over an open SDK session, retrying only transient throttling.
+
+    Split out of :func:`_call_asknews_search` so the retry ladder is not nested
+    inside the semaphore + SDK context managers.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, tries + 1):
+        try:
+            await research_providers.asknews_rate_gate()
+            response = await sdk.news.search_news(
+                query=query,
+                n_articles=6,
+                return_type="both",
+                strategy="news knowledge",
+            )
+            return list(response.as_dicts or [])
+        except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+            last_exc = exc
+            # Transient-only retry, matching the primary provider's ``_is_retryable``
+            # (``providers.py``). The 403011 subscription-inactive error is PERMANENT —
+            # off-season billing, not throttling — so it must NOT be exempted here: re-rolling
+            # it burns the whole ``ASKNEWS_MAX_TRIES`` ladder of ``ASKNEWS_BACKOFF_SECS``
+            # sleeps (a double-digit fraction of GAP_FILL_V2_WALL_DEADLINE, since the sleep
+            # below grows as 3**attempt) on a call that can never succeed.
+            if not _is_rate_limited_error(exc) and "concurrency limit" not in str(exc).lower():
+                raise
+            if attempt >= tries:
+                raise
+            await asyncio.sleep(backoff * (10 + 3**attempt))
+    if last_exc is not None:
+        raise last_exc
+    return []
 
 
 async def _call_asknews_search(query: str) -> list[Any]:
@@ -393,35 +428,7 @@ async def _call_asknews_search(query: str) -> list[Any]:
     semaphore = research_providers.get_asknews_semaphore()
 
     async with semaphore, AsyncAskNewsSDK(client_id=client_id, client_secret=secret, scopes={"news"}) as sdk:
-        last_exc: Exception | None = None
-        for attempt in range(1, tries + 1):
-            try:
-                await research_providers.asknews_rate_gate()
-                response = await sdk.news.search_news(
-                    query=query,
-                    n_articles=6,
-                    return_type="both",
-                    strategy="news knowledge",
-                )
-                return list(response.as_dicts or [])
-            except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
-                last_exc = exc
-                # Transient-only retry, matching the primary provider's ``_is_retryable``
-                # (``providers.py``). The 403011 subscription-inactive error is PERMANENT —
-                # off-season billing, not throttling — so it must NOT be exempted here: re-rolling
-                # it burns the whole ``ASKNEWS_MAX_TRIES`` ladder of ``ASKNEWS_BACKOFF_SECS``
-                # sleeps (a double-digit fraction of GAP_FILL_V2_WALL_DEADLINE, since the sleep
-                # below grows as 3**attempt) on a call that can never succeed.
-                if not _is_rate_limited_error(exc):
-                    msg = str(exc).lower()
-                    if "concurrency limit" not in msg:
-                        raise
-                if attempt >= tries:
-                    raise
-                await asyncio.sleep(backoff * (10 + 3**attempt))
-        if last_exc is not None:
-            raise last_exc
-    return []
+        return await _asknews_search_with_retry(sdk, query, tries, backoff)
 
 
 async def _run_exa_search(query: str, end_published_date: str | None) -> Any:
@@ -475,15 +482,12 @@ _METACULUS_FETCH_BLOCK_MSG = (
 )
 
 
-async def _fetch_plain(url: str) -> PlainFetchResult:
-    if not await resolution_source.is_public_http_url(url):
-        return PlainFetchResult(
-            status="blocked",
-            method="plain",
-            text="Blocked non-public or unsupported URL.",
-            links=[],
-            url=url,
-        )
+def _fetch_plain_url_block(url: str) -> PlainFetchResult | None:
+    """Reject a URL the plain rung must not dial, or None when it is fetchable.
+
+    Runs on the caller-supplied URL and again on every redirect hop, so a 3xx
+    cannot walk into a target the initial check would have refused.
+    """
     # Block metaculus.com from our runner IP. Question pages are a JS SPA whose
     # near-empty plain fetch would auto-escalate to headless Chromium, whose
     # route guard then permits the SPA's own XHR fan-out to the Metaculus API —
@@ -499,195 +503,242 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
             links=[],
             url=url,
         )
+    return None
+
+
+async def _plain_redirect_outcome(
+    resp: aiohttp.ClientResponse, current_url: str, content_type: str
+) -> PlainFetchResult | str:
+    """Vet a 3xx hop: return the next URL to follow, or a terminal blocked/error result."""
+    location = resp.headers.get("Location") if resp.headers else None
+    if not location:
+        return PlainFetchResult(
+            status="error",
+            method="plain",
+            text=f"Malformed redirect from {current_url}",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+        )
+    next_url = urljoin(current_url, location)
+    if not await resolution_source.is_public_http_url(next_url):
+        return PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text="Blocked non-public redirect target.",
+            links=[],
+            url=next_url,
+            content_type=content_type or None,
+        )
+    # A 3xx to metaculus.com must not be followed either (same
+    # our-IP / no-new-info rationale as the initial-URL block).
+    blocked = _fetch_plain_url_block(next_url)
+    if blocked is not None:
+        return PlainFetchResult(
+            status=blocked.status,
+            method=blocked.method,
+            text=blocked.text,
+            links=[],
+            url=next_url,
+            content_type=content_type or None,
+        )
+    return next_url
+
+
+async def _plain_html_outcome(body: bytes, html: str, content_type: str, current_url: str) -> PlainFetchResult:
+    """Outcome for an HTML body: trafilatura main text plus the page's links."""
+    extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, current_url)
+    text = extracted or ""
+    links = _extract_links_from_html(html, current_url)
+    if not text.strip():
+        # No extractable text on a 200 OK (JS wall, consent
+        # gate, empty body). A distinct "empty" status keeps
+        # the ladder escalating to the rendered rung while
+        # barring this outcome from the status=="ok" tier
+        # grant — an unread page must never be "fetched".
+        return PlainFetchResult(
+            status="empty",
+            method="plain",
+            text="Plain fetch returned no extractable text.",
+            links=links,
+            url=current_url,
+            content_type=content_type or None,
+            escalate_rendered=True,
+        )
+    return PlainFetchResult(
+        status="ok",
+        method="plain",
+        text=text,
+        links=links,
+        url=current_url,
+        content_type=content_type or None,
+        escalate_rendered=len(text.strip()) < _FETCH_MIN_CONTENT_CHARS,
+    )
+
+
+def _plain_textual_outcome(
+    html: str, undecodable_ratio: float, content_type: str, current_url: str
+) -> PlainFetchResult:
+    """Outcome for a raw text/CSV/JSON body: tags stripped, no link extraction."""
+    if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO:
+        # The decode failed rather than the text being slightly
+        # dirty (BOM-less UTF-16, an undeclared 8-bit codec):
+        # what we hold is replacement chars and NULs, not the
+        # page. Shipping it as "ok" would hand the driver
+        # mojibake as a read source. "empty" keeps the ladder
+        # escalating to the rendered rung — the browser's own
+        # charset sniffing can rescue what a declared-charset
+        # decode could not — while barring the tier grant.
+        return PlainFetchResult(
+            status="empty",
+            method="plain",
+            text="Plain fetch could not decode the body as text.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+            escalate_rendered=True,
+        )
+    # Same allow-listed tag strip the Tier-1 raw-body branches run:
+    # a Datawrapper poll CSV measured 69% `<a href=...>` markup, so
+    # without it the driver's max_result_chars budget buys tags
+    # instead of rows, and the inflated length also defeats the
+    # short-content escalation heuristic below.
+    text = resolution_source.strip_html_tags(html).strip()
+    if not text:
+        return PlainFetchResult(
+            status="empty",
+            method="plain",
+            text="Plain fetch returned no extractable text.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+            escalate_rendered=True,
+        )
+    return PlainFetchResult(
+        status="ok",
+        method="plain",
+        text=text,
+        links=[],
+        url=current_url,
+        content_type=content_type or None,
+        escalate_rendered=len(text) < _FETCH_MIN_CONTENT_CHARS,
+    )
+
+
+_DOCUMENT_NEEDED_MSG = "This URL is a PDF or image — use read_document(url, ask) to read it."
+
+
+async def _plain_response_outcome(resp: aiohttp.ClientResponse, current_url: str) -> PlainFetchResult | str:
+    """Classify one HTTP response: a terminal result, or the next URL on a vetted 3xx."""
+    status = resp.status
+    content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
+    if status in REDIRECT_STATUSES:
+        return await _plain_redirect_outcome(resp, current_url, content_type)
+    if status in _RETRYABLE_FETCH_BLOCK_STATUSES:
+        return PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text=f"Fetch blocked with HTTP {status}.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+        )
+    if status != 200:
+        return PlainFetchResult(
+            status="error",
+            method="plain",
+            text=f"Fetch failed with HTTP {status}.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+        )
+    if _content_type_is_document(content_type):
+        return PlainFetchResult(
+            status="ok",
+            method="document_needed",
+            text=_DOCUMENT_NEEDED_MSG,
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+        )
+    body = await _read_response_body(resp, f"agentic fetch {urlparse(current_url).netloc}")
+    if body is None:
+        return PlainFetchResult(
+            status="error",
+            method="plain",
+            text="Fetch body exceeded the size limit.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+        )
+    if _body_is_document(body):
+        return PlainFetchResult(
+            status="ok",
+            method="document_needed",
+            text=_DOCUMENT_NEEDED_MSG,
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+        )
+
+    # Charset-honoring decode (BOM > declared charset > UTF-8), not a
+    # forced UTF-8 read: a windows-1252 or UTF-16 body decoded that way
+    # is `0�.�4�2�`-style mojibake that reached the driver as
+    # status="ok". The ratio is the refusal signal on the textual
+    # branch; the HTML branch is unaffected because its main text comes
+    # from `_extract_main_text`, which decodes the raw bytes itself.
+    html, undecodable_ratio = decode_text_body(body, content_type)
+    if any(token in content_type for token in _HTML_CONTENT_TYPE_TOKENS) or "<html" in html.lower():
+        return await _plain_html_outcome(body, html, content_type, current_url)
+    if any(token in content_type for token in _TEXTUAL_CONTENT_TYPE_TOKENS) or not content_type:
+        return _plain_textual_outcome(html, undecodable_ratio, content_type, current_url)
+    return PlainFetchResult(
+        status="error",
+        method="plain",
+        text=f"Unsupported content type: {content_type or 'unknown'}",
+        links=[],
+        url=current_url,
+        content_type=content_type or None,
+    )
+
+
+async def _fetch_one_hop(session: aiohttp.ClientSession, current_url: str) -> PlainFetchResult | str:
+    """One request against ``current_url`` under its host gate: terminal result, or the next URL."""
+    async with _host_gate(current_url):
+        try:
+            async with session.get(current_url, allow_redirects=False) as resp:
+                return await _plain_response_outcome(resp, current_url)
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            return PlainFetchResult(
+                status="error",
+                method="plain",
+                text=f"Fetch error: {type(exc).__name__}: {exc}",
+                links=[],
+                url=current_url,
+            )
+
+
+async def _fetch_plain(url: str) -> PlainFetchResult:
+    if not await resolution_source.is_public_http_url(url):
+        return PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text="Blocked non-public or unsupported URL.",
+            links=[],
+            url=url,
+        )
+    blocked = _fetch_plain_url_block(url)
+    if blocked is not None:
+        return blocked
 
     session = resolution_source._get_session()
     async with session:
         current_url = url
         for _ in range(MAX_REDIRECTS + 1):
-            async with _host_gate(current_url):
-                try:
-                    async with session.get(current_url, allow_redirects=False) as resp:
-                        status = resp.status
-                        content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
-                        if status in REDIRECT_STATUSES:
-                            location = resp.headers.get("Location") if resp.headers else None
-                            if not location:
-                                return PlainFetchResult(
-                                    status="error",
-                                    method="plain",
-                                    text=f"Malformed redirect from {current_url}",
-                                    links=[],
-                                    url=current_url,
-                                    content_type=content_type or None,
-                                )
-                            next_url = urljoin(current_url, location)
-                            if not await resolution_source.is_public_http_url(next_url):
-                                return PlainFetchResult(
-                                    status="blocked",
-                                    method="plain",
-                                    text="Blocked non-public redirect target.",
-                                    links=[],
-                                    url=next_url,
-                                    content_type=content_type or None,
-                                )
-                            # A 3xx to metaculus.com must not be followed either (same
-                            # our-IP / no-new-info rationale as the initial-URL block).
-                            if resolution_source.is_metaculus_self_ref(next_url):
-                                return PlainFetchResult(
-                                    status="blocked",
-                                    method="plain",
-                                    text=_METACULUS_FETCH_BLOCK_MSG,
-                                    links=[],
-                                    url=next_url,
-                                    content_type=content_type or None,
-                                )
-                            current_url = next_url
-                            continue
-                        if status in _RETRYABLE_FETCH_BLOCK_STATUSES:
-                            return PlainFetchResult(
-                                status="blocked",
-                                method="plain",
-                                text=f"Fetch blocked with HTTP {status}.",
-                                links=[],
-                                url=current_url,
-                                content_type=content_type or None,
-                            )
-                        if status != 200:
-                            return PlainFetchResult(
-                                status="error",
-                                method="plain",
-                                text=f"Fetch failed with HTTP {status}.",
-                                links=[],
-                                url=current_url,
-                                content_type=content_type or None,
-                            )
-                        if _content_type_is_document(content_type):
-                            return PlainFetchResult(
-                                status="ok",
-                                method="document_needed",
-                                text="This URL is a PDF or image — use read_document(url, ask) to read it.",
-                                links=[],
-                                url=current_url,
-                                content_type=content_type or None,
-                            )
-                        body = await _read_response_body(resp, f"agentic fetch {urlparse(current_url).netloc}")
-                        if body is None:
-                            return PlainFetchResult(
-                                status="error",
-                                method="plain",
-                                text="Fetch body exceeded the size limit.",
-                                links=[],
-                                url=current_url,
-                                content_type=content_type or None,
-                            )
-                        if _body_is_document(body):
-                            return PlainFetchResult(
-                                status="ok",
-                                method="document_needed",
-                                text="This URL is a PDF or image — use read_document(url, ask) to read it.",
-                                links=[],
-                                url=current_url,
-                                content_type=content_type or None,
-                            )
-
-                        # Charset-honoring decode (BOM > declared charset > UTF-8), not a
-                        # forced UTF-8 read: a windows-1252 or UTF-16 body decoded that way
-                        # is `0�.�4�2�`-style mojibake that reached the driver as
-                        # status="ok". The ratio is the refusal signal on the textual
-                        # branch below; the HTML branch is unaffected because its main
-                        # text comes from `_extract_main_text`, which decodes the raw
-                        # bytes itself.
-                        html, undecodable_ratio = decode_text_body(body, content_type)
-                        if any(token in content_type for token in _HTML_CONTENT_TYPE_TOKENS) or "<html" in html.lower():
-                            extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, current_url)
-                            text = extracted or ""
-                            links = _extract_links_from_html(html, current_url)
-                            if not text.strip():
-                                # No extractable text on a 200 OK (JS wall, consent
-                                # gate, empty body). A distinct "empty" status keeps
-                                # the ladder escalating to the rendered rung while
-                                # barring this outcome from the status=="ok" tier
-                                # grant — an unread page must never be "fetched".
-                                return PlainFetchResult(
-                                    status="empty",
-                                    method="plain",
-                                    text="Plain fetch returned no extractable text.",
-                                    links=links,
-                                    url=current_url,
-                                    content_type=content_type or None,
-                                    escalate_rendered=True,
-                                )
-                            return PlainFetchResult(
-                                status="ok",
-                                method="plain",
-                                text=text,
-                                links=links,
-                                url=current_url,
-                                content_type=content_type or None,
-                                escalate_rendered=len(text.strip()) < _FETCH_MIN_CONTENT_CHARS,
-                            )
-
-                        if any(token in content_type for token in _TEXTUAL_CONTENT_TYPE_TOKENS) or not content_type:
-                            if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO:
-                                # The decode failed rather than the text being slightly
-                                # dirty (BOM-less UTF-16, an undeclared 8-bit codec):
-                                # what we hold is replacement chars and NULs, not the
-                                # page. Shipping it as "ok" would hand the driver
-                                # mojibake as a read source. "empty" keeps the ladder
-                                # escalating to the rendered rung — the browser's own
-                                # charset sniffing can rescue what a declared-charset
-                                # decode could not — while barring the tier grant.
-                                return PlainFetchResult(
-                                    status="empty",
-                                    method="plain",
-                                    text="Plain fetch could not decode the body as text.",
-                                    links=[],
-                                    url=current_url,
-                                    content_type=content_type or None,
-                                    escalate_rendered=True,
-                                )
-                            # Same allow-listed tag strip the Tier-1 raw-body branches run:
-                            # a Datawrapper poll CSV measured 69% `<a href=...>` markup, so
-                            # without it the driver's max_result_chars budget buys tags
-                            # instead of rows, and the inflated length also defeats the
-                            # short-content escalation heuristic below.
-                            text = resolution_source.strip_html_tags(html).strip()
-                            if not text:
-                                return PlainFetchResult(
-                                    status="empty",
-                                    method="plain",
-                                    text="Plain fetch returned no extractable text.",
-                                    links=[],
-                                    url=current_url,
-                                    content_type=content_type or None,
-                                    escalate_rendered=True,
-                                )
-                            return PlainFetchResult(
-                                status="ok",
-                                method="plain",
-                                text=text,
-                                links=[],
-                                url=current_url,
-                                content_type=content_type or None,
-                                escalate_rendered=len(text) < _FETCH_MIN_CONTENT_CHARS,
-                            )
-
-                        return PlainFetchResult(
-                            status="error",
-                            method="plain",
-                            text=f"Unsupported content type: {content_type or 'unknown'}",
-                            links=[],
-                            url=current_url,
-                            content_type=content_type or None,
-                        )
-                except (TimeoutError, aiohttp.ClientError) as exc:
-                    return PlainFetchResult(
-                        status="error",
-                        method="plain",
-                        text=f"Fetch error: {type(exc).__name__}: {exc}",
-                        links=[],
-                        url=current_url,
-                    )
+            outcome = await _fetch_one_hop(session, current_url)
+            if isinstance(outcome, PlainFetchResult):
+                return outcome
+            current_url = outcome
     return PlainFetchResult(status="error", method="plain", text="Redirect limit exceeded.", links=[], url=url)
 
 
@@ -706,6 +757,47 @@ def _host_resolver_rule(host: str, ip: str) -> str:
     else:
         target = f"[{ip}]" if parsed_ip.version == 6 else ip
     return f"--host-resolver-rules=MAP {host} {target}"
+
+
+def _pinnable_url_host(url: str) -> str | None:
+    """Hostname of a URL eligible for DNS pinning, or None when the URL itself disqualifies it."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    # Userinfo defeats hostname-based trust (`https://trusted@10.0.0.1/`).
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    return parsed.hostname or None
+
+
+async def _resolve_host_to_one_public_ip(host: str) -> str | None:
+    """Resolve ``host`` once off the event loop and return the FIRST address to pin.
+
+    Returns None when resolution fails or ANY resolved address is disallowed —
+    same rebinding-defense stance as the per-request preflight.
+    """
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except (socket.gaierror, OSError):
+        return None
+    vetted_ip: str | None = None
+    for info in infos:
+        # sockaddr shape: IPv4 = (ip, port); IPv6 = (ip, port, flowinfo, scopeid).
+        sockaddr = info[4] if len(info) >= 5 else None
+        if not sockaddr:
+            return None
+        try:
+            resolved = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return None
+        if resolution_source._ip_is_disallowed(resolved):
+            return None
+        if vetted_ip is None:
+            vetted_ip = str(resolved)
+    return vetted_ip
 
 
 async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
@@ -727,16 +819,7 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
     Fails CLOSED: on any rejection the caller skips Chromium for that host and the
     fetch ladder degrades to plain / read_document.
     """
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return None
-    if parsed.scheme.lower() not in ("http", "https"):
-        return None
-    # Userinfo defeats hostname-based trust (`https://trusted@10.0.0.1/`).
-    if parsed.username is not None or parsed.password is not None:
-        return None
-    host = parsed.hostname or ""
+    host = _pinnable_url_host(url)
     if not host:
         return None
 
@@ -750,27 +833,7 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
             return None
         return host, str(literal)
 
-    # Hostname branch: resolve once off the event loop, reject if ANY resolved
-    # address is disallowed (same rebinding-defense stance as the preflight),
-    # and pin to the first survivor.
-    try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
-    except (socket.gaierror, OSError):
-        return None
-    vetted_ip: str | None = None
-    for info in infos:
-        # sockaddr shape: IPv4 = (ip, port); IPv6 = (ip, port, flowinfo, scopeid).
-        sockaddr = info[4] if len(info) >= 5 else None
-        if not sockaddr:
-            return None
-        try:
-            resolved = ipaddress.ip_address(sockaddr[0])
-        except ValueError:
-            return None
-        if resolution_source._ip_is_disallowed(resolved):
-            return None
-        if vetted_ip is None:
-            vetted_ip = str(resolved)
+    vetted_ip = await _resolve_host_to_one_public_ip(host)
     if vetted_ip is None:
         return None
     return host, vetted_ip
@@ -782,7 +845,7 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
             Error as PlaywrightError,
         )
         from playwright.async_api import async_playwright  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # optional-dep import boundary: playwright missing/broken degrades the rendered rung, never the run
         _warn_playwright_unavailable_once(exc)
         return None
 
@@ -894,7 +957,7 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
                     logger.debug("agentic rendered fetch unroute_all race: %s", exc)
                 await context.close()
                 await browser.close()
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # top-level soft-fail for the rendered fetch rung: any browser failure falls back to plain / read_document
         _warn_playwright_unavailable_once(exc)
         return None
 
@@ -948,7 +1011,7 @@ async def search_news(query: str) -> ToolOutcome:
         )
     try:
         articles = await _call_asknews_search(query)
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # tool-handler soft-fail boundary: a dead provider becomes a tool result the driver can read, never a loop crash
         return _format_fetch_error(f"AskNews search failed: {type(exc).__name__}: {exc}", method="news")
     return ToolOutcome(content_markdown=_format_asknews_results(articles), method="news")
 
@@ -958,7 +1021,7 @@ async def search_web(query: str, end_published_date: str | None = None) -> ToolO
         return _format_fetch_error(f"Exa API key is not configured; set {EXA_API_KEY_ENV}.", method="search")
     try:
         results = await _call_exa_search(query, end_published_date)
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # tool-handler soft-fail boundary: a dead provider becomes a tool result the driver can read, never a loop crash
         return _format_fetch_error(f"Exa search failed: {type(exc).__name__}: {exc}", method="search")
     return ToolOutcome(content_markdown=_format_exa_results(results), method="search")
 
@@ -983,21 +1046,21 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
     if plain.status not in ("ok", "empty"):
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="error")
     if plain.status == "ok" and not plain.escalate_rendered:
-        return _render_fetch_outcome(url, plain.text, plain.links, "plain", start_char)
+        return _render_fetch_outcome(url, plain.text, plain.links, method="plain", start_char=start_char)
 
     rendered = await _try_rendered_fetch(plain.url)
     if rendered is not None:
         if rendered.method == "document_needed":
             return await read_document(rendered.url, _generic_document_ask(question_topic))
         if rendered.status == "ok" and rendered.text:
-            return _render_fetch_outcome(url, rendered.text, rendered.links, "rendered", start_char)
+            return _render_fetch_outcome(url, rendered.text, rendered.links, method="rendered", start_char=start_char)
     # Rendered was unavailable, errored, or itself extracted nothing. Fall back to
     # plain ONLY when the plain fetch actually read (thin-but-real) content; a plain
     # fetch that produced nothing has no content to hand back and must not be
     # laundered as a successful "plain"/"ok" retrieval (the companiesmarketcap.com
     # js-wall failure: an unread page stamped `fetched` and superseded the briefing).
     if plain.status == "ok":
-        return _render_fetch_outcome(url, plain.text, plain.links, "plain", start_char)
+        return _render_fetch_outcome(url, plain.text, plain.links, method="plain", start_char=start_char)
     return _empty_fetch_outcome(plain.url)
 
 
@@ -1024,7 +1087,7 @@ async def read_document(url: str, ask: str) -> ToolOutcome:
         )
     except TimeoutError:
         return _format_fetch_error("Document read timed out.", method="document")
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # tool-handler soft-fail boundary: a dead reader becomes a tool result the driver can read, never a loop crash
         return _format_fetch_error(f"Document read failed: {type(exc).__name__}: {exc}", method="document")
     if n_url_success == 0:
         # Greppable, mirroring gemini_search's GEMINI_UNGROUNDED_SUPPRESSED so the rate is
