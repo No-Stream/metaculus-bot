@@ -834,7 +834,10 @@ async def test_invoke_verifier_uses_sonnet_and_correct_flags(monkeypatch: pytest
     assert any("claude" in str(a) for a in argv)
     assert "-p" in argv
     assert "--max-turns" in argv
-    assert "--permission-mode" in argv
+    # Hardened 2026-08-27: no permission-mode bypass; every tool denied.
+    assert "--permission-mode" not in argv
+    assert "--disallowedTools" in argv
+    assert "Bash" in argv[argv.index("--disallowedTools") + 1]
     assert "--append-system-prompt" in argv
     sys_prompt_idx = argv.index("--append-system-prompt")
     sys_prompt = argv[sys_prompt_idx + 1]

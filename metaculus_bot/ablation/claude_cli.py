@@ -30,6 +30,14 @@ logger: logging.Logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 600
 DEFAULT_CLAUDE_EXECUTABLE = "claude"
 
+# The judge needs NO tools: it reads a prompt (which embeds web-derived research
+# text — an injection surface) and emits JSON. Enumerated deny list rather than
+# an empty --allowedTools, whose parse shape correlated with past run failures
+# (see _build_argv docstring). Unknown names are harmless string matches.
+_DISALLOWED_TOOLS = (
+    "Bash,Edit,Write,MultiEdit,NotebookEdit,Read,Grep,Glob,LS,WebFetch,WebSearch,Task,Agent,TodoWrite,KillShell"
+)
+
 
 def _settings_payload() -> str:
     return json.dumps({"env": {"ENABLE_PROMPT_CACHING_1H": "0"}})
@@ -46,7 +54,7 @@ def _build_argv(system_prompt: str, *, claude_executable: str = DEFAULT_CLAUDE_E
                                    it in the prompt — we don't need an outer
                                    JSON envelope wrapping it).
       --max-turns 1                one shot
-      --permission-mode bypassPermissions   no permission prompts
+      --disallowedTools <list>     deny every tool (see _DISALLOWED_TOOLS)
       --settings '{...}'           force-disable prompt-caching 1H beta (the
                                    headless gateway rejects the
                                    ``prompt-caching-2025-XX-XX`` beta header,
@@ -61,12 +69,15 @@ def _build_argv(system_prompt: str, *, claude_executable: str = DEFAULT_CLAUDE_E
     of headless invocations against the same gateway. Cargo-culting that
     pattern.
 
-    Tools are NOT explicitly disabled here either — ``--max-turns 1`` already
-    constrains the model to one shot, and the system prompts instruct it to
-    output JSON only. Adding ``--allowedTools ""`` is a known-fragile flag in
-    non-interactive mode (per OpenRouter / Anthropic GitHub issues) and was the
-    only differing flag between run #5 (worked) and the latest failures —
-    dropping it.
+    Tool posture (hardened 2026-08-27 after a security review): the judge is a
+    pure text-in/JSON-out call whose prompt embeds WEB-DERIVED research text, so
+    a prompt injection steering one tool call was a real local-execution risk
+    under the old ``--permission-mode bypassPermissions``. Every tool is now
+    denied via the enumerated ``--disallowedTools`` list and the permission mode
+    is left at the headless default (deny). The historical fragility note stands
+    for the OTHER shape: ``--allowedTools ""`` (empty allowlist) was the flag
+    correlated with run failures and remains avoided — an enumerated deny list
+    does not share that parse shape.
     """
     return [
         claude_executable,
@@ -75,8 +86,8 @@ def _build_argv(system_prompt: str, *, claude_executable: str = DEFAULT_CLAUDE_E
         "text",
         "--max-turns",
         "1",
-        "--permission-mode",
-        "bypassPermissions",
+        "--disallowedTools",
+        _DISALLOWED_TOOLS,
         "--settings",
         _settings_payload(),
         "--append-system-prompt",
@@ -165,7 +176,7 @@ def _extract_inner_result(stdout_text: str) -> str:
         # as a misleading downstream parser error.
         logger.warning(
             "claude -p stdout was not parseable JSON; returning raw (first 200 chars: %r)",
-            stripped[:200],
+            stripped[:200],  # HARNESS-SCAN-EXEMPT-subsampling  # log-line display truncation
         )
         return stripped
     if isinstance(envelope, list):

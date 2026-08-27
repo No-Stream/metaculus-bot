@@ -507,9 +507,14 @@ async def test_invoke_claude_redactor_uses_correct_flags(monkeypatch: pytest.Mon
     assert "--max-turns" in argv
     max_idx = argv.index("--max-turns")
     assert argv[max_idx + 1] == "1"
-    assert "--permission-mode" in argv
-    perm_idx = argv.index("--permission-mode")
-    assert argv[perm_idx + 1] == "bypassPermissions"
+    # Security posture (2026-08-27): the judge's prompt embeds web-derived text,
+    # so every tool is denied and permission mode stays at the headless default —
+    # a prompt injection must have nothing to steer.
+    assert "--permission-mode" not in argv
+    assert "--disallowedTools" in argv
+    tools_idx = argv.index("--disallowedTools")
+    for tool in ("Bash", "Edit", "Write", "WebFetch", "Task"):
+        assert tool in argv[tools_idx + 1]
     # Force-disable prompt-caching beta (the headless gateway rejects it;
     # diagnosed 2026-05-06).
     assert "--settings" in argv
