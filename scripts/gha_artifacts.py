@@ -87,7 +87,7 @@ def verify_gh_cli() -> None:
         logger.error("gh CLI returned an error. Check authentication with 'gh auth status'.")
         sys.exit(1)
 
-    result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, check=False)
     if result.returncode != 0:
         logger.error(f"gh CLI not authenticated: {result.stderr.strip()}")
         sys.exit(1)
@@ -126,7 +126,7 @@ def list_research_artifacts(repo: str) -> list[dict]:
         (".artifacts[] | {id, name, created_at, expires_at, expired, size_in_bytes, run_id: .workflow_run.id}"),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S, check=False)
     except subprocess.TimeoutExpired:
         logger.error(f"gh api artifacts listing timed out ({GH_API_TIMEOUT_S}s) for {repo}")
         sys.exit(1)
@@ -241,7 +241,7 @@ def _download_artifact_to(run_id: int, repo: str, artifact_name: str, dest_dir: 
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["gh", "run", "download", str(run_id), "--repo", repo, "--name", artifact_name, "--dir", str(run_dir)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=ARTIFACT_DOWNLOAD_TIMEOUT_S)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=ARTIFACT_DOWNLOAD_TIMEOUT_S, check=False)
     except subprocess.TimeoutExpired:
         logger.warning(
             f"Timed out ({ARTIFACT_DOWNLOAD_TIMEOUT_S}s) downloading {artifact_name} (run {run_id}); skipping"
@@ -416,7 +416,7 @@ def iter_store_run_dirs(
         yield int(art["run_id"]), art, store_run_dir(store_dir, name)
     if missing:
         # The count above is exact; the tail is named for grep-ability, not analysis.
-        named = ", ".join(missing[:5])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        named = ", ".join(missing[:5])  # HARNESS-SCAN-EXEMPT-subsampling
         logger.warning(
             f"{len(missing)} selected artifact(s) are not in the store at {store_dir} and were NOT harvested "
             f"(first few: {named})"

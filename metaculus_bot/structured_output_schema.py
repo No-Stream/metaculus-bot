@@ -248,7 +248,7 @@ class NumericStructured(BaseModel):
                 f"NumericStructured.declared_percentiles must include at least "
                 f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}, missing {sorted(missing)}"
             )
-        for pct in v.keys():
+        for pct in v:
             if not (0.0 <= pct <= 1.0):
                 raise ValueError(f"Percentile keys must be in [0, 1], got {pct}")
         sorted_keys = sorted(v.keys())
@@ -588,7 +588,7 @@ def parse_structured_payload(
         # NOT a schema-wide before-validator: those silently coerce bad
         # clause probs and miss the reversed-anchor case. Retry with only
         # the telemetry fields dropped, so any error in a core field
-        # (posterior_prob, prior, base_rate, hazard, evidence, scenarios)
+        # (posterior_prob, prior, base_rate, hazard, evidence, scenarios)  # noqa: ERA001  # prose list of core schema fields, not commented-out code
         # still surfaces via the None return.
         _TELEMETRY_FIELDS = {"base_rate_anchor", "criteria_clauses"}
         if question_type == "binary" and _TELEMETRY_FIELDS & payload.keys():

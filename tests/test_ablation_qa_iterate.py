@@ -598,7 +598,7 @@ def test_iterate_outcome_serializable_to_json() -> None:
         qid=42,
         final_status="clean",
         iterations=2,
-        final_blob_path=Path("/tmp/sanitized/42.md"),
+        final_blob_path=Path("/tmp/sanitized/42.md"),  # noqa: S108  # assertion fixture path, not a real temporary file
         verifier_scores=[score],
         reject_reason=None,
     )
@@ -658,7 +658,9 @@ def test_render_qa_summary_includes_aggregate_stats(tmp_path: Path) -> None:
     assert "rejected_leakage" in text
     assert "rejected_forecastability" in text
     assert "Total qids: 3" in text or "total: 3" in text.lower()
-    assert "Q1" in text and "Q2" in text and "Q3" in text
+    assert "Q1" in text
+    assert "Q2" in text
+    assert "Q3" in text
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +824,7 @@ async def test_invoke_verifier_uses_sonnet_and_correct_flags(monkeypatch: pytest
         class _Proc:
             returncode = 0
 
-            async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:  # noqa: A002  # mirrors asyncio subprocess communicate(input=...)
                 captured["stdin"] = input
                 await asyncio.sleep(0)
                 return b'{"verdicts": []}', b""
@@ -859,7 +861,7 @@ async def test_invoke_re_redactor_includes_verifier_notes_in_prompt(monkeypatch:
         class _Proc:
             returncode = 0
 
-            async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:  # noqa: A002  # mirrors asyncio subprocess communicate(input=...)
                 captured["stdin"] = input
                 await asyncio.sleep(0)
                 return b'{"results": []}', b""
@@ -943,7 +945,7 @@ async def test_run_claude_subprocess_timeout_kills_subprocess(
         proc.pid = 42424
         proc.returncode = None
 
-        async def slow_communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+        async def slow_communicate(input: bytes | None = None) -> tuple[bytes, bytes]:  # noqa: A002  # mirrors asyncio subprocess communicate(input=...)
             await asyncio.sleep(10)  # forces wait_for to time out
             return b"", b""
 
@@ -965,13 +967,15 @@ async def test_run_claude_subprocess_timeout_kills_subprocess(
         fake_create_subprocess_exec,
     )
 
-    with caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.qa_iterate"):
-        with pytest.raises(asyncio.TimeoutError):
-            await qa_iterate._run_claude_subprocess(
-                ["claude", "-p"],
-                "any prompt",
-                timeout_seconds=0,
-            )
+    with (
+        caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.qa_iterate"),
+        pytest.raises(asyncio.TimeoutError),
+    ):
+        await qa_iterate._run_claude_subprocess(
+            ["claude", "-p"],
+            "any prompt",
+            timeout_seconds=0,
+        )
 
     assert kill_calls["n"] == 1, f"proc.kill() should fire exactly once on timeout; got {kill_calls['n']}"
     assert wait_calls["n"] == 1, "proc.wait() should be awaited after kill so the child is reaped"
@@ -1411,5 +1415,5 @@ class TestReRedactorVerbatimCheck:
         sanitized_blob = "Background context. The reported value was 66.246 percent."
         raw = _redactor_response(qid, sanitized_blob)
 
-        with pytest.raises(ValueError, match="66.246"):
+        with pytest.raises(ValueError, match=r"66\.246"):
             _parse_re_redactor_response(raw, qid, gt)

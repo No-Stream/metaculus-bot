@@ -53,6 +53,7 @@ from metaculus_bot.drop_telemetry import (
     classify_raised_drop_cause,
     emit_drop_telemetry,
 )
+from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import (
@@ -230,9 +231,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # 0.2.92 added an upstream success-rate gate in
             # _handle_errors_in__run_individual_question: it raises when
             # len(predictions) < expected_total_predictions * required_successful_predictions.
-            # expected_total_predictions == predictions_per_research_report, which
-            # prepare_llm_config sets to the configured roster width. At the 0.5
-            # default the gate would reject a single-survivor publish on any roster
+            # Upstream's expected_total_predictions equals the
+            # predictions_per_research_report that prepare_llm_config sets to the
+            # configured roster width. At the 0.5 default the gate would reject a
+            # single-survivor publish on any roster
             # wider than two, contradicting MIN_FORECASTERS_TO_PUBLISH. Pin it to 0.0 so OUR
             # min_forecasters_to_publish guard (above) stays the sole arbiter of
             # whether a degraded ensemble still publishes.
@@ -248,7 +250,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # stacking function so that mocking bot._run_stacking flows through.
         # Use a lambda with dynamic attribute lookup so mock.patch replaces propagate.
         self._pipeline.parser_llm = self.get_llm("parser", "llm")
-        self._pipeline.run_stacking_fn = lambda *args, **kwargs: self._run_stacking(*args, **kwargs)
+        self._pipeline.run_stacking_fn = lambda *args, **kwargs: self._run_stacking(*args, **kwargs)  # noqa: PLW0108  # deliberate: the lambda defers attribute lookup so mock.patch of _run_stacking propagates
 
         self._research = ResearchOrchestrator(
             default_llm=self.get_llm("default", "llm"),
@@ -271,7 +273,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if self.aggregation_strategy == AggregationStrategy.STACKING:
             stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
             base_models = [m.model for m in self._forecaster_llms]
-            short_list = base_models if len(base_models) <= 6 else base_models[:6] + ["..."]
+            short_list = base_models if len(base_models) <= 6 else [*base_models[:6], "..."]
             logger.info(
                 "STACKING config | stacker=%s | base_forecasters(%d)=%s | final_outputs_per_question=1",
                 stacker_name,
@@ -282,7 +284,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
             analyzer_name = self._analyzer_llm.model if self._analyzer_llm else "<missing>"
             base_models = [m.model for m in self._forecaster_llms]
-            short_list = base_models if len(base_models) <= 6 else base_models[:6] + ["..."]
+            short_list = base_models if len(base_models) <= 6 else [*base_models[:6], "..."]
             logger.info(
                 "CONDITIONAL_STACKING config | stacker=%s | analyzer=%s | base_forecasters(%d)=%s | thresholds=%s",
                 stacker_name,
@@ -677,8 +679,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Probabilistic tools: deterministic cross-model math runs once per
         # question and rides at the top of the stacker prompt. No-ops when
         # PROBABILISTIC_TOOLS_ENABLED is unset.
-        from metaculus_bot.tool_runner import (
-            build_cross_model_aggregation,  # function-scoped: see AGENTS.md
+        from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            build_cross_model_aggregation,
         )
 
         aggregated_tool_output = (
@@ -926,7 +928,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
         final_cost: float,
         time_spent_in_minutes: float,
     ) -> str:
-        from metaculus_bot.comment.formatting import build_unified_explanation
+        # Kept function-scoped: comment.formatting imports tool_runner at module scope,
+        # so hoisting this would pull tool_runner + probabilistic_tools onto the
+        # cold-start path even when PROBABILISTIC_TOOLS_ENABLED is off.
+        from metaculus_bot.comment.formatting import build_unified_explanation  # noqa: PLC0415
 
         base_text = super()._create_unified_explanation(
             question,
@@ -1049,8 +1054,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # the forecaster's structured JSON block (see tool_runner.py). The
         # tool runner no-ops when PROBABILISTIC_TOOLS_ENABLED is off or no
         # block was emitted; callers don't gate.
-        from metaculus_bot.tool_runner import (
-            run_tools_for_forecaster,  # function-scoped: see AGENTS.md
+        from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            run_tools_for_forecaster,
         )
 
         computed_md = run_tools_for_forecaster(
@@ -1101,8 +1106,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
     async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
         self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[float]:
-        from metaculus_bot.forecaster_runners import run_binary_forecast
-
         return await run_binary_forecast(
             question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
         )
@@ -1110,15 +1113,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
     async def _run_forecast_on_multiple_choice(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
         self, question: MultipleChoiceQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[PredictedOptionList]:
-        from metaculus_bot.forecaster_runners import run_mc_forecast
-
         return await run_mc_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64)
 
     async def _run_forecast_on_numeric(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
         self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[NumericDistribution]:
-        from metaculus_bot.forecaster_runners import run_numeric_forecast
-
         prediction, discrete_vote = await run_numeric_forecast(
             question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
         )

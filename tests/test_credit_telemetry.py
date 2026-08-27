@@ -539,7 +539,7 @@ class TestDonatedKeyStateProbe:
             assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
 
     @pytest.mark.parametrize(
-        "limit, limit_remaining",
+        ("limit", "limit_remaining"),
         [
             (850.0, float("nan")),
             (float("nan"), 0.0),
@@ -741,7 +741,7 @@ class TestDonatedKeyStateProbe:
         assert get_probed_donated_key_state() is None
 
     @pytest.mark.parametrize(
-        "responses, expected_state",
+        ("responses", "expected_state"),
         [
             ({DONATED_KEY: [_http_status_error(401)]}, "revoked"),
             ({DONATED_KEY: [_payload(0.0, 4.39, limit=0.0)]}, "zeroed"),
@@ -763,9 +763,11 @@ class TestDonatedKeyStateProbe:
         WARNING would train the operator to ignore the marker that matters.
         """
         _set_keys(monkeypatch, personal=None)
-        with _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=850.0)]}):
-            with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
-                classify_donated_key_state()
+        with (
+            _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=850.0)]}),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"),
+        ):
+            classify_donated_key_state()
 
         assert any("DONATED_KEY_STATE: state=drained" in r.getMessage() for r in caplog.records)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

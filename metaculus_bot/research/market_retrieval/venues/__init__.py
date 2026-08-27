@@ -83,7 +83,7 @@ from metaculus_bot.research.market_retrieval.venues.predictit import (
     predictit_prefetch,
 )
 
-__all__ = [
+__all__ = [  # noqa: RUF022  # grouped by venue with section comments, not alphabetical
     # The submodules themselves, so a test can patch a CONSTANT where it is actually read.
     "kalshi",
     "manifold",

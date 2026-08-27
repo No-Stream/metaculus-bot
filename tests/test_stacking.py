@@ -596,14 +596,16 @@ class TestStackingIntegration:
         )
 
         # Mock _run_stacking to raise an exception
-        with patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")):
-            with pytest.raises(RuntimeError, match="Stacking failed"):
-                await bot._aggregate_predictions(
-                    predictions=[0.4, 0.6],
-                    question=question,
-                    research="test research",
-                    reasoned_predictions=[Mock(), Mock()],
-                )
+        with (
+            patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")),
+            pytest.raises(RuntimeError, match="Stacking failed"),
+        ):
+            await bot._aggregate_predictions(
+                predictions=[0.4, 0.6],
+                question=question,
+                research="test research",
+                reasoned_predictions=[Mock(), Mock()],
+            )
 
 
 class TestStackingMethods:
@@ -1228,16 +1230,18 @@ class TestStackerTransientRetry:
 
         clock = iter([0.0] + [TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0] * 10)
 
-        with patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)):
-            with pytest.raises(litellm_exc.Timeout):
-                await run_stacking_binary(
-                    stacker,
-                    parser,
-                    self._binary_question(),
-                    "research",
-                    ["base reasoning"],
-                    stacker_wall_timeout=500.0,
-                )
+        with (
+            patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)),
+            pytest.raises(litellm_exc.Timeout),
+        ):
+            await run_stacking_binary(
+                stacker,
+                parser,
+                self._binary_question(),
+                "research",
+                ["base reasoning"],
+                stacker_wall_timeout=500.0,
+            )
 
         assert stacker.invoke.await_count == 1
 

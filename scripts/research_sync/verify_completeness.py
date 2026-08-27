@@ -139,7 +139,7 @@ def _print_artifact_sample(header: str, artifacts: list[dict], label: str, limit
     """
     print(f"\n{header}")
     ordered = sorted(artifacts, key=lambda a: a.get("created_at", ""))
-    for art in ordered[:limit]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+    for art in ordered[:limit]:  # HARNESS-SCAN-EXEMPT-subsampling
         print(f"  {label}: {art.get('name')} (created_at={art.get('created_at')})")
     if len(ordered) > limit:
         print(f"  ... and {len(ordered) - limit} more")
@@ -245,7 +245,7 @@ def main() -> None:
     if unpromoted:
         print("\nNOT PROMOTED — questions with an artifact record that latest/ does not serve:")
         # Report truncation, not analysis: the count above is exact and the tail is named.
-        for qid in unpromoted[:20]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        for qid in unpromoted[:20]:  # HARNESS-SCAN-EXEMPT-subsampling
             print(f"  DEMOTED: qid={qid} (latest_source={manifest[qid].get('latest_source')})")
         if len(unpromoted) > 20:
             print(f"  ... and {len(unpromoted) - 20} more")

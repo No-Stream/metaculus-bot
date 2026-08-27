@@ -24,6 +24,8 @@ from forecasting_tools.data_models.questions import (
     NumericQuestion,
     QuestionState,
 )
+from requests import exceptions as req_exc
+from urllib3 import exceptions as ul3_exc
 
 from metaculus_bot.backtest.scoring import GroundTruth
 from metaculus_bot.constants import (
@@ -377,9 +379,6 @@ async def _fetch_with_retries(
     min_forecasters: int,
 ) -> list[MetaculusQuestion]:
     """Fetch resolved questions with retry logic matching community_benchmark.py."""
-    from requests import exceptions as req_exc
-    from urllib3 import exceptions as ul3_exc
-
     api_filter = ApiFilter(
         allowed_statuses=["resolved"],
         allowed_tournaments=[tournament],

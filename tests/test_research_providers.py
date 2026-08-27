@@ -55,7 +55,7 @@ class TestIsAsknewsSubscriptionError:
 
 
 @pytest.mark.parametrize(
-    "exc,expected",
+    ("exc", "expected"),
     [
         (_FakeForbiddenError("403011 - subscription is not currently active"), True),
         (_FakeForbiddenError("some other error"), False),

@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from backtest import _load_research_from_archive
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
 from scripts.backfill_research_from_logs import existing_records, parse_research_blocks
@@ -462,7 +464,7 @@ class TestBackfillE2E:
                 loaded.append(json.loads(line.strip()))
 
         assert len(loaded) == len(records)
-        for original, roundtripped in zip(records, loaded):
+        for original, roundtripped in zip(records, loaded, strict=False):
             assert original == roundtripped
 
 
@@ -612,13 +614,12 @@ class TestArtifactsEndpointSweep:
     def test_list_research_artifacts_exits_on_gh_failure(self) -> None:
         """A gh error is fail-fast (sys.exit), never silently swallowed."""
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
-        with mock.patch("scripts.gha_artifacts.subprocess.run", return_value=failed):
-            try:
-                list_research_artifacts("repo")
-            except SystemExit as exc:
-                assert exc.code == 1
-            else:
-                raise AssertionError("expected SystemExit on gh failure")
+        with (
+            mock.patch("scripts.gha_artifacts.subprocess.run", return_value=failed),
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            list_research_artifacts("repo")
+        assert excinfo.value.code == 1
 
     def test_only_live_research_artifacts_downloaded_expired_logged(self, caplog) -> None:
         """Live research-* downloaded; expired logged (not downloaded); non-research ignored.

@@ -186,10 +186,7 @@ async def run_gemini_only_research(
             gap_fill_blob = ""
             gap_fill_used = False
 
-    if gap_fill_blob:
-        blob = f"{first_pass}{_GAP_FILL_HEADER}{gap_fill_blob}"
-    else:
-        blob = first_pass
+    blob = f"{first_pass}{_GAP_FILL_HEADER}{gap_fill_blob}" if gap_fill_blob else first_pass
 
     meta = _build_meta(
         first_pass=first_pass,

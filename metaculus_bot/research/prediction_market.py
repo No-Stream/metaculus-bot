@@ -311,7 +311,7 @@ async def _invoke_market_llm(
             backoffs=backoffs,
         )
     # `openai.APIError` and NOT `litellm.exceptions.APIError`: every litellm transport exception
-    # (Timeout, RateLimitError, APIConnectionError, InternalServerError, ServiceUnavailableError)
+    # (Timeout, RateLimitError, APIConnectionError, InternalServerError, ServiceUnavailableError)  # noqa: ERA001  # prose list of exception classes, not code
     # subclasses the openai root but NOT litellm's own APIError, so catching the latter caught
     # only a bare `APIError` and let every realistic provider blip escape — past `_rank_pool`'s
     # `except RankingUnusable` to the snapshot-level net, discarding the WHOLE snapshot where the

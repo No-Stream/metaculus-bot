@@ -276,10 +276,10 @@ def _build_redactor_prompt(batch: list[tuple[MetaculusQuestion, GroundTruth, str
     parts.append("# Redactor batch task")
     parts.append("")
     parts.append(
-        "You are about to receive %d question(s). For each, the ground truth "
+        f"You are about to receive {len(batch)} question(s). For each, the ground truth "
         "is shown ONLY so you know what to redact. The ground truth MUST NOT "
         "appear anywhere in your sanitized output — not verbatim, not "
-        "paraphrased numerically, not case-shifted." % len(batch)
+        "paraphrased numerically, not case-shifted."
     )
     parts.append("")
     parts.append(
@@ -671,10 +671,10 @@ async def _process_batch(
         )
         return out
     except TimeoutError as exc:
-        logger.error("Redactor subprocess timed out for qids=%s: %s", qids, exc, exc_info=True)
+        logger.exception("Redactor subprocess timed out for qids=%s: %s", qids, exc)
         return out
     except Exception as exc:
-        logger.error("Redactor subprocess raised unexpected error for qids=%s: %s", qids, exc, exc_info=True)
+        logger.exception("Redactor subprocess raised unexpected error for qids=%s: %s", qids, exc)
         return out
 
     ground_truths = {_require_qid(q): gt for q, gt, _ in batch}

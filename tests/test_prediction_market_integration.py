@@ -271,7 +271,8 @@ async def test_predictit_real_prefetch_and_search_returns_parseable_response():
     assert isinstance(sample, dict)
     assert sample.get("name") or sample.get("shortName")
     contracts = sample.get("contracts")
-    assert isinstance(contracts, list) and contracts
+    assert isinstance(contracts, list)
+    assert contracts
     assert "lastTradePrice" in contracts[0]
 
     rows = [predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy") for market in markets]

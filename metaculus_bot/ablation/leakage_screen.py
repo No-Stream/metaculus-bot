@@ -447,7 +447,7 @@ async def screen_batch(
         )
     results = await asyncio.gather(*tasks)
 
-    all_verdicts: dict[int, dict] = {qid: verdict for qid, verdict in results}
+    all_verdicts: dict[int, dict] = dict(results)
     clean_qids: set[int] = {qid for qid, verdict in all_verdicts.items() if not verdict["is_leaked"]}
 
     clean_questions = [q for q in questions_with_research if q.id_of_question in clean_qids]

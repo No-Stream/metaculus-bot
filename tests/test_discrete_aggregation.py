@@ -183,14 +183,17 @@ def test_ensemble_median_ramp_does_not_overflow_above_one():
         # Valid monotonic CDF in [0, 1] with sub-min-step gaps near the top bins that force
         # the ramp branch (the exact shape the 2026-07-20 audit used to trigger the crash).
         p = np.array([0.0, 0.6, 0.9, 0.97, 0.99, 0.994, 0.997, 0.9993, 1.0])
-        assert bool(np.all(np.diff(p) > 0)) and p.min() >= 0.0 and p.max() <= 1.0
+        assert bool(np.all(np.diff(p) > 0))
+        assert p.min() >= 0.0
+        assert p.max() <= 1.0
         assert float(np.diff(p).min()) < 0.01 / (question.cdf_size - 1), "test setup must trigger the ramp"
 
         dist = _postprocess_ensemble_cdf(x, p.copy(), question, "median")
         probs = np.array([pp.percentile for pp in dist.cdf], dtype=float)
 
         assert len(probs) == question.cdf_size
-        assert probs.min() >= 0.0 and probs.max() <= 1.0 + 1e-12, f"interior overflow: max={probs.max()}"
+        assert probs.min() >= 0.0, f"interior overflow: max={probs.max()}"
+        assert probs.max() <= 1.0 + 1e-12, f"interior overflow: max={probs.max()}"
         diffs = np.diff(probs)
         assert np.all(diffs > 0.0), "CDF must be strictly increasing"
         min_step = 0.01 / (question.cdf_size - 1)

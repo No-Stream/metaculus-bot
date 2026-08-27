@@ -88,7 +88,7 @@ _TOY_STORY_VALUES = [90e6, 100e6, 110e6, 125e6, 140e6, 158e6, 165e6, 172e6, 185e
 
 
 def _declared(values: Sequence[float]) -> list[Percentile]:
-    return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values)]
+    return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=False)]
 
 
 class TestMcSubOnePercentProbabilityIsFloored:
@@ -325,7 +325,7 @@ class TestNumericDistributionAcceptsBeyondRangePercentiles:
         the "beyond-range is accepted" pin above reflects real tolerance, not a
         disabled validator.
         """
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Percentiles must be in strictly increasing order"):
             NumericDistribution(
                 declared_percentiles=[
                     Percentile(percentile=0.5, value=10.0),

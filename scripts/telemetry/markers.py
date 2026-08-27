@@ -474,7 +474,7 @@ MARKER_SPECS: list[MarkerSpec] = [
         # `decision` is routed|skipped; `step` names the deciding branch on a route
         # (url_single / url_spread / kw_single) or the reject reason on a skip
         # (url_ambiguous, url_quantity_gate, url_change_vs_level_guard,
-        # url_no_relative_return_wording, kw_no_keyword_hit, kw_derivation_gate,
+        # url_no_relative_return_wording, kw_no_keyword_hit, kw_derivation_gate,  # noqa: ERA001  # prose list of route/skip tokens, not code
         # kw_ambiguous, kw_change_vs_level_guard). `series` is the series involved where one
         # is known — comma-joined on ambiguity, slash-joined on a spread, the "none" sentinel
         # (-> None) on a plain keyword miss. All values are spaceless, so `\S+` takes each.
@@ -593,8 +593,8 @@ MARKER_SPECS: list[MarkerSpec] = [
         "publish_hardening",
         # Per-attempt publish failure WARN (metaculus_bot/publish_hardening.py
         # _wrap_with_timeout_retry). Two emitted shapes share the prefix:
-        #   "PUBLISH_HARDENING: <method> attempt N/M timed out after Ts"
-        #   "PUBLISH_HARDENING: <method> attempt N/M failed (<ExcType>: <msg>)"
+        #   "PUBLISH_HARDENING: <method> attempt N/M timed out after Ts"  # noqa: ERA001  # documented marker format, not commented-out code
+        #   "PUBLISH_HARDENING: <method> attempt N/M failed (<ExcType>: <msg>)"  # noqa: ERA001  # documented marker format, not commented-out code
         # The ``attempt N/M`` clause is what keeps this spec off the OTHER
         # PUBLISH_HARDENING-prefixed strings in that module (the applied-INFO line,
         # the seam-moved AttributeErrors, the loop-exited RuntimeError). Exactly one

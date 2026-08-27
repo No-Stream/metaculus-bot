@@ -101,11 +101,7 @@ class Era:
     end: datetime | None
 
     def contains(self, dt: datetime) -> bool:
-        if self.start is not None and dt < self.start:
-            return False
-        if self.end is not None and dt >= self.end:
-            return False
-        return True
+        return (self.start is None or dt >= self.start) and (self.end is None or dt < self.end)
 
 
 # Config-flip boundaries that plausibly shift the numeric width distribution.
@@ -626,7 +622,9 @@ def main(argv: list[str] | None = None) -> None:
     metrics = compute_all_eras(data, exclude_qids=exclude_qids)
     if exclude_qids:
         logger.info(f"Excluding question ids from every row: {sorted(exclude_qids)}")
-    print(render_markdown(metrics))
+    # The rendered markdown IS this CLI's product and belongs on stdout; logging above
+    # is deliberately pinned to stderr so the report can be piped on its own.
+    print(render_markdown(metrics))  # noqa: T201
 
     if args.output_json:
         with open(args.output_json, "w") as f:

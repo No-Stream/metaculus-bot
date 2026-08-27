@@ -258,7 +258,8 @@ class TestOfflineReharvestFromTheStore:
         manifest = json.loads((dirs["research_dir"] / "manifest.json").read_text())
         assert set(manifest) == {"40100", "40200"}
         assert {r["run_id"] for r in load_marker_records(dirs["telemetry_dir"], "extraction_rung")} == {"100", "200"}
-        assert (dirs["raw_dir"] / "100.jsonl").exists() and (dirs["raw_dir"] / "200.jsonl").exists()
+        assert (dirs["raw_dir"] / "100.jsonl").exists()
+        assert (dirs["raw_dir"] / "200.jsonl").exists()
         assert (summary.research_questions, summary.telemetry_runs) == (2, 2)
         assert summary.expired == [], "the store cannot hold an expired artifact"
 

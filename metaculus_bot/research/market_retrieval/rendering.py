@@ -663,7 +663,7 @@ def _ladder_hard_bound(rest: Sequence[MarketChild], *, cap: int = LADDER_ROW_MAX
     )
 
     # and the loop below then adds every further term that fits.
-    kept: set[int] = set(by_content[:1])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+    kept: set[int] = set(by_content[:1])  # HARNESS-SCAN-EXEMPT-subsampling
     for index in by_content[1:]:
         trial = kept | {index}
         body = " / ".join(_ladder_term(rest[position]) for position in sorted(trial))
@@ -848,13 +848,15 @@ def render_snapshot_with_stats(
     # title has to exist before any of them can be compacted.
     full_positions: list[list[int]] = []
     leftovers: list[list[MarketChild]] = []
-    for match, allowance in zip(matches, allowances):
+    for match, allowance in zip(matches, allowances, strict=False):
         order = _full_row_order(match.children)
         keep = set(order[:allowance])
         full_positions.append(order[:allowance])
         leftovers.append([child for index, child in enumerate(match.children) if index not in keep])
     ladder_families = [index for index, rest in enumerate(leftovers) if rest]
-    ladder_rows = dict(zip(ladder_families, _fit_ladder_section([leftovers[index] for index in ladder_families])))
+    ladder_rows = dict(
+        zip(ladder_families, _fit_ladder_section([leftovers[index] for index in ladder_families]), strict=False)
+    )
 
     lines: list[str] = []
     if ranking_degraded:

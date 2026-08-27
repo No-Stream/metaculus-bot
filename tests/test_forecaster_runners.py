@@ -101,6 +101,7 @@ _STANDARD_PERCENTILES: list[Percentile] = [
     for p, v in zip(
         [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
         [50, 100, 150, 200, 350, 450, 550, 700, 800, 900, 950],
+        strict=True,
     )
 ]
 
@@ -458,9 +459,9 @@ class TestRunNumericForecast:
             ),
             patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
             patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(True, "off by 1000x")),
+            pytest.raises(UnitMismatchError, match="off by 1000x"),
         ):
-            with pytest.raises(UnitMismatchError, match="off by 1000x"):
-                await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm)
+            await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm)
 
     @pytest.mark.asyncio
     async def test_c3_block_read_skips_parser_call_for_outcome_type(

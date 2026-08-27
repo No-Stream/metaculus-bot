@@ -4,6 +4,7 @@ Unit tests for cluster processing utilities.
 Tests for cluster detection and spreading functions extracted from main.py.
 """
 
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import cast
 
@@ -112,7 +113,7 @@ class TestClusterProcessing:
         # Check that clustered values are now different
         cluster_values = result[1:4]  # The cluster positions
         assert len(set(cluster_values)) == 3  # All different now
-        assert all(a < b for a, b in zip(cluster_values, cluster_values[1:]))  # Strictly increasing
+        assert all(a < b for a, b in pairwise(cluster_values))  # Strictly increasing
 
     def test_apply_cluster_spreading_boundary_constraints(self):
         """Test cluster spreading respects boundary constraints.
@@ -197,7 +198,7 @@ class TestIsDegenerateCluster:
         result = apply_jitter_for_duplicates(values.copy(), question, 100.0, percentiles)
 
         # Should be strictly increasing
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
 
     def test_apply_jitter_for_duplicates_boundary_respect(self):
         """Test jitter respects boundaries."""
@@ -211,7 +212,7 @@ class TestIsDegenerateCluster:
         result = apply_jitter_for_duplicates(values.copy(), question, 100.0, percentiles)
 
         # Should be strictly increasing and within bounds
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
         assert all(v <= question.upper_bound for v in result)
 
     def test_ensure_strictly_increasing_bounded_left_to_right(self):
@@ -222,7 +223,7 @@ class TestIsDegenerateCluster:
         result = ensure_strictly_increasing_bounded(values.copy(), question, 100.0)
 
         # Should be strictly increasing
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
 
     def test_ensure_strictly_increasing_bounded_right_to_left(self):
         """Test right-to-left adjustment for boundary cases."""
@@ -232,7 +233,7 @@ class TestIsDegenerateCluster:
         result = ensure_strictly_increasing_bounded(values.copy(), question, 100.0)
 
         # Should be strictly increasing and within bounds
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
         assert all(v <= question.upper_bound for v in result)
 
     def test_ensure_strictly_increasing_bounded_respects_boundaries(self):
@@ -243,5 +244,5 @@ class TestIsDegenerateCluster:
         result = ensure_strictly_increasing_bounded(values.copy(), question, 100.0)
 
         # Should be strictly increasing and above lower bound
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
         assert all(v >= question.lower_bound for v in result)

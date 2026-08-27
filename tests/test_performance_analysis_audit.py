@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -331,7 +331,7 @@ class TestRankNumericOwnGrid:
     against a 1/200 baseline instead of its own (up to 85 log pts on an 11-point
     grid, always inflating good coarse-grid scores)."""
 
-    _MEMBERS = {
+    _MEMBERS: ClassVar[dict[str, list[tuple[float, float]]]] = {
         "model-a": [(2.5, 0.4), (10.0, 0.6), (50.0, 1.2), (90.0, 2.0), (97.5, 2.8)],
         "model-b": [(2.5, 0.5), (10.0, 0.7), (50.0, 1.3), (90.0, 2.1), (97.5, 2.9)],
     }

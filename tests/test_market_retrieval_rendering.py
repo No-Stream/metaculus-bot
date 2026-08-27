@@ -161,7 +161,7 @@ def _table_rows(text: str) -> list[dict[str, str]]:
         cells = [cell.strip() for cell in line.strip("| ").split(" | ")]
         if set("".join(cells)) <= {"-"}:
             continue  # the |---|---| separator
-        out.append(dict(zip(header, cells)))
+        out.append(dict(zip(header, cells, strict=False)))
     return out
 
 
@@ -205,7 +205,7 @@ class TestColumns:
         """`conf` and `relevance` are gone; `status`, `relation` and `why` replace them."""
         rendered = render_snapshot(MarketSnapshot(matches=[_row()]))
 
-        header = [line for line in rendered.split("\n") if line.startswith("| platform")][0]
+        header = next(line for line in rendered.split("\n") if line.startswith("| platform"))
         assert header == "| platform | title | prob | total_vol | OI | signal | close | status | relation | why |"
         assert TABLE_COLUMNS == (
             "platform",

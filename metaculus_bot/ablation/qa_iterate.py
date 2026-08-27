@@ -605,7 +605,7 @@ async def run_qa_iterate_batch(
 
     tasks = [_one(qid, payload) for qid, payload in inputs.items()]
     results = await asyncio.gather(*tasks)
-    return {qid: outcome for qid, outcome in results}
+    return dict(results)
 
 
 # ---------------------------------------------------------------------------

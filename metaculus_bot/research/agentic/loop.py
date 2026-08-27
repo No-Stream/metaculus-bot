@@ -64,7 +64,7 @@ _TRACKER_PARAM_NAMES = frozenset({"gclid", "fbclid", "mc_cid", "mc_eid", "ref", 
 # All straight/curly quote glyphs and backticks are DELETED during normalization
 # so a driver quote wrapped in glyphs still matches unwrapped source text — both
 # sides run through _normalize_quote_text, so deletion is symmetric.
-_QUOTE_GLYPHS_RE = re.compile(r"[\"'‘’“”`]")
+_QUOTE_GLYPHS_RE = re.compile(r"[\"'‘’“”`]")  # noqa: RUF001  # the curly glyphs ARE the pattern; ASCII-ifying would stop matching them
 _WHITESPACE_RE = re.compile(r"\s+")
 
 # Retrieval-quality tiers (W4). ToolOutcome.method records HOW a URL's content
@@ -208,10 +208,12 @@ def _normalize_quote_text(text: str) -> str:
 # under it and full narration sentences well over it. Named so the boundary tests
 # can pin it at N and N+1 instead of restating a magic number.
 _SPAN_JOINER_MAX_CHARS = 24
+# The RUF001 suppressions below are load-bearing: the curly quote glyphs ARE the
+# pattern, so ASCII-ifying them would stop matching the text they exist to split.
 _SPAN_BOUNDARY_RE = re.compile(
     r"(\.{3,}|…"
-    r"|[\"'‘’“”`]\s*[\"'‘’“”`]"
-    rf"|(?<=\S)[\"'‘’“”`][^\"'‘’“”`]{{0,{_SPAN_JOINER_MAX_CHARS}}}?[\"'‘’“”`](?=\S))"
+    r"|[\"'‘’“”`]\s*[\"'‘’“”`]"  # noqa: RUF001
+    rf"|(?<=\S)[\"'‘’“”`][^\"'‘’“”`]{{0,{_SPAN_JOINER_MAX_CHARS}}}?[\"'‘’“”`](?=\S))"  # noqa: RUF001
 )
 # Minimum normalized length for a split span to be grounded on its own.
 # Below this a span is a bare token or punctuation run that appears in arbitrary
@@ -970,7 +972,9 @@ def _conclude_gate_debts(state: _LoopState, entries: list[GapAccountingEntry]) -
     reached.
     """
     plan = state.research_plan
-    assert plan is not None and plan.gaps  # caller guards; keeps the type narrow
+    # Caller guards both; asserted separately to keep the type narrow.
+    assert plan is not None
+    assert plan.gaps
     gaps = plan.gaps
     debts: list[str] = []
 
@@ -1513,9 +1517,9 @@ async def _run_ghost_phase(
     panel proxy. It measures whether the v2 findings alone, forecast by one cheap
     model, land near truth — scored OFFLINE against resolution by
     ``scripts/score_ghosts.py``. It genuinely diverges from the published ensemble
-    median (measured 2026-08-24 on 39 triple-era binaries: |ghost − panel| median
+    median (measured 2026-08-24 on 39 triple-era binaries: |ghost - panel| median
     8 pp, non-zero on 37 of 39) but with NO systematic confidence direction — the
-    ghost−panel confidence delta was −3.13 pp mean, CI95 [−6.37, +0.25], so the
+    ghost-minus-panel confidence delta was -3.13 pp mean, CI95 [-6.37, +0.25], so the
     old "a single low-effort model is over-decisive by construction" prediction is
     unsupported and a negative ghost delta must not be explained away as expected
     over-decisiveness. Either way, ghost-vs-published divergence is NOT an alarm

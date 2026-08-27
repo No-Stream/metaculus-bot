@@ -189,7 +189,7 @@ def select_cohort(
         sel_numeric = sorted(numeric_pool, key=lambda r: _rank_key_best_logscore(r, "numeric_log_score"))[:n_numeric]
         sel_mc = sorted(mc_pool, key=lambda r: _rank_key_best_logscore(r, "mc_log_score"))[:n_mc]
     elif mode == "middle":
-        rng = random.Random(seed)
+        rng = random.Random(seed)  # noqa: S311  # deterministic audit sampling, not cryptographic
         middle = _middle_band(records)
         binary_pool = [r for r in middle if r.get("type") == "binary"]
         numeric_pool = [r for r in middle if r.get("type") in ("numeric", "discrete")]
@@ -852,7 +852,7 @@ def emit_combined_report(
     lines: list[str] = []
     lines.append("# Audit: bot misses (combined report)\n")
     lines.append("## Table of contents\n")
-    for entry, path in zip(records_with_rankings, miss_paths, strict=False):
+    for entry, _path in zip(records_with_rankings, miss_paths, strict=False):
         rec = entry["record"]
         anchor = f"miss-{rec['post_id']}"
         lines.append(f"- [{rec['post_id']} — {rec.get('title', '')[:70]}](#{anchor})")

@@ -29,9 +29,9 @@ primary cost-control mechanism.
 
 Cost note (rough order of magnitude — for the operator's mental model only):
 
-* A frontier stacker with ``reasoning={"effort": "high"}`` runs ~$0.05–0.10 per call.
-* 20-question intermediate sweep (40 stacker calls) ≈ $2–4 if everything pays.
-* 60-question medium sweep (120 stacker calls) ≈ $6–12 worst case.
+* A frontier stacker with ``reasoning={"effort": "high"}`` runs ~$0.05-0.10 per call.
+* 20-question intermediate sweep (40 stacker calls) ≈ $2-4 if everything pays.
+* 60-question medium sweep (120 stacker calls) ≈ $6-12 worst case.
 * In practice the donated key absorbs almost everything, so the actual
   paid spend is usually a small fraction of the worst-case figure.
 """
@@ -275,10 +275,7 @@ def _is_finite_prediction(prediction_value: Any) -> bool:
         cdf = prediction_value.get("cdf_probabilities") or []
         if not cdf:
             return False
-        for value in cdf:
-            if not isinstance(value, (int, float)) or not math.isfinite(value):
-                return False
-        return True
+        return all(isinstance(value, (int, float)) and math.isfinite(value) for value in cdf)
     return False
 
 
@@ -342,8 +339,8 @@ async def _dispatch_stacker(
         # Function-scoped imports survive Ruff's unused-import pass when added
         # in the same edit as their usage; see AGENTS.md note on ``main.py``'s
         # function-scoped imports for the same reason.
-        from metaculus_bot.exceptions import (
-            UnitMismatchError,  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.exceptions import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            UnitMismatchError,  # HARNESS-SCAN-EXEMPT-function-level-import
         )
         from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
             build_numeric_distribution,

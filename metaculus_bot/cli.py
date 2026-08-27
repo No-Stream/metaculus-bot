@@ -164,7 +164,7 @@ def main() -> None:
             EXAMPLE_QUESTIONS = [
                 "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
                 "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
-                # "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
+                # "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice  # noqa: ERA001  # parked test question, kept for one-line re-enable
                 "https://www.metaculus.com/questions/20683/which-ai-world/",  # Scott Aaronson's five AI worlds
                 "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
             ]
@@ -208,8 +208,8 @@ def main() -> None:
     # exception keeps its traceback and CI stays exactly as red as before.
     report_summary_error: Exception | None = None
     try:
-        TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
-    except Exception as exc:  # noqa: HARNESS-SCAN-EXEMPT-broad-except  # held only until the breakdown is emitted, then re-raised below
+        TemplateForecaster.log_report_summary(forecast_reports)
+    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # held until the breakdown is emitted, then re-raised
         report_summary_error = exc
 
     # Alert on degraded runs. Publication has already happened inside

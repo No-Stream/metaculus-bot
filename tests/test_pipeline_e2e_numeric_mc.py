@@ -9,6 +9,7 @@ Also tests cross-cutting batch behavior and comment markers.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timedelta
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -137,7 +138,7 @@ def _numeric_percentiles(median: float, scale: float = 1.0, bounds: tuple[float,
     lo, hi = bounds
     return [
         Percentile(percentile=pct, value=max(lo + 0.01, min(hi - 0.01, median + off * scale)))
-        for pct, off in zip(STANDARD_PERCENTILES, offsets)
+        for pct, off in zip(STANDARD_PERCENTILES, offsets, strict=True)
     ]
 
 
@@ -178,7 +179,9 @@ def _build_numeric_distribution(
 def _mc_option_list(probs: list[float], options: list[str] | None = None) -> PredictedOptionList:
     opts = options or ["Red", "Blue", "Green"]
     return PredictedOptionList(
-        predicted_options=[PredictedOption(option_name=name, probability=p) for name, p in zip(opts, probs)]
+        predicted_options=[
+            PredictedOption(option_name=name, probability=p) for name, p in zip(opts, probs, strict=False)
+        ]
     )
 
 
@@ -321,6 +324,7 @@ class TestNumericUnitMismatch:
             for pct, val in zip(
                 STANDARD_PERCENTILES,
                 [3.2, 3.5, 3.8, 4.1, 4.5, 4.8, 5.1, 5.8, 6.5, 7.2, 8.0],
+                strict=False,
             )
         ]
 
@@ -605,10 +609,8 @@ class TestMultiQuestionBatchPartialFailure:
                 return_exceptions=True,
             )
             numeric_result = None
-            try:
+            with contextlib.suppress(RuntimeError):
                 numeric_result = await bot._research_and_make_predictions(numeric_q)
-            except RuntimeError:
-                pass
 
         binary_result, mc_result = results[0], results[1]
 

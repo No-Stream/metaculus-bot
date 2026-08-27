@@ -29,7 +29,7 @@ def _binary_question(qid: int = 100) -> MagicMock:
 def _mc_pred(probs: list[float]) -> PredictedOptionList:
     names = ["A", "B", "C", "D"][: len(probs)]
     return PredictedOptionList(
-        predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in zip(names, probs)]
+        predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in zip(names, probs, strict=True)]
     )
 
 
@@ -84,7 +84,7 @@ class TestApplyPlattCalibration:
         q.id_of_question = 999
         result = apply_platt_calibration(pred, q, binary_params, mc_params)
         assert isinstance(result, PredictedOptionList)
-        for got, exp in zip(result.predicted_options, ref.predicted_options):
+        for got, exp in zip(result.predicted_options, ref.predicted_options, strict=True):
             assert got.probability == pytest.approx(exp.probability)
 
     def test_numeric_distribution_passes_through(self, monkeypatch: pytest.MonkeyPatch) -> None:

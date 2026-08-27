@@ -89,7 +89,7 @@ _RELATIVE_RETURN_RE = re.compile(r"\breturns?\b(?!\s+to\b)|\boutperform|\brelati
 # 2026-08-24 `_single_url_route` applies this guard to the one-URL version (q45362's shape);
 # a question that names both legs in prose and cites no URL reaches the keyword registry,
 # where the guard below catches it. The magnitude backstop covers neither reliably: a
-# 4.4-4.95 percent level band against a −50..50 basis-point displayed range scores INSIDE
+# 4.4-4.95 percent level band against a -50..50 basis-point displayed range scores INSIDE
 # that range once the open-bound tolerance widens it (pinned in the tests).
 #
 # Applied as a ROUTE-level guard rather than per-entry `exclude_keywords`, because an exclude

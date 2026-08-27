@@ -107,9 +107,9 @@ def parse_iso_guarded(value: Any) -> datetime | None:
     if len(text) < 10 or text[4] != "-" or text[7] != "-":
         return None
     # Calendar-date field slices, not data sampling.
-    if not (text[:4].isdigit() and text[5:7].isdigit() and text[8:10].isdigit()):  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+    if not (text[:4].isdigit() and text[5:7].isdigit() and text[8:10].isdigit()):  # HARNESS-SCAN-EXEMPT-subsampling
         return None
-    return parse_iso(text) or parse_iso(text[:10])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+    return parse_iso(text) or parse_iso(text[:10])  # HARNESS-SCAN-EXEMPT-subsampling
 
 
 def settlement_sources(raw: Any) -> tuple[SettlementSource, ...]:

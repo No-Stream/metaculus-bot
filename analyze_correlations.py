@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +28,8 @@ from forecasting_tools.cp_benchmarking.benchmark_for_bot import BenchmarkForBot
 
 from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 from metaculus_bot.scoring_patches import apply_scoring_patches
+from metaculus_bot.scoring_patches import calculate_multiple_choice_baseline_score as _score_mc
+from metaculus_bot.scoring_patches import calculate_numeric_baseline_score as _score_num
 
 logger = logging.getLogger(__name__)
 
@@ -183,13 +186,6 @@ def _ensemble_per_type(
     the appropriate baseline scorer, and returns {qtype: summary-stats}. Skips questions any
     model is missing or that lack the data needed to score.
     """
-    from metaculus_bot.scoring_patches import (
-        calculate_multiple_choice_baseline_score as _score_mc,
-    )
-    from metaculus_bot.scoring_patches import (
-        calculate_numeric_baseline_score as _score_num,
-    )
-
     qmap: dict[int, dict[str, Any]] = {}
     for b in benches_filtered:
         m = _model_name_for(analyzer, b)
@@ -240,7 +236,7 @@ def _ensemble_per_type(
             agg_probs = [p / s for p in agg_probs] if s > 0 else [1.0 / len(option_names)] * len(option_names)
             pred_obj = SimpleNamespace(
                 predicted_options=[
-                    SimpleNamespace(option_name=n, probability=p) for n, p in zip(option_names, agg_probs)
+                    SimpleNamespace(option_name=n, probability=p) for n, p in zip(option_names, agg_probs, strict=True)
                 ]
             )
             fake = SimpleNamespace(question=rep0.question, prediction=pred_obj)
@@ -263,7 +259,7 @@ def _ensemble_per_type(
             agg_percs = percs.mean(axis=0) if agg == "mean" else np.median(percs, axis=0)
             x = [float(getattr(pt, "value", i)) for i, pt in enumerate(cdfs[0][:min_len])]
             pred_obj = SimpleNamespace(
-                cdf=[SimpleNamespace(value=xi, percentile=float(pi)) for xi, pi in zip(x, agg_percs)]
+                cdf=[SimpleNamespace(value=xi, percentile=float(pi)) for xi, pi in zip(x, agg_percs, strict=True)]
             )
             fake = SimpleNamespace(question=rep0.question, prediction=pred_obj)
             sc = _score_num(fake)
@@ -525,9 +521,7 @@ def _resolve_output_path(args: argparse.Namespace) -> str | Path:
         filename = f"correlation_analysis_{timestamp}.md"
     else:
         # Fallback to current timestamp if can't extract from input
-        from datetime import datetime
-
-        current_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        current_timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"correlation_analysis_{current_timestamp}.md"
 
     if benchmark_path.is_file():

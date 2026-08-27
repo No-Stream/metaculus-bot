@@ -4,6 +4,7 @@ Tests for PCHIP-based CDF construction.
 Based on the panchul implementation with comprehensive validation.
 """
 
+from itertools import pairwise
 from typing import cast
 
 import numpy as np
@@ -118,7 +119,7 @@ class TestEnforceStrictIncreasing:
 
         # Values should be strictly increasing
         values = [result[k] for k in sorted(result.keys())]
-        assert all(a < b for a, b in zip(values[:-1], values[1:]))
+        assert all(a < b for a, b in pairwise(values))
 
     def test_mixed_duplicates(self):
         """Test with some duplicates and some valid values."""
@@ -126,7 +127,7 @@ class TestEnforceStrictIncreasing:
         result = enforce_strict_increasing(data)
 
         values = [result[k] for k in sorted(result.keys())]
-        assert all(a < b for a, b in zip(values[:-1], values[1:]))
+        assert all(a < b for a, b in pairwise(values))
         assert result[10.0] == 1.0  # First value unchanged
         assert result[40.0] == 5.0  # Last value unchanged
 
@@ -191,7 +192,7 @@ class TestGeneratePchipCdf:
         """Test basic CDF generation with simple percentiles."""
         percentiles = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
 
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=False,
             open_lower_bound=False,
@@ -203,13 +204,13 @@ class TestGeneratePchipCdf:
         assert len(cdf) == 201
         assert cdf[0] == 0.0  # Closed lower bound
         assert cdf[-1] == 1.0  # Closed upper bound
-        assert all(a <= b for a, b in zip(cdf[:-1], cdf[1:]))  # Monotonic
+        assert all(a <= b for a, b in pairwise(cdf))  # Monotonic
 
     def test_open_bounds_generation(self):
         """Test CDF generation with open bounds."""
         percentiles = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
 
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=True,
             open_lower_bound=True,
@@ -221,14 +222,14 @@ class TestGeneratePchipCdf:
         assert len(cdf) == 201
         assert cdf[0] >= 0.001  # Open lower bound
         assert cdf[-1] <= 0.999  # Open upper bound
-        assert all(a <= b for a, b in zip(cdf[:-1], cdf[1:]))  # Monotonic
+        assert all(a <= b for a, b in pairwise(cdf))  # Monotonic
 
     def test_minimum_step_enforcement(self):
         """Test that minimum step size is enforced."""
         percentiles = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
         min_step = 5e-5
 
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=False,
             open_lower_bound=False,
@@ -254,7 +255,7 @@ class TestGeneratePchipCdf:
             95.0: 195.0,
         }
 
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=False,
             open_lower_bound=False,
@@ -268,7 +269,7 @@ class TestGeneratePchipCdf:
         assert cdf[-1] == 1.0
 
         # Verify monotonicity
-        assert all(a <= b for a, b in zip(cdf[:-1], cdf[1:]))
+        assert all(a <= b for a, b in pairwise(cdf))
 
         # Verify minimum step
         steps = np.diff(cdf)
@@ -279,7 +280,7 @@ class TestGeneratePchipCdf:
         percentiles = {10.0: 1.0, 50.0: 10.0, 90.0: 100.0}  # All positive, good for log
 
         # Should work without error and produce smooth results
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=False,
             open_lower_bound=False,
@@ -289,13 +290,13 @@ class TestGeneratePchipCdf:
         )
 
         assert len(cdf) == 201
-        assert all(a <= b for a, b in zip(cdf[:-1], cdf[1:]))
+        assert all(a <= b for a, b in pairwise(cdf))
 
     def test_zero_point_handling(self):
         """Test that zero_point prevents log transform."""
         percentiles = {10.0: 1.0, 50.0: 10.0, 90.0: 100.0}
 
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=False,
             open_lower_bound=False,
@@ -305,13 +306,13 @@ class TestGeneratePchipCdf:
         )
 
         assert len(cdf) == 201
-        assert all(a <= b for a, b in zip(cdf[:-1], cdf[1:]))
+        assert all(a <= b for a, b in pairwise(cdf))
 
     def test_duplicate_values_handling(self):
         """Test handling of duplicate percentile values."""
         percentiles = {10.0: 5.0, 50.0: 5.0, 90.0: 5.0}  # All same value
 
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=False,
             open_lower_bound=False,
@@ -321,7 +322,7 @@ class TestGeneratePchipCdf:
         )
 
         assert len(cdf) == 201
-        assert all(a <= b for a, b in zip(cdf[:-1], cdf[1:]))
+        assert all(a <= b for a, b in pairwise(cdf))
 
     def test_non_finite_value_raises_instead_of_dropping_the_anchor(self):
         """A non-finite VALUE fails the build instead of being silently skipped.
@@ -408,7 +409,7 @@ class TestGeneratePchipCdf:
         """Test error handling for invalid bounds."""
         percentiles = {50.0: 5.0}
 
-        with pytest.raises(ValueError, match="Upper bound.*must be greater than lower bound"):
+        with pytest.raises(ValueError, match=r"Upper bound.*must be greater than lower bound"):
             generate_pchip_cdf(
                 percentile_values=percentiles,
                 open_upper_bound=False,
@@ -444,7 +445,7 @@ class TestGeneratePchipCdf:
             95.0: 1095.0,  # P95: 3 years
         }
 
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=True,
             open_lower_bound=True,
@@ -468,9 +469,9 @@ class TestGeneratePchipCdf:
         """Concentrated mass on a wide grid satisfies CDF constraints without aggressive enforcement.
 
         Reproduces the oldest-human-age scenario (Q14333): percentiles cluster
-        around 111–172 on a [0, 200] grid.  Without the uniform pre-mix, PCHIP
+        around 111-172 on a [0, 200] grid.  Without the uniform pre-mix, PCHIP
         produces near-zero steps in the tails and requires aggressive enforcement
-        on 11–25 % of bins.  The pre-mix should handle this proactively.
+        on 11-25 % of bins.  The pre-mix should handle this proactively.
         """
         percentiles = {
             2.5: 111.0,
@@ -521,7 +522,7 @@ class TestGeneratePchipCdf:
             95.0: 15.0,
         }
 
-        cdf, aggressive_enforcement = generate_pchip_cdf(
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=percentiles,
             open_upper_bound=False,
             open_lower_bound=False,
@@ -533,7 +534,7 @@ class TestGeneratePchipCdf:
         assert len(cdf) == 201
         assert cdf[0] == 0.0
         assert cdf[-1] == 1.0
-        assert all(a <= b for a, b in zip(cdf[:-1], cdf[1:]))
+        assert all(a <= b for a, b in pairwise(cdf))
 
 
 if __name__ == "__main__":

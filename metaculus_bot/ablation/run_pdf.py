@@ -334,7 +334,7 @@ async def run_pdf_for_qid(
     if isinstance(question, NumericQuestion):
         numeric_cdf_size = _resolve_numeric_cdf_size(surviving, question)
 
-    for slug, payload in surviving.items():
+    for payload in surviving.values():
         reasoning = payload.get("reasoning", "")
         block = parse_structured_block(reasoning, qtype_label)
         if block is None:
@@ -443,10 +443,7 @@ async def _aggregate_numeric_predictions(
 
     n_points = len(predictions[0])
     prob_arrays = np.array([[p.percentile for p in perc_list] for perc_list in predictions], dtype=float)
-    if aggregation == "mean":
-        median_probs = np.mean(prob_arrays, axis=0)
-    else:
-        median_probs = np.median(prob_arrays, axis=0)
+    median_probs = np.mean(prob_arrays, axis=0) if aggregation == "mean" else np.median(prob_arrays, axis=0)
 
     median_probs = np.clip(median_probs, 0.0, 1.0)
     median_probs = np.maximum.accumulate(median_probs)

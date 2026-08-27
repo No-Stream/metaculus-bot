@@ -32,6 +32,16 @@ from metaculus_bot.constants import (
     ASKNEWS_SECRET_ENV,
     ASKNEWS_WALL_TIMEOUT,
     EXA_API_KEY_ENV,
+    NATIVE_SEARCH_CONTEXT_SIZE,
+    NATIVE_SEARCH_DEFAULT_MODEL,
+    NATIVE_SEARCH_MAX_RESULTS,
+    NATIVE_SEARCH_MAX_TOKENS,
+    NATIVE_SEARCH_MODEL_ENV,
+    NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
+    NATIVE_SEARCH_REASONING_EFFORT_ENV,
+    NATIVE_SEARCH_TIMEOUT,
+    NATIVE_SEARCH_VERBOSITY_DEFAULT,
+    NATIVE_SEARCH_VERBOSITY_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
     PERPLEXITY_RESEARCH_MODEL,
@@ -131,10 +141,9 @@ def is_asknews_subscription_error(exc: BaseException) -> bool:
     code 403011 or "subscription is not currently active" when billing lapses.
     """
     msg = str(exc).lower()
-    if "forbiddenerror" in type(exc).__name__.lower():
-        if "403011" in msg or "subscription is not currently active" in msg:
-            return True
-    return False
+    return "forbiddenerror" in type(exc).__name__.lower() and (
+        "403011" in msg or "subscription is not currently active" in msg
+    )
 
 
 def _asknews_provider() -> ResearchCallable:
@@ -167,7 +176,9 @@ def _asknews_provider() -> ResearchCallable:
 
         async with _ASKNEWS_GLOBAL_SEMAPHORE:
             # Use custom AskNews integration with proper rate limiting between API calls
-            from asknews_sdk import AsyncAskNewsSDK
+            from asknews_sdk import (  # noqa: PLC0415  # late import: tests patch asknews_sdk.AsyncAskNewsSDK at source
+                AsyncAskNewsSDK,
+            )
 
             client_id = os.getenv(ASKNEWS_CLIENT_ID_ENV)
             secret = os.getenv(ASKNEWS_SECRET_ENV)
@@ -179,7 +190,7 @@ def _asknews_provider() -> ResearchCallable:
             async with AsyncAskNewsSDK(
                 client_id=client_id,
                 client_secret=secret,
-                scopes=set(["news"]),
+                scopes={"news"},
             ) as sdk:
                 # Phase 1: HOT (latest news) with its own retry loop, consuming from total budget
                 hot_articles = None
@@ -212,7 +223,7 @@ def _asknews_provider() -> ResearchCallable:
                             await asyncio.sleep(sleep_for)
                         else:
                             assert last_exc is not None
-                            raise last_exc
+                            raise last_exc  # noqa: B904  # re-raises the exception being handled; `from` would self-reference
 
                 assert hot_articles is not None
 
@@ -252,7 +263,7 @@ def _asknews_provider() -> ResearchCallable:
                             await asyncio.sleep(sleep_for)
                         else:
                             assert last_exc is not None
-                            raise last_exc
+                            raise last_exc  # noqa: B904  # re-raises the exception being handled; `from` would self-reference
 
                 assert historical_articles is not None
 
@@ -433,31 +444,18 @@ def build_native_search_llm(
     env-driven LOW. An empty string (from either the override or the env)
     disables passing the corresponding kwarg.
     """
-    from metaculus_bot.constants import (
-        NATIVE_SEARCH_CONTEXT_SIZE,
-        NATIVE_SEARCH_DEFAULT_MODEL,
-        NATIVE_SEARCH_MAX_RESULTS,
-        NATIVE_SEARCH_MAX_TOKENS,
-        NATIVE_SEARCH_MODEL_ENV,
-        NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
-        NATIVE_SEARCH_REASONING_EFFORT_ENV,
-        NATIVE_SEARCH_TIMEOUT,
-        NATIVE_SEARCH_VERBOSITY_DEFAULT,
-        NATIVE_SEARCH_VERBOSITY_ENV,
-    )
-
     base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
     model_with_search = f"openrouter/{base_model}"
 
-    kwargs: dict = dict(
-        model=model_with_search,
+    kwargs: dict = {
+        "model": model_with_search,
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
         # kept to pin provider-default sampling against a future default flip. reasoning
         # models defer to provider defaults. top_p left unset.
-        temperature=None,
-        max_tokens=NATIVE_SEARCH_MAX_TOKENS,
-        timeout=NATIVE_SEARCH_TIMEOUT,
+        "temperature": None,
+        "max_tokens": NATIVE_SEARCH_MAX_TOKENS,
+        "timeout": NATIVE_SEARCH_TIMEOUT,
         # allowed_tries=1: a malformed-whitespace response from OpenRouter (the
         # 2026-05-20 incident) won't be cured by retrying the same call, and
         # the wall-clock guard at the caller (asyncio.wait_for in _fetch) is
@@ -465,10 +463,10 @@ def build_native_search_llm(
         # NATIVE_SEARCH_WALL_TIMEOUT window instead of forecasting-tools'
         # default ``allowed_tries`` multiplied by NATIVE_SEARCH_TIMEOUT (which
         # resets per HTTP request).
-        allowed_tries=1,
-        plugins=[{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
-        web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
-    )
+        "allowed_tries": 1,
+        "plugins": [{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
+        "web_search_options": {"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
+    }
 
     effort = (
         reasoning_effort
@@ -506,7 +504,9 @@ def _native_search_provider(
     """Research provider using models with native web search capability via OpenRouter :online suffix."""
 
     async def _fetch(question: MetaculusQuestion) -> str:
-        from metaculus_bot.constants import NATIVE_SEARCH_WALL_TIMEOUT
+        from metaculus_bot.constants import (  # noqa: PLC0415  # late read: tests patch this constant on the constants module
+            NATIVE_SEARCH_WALL_TIMEOUT,
+        )
 
         llm = build_native_search_llm(model_slug)
         prompt = web_research_prompt(
@@ -581,11 +581,11 @@ def choose_provider_with_name(
         if forced_lc == "perplexity":
             if perplexity_callback is not None:
                 return perplexity_callback, "perplexity"
-            return _perplexity_provider(False, is_benchmarking), "perplexity"
+            return _perplexity_provider(use_open_router=False, is_benchmarking=is_benchmarking), "perplexity"
         if forced_lc == "openrouter":
             if openrouter_callback is not None:
                 return openrouter_callback, "openrouter"
-            return _perplexity_provider(True, is_benchmarking), "openrouter"
+            return _perplexity_provider(use_open_router=True, is_benchmarking=is_benchmarking), "openrouter"
         # Any other value behaves as auto
 
     if os.getenv(ASKNEWS_CLIENT_ID_ENV) and os.getenv(ASKNEWS_SECRET_ENV):
@@ -601,12 +601,12 @@ def choose_provider_with_name(
     if os.getenv(PERPLEXITY_API_KEY_ENV):
         if perplexity_callback is not None:
             return perplexity_callback, "perplexity"
-        return _perplexity_provider(False, is_benchmarking), "perplexity"
+        return _perplexity_provider(use_open_router=False, is_benchmarking=is_benchmarking), "perplexity"
 
     if os.getenv(OPENROUTER_API_KEY_ENV):
         if openrouter_callback is not None:
             return openrouter_callback, "openrouter"
-        return _perplexity_provider(True, is_benchmarking), "openrouter"
+        return _perplexity_provider(use_open_router=True, is_benchmarking=is_benchmarking), "openrouter"
 
     async def _empty(_: MetaculusQuestion) -> str:
         return ""
@@ -699,11 +699,7 @@ def _dedup_articles_by_url(articles: list[Any]) -> list[Any]:
     seen: set[str] = set()
     result: list[Any] = []
     for item in articles:
-        url = None
-        if isinstance(item, dict):  # type: ignore[unreachable]
-            url = item.get("article_url")
-        else:
-            url = getattr(item, "article_url", None)
+        url = item.get("article_url") if isinstance(item, dict) else getattr(item, "article_url", None)  # type: ignore[unreachable]
 
         if not url:
             result.append(item)

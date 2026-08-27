@@ -1,7 +1,7 @@
 """Timezone-robustness pinning tests for ``prompts._forecasting_window_str``.
 
-Seam: ``_forecasting_window_str`` computes ``today − question.open_time`` (and
-``scheduled_resolution_time − today``) to render the "days ago" / "days from
+Seam: ``_forecasting_window_str`` computes ``today - question.open_time`` (and
+``scheduled_resolution_time - today``) to render the "days ago" / "days from
 now" window anchor injected into every forecasting prompt. On the currently
 installed forecasting-tools 0.2.54, ``MetaculusQuestion._parse_api_date`` uses
 ``datetime.strptime`` with the trailing ``Z`` as a literal character, so

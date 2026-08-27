@@ -388,7 +388,9 @@ class TestBuildUnifiedExplanation:
             n_configured=3,
         )
         match = FORECASTERS_USED_MARKER_RE.search(result)
-        assert match is not None and match.group(1) == "2" and match.group(2) == "3"
+        assert match is not None
+        assert match.group(1) == "2"
+        assert match.group(2) == "3"
         # Additive: existing markers are untouched.
         assert STACKER_OUTCOME_SKIPPED_CONFIG_OFF in result
 

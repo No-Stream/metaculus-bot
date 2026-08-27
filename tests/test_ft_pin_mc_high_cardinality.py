@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -193,11 +194,12 @@ class TestRawSubFloorConstructionRaisesOn0292:
 
     _DOMINANT = 0.984
     _SUB_FLOOR = 0.002
-    _NEAR_FLOOR_NAMES = [f"opt{i}" for i in range(8)]  # 8 near-floor options -> the >=6-option raise regime
+    # 8 near-floor options -> the >=6-option raise regime
+    _NEAR_FLOOR_NAMES: ClassVar[list[str]] = [f"opt{i}" for i in range(8)]
 
     def test_raw_sub_floor_construction_raises(self) -> None:
         """A raw dominant + eight-sub-floor ballot now RAISES on 0.2.92 construction (the >0.05-move guard)."""
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="differs from original probability"):
             PredictedOptionList(
                 predicted_options=[
                     PredictedOption(option_name="Dominant", probability=self._DOMINANT),

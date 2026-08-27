@@ -1361,7 +1361,7 @@ def _interleave_dataset_results(
     the rendered section (and the total-budget trimming order) keeps a chart's
     data adjacent to the page that embeds it."""
     by_parent: dict[int, list[FetchResult]] = {}
-    for (idx, _chart), ds in zip(picks, dataset_results):
+    for (idx, _chart), ds in zip(picks, dataset_results, strict=False):
         by_parent.setdefault(idx, []).append(ds)
     merged: list[FetchResult] = []
     for idx, r in enumerate(page_results):

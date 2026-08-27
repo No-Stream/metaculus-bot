@@ -50,7 +50,8 @@ def test_dedup_articles_by_url_preserves_order_and_keeps_non_url_items() -> None
     assert len(deduped) == 3
     assert isinstance(deduped[0], DummyArticle)
     assert isinstance(deduped[1], dict)
-    assert isinstance(deduped[2], dict) and deduped[2].get("no_url")
+    assert isinstance(deduped[2], dict)
+    assert deduped[2].get("no_url")
 
 
 # Dual research stream formatting.

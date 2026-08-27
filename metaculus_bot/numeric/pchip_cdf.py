@@ -300,7 +300,7 @@ def generate_pchip_cdf(
         last_value = v
 
     # Create arrays of percentiles and values
-    percentiles, values = zip(*sorted(pv.items()))
+    percentiles, values = zip(*sorted(pv.items()), strict=False)
     percentiles = np.array(percentiles) / 100.0  # Convert to [0,1] range
     values = np.array(values)
 
@@ -354,10 +354,7 @@ def generate_pchip_cdf(
     # Uniform mixture for min-step compliance (same approach as discrete_snap.py)
     _ALPHA_SAFETY_MARGIN = 1.1
     total_range = float(cdf_y[-1] - cdf_y[0])
-    if total_range > 1e-12:
-        min_alpha = min_step * num_points / total_range * _ALPHA_SAFETY_MARGIN
-    else:
-        min_alpha = 1.0
+    min_alpha = min_step * num_points / total_range * _ALPHA_SAFETY_MARGIN if total_range > 1e-12 else 1.0
     alpha = min(1.0, min_alpha)
     uniform_cdf = np.linspace(float(cdf_y[0]), float(cdf_y[-1]), num_points)
     cdf_y = (1.0 - alpha) * cdf_y + alpha * uniform_cdf
@@ -423,15 +420,8 @@ def generate_pchip_cdf(
         )
 
         # Create a strictly monotonic sequence
-        if not open_lower_bound:
-            start_val = 0.0
-        else:
-            start_val = cdf_y[0]
-
-        if not open_upper_bound:
-            end_val = 1.0
-        else:
-            end_val = min(cdf_y[-1], 1.0)
+        start_val = 0.0 if not open_lower_bound else cdf_y[0]
+        end_val = 1.0 if not open_upper_bound else min(cdf_y[-1], 1.0)
 
         available_range = end_val - start_val
         # Ensure we have enough room for all steps

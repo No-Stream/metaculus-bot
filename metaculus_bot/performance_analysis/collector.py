@@ -192,11 +192,9 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
     # values from parse_per_model_mc_option_probs as per_model_forecasts.
     per_model_numeric_percentiles = parse_per_model_numeric_percentiles(comment_text) if comment_text else {}
     per_model_mc_option_probs = parse_per_model_mc_option_probs(comment_text) if comment_text else {}
-    if per_model_mc_option_probs:
-        # MC question: use the full option-probability dicts.
-        per_model = per_model_mc_option_probs
-    else:
-        per_model = parse_per_model_forecasts(comment_text) if comment_text else {}
+    # An MC question yields full option-probability dicts; anything else falls back to the
+    # legacy single-value bullet parser.
+    per_model = per_model_mc_option_probs or (parse_per_model_forecasts(comment_text) if comment_text else {})
     was_stacked = parse_stacked_marker(comment_text) if comment_text else None
     # Tri-state outcome: prefers the new STACKER_OUTCOME= marker, falls back to
     # the legacy STACKED= marker, then to historical body-shape detection for
@@ -584,9 +582,7 @@ def _rescorable(record: object) -> bool:
     q_type = record.get("type")
     if q_type == "binary" and "our_prob_yes" not in record:
         return False
-    if q_type in ("numeric", "discrete") and not all(k in record for k in ("open_lower_bound", "open_upper_bound")):
-        return False
-    return True
+    return q_type not in ("numeric", "discrete") or all(k in record for k in ("open_lower_bound", "open_upper_bound"))
 
 
 # Recomputation float wiggle vs a genuinely different stored value. The scorer

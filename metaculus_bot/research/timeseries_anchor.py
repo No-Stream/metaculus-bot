@@ -148,7 +148,7 @@ def _maybe_stash_single_chart(
     use_log = bool(np.all(y > 0.0))
     band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
 
-    from metaculus_bot.research.ts_chart import (
+    from metaculus_bot.research.ts_chart import (  # noqa: PLC0415  # matplotlib kept off the cold path
         render_anchor_chart,
     )
 
@@ -177,7 +177,7 @@ def _finite_bound(v: float) -> bool:
 
 
 def _band_misses_bounds(question: NumericQuestion, band: tuple[float, float, float] | None) -> bool:
-    """Generic units/magnitude backstop: True when the rendered P10–P90 band lies ENTIRELY
+    """Generic units/magnitude backstop: True when the rendered P10-P90 band lies ENTIRELY
     outside the question's displayed range — a gross mismatch (level-vs-derived, or a
     wrong-country CPI magnitude) meaning the anchor describes a different quantity than the
     one that resolves. Returns False when no band was rendered — nothing to check.

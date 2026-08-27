@@ -123,9 +123,7 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     msg = str(exc)
     if '"code":429' in msg or "code: 429" in msg:
         return True
-    if "rate-limited upstream" in msg.lower():
-        return True
-    return False
+    return "rate-limited upstream" in msg.lower()
 
 
 def _parse_retry_after_seconds(exc: BaseException) -> float | None:
@@ -185,7 +183,7 @@ def _backoff_seconds(attempt: int) -> float:
     ``2**attempt + uniform[0, 1)`` capped at ``_RATE_LIMIT_BACKOFF_CAP_SECONDS``.
     Matches the OpenRouter docs' 1s/2s/4s/8s recommendation when uncapped.
     """
-    return min(_RATE_LIMIT_BACKOFF_CAP_SECONDS, (2**attempt) + random.uniform(0.0, 1.0))
+    return min(_RATE_LIMIT_BACKOFF_CAP_SECONDS, (2**attempt) + random.uniform(0.0, 1.0))  # noqa: S311  # non-cryptographic backoff jitter
 
 
 # The window patch monkey-patches `_forecasting_window_str` GLOBALLY, and its
@@ -374,7 +372,7 @@ def deserialize_prediction_value(payload: dict[str, Any], question: MetaculusQue
         return PredictedOptionList(
             predicted_options=[
                 PredictedOption(option_name=opt["option_name"], probability=prob)
-                for opt, prob in zip(options_payload, clamped)
+                for opt, prob in zip(options_payload, clamped, strict=True)
             ]
         )
     if payload_type == "numeric":
@@ -577,7 +575,7 @@ async def _run_one_forecaster(
                     # (3600s / one hour observed in the wild on hot-tail throttles).
                     retry_after = _parse_retry_after_seconds(exc)
                     if retry_after is not None:
-                        sleep_seconds = min(retry_after + random.uniform(0.1, 0.5), _MAX_RATE_LIMIT_SLEEP_SECONDS)
+                        sleep_seconds = min(retry_after + random.uniform(0.1, 0.5), _MAX_RATE_LIMIT_SLEEP_SECONDS)  # noqa: S311  # non-cryptographic backoff jitter
                     else:
                         sleep_seconds = _backoff_seconds(attempt)
                     provider_name = _parse_provider_name(exc) or "unknown"
@@ -716,7 +714,7 @@ async def run_forecasters_for_question(
         # env value is restored on exit so anything outside the forecast stage
         # observes the operator's setting unchanged.
         async with _get_window_patch_lock():
-            with patched_window_for_question(question), probabilistic_tools_enabled(False):
+            with patched_window_for_question(question), probabilistic_tools_enabled(enabled=False):
                 tasks = [
                     _run_one_forecaster(
                         question,
@@ -772,7 +770,7 @@ async def run_forecasters_batch(
     semaphore = asyncio.Semaphore(per_question_concurrency)
     # Late binding via module attribute so tests can monkeypatch
     # `run_forecasters_for_question` on the module and have it observed here.
-    from metaculus_bot.ablation import forecasters as _self_module
+    from metaculus_bot.ablation import forecasters as _self_module  # noqa: PLC0415, PLW0406  # deliberate; see above
 
     async def _run_one(question: MetaculusQuestion, blob: str) -> tuple[int, dict[str, dict[str, Any]]]:
         qid = question.id_of_question

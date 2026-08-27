@@ -352,7 +352,7 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
     Sync function -- caller wraps in asyncio.to_thread().
     Returns formatted markdown or "" on any failure.
 
-    Both paths fetch by explicit calendar start date, ``as_of`` −
+    Both paths fetch by explicit calendar start date, ``as_of`` -
     ``FINANCIAL_YFINANCE_LOOKBACK_DAYS`` (``as_of`` defaults to now; the live provider
     passes now explicitly). A bare ``period="Nd"`` is deliberately avoided: Yahoo's
     chart API reads that custom range as N trading BARS for listed assets but ~N
@@ -519,7 +519,7 @@ def _compute_period_returns(close: pd.Series, periods_per_year: int) -> str:
     ``periods_per_year`` is REQUIRED (no trading-day default): it selects the slip
     grace that separates routine weekend/holiday slippage from a data gap, so a caller
     that forgets it would silently reproduce the q44882 mislabelling on a 24/7 series.
-    Each label's start value is the newest observation at or before ``last − days``
+    Each label's start value is the newest observation at or before ``last - days``
     (the same pattern as the FRED YoY lookup below); a label whose match lands beyond
     the basis's slip grace discloses the actual span ("1d (actual 2d)") instead of
     wearing a period it doesn't cover. A label with no observation at or before its
@@ -699,7 +699,7 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
     Backtest-safe like ``timeseries_anchor``: under ``is_benchmarking`` every fetch is
     ceilinged to ``question.open_time`` (NOT the resolution time — post-open data can
     contain the resolution). Both modes fetch yfinance by explicit start date
-    (``as_of`` − ``FINANCIAL_YFINANCE_LOOKBACK_DAYS``); benchmarking additionally
+    (``as_of`` - ``FINANCIAL_YFINANCE_LOOKBACK_DAYS``); benchmarking additionally
     ceilings the window via ``end`` and skips the leaky ``.info`` fundamentals. FRED:
     live uses the fredapi path, while benchmarking routes through the keyless
     ``ts_fetch`` fredgraph / ALFRED-vintage path so revised macro series return the

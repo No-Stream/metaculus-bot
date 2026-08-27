@@ -16,6 +16,7 @@ non-breaking for the public + private API surface.
 from __future__ import annotations
 
 import logging
+from itertools import combinations
 from typing import Any
 
 import numpy as np
@@ -291,10 +292,10 @@ class CorrelationAnalyzer:
             report = None
             for benchmark in self.benchmarks:
                 for report_candidate in benchmark.forecast_reports:
-                    if (report_candidate.question.id_of_question or 0) == q_id:
-                        if extract_model_name(benchmark) == pred.model_name:
-                            report = report_candidate
-                            break
+                    matches_question = (report_candidate.question.id_of_question or 0) == q_id
+                    if matches_question and extract_model_name(benchmark) == pred.model_name:
+                        report = report_candidate
+                        break
                 if report:
                     break
 
@@ -303,7 +304,7 @@ class CorrelationAnalyzer:
                 question_data[q_id][pred.model_name] = (q_type, components)
 
         # Calculate correlations for each question, then average
-        model_names = list(set(pred.model_name for pred in self.predictions))
+        model_names = list({pred.model_name for pred in self.predictions})
         n_models = len(model_names)
 
         # Initialize correlation matrices
@@ -317,12 +318,12 @@ class CorrelationAnalyzer:
                 continue
 
             # Group by question type
-            q_types = set(data[0] for data in model_data.values())
+            q_types = {data[0] for data in model_data.values()}
             if len(q_types) > 1:
                 logger.warning(f"Question {q_id} has mixed types across models: {q_types}")
                 continue
 
-            q_type = list(q_types)[0]
+            q_type = next(iter(q_types))
 
             # Calculate correlation for this question
             model_indices = {name: i for i, name in enumerate(model_names)}
@@ -428,8 +429,6 @@ class CorrelationAnalyzer:
 
         # Generate all possible ensemble combinations up to max_ensemble_size
         # Test both MEAN and MEDIAN aggregation strategies for each combination
-        from itertools import combinations
-
         for size in range(2, max_ensemble_size + 1):
             for model_combo in combinations(model_stats.keys(), size):
                 # Test both aggregation strategies for each model combination
@@ -654,11 +653,12 @@ class CorrelationAnalyzer:
             ensemble_groups[models_key].append(ensemble)
 
         # Show top 5 model combinations with both aggregation strategies
-        combination_count = 0
-        for models_key, ensembles in sorted(
-            ensemble_groups.items(),
-            key=lambda x: max(e.ensemble_score for e in x[1]),
-            reverse=True,
+        for combination_count, (models_key, ensembles) in enumerate(
+            sorted(
+                ensemble_groups.items(),
+                key=lambda x: max(e.ensemble_score for e in x[1]),
+                reverse=True,
+            )
         ):
             if combination_count >= 5:
                 break
@@ -677,8 +677,6 @@ class CorrelationAnalyzer:
                     f"Diversity {ensemble.diversity_score:.3f}, "
                     f"Overall {ensemble.ensemble_score:.3f}"
                 )
-
-            combination_count += 1
 
         report_text = "\n".join(report)
 

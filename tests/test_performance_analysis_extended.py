@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 import pytest
@@ -755,10 +755,11 @@ class TestInterpolatePitOutOfGrid:
     grid the PIT must come off the members' declared-percentile curves instead.
     """
 
-    _LOWER, _UPPER = 100.0, 200.0
+    _LOWER: ClassVar[float] = 100.0
+    _UPPER: ClassVar[float] = 200.0
     # 90% of the mass below the open lower bound (F(100) = 0.90), like q44218's 0.9168.
-    _CDF = list(np.linspace(0.90, 0.975, 201))
-    _PERCENTILES = {
+    _CDF: ClassVar[list[float]] = list(np.linspace(0.90, 0.975, 201))
+    _PERCENTILES: ClassVar[dict[str, list[list[float]]]] = {
         "model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]],
         "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
     }
@@ -873,7 +874,7 @@ class TestDeclaredPercentileCurveTolerance:
     surviving curves or fall back to the grid read.
     """
 
-    _GOOD = [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]]
+    _GOOD: ClassVar[list[list[float]]] = [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]]
 
     def test_non_numeric_declared_value_drops_only_that_curve(self):
         # A percentile line that parsed to a non-number: the median is taken over the
@@ -941,21 +942,29 @@ class TestMaxStepClampScreen:
     discrete that legitimately holds a 0.2 bin must NOT fire."""
 
     # 11-point integer grid; steps[1] (the [1, 2] bin) is exactly 0.20.
-    _GRID = [float(v) for v in range(11)]
-    _CDF = [0.0, 0.05, 0.25, 0.45, 0.65, 0.85, 0.90, 0.93, 0.96, 0.98, 1.0]
+    _GRID: ClassVar[list[float]] = [float(v) for v in range(11)]
+    _CDF: ClassVar[list[float]] = [0.0, 0.05, 0.25, 0.45, 0.65, 0.85, 0.90, 0.93, 0.96, 0.98, 1.0]
     # Both members concentrate ~0.70 of their mass on the [1, 2] bin. Curves are
     # 11-ANCHOR on purpose: the screen now drops any member under
     # MIN_SCOREABLE_ANCHORS, because its verdict turns on the MINIMUM member bin mass
     # and a 3-anchor interpolation across one bin is not the declared distribution.
-    _LABELS = [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0]
-    _MEMBERS = {
+    _LABELS: ClassVar[list[float]] = [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0]
+    _MEMBERS: ClassVar[dict[str, list[list[float]]]] = {
         "model-a": [
             [label, value]
-            for label, value in zip(_LABELS, [0.90, 1.00, 1.15, 1.30, 1.45, 1.55, 1.70, 1.85, 2.00, 2.30, 2.60])
+            for label, value in zip(
+                _LABELS,
+                [0.90, 1.00, 1.15, 1.30, 1.45, 1.55, 1.70, 1.85, 2.00, 2.30, 2.60],
+                strict=True,
+            )
         ],
         "model-b": [
             [label, value]
-            for label, value in zip(_LABELS, [0.95, 1.05, 1.18, 1.32, 1.46, 1.56, 1.72, 1.90, 2.05, 2.35, 2.65])
+            for label, value in zip(
+                _LABELS,
+                [0.95, 1.05, 1.18, 1.32, 1.46, 1.56, 1.72, 1.90, 2.05, 2.35, 2.65],
+                strict=True,
+            )
         ],
     }
     _PRE_FIX_TS = "2026-06-11T00:00:00Z"
@@ -1004,6 +1013,7 @@ class TestMaxStepClampScreen:
                 for label, value in zip(
                     self._LABELS,
                     [99.90, 100.00, 100.15, 100.30, 100.45, 100.55, 100.70, 100.85, 101.00, 101.30, 101.60],
+                    strict=True,
                 )
             ],
             "model-b": [
@@ -1011,6 +1021,7 @@ class TestMaxStepClampScreen:
                 for label, value in zip(
                     self._LABELS,
                     [99.95, 100.05, 100.18, 100.32, 100.46, 100.56, 100.72, 100.90, 101.05, 101.35, 101.65],
+                    strict=True,
                 )
             ],
         }
@@ -1206,7 +1217,7 @@ class TestRescoreRecords:
     score VALUES are whatever the scorer computed when the file was written — a
     scorer fix never reaches previously-saved files. The checked-in q38991
     fixture is the real record that carried a linear-bucket numeric_log_score of
-    −193.29 for a month after the zero_point coercion fix, against a platform
+    -193.29 for a month after the zero_point coercion fix, against a platform
     spot_baseline_score of 165.54.
     """
 

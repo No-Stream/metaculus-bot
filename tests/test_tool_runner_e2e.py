@@ -189,9 +189,11 @@ def _make_binary_reasoned_predictions(
 ) -> tuple[list[float], list[ReasonedPrediction[float]]]:
     rationales = [
         _binary_rationale(f"m{i + 1}", post, pri, kn[0], kn[1])
-        for i, (post, pri, kn) in enumerate(zip(posteriors, priors, k_n_pairs))
+        for i, (post, pri, kn) in enumerate(zip(posteriors, priors, k_n_pairs, strict=False))
     ]
-    reasoned = [ReasonedPrediction(prediction_value=post, reasoning=r) for post, r in zip(posteriors, rationales)]
+    reasoned = [
+        ReasonedPrediction(prediction_value=post, reasoning=r) for post, r in zip(posteriors, rationales, strict=False)
+    ]
     return posteriors, reasoned
 
 
@@ -264,26 +266,26 @@ class TestBinaryStackingCrossModelAggregation:
             parser_response=BinaryPrediction(prediction_in_decimal=0.42),
         )
 
-        with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with (
-                patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
-                patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
-                patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
-            ):
-                aggregated = await bot._aggregate_predictions(
-                    posteriors,  # type: ignore[arg-type]
-                    question,
-                    research="research",
-                    reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: float ∈ PredictionTypes
-                    aggregated_tool_output=__import__(
-                        "metaculus_bot.tool_runner", fromlist=["build_cross_model_aggregation"]
-                    ).build_cross_model_aggregation(
-                        question=question,
-                        rationales=[r.reasoning for r in reasoned],
-                        prediction_values=posteriors,
-                    )
-                    or None,
+        with (
+            patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke),
+            patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
+            patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
+            patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
+        ):
+            aggregated = await bot._aggregate_predictions(
+                posteriors,  # type: ignore[arg-type]
+                question,
+                research="research",
+                reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: float ∈ PredictionTypes
+                aggregated_tool_output=__import__(
+                    "metaculus_bot.tool_runner", fromlist=["build_cross_model_aggregation"]
+                ).build_cross_model_aggregation(
+                    question=question,
+                    rationales=[r.reasoning for r in reasoned],
+                    prediction_values=posteriors,
                 )
+                or None,
+            )
 
         assert isinstance(aggregated, float)
         assert len(capture.prompts) == 1
@@ -300,7 +302,9 @@ class TestBinaryStackingCrossModelAggregation:
         assert "Pools over 3 forecasters" in prompt
         # The actual numeric values come from the tool — we don't pin them, but
         # the "linear ... log ... Satopää" anchor must be present.
-        assert "linear" in prompt and "log" in prompt and "Satopää" in prompt
+        assert "linear" in prompt
+        assert "log" in prompt
+        assert "Satopää" in prompt
 
         # - Blended base rate from the 3 declared base_rates
         assert "Blended base rate across 3 forecasters" in prompt
@@ -328,24 +332,24 @@ class TestBinaryStackingCrossModelAggregation:
         )
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
-        with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with (
-                patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
-                patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
-                patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
-            ):
-                await bot._aggregate_predictions(
-                    posteriors,  # type: ignore[arg-type]
-                    question,
-                    research="research",
-                    reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: float ∈ PredictionTypes
-                    aggregated_tool_output=build_cross_model_aggregation(
-                        question=question,
-                        rationales=[r.reasoning for r in reasoned],
-                        prediction_values=posteriors,
-                    )
-                    or None,
+        with (
+            patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke),
+            patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
+            patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
+            patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
+        ):
+            await bot._aggregate_predictions(
+                posteriors,  # type: ignore[arg-type]
+                question,
+                research="research",
+                reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: float ∈ PredictionTypes
+                aggregated_tool_output=build_cross_model_aggregation(
+                    question=question,
+                    rationales=[r.reasoning for r in reasoned],
+                    prediction_values=posteriors,
                 )
+                or None,
+            )
 
         assert "Cross-model aggregation (deterministic math)" in capture.prompts[0]
         assert "Pools over 3 forecasters" in capture.prompts[0]
@@ -429,7 +433,7 @@ class TestNumericStackingCrossModelAggregation:
         from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
         numeric_predictions = []
-        for rationale, declared in zip(rationales, _NUMERIC_DECLARED.values()):
+        for rationale, declared in zip(rationales, _NUMERIC_DECLARED.values(), strict=False):
             pcts = _percentile_objs_from(declared)
             sanitized, zero_point = sanitize_percentiles(pcts, question)
             pred = build_numeric_distribution(sanitized, question, zero_point)
@@ -437,7 +441,8 @@ class TestNumericStackingCrossModelAggregation:
             _ = rationale, create_pchip_numeric_distribution  # silence unused-import lint
 
         reasoned = [
-            ReasonedPrediction(prediction_value=p, reasoning=r) for p, r in zip(numeric_predictions, rationales)
+            ReasonedPrediction(prediction_value=p, reasoning=r)
+            for p, r in zip(numeric_predictions, rationales, strict=False)
         ]
 
         capture = _PromptCapture(
@@ -446,24 +451,24 @@ class TestNumericStackingCrossModelAggregation:
         )
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
-        with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with (
-                patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
-                patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
-                patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
-            ):
-                await bot._aggregate_predictions(
-                    numeric_predictions,  # type: ignore[arg-type]
-                    question,
-                    research="research",
-                    reasoned_predictions=reasoned,
-                    aggregated_tool_output=build_cross_model_aggregation(
-                        question=question,
-                        rationales=rationales,
-                        prediction_values=[_percentile_objs_from(d) for d in _NUMERIC_DECLARED.values()],
-                    )
-                    or None,
+        with (
+            patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke),
+            patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
+            patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
+            patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
+        ):
+            await bot._aggregate_predictions(
+                numeric_predictions,  # type: ignore[arg-type]
+                question,
+                research="research",
+                reasoned_predictions=reasoned,
+                aggregated_tool_output=build_cross_model_aggregation(
+                    question=question,
+                    rationales=rationales,
+                    prediction_values=[_percentile_objs_from(d) for d in _NUMERIC_DECLARED.values()],
                 )
+                or None,
+            )
 
         prompt = capture.prompts[0]
         assert "Cross-model aggregation (deterministic math)" in prompt
@@ -495,7 +500,10 @@ class TestMcStackingCrossModelAggregation:
             )
             for p in probs_per_forecaster
         ]
-        reasoned = [ReasonedPrediction(prediction_value=v, reasoning=r) for v, r in zip(prediction_values, rationales)]
+        reasoned = [
+            ReasonedPrediction(prediction_value=v, reasoning=r)
+            for v, r in zip(prediction_values, rationales, strict=False)
+        ]
 
         capture = _PromptCapture(
             stacker_response="Red: 50%, Blue: 30%, Green: 20%",
@@ -509,24 +517,24 @@ class TestMcStackingCrossModelAggregation:
         )
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
-        with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with (
-                patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
-                patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
-                patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
-            ):
-                await bot._aggregate_predictions(
-                    prediction_values,  # type: ignore[arg-type]
-                    question,
-                    research="research",
-                    reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: PredictedOptionList ∈ PredictionTypes
-                    aggregated_tool_output=build_cross_model_aggregation(
-                        question=question,
-                        rationales=rationales,
-                        prediction_values=prediction_values,
-                    )
-                    or None,
+        with (
+            patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke),
+            patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
+            patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
+            patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
+        ):
+            await bot._aggregate_predictions(
+                prediction_values,  # type: ignore[arg-type]
+                question,
+                research="research",
+                reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: PredictedOptionList ∈ PredictionTypes
+                aggregated_tool_output=build_cross_model_aggregation(
+                    question=question,
+                    rationales=rationales,
+                    prediction_values=prediction_values,
                 )
+                or None,
+            )
 
         prompt = capture.prompts[0]
         assert "Cross-model aggregation (deterministic math)" in prompt

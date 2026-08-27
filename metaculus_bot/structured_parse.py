@@ -11,7 +11,7 @@ fall back to forecasting_tools.structure_output (today's exact behavior).
 from __future__ import annotations
 
 import logging
-from typing import TypeVar, get_args, get_origin
+from typing import get_args, get_origin
 
 from forecasting_tools import GeneralLlm, structure_output
 from forecasting_tools.data_models.numeric_report import Percentile
@@ -21,8 +21,6 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.simple_types import OptionProbability
 
 logger = logging.getLogger(__name__)
-T = TypeVar("T")
-
 
 # ---------------------------------------------------------------------------
 # Wrapper models for list types (response_format requires a single BaseModel)
@@ -94,7 +92,7 @@ def _build_constrained_llm(response_format_model: type[BaseModel], parser_model:
 # ---------------------------------------------------------------------------
 
 
-async def parse_structured(
+async def parse_structured[T](
     text: str,
     output_type: type[T],
     parser_llm: GeneralLlm,

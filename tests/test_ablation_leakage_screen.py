@@ -277,7 +277,7 @@ class TestScreenResearchBlob:
         falls through to detector_failed=True (conservative drop)."""
         from metaculus_bot.ablation.leakage_screen import _extract_is_leaked
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"'is_leaked' string must be true/false/yes/no"):
             _extract_is_leaked('{"is_leaked": "maybe", "explanation": "x"}')
 
     def test_extract_is_leaked_still_accepts_real_bools(self) -> None:

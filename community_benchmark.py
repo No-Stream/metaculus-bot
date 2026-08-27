@@ -11,11 +11,13 @@ Prefer ``backtest.py`` which scores against actual question resolutions.
 
 import argparse
 import asyncio
+import http.client
 import logging
 import os
 import random
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 from typing import Literal, cast
 
@@ -29,7 +31,9 @@ from forecasting_tools import (
     run_benchmark_streamlit_page,
 )
 from forecasting_tools.data_models.questions import QuestionBasicType
+from requests import exceptions as req_exc
 from tqdm import tqdm
+from urllib3 import exceptions as ul3_exc
 
 from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
@@ -52,6 +56,7 @@ from metaculus_bot.constants import (
     HEARTBEAT_INTERVAL,
     TYPE_MIX,
 )
+from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 from metaculus_bot.scoring_patches import (
     apply_scoring_patches,
     log_score_scale_validation,
@@ -101,18 +106,13 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
         "num_forecasters_gte": 40,
         "scheduled_resolve_time_lt": one_year_from_now,
         "includes_bots_in_aggregates": False,
-        "open_time_gt": datetime.now() - timedelta(days=90),
+        "open_time_gt": datetime.now().astimezone() - timedelta(days=90),
     }
 
     all_questions = []
 
     # Helper: fetch with retries and backoff
     async def _fetch_type_with_retries(question_type: str, count: int) -> list:
-        import http.client
-
-        from requests import exceptions as req_exc  # type: ignore
-        from urllib3 import exceptions as ul3_exc  # type: ignore
-
         # Build filter per type
         filter_kwargs = base_filter_kwargs.copy()
 
@@ -166,8 +166,6 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
                     continue
                 # Final failure or non-retryable
                 logger.error(f"❌ Failed to fetch {question_type} questions: {e}")
-                import traceback
-
                 logger.error(f"Full traceback: {traceback.format_exc()}")
                 sys.stdout.flush()
                 raise RuntimeError(
@@ -242,7 +240,7 @@ async def benchmark_forecast_bot(
             allowed_types=["binary"],
             num_forecasters_gte=30,
             includes_bots_in_aggregates=False,
-            open_time_gt=datetime.now() - timedelta(days=90),
+            open_time_gt=datetime.now().astimezone() - timedelta(days=90),
         )
         questions = await MetaculusApi.get_questions_matching_filter(
             api_filter,
@@ -253,7 +251,7 @@ async def benchmark_forecast_bot(
         # Confirm the host is the real Metaculus before the token-sending fetch.
         verify_metaculus_api_identity()
         # Below is an example of getting custom questions
-        one_year_from_now = datetime.now() + timedelta(days=365)
+        one_year_from_now = datetime.now().astimezone() + timedelta(days=365)
 
         if mixed_types:
             # Get mixed question types with 50/25/25 distribution
@@ -266,7 +264,7 @@ async def benchmark_forecast_bot(
                 num_forecasters_gte=40,
                 scheduled_resolve_time_lt=one_year_from_now,
                 includes_bots_in_aggregates=False,
-                open_time_gt=datetime.now() - timedelta(days=90),
+                open_time_gt=datetime.now().astimezone() - timedelta(days=90),
             )
             questions = await MetaculusApi.get_questions_matching_filter(
                 api_filter,
@@ -390,8 +388,6 @@ async def benchmark_forecast_bot(
         # TODO: refactor out this logic, jank to have here.
         # Perform correlation analysis if we have multiple models
         if len(benchmarks) > 1:
-            from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
-
             analyzer = CorrelationAnalyzer()
             analyzer.add_benchmark_results(benchmarks)
 
@@ -416,13 +412,13 @@ async def benchmark_forecast_bot(
 
             # Generate and log correlation report
             report = analyzer.generate_correlation_report("benchmarks/correlation_analysis.md")
-            logger.info("\n" + "=" * 50)
+            logger.info("\n%s", "=" * 50)
             logger.info("CORRELATION ANALYSIS")
             logger.info("=" * 50)
             logger.info(report)
 
             # Generate all possible ensemble combinations with different aggregation strategies
-            logger.info("\n" + "=" * 50)
+            logger.info("\n%s", "=" * 50)
             logger.info("ENSEMBLE GENERATION (Post-hoc)")
             logger.info("=" * 50)
             optimal_ensembles = analyzer.find_optimal_ensembles(max_ensemble_size=6, max_cost_per_question=1.0)

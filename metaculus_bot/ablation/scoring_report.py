@@ -410,10 +410,7 @@ def render_summary_markdown(stats: list[PairedStats], paired_scores: list[Paired
 
     if "model_lineup" in metadata:
         lineup = metadata["model_lineup"]
-        if isinstance(lineup, (list, tuple)):
-            lineup_str = ", ".join(str(m) for m in lineup)
-        else:
-            lineup_str = str(lineup)
+        lineup_str = ", ".join(str(m) for m in lineup) if isinstance(lineup, (list, tuple)) else str(lineup)
         lines.append(f"- Model lineup: {lineup_str}")
     for key, value in metadata.items():
         if key in {"timestamp", "n_questions", "model_lineup"}:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from itertools import pairwise
 
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
@@ -119,7 +120,7 @@ def detect_unit_mismatch(
     span = v95 - v05
 
     # Min adjacent diff
-    diffs = [b - a for a, b in zip(values_sorted, values_sorted[1:])]
+    diffs = [b - a for a, b in pairwise(values_sorted)]
     min_step = min(diffs) if diffs else 0.0
 
     # Max magnitude

@@ -118,7 +118,7 @@ def _unpack(theta: np.ndarray, n_components: int) -> tuple[np.ndarray, np.ndarra
 
 
 def _mixture_cdf_values(weights: np.ndarray, means: np.ndarray, sds: np.ndarray, values: np.ndarray) -> np.ndarray:
-    # Shape: (n_components, n_values)
+    # per_component has one row per component and one column per value.
     per_component = weights[:, None] * norm.cdf(values[None, :], loc=means[:, None], scale=sds[:, None])
     return per_component.sum(axis=0)
 
@@ -187,7 +187,10 @@ def _fit_mixture_one_seed(
     if np.any(sds < _MIN_FIT_SD):
         return None, float("inf")
 
-    comps = tuple(MixtureComponent(weight=float(w), mean=float(m), sd=float(s)) for w, m, s in zip(weights, means, sds))
+    comps = tuple(
+        MixtureComponent(weight=float(w), mean=float(m), sd=float(s))
+        for w, m, s in zip(weights, means, sds, strict=True)
+    )
     return MixtureOfNormals(comps), float(result.fun)
 
 

@@ -58,6 +58,7 @@ from metaculus_bot.research.provider_diagnostics import (
 from metaculus_bot.research.providers import (
     ResearchCallable,
     choose_provider_with_name,
+    is_asknews_subscription_error,
     native_search_provider,
 )
 from metaculus_bot.time_budget import QuestionTimeBudget
@@ -194,7 +195,7 @@ class ResearchOrchestrator:
         names predate the ranked pipeline, where the counter moved from the retired /series
         index to the events catalogue — a strictly more load-bearing thing, since the
         catalogue feeds both the settlement-source join and the fuzzy channel."""
-        from metaculus_bot.research.prediction_market import (
+        from metaculus_bot.research.prediction_market import (  # noqa: PLC0415  # optional market deps stay off cold path
             kalshi_catalogue_fetch_failures,
         )
 
@@ -218,7 +219,7 @@ class ResearchOrchestrator:
         Operator decision 2026-07-25: alert on ANY source loss, not only a total
         blackout. The provider soft-fails every venue internally, so without this the
         forecasters silently run on zero market data while CI stays green."""
-        from metaculus_bot.research.prediction_market import (
+        from metaculus_bot.research.prediction_market import (  # noqa: PLC0415  # optional market deps stay off cold path
             prediction_market_source_losses,
         )
 
@@ -250,7 +251,7 @@ class ResearchOrchestrator:
         Suppressed findings are excluded here but still logged in full and still
         ride the PROVIDER_DEGRADATION marker (see
         constants.provider_degradation_alerts_active)."""
-        from metaculus_bot.research.provider_health import (
+        from metaculus_bot.research.provider_health import (  # noqa: PLC0415  # lazy counter import
             provider_degradation_count,
         )
 
@@ -263,7 +264,7 @@ class ResearchOrchestrator:
         other end-of-run summaries. Fires even at zero findings — a measured zero is
         a positive statement of provider health, the same reasoning behind
         FORECASTERS_SURVIVED existing next to FORECASTER_DROPS."""
-        from metaculus_bot.research.provider_health import (
+        from metaculus_bot.research.provider_health import (  # noqa: PLC0415  # lazy counter import
             log_provider_degradation_summary,
         )
 
@@ -281,7 +282,7 @@ class ResearchOrchestrator:
             reset_series_degradation_counter,
             reset_source_loss_counter,
         )
-        from metaculus_bot.research.provider_health import (
+        from metaculus_bot.research.provider_health import (  # noqa: PLC0415  # lazy counter import
             reset_provider_health,
         )
 
@@ -370,7 +371,7 @@ class ResearchOrchestrator:
                     if not gap_fill_v1_active:
                         return ""
                     try:
-                        from metaculus_bot.research.targeted import (
+                        from metaculus_bot.research.targeted import (  # noqa: PLC0415  # import stays inside failure guard
                             run_gap_fill_pass,
                         )
 
@@ -414,7 +415,7 @@ class ResearchOrchestrator:
                     if not gap_fill_v2_active:
                         return ""
                     try:
-                        from metaculus_bot.research.agentic_gap_fill import (
+                        from metaculus_bot.research.agentic_gap_fill import (  # noqa: PLC0415  # import stays inside failure guard
                             run_gap_fill_v2,
                         )
 
@@ -658,7 +659,7 @@ class ResearchOrchestrator:
             )
 
         if not fast_path and env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
-            from metaculus_bot.research.gemini_search import (
+            from metaculus_bot.research.gemini_search import (  # noqa: PLC0415  # gated google-genai provider
                 gemini_search_provider,
             )
 
@@ -671,28 +672,28 @@ class ResearchOrchestrator:
             )
 
         if env_flag_enabled(FINANCIAL_DATA_ENABLED_ENV):
-            from metaculus_bot.research.financial_data import (
+            from metaculus_bot.research.financial_data import (  # noqa: PLC0415  # gated pandas/yfinance/fredapi provider
                 financial_data_provider,
             )
 
             providers.append((financial_data_provider(is_benchmarking=self._is_benchmarking), "financial_data"))
 
         if env_flag_enabled(TS_ANCHOR_ENABLED_ENV):
-            from metaculus_bot.research.timeseries_anchor import (
+            from metaculus_bot.research.timeseries_anchor import (  # noqa: PLC0415  # gated numpy/pandas provider
                 timeseries_anchor_provider,
             )
 
             providers.append((timeseries_anchor_provider(is_benchmarking=self._is_benchmarking), "timeseries_anchor"))
 
         if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
-            from metaculus_bot.research.prediction_market import (
+            from metaculus_bot.research.prediction_market import (  # noqa: PLC0415  # gated rapidfuzz/aiohttp provider
                 prediction_market_provider,
             )
 
             providers.append((prediction_market_provider(is_benchmarking=self._is_benchmarking), "prediction_market"))
 
         if env_flag_enabled(RESOLUTION_SOURCE_ENABLED_ENV):
-            from metaculus_bot.research.resolution_source import (
+            from metaculus_bot.research.resolution_source import (  # noqa: PLC0415  # gated aiohttp/trafilatura provider
                 resolution_source_provider,
             )
 
@@ -709,10 +710,6 @@ class ResearchOrchestrator:
         providers: list[tuple[ResearchCallable, str]],
         time_budget: QuestionTimeBudget | None = None,
     ) -> tuple[str, list[ProviderResult], str]:
-        from metaculus_bot.research.providers import (
-            is_asknews_subscription_error,
-        )
-
         # Raw pre-summarization AskNews article text, captured for the research
         # archive (2026-07-18 audit hygiene: the archive otherwise stores only the
         # post-summarization briefing, so FETCH-vs-SUMMARIZE attribution and

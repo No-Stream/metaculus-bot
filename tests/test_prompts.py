@@ -10,6 +10,7 @@ backtest scores would silently get polluted with prediction-market data.
 import json
 import re
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -1004,13 +1005,13 @@ class TestOptionProbsExampleJsonValidity:
 
 def _summarizer_prompt(**overrides) -> str:
     """Build the AskNews summarizer prompt with representative defaults."""
-    kwargs = dict(
-        question_text="Will X happen by 2027?",
-        resolution_criteria="Resolves YES if X happens",
-        fine_print="fp",
-        open_date="2026-03-15",
-        research="raw asknews articles",
-    )
+    kwargs = {
+        "question_text": "Will X happen by 2027?",
+        "resolution_criteria": "Resolves YES if X happens",
+        "fine_print": "fp",
+        "open_date": "2026-03-15",
+        "research": "raw asknews articles",
+    }
     kwargs.update(overrides)
     return asknews_summarizer_prompt(**kwargs)
 
@@ -1025,7 +1026,7 @@ class TestResearchPromptsCarryMcOptions:
     candidates it knows exist.
     """
 
-    _BALLOT = ["Mir Kim", "Hunter Feuerstein", "Other"]
+    _BALLOT: ClassVar[list[str]] = ["Mir Kim", "Hunter Feuerstein", "Other"]
     _LINE = "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other"
 
     def test_web_research_prompt_names_the_ballot(self) -> None:

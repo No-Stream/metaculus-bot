@@ -338,7 +338,7 @@ DISCRETE_SNAP_MAX_INTEGERS: int = 200
 DISCRETE_SNAP_UNIFORM_MIX: float = 0.0
 
 # --- Conditional Stacking Thresholds ---
-# Binary: probability range (max − min) across per-model predictions. Chosen because
+# Binary: probability range (max - min) across per-model predictions. Chosen because
 # log-odds spread saturates on clamped-extreme models that are often correct,
 # conflating "one model is sure" with "ensemble is split."
 CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD: float = 0.15
@@ -615,7 +615,7 @@ FRED_API_KEY_ENV: str = "FRED_API_KEY"
 FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5.6-luna"
 FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
 # Calendar-day lookback behind every yfinance history() fetch. BOTH paths (live and
-# backtest) fetch by explicit start date = as_of − this many days, end-inclusive, so the
+# backtest) fetch by explicit start date = as_of - this many days, end-inclusive, so the
 # window holds LOOKBACK+1 calendar dates. Never spent as a bare `period="Nd"`: Yahoo's
 # chart API reads that custom range as N trading BARS for listed assets but ~N calendar
 # DATES for 24/7 ones — one integer under two unit systems, which is how the listed-asset
@@ -728,7 +728,7 @@ TIME_BUDGET_FAST_PATH_THRESHOLD: int = 1815
 TIME_BUDGET_MIN_VIABLE_S: int = 300
 
 # Fraction of the TOTAL budget granted to the research phase as ONE fixed window
-# anchored at the budget's start (research_phase_deadline_s = total*share −
+# anchored at the budget's start (research_phase_deadline_s = total*share -
 # elapsed), enforced as a deadline on the parallel-provider phase and on each
 # gap-fill pass. Fixed rather than a rolling share of remaining: research
 # consults the deadline at two sequential points, and re-taking 50% of remaining
@@ -932,7 +932,7 @@ KALSHI_PREFETCH_MAX_PAGES: int = 120
 # render. Its value is grounding + SHARPENING our over-wide published low tail
 # (cov@10 was 0.02 vs a 0.10 target). Backtest-safe (the FIRST research provider that
 # is): live uses as_of=now, is_benchmarking uses question.open_time so series data up
-# to resolution IS the answer (NOT scheduled_resolution − buffer), with ALFRED
+# to resolution IS the answer (NOT scheduled_resolution - buffer), with ALFRED
 # vintages at as_of for revising series.
 TS_ANCHOR_ENABLED_ENV: str = "TS_ANCHOR_ENABLED"
 # Chart-image side-channel: when on (and TS_ANCHOR_ENABLED is also on), the

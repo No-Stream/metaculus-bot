@@ -412,7 +412,7 @@ class TestRelativeNumericScoring:
         # Bot has tight distribution around 50 (better than uniform)
         values = [30, 45, 48, 50, 52, 55, 70]
         percs = [0.05, 0.2, 0.4, 0.5, 0.6, 0.8, 0.95]
-        for p, v in zip(percs, values):
+        for p, v in zip(percs, values, strict=True):
             percentiles.append(P(p * 100, v))
 
         prediction = Mock()
@@ -464,7 +464,7 @@ class TestRelativeNumericScoring:
         numeric_score = calculate_numeric_baseline_score(report)
 
         # Compare to binary scoring for similar "neutral" prediction
-        # Binary: 100.0 * (c * (log2(p) + 1.0) + (1.0 - c) * (log2(1.0 - p) + 1.0))
+        # Binary scoring formula is 100.0 * (c * (log2(p) + 1.0) + (1.0 - c) * (log2(1.0 - p) + 1.0))
         c, p = 0.5, 0.5  # Both 50% - neutral
         binary_score = 100.0 * (c * (math.log2(p) + 1.0) + (1.0 - c) * (math.log2(1.0 - p) + 1.0))
 
@@ -475,8 +475,6 @@ class TestRelativeNumericScoring:
         # Both should be relatively close to each other for neutral predictions
         score_diff = abs(numeric_score - binary_score)
         assert score_diff < 150  # Should be within reasonable range of each other
-
-        print(f"Numeric score: {numeric_score:.2f}, Binary score: {binary_score:.2f}")
 
 
 class TestScoreScaling:

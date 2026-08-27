@@ -416,7 +416,8 @@ class TestDriverSystemPromptConcludeGate:
 
     def test_step3_describes_what_gets_rejected(self) -> None:
         collapsed = " ".join(build_system_prompt("2026-07-21").split())
-        assert "An EARLY conclude" in collapsed and "REJECTED" in collapsed
+        assert "An EARLY conclude" in collapsed
+        assert "REJECTED" in collapsed
         assert "a plan gap is missing from the accounting" in collapsed
         assert "fewer external tool calls than you have plan gaps" in collapsed
         assert "the fetch floor is unmet" in collapsed

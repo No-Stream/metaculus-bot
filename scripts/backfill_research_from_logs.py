@@ -160,7 +160,7 @@ def list_qualifying_runs(workflow: str, limit: int, status: str, since: str, rep
         "--json",
         "databaseId,createdAt,conclusion,status",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         logger.error(f"gh run list failed: {result.stderr}")
         sys.exit(1)
@@ -176,7 +176,7 @@ def list_qualifying_runs(workflow: str, limit: int, status: str, since: str, rep
 def download_run_log(run_id: int, repo: str) -> str | None:
     """Download the full log for a GHA run. Returns None on failure."""
     cmd = ["gh", "run", "view", str(run_id), "--repo", repo, "--log"]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     if result.returncode != 0:
         logger.warning(f"Failed to download log for run {run_id}: {result.stderr.strip()}")
         return None

@@ -178,10 +178,10 @@ def test_crps_wrong_side():
 
 
 def test_crps_invalid_inputs():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Invalid CDF: need >= 2 matched x/cdf pairs"):
         numeric_crps([1.0], [0.5], resolution=1.0)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Invalid CDF: need >= 2 matched x/cdf pairs"):
         numeric_crps([1.0, 2.0, 3.0], [0.0, 1.0], resolution=2.0)
 
 
@@ -282,7 +282,7 @@ def test_mc_log_score_wrong():
 
 
 def test_mc_log_score_invalid_k():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Need at least 2 options"):
         mc_log_score([1.0], 0)
 
 

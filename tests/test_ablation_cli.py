@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -5258,7 +5259,7 @@ class TestBuildReportShimNumericSorting:
         cdf_values = [point.value for point in report.prediction.cdf]
         assert len(cdf_values) == 201, f"Expected 201-point CDF, got {len(cdf_values)}"
         # PCHIP guarantees strict monotonicity in the value axis; assert it.
-        for prev, current in zip(cdf_values, cdf_values[1:]):
+        for prev, current in pairwise(cdf_values):
             assert current > prev, f"CDF values not strictly increasing: {prev} >= {current}"
 
 
@@ -5808,7 +5809,7 @@ class TestForceStagesCascade:
         # Second run with --force-stages forecast: BOTH forecaster AND stacker
         # should re-run (cascade invalidates downstream). Without C1, the
         # stacker would return cached payloads from the OLD forecaster run.
-        argv_forced = argv + ["--force-stages", "forecast"]
+        argv_forced = [*argv, "--force-stages", "forecast"]
         await run_ablation(_build_parser().parse_args(argv_forced))
 
         assert mocks["forecasters"].await_count == forecaster_count_after_run1 + 1
@@ -5944,7 +5945,7 @@ class TestQidsFilterAppliedAfterHydration:
 # ---------------------------------------------------------------------------
 # M1: score_only must error when arm_A and arm_B have zero qid overlap.
 #
-# The current "either dict empty" check passes when {1,2,3} ∪ {4,5,6}, then
+# The current "either dict empty" check passes when {1,2,3} union {4,5,6}, then
 # _stage_score takes the intersection (empty) and produces an "n=0 success".
 # ---------------------------------------------------------------------------
 

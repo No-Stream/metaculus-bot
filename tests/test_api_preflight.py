@@ -98,16 +98,20 @@ class TestRaisesOnImposterHost:
             verify_metaculus_api_identity()
 
     def test_302_redirect_raises_and_is_not_followed(self) -> None:
-        with _mock_transport(status=302, body="") as captured:
-            with pytest.raises(MetaculusApiIdentityError, match="302"):
-                verify_metaculus_api_identity()
+        with (
+            _mock_transport(status=302, body="") as captured,
+            pytest.raises(MetaculusApiIdentityError, match="302"),
+        ):
+            verify_metaculus_api_identity()
         # allow_redirects=False: the lander redirect must stay visible as a 3xx.
         assert captured["send_count"] == 1
 
     def test_500_raises_with_server_error_flavor(self) -> None:
-        with _mock_transport(status=500, body="Internal Server Error"):
-            with pytest.raises(MetaculusApiIdentityError, match="server error"):
-                verify_metaculus_api_identity()
+        with (
+            _mock_transport(status=500, body="Internal Server Error"),
+            pytest.raises(MetaculusApiIdentityError, match="server error"),
+        ):
+            verify_metaculus_api_identity()
 
     def test_connection_error_raises_chained(self) -> None:
         original = requests.ConnectionError("dns down")
@@ -127,9 +131,11 @@ class TestTransientEdgeStatuses:
 
     @pytest.mark.parametrize("status", [408, 429, 502, 503, 504])
     def test_transient_status_raises_without_hijack_hint(self, status: int) -> None:
-        with _mock_transport(status=status, body="Too Many Requests"):
-            with pytest.raises(MetaculusApiIdentityError, match="transient") as excinfo:
-                verify_metaculus_api_identity()
+        with (
+            _mock_transport(status=status, body="Too Many Requests"),
+            pytest.raises(MetaculusApiIdentityError, match="transient") as excinfo,
+        ):
+            verify_metaculus_api_identity()
         message = str(excinfo.value)
         # Must not carry the DNS-parking/hijack diagnostic (its distinctive tokens).
         assert "parking" not in message

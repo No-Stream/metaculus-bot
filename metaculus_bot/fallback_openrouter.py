@@ -538,15 +538,13 @@ def should_retry_with_general_key(exc: Exception) -> bool:
         return True
     if _is_credit_failure(status, msg):
         return True
-    if any(cue in provider_text for cue in _ROUTE_SCOPED_TEXT_CUES):
-        return True
-
-    # Default: keep the key. What reaches here is everything a swap cannot help —
-    # moderation and permission refusals (both keys refuse the same prompt), 502/503
-    # upstream outages, and a plain missing-model 404. The explicit negative blocks this
+    # Route-scoped wording is the last positive signal. Everything it does not match
+    # keeps the key: what reaches here is everything a swap cannot help — moderation
+    # and permission refusals (both keys refuse the same prompt), 502/503 upstream
+    # outages, and a plain missing-model 404. The explicit negative blocks this
     # replaced were unreachable in the reported-status regime, because the 403 return
     # above and the positive branches had already claimed every status they named.
-    return False
+    return any(cue in provider_text for cue in _ROUTE_SCOPED_TEXT_CUES)
 
 
 def _is_donated_404(exc: Exception) -> bool:

@@ -5,7 +5,7 @@ Posture pinned by these tests:
 * Lineup is 4 free models. ``gpt-oss-120b:free`` was removed (task #16,
   donated-key wrapper 404'd). ``glm-4.5-air:free`` was removed
   (Phase A.3 Package 3b, 2026-05-14, after qid 43171 hallucinated
-  partial-week TSA data with σ=13K vs ensemble σ ~965K).
+  partial-week TSA data with sigma=13K vs ensemble sigma ~965K).
 * The FREE forecaster + parser are constructed as plain ``GeneralLlm`` (no
   ``api_key`` set), so litellm reads ``OPENROUTER_API_KEY`` from env at
   invoke time — ``:free`` models bypass the donated key because their
@@ -30,8 +30,8 @@ def test_free_forecaster_models_count_is_four() -> None:
 def test_glm_dropped_from_lineup() -> None:
     """Regression: qid 43171 hallucinated TSA partial-week data; GLM dropped 2026-05-14.
 
-    GLM-4.5-air emitted a "normal" distribution with σ=13K vs ensemble median σ ~965K
-    (1.3% of ensemble σ). Arm B's stacker over-weighted GLM and saturated the schema
+    GLM-4.5-air emitted a "normal" distribution with sigma=13K vs ensemble median sigma ~965K
+    (1.3% of ensemble sigma). Arm B's stacker over-weighted GLM and saturated the schema
     floor (-220 log score). Sign-off: user, post-Phase-A.2.
     """
     from metaculus_bot.ablation.forecaster_lineup import FREE_FORECASTER_MODELS
@@ -60,7 +60,7 @@ def test_build_free_forecaster_llms_returns_four_plain_general_llms() -> None:
 
     llms = build_free_forecaster_llms()
     assert len(llms) == 4
-    for llm, expected_model in zip(llms, FREE_FORECASTER_MODELS):
+    for llm, expected_model in zip(llms, FREE_FORECASTER_MODELS, strict=False):
         assert isinstance(llm, GeneralLlm)
         assert not isinstance(llm, FallbackOpenRouterLlm), (
             f"{expected_model} must be plain GeneralLlm (no donated-key wrap)"
@@ -105,7 +105,7 @@ def test_build_prod_forecaster_llms_routes_via_donated_wrapper(monkeypatch) -> N
 
     llms = build_prod_forecaster_llms()
     assert len(llms) == len(PROD_FORECASTER_MODELS) == 3
-    for llm, expected_model in zip(llms, PROD_FORECASTER_MODELS):
+    for llm, expected_model in zip(llms, PROD_FORECASTER_MODELS, strict=False):
         assert isinstance(llm, FallbackOpenRouterLlm), (
             f"{expected_model} must route via the donated-key wrapper (Metaculus work -> donated key)"
         )

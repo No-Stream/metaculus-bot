@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from itertools import pairwise
 
 import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
@@ -51,7 +52,7 @@ def is_degenerate_cluster(values: list[float], value_eps: float) -> bool:
     """
     if len(values) < 2:
         return False
-    return all(abs(b - a) <= value_eps for a, b in zip(values, values[1:]))
+    return all(abs(b - a) <= value_eps for a, b in pairwise(values))
 
 
 def compute_cluster_parameters(
@@ -61,10 +62,7 @@ def compute_cluster_parameters(
     value_eps = max(range_size * NUM_VALUE_EPSILON_MULT, CLUSTER_DETECTION_ATOL)
     base_delta = max(range_size * NUM_SPREAD_DELTA_MULT, CLUSTER_SPREAD_BASE_DELTA)
     # Prefer a spread relative to the raw span when available to avoid range-driven explosions
-    if span is not None and span > 0:
-        span_based = max(0.02 * span, CLUSTER_SPREAD_BASE_DELTA)
-    else:
-        span_based = base_delta
+    span_based = max(0.02 * span, CLUSTER_SPREAD_BASE_DELTA) if span is not None and span > 0 else base_delta
     spread_delta = max(base_delta, span_based, COUNT_LIKE_DELTA_MULTIPLIER if count_like else base_delta)
     return value_eps, base_delta, spread_delta
 
@@ -128,10 +126,7 @@ def apply_cluster_spreading(
             # If next value exists and last new exceeds it, compress offsets
             if j + 1 < len(modified_values) and new_vals[-1] >= modified_values[j + 1]:
                 # Compress spread to fit in available gap
-                available = max(
-                    modified_values[j + 1] - (new_vals[0]),
-                    max(value_eps, STRICT_ORDERING_EPSILON),
-                )
+                available = max(modified_values[j + 1] - new_vals[0], value_eps, STRICT_ORDERING_EPSILON)
                 if k > 1:
                     step = available / k
                     new_vals = [new_vals[0] + step * idx for idx in range(k)]

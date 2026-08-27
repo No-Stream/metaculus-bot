@@ -403,7 +403,7 @@ class TestAnnualizationBasis:
         # mis-keyed intermediate target (3m reading 63 days = 9 calendar weeks under a
         # "3m" label) can't hide between the two tested ones. Table-driven, so a new
         # period label is covered the moment it lands. The expected start is pandas' own
-        # at-or-before read of `last − days` — pinning the table plus the match semantics
+        # at-or-before read of `last - days` — pinning the table plus the match semantics
         # — and on the gap-free daily index the 365-basis reads are additionally asserted
         # bit-identical to the historical row offsets, so the calendar-day rewrite
         # provably left 24/7 numbers unchanged. The marker asserts at the bottom pin the
@@ -1181,10 +1181,10 @@ class TestDeterministicRouting:
         with (
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
+            caplog.at_level("WARNING", logger="metaculus_bot.research.financial_data"),
         ):
-            with caplog.at_level("WARNING", logger="metaculus_bot.research.financial_data"):
-                provider = financial_data_provider()
-                result = await provider(question)
+            provider = financial_data_provider()
+            result = await provider(question)
 
         # The clean token still fetched; the malformed one is gone everywhere.
         assert "### AAPL" in result
@@ -1332,7 +1332,7 @@ class TestBenchmarkingDateCeiling:
 
     def test_yfinance_benchmarking_uses_start_end_ceiling_and_skips_info(self) -> None:
         """Benchmarking yfinance fetch: history is called with start/end (NOT period),
-        end == open_time.date() + 1 day, start == open_time.date() − the lookback
+        end == open_time.date() + 1 day, start == open_time.date() - the lookback
         constant, and `.info` is never accessed (a PropertyMock that would raise if
         touched)."""
         dates = pd.date_range(end="2026-03-15", periods=252, freq="B")

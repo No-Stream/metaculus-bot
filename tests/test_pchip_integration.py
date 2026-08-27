@@ -4,6 +4,7 @@ Integration tests for PCHIP CDF with forecasting-tools NumericDistribution.
 Tests that our CDF override approach works correctly with the framework.
 """
 
+from itertools import pairwise
 from types import SimpleNamespace
 
 import numpy as np
@@ -41,7 +42,7 @@ class TestPchipIntegration:
 
         # Generate PCHIP CDF
         pchip_percentiles = percentiles_to_pchip_format(percentiles)
-        pchip_cdf, aggressive_enforcement = generate_pchip_cdf(
+        pchip_cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=pchip_percentiles,
             open_upper_bound=question.open_upper_bound,
             open_lower_bound=question.open_lower_bound,
@@ -53,7 +54,8 @@ class TestPchipIntegration:
         # Create override exactly as in main.py
         x_vals = np.linspace(question.lower_bound, question.upper_bound, len(pchip_cdf))
         pchip_percentile_objects = [
-            Percentile(percentile=prob_val, value=question_val) for question_val, prob_val in zip(x_vals, pchip_cdf)
+            Percentile(percentile=prob_val, value=question_val)
+            for question_val, prob_val in zip(x_vals, pchip_cdf, strict=True)
         ]
 
         # Validate the format
@@ -69,8 +71,8 @@ class TestPchipIntegration:
         assert all(question.lower_bound <= v <= question.upper_bound for v in question_values)
 
         # Validate monotonicity (CDF requirements)
-        assert all(a <= b for a, b in zip(prob_values[:-1], prob_values[1:]))
-        assert all(a <= b for a, b in zip(question_values[:-1], question_values[1:]))
+        assert all(a <= b for a, b in pairwise(prob_values))
+        assert all(a <= b for a, b in pairwise(question_values))
 
     def test_spacing_assertion_compliance(self):
         """Test that our PCHIP CDF satisfies the 5e-5 spacing requirement."""
@@ -90,7 +92,7 @@ class TestPchipIntegration:
 
         # Generate PCHIP CDF
         pchip_percentiles = percentiles_to_pchip_format(percentiles)
-        pchip_cdf, aggressive_enforcement = generate_pchip_cdf(
+        pchip_cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=pchip_percentiles,
             open_upper_bound=question.open_upper_bound,
             open_lower_bound=question.open_lower_bound,
@@ -122,7 +124,7 @@ class TestPchipIntegration:
         )
 
         pchip_percentiles = percentiles_to_pchip_format(percentiles)
-        pchip_cdf, aggressive_enforcement = generate_pchip_cdf(
+        pchip_cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=pchip_percentiles,
             open_upper_bound=question.open_upper_bound,
             open_lower_bound=question.open_lower_bound,
@@ -148,7 +150,7 @@ class TestPchipIntegration:
                 # x_vals contains the corresponding question values
                 return [
                     Percentile(percentile=prob_val, value=question_val)
-                    for question_val, prob_val in zip(x_vals, self._pchip_cdf_values)
+                    for question_val, prob_val in zip(x_vals, self._pchip_cdf_values, strict=True)
                 ]
 
         prediction = PchipNumericDistribution(
@@ -196,7 +198,7 @@ class TestPchipIntegration:
 
         # This should work with PCHIP even though values are close
         pchip_percentiles = percentiles_to_pchip_format(percentiles)
-        pchip_cdf, aggressive_enforcement = generate_pchip_cdf(
+        pchip_cdf, _aggressive_enforcement = generate_pchip_cdf(
             percentile_values=pchip_percentiles,
             open_upper_bound=question.open_upper_bound,
             open_lower_bound=question.open_lower_bound,

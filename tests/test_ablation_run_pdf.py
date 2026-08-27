@@ -672,7 +672,8 @@ class TestNumericDiscreteGridLength:
         assert block.declared_percentiles is not None
 
         new = _compute_numeric_prediction(block, question, cdf_size=201)
-        assert new is not None and len(new) == 201
+        assert new is not None
+        assert len(new) == 201
         new_probs = np.array([p.percentile for p in new], dtype=float)
 
         # Verbatim replay of the pre-parameterization body (hard-coded 201, MIN_CDF_PROB_STEP,

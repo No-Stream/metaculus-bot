@@ -152,7 +152,7 @@ async def test_search_web_retries_then_success(monkeypatch: pytest.MonkeyPatch) 
     )
     sleeps: list[float] = []
 
-    monkeypatch.setattr("asyncio.sleep", AsyncMock(side_effect=lambda delay: sleeps.append(delay)))
+    monkeypatch.setattr("asyncio.sleep", AsyncMock(side_effect=sleeps.append))
     _patch_async_exa(monkeypatch, searcher)
 
     outcome = await agentic_tools.search_web("query")
@@ -579,7 +579,8 @@ async def test_fetch_plain_textual_branch_strips_allowlisted_markup(monkeypatch:
 
     assert result.status == "ok"
     assert "Emerson College" in result.text
-    assert "<a " not in result.text and "style=" not in result.text
+    assert "<a " not in result.text
+    assert "style=" not in result.text
     assert "a < 5 and b > 3" in result.text
 
 
@@ -735,7 +736,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def content(self) -> str:
@@ -779,7 +780,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     plain_task = asyncio.create_task(agentic_tools._fetch_plain("https://example.com/plain-page"))
@@ -797,7 +798,8 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     rendered_result = await rendered_task
 
     assert plain_result.status == "ok"
-    assert rendered_result is not None and rendered_result.method == "rendered"
+    assert rendered_result is not None
+    assert rendered_result.method == "rendered"
     assert events.index("plain_read_finished") < events.index("rendered_started")
 
 
@@ -850,7 +852,7 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
             self.aborted = code
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def content(self) -> str:
@@ -892,11 +894,12 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     result = await agentic_tools._try_rendered_fetch("https://example.com/page")
-    assert result is not None and result.method == "rendered"
+    assert result is not None
+    assert result.method == "rendered"
 
     # Teardown drained the handlers before close (Playwright's remedy for the storm).
     assert captured["unroute_behavior"] == "ignoreErrors"
@@ -1261,7 +1264,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
             return None
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             assert url == "https://example.com/page"
             assert wait_until == "networkidle"
             assert timeout == 35_000
@@ -1321,7 +1324,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
@@ -1352,7 +1355,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     at_cap = asyncio.Event()
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def content(self) -> str:
@@ -1412,7 +1415,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     tasks = [
@@ -1459,7 +1462,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     guard_holder: list = []
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             # Drive the guard the way Chromium would: the public main-frame
             # request continues; the page's client-side redirect to the
             # private host is aborted.
@@ -1522,7 +1525,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
@@ -1659,7 +1662,7 @@ async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: p
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://rebind.example.com/page")
@@ -1675,7 +1678,7 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     launch_args: list[list[str] | None] = []
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def content(self) -> str:
@@ -1724,12 +1727,13 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
-    assert outcome is not None and outcome.method == "rendered"
+    assert outcome is not None
+    assert outcome.method == "rendered"
     assert len(launch_args) == 1
     assert launch_args[0] == ["--host-resolver-rules=MAP example.com 93.184.216.34"]
 

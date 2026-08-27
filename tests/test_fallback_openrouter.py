@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -112,7 +113,7 @@ class TestPredicates:
         assert frozenset({"openai", "anthropic", "google"}) == DONATED_KEY_PROVIDERS
 
     @pytest.mark.parametrize(
-        "message, expected",
+        ("message", "expected"),
         [
             ("HTTP 402 Payment Required", True),
             ("payment required", True),
@@ -1540,7 +1541,7 @@ class TestProbeFailureCannotVetoRouting:
     hold for the wrong reason there while passing locally off the repo's ``.env``.
     """
 
-    _BOOMS = [RuntimeError("transport wedged"), FileNotFoundError("bad SSL_CERT_FILE")]
+    _BOOMS: ClassVar[list[Exception]] = [RuntimeError("transport wedged"), FileNotFoundError("bad SSL_CERT_FILE")]
 
     @pytest.fixture(autouse=True)
     def _clean_counters(self, monkeypatch: pytest.MonkeyPatch):

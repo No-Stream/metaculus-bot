@@ -238,7 +238,7 @@ def log_pool_cdfs(
     n_buckets = len(grid) + 1
     log_density_acc = np.zeros(n_buckets, dtype=float)
     pmf_eps = 1e-12
-    for cdf, weight in zip(cdfs, w):
+    for cdf, weight in zip(cdfs, w, strict=True):
         probs = np.maximum.accumulate(_cdf_probs(cdf))
         pmf = np.empty(n_buckets, dtype=float)
         pmf[0] = probs[0]  # below-lower boundary bucket

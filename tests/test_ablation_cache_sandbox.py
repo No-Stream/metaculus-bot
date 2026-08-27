@@ -79,7 +79,7 @@ def test_constructor_guard_catches_non_tmp_path(tmp_path: Path) -> None:
     def guarded_init(self: AblationCache, root: Any = "backtests/ablation") -> None:
         as_path = Path(root)
         # Allow tmp paths and the explicit default-root unit test (no writes).
-        is_tmp = "pytest-of-" in str(as_path) or str(as_path).startswith("/tmp")
+        is_tmp = "pytest-of-" in str(as_path) or str(as_path).startswith("/tmp")  # noqa: S108  # deliberate prefix check, not a temp-file operation
         is_default_test = str(as_path) == str(forbidden)
         if not (is_tmp or is_default_test):
             raise AssertionError(
@@ -88,7 +88,7 @@ def test_constructor_guard_catches_non_tmp_path(tmp_path: Path) -> None:
         real_init(self, root)
 
     with patch.object(AblationCache, "__init__", guarded_init):
-        # OK: tmp_path
+        # Exercise the temporary-path branch.
         cache_ok = AblationCache(tmp_path / "abl")
         assert cache_ok.root == tmp_path / "abl"
 
@@ -151,4 +151,6 @@ def test_documented_mock_poisoned_files_in_live_cache_for_manual_cleanup() -> No
 
     if poisoned:
         # Surface, but don't fail — the test exists to document, not block.
-        print("\n=== Mock-poisoned forecaster cache entries (manual cleanup recommended) ===\n" + "\n".join(poisoned))
+        print(  # noqa: T201  # deliberate operator-facing cleanup report
+            "\n=== Mock-poisoned forecaster cache entries (manual cleanup recommended) ===\n" + "\n".join(poisoned)
+        )

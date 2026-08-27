@@ -52,18 +52,18 @@ class TestConstruction:
 class TestValidation:
     def test_wrong_count_raises(self):
         too_few = {p: v for p, v in _STANDARD_VALUES.items() if p != 0.975}
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="requires exactly the standard percentiles"):
             PercentileSet.from_mapping(too_few)
 
     def test_missing_p50_raises_naming_it(self):
         missing_median = {p: v for p, v in _STANDARD_VALUES.items() if p != 0.50}
-        with pytest.raises(ValueError, match="0.5"):
+        with pytest.raises(ValueError, match=r"0\.5"):
             PercentileSet.from_mapping(missing_median)
 
     def test_extra_key_raises_naming_it(self):
         with_extra = dict(_STANDARD_VALUES)
         with_extra[0.11] = 123.0
-        with pytest.raises(ValueError, match="0.11"):
+        with pytest.raises(ValueError, match=r"0\.11"):
             PercentileSet.from_mapping(with_extra)
 
     def test_from_mapping_colliding_keys_raise(self):
@@ -165,7 +165,7 @@ class TestSpreadMetricsUnchanged:
         std_pcts = [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99]
 
         def make(values: list[float]) -> list[Percentile]:
-            return [Percentile(percentile=p / 100.0, value=v) for p, v in zip(std_pcts, values)]
+            return [Percentile(percentile=p / 100.0, value=v) for p, v in zip(std_pcts, values, strict=True)]
 
         # Same fixture as the pre-existing closed-bounds spread test (P1/P99 tails added).
         model1 = make([5, 10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70, 75])

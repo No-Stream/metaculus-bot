@@ -361,7 +361,7 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
 
     On a coarse discrete grid the pre-``9f1175c`` flat 0.2 cap can hold the realized
     bin far below what every member asked for (q43913: published 0.200 where members'
-    own curves wanted 0.575-0.823 — peer −38.67). That is a pipeline defect
+    own curves wanted 0.575-0.823 — peer -38.67). That is a pipeline defect
     masquerading as a forecast error, and it manufactures apparent dissent: each
     member keeps its concentrated mass while the published curve does not.
 
@@ -571,7 +571,8 @@ def no_bias_check(data: list[dict]) -> dict:
     outcomes = [1.0 if r["resolution_parsed"] else 0.0 for r in binary]
     mean_predicted = _mean(probs)
     actual_yes_rate = _mean(outcomes)
-    assert mean_predicted is not None and actual_yes_rate is not None
+    assert mean_predicted is not None
+    assert actual_yes_rate is not None
     bias_pp = (mean_predicted - actual_yes_rate) * 100.0
 
     low_range = [r for r in binary if 0.10 <= r["our_prob_yes"] <= 0.30]
@@ -581,7 +582,8 @@ def no_bias_check(data: list[dict]) -> dict:
         lr_outcomes = [1.0 if r["resolution_parsed"] else 0.0 for r in low_range]
         lr_mean_pred = _mean(lr_probs)
         lr_actual = _mean(lr_outcomes)
-        assert lr_mean_pred is not None and lr_actual is not None
+        assert lr_mean_pred is not None
+        assert lr_actual is not None
         low_range_summary = {
             "count": len(low_range),
             "mean_predicted": lr_mean_pred,

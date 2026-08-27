@@ -325,7 +325,7 @@ def _empirical_max_band(y: np.ndarray, h: int, *, use_log: bool, last: float) ->
 
 
 def _build_spread_series(series_a: pd.Series, series_b: pd.Series) -> pd.Series:
-    """Cumulative-from-start relative-return spread (pp): 100·[(logA−logA₀)−(logB−logB₀)].
+    """Cumulative-from-start relative-return spread (pp): 100·[(logA-logA₀)-(logB-logB₀)].
 
     Inner-joined on date. The h-step change of this cumulative series equals the
     forward-window relative return, so the band machinery reads it directly. Both

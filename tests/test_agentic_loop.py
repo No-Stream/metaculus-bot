@@ -731,7 +731,7 @@ async def test_append_only_message_history_is_preserved_across_steps() -> None:
         llm_call=fake_llm,
     )
 
-    for earlier, later in zip(fake_llm.calls, fake_llm.calls[1:]):
+    for earlier, later in zip(fake_llm.calls, fake_llm.calls[1:], strict=False):
         assert later["messages"][: len(earlier["messages"])] == earlier["messages"]
 
 
@@ -982,7 +982,8 @@ async def test_ghost_phase_numeric_emits_no_qtype_mismatch_warnings(caplog: pyte
         "system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm, ghost_prompt="ghost now"
     )
 
-    assert result.ghost is not None and result.ghost.qtype == "numeric"
+    assert result.ghost is not None
+    assert result.ghost.qtype == "numeric"
     assert [r for r in caplog.records if "question_type mismatch" in r.getMessage()] == []
 
 

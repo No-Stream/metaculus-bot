@@ -96,7 +96,7 @@ def build_workflow_map(repo: str) -> dict[int, str]:
         ".workflow_runs[] | {id, path}",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S, check=False)
     except subprocess.TimeoutExpired:
         logger.warning(
             f"workflow-runs enumeration timed out ({GH_API_TIMEOUT_S}s); falling back to the archive-derived map"

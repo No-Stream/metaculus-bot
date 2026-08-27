@@ -153,7 +153,7 @@ def _make_mc_pred(probs: list[float], names: list[str] | None = None) -> Predict
     if len(names) != len(probs):
         raise ValueError("names/probs length mismatch")
     return PredictedOptionList(
-        predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in zip(names, probs)]
+        predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in zip(names, probs, strict=True)]
     )
 
 
@@ -356,10 +356,12 @@ async def test_mc_many_options_can_fall_below_binary_floor(monkeypatch: pytest.M
     per_option_unclipped = [
         1.0 / (1.0 + math.exp(-(params.bias + params.slope * math.log(p / (1.0 - p))))) for p in raw_combined
     ]
-    per_option = [max(p - loose_cap, min(p + loose_cap, q)) for p, q in zip(raw_combined, per_option_unclipped)]
+    per_option = [
+        max(p - loose_cap, min(p + loose_cap, q)) for p, q in zip(raw_combined, per_option_unclipped, strict=True)
+    ]
     clamped = [max(MC_PROB_MIN, min(MC_PROB_MAX, q)) for q in per_option]
     total = sum(clamped)
-    expected_probs = {n: q / total for n, q in zip(names, clamped)}
+    expected_probs = {n: q / total for n, q in zip(names, clamped, strict=True)}
 
     result = await bot._aggregate_predictions([pred_a, pred_b], question)
 

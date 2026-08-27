@@ -11,7 +11,7 @@ from metaculus_bot.probabilistic_tools._numeric_helpers import logit, resolve_we
 
 logger = logging.getLogger(__name__)
 
-# Default strength (pseudo-count total α+β) for an informative Beta prior
+# Default strength (pseudo-count total alpha+beta) for an informative Beta prior
 # centered on ``prior_mean``. 5 pseudo-counts is a mildly informative prior
 # that moves with the stated outside view but lets modest data (n>=10) shift
 # the posterior noticeably. Tune via backtest.
@@ -37,8 +37,8 @@ def beta_binomial_update(
 ) -> BetaBinomialResult:
     """Bayesian update on a Beta-binomial model with informative prior.
 
-    The prior is Beta(α, β) with ``α = prior_strength * prior_mean`` and
-    ``β = prior_strength * (1 - prior_mean)``. Defaults
+    The prior is Beta(alpha, beta) with ``alpha = prior_strength * prior_mean`` and
+    ``beta = prior_strength * (1 - prior_mean)``. Defaults
     ``prior_mean=0.5, prior_strength=1.0`` give a weakly informative prior
     (roughly Jeffreys' strength with uniform center).
 

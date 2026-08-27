@@ -324,7 +324,7 @@ async def polymarket_search(session: Any, query: str, *, width: int) -> list[Mar
         POLYMARKET_SEARCH_URL,
         {"q": query, "limit_per_type": str(VENUE_SEARCH_LIMIT), "events_status": "active"},
         max_attempts=POLYMARKET_MAX_ATTEMPTS,
-        label=f"Polymarket q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
+        label=f"Polymarket q={query[:40]!r}",  # HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
         return None

@@ -1,4 +1,4 @@
-# noqa: HARNESS-SCAN-EXEMPT-monolithic-file-loc
+# HARNESS-SCAN-EXEMPT-monolithic-file-loc
 """Tests for the per-arm stacker runner used in the probabilistic-tools ablation benchmark.
 
 Treatment in our A/B test is *only* visible to the stacker. Forecasters run once and never
@@ -29,6 +29,7 @@ import math
 import os
 import textwrap
 from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -212,10 +213,7 @@ def _three_mc_forecasters() -> dict[str, dict]:
 
 def _capture_base_texts(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[str]:
     """Pull the base_texts argument from a captured stacker call (positional or kw)."""
-    if len(args) > 4:
-        base_texts = args[4]
-    else:
-        base_texts = kwargs.get("base_texts", [])
+    base_texts = args[4] if len(args) > 4 else kwargs.get("base_texts", [])
     assert base_texts is not None
     return list(base_texts)
 
@@ -279,14 +277,14 @@ class TestProbabilisticToolsEnabled:
 
     def test_env_var_restored_on_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(FEATURE_FLAG, raising=False)
-        with pytest.raises(RuntimeError, match="boom"), probabilistic_tools_enabled(True):
+        with pytest.raises(RuntimeError, match="boom"), probabilistic_tools_enabled(True):  # noqa: PT012  # in-block assert must run inside the live context manager
             assert os.environ[FEATURE_FLAG] == "1"
             raise RuntimeError("boom")
         assert FEATURE_FLAG not in os.environ
 
     def test_env_var_restored_on_exception_when_previously_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(FEATURE_FLAG, "preset")
-        with pytest.raises(ValueError), probabilistic_tools_enabled(False):
+        with pytest.raises(ValueError, match="boom"), probabilistic_tools_enabled(False):  # noqa: PT012  # in-block assert must run inside the live context manager
             assert FEATURE_FLAG not in os.environ
             raise ValueError("boom")
         assert os.environ[FEATURE_FLAG] == "preset"
@@ -639,7 +637,9 @@ class TestPerForecasterComputedQuantities:
         # rationale starts with "Model: openrouter/test/m1\n\n"; after strip, must not start with "Model:"
         assert captured_base_texts
         for base_text in captured_base_texts[0]:
-            assert not base_text.startswith("Model: "), f"Expected stripped, got: {base_text[:60]!r}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # display truncation in assert message, not data subsampling
+            assert not base_text.startswith("Model: "), (
+                f"Expected stripped, got: {base_text[:60]!r}"
+            )  # HARNESS-SCAN-EXEMPT-subsampling  # display truncation in assert message, not data subsampling
 
     def test_per_forecaster_computed_quantities_recorded_in_payload(
         self,
@@ -1095,7 +1095,7 @@ class TestSoftDeadline:
         timeout in the payload's ``errors``.
         """
         from metaculus_bot.ablation import (
-            run_stacker as run_stacker_module,  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            run_stacker as run_stacker_module,  # HARNESS-SCAN-EXEMPT-function-level-import
         )
 
         monkeypatch.setattr(run_stacker_module, "STACKER_SOFT_DEADLINE", 1)
@@ -1156,7 +1156,7 @@ class TestSoftDeadline:
         median fallback (M3) takes over — but errors record both timeouts.
         """
         from metaculus_bot.ablation import (
-            run_stacker as run_stacker_module,  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            run_stacker as run_stacker_module,  # HARNESS-SCAN-EXEMPT-function-level-import
         )
 
         monkeypatch.setattr(run_stacker_module, "STACKER_SOFT_DEADLINE", 1)
@@ -1212,7 +1212,7 @@ class TestWindowPatchActive:
         fallback_stacker_llm: MagicMock,
         parser_llm: MagicMock,
     ) -> None:
-        from metaculus_bot.ablation import window_patch as wp  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.ablation import window_patch as wp  # HARNESS-SCAN-EXEMPT-function-level-import
 
         observed_active: list[bool] = []
 
@@ -1536,14 +1536,18 @@ class TestQuestionTypeDispatch:
         # keeps the canonical set; sanitize_percentiles validates count).
         assert len(sp["declared_percentiles"]) == 13
         # sort_percentiles_by_value reorders by ``percentile`` ascending.
-        percentile_keys = [round(float(p["percentile"]), 6) for p in sp["declared_percentiles"]]  # noqa: HARNESS-SCAN-EXEMPT-object-explosion  # tiny test frame (13 percentiles)
+        percentile_keys = [
+            round(float(p["percentile"]), 6) for p in sp["declared_percentiles"]
+        ]  # HARNESS-SCAN-EXEMPT-object-explosion  # tiny test frame (13 percentiles)
         assert percentile_keys == sorted(percentile_keys), (
             f"sanitize_percentiles should sort by percentile; got {percentile_keys}"
         )
         # apply_jitter_for_duplicates / ensure_strictly_increasing_bounded:
         # value-axis must be strictly increasing after sanitization.
-        values = [float(p["value"]) for p in sp["declared_percentiles"]]  # noqa: HARNESS-SCAN-EXEMPT-object-explosion  # tiny test frame (13 percentiles)
-        assert all(v_next > v_prev for v_prev, v_next in zip(values, values[1:])), (
+        values = [
+            float(p["value"]) for p in sp["declared_percentiles"]
+        ]  # HARNESS-SCAN-EXEMPT-object-explosion  # tiny test frame (13 percentiles)
+        assert all(v_next > v_prev for v_prev, v_next in pairwise(values)), (
             f"sanitize_percentiles should produce strictly increasing values; got {values}"
         )
         # Full 201-point CDF ran through build_numeric_distribution.
@@ -1652,7 +1656,7 @@ class TestPayloadShape:
                 )
             )
         # binary: stored using canonical forecasters.serialize_prediction_value format
-        import json  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        import json  # HARNESS-SCAN-EXEMPT-function-level-import
 
         assert payload["stacker_prediction"] == {"type": "binary", "prob": 0.42}
         # JSON-roundtrippable
@@ -1725,7 +1729,7 @@ class TestPayloadShape:
                     parser_llm=parser_llm,
                 )
             )
-        import json  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        import json  # HARNESS-SCAN-EXEMPT-function-level-import
 
         # numeric (post-Bucket-1): full-CDF schema; JSON-roundtrippable.
         sp = payload["stacker_prediction"]
@@ -1792,7 +1796,7 @@ class TestPayloadShape:
                     parser_llm=parser_llm,
                 )
             )
-        import json  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        import json  # HARNESS-SCAN-EXEMPT-function-level-import
 
         sp = payload["stacker_prediction"]
         assert isinstance(sp, dict)
@@ -1996,7 +2000,7 @@ class TestConcurrentStackerLock:
         concurrent stacker calls would race and the second to enter would
         crash. The lock keeps each call inside its own patched region.
         """
-        from metaculus_bot.ablation import window_patch as wp  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.ablation import window_patch as wp  # HARNESS-SCAN-EXEMPT-function-level-import
 
         observed_active_during_call: list[bool] = []
         max_concurrent_in_patch = 0
@@ -2598,12 +2602,12 @@ class TestDefaultStackerWiredViaDonatedKey:
     def test_default_stacker_uses_opus_4_5_via_donated_key_wrapper(
         self, cache: AblationCache, parser_llm: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.ablation.run_stacker import (  # HARNESS-SCAN-EXEMPT-function-level-import
             DEFAULT_STACKER_FALLBACK_MODEL,
             DEFAULT_STACKER_MODEL,
         )
         from metaculus_bot.fallback_openrouter import (
-            FallbackOpenRouterLlm,  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            FallbackOpenRouterLlm,  # HARNESS-SCAN-EXEMPT-function-level-import
         )
 
         # Both keys present + distinct → wrapper chooses FallbackOpenRouterLlm.
@@ -2660,7 +2664,7 @@ class TestDefaultStackerWiredViaDonatedKey:
         self, cache: AblationCache, parser_llm: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from metaculus_bot.fallback_openrouter import (
-            FallbackOpenRouterLlm,  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            FallbackOpenRouterLlm,  # HARNESS-SCAN-EXEMPT-function-level-import
         )
 
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "fake_donated")
@@ -2823,7 +2827,8 @@ class TestPerStackerCacheKeying:
 
         out_45 = cache.read_stacker_output(qid=501, arm=ARM_STACK_AUG, stacker_slug=slug_opus45)
         out_48 = cache.read_stacker_output(qid=501, arm=ARM_STACK_AUG, stacker_slug=slug_opus48)
-        assert out_45 is not None and out_48 is not None
+        assert out_45 is not None
+        assert out_48 is not None
         assert out_45["stacker_prediction"] == {"type": "binary", "prob": 0.45}
         assert out_48["stacker_prediction"] == {"type": "binary", "prob": 0.48}
 
@@ -3073,7 +3078,8 @@ class TestMedianFallback:
         assert payload["stacker_prediction"]["prob"] == pytest.approx(0.5)
         # Both failures recorded
         joined_errors = " | ".join(payload["errors"])
-        assert "primary" in joined_errors and "fallback" in joined_errors
+        assert "primary" in joined_errors
+        assert "fallback" in joined_errors
 
     def test_both_stackers_fail_falls_back_to_median_mc(
         self,
@@ -3308,7 +3314,7 @@ class TestStackerPromptSizeGuard:
 
 class TestNaNFiltering:
     def test_surviving_forecasters_filters_binary_nan(self) -> None:
-        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.ablation.run_stacker import (  # HARNESS-SCAN-EXEMPT-function-level-import
             _surviving_forecasters,
         )
 
@@ -3322,7 +3328,7 @@ class TestNaNFiltering:
         assert set(surviving.keys()) == {"m2", "m3"}
 
     def test_surviving_forecasters_filters_binary_infinity(self) -> None:
-        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.ablation.run_stacker import (  # HARNESS-SCAN-EXEMPT-function-level-import
             _surviving_forecasters,
         )
 
@@ -3335,7 +3341,7 @@ class TestNaNFiltering:
         assert "m1" not in surviving
 
     def test_surviving_forecasters_filters_mc_nan_option(self) -> None:
-        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.ablation.run_stacker import (  # HARNESS-SCAN-EXEMPT-function-level-import
             _surviving_forecasters,
         )
 
@@ -3350,7 +3356,7 @@ class TestNaNFiltering:
         assert "m1" not in surviving
 
     def test_surviving_forecasters_filters_numeric_nan_in_cdf(self) -> None:
-        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.ablation.run_stacker import (  # HARNESS-SCAN-EXEMPT-function-level-import
             _surviving_forecasters,
         )
 
@@ -3365,7 +3371,7 @@ class TestNaNFiltering:
         assert "m1" not in surviving
 
     def test_surviving_forecasters_keeps_finite_values(self) -> None:
-        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.ablation.run_stacker import (  # HARNESS-SCAN-EXEMPT-function-level-import
             _surviving_forecasters,
         )
 

@@ -1,5 +1,6 @@
 import logging
-from typing import Any
+from itertools import pairwise
+from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -11,23 +12,23 @@ from metaculus_bot.numeric.validation import detect_unit_mismatch
 
 
 def _build_question(**overrides) -> NumericQuestion:
-    base_kwargs: dict[str, Any] = dict(
-        id_of_question=1,
-        id_of_post=1,
-        page_url="https://example.com/q/1",
-        question_text="Test numeric question",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-        published_time=None,
-        close_time=None,
-        lower_bound=0.0,
-        upper_bound=100.0,
-        open_lower_bound=False,
-        open_upper_bound=False,
-        unit_of_measure="units",
-        zero_point=0.0,
-    )
+    base_kwargs: dict[str, Any] = {
+        "id_of_question": 1,
+        "id_of_post": 1,
+        "page_url": "https://example.com/q/1",
+        "question_text": "Test numeric question",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+        "published_time": None,
+        "close_time": None,
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+        "unit_of_measure": "units",
+        "zero_point": 0.0,
+    }
     base_kwargs.update(overrides)
     return NumericQuestion(**base_kwargs)
 
@@ -60,7 +61,7 @@ def test_sanitize_percentiles_orders_and_jitters(monkeypatch):
 
     # Values should be strictly increasing after jitter/clamp
     sanitized_values = [p.value for p in sanitized]
-    assert all(b > a for a, b in zip(sanitized_values, sanitized_values[1:]))
+    assert all(b > a for a, b in pairwise(sanitized_values))
 
     # Discrete question (cdf_size != default) should force zero_point to None
     assert zero_point is None
@@ -80,7 +81,7 @@ class TestPointMassDeclaration:
     """
 
     _POINT_MASS = 42.0
-    _LABELS = [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99]
+    _LABELS: ClassVar[list[float]] = [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99]
 
     def _declared(self) -> list[Percentile]:
         return [Percentile(percentile=p, value=self._POINT_MASS) for p in self._LABELS]
@@ -92,7 +93,7 @@ class TestPointMassDeclaration:
         values = [float(p.value) for p in sanitized]
         # Strictly increasing (the CDF needs it) but only by the ordering epsilon:
         # max(MIN_BOUNDARY_DISTANCE * range, STRICT_ORDERING_EPSILON) per step.
-        assert all(b > a for a, b in zip(values, values[1:]))
+        assert all(b > a for a, b in pairwise(values))
         span = max(values) - min(values)
         assert span < 1e-4, f"sanitisation invented {span} of width from a point mass"
 
@@ -129,14 +130,14 @@ class TestPointMassDeclaration:
         declaration is separated, no marker fires, and the guard passes it."""
         question = _build_question(lower_bound=0.0, upper_bound=20.0, zero_point=None)
         values = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0]
-        declared = [Percentile(percentile=p, value=v) for p, v in zip(self._LABELS, values)]
+        declared = [Percentile(percentile=p, value=v) for p, v in zip(self._LABELS, values, strict=False)]
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pipeline"):
             sanitized, _zero_point = sanitize_percentiles(declared, question)
 
         assert not [r for r in caplog.records if "NUMERIC_DEGENERATE_DECLARATION:" in r.getMessage()]
         sanitized_values = [float(p.value) for p in sanitized]
-        assert all(b > a for a, b in zip(sanitized_values, sanitized_values[1:]))
+        assert all(b > a for a, b in pairwise(sanitized_values))
         assert detect_unit_mismatch(sanitized, question) == (False, "")
 
 

@@ -43,6 +43,8 @@ import sys
 from pathlib import Path
 from statistics import mean
 
+from metaculus_bot.api_preflight import verify_metaculus_api_identity
+from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
 from metaculus_bot.scoring_common import binary_log_score, mc_log_score, numeric_log_score
 from scripts.telemetry.archive import load_marker_records
 
@@ -515,21 +517,10 @@ def render_report(summary: dict) -> str:
 def _load_records(perf_json: str | None, tournament: str | None) -> list[dict]:
     """Load resolved-question records from a perf JSON, else a live read-only pull, else []."""
     if perf_json:
-        from metaculus_bot.performance_analysis.collector import (
-            load_dataset,
-        )
-
         records = load_dataset(perf_json)
         logger.info(f"Loaded {len(records)} records from {perf_json}")
         return records
     if tournament:
-        from metaculus_bot.api_preflight import (
-            verify_metaculus_api_identity,
-        )
-        from metaculus_bot.performance_analysis.collector import (
-            build_performance_dataset,
-        )
-
         # Confirm the host is the real Metaculus before the token-sending pull.
         verify_metaculus_api_identity()
         logger.info(f"Building performance dataset from tournament '{tournament}' (read-only Metaculus pull)...")

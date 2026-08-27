@@ -62,5 +62,7 @@ def aggregate_mc(
     # the old manual clamp-then-divide, where renormalization could drag a floored
     # option back below the floor.
     normalized = clamp_and_renormalize_probs(ordered_raw)
-    aggregated_options = [PredictedOption(option_name=name, probability=p) for name, p in zip(option_order, normalized)]
+    aggregated_options = [
+        PredictedOption(option_name=name, probability=p) for name, p in zip(option_order, normalized, strict=True)
+    ]
     return PredictedOptionList(predicted_options=aggregated_options)

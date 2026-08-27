@@ -150,7 +150,9 @@ def _summarize_exc(exc: BaseException) -> str:
 
 def _backoff_seconds(attempt: int) -> float:
     """Exponential backoff with jitter. ``attempt`` is 1-indexed (first retry uses attempt=1)."""
-    return FETCH_GET_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, FETCH_GET_BACKOFF_JITTER)
+    return FETCH_GET_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(  # noqa: S311  # retry jitter, not cryptography
+        0, FETCH_GET_BACKOFF_JITTER
+    )
 
 
 def _wrap_with_retry(method_name: str, original: Callable[..., Any]) -> Callable[..., Any]:
@@ -188,6 +190,11 @@ def _wrap_with_retry(method_name: str, original: Callable[..., Any]) -> Callable
                     sleep_s,
                 )
                 time.sleep(sleep_s)
+
+        # HARNESS-SCAN-EXEMPT-shouldnt-happen-silent-fallback: unreachable while
+        # attempts >= 1 — the loop either returns, re-raises, or retries. Spelled out
+        # because RET503 wants the fall-through explicit; behavior is unchanged.
+        return None
 
     return wrapper
 

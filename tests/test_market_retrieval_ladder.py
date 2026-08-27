@@ -15,7 +15,7 @@ Fine would win the FL-06 Republican primary with. Exactly one market in existenc
 quantity — Kalshi's ten-bracket margin ladder — and the render showed the forecasters ONE of its
 brackets. All three read that single bracket as an equality constraint on a tail (``P(F>70%) = 0.585``
 "exactly"), each then cut its own pre-market mass on the resolving bucket, and the published 0.130
-scored −26.77 spot. Complete enumeration of the same ladder lands at 0.19-0.29 under the models' own
+scored -26.77 spot. Complete enumeration of the same ladder lands at 0.19-0.29 under the models' own
 margin→share formula. A single bracket of a distribution is not a small amount of the distribution; it
 is a different kind of object.
 """
@@ -119,7 +119,7 @@ _FAMILY_SHAPES: dict[str, tuple[MarketChild, ...]] = {
     "duplicate_instances": (MarketChild(title="same rung", implied_prob_yes=0.11),) * 14,
     "two_hundred_rungs": tuple(
         MarketChild(title=f"rung {index}", implied_prob_yes=0.90)
-        for index in range(200)  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        for index in range(200)  # HARNESS-SCAN-EXEMPT-subsampling
     ),
 }
 
@@ -307,9 +307,13 @@ class TestCompletenessInvariant:
         matching a named Metaculus option cut, because it was the cheapest rung in the family. A
         0.0015 bracket is the answer to "could this option happen at all", so a rule that drops it by
         price answers the wrong question."""
-        children = tuple(
-            MarketChild(title=f"outcome {index}", implied_prob_yes=0.5) for index in range(MAX_CHILD_ROWS_PER_MARKET)
-        ) + (MarketChild(title="the matching option", implied_prob_yes=0.0015),)
+        children = (
+            *(
+                MarketChild(title=f"outcome {index}", implied_prob_yes=0.5)
+                for index in range(MAX_CHILD_ROWS_PER_MARKET)
+            ),
+            MarketChild(title="the matching option", implied_prob_yes=0.0015),
+        )
 
         rendered = render_snapshot(MarketSnapshot(matches=[_row(title="ballot", prob=None, children=children)]))
 
@@ -466,7 +470,8 @@ class TestCompactionStages:
         title = self._forced(ladder, stage=4)  # floor 0.05
 
         assert "Above $3400 0.46" in title, "the crossing is exactly what must survive"
-        assert "Above $3360 0.74" in title and "Above $3440 0.21" in title, "and the rungs bracketing it"
+        assert "Above $3360 0.74" in title, "and the rungs bracketing it"
+        assert "Above $3440 0.21" in title, "and the rungs bracketing it"
         assert "Above $3200 0.99" not in title, "a 0.99 rung on a live ladder says nothing"
         assert "Above $3560 0.01" not in title, "and neither does its opposite tail"
         assert "+5 off certainty by under 0.05 (3.00 summed)" in title
@@ -580,7 +585,7 @@ class TestLadderSectionBudget:
         """
         children = tuple(
             MarketChild(title=f"rung {index:03d}", implied_prob_yes=0.50)
-            for index in range(200)  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+            for index in range(200)  # HARNESS-SCAN-EXEMPT-subsampling
         )
 
         rendered, stats = render_snapshot_with_stats(
@@ -602,7 +607,7 @@ class TestLadderSectionBudget:
         """
         children = tuple(
             MarketChild(title=f"rung {index:03d}", implied_prob_yes=0.90)
-            for index in range(200)  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+            for index in range(200)  # HARNESS-SCAN-EXEMPT-subsampling
         )
         from metaculus_bot.research.market_retrieval.rendering import _ladder_at_stage
 
@@ -663,7 +668,7 @@ class TestLadderSectionBudget:
         """
         children = tuple(
             MarketChild(title=f"rung {index:03d}", implied_prob_yes=0.50)
-            for index in range(200)  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+            for index in range(200)  # HARNESS-SCAN-EXEMPT-subsampling
         ) + tuple(MarketChild(title=f"unquoted {index}", price_withheld=True) for index in range(3))
 
         rendered, stats = render_snapshot_with_stats(
@@ -674,7 +679,8 @@ class TestLadderSectionBudget:
         assert stats.max_stage == LADDER_HARD_BOUND_STAGE
         assert "unquoted" not in title, "an outcome with no price must not evict a priced one from the row"
         named = _ladder_terms(title)
-        assert named and all(price is not None for _, price, _ in named)
+        assert named
+        assert all(price is not None for _, price, _ in named)
         # The remainder's summed price counts the dropped PRICED rungs only, so the three unquoted ones
         # are inside the count and contribute nothing to the sum. The row now STATES that denominator:
         # the count the sum covers used to be invisible, so `+160 more (78.50 summed)` read as 78.50
@@ -695,7 +701,7 @@ class TestLadderSectionBudget:
         """
         children = tuple(
             MarketChild(title=f"rung {index:03d}", implied_prob_yes=0.50)
-            for index in range(200)  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+            for index in range(200)  # HARNESS-SCAN-EXEMPT-subsampling
         ) + tuple(MarketChild(title=f"Above {index}", implied_prob_yes=1.0, is_resolved=True) for index in range(8))
 
         rendered, stats = render_snapshot_with_stats(
@@ -767,10 +773,13 @@ class TestQuoteRangeCell:
     def test_a_blanked_outcome_reads_as_unpriced_in_the_ladder(self) -> None:
         """The same claim one row down: a ladder term for a blanked outcome carries a dash, so it joins
         the `+N unquoted` group under compaction rather than a summed price group."""
-        children = tuple(
-            MarketChild(title=f"real {index}", implied_prob_yes=0.5 - 0.01 * index)
-            for index in range(MAX_CHILD_ROWS_PER_MARKET)
-        ) + (MarketChild(title="untouched leg", price_withheld=True),)
+        children = (
+            *(
+                MarketChild(title=f"real {index}", implied_prob_yes=0.5 - 0.01 * index)
+                for index in range(MAX_CHILD_ROWS_PER_MARKET)
+            ),
+            MarketChild(title="untouched leg", price_withheld=True),
+        )
 
         rendered = render_snapshot(MarketSnapshot(matches=[_row(prob=None, children=children)]))
 

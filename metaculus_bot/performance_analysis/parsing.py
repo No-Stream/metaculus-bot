@@ -313,10 +313,7 @@ def _split_stacker_combined_body(body: str) -> tuple[str, list[tuple[str | None,
     # meta text we return is just the prose.
     stacker_lstripped = stacker_portion.lstrip()
     model_match = _REASONING_MODEL_PREFIX_RE.match(stacker_lstripped)
-    if model_match:
-        stacker_meta = stacker_lstripped[model_match.end() :].lstrip("\r\n")
-    else:
-        stacker_meta = stacker_lstripped
+    stacker_meta = stacker_lstripped[model_match.end() :].lstrip("\r\n") if model_match else stacker_lstripped
     stacker_meta = stacker_meta.rstrip()
 
     # Walk the base portion, splitting on each line that starts with "Model:".
@@ -327,10 +324,7 @@ def _split_stacker_combined_body(body: str) -> tuple[str, list[tuple[str | None,
     for i, match in enumerate(matches):
         raw_model = match.group(1).strip()
         model_name: str | None
-        if raw_model:
-            model_name = raw_model.rsplit("/", 1)[-1].strip() or None
-        else:
-            model_name = None
+        model_name = (raw_model.rsplit("/", 1)[-1].strip() or None) if raw_model else None
         start = match.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(base_portion)
         prose = base_portion[start:end].strip("\r\n").rstrip()
@@ -488,10 +482,7 @@ def _iter_per_model_blocks(
 
         key = extract_model_display_name_from_reasoning(body_lstripped)
         model_match = _REASONING_MODEL_PREFIX_RE.match(body_lstripped)
-        if model_match:
-            prose = body_lstripped[model_match.end() :].lstrip("\r\n").rstrip()
-        else:
-            prose = body_lstripped.rstrip()
+        prose = body_lstripped[model_match.end() :].lstrip("\r\n").rstrip() if model_match else body_lstripped.rstrip()
         if key is None:
             key = fallback_map.get(idx) or anonymous_model_key(idx)
         yield key, prose, False
@@ -960,10 +951,7 @@ def parse_per_model_forecasts(
         idx = int(match.group(1))
         inline_name = match.group(2)
         value = match.group(3).strip()
-        if inline_name is not None:
-            key = inline_name.strip()
-        else:
-            key = fallback_map.get(idx) or anonymous_model_key(idx)
+        key = inline_name.strip() if inline_name is not None else (fallback_map.get(idx) or anonymous_model_key(idx))
         result[key] = value
     return result
 
@@ -1028,10 +1016,7 @@ def parse_per_model_mc_option_probs(
         idx = int(match.group(1))
         inline_name = match.group(2)
 
-        if inline_name is not None:
-            key = inline_name.strip()
-        else:
-            key = fallback_map.get(idx) or anonymous_model_key(idx)
+        key = inline_name.strip() if inline_name is not None else (fallback_map.get(idx) or anonymous_model_key(idx))
 
         # Region: the captured first-line value (group 3) plus everything
         # until the next bullet or end of summary. Group 3 matters because for

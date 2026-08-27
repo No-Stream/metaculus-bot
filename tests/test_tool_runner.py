@@ -51,45 +51,45 @@ def _enable_feature_flag(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _make_binary_question(**overrides: Any) -> BinaryQuestion:
-    defaults: dict[str, Any] = dict(
-        question_text="Will it rain before May 1?",
-        id_of_question=1,
-        page_url="https://example.com/q/1",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-    )
+    defaults: dict[str, Any] = {
+        "question_text": "Will it rain before May 1?",
+        "id_of_question": 1,
+        "page_url": "https://example.com/q/1",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+    }
     defaults.update(overrides)
     return BinaryQuestion(**defaults)
 
 
 def _make_numeric_question(**overrides: Any) -> NumericQuestion:
-    defaults: dict[str, Any] = dict(
-        question_text="What will X be?",
-        id_of_question=3,
-        page_url="https://example.com/q/3",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-        lower_bound=0.0,
-        upper_bound=100.0,
-        open_lower_bound=False,
-        open_upper_bound=False,
-    )
+    defaults: dict[str, Any] = {
+        "question_text": "What will X be?",
+        "id_of_question": 3,
+        "page_url": "https://example.com/q/3",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+    }
     defaults.update(overrides)
     return NumericQuestion(**defaults)
 
 
 def _make_mc_question(**overrides: Any) -> MultipleChoiceQuestion:
-    defaults: dict[str, Any] = dict(
-        question_text="Which color?",
-        options=["Red", "Blue", "Green"],
-        id_of_question=2,
-        page_url="https://example.com/q/2",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-    )
+    defaults: dict[str, Any] = {
+        "question_text": "Which color?",
+        "options": ["Red", "Blue", "Green"],
+        "id_of_question": 2,
+        "page_url": "https://example.com/q/2",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+    }
     defaults.update(overrides)
     return MultipleChoiceQuestion(**defaults)
 
@@ -144,7 +144,7 @@ def _mc_payload(**overrides) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# run_tools_for_forecaster: binary
+# run_tools_for_forecaster - binary
 # ---------------------------------------------------------------------------
 
 
@@ -453,7 +453,7 @@ class TestAnchorAndClauseTelemetryLines:
 
 
 # ---------------------------------------------------------------------------
-# run_tools_for_forecaster: numeric
+# run_tools_for_forecaster - numeric
 # ---------------------------------------------------------------------------
 
 
@@ -1076,7 +1076,7 @@ options plus a catchall.
 class TestMcContractBridge:
     def _extract_top_means(self, result: str) -> dict[str, float]:
         """Parse the Dirichlet top-3 line into a {name: mean} dict."""
-        # Format: "...: Name1 0.xxx [80% CI ...]; Name2 0.xxx [80% CI ...]; Name3 0.xxx [80% CI ...]"
+        # Example line - "...: Name1 0.xxx [80% CI ...]; Name2 0.xxx [80% CI ...]; Name3 0.xxx [80% CI ...]"
         means: dict[str, float] = {}
         for match in re.finditer(r"([A-Za-z_]+) (\d\.\d{3}) \[80% CI", result):
             means[match.group(1)] = float(match.group(2))
@@ -1336,19 +1336,19 @@ class TestSpreadPlausibilityCheck:
     """Per-forecaster spread sanity check for numeric aggregation.
 
     Defense-in-depth atop the family-consistency check. Catches a
-    confidently-narrow forecaster (e.g. qid 43171's GLM-4.5-air with σ=13K
-    while ensemble σ ~965K) that the family check ratifies but is
+    confidently-narrow forecaster (e.g. qid 43171's GLM-4.5-air with sigma=13K
+    while ensemble sigma ~965K) that the family check ratifies but is
     effectively over-fit to fabricated data.
 
-    σ is derived from declared P10/P90: σ ≈ (P90 - P10) / 2.5631 (the
+    sigma is derived from declared P10/P90: sigma ≈ (P90 - P10) / 2.5631 (the
     ``_P10_P90_Z_GAP`` constant from probabilistic_tools/distributions.py).
-    For each forecaster, ratio = σ_i / median(σ across forecasters). If
+    For each forecaster, ratio = sigma_i / median(sigma across forecasters). If
     ratio < 0.10, emit a ⚠ Spread anomaly line. Otherwise emit a single
     summary line confirming all forecasters fall within the threshold.
     """
 
     def _make_pcts(self, median: float, p10: float, p90: float) -> list[Percentile]:
-        """11-point percentile vector implied σ = (p90 - p10) / 2.5631."""
+        """11-point percentile vector implied sigma = (p90 - p10) / 2.5631."""
         return [
             Percentile(percentile=0.025, value=median - 2 * (median - p10)),
             Percentile(percentile=0.05, value=median - 1.5 * (median - p10)),
@@ -1364,8 +1364,8 @@ class TestSpreadPlausibilityCheck:
         ]
 
     def test_warns_on_narrow_sigma_forecaster(self):
-        """Forecaster 4 has σ ≈ 0.039 (P90-P10 = 0.1 / 2.5631), the others σ ≈ 1.0."""
-        # Three forecasters with σ ≈ 1.0 ((P90-P10) ≈ 2.5631) plus one narrow.
+        """Forecaster 4 has sigma ≈ 0.039 (P90-P10 = 0.1 / 2.5631), the others sigma ≈ 1.0."""
+        # Three forecasters with sigma ≈ 1.0 ((P90-P10) ≈ 2.5631) plus one narrow.
         preds = [
             self._make_pcts(median=10.0, p10=10.0 - 1.28155, p90=10.0 + 1.28155),
             self._make_pcts(median=12.0, p10=12.0 - 1.28155, p90=12.0 + 1.28155),
@@ -1381,7 +1381,7 @@ class TestSpreadPlausibilityCheck:
             assert f"forecaster {idx})" not in out, f"forecaster {idx} should not be flagged"
 
     def test_no_warning_when_all_within_threshold(self):
-        """Three forecasters, σ in {0.95, 1.0, 1.05} — all within 10× of median σ."""
+        """Three forecasters, sigma in {0.95, 1.0, 1.05} — all within 10× of median sigma."""
         preds = [
             self._make_pcts(median=10.0, p10=10.0 - 0.5 * 2.5631 * 0.95, p90=10.0 + 0.5 * 2.5631 * 0.95),
             self._make_pcts(median=10.0, p10=10.0 - 0.5 * 2.5631 * 1.0, p90=10.0 + 0.5 * 2.5631 * 1.0),
@@ -1393,7 +1393,7 @@ class TestSpreadPlausibilityCheck:
         assert "all 3 forecasters within 10×" in out
 
     def test_skips_when_p10_or_p90_missing(self):
-        """Forecasters without both P10 and P90 are excluded from the σ pool."""
+        """Forecasters without both P10 and P90 are excluded from the sigma pool."""
         # Two forecasters have full P10/P90, one only has P50.
         preds_full = self._make_pcts(median=10.0, p10=8.0, p90=12.0)
         preds_full_2 = self._make_pcts(median=11.0, p10=9.0, p90=13.0)
@@ -1403,12 +1403,12 @@ class TestSpreadPlausibilityCheck:
             rationales=["", "", ""],
             prediction_percentiles=[preds_full, preds_full_2, preds_no_tail],
         )
-        # Should still produce a summary line for the 2 forecasters with valid σ.
+        # Should still produce a summary line for the 2 forecasters with valid sigma.
         assert "Spread plausibility" in out
         assert "all 2 forecasters within 10×" in out
 
     def test_skips_when_only_one_forecaster(self):
-        """With one forecaster the median σ is undefined; section is suppressed."""
+        """With one forecaster the median sigma is undefined; section is suppressed."""
         # Even though we still have ≥2 entries (gating bound), only one has P10/P90.
         preds_full = self._make_pcts(median=10.0, p10=8.0, p90=12.0)
         preds_no_tail = [Percentile(percentile=0.5, value=10.5)]
@@ -1417,37 +1417,37 @@ class TestSpreadPlausibilityCheck:
             rationales=["", ""],
             prediction_percentiles=[preds_full, preds_no_tail],
         )
-        # No spread section because only one forecaster has a valid σ.
+        # No spread section because only one forecaster has a valid sigma.
         assert "Spread anomaly" not in out
         assert "Spread plausibility" not in out
 
     def test_emits_summary_when_no_anomalies(self):
-        """When all σ within threshold, emit a single summary line."""
+        """When all sigma within threshold, emit a single summary line."""
         preds = [
-            self._make_pcts(median=10.0, p10=8.0, p90=12.0),  # σ ≈ 1.56
-            self._make_pcts(median=10.0, p10=8.5, p90=11.5),  # σ ≈ 1.17
-            self._make_pcts(median=10.0, p10=7.5, p90=12.5),  # σ ≈ 1.95
+            self._make_pcts(median=10.0, p10=8.0, p90=12.0),  # sigma ≈ 1.56
+            self._make_pcts(median=10.0, p10=8.5, p90=11.5),  # sigma ≈ 1.17
+            self._make_pcts(median=10.0, p10=7.5, p90=12.5),  # sigma ≈ 1.95
         ]
         out = aggregate_numeric_values(rationales=["", "", ""], prediction_percentiles=preds)
         assert "Spread plausibility" in out
         assert "all 3 forecasters" in out
 
     def test_qid_43171_regression_pattern(self):
-        """Replay qid 43171's pattern: one forecaster with σ ~0.04M, three with σ in 1-3M.
+        """Replay qid 43171's pattern: one forecaster with sigma ~0.04M, three with sigma in 1-3M.
 
         Don't need real Metaculus data — synthetic 4-forecaster scenario reproduces
-        the GLM-vs-ensemble-σ ratio that the family check failed to catch.
+        the GLM-vs-ensemble-sigma ratio that the family check failed to catch.
         """
-        # Three with σ ~1.0M-3.0M, one narrow with σ ~0.04M. Ratio ~= 0.02 ≪ 0.10.
+        # Three with sigma ~1.0M-3.0M, one narrow with sigma ~0.04M. Ratio ~= 0.02 ≪ 0.10.
         m = 1_000_000.0  # Median value scale
         preds = [
-            # σ ≈ 1.0M
+            # sigma ≈ 1.0M
             self._make_pcts(median=m, p10=m - 1.28155 * 1_000_000, p90=m + 1.28155 * 1_000_000),
-            # σ ≈ 2.0M
+            # sigma ≈ 2.0M
             self._make_pcts(median=m, p10=m - 1.28155 * 2_000_000, p90=m + 1.28155 * 2_000_000),
-            # σ ≈ 3.0M
+            # sigma ≈ 3.0M
             self._make_pcts(median=m, p10=m - 1.28155 * 3_000_000, p90=m + 1.28155 * 3_000_000),
-            # σ ≈ 0.04M (the GLM-style narrow one — third forecaster, 0-indexed = 3, 1-indexed = 4)
+            # sigma ≈ 0.04M (the GLM-style narrow one — third forecaster, 0-indexed = 3, 1-indexed = 4)
             self._make_pcts(median=m, p10=m - 1.28155 * 40_000, p90=m + 1.28155 * 40_000),
         ]
         out = aggregate_numeric_values(rationales=["", "", "", ""], prediction_percentiles=preds)

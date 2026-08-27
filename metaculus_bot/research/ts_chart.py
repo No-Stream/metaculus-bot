@@ -83,7 +83,12 @@ def render_anchor_chart(
     ax.plot(recent.index, recent.to_numpy(dtype="float64"), color=SERIES_COLOR, lw=1.1, label="series")
     ax.axvline(as_of_ts, color=AS_OF_COLOR, ls="--", lw=1.0, label="forecast time")
     ax.fill_between(
-        [as_of_ts, horizon_ts], [p10, p10], [p90, p90], color=BAND_COLOR, alpha=0.22, label="anchor P10–P90"
+        [as_of_ts, horizon_ts],
+        [p10, p10],
+        [p90, p90],
+        color=BAND_COLOR,
+        alpha=0.22,
+        label="anchor P10–P90",  # noqa: RUF001  # en dash is deliberate range typography in the chart legend
     )
     ax.plot([as_of_ts, horizon_ts], [p50, p50], color=P50_COLOR, lw=1.4, ls=":", label="anchor P50")
 
@@ -97,7 +102,7 @@ def render_anchor_chart(
 def _finish_axes(ax, fig: Figure, recent: pd.Series, band: tuple[float, float, float], title: str) -> None:
     ax.set_title(_truncate_title(title), fontsize=9, loc="left")
     ax.tick_params(axis="both", labelsize=8)
-    ax.grid(True, alpha=0.25, lw=0.5)
+    ax.grid(visible=True, alpha=0.25, lw=0.5)
     for lab in ax.get_xticklabels():
         lab.set_rotation(30)
         lab.set_ha("right")

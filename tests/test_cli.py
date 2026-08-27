@@ -335,9 +335,11 @@ class TestCliCreditFloor:
             def _crash(*_args: object, **_kwargs: object) -> None:
                 raise RuntimeError("forecasting blew up")
 
-            with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)):
-                with pytest.raises(RuntimeError, match="forecasting blew up"):
-                    cli_main()
+            with (
+                patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)),
+                pytest.raises(RuntimeError, match="forecasting blew up"),
+            ):
+                cli_main()
             telemetry.log_start.assert_called_once()
             telemetry.log_end_and_check_floor.assert_called_once()
 
@@ -403,13 +405,15 @@ class TestCliResearchFlush:
             self._record_two(forecaster_class.call_args.kwargs["research_sink"])
             raise RuntimeError("forecast loop blew up")
 
-        with _cli_main_test_mode(alertable_count=0):
-            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_crash)):
-                    # The original exception must still propagate: the flush is a rescue,
-                    # not a swallow.
-                    with pytest.raises(RuntimeError, match="forecast loop blew up"):
-                        cli_main()
+        with (
+            _cli_main_test_mode(alertable_count=0),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_crash)),
+            pytest.raises(RuntimeError, match="forecast loop blew up"),
+        ):
+            # The original exception must still propagate: the flush is a rescue,
+            # not a swallow.
+            cli_main()
 
         assert [r["qid"] for r in self._flushed_records(tmp_path)] == [43613, 50001]
 
@@ -423,10 +427,12 @@ class TestCliResearchFlush:
             self._record_two(forecaster_class.call_args.kwargs["research_sink"])
             return []
 
-        with _cli_main_test_mode(alertable_count=0):
-            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)):
-                    cli_main()
+        with (
+            _cli_main_test_mode(alertable_count=0),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)),
+        ):
+            cli_main()
 
         assert [r["qid"] for r in self._flushed_records(tmp_path)] == [43613, 50001]
 
@@ -440,11 +446,13 @@ class TestCliResearchFlush:
             raise RuntimeError("boom")
 
         forecaster_class = self._forecaster_class()
-        with _cli_main_test_mode(alertable_count=0):
-            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)):
-                    with pytest.raises(RuntimeError, match="boom"):
-                        cli_main()
+        with (
+            _cli_main_test_mode(alertable_count=0),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            cli_main()
 
         assert forecaster_class.call_args.kwargs["research_sink"] is None
         assert not (tmp_path / "research_outputs").exists()
@@ -1124,11 +1132,13 @@ class TestAlertableSummarySurvivesForecastFailure:
         forecaster_class = MagicMock(return_value=bot)
         forecaster_class.log_report_summary.side_effect = RuntimeError("1 errors occurred while forecasting")
 
-        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
-            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"):
-                    with pytest.raises(RuntimeError, match="errors occurred while forecasting"):
-                        cli_main()
+        with (
+            _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            pytest.raises(RuntimeError, match="errors occurred while forecasting"),
+        ):
+            cli_main()
 
         breakdown_lines = [m for m in caplog.messages if m.startswith("Run completed with")]
         assert len(breakdown_lines) == 1
@@ -1146,11 +1156,13 @@ class TestAlertableSummarySurvivesForecastFailure:
         forecaster_class = MagicMock(return_value=bot)
         forecaster_class.log_report_summary.side_effect = RuntimeError("2 errors occurred while forecasting")
 
-        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
-            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"):
-                    with pytest.raises(RuntimeError):
-                        cli_main()
+        with (
+            _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            pytest.raises(RuntimeError),
+        ):
+            cli_main()
 
         breakdown = next(m for m in caplog.messages if m.startswith("Run completed with"))
         assert breakdown.startswith("Run completed with 3 alertable")

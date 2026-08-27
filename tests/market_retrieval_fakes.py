@@ -439,7 +439,7 @@ async def fetch_snapshot(
     ranking: str | Callable[[str], str] = "[]",
     author: str = AUTHOR_JSON,
     as_of: datetime | None = None,
-    timeout: float = 5.0,
+    timeout: float = 5.0,  # noqa: ASYNC109  # mirrors the production fetch_market_snapshot timeout parameter
     configs: list[dict] | None = None,
 ) -> MarketSnapshot:
     """One snapshot through the real pipeline with both LLM stages stubbed."""

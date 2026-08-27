@@ -746,7 +746,10 @@ def _seeded_replay_cache(tmp_path) -> AblationCache:
 
 
 class TestLoadReplayDatasetFromSeededCache:
-    def test_loads_one_record_per_type(self, _seeded_replay_cache: AblationCache) -> None:
+    def test_loads_one_record_per_type(
+        self,
+        _seeded_replay_cache: AblationCache,  # noqa: PT019  # value is consumed, not merely requested
+    ) -> None:
         # Run under no_network() to also exercise the zero-API guarantee — pure
         # disk reads must never touch the network.
         with no_network():
@@ -756,7 +759,10 @@ class TestLoadReplayDatasetFromSeededCache:
         assert len(dataset.mc) == 1
         assert len(dataset.numeric) == 1
 
-    def test_binary_record_shape_and_outcome(self, _seeded_replay_cache: AblationCache) -> None:
+    def test_binary_record_shape_and_outcome(
+        self,
+        _seeded_replay_cache: AblationCache,  # noqa: PT019  # value is consumed, not merely requested
+    ) -> None:
         with no_network():
             dataset = load_replay_dataset(_seeded_replay_cache)
         record = dataset.binary[0]
@@ -769,7 +775,10 @@ class TestLoadReplayDatasetFromSeededCache:
         # No structured JSON block in the rationale -> no reconstructed p_math.
         assert record.p_maths == []
 
-    def test_mc_record_shape_and_correct_index(self, _seeded_replay_cache: AblationCache) -> None:
+    def test_mc_record_shape_and_correct_index(
+        self,
+        _seeded_replay_cache: AblationCache,  # noqa: PT019  # value is consumed, not merely requested
+    ) -> None:
         with no_network():
             dataset = load_replay_dataset(_seeded_replay_cache)
         record = dataset.mc[0]
@@ -784,7 +793,10 @@ class TestLoadReplayDatasetFromSeededCache:
             assert set(vec) == {"Red", "Blue"}
             assert sum(vec.values()) == pytest.approx(1.0)
 
-    def test_numeric_record_shape_and_resolution(self, _seeded_replay_cache: AblationCache) -> None:
+    def test_numeric_record_shape_and_resolution(
+        self,
+        _seeded_replay_cache: AblationCache,  # noqa: PT019  # value is consumed, not merely requested
+    ) -> None:
         with no_network():
             dataset = load_replay_dataset(_seeded_replay_cache)
         record = dataset.numeric[0]
@@ -799,7 +811,10 @@ class TestLoadReplayDatasetFromSeededCache:
             assert len(cdf) == 201
             assert all(isinstance(p, Percentile) for p in cdf)
 
-    def test_loaded_records_score_finite_end_to_end(self, _seeded_replay_cache: AblationCache) -> None:
+    def test_loaded_records_score_finite_end_to_end(
+        self,
+        _seeded_replay_cache: AblationCache,  # noqa: PT019  # value is consumed, not merely requested
+    ) -> None:
         # The whole point of the loader is feeding the scorers; confirm the
         # seeded records produce finite scores across every config.
         with no_network():
@@ -864,7 +879,7 @@ class TestResolutionToFloat:
         with no_network():
             dataset = load_replay_dataset(cache)
         assert len(dataset.numeric) == 1
-        # upper_bound (100.0) + 1.0
+        # Out-of-bounds resolution: one unit above the 100.0 upper bound.
         assert dataset.numeric[0].resolution_value == pytest.approx(101.0)
 
 

@@ -124,7 +124,7 @@ class AggregationPipeline:
         base_predictions = [stacking.strip_model_tag(pred.reasoning) for pred in reasoned_predictions]
 
         if self.stacking_randomize_order:
-            combined = list(zip(base_predictions, reasoned_predictions))
+            combined = list(zip(base_predictions, reasoned_predictions, strict=True))
             random.shuffle(combined)
             base_predictions = [bp for bp, _ in combined]
             reasoned_predictions = [rp for _, rp in combined]

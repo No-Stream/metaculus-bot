@@ -220,7 +220,7 @@ def _fifty_two_week_line(series: pd.Series, ceiling: date, last: float) -> str:
     high = float(window.max())
     span = high - low
     pct = f"{(last - low) / span * 100:.0f}% of the way up the range" if span > 0 else "range is flat"
-    return f"- {label}: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"
+    return f"- {label}: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"  # noqa: RUF001  # en dash is deliberate range typography in rendered research
 
 
 def _realized_vol_line(series: pd.Series, clock: SeriesClock) -> str | None:
@@ -430,7 +430,7 @@ def _render_spread(
     date_b = pd.DatetimeIndex(series_b.index)[-1].strftime("%Y-%m-%d")
     parts: list[str] = [
         f"**Relative-return spread: {route.label} vs {route.label_b}** "
-        f"(ret[{route.label}] − ret[{route.label_b}] over the forecast window, in percentage points)",
+        f"(ret[{route.label}] − ret[{route.label_b}] over the forecast window, in percentage points)",  # noqa: RUF001  # minus sign is deliberate math typography in rendered research
         f"- {route.label} latest: {_fmt(last_a)} (as of {date_a})",
         f"- {route.label_b} latest: {_fmt(last_b)} (as of {date_b})",
     ]

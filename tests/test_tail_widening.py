@@ -1,6 +1,7 @@
 import math
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -46,7 +47,7 @@ def _make_question(lower=0.0, upper=100.0, open_lower=False, open_upper=False):
 def _standard_percentiles(values: Sequence[float]) -> list[Percentile]:
     ps = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
     assert len(values) == len(ps)
-    return [Percentile(percentile=p, value=float(v)) for p, v in zip(ps, values)]
+    return [Percentile(percentile=p, value=float(v)) for p, v in zip(ps, values, strict=True)]
 
 
 class TestTailWideningUnit:
@@ -86,14 +87,14 @@ class TestTailWideningUnit:
         """Negative k_tail is nonsense; must fail fast per repo fail-fast convention."""
         q = _make_question(0.0, 100.0, False, False)
         base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="narrowing is not implemented"):
             widen_declared_percentiles(base, q, k_tail=-1.0, tail_start=0.2, span_floor_gamma=0.0)
 
     def test_span_floor_gamma_negative_raises(self):
         """Negative span_floor_gamma produces nonsense; must fail fast."""
         q = _make_question(0.0, 100.0, False, False)
         base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="must be >= 0"):
             widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=-0.5)
 
     def test_span_floor_gamma_zero_matches_one_on_real_shapes(self):
@@ -122,7 +123,7 @@ class TestTailWideningUnit:
             out_one = widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=1.0)
             vals_zero = [p.value for p in out_zero]
             vals_one = [p.value for p in out_one]
-            for a, b in zip(vals_zero, vals_one):
+            for a, b in zip(vals_zero, vals_one, strict=True):
                 assert math.isclose(a, b, rel_tol=0, abs_tol=1e-12), (values, vals_zero, vals_one)
 
     def test_closed_bounds_widening_increases_tail_spans(self):
@@ -155,10 +156,10 @@ class TestTailWideningUnit:
         # Bounds respected and strictly increasing
         vals = [pp.value for pp in p]
         assert all(0.0 <= v <= 100.0 for v in vals)
-        assert all(b > a for a, b in zip(vals, vals[1:])), vals
+        assert all(b > a for a, b in pairwise(vals)), vals
 
     @pytest.mark.parametrize(
-        "open_lower, open_upper",
+        ("open_lower", "open_upper"),
         [
             (False, True),  # lower-bounded
             (True, False),  # upper-bounded
@@ -173,7 +174,7 @@ class TestTailWideningUnit:
         assert math.isclose(next(p.value for p in out if math.isclose(p.percentile, 0.5)), 50.0, abs_tol=1e-9)
         vals = [pp.value for pp in out]
         assert all(L <= v <= U for v in vals)
-        assert all(b > a for a, b in zip(vals, vals[1:])), vals
+        assert all(b > a for a, b in pairwise(vals)), vals
 
     def test_span_floor_enforced(self):
         q = _make_question(0.0, 100.0, False, False)
@@ -187,7 +188,7 @@ class TestTailWideningUnit:
         assert (_get(out, 0.05) - _get(out, 0.025)) >= (_get(out, 0.10) - _get(out, 0.05)) - 1e-12
         assert (_get(out, 0.975) - _get(out, 0.95)) >= (_get(out, 0.95) - _get(out, 0.90)) - 1e-12
         vals = [pp.value for pp in out]
-        assert all(b > a for a, b in zip(vals, vals[1:])), vals
+        assert all(b > a for a, b in pairwise(vals)), vals
 
 
 class TestTailWideningIntegration:
@@ -260,4 +261,4 @@ class TestTailWideningIntegration:
         cdf = result.prediction_value.cdf  # type: ignore[attr-defined]
         probs = [p.percentile for p in cdf]
         assert len(cdf) == 101
-        assert all(a <= b for a, b in zip(probs[:-1], probs[1:]))
+        assert all(a <= b for a, b in pairwise(probs))

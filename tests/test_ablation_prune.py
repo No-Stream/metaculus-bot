@@ -483,7 +483,7 @@ async def test_invoke_claude_redactor_uses_correct_flags(monkeypatch: pytest.Mon
         await asyncio.sleep(0)
         proc = MagicMock()
 
-        async def communicate(input=None):
+        async def communicate(input=None):  # noqa: A002  # mirrors subprocess API's keyword name
             captured["stdin"] = input
             await asyncio.sleep(0)
             return b'{"results": []}', b""
@@ -951,7 +951,7 @@ async def test_invoke_claude_redactor_timeout_kills_subprocess(
         proc.pid = 12345
         proc.returncode = None
 
-        async def slow_communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+        async def slow_communicate(input: bytes | None = None) -> tuple[bytes, bytes]:  # noqa: A002  # mirrors subprocess API's keyword name
             await asyncio.sleep(10)  # forces the wait_for to time out
             return b"", b""
 
@@ -974,12 +974,14 @@ async def test_invoke_claude_redactor_timeout_kills_subprocess(
         fake_create_subprocess_exec,
     )
 
-    with caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.prune"):
-        with pytest.raises(asyncio.TimeoutError):
-            # timeout_seconds is typed as int; cast a tiny float through int(0)
-            # which still triggers wait_for's TimeoutError immediately because
-            # slow_communicate awaits 10 seconds.
-            await _invoke_claude_redactor("any prompt", timeout_seconds=0)
+    with (
+        caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.prune"),
+        pytest.raises(asyncio.TimeoutError),
+    ):
+        # timeout_seconds is typed as int; cast a tiny float through int(0)
+        # which still triggers wait_for's TimeoutError immediately because
+        # slow_communicate awaits 10 seconds.
+        await _invoke_claude_redactor("any prompt", timeout_seconds=0)
 
     assert kill_calls["n"] == 1, f"proc.kill() should fire exactly once on timeout; got {kill_calls['n']}"
     assert wait_calls["n"] == 1, "proc.wait() should be awaited after kill so the child is reaped"
@@ -1044,7 +1046,8 @@ async def test_process_batch_splits_oversized_prompt(
 
     # Recursive split should have produced 2 single-qid invocations
     # (no successful 2-qid call because the original prompt was over the limit).
-    assert [5000] in invocations and [5001] in invocations
+    assert [5000] in invocations
+    assert [5001] in invocations
     assert all(len(ids) == 1 for ids in invocations), (
         f"expected only single-qid invocations after split; saw batch sizes {[len(i) for i in invocations]}"
     )

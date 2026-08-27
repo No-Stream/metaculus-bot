@@ -132,7 +132,7 @@ def _initial_normal_guess(items: list[tuple[float, float]]) -> tuple[float, floa
         p90 = next(v for p, v in items if p == 0.9)
         sigma_guess = max((p90 - p10) / _P10_P90_Z_GAP, 1e-6)
         return mu_guess, sigma_guess
-    # Fallback: interpolate at ±1σ under the normal (0.1587 / 0.8413).
+    # Fallback: interpolate at +/-1 sigma under the normal (0.1587 / 0.8413).
     lo = float(np.interp(0.1587, probs, vals))
     hi = float(np.interp(0.8413, probs, vals))
     sigma_guess = max((hi - lo) / 2.0, 1e-6)
@@ -207,15 +207,8 @@ def out_of_bounds_mass(
     if lower_bound is not None and upper_bound is not None and not (lower_bound < upper_bound):
         raise ValueError(f"lower_bound {lower_bound} must be < upper_bound {upper_bound}")
 
-    if lower_bound is None:
-        prob_below = 0.0
-    else:
-        prob_below = eval_cdf(fit, lower_bound)
-
-    if upper_bound is None:
-        prob_above = 0.0
-    else:
-        prob_above = 1.0 - eval_cdf(fit, upper_bound)
+    prob_below = 0.0 if lower_bound is None else eval_cdf(fit, lower_bound)
+    prob_above = 0.0 if upper_bound is None else 1.0 - eval_cdf(fit, upper_bound)
 
     interior = max(0.0, 1.0 - prob_below - prob_above)
     return TailMassResult(

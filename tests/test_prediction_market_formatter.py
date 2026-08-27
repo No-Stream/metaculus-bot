@@ -183,7 +183,8 @@ class TestChildRenderMarker:
         """The field the whole marker exists for, on both places a price can be refused."""
         family = self._family(4)
         family.price_withheld = True
-        family.children = family.children + (
+        family.children = (
+            *family.children,
             MarketChild(title="no book", quote_low=0.0, quote_high=1.0, price_withheld=True),
         )
 

@@ -78,7 +78,7 @@ class TestUnitMismatchFailsShut:
             list[Percentile], [SimpleNamespace(percentile=p.percentile, value="not-a-number") for p in _standard_13()]
         )
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="could not convert string to float"):
             detect_unit_mismatch(broken, question)
 
     def test_missing_value_attribute_propagates(self):

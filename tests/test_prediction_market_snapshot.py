@@ -566,7 +566,8 @@ class TestFetchMarketSnapshot:
         expected = ",".join(f"{venue}:{index}@{rank}" for rank, (venue, index) in enumerate(first_of.items()))
 
         assert f"rendered={expected}" in line, line
-        assert len(first_of) > 1 and any(index > 0 for index in first_of.values()), (
+        assert len(first_of) > 1
+        assert any(index > 0 for index in first_of.values()), (
             f"the fixture must span several venue blocks so a nonzero index is under test; got {first_of}"
         )
 

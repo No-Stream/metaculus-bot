@@ -835,7 +835,7 @@ class TestMultipleChoiceOptionProbs:
 
 class TestDiscreteCountValidators:
     def test_beta_binom_without_ceiling_raises(self) -> None:
-        with pytest.raises(ValidationError, match="beta_binom_ceiling.*requires ceiling"):
+        with pytest.raises(ValidationError, match=r"beta_binom_ceiling.*requires ceiling"):
             DiscreteCountStructured(
                 question_type="discrete_count",
                 mean_estimate=3.0,

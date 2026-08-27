@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from itertools import pairwise
 
 from forecasting_tools import NumericDistribution
 from forecasting_tools.data_models.numeric_report import Percentile
@@ -28,8 +29,8 @@ def log_cdf_diagnostics_on_error(prediction: NumericDistribution, question: Nume
         }
         vals = [float(p.value) for p in declared]
         prcs = [float(p.percentile) for p in declared]
-        deltas_val = [b - a for a, b in zip(vals, vals[1:])]
-        deltas_pct = [b - a for a, b in zip(prcs, prcs[1:])]
+        deltas_val = [b - a for a, b in pairwise(vals)]
+        deltas_pct = [b - a for a, b in pairwise(prcs)]
 
         logger.error(
             "Numeric CDF spacing assertion for Q %s | URL %s | error=%s\n"
@@ -40,7 +41,7 @@ def log_cdf_diagnostics_on_error(prediction: NumericDistribution, question: Nume
             getattr(question, "page_url", None),
             error,
             bounds,
-            [(p, v) for p, v in zip(prcs, vals)],
+            [(p, v) for p, v in zip(prcs, vals, strict=True)],
             deltas_val,
             deltas_pct,
         )

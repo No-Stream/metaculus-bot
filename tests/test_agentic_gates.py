@@ -799,7 +799,10 @@ class TestProvenanceGate:
                                 "findings": [
                                     _finding(
                                         "https://agency.example/report",
-                                        quote="‘The rate was 4.1 percent.’",
+                                        # The curly single quotes ARE the fixture: this test pins that
+                                        # glyph deletion converges when the two sides use different
+                                        # quote families, so they must not be flattened to ASCII.
+                                        quote="‘The rate was 4.1 percent.’",  # noqa: RUF001
                                     )
                                 ]
                             },

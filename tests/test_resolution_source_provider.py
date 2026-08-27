@@ -145,10 +145,7 @@ class FakeSession:
                 idx = min(self._call_counts[prefix], len(handler_list) - 1)
                 self._call_counts[prefix] += 1
                 handler = handler_list[idx]
-                if callable(handler) and not isinstance(handler, FakeResponse):
-                    inner = handler(url)
-                else:
-                    inner = handler
+                inner = handler(url) if callable(handler) and not isinstance(handler, FakeResponse) else handler
                 host = urlparse(url).netloc
                 return _TrackingResponse(inner, host, self)
         raise AssertionError(f"no handler for URL {url}")
@@ -429,7 +426,9 @@ class TestStripHtmlTags:
         out = strip_html_tags(self._VUUVZ_ROW)
 
         assert "Emerson College" in out
-        assert "<a " not in out and "</a>" not in out and "style=" not in out
+        assert "<a " not in out
+        assert "</a>" not in out
+        assert "style=" not in out
         assert len(out) < len(self._VUUVZ_ROW) / 2.5
 
     @pytest.mark.parametrize(
@@ -815,7 +814,8 @@ class TestFetchOne:
         )
         result = await _fetch_one(session, "https://json.example.com/kev", {})
         assert result.status == "success"
-        assert result.content_type is not None and "json" in result.content_type
+        assert result.content_type is not None
+        assert "json" in result.content_type
         assert result.text.startswith('{"vulnerabilities')
         # Truncated -> marker appears, total bounded by cap.
         assert f"[truncated at {cap} chars — full source at https://json.example.com/kev]" in result.text
@@ -847,7 +847,7 @@ class TestFetchOne:
     async def test_a_declared_charset_body_decodes_instead_of_mojibaking(self):
         """`charset=` was parsed for ROUTING and then ignored for decoding, so a Windows-1252 CSV
         rendered as grading evidence with replacement characters where its punctuation had been."""
-        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")
+        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")  # noqa: RUF001  # cp1252 fixture
         session = FakeSession(
             {
                 "https://poll.example.com/d.csv": FakeResponse(
@@ -859,7 +859,7 @@ class TestFetchOne:
         result = await _fetch_one(session, "https://poll.example.com/d.csv", {})
 
         assert result.status == "success"
-        assert "O’Brien Research" in result.text
+        assert "O’Brien Research" in result.text  # noqa: RUF001  # cp1252 fixture
         assert "�" not in result.text
 
     async def test_an_undecodable_body_is_refused_rather_than_rendered_as_mojibake(self):
@@ -887,7 +887,8 @@ class TestFetchOne:
 
         assert result.status == "success"
         assert "Emerson College" in result.text
-        assert "<a " not in result.text and "style=" not in result.text
+        assert "<a " not in result.text
+        assert "style=" not in result.text
 
     async def test_json_bodies_keep_their_angle_brackets(self):
         """A JSON body's angle brackets sit inside string values that ARE the data, so the strip is
@@ -1253,7 +1254,7 @@ class TestIsPublicHttpUrl:
 
     async def test_rejects_hostname_resolving_to_private(self, monkeypatch):
         # Patch getaddrinfo to return a private IP for the hostname.
-        async def _fake_ainfo(host, port, family=0, type=0, proto=0, flags=0):
+        async def _fake_ainfo(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002  # mirrors socket.getaddrinfo
             del host, port, family, type, proto, flags
             return [_addrinfo("10.0.0.5")]
 

@@ -14,17 +14,16 @@ def _make_mc_question(options, cp_probs):
         "forecast_values": list(cp_probs),
     }
     api_q = {"aggregations": {"recency_weighted": {"latest": latest}}}
-    question = SimpleNamespace(
+    return SimpleNamespace(
         id_of_question=123,
         options=list(options),
         api_json={"question": api_q},
     )
-    return question
 
 
 def _make_mc_prediction(options, probs):
     # Build a minimal predicted_options list with option and probability
-    opts = [SimpleNamespace(option=o, probability=float(p)) for o, p in zip(options, probs)]
+    opts = [SimpleNamespace(option=o, probability=float(p)) for o, p in zip(options, probs, strict=False)]
     return SimpleNamespace(predicted_options=opts)
 
 
@@ -43,7 +42,8 @@ def test_mc_scoring_prefers_matching_distribution():
     rep_mismatch = SimpleNamespace(question=q, prediction=pred_mismatch)
     score_mismatch = calculate_multiple_choice_baseline_score(rep_mismatch)
 
-    assert score_match is not None and score_mismatch is not None
+    assert score_match is not None
+    assert score_mismatch is not None
     assert score_match > score_mismatch
 
 
@@ -74,7 +74,7 @@ class _Perc:
 
 class _NumericPred:
     def __init__(self, x, cdf):
-        self._cdf = [_Perc(v, p) for v, p in zip(x, cdf)]
+        self._cdf = [_Perc(v, p) for v, p in zip(x, cdf, strict=False)]
 
     @property
     def cdf(self):
@@ -97,5 +97,6 @@ def test_numeric_scoring_prefers_matching_distribution():
     rep_mismatch = SimpleNamespace(question=q, prediction=pred_mismatch)
     score_mismatch = calculate_numeric_baseline_score(rep_mismatch)
 
-    assert score_match is not None and score_mismatch is not None
+    assert score_match is not None
+    assert score_mismatch is not None
     assert score_match > score_mismatch

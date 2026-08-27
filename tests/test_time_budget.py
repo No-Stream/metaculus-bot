@@ -356,8 +356,10 @@ class TestFastPathProviderSelection:
             )
 
         fast_names, roomy_names = handed_downstream
-        assert "native_search" not in fast_names and "gemini_search" not in fast_names
-        assert "native_search" in roomy_names and "gemini_search" in roomy_names
+        assert "native_search" not in fast_names
+        assert "gemini_search" not in fast_names
+        assert "native_search" in roomy_names
+        assert "gemini_search" in roomy_names
 
     @pytest.mark.asyncio
     async def test_fast_path_with_nothing_configured_falls_back_to_the_empty_stub(self, monkeypatch):

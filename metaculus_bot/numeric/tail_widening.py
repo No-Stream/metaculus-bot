@@ -163,17 +163,14 @@ def widen_declared_percentiles(
     # Apply tail ramp widening
     k_delta = max(0.0, k_tail - 1.0)
     widened_y = []
-    for p, y in zip(p_vals, y_vals):
+    for p, y in zip(p_vals, y_vals, strict=True):
         w = _tail_weight(p, tail_start)
         k_eff = 1.0 + k_delta * w
         widened_y.append(y_m + k_eff * (y - y_m))
     widened_y_arr = np.array(widened_y, dtype=float)
 
     # Inverse transform back to x-space (or keep original if k_tail<=1)
-    if k_tail > 1.0:
-        widened_x = np.array([inv(y) for y in widened_y_arr], dtype=float)
-    else:
-        widened_x = x_vals.copy()
+    widened_x = np.array([inv(y) for y in widened_y_arr], dtype=float) if k_tail > 1.0 else x_vals.copy()
 
     # Clamp to numeric bounds
     widened_x = np.clip(widened_x, L, U)
@@ -259,7 +256,9 @@ def widen_declared_percentiles(
                 updated[i] = max(min_allowed, max_allowed)
 
     # Rebuild Percentile objects preserving original percentiles
-    result: list[Percentile] = [Percentile(value=float(v), percentile=float(p)) for v, p in zip(updated, p_vals)]
+    result: list[Percentile] = [
+        Percentile(value=float(v), percentile=float(p)) for v, p in zip(updated, p_vals, strict=True)
+    ]
 
     try:
         # Quick sanity: monotone increasing

@@ -273,11 +273,7 @@ def _body_is_document(body: bytes) -> bool:
     stripped = body.lstrip()
     if stripped.startswith(b"%PDF-"):
         return True
-    return (
-        stripped.startswith(b"\x89PNG\r\n\x1a\n")
-        or stripped.startswith(b"\xff\xd8\xff")
-        or stripped.startswith((b"GIF87a", b"GIF89a"))
-    )
+    return stripped.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a"))
 
 
 def _extract_links_from_html(html: str, base_url: str) -> list[str]:
@@ -782,7 +778,7 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
 
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     try:
-        from playwright.async_api import (
+        from playwright.async_api import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
             Error as PlaywrightError,
         )
         from playwright.async_api import async_playwright  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import

@@ -59,19 +59,19 @@ def _make_mc_question(qid: int = 2345) -> MultipleChoiceQuestion:
         Any,
     )
 
-    fields: dict[str, Any] = dict(
-        question_text="Which option?",
-        id_of_post=qid,
-        id_of_question=qid,
-        page_url=f"https://example.com/q/{qid}",
-        background_info="Background",
-        resolution_criteria="Resolves to one of the listed options.",
-        fine_print="",
-        options=["A", "B", "C"],
-        option_is_ordered=False,
-        open_time=_OPEN,
-        scheduled_resolution_time=_RESOLVE,
-    )
+    fields: dict[str, Any] = {
+        "question_text": "Which option?",
+        "id_of_post": qid,
+        "id_of_question": qid,
+        "page_url": f"https://example.com/q/{qid}",
+        "background_info": "Background",
+        "resolution_criteria": "Resolves to one of the listed options.",
+        "fine_print": "",
+        "options": ["A", "B", "C"],
+        "option_is_ordered": False,
+        "open_time": _OPEN,
+        "scheduled_resolution_time": _RESOLVE,
+    }
     return MultipleChoiceQuestion(**fields)
 
 
@@ -205,6 +205,7 @@ def test_serialize_numeric_prediction_value() -> None:
         for v, p in zip(
             [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0, 99.0],
             [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975],
+            strict=False,
         )
     ]
     q = _make_numeric_question()
@@ -309,7 +310,7 @@ async def test_payload_has_required_fields(
             parser_llm=parser_llm,
         )
 
-    for slug, payload in result.items():
+    for _slug, payload in result.items():
         assert "model" in payload
         assert "prediction_value" in payload
         assert "reasoning" in payload
@@ -677,6 +678,7 @@ async def test_runner_serializes_numeric_prediction_value(
         for v, p in zip(
             [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0, 99.0],
             [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975],
+            strict=False,
         )
     ]
     pchip_cdf = [i / 200 for i in range(201)]
@@ -747,6 +749,7 @@ async def test_one_serialize_failure_does_not_drop_other_forecaster_payloads(
         for v, p in zip(
             [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0, 99.0],
             [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975],
+            strict=False,
         )
     ]
     pchip_cdf = [i / 200 for i in range(201)]
@@ -1089,7 +1092,7 @@ async def test_run_one_forecaster_removes_notepad_after_make_prediction_raises(
         patch("metaculus_bot.ablation.forecasters._build_bot", return_value=bot),
         patch.object(TemplateForecaster, "_run_forecast_on_binary", new=boom),
     ):
-        slug, payload = await _run_one_forecaster(q, "research", one_llm, parser_llm, cache, semaphore=semaphore)
+        _slug, payload = await _run_one_forecaster(q, "research", one_llm, parser_llm, cache, semaphore=semaphore)
 
     # The forecast raised, so prediction_value is None and errors is populated.
     assert payload["prediction_value"] is None
@@ -1164,7 +1167,7 @@ async def test_run_one_forecaster_retries_on_rate_limit_then_succeeds(
         patch.object(TemplateForecaster, "_make_prediction", new=mock_make),
         patch("metaculus_bot.ablation.forecasters.asyncio.sleep", new=sleep_mock),
     ):
-        slug, payload = await _run_one_forecaster(
+        _slug, payload = await _run_one_forecaster(
             q,
             "research blob",
             one_llm,
@@ -1278,7 +1281,7 @@ async def test_run_one_forecaster_exhausts_retries_records_errors_no_raise(
         patch.object(TemplateForecaster, "_make_prediction", new=mock_make),
         patch("metaculus_bot.ablation.forecasters.asyncio.sleep", new=sleep_mock),
     ):
-        slug, payload = await _run_one_forecaster(
+        _slug, payload = await _run_one_forecaster(
             q,
             "research blob",
             one_llm,
@@ -1315,7 +1318,7 @@ async def test_run_one_forecaster_non_rate_limit_error_not_retried(
         patch.object(TemplateForecaster, "_make_prediction", new=mock_make),
         patch("metaculus_bot.ablation.forecasters.asyncio.sleep", new=sleep_mock),
     ):
-        slug, payload = await _run_one_forecaster(
+        _slug, payload = await _run_one_forecaster(
             q,
             "research blob",
             one_llm,
@@ -1471,7 +1474,7 @@ async def test_run_one_forecaster_enforces_soft_deadline_timeout(
     semaphore = asyncio.Semaphore(1)
     start = asyncio.get_event_loop().time()
     with patch.object(TemplateForecaster, "_make_prediction", new=stall):
-        slug, payload = await _run_one_forecaster(
+        _slug, payload = await _run_one_forecaster(
             q,
             "research blob",
             one_llm,

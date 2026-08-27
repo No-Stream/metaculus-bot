@@ -101,9 +101,9 @@ def _trim_with_notice(text: str, limit: int, notice: str, *, preserve_header: bo
 _RATIONALE_HEADER_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^##\s+R\d+:\s+Forecaster\s+\d+\s+Reasoning[ \t]*$")
 
 # The bot-injected "Model: openrouter/<provider>/<name>" attribution line that
-# opens each rationale body. Kept byte-stable because
-# performance_analysis/parsing.py (_R1_MODEL_RE, _REASONING_MODEL_PREFIX_RE)
-# keys per-model attribution on it — the exact line a naive header+tail trim
+# opens each rationale body. Kept byte-stable because the per-model attribution
+# regexes in performance_analysis/parsing.py — named _R1_MODEL_RE and
+# _REASONING_MODEL_PREFIX_RE — key on it: the exact line a naive header+tail trim
 # destroyed (measured: Forecaster 1's Model: line eaten in 29/29 July trims).
 _MODEL_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^Model:[ \t]*[^\n]*$")
 

@@ -203,4 +203,5 @@ async def test_full_pipeline_single_question_free_model():
     assert isinstance(report, ForecastReport)
     assert isinstance(report.prediction, float)
     assert 0.0 < report.prediction < 1.0
-    assert report.explanation and len(report.explanation) > 0
+    assert report.explanation
+    assert len(report.explanation) > 0

@@ -76,10 +76,7 @@ def _install_mocks(
 
     factory = gemini_factory or MagicMock(return_value=gemini_callable)
 
-    if isinstance(gap_blob, Exception):
-        gap_fill = AsyncMock(side_effect=gap_blob)
-    else:
-        gap_fill = AsyncMock(return_value=gap_blob)
+    gap_fill = AsyncMock(side_effect=gap_blob) if isinstance(gap_blob, Exception) else AsyncMock(return_value=gap_blob)
 
     monkeypatch.setattr("metaculus_bot.ablation.research.gemini_search_provider", factory)
     monkeypatch.setattr("metaculus_bot.ablation.research.run_gap_fill_pass", gap_fill)
@@ -109,7 +106,7 @@ async def test_cache_hit_short_circuits_gemini(
         gap_blob="should not be called",
     )
 
-    blob, meta = await run_gemini_only_research(question, cache)
+    blob, _meta = await run_gemini_only_research(question, cache)
 
     assert blob == "cached blob"
     factory.assert_not_called()
@@ -166,7 +163,7 @@ async def test_force_true_bypasses_cache(
         gap_blob="fresh gap addendum",
     )
 
-    blob, meta = await run_gemini_only_research(question, cache, force=True)
+    _blob, _meta = await run_gemini_only_research(question, cache, force=True)
 
     factory.assert_called_once()
     gemini_callable.assert_called_once()
@@ -238,7 +235,7 @@ async def test_gap_fill_skipped_when_first_pass_too_short(
 
     question = _make_question(qid=3)
     short_first_pass = "tiny"  # 4 chars, well below 200
-    gemini_callable, gap_fill, factory = _install_mocks(
+    _gemini_callable, gap_fill, _factory = _install_mocks(
         monkeypatch,
         gemini_blob=short_first_pass,
         gap_blob="should not be called",
@@ -443,7 +440,7 @@ async def test_is_benchmarking_threaded_to_gemini(
     question = _make_question(qid=10)
     long_first_pass = "first pass " * 30
 
-    gemini_callable, gap_fill, factory = _install_mocks(
+    _gemini_callable, gap_fill, factory = _install_mocks(
         monkeypatch,
         gemini_blob=long_first_pass,
         gap_blob="addendum",
@@ -706,7 +703,7 @@ async def test_run_gemini_only_research_skips_gap_fill_when_disabled(
 
     question = _make_question(qid=1600)
     long_first_pass = "first pass " * 30  # > 200 chars
-    gemini_callable, gap_fill, factory = _install_mocks(
+    _gemini_callable, gap_fill, _factory = _install_mocks(
         monkeypatch,
         gemini_blob=long_first_pass,
         gap_blob="should not be called",

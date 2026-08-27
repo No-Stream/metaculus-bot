@@ -317,8 +317,8 @@ class TestExceededSpreadThreshold:
         # Standard 11-percentile lists (raw 0-100 labels) on a [0, 100] range.
         # P10: |40-20|/100=0.20; P50: |60-40|/100=0.20; P90: |80-60|/100=0.20 > 0.15.
         std = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
-        model_a = [[p, v] for p, v in zip(std, [10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])]
-        model_b = [[p, v] for p, v in zip(std, [30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90])]
+        model_a = [[p, v] for p, v in zip(std, [10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70], strict=True)]
+        model_b = [[p, v] for p, v in zip(std, [30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90], strict=True)]
         record = {
             "type": "numeric",
             "per_model_numeric_percentiles": {"a": model_a, "b": model_b},
@@ -333,7 +333,7 @@ class TestExceededSpreadThreshold:
         # scoreable member. With the sparse member excluded only one map remains, no
         # spread is computable, and the verdict is None rather than a measured spread.
         std = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
-        dense = [[p, v] for p, v in zip(std, [10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])]
+        dense = [[p, v] for p, v in zip(std, [10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70], strict=True)]
         sparse_once = [[10.0, 40.0], [25.0, 50.0], [50.0, 60.0], [75.0, 70.0], [90.0, 80.0]]
         record = {
             "type": "numeric",
@@ -354,8 +354,8 @@ class TestExceededSpreadThreshold:
         # is identical between models, so a positional bug would see 0 and return False.
         vals_a = [5, 10, 15, 20, 30, 40, 50, 55, 70, 80, 85, 90, 95]
         vals_b = [5, 10, 15, 20, 30, 40, 90, 55, 70, 80, 85, 90, 95]
-        model_a = [[p, v] for p, v in zip(labels, vals_a)]
-        model_b = [[p, v] for p, v in zip(labels, vals_b)]
+        model_a = [[p, v] for p, v in zip(labels, vals_a, strict=True)]
+        model_b = [[p, v] for p, v in zip(labels, vals_b, strict=True)]
         record = {
             "type": "numeric",
             "per_model_numeric_percentiles": {"a": model_a, "b": model_b},

@@ -809,7 +809,8 @@ class TestDatasetMarkupStripping:
         result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
 
         assert result.status == "success"
-        assert "Pollster 000" in result.text and "Pollster 004" in result.text
+        assert "Pollster 000" in result.text
+        assert "Pollster 004" in result.text
         assert "<a " not in result.text
         assert "style=" not in result.text
         assert "nofollow" not in result.text

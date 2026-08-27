@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from itertools import pairwise
 
 import pytest
 
@@ -61,11 +62,11 @@ class TestPoolBinary:
         assert 0.0 < result < 1.0
 
     def test_rejects_weight_below_zero(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"w must be in \[0, 1\]"):
             pool_binary(p_model=0.3, p_math=0.8, w=-0.1)
 
     def test_rejects_weight_above_one(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"w must be in \[0, 1\]"):
             pool_binary(p_model=0.3, p_math=0.8, w=1.1)
 
 
@@ -92,7 +93,7 @@ class TestReconstructPMath:
 
     def test_synthetic_evidence_matches_hand_computed_log_odds(self):
         # base 0.3; one up/moderate (LR=3.0); one down/weak (LR=1.5 -> 1/1.5).
-        # log_odds = log(0.3/0.7) + log(3.0) + log(1/1.5)
+        # log_odds = log(0.3/0.7) + log(3.0) + log(1/1.5)  # noqa: ERA001  # hand-computed log-odds arithmetic, not dead code
         #          = log(0.3/0.7 * 3.0/1.5) = log(0.857142857) -> p = 0.461538461
         evidence = [
             _Evidence(direction="up", strength="moderate"),
@@ -143,7 +144,7 @@ class TestAdaptiveWeight:
 
     def test_monotone_nondecreasing_in_divergence(self):
         weights = [adaptive_weight(d) for d in (0.0, 0.5, 1.0, 2.0, 4.0)]
-        assert all(b >= a for a, b in zip(weights, weights[1:]))
+        assert all(b >= a for a, b in pairwise(weights))
 
     def test_clamped_to_max_weight(self):
         assert adaptive_weight(1e6, max_weight=0.5) == pytest.approx(0.5)
@@ -152,5 +153,5 @@ class TestAdaptiveWeight:
         assert adaptive_weight(0.3, threshold=1.0) == pytest.approx(0.0)
 
     def test_rejects_max_weight_out_of_range(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"max_weight must be in \[0, 1\]"):
             adaptive_weight(1.0, max_weight=1.5)

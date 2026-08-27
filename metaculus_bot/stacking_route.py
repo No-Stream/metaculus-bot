@@ -240,7 +240,7 @@ async def _targeted_research_for_crux(
             question.id_of_question,
         )
         return ""
-    except Exception:  # noqa: HARNESS-SCAN-EXEMPT-broad-except  # enrichment-only; degrade to base research
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # enrichment-only; degrade to base research
         bot._conditional_stacking_crux_failures += 1
         logger.exception("Disagreement crux extraction failed, skipping targeted research")
         return ""
@@ -252,7 +252,7 @@ async def _targeted_research_for_crux(
             run_targeted_search(crux, question.question_text, is_benchmarking=bot.is_benchmarking),
             timeout=_enrichment_timeout(NATIVE_SEARCH_WALL_TIMEOUT, time_budget),
         )
-    except Exception:  # noqa: HARNESS-SCAN-EXEMPT-broad-except  # enrichment-only; degrade to base research
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # enrichment-only; degrade to base research
         bot._conditional_stacking_search_failures += 1
         logger.exception("Targeted search failed, proceeding with base research only")
         return ""

@@ -126,8 +126,8 @@ def get_lineup(name: str) -> tuple[list[GeneralLlm], list[str]]:
 #   slot. Removed in task #16.
 # * ``openrouter/z-ai/glm-4.5-air:free`` removed 2026-05-14 (Phase A.3 Package
 #   3b) after qid 43171: GLM hallucinated TSA partial-week data and emitted a
-#   "normal" distribution with σ=13K vs ensemble median σ ~965K (1.3% of
-#   ensemble σ). Arm B's stacker over-weighted GLM and saturated the schema
+#   "normal" distribution with sigma=13K vs ensemble median sigma ~965K (1.3% of
+#   ensemble sigma). Arm B's stacker over-weighted GLM and saturated the schema
 #   floor (-220 log score). User signed off post-Phase-A.2.
 # * ``qwen3-next-80b-a3b-instruct:free`` is retained despite chronic Venice
 #   upstream rate-limiting — that's what the ``patient`` rate-limit-mode (CLI

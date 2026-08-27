@@ -108,7 +108,7 @@ def _make_mc_report(option_probs: dict[str, float]) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# score_arm_for_qid (3-arm)
+# Tests for the 3-arm score_arm_for_qid path
 # ---------------------------------------------------------------------------
 
 
@@ -394,7 +394,7 @@ class TestScoreArmForQid:
 
 class TestBootstrapMeanCi:
     def test_bootstrap_mean_ci_recovers_known_mean(self):
-        rng = random.Random(123)
+        rng = random.Random(123)  # noqa: S311  # non-cryptographic test data
         deltas = [rng.gauss(0.5, 0.1) for _ in range(100)]
 
         mean, ci_low, ci_high = bootstrap_mean_ci(deltas, n_bootstrap=2000, seed=1)

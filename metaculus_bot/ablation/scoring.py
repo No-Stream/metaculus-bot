@@ -63,7 +63,8 @@ COMPARISONS_5ARM: tuple[str, ...] = (
 # remaining four pit the deterministic mean against each LLM/pdf arm. The arm
 # order in score_arm_for_qid for this mode is
 # [stack, stack_aug, pdf_min1, pdf_min2, median, mean].
-COMPARISONS_6ARM: tuple[str, ...] = COMPARISONS_5ARM + (
+COMPARISONS_6ARM: tuple[str, ...] = (
+    *COMPARISONS_5ARM,
     "mean-stack",
     "mean-stack_aug",
     "mean-pdf_min1",

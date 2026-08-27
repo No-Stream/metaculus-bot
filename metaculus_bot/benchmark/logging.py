@@ -20,7 +20,7 @@ def log_bot_lineup(bots: Sequence[ForecastBot]) -> None:
                 stacker = stacker_llm.model if stacker_llm else "<missing>"
                 base_f = getattr(b, "_forecaster_llms", [])
                 base_names = [m.model for m in base_f]
-                short = base_names if len(base_names) <= 6 else base_names[:6] + ["..."]
+                short = base_names if len(base_names) <= 6 else [*base_names[:6], "..."]
                 logger.info(
                     "- Bot %d/%d | name=%s | strategy=STACKING | R×P=%s×%s | stacker=%s | base_forecasters(%d)=%s | final_outputs_per_q=1",
                     idx,

@@ -410,7 +410,7 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
     Returns:
         Baseline score or None if cannot be calculated
     """
-    global _MC_ATTEMPTS, _MC_MISSING_COMMUNITY, _MC_SUCCESSES
+    global _MC_ATTEMPTS, _MC_SUCCESSES
 
     # Check cache first to avoid duplicate calculations
     q_id = getattr(report.question, "id_of_question", None)
@@ -483,7 +483,7 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
         K = max(1, len(bot_probs))
         lnK = math.log(K) if K > 1 else 1.0
         sum_ln = 0.0
-        for c_i, p_i in zip(community_probs, bot_probs):
+        for c_i, p_i in zip(community_probs, bot_probs, strict=True):
             sum_ln += c_i * math.log(max(p_i, eps))
         final_score = 100.0 * (sum_ln / lnK + 1.0)
         _MC_SUCCESSES += 1
@@ -612,15 +612,15 @@ def calculate_numeric_baseline_score(report: Any, cache: dict | None = None) -> 
     Returns:
         Baseline score or None if cannot be calculated (expected range: ~[-100, +20])
     """
-    global _NUMERIC_PMF_ATTEMPTS, _NUMERIC_PMF_SUCCESSES
-    global _NUMERIC_FALLBACK_ATTEMPTS, _NUMERIC_FALLBACK_SUCCESSES
+    global _NUMERIC_PMF_ATTEMPTS
+    global _NUMERIC_FALLBACK_ATTEMPTS
 
     # Check cache first to avoid duplicate calculations
     q_id = getattr(report.question, "id_of_question", None)
     if cache is not None and q_id is not None:
         cache_key = (q_id, "numeric")
         if cache_key in cache:
-            cached_score, diagnostics_logged = cache[cache_key]
+            cached_score, _diagnostics_logged = cache[cache_key]
             if cached_score is not None:
                 logger.debug(f"Numeric Question {q_id}: using cached baseline score {cached_score:.2f}")
                 return cached_score
@@ -809,7 +809,7 @@ def _calculate_relative_numeric_score(
 def patch_multiple_choice_scoring():
     """Monkey patch MultipleChoiceReport.expected_baseline_score"""
     try:
-        from forecasting_tools.data_models.multiple_choice_report import (
+        from forecasting_tools.data_models.multiple_choice_report import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
             MultipleChoiceReport,
         )
 
@@ -829,7 +829,9 @@ def patch_multiple_choice_scoring():
 def patch_numeric_scoring():
     """Monkey patch NumericReport.expected_baseline_score"""
     try:
-        from forecasting_tools.data_models.numeric_report import NumericReport
+        from forecasting_tools.data_models.numeric_report import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
+            NumericReport,
+        )
 
         def expected_baseline_score_numeric(self) -> float | None:
             return calculate_numeric_baseline_score(self)
@@ -847,10 +849,14 @@ def patch_numeric_scoring():
 def patch_error_handling():
     """Monkey patch ForecastReport.calculate_average_expected_baseline_score to fix UnboundLocalError"""
     try:
-        from collections.abc import Sequence
+        from collections.abc import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
+            Sequence,
+        )
 
-        import typeguard
-        from forecasting_tools.data_models.forecast_report import ForecastReport
+        import typeguard  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
+        from forecasting_tools.data_models.forecast_report import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
+            ForecastReport,
+        )
 
         @staticmethod
         def calculate_average_expected_baseline_score_fixed(
@@ -902,7 +908,7 @@ def log_score_scale_validation(benchmarks: list[Any]) -> None:
         benchmarks: List of BenchmarkForBot objects
     """
     try:
-        from forecasting_tools.data_models.questions import (
+        from forecasting_tools.data_models.questions import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
             BinaryQuestion,
             MultipleChoiceQuestion,
             NumericQuestion,

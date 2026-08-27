@@ -282,7 +282,10 @@ assert CLAUSE_DIVERGENCE_MARKER_RE.search(format_clause_divergence_marker(-4.0))
 )
 _forecasters_used_match = FORECASTERS_USED_MARKER_RE.search(format_forecasters_used_marker(2, 3))
 assert _forecasters_used_match is not None, "FORECASTERS_USED_MARKER_RE does not match its own formatter output"
-assert _forecasters_used_match.group(1) == "2" and _forecasters_used_match.group(2) == "3", (
+assert _forecasters_used_match.group(1) == "2", (
+    f"FORECASTERS_USED_MARKER_RE captured {_forecasters_used_match.groups()!r}; expected ('2', '3')"
+)
+assert _forecasters_used_match.group(2) == "3", (
     f"FORECASTERS_USED_MARKER_RE captured {_forecasters_used_match.groups()!r}; expected ('2', '3')"
 )
 del _forecasters_used_match

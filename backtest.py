@@ -324,7 +324,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
         save_backtest_data(question_set, results, output_dir="backtests")
 
         logger.info(f"\nTotal Cost: {cost_manager.current_usage}")
-        logger.info("\n" + "=" * 60)
+        logger.info("\n%s", "=" * 60)
         logger.info("BACKTEST REPORT")
         logger.info("=" * 60)
         logger.info(report_text)

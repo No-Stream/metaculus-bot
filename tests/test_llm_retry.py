@@ -95,7 +95,7 @@ def _fake_clock(start: float, after: float) -> Callable[[], float]:
 
 
 @pytest.fixture(autouse=True)
-def _no_real_sleep(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+def no_real_sleep(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     """Patch asyncio.sleep inside llm_retry so backoffs don't slow the suite.
 
     Returned so individual tests can assert call args. The patch targets the
@@ -111,22 +111,22 @@ async def test_fast_timeout_retries_then_succeeds() -> None:
     """A fast (sub-elapsed-gate) litellm_exc.Timeout retries and the next call wins."""
     awaitable = AsyncMock(side_effect=[_timeout(), "ok"])
 
-    out = await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+    out = await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t")
 
     assert out == "ok"
     assert awaitable.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_success_on_first_try_calls_once_no_sleep(_no_real_sleep: AsyncMock) -> None:
+async def test_success_on_first_try_calls_once_no_sleep(no_real_sleep: AsyncMock) -> None:
     """Happy path: one call, no backoff sleep."""
     awaitable = AsyncMock(return_value="ok")
 
-    out = await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+    out = await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t")
 
     assert out == "ok"
     assert awaitable.await_count == 1
-    _no_real_sleep.assert_not_awaited()
+    no_real_sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -143,7 +143,7 @@ async def test_slow_transient_failure_not_retried() -> None:
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
     with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(litellm_exc.Timeout):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t")
 
     assert awaitable.await_count == 1
 
@@ -182,7 +182,7 @@ async def test_non_transient_exception_not_retried() -> None:
     awaitable = AsyncMock(side_effect=litellm_exc.AuthenticationError("bad key", model="m", llm_provider="openrouter"))
 
     with pytest.raises(litellm_exc.AuthenticationError):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t")
 
     assert awaitable.await_count == 1
 
@@ -192,8 +192,8 @@ async def test_value_error_not_retried() -> None:
     """A plain ValueError is not in the transient set → not retried."""
     awaitable = AsyncMock(side_effect=ValueError("nope"))
 
-    with pytest.raises(ValueError):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+    with pytest.raises(ValueError, match="nope"):
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t")
 
     assert awaitable.await_count == 1
 
@@ -204,7 +204,7 @@ async def test_rate_limit_error_not_retried() -> None:
     awaitable = AsyncMock(side_effect=litellm_exc.RateLimitError("slow down", model="m", llm_provider="openrouter"))
 
     with pytest.raises(litellm_exc.RateLimitError):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t")
 
     assert awaitable.await_count == 1
 
@@ -217,38 +217,38 @@ async def test_exhausting_backoffs_reraises_last_and_calls_n_plus_one_times() ->
     )
 
     with pytest.raises(litellm_exc.APIConnectionError):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t")
 
     assert awaitable.await_count == len(DEFAULT_TRANSIENT_BACKOFFS) + 1
 
 
 @pytest.mark.asyncio
-async def test_backoff_sequence_in_order(_no_real_sleep: AsyncMock) -> None:
+async def test_backoff_sequence_in_order(no_real_sleep: AsyncMock) -> None:
     """Backoff sleeps happen in order: 1.0, 10.0, 30.0 (the default sequence)."""
     awaitable = AsyncMock(
         side_effect=litellm_exc.InternalServerError(message="500", model="m", llm_provider="openrouter")
     )
 
     with pytest.raises(litellm_exc.InternalServerError):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t")
 
-    actual = [c.args[0] for c in _no_real_sleep.await_args_list]
+    actual = [c.args[0] for c in no_real_sleep.await_args_list]
     assert actual == list(DEFAULT_TRANSIENT_BACKOFFS)
     assert actual == [1.0, 10.0, 30.0]
 
 
 @pytest.mark.asyncio
-async def test_custom_backoffs_control_attempt_count(_no_real_sleep: AsyncMock) -> None:
+async def test_custom_backoffs_control_attempt_count(no_real_sleep: AsyncMock) -> None:
     """A custom backoffs tuple sets attempts = len(backoffs)+1 and its own sleep schedule."""
     awaitable = AsyncMock(
         side_effect=litellm_exc.ServiceUnavailableError(message="503", model="m", llm_provider="openrouter")
     )
 
     with pytest.raises(litellm_exc.ServiceUnavailableError):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t", backoffs=(0.5, 2.0))
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t", backoffs=(0.5, 2.0))
 
     assert awaitable.await_count == 3  # len((0.5, 2.0)) + 1
-    assert [c.args[0] for c in _no_real_sleep.await_args_list] == [0.5, 2.0]
+    assert [c.args[0] for c in no_real_sleep.await_args_list] == [0.5, 2.0]
 
 
 @pytest.mark.asyncio
@@ -269,7 +269,7 @@ async def test_elapsed_gate_blocks_retry_even_for_transient_type() -> None:
     awaitable = AsyncMock(side_effect=_slow_then_fail)
 
     with pytest.raises(litellm_exc.Timeout):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t", max_elapsed_s=0.01)
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="t", max_elapsed_s=0.01)
 
     assert awaitable.await_count == 1
 
@@ -301,7 +301,7 @@ async def test_warning_logged_on_each_retry(caplog: pytest.LogCaptureFixture) ->
     awaitable = AsyncMock(side_effect=_timeout("blip"))
 
     with caplog.at_level("WARNING", logger="metaculus_bot.llm_retry"), pytest.raises(litellm_exc.Timeout):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="my_label")
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="my_label")
 
     retry_warnings = [r for r in caplog.records if "my_label" in r.message]
     # One warning per retry = len(backoffs) (the final attempt does not warn).
@@ -555,7 +555,7 @@ async def test_broad_retry_retries_generic_error_under_gate() -> None:
     """A generic ValueError (e.g. empty-model-response) under the gate is retried."""
     awaitable = AsyncMock(side_effect=[ValueError("empty response"), "ok"])
 
-    out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    out = await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert out == "ok"
     assert awaitable.await_count == 2
@@ -567,7 +567,7 @@ async def test_broad_retry_does_not_retry_authentication_error() -> None:
     awaitable = AsyncMock(side_effect=litellm_exc.AuthenticationError("bad key", model="m", llm_provider="openrouter"))
 
     with pytest.raises(litellm_exc.AuthenticationError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -578,7 +578,7 @@ async def test_broad_retry_does_not_retry_bad_request_error() -> None:
     awaitable = AsyncMock(side_effect=litellm_exc.BadRequestError("bad", model="m", llm_provider="openrouter"))
 
     with pytest.raises(litellm_exc.BadRequestError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -598,7 +598,7 @@ async def test_broad_retry_does_not_retry_python_bug_types(bug_exc: Exception) -
     awaitable = AsyncMock(side_effect=bug_exc)
 
     with pytest.raises(type(bug_exc)):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -612,7 +612,7 @@ async def test_broad_retry_retries_empty_response_runtimeerror() -> None:
     """
     awaitable = AsyncMock(side_effect=[RuntimeError("LLM answer is an empty string"), "ok"])
 
-    out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    out = await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert out == "ok"
     assert awaitable.await_count == 2
@@ -628,8 +628,11 @@ async def test_broad_retry_does_not_retry_slow_failure_of_any_type() -> None:
     awaitable = AsyncMock(side_effect=ValueError("slow generic failure"))
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(ValueError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    with (
+        patch("metaculus_bot.llm_retry.time.monotonic", clock),
+        pytest.raises(ValueError, match="slow generic failure"),
+    ):
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -647,21 +650,21 @@ async def test_broad_retry_does_not_retry_asyncio_timeout() -> None:
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
     with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(asyncio.TimeoutError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_broad_retry_shares_backoff_sequence(_no_real_sleep: AsyncMock) -> None:
+async def test_broad_retry_shares_backoff_sequence(no_real_sleep: AsyncMock) -> None:
     """The broad path reuses the same loop/backoff logic (no duplicated machinery)."""
     awaitable = AsyncMock(side_effect=ValueError("always"))
 
-    with pytest.raises(ValueError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    with pytest.raises(ValueError, match="always"):
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == len(DEFAULT_TRANSIENT_BACKOFFS) + 1
-    assert [c.args[0] for c in _no_real_sleep.await_args_list] == list(DEFAULT_TRANSIENT_BACKOFFS)
+    assert [c.args[0] for c in no_real_sleep.await_args_list] == list(DEFAULT_TRANSIENT_BACKOFFS)
 
 
 @pytest.mark.asyncio
@@ -674,9 +677,7 @@ async def test_predicate_param_overrides_transient_type_check() -> None:
     """
     awaitable = AsyncMock(side_effect=[ValueError("blip"), "ok"])
 
-    out = await invoke_with_transient_retry(
-        lambda: awaitable(), wall_timeout=_BIG_WALL, label="p", predicate=lambda _exc: True
-    )
+    out = await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="p", predicate=lambda _exc: True)
 
     assert out == "ok"
     assert awaitable.await_count == 2
@@ -728,7 +729,7 @@ async def test_slow_zero_output_api_error_is_retried_and_succeeds() -> None:
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
     with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_binary")
+        out = await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="forecaster_binary")
 
     assert out == "recovered"
     assert awaitable.await_count == 2
@@ -746,7 +747,7 @@ async def test_slow_empty_string_runtimeerror_is_retried() -> None:
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
     with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_numeric")
+        out = await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="forecaster_numeric")
 
     assert out == "ok"
     assert awaitable.await_count == 2
@@ -762,9 +763,11 @@ async def test_slow_zero_output_emits_warning_with_label(caplog: pytest.LogCaptu
     awaitable = AsyncMock(side_effect=[_api_error(_PROD_WHITESPACE_BODY_MESSAGE), "ok"])
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        with caplog.at_level("WARNING", logger="metaculus_bot.llm_retry"):
-            out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_mc")
+    with (
+        patch("metaculus_bot.llm_retry.time.monotonic", clock),
+        caplog.at_level("WARNING", logger="metaculus_bot.llm_retry"),
+    ):
+        out = await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="forecaster_mc")
 
     assert out == "ok"
     warnings = [r for r in caplog.records if "forecaster_mc" in r.message]
@@ -773,7 +776,7 @@ async def test_slow_zero_output_emits_warning_with_label(caplog: pytest.LogCaptu
 
 
 @pytest.mark.asyncio
-async def test_slow_zero_output_reroll_capped_at_one_no_backoff(_no_real_sleep: AsyncMock) -> None:
+async def test_slow_zero_output_reroll_capped_at_one_no_backoff(no_real_sleep: AsyncMock) -> None:
     """A persistently-failing slow zero-output is re-rolled EXACTLY once (no backoff ladder).
 
     The exemption bypasses the deadline gate, so it must stay bounded: one immediate
@@ -788,10 +791,10 @@ async def test_slow_zero_output_reroll_capped_at_one_no_backoff(_no_real_sleep: 
     awaitable = AsyncMock(side_effect=_slow_zero_output)
 
     with pytest.raises(litellm_exc.APIError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b", max_elapsed_s=0.01)
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b", max_elapsed_s=0.01)
 
     assert awaitable.await_count == 2  # attempt 0 + exactly one exempted re-roll
-    _no_real_sleep.assert_not_awaited()  # the exemption path takes no backoff sleep
+    no_real_sleep.assert_not_awaited()  # the exemption path takes no backoff sleep
 
 
 @pytest.mark.asyncio
@@ -799,7 +802,7 @@ async def test_fast_zero_output_api_error_retried_unchanged() -> None:
     """A FAST whitespace-body APIError retries via the normal ladder (behavior unchanged)."""
     awaitable = AsyncMock(side_effect=[_api_error(_PROD_WHITESPACE_BODY_MESSAGE), "ok"])
 
-    out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    out = await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert out == "ok"
     assert awaitable.await_count == 2
@@ -816,7 +819,7 @@ async def test_slow_non_empty_runtimeerror_not_exempted() -> None:
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
     with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(RuntimeError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -836,7 +839,7 @@ async def test_slow_permanent_error_not_retried_even_slow() -> None:
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
     with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(litellm_exc.BadRequestError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -855,7 +858,7 @@ async def test_transient_predicate_does_not_exempt_zero_output() -> None:
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
     with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(litellm_exc.APIError):
-        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="stacker_binary")
+        await invoke_with_transient_retry(awaitable, wall_timeout=_BIG_WALL, label="stacker_binary")
 
     assert awaitable.await_count == 1
 
@@ -1039,7 +1042,7 @@ def test_broad_predicate_falls_back_to_type_check_without_status() -> None:
 
 
 @pytest.mark.asyncio
-async def test_production_403_consumes_one_attempt_with_no_backoff(_no_real_sleep: AsyncMock) -> None:
+async def test_production_403_consumes_one_attempt_with_no_backoff(no_real_sleep: AsyncMock) -> None:
     """The wall-clock fix: the production 403 costs ONE attempt, not four.
 
     Before this change the summarizer ran attempts 1-4 and slept the full
@@ -1050,10 +1053,10 @@ async def test_production_403_consumes_one_attempt_with_no_backoff(_no_real_slee
     awaitable = AsyncMock(side_effect=_api_error_with_status(403, _PROD_KEY_LIMIT_MESSAGE))
 
     with pytest.raises(litellm_exc.APIError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="asknews_summarizer")
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="asknews_summarizer")
 
     assert awaitable.await_count == 1
-    _no_real_sleep.assert_not_awaited()
+    no_real_sleep.assert_not_awaited()
 
 
 def test_llm_status_code_reads_the_reported_status() -> None:
@@ -1115,6 +1118,6 @@ async def test_slow_403_is_not_rescued_by_the_zero_output_exemption() -> None:
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
     with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(litellm_exc.APIError):
-        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_binary")
+        await invoke_with_broad_retry(awaitable, wall_timeout=_BIG_WALL, label="forecaster_binary")
 
     assert awaitable.await_count == 1

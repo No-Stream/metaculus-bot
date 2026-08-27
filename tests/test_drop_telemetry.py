@@ -88,7 +88,7 @@ class TestDropSiteAttribution:
         ]
 
     @pytest.mark.parametrize(
-        "exc,expected_cause",
+        ("exc", "expected_cause"),
         [
             (ValueExtractionError("all extraction rungs failed"), "parse_extraction"),
             (RuntimeError("LLM answer is an empty string. The model was prov/model-b"), "zero_output"),

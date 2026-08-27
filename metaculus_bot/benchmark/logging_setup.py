@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 from datetime import datetime
@@ -16,10 +17,8 @@ class FlushingStreamHandler(logging.StreamHandler):
         try:
             self.flush()
         finally:
-            try:
+            with contextlib.suppress(Exception):  # pragma: no cover - best effort
                 sys.stderr.flush()
-            except Exception:  # pragma: no cover - best effort
-                pass
 
 
 def configure_benchmark_logging(log_dir: str = "benchmarks") -> Path:

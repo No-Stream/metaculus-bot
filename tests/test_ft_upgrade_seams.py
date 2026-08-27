@@ -126,7 +126,9 @@ class TestPchipCdfIsWhatGetsPublished:
 
     @pytest.fixture
     def pchip_distribution(self, question: NumericQuestion) -> NumericDistribution:
-        declared = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, _DECLARED_VALUES)]
+        declared = [
+            Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, _DECLARED_VALUES, strict=True)
+        ]
         sanitized, zero_point = sanitize_percentiles(declared, question)
         return build_numeric_distribution(sanitized, question, zero_point)
 
@@ -374,7 +376,9 @@ class TestPublishHardeningWrapsRealPublishPath:
             unit_of_measure="units",
             cdf_size=201,
         )
-        declared = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, _DECLARED_VALUES)]
+        declared = [
+            Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, _DECLARED_VALUES, strict=True)
+        ]
         distribution = NumericDistribution.from_question(declared, question)
         return NumericReport(question=question, prediction=distribution, explanation="# Seam test")
 
@@ -527,8 +531,10 @@ class TestQuestionBoundsPatchTargetExistsAndBehaves:
         # Exact tuple: (open_upper, open_lower, upper, lower, zero_point), ints coerced to float.
         assert result == (False, True, 200.0, 0.0, 100.0)
         open_upper, open_lower, upper, lower, zero_point = result
-        assert isinstance(open_upper, bool) and isinstance(open_lower, bool)
-        assert isinstance(upper, float) and isinstance(lower, float)
+        assert isinstance(open_upper, bool)
+        assert isinstance(open_lower, bool)
+        assert isinstance(upper, float)
+        assert isinstance(lower, float)
         assert isinstance(zero_point, float)
 
     def test_none_zero_point_preserved(self) -> None:
@@ -566,9 +572,12 @@ class TestQuestionBoundsPatchTargetExistsAndBehaves:
             },
         }
         question = NumericQuestion.from_metaculus_api_json(api_json)
-        assert question.lower_bound == 0.0 and isinstance(question.lower_bound, float)
-        assert question.upper_bound == 200.0 and isinstance(question.upper_bound, float)
-        assert question.open_lower_bound is True and question.open_upper_bound is False
+        assert question.lower_bound == 0.0
+        assert isinstance(question.lower_bound, float)
+        assert question.upper_bound == 200.0
+        assert isinstance(question.upper_bound, float)
+        assert question.open_lower_bound is True
+        assert question.open_upper_bound is False
 
     def test_captured_original_floatcasts_bounds_but_leaves_zero_point_raw(self) -> None:
         """0.2.92 contract of the closure-captured upstream original.
@@ -582,7 +591,7 @@ class TestQuestionBoundsPatchTargetExistsAndBehaves:
         ints; upstream no longer does.)
         """
         descriptor = BoundedQuestionMixin.__dict__["_get_bounds_from_api_json"]
-        free = dict(zip(descriptor.__func__.__code__.co_freevars, descriptor.__func__.__closure__ or ()))
+        free = dict(zip(descriptor.__func__.__code__.co_freevars, descriptor.__func__.__closure__ or (), strict=False))
         # Annotate Any: the closure-cell extraction is untyped, and unpacking the
         # call result below would otherwise trip basedpyright's "Never not iterable".
         original: Any = free["_original_func"].cell_contents
@@ -591,8 +600,10 @@ class TestQuestionBoundsPatchTargetExistsAndBehaves:
             BoundedQuestionMixin, self._scaling_json(range_max=200, range_min=0, zero_point=100)
         )
         assert (upper, lower) == (200.0, 0.0)
-        assert isinstance(upper, float) and isinstance(lower, float)  # upstream float-casts the bounds
-        assert zero_point == 100 and isinstance(zero_point, int)  # ...but leaves zero_point a raw int
+        assert isinstance(upper, float)  # upstream float-casts the bounds
+        assert isinstance(lower, float)
+        assert zero_point == 100
+        assert isinstance(zero_point, int)  # ...but leaves zero_point a raw int
 
 
 class TestHeartbeatWrapsRunABatch:

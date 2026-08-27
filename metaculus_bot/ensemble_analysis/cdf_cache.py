@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,9 +57,6 @@ class NumericCdfCache:
         objects convertible to the NumericDistribution "Percentile"-like shape required by
         downstream scoring (which only reads `.percentile`).
         """
-        # Local import to avoid module-level dependency and to satisfy linters for this scope
-        from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
-
         qid = getattr(question, "id_of_question", None)
         if qid is None:
             qid = -1
@@ -87,7 +86,7 @@ class NumericCdfCache:
                     n = len(raw)
                     x = np.linspace(float(lower), float(upper), n)
                     out = []
-                    for xi, p in zip(x, raw):
+                    for xi, p in zip(x, raw, strict=True):
                         out.append(SimpleNamespace(value=float(xi), percentile=float(p.percentile)))
                     self._safe_cdf_cache[key] = out
                     return out
@@ -96,7 +95,7 @@ class NumericCdfCache:
                 upper = question.upper_bound
                 n = len(raw)
                 x = np.linspace(float(lower), float(upper), n)
-                out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, raw)]
+                out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, raw, strict=True)]
                 self._safe_cdf_cache[key] = out
                 return out
         except Exception as e:
@@ -144,7 +143,7 @@ class NumericCdfCache:
             # Ensure monotone and within [0,1]
             cdf_vals = list(np.maximum.accumulate(np.clip(np.array(cdf_vals, dtype=float), 0.0, 1.0)))
             x = np.linspace(float(lower), float(upper), len(cdf_vals))
-            out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, cdf_vals)]
+            out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, cdf_vals, strict=True)]
             self._safe_cdf_cache[key] = out
             stats["safe_cdf_built"].add(key)
             return out
@@ -172,7 +171,7 @@ class NumericCdfCache:
             lower = question.lower_bound
             upper = question.upper_bound
             x = np.linspace(float(lower), float(upper), n)
-            out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, vals)]
+            out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, vals, strict=True)]
             self._safe_cdf_cache[key] = out
             stats["safe_cdf_ramp"].add(key)
             return out

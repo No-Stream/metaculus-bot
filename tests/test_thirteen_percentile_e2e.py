@@ -55,7 +55,7 @@ def _question(
 def _declared(values: list[float]) -> list[Percentile]:
     """Build the standard 13-percentile list from 13 strictly-increasing values."""
     assert len(values) == EXPECTED_PERCENTILE_COUNT == 13
-    return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values)]
+    return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
 
 
 def _assert_valid_metaculus_cdf(cdf: list[Percentile], *, open_lower: bool, open_upper: bool) -> np.ndarray:

@@ -106,7 +106,7 @@ def _normalize_name(name: str) -> str:
     stripped = name.strip()
     # Remove leading "Option" labels if present
     lowered = stripped.lower()
-    if lowered.startswith("option ") or lowered.startswith("option:"):
+    if lowered.startswith(("option ", "option:")):
         # drop leading token up to colon/space
         parts = stripped.split(":", 1)
         if len(parts) == 2:
@@ -170,7 +170,9 @@ def build_mc_prediction(
     # already-in-bounds, sum-1 values and is a no-op.
     clamped = clamp_and_renormalize_probs([p for _, p in pairs])
     return PredictedOptionList(
-        predicted_options=[PredictedOption(option_name=n, probability=p) for (n, _), p in zip(pairs, clamped)]
+        predicted_options=[
+            PredictedOption(option_name=n, probability=p) for (n, _), p in zip(pairs, clamped, strict=True)
+        ]
     )
 
 

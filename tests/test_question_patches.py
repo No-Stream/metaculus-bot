@@ -38,19 +38,24 @@ class TestGetBoundsIntCoercion:
     def test_int_bounds_coerced_to_float(self):
         result = BoundedQuestionMixin._get_bounds_from_api_json(_make_scaling_json(range_max=200, range_min=0))
         _, _, upper, lower, _ = result
-        assert upper == 200.0 and isinstance(upper, float)
-        assert lower == 0.0 and isinstance(lower, float)
+        assert upper == 200.0
+        assert isinstance(upper, float)
+        assert lower == 0.0
+        assert isinstance(lower, float)
 
     def test_float_bounds_still_work(self):
         result = BoundedQuestionMixin._get_bounds_from_api_json(_make_scaling_json(range_max=200.0, range_min=0.0))
         _, _, upper, lower, _ = result
-        assert upper == 200.0 and isinstance(upper, float)
-        assert lower == 0.0 and isinstance(lower, float)
+        assert upper == 200.0
+        assert isinstance(upper, float)
+        assert lower == 0.0
+        assert isinstance(lower, float)
 
     def test_int_zero_point_coerced(self):
         result = BoundedQuestionMixin._get_bounds_from_api_json(_make_scaling_json(zero_point=100))
         _, _, _, _, zp = result
-        assert zp == 100.0 and isinstance(zp, float)
+        assert zp == 100.0
+        assert isinstance(zp, float)
 
     def test_none_zero_point_preserved(self):
         result = BoundedQuestionMixin._get_bounds_from_api_json(_make_scaling_json(zero_point=None))
@@ -62,6 +67,9 @@ class TestGetBoundsIntCoercion:
             _make_scaling_json(range_max=200, range_min=0.5, zero_point=1)
         )
         _, _, upper, lower, zp = result
-        assert upper == 200.0 and isinstance(upper, float)
-        assert lower == 0.5 and isinstance(lower, float)
-        assert zp == 1.0 and isinstance(zp, float)
+        assert upper == 200.0
+        assert isinstance(upper, float)
+        assert lower == 0.5
+        assert isinstance(lower, float)
+        assert zp == 1.0
+        assert isinstance(zp, float)

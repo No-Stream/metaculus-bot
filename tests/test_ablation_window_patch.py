@@ -150,18 +150,24 @@ class TestPatchedWindowForQuestion:
 
     def test_re_entrancy_raises(self) -> None:
         question = _question()
-        with patched_window_for_question(question), pytest.raises(RuntimeError, match="already active"):
-            with patched_window_for_question(question):
-                pass
+        with (
+            patched_window_for_question(question),
+            pytest.raises(RuntimeError, match="already active"),
+            patched_window_for_question(question),
+        ):
+            pass
 
     def test_re_entrancy_does_not_corrupt_outer_restore(self) -> None:
         """If an inner enter raises RuntimeError, the outer cleanup must still run."""
         question = _question()
         before = prompts_module._forecasting_window_str
 
-        with patched_window_for_question(question), pytest.raises(RuntimeError):
-            with patched_window_for_question(question):
-                pass
+        with (
+            patched_window_for_question(question),
+            pytest.raises(RuntimeError),
+            patched_window_for_question(question),
+        ):
+            pass
 
         assert prompts_module._forecasting_window_str is before
 

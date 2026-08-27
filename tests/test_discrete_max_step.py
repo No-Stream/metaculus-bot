@@ -48,24 +48,24 @@ _CONCENTRATED_LOW_COUNT: list[tuple[float, float]] = [
 
 
 def _discrete_count_question(**overrides) -> NumericQuestion:
-    base: dict[str, Any] = dict(
-        id_of_question=38880,
-        id_of_post=38880,
-        page_url="https://example.com/q/38880",
-        question_text="How many X will happen? (count 0-7)",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-        published_time=None,
-        close_time=None,
-        lower_bound=-0.5,
-        upper_bound=7.5,
-        open_lower_bound=False,
-        open_upper_bound=True,
-        unit_of_measure="",
-        zero_point=None,
-        cdf_size=9,
-    )
+    base: dict[str, Any] = {
+        "id_of_question": 38880,
+        "id_of_post": 38880,
+        "page_url": "https://example.com/q/38880",
+        "question_text": "How many X will happen? (count 0-7)",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+        "published_time": None,
+        "close_time": None,
+        "lower_bound": -0.5,
+        "upper_bound": 7.5,
+        "open_lower_bound": False,
+        "open_upper_bound": True,
+        "unit_of_measure": "",
+        "zero_point": None,
+        "cdf_size": 9,
+    }
     base.update(overrides)
     return NumericQuestion(**base)
 

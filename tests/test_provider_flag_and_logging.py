@@ -70,9 +70,11 @@ async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
         # This test used to assert that sentence plus the header; both were the defect,
         # since an empty AskNews read then arrived as `ok` with chars>0 and the summarizer
         # was asked to brief from prose that carried no facts.
-        with patch.object(ResearchOrchestrator, "_summarize_asknews", new_callable=AsyncMock) as summarize:
-            with caplog.at_level(logging.INFO):
-                res = await bot.run_research(q)
+        with (
+            patch.object(ResearchOrchestrator, "_summarize_asknews", new_callable=AsyncMock) as summarize,
+            caplog.at_level(logging.INFO),
+        ):
+            res = await bot.run_research(q)
         assert "No articles were found for this query." not in res
         assert "## News Articles (AskNews)" not in res
         # The spend-saving half of the empty-read fix: nothing to brief from, so the
@@ -455,9 +457,8 @@ def _reset_pm_caches():
 
 
 @pytest.mark.asyncio
-async def test_prediction_market_provider_integrates_with_run_providers_parallel(
-    mock_os_getenv, caplog, _reset_pm_caches
-):
+@pytest.mark.usefixtures("_reset_pm_caches")
+async def test_prediction_market_provider_integrates_with_run_providers_parallel(mock_os_getenv, caplog):
     """Flag ON + ASKNEWS creds + GEMINI creds + PREDICTION_MARKETS_ENABLED:
     all three providers should run in parallel and combined research must
     contain blocks from each. Verifies end-to-end that:
@@ -611,7 +612,8 @@ async def test_prediction_market_provider_disabled_flag_excludes_from_parallel(m
 
 
 @pytest.mark.asyncio
-async def test_prediction_market_provider_passes_no_as_of_through_the_orchestrator(mock_os_getenv, _reset_pm_caches):
+@pytest.mark.usefixtures("_reset_pm_caches")
+async def test_prediction_market_provider_passes_no_as_of_through_the_orchestrator(mock_os_getenv):
     """The provider path passes ``as_of=None``, even for a question that HAS a scheduled
     resolution — asserted here at the orchestrator level, where a future caller might inject one.
 

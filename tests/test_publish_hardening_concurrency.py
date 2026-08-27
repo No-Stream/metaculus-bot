@@ -95,7 +95,7 @@ class TestPublishDoesNotBlockTheEventLoop:
         # Stand in for ft's async publish whose body is fully synchronous — the shape
         # that pins the loop. Installed BEFORE the offload so the offload wraps it.
         async def fake_async_publish(self: Any, metaculus_client: Any = None) -> str:
-            time.sleep(publish_seconds)
+            time.sleep(publish_seconds)  # noqa: ASYNC251  # the blocking body IS what this test pins
             return "published"
 
         monkeypatch.setattr(BinaryReport, publish_hardening._PUBLISH_METHOD, fake_async_publish)
@@ -469,9 +469,11 @@ class TestNonRetryable4xxIsNotRetried:
         wrapped = publish_hardening._wrap_with_timeout_retry("_post_question_prediction", always_405)
         publish_hardening.reset_publish_attempt_failures()
         try:
-            with caplog.at_level(logging.WARNING, logger="metaculus_bot.publish_hardening"):
-                with pytest.raises(requests.HTTPError):
-                    wrapped()
+            with (
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.publish_hardening"),
+                pytest.raises(requests.HTTPError),
+            ):
+                wrapped()
         finally:
             publish_hardening.reset_publish_attempt_failures()
 
@@ -500,9 +502,11 @@ class TestNonRetryable4xxIsNotRetried:
         wrapped = publish_hardening._wrap_with_timeout_retry("post_question_comment", always_429)
         publish_hardening.reset_publish_attempt_failures()
         try:
-            with caplog.at_level(logging.WARNING, logger="metaculus_bot.publish_hardening"):
-                with pytest.raises(requests.HTTPError):
-                    wrapped()
+            with (
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.publish_hardening"),
+                pytest.raises(requests.HTTPError),
+            ):
+                wrapped()
         finally:
             publish_hardening.reset_publish_attempt_failures()
 

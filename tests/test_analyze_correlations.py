@@ -1,5 +1,6 @@
 """Minimal tests for analyze_correlations.py CLI utility functions."""
 
+import contextlib
 import json
 import tempfile
 from datetime import datetime
@@ -259,12 +260,12 @@ def test_main_function_flow(mock_load, mock_analyzer_class):
     mock_analyzer_class.return_value = mock_analyzer
 
     # Mock sys.argv to avoid parsing real command line
-    with patch("sys.argv", ["analyze_correlations.py", "test.jsonl"]):
+    with (
+        patch("sys.argv", ["analyze_correlations.py", "test.jsonl"]),
+        contextlib.suppress(SystemExit),
+    ):
         # Should run without errors
-        try:
-            analyze_correlations.main()
-        except SystemExit:
-            pass  # Expected from successful completion
+        analyze_correlations.main()
 
 
 @patch("analyze_correlations.load_benchmarks_from_path")
@@ -288,10 +289,7 @@ def test_timestamped_output_filename():
     timestamp = extract_timestamp_from_filename(input_file)
 
     # Simulate the logic in main()
-    if timestamp:
-        filename = f"correlation_analysis_{timestamp}.md"
-    else:
-        filename = "correlation_analysis.md"
+    filename = f"correlation_analysis_{timestamp}.md" if timestamp else "correlation_analysis.md"
 
     expected_filename = "correlation_analysis_2025-08-10_15-04-51.md"
     assert filename == expected_filename

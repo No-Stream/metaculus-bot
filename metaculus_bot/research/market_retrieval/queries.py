@@ -58,7 +58,7 @@ _MANIFOLD_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'À-ɏ&.\-]*")
 
 # `has_date_like_token`'s vocabulary. A day number carries an optional ordinal suffix so
 # "June 30th" reads as a date rather than as an identifier ending in letters.
-_TOKEN_EDGE_PUNCTUATION = "\"'“”‘’.,;:!?()[]{}"
+_TOKEN_EDGE_PUNCTUATION = "\"'“”‘’.,;:!?()[]{}"  # noqa: RUF001  # curly quotes are data: edge punctuation to strip
 _DIGIT_GROUP_RE = re.compile(r"\d+")
 _DAY_NUMBER_RE = re.compile(r"\d{1,2}(?:st|nd|rd|th)?", re.IGNORECASE)
 _PLAUSIBLE_YEARS = range(1900, 2100)
@@ -458,7 +458,9 @@ def parse_query_author(text: str) -> tuple[str, ...]:
     # closing brace.
     object_blob = extract_json_block(blob) or extract_first_balanced_braces(blob)
     if object_blob is None:
-        logger.warning(f"market query author: no JSON object found in {blob[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
+        logger.warning(
+            f"market query author: no JSON object found in {blob[:160]!r}"  # HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
+        )
         return ()
     try:
         parsed = json.loads(object_blob)

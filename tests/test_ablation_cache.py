@@ -111,7 +111,8 @@ def test_atomic_write_round_trip_stacker_output(cache: AblationCache) -> None:
 
     a = cache.read_stacker_output(qid=42, arm="stack")
     b = cache.read_stacker_output(qid=42, arm="stack_aug")
-    assert a is not None and b is not None
+    assert a is not None
+    assert b is not None
     assert a["stacker_prediction"] == 0.55
     assert b["stacker_prediction"] == 0.60
     assert b["computed_quantities"] == "## Computed quantities\n\nPooled = 0.58"
@@ -185,7 +186,8 @@ def test_two_stackers_write_distinct_files_and_wrong_slug_misses(cache: Ablation
     # Each slug reads back its own payload.
     read_opus45 = cache.read_stacker_output(qid=7, arm="stack_aug", stacker_slug=slug_opus45)
     read_opus48 = cache.read_stacker_output(qid=7, arm="stack_aug", stacker_slug=slug_opus48)
-    assert read_opus45 is not None and read_opus48 is not None
+    assert read_opus45 is not None
+    assert read_opus48 is not None
     assert read_opus45["stacker_prediction"] == {"type": "binary", "prob": 0.45}
     assert read_opus48["stacker_prediction"] == {"type": "binary", "prob": 0.48}
 

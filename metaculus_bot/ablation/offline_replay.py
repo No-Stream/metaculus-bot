@@ -724,10 +724,7 @@ NUMERIC_TAIL_FLOORS: tuple[float, ...] = (1e-3, 5e-3)
 def _numeric_vertical(record: NumericRecord, method: Literal["mean", "median"]) -> list[float]:
     """Vertical (pointwise) mean/median of the per-forecaster CDF probabilities — the incumbent."""
     prob_arrays = np.array([_cdf_probs(cdf) for cdf in record.cdfs], dtype=float)
-    if method == "mean":
-        agg = np.mean(prob_arrays, axis=0)
-    else:
-        agg = np.median(prob_arrays, axis=0)
+    agg = np.mean(prob_arrays, axis=0) if method == "mean" else np.median(prob_arrays, axis=0)
     agg = np.clip(agg, 0.0, 1.0)
     agg = np.maximum.accumulate(agg)
     return list(map(float, agg))

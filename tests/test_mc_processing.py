@@ -39,7 +39,7 @@ class TestBuildMcPredictionRefusesToInvent:
             build_mc_prediction(_raw([("Delta", 0.6), ("Epsilon", 0.4)]), OPTIONS)
 
     def test_error_names_both_option_sets(self) -> None:
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ValueError, match="no parsed option matched") as excinfo:
             build_mc_prediction(_raw([("Delta", 1.0)]), OPTIONS)
         message = str(excinfo.value)
         assert "Alpha" in message
@@ -86,9 +86,11 @@ class TestExtractionLadderDropsInsteadOfImputing:
                 return PredictedOptionList(predicted_options=[])
             return []
 
-        with patch("metaculus_bot.value_extraction.parse_structured", new=parse):
-            with pytest.raises(ValueExtractionError):
-                await extract_mc("prose with no ballot in it", OPTIONS, MagicMock(), question_id=5, model_name="m")
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=parse),
+            pytest.raises(ValueExtractionError),
+        ):
+            await extract_mc("prose with no ballot in it", OPTIONS, MagicMock(), question_id=5, model_name="m")
 
     @pytest.mark.asyncio
     async def test_unmatched_llm_ballot_raises_value_extraction_error(self) -> None:
@@ -99,9 +101,11 @@ class TestExtractionLadderDropsInsteadOfImputing:
                 return PredictedOptionList(predicted_options=[PredictedOption(option_name="Delta", probability=1.0)])
             return unmatched
 
-        with patch("metaculus_bot.value_extraction.parse_structured", new=parse):
-            with pytest.raises(ValueExtractionError):
-                await extract_mc("prose about something else", OPTIONS, MagicMock(), question_id=5, model_name="m")
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=parse),
+            pytest.raises(ValueExtractionError),
+        ):
+            await extract_mc("prose about something else", OPTIONS, MagicMock(), question_id=5, model_name="m")
 
     @pytest.mark.asyncio
     async def test_good_llm_ballot_still_salvages(self) -> None:
@@ -110,7 +114,7 @@ class TestExtractionLadderDropsInsteadOfImputing:
             return_value=PredictedOptionList(
                 predicted_options=[
                     PredictedOption(option_name=name, probability=prob)
-                    for name, prob in zip(OPTIONS, [0.4, 0.35, 0.25])
+                    for name, prob in zip(OPTIONS, [0.4, 0.35, 0.25], strict=False)
                 ]
             )
         )

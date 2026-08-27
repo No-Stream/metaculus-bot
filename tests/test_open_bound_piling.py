@@ -46,7 +46,7 @@ def _make_question(*, open_upper=False, open_lower=False, lower=0.0, upper=100.0
 def _make_prediction(cdf_probs: list[float], *, lower: float = 0.0, upper: float = 100.0) -> NumericDistribution:
     """Stub exposing ``.cdf`` as a Percentile list on a uniform value grid."""
     x_vals = np.linspace(lower, upper, len(cdf_probs))
-    cdf = [Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_vals, cdf_probs)]
+    cdf = [Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_vals, cdf_probs, strict=False)]
     return cast(NumericDistribution, SimpleNamespace(cdf=cdf))
 
 
@@ -258,7 +258,7 @@ def _discrete_open_upper_question() -> NumericQuestion:
 def _run_discrete_detector(values: list[float], caplog) -> list[str]:
     """Drive values through the REAL pipeline (sanitize → build) then the detector."""
     q = _discrete_open_upper_question()
-    pcts = [Percentile(percentile=p, value=v) for p, v in zip(_STANDARD_PS, values)]
+    pcts = [Percentile(percentile=p, value=v) for p, v in zip(_STANDARD_PS, values, strict=False)]
     sanitized, zero_point = sanitize_percentiles(pcts, q)
     prediction = build_numeric_distribution(sanitized, q, zero_point)
 

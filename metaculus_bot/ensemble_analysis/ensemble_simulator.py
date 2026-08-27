@@ -22,6 +22,7 @@ would not have observed).
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,10 @@ from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.ensemble_analysis.benchmark_identity import extract_model_name, get_question_type
 from metaculus_bot.ensemble_analysis.cdf_cache import NumericCdfCache
 from metaculus_bot.ensemble_analysis.types import CorrelationMatrix, EnsembleCandidate
+from metaculus_bot.scoring_patches import (
+    calculate_multiple_choice_baseline_score,
+    calculate_numeric_baseline_score,
+)
 
 if TYPE_CHECKING:
     from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
@@ -64,7 +69,7 @@ class _AggregatedNumericPrediction:
     """Lightweight numeric prediction exposing only the ``.cdf`` downstream scoring reads."""
 
     def __init__(self, x: list[float], cdf_probs: list[float]) -> None:
-        self._cdf = [_CdfPoint(v, p) for v, p in zip(x, cdf_probs)]
+        self._cdf = [_CdfPoint(v, p) for v, p in zip(x, cdf_probs, strict=False)]
 
     @property
     def cdf(self) -> list[_CdfPoint]:
@@ -196,11 +201,6 @@ class EnsembleSimulator:
         self, models: list[str], aggregation_strategy: AggregationStrategy | str
     ) -> float:
         """Simulate ensemble performance by aggregating actual model predictions and scoring them properly."""
-        from metaculus_bot.scoring_patches import (
-            calculate_multiple_choice_baseline_score,
-            calculate_numeric_baseline_score,
-        )
-
         strategy = _normalize_strategy(aggregation_strategy)
 
         # Group data by question from benchmark reports
@@ -254,10 +254,7 @@ class EnsembleSimulator:
                 if q_type == "binary":
                     # Aggregate scalar prob and use binary baseline formula
                     pred_vals = [float(p) for p in preds]
-                    if strategy == "mean":
-                        agg_p = float(np.mean(pred_vals))
-                    else:
-                        agg_p = float(np.median(pred_vals))
+                    agg_p = float(np.mean(pred_vals)) if strategy == "mean" else float(np.median(pred_vals))
                     c = getattr(q, "community_prediction_at_access_time", None)
                     score = self.calculate_baseline_score(agg_p, c, "binary")
                     if score is not None:
@@ -290,7 +287,8 @@ class EnsembleSimulator:
                     # Build lightweight report-like object
                     pred_obj = SimpleNamespace(
                         predicted_options=[
-                            SimpleNamespace(option_name=n, probability=p) for n, p in zip(option_names, aggregated)
+                            SimpleNamespace(option_name=n, probability=p)
+                            for n, p in zip(option_names, aggregated, strict=True)
                         ]
                     )
                     fake_report = SimpleNamespace(question=q, prediction=pred_obj)
@@ -316,10 +314,7 @@ class EnsembleSimulator:
                     x_vals = [pt.value for pt in cdfs[0]]
                     # Stack cdf percentiles
                     stacks = np.array([[float(pt.percentile) for pt in c] for c in cdfs])
-                    if strategy == "mean":
-                        agg_cdf = stacks.mean(axis=0)
-                    else:
-                        agg_cdf = np.median(stacks, axis=0)
+                    agg_cdf = stacks.mean(axis=0) if strategy == "mean" else np.median(stacks, axis=0)
 
                     agg_pred = _AggregatedNumericPrediction(x_vals, list(agg_cdf))
                     fake_report = SimpleNamespace(question=q, prediction=agg_pred)
@@ -449,8 +444,6 @@ class EnsembleSimulator:
         self, prediction_value: float, community_prediction: Any, question_type: str
     ) -> float | None:
         """Calculate baseline score using the same logic as forecasting_tools."""
-        import math
-
         if community_prediction is None:
             return None
 

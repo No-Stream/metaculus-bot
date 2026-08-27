@@ -529,7 +529,8 @@ class TestCandidateLine:
         line = render_candidate_line(0, row)
 
         assert "scale: 0 to 250" in line
-        assert "120" not in line and "0.48" not in line, "the value is a price and this line quotes none"
+        assert "120" not in line, "the value is a price and this line quotes none"
+        assert "0.48" not in line, "the value is a price and this line quotes none"
         segments = [segment.strip() for segment in line.split("|")]
         assert segments.index("scale: 0 to 250") < segments.index("rules: Per Wikipedia.")
 
@@ -621,8 +622,10 @@ class TestRankerPrompt:
 
         prompt = build_ranker_prompt(long_question, _pool(1))
 
-        assert "c" * 1200 in prompt and "c" * 1201 not in prompt
-        assert "f" * 600 in prompt and "f" * 601 not in prompt
+        assert "c" * 1200 in prompt
+        assert "c" * 1201 not in prompt
+        assert "f" * 600 in prompt
+        assert "f" * 601 not in prompt
 
     def test_candidates_are_grouped_by_venue_in_pool_order(self) -> None:
         """No interleaving. The grouping is derived from the pool's own order so the prompt and
