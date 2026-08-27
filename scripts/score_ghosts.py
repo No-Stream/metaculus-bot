@@ -249,10 +249,10 @@ def _paired_numeric_scores(
     """
     # Lazy imports: the PCHIP builder pulls numpy/scipy. Keep the n=0 path
     # dependency-light — numeric scoring only runs once real records join.
-    from metaculus_bot.numeric.config import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: pair the grid-step rule with the CDF builder it feeds
+    from metaculus_bot.numeric.config import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # lazy: pair the grid-step rule with the CDF builder it feeds
         grid_step_constraints,
     )
-    from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the n=0 path free of numpy/scipy
+    from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the n=0 path free of numpy/scipy
         generate_pchip_cdf,
     )
 
@@ -358,7 +358,7 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
     # Lazy import: the collector helper drags the collector's heavy import chain
     # (requests, env loading). Keep the n=0 path dependency-light — numeric scoring only
     # runs once real records join.
-    from metaculus_bot.performance_analysis.collector import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the pure scoring core decoupled from the collector's import chain
+    from metaculus_bot.performance_analysis.collector import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the pure scoring core decoupled from the collector's import chain
         resolve_numeric_record_to_score_inputs,
     )
 

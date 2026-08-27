@@ -1,4 +1,4 @@
-# noqa: HARNESS-SCAN-EXEMPT-monolithic-file-loc  # one class per MARKER_SPECS entry; a split fragments the registry
+# HARNESS-SCAN-EXEMPT-monolithic-file-loc  # one class per MARKER_SPECS entry; a split fragments the registry
 """Tests for the run-log telemetry marker parser (scripts/telemetry/markers.py).
 
 Each example line below is copied from the format string in the emitting code
@@ -19,6 +19,9 @@ tests loudly instead of silently dropping records from the archive:
 """
 
 import json
+import os
+import re
+from pathlib import Path
 
 import pytest
 
@@ -1765,3 +1768,38 @@ class TestGapFillAnalyzerFailed:
         assert rec["marker"] == "gap_fill_analyzer_failed"
         assert rec["qid"] is None
         assert rec["error"] == "TimeoutError"
+
+
+class TestMarkerNotInsideNoqaDirective:
+    """HARNESS-SCAN-EXEMPT markers must never sit inside a ``# noqa:`` code list.
+
+    Inside one, ruff owns the comment: RUF100's autofix deletes an unused noqa
+    together with everything trailing it (how 26 markers vanished in the
+    aug2026 lint expansion), and a noqa whose only "code" is a marker is an
+    invalid directive that suppresses nothing. Canonical shapes are
+    ``# noqa: <codes>`` followed by a separate ``# HARNESS-SCAN-EXEMPT-<kind>``
+    comment, or a plain trailing marker comment with no noqa at all.
+    """
+
+    def test_no_noqa_code_list_contains_a_marker(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        noqa_code_list = re.compile(r"#\s*noqa:([^#\n]*)", re.IGNORECASE)
+        offenders: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(repo_root):
+            dirnames[:] = [
+                d for d in dirnames if not (d.startswith((".", "scratch", "REFERENCE_COPY")) or d == "node_modules")
+            ]
+            for filename in filenames:
+                if not filename.endswith(".py"):
+                    continue
+                path = Path(dirpath) / filename
+                for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                    for match in noqa_code_list.finditer(line):
+                        tokens = re.split(r"[,\s]+", match.group(1))
+                        if any("HARNESS-SCAN-EXEMPT" in token for token in tokens):
+                            offenders.append(f"{path.relative_to(repo_root)}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "HARNESS-SCAN-EXEMPT marker(s) found inside a noqa code list; move each marker "
+            "into its own trailing comment (`# noqa: <codes>  # HARNESS-SCAN-EXEMPT-<kind>  # <reason>`):\n"
+            + "\n".join(offenders)
+        )

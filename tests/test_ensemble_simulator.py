@@ -204,6 +204,30 @@ class TestNumericSimulation:
         assert [pt.percentile for pt in aggregated] == pytest.approx(expected)
         assert [pt.value for pt in aggregated] == pytest.approx([pt.value for pt in low.cdf])
 
+    def test_each_member_cdf_is_fetched_under_its_own_model_name(self, monkeypatch: pytest.MonkeyPatch):
+        """The safe-CDF cache is keyed (model_name, qid), so each member must arrive
+        under its own name — not a reverse-inferred or shared one."""
+        monkeypatch.setattr(simulator_module, "calculate_numeric_baseline_score", lambda *_a, **_k: 7.0)
+        question = _question(1)
+        low = _numeric(10.0, 30.0, 50.0)
+        high = _numeric(50.0, 70.0, 90.0)
+        sim = _simulator(
+            [
+                _benchmark("model-a", [_report(question, low)]),
+                _benchmark("model-b", [_report(question, high)]),
+            ]
+        )
+        seen: list[tuple[str, Any]] = []
+
+        def _capture(**kw: Any) -> list[Any]:
+            seen.append((kw["model_name"], kw["prediction"]))
+            return []
+
+        monkeypatch.setattr(sim._cdf_cache, "get_safe_numeric_cdf", _capture)
+        sim.simulate_ensemble_performance(["model-a", "model-b"], "mean")
+
+        assert seen == [("model-a", low), ("model-b", high)]
+
     def test_unusable_numeric_prediction_is_a_warning_not_a_crash(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
@@ -274,16 +298,3 @@ class TestAggregatePredictions:
     def test_unknown_question_type_raises(self):
         with pytest.raises(ValueError, match="Unknown question type"):
             self._sim().aggregate_predictions({"a": 0.5}, ["a"], "trinary", "mean")
-
-
-class TestModelNameInference:
-    def test_matches_on_question_id_and_prediction_identity(self):
-        question = _question(1, community=0.6)
-        prediction = 0.42
-        sim = _simulator([_benchmark("model-a", [_report(question, prediction)])])
-        assert sim.infer_model_name_from_prediction(1, prediction) == "model-a"
-
-    def test_unmatched_prediction_reports_unknown(self):
-        question = _question(1, community=0.6)
-        sim = _simulator([_benchmark("model-a", [_report(question, 0.42)])])
-        assert sim.infer_model_name_from_prediction(99, 0.42) == "unknown"

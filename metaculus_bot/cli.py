@@ -166,7 +166,7 @@ def main() -> None:
     research_writer = None
     research_sink = None
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
-        from metaculus_bot.research.persistence import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.research.persistence import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
             ResearchPersistenceWriter,
         )
 

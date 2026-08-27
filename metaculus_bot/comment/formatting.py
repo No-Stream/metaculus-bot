@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from typing import Literal
 
-from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.comment.markers import (
@@ -33,14 +32,10 @@ from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,
 )
+from metaculus_bot.question_types import question_type_of
 from metaculus_bot.tool_runner import _feature_enabled as _tool_runner_feature_enabled
 
 logger = logging.getLogger(__name__)
-
-# Mirrors tool_runner._feature_enabled's question_type argument. A module-level alias rather
-# than an inline Literal in the return annotation: ruff's quoted-annotation autofix strips the
-# quotes off an inline `Literal["binary", ...]` under `from __future__ import annotations`.
-_QuestionTypeKey = Literal["binary", "numeric", "multiple_choice"]
 
 
 def format_research_summary_with_models(
@@ -106,24 +101,9 @@ def _stacker_outcome_markers(stacker_outcome: str) -> tuple[str, str]:
             raise ValueError(f"Unknown stacker outcome {other!r}")
 
 
-def _question_type_key(question: object) -> _QuestionTypeKey | None:
-    """The per-type key the tool-runner flag lookup uses, or None for an unhandled type.
-
-    BinaryQuestion and MultipleChoiceQuestion are matched before NumericQuestion because
-    DiscreteQuestion subclasses the latter and must read the numeric key.
-    """
-    if isinstance(question, BinaryQuestion):
-        return "binary"
-    if isinstance(question, NumericQuestion):
-        return "numeric"
-    if isinstance(question, MultipleChoiceQuestion):
-        return "multiple_choice"
-    return None
-
-
 def build_unified_explanation(
     base_text: str,
-    question: object,
+    question: MetaculusQuestion,
     aggregation_strategy: AggregationStrategy,
     stacker_outcome: str | None,
     *,
@@ -155,7 +135,7 @@ def build_unified_explanation(
     )
 
     outcome_marker, legacy_marker = _stacker_outcome_markers(stacker_outcome)
-    qtype = _question_type_key(question)
+    qtype = question_type_of(question)
 
     skip_reason_suffix = "" if skip_reason is None else f"\n{format_stacker_skip_reason_marker(skip_reason)}"
     tools_marker = TOOLS_USED_MARKER_TRUE if _tool_runner_feature_enabled(qtype) else TOOLS_USED_MARKER_FALSE

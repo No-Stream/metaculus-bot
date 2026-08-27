@@ -168,7 +168,7 @@ def _wrap_with_retry(method_name: str, original: Callable[..., Any]) -> Callable
     @functools.wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         # Read at call time so test monkeypatching of FETCH_GET_RETRIES works.
-        from metaculus_bot.constants import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.constants import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
             FETCH_GET_RETRIES as _retries,
         )
 

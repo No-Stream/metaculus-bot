@@ -6,7 +6,7 @@ For ablation backtests on resolved 2026 questions, the negative "from now"
 deltas tell the forecaster the question already resolved — a leakage vector.
 
 This module patches `_forecasting_window_str` (and the
-`{datetime.now().year}` token in `gap_fill_analyzer_prompt`) for the
+`{datetime.now(UTC).year}` token in `gap_fill_analyzer_prompt`) for the
 duration of a context manager scoped to one specific question.
 """
 
@@ -26,6 +26,7 @@ from metaculus_bot.ablation.window_patch import (
     patched_window_and_year_for_question,
     patched_window_for_question,
 )
+from metaculus_bot.research import targeted
 
 
 def _question(
@@ -181,7 +182,7 @@ class TestPatchedGapFillYearForQuestion:
             open_time=datetime(2026, 1, 1),
             scheduled_resolution_time=datetime(2026, 5, 1),
         )
-        current_year = str(datetime.now().year)
+        current_year = str(datetime.now(UTC).year)
 
         with patched_gap_fill_year_for_question(question):
             prompt = prompts_module.gap_fill_analyzer_prompt(
@@ -225,6 +226,57 @@ class TestPatchedGapFillYearForQuestion:
             )
         assert "Will BTC hit 200k?" in prompt
 
+    def test_patched_function_visible_from_targeted_namespace(self) -> None:
+        """``research.targeted`` from-imports the prompt at module scope, and
+        ``run_gap_fill_pass`` calls that bare name — so the patch must rebind
+        the ``targeted`` binding too, or the production call path renders the
+        real current year (the bug that made this guard inert on every real
+        ablation run)."""
+        question = _question(
+            open_time=datetime(2026, 1, 1),
+            scheduled_resolution_time=datetime(2026, 5, 1),
+        )
+        current_year = str(datetime.now(UTC).year)
+        before_targeted = targeted.gap_fill_analyzer_prompt
+
+        with patched_gap_fill_year_for_question(question):
+            assert targeted.gap_fill_analyzer_prompt is prompts_module.gap_fill_analyzer_prompt
+            prompt = targeted.gap_fill_analyzer_prompt(
+                question_text="Q?",
+                resolution_criteria="rc",
+                fine_print="fp",
+                first_pass_research="fpr",
+                is_benchmarking=False,
+            )
+
+        assert f"no {current_year} data" not in prompt
+        assert "no 2025 data" in prompt
+        # The targeted-namespace binding is restored on exit as well.
+        assert targeted.gap_fill_analyzer_prompt is before_targeted
+
+    def test_raises_when_leak_phrase_is_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Zero substitutions means the prompt template and this guard drifted
+        apart (rubric item 8 is unconditional) — that must raise, not silently
+        leak the real current year into the analyzer prompt."""
+        question = _question()
+        monkeypatch.setattr(
+            prompts_module,
+            "gap_fill_analyzer_prompt",
+            lambda *_args, **_kwargs: "a template with no stale-info rubric phrase",
+        )
+
+        with (
+            patched_gap_fill_year_for_question(question),
+            pytest.raises(RuntimeError, match="year leak not neutralized"),
+        ):
+            prompts_module.gap_fill_analyzer_prompt(
+                question_text="Q?",
+                resolution_criteria="rc",
+                fine_print="fp",
+                first_pass_research="fpr",
+                is_benchmarking=False,
+            )
+
 
 # patched_window_and_year_for_question
 
@@ -235,7 +287,7 @@ class TestPatchedWindowAndYearForQuestion:
             open_time=datetime(2026, 1, 1),
             scheduled_resolution_time=datetime(2026, 5, 1),
         )
-        current_year = str(datetime.now().year)
+        current_year = str(datetime.now(UTC).year)
 
         with patched_window_and_year_for_question(question):
             window = prompts_module._forecasting_window_str(cast(NumericQuestion, question))

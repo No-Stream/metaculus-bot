@@ -165,7 +165,7 @@ class _RealCommentAttributionChecks:
                 unattributable.append(rec["post_id"])
         assert not parser_bad, (
             "Parser dropped a forecast it had the evidence to recover "
-            f"(anonymized despite a present Model: line, or found no bullets at all): {parser_bad[:10]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # error-message display truncation, not data subsampling
+            f"(anonymized despite a present Model: line, or found no bullets at all): {parser_bad[:10]}"  # HARNESS-SCAN-EXEMPT-subsampling  # error-message display truncation, not data subsampling
         )
         # Coverage floor over the records that HAVE an attribution source, so a
         # shift in the unattributable cohort's size can't mask a real drop.

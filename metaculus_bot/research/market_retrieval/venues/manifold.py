@@ -264,7 +264,7 @@ async def manifold_search(session: Any, query: str, *, width: int) -> list[Marke
         {"term": query, "contractType": "ALL", "limit": str(VENUE_SEARCH_LIMIT)},
         max_attempts=MANIFOLD_MAX_ATTEMPTS,
         retryable_statuses=(429, 500, 502, 503, 504),
-        label=f"Manifold q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
+        label=f"Manifold q={query[:40]!r}",  # HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
         return None
@@ -285,7 +285,7 @@ async def manifold_market_detail(session: Any, market_id: str) -> dict[str, Any]
         {},
         max_attempts=1,
         retryable_statuses=(429, 500, 502, 503, 504),
-        label=f"Manifold detail id={market_id[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
+        label=f"Manifold detail id={market_id[:40]!r}",  # HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     return payload if isinstance(payload, dict) else None
 

@@ -103,6 +103,7 @@ from metaculus_bot.backtest.question_prep import (
     fetch_resolved_questions_stratified,
 )
 from metaculus_bot.backtest.scoring import GroundTruth
+from metaculus_bot.question_types import question_type_of
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -479,13 +480,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _question_type_str(question: Any) -> str:
-    if isinstance(question, BinaryQuestion):
-        return "binary"
-    if isinstance(question, MultipleChoiceQuestion):
-        return "multiple_choice"
-    if isinstance(question, NumericQuestion):
-        return "numeric"
-    raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    qtype = question_type_of(question)
+    if qtype is None:
+        raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    return qtype
 
 
 def _serialize_resolution(resolution: Any) -> Any:

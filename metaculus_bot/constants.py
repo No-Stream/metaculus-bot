@@ -954,6 +954,8 @@ TS_ANCHOR_ENABLED_ENV: str = "TS_ANCHOR_ENABLED"
 # each base model as a vision message. OFF everywhere until the text-vs-image
 # A/B (FUTURE.md "TS anchor chart image"). Independent of TS_ANCHOR_ENABLED so
 # the text anchor can ship before the (costlier, unvalidated) image does.
+# NOTE: matplotlib is a dev-only dependency; under the bot workflows' --no-dev
+# install, flipping this on degrades to the text-only anchor with one ERROR log.
 TS_ANCHOR_CHART_ENABLED_ENV: str = "TS_ANCHOR_CHART_ENABLED"
 # Wall-clock cap on the whole provider (fetch fan-out + render). Fetches run in
 # asyncio.to_thread under asyncio.wait_for; a hung endpoint soft-fails to "".

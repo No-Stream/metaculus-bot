@@ -255,8 +255,8 @@ def _fetch_fred_csv(spec: SeriesSpec, start: date, ceiling: date, vintage: date 
 
 
 def _fetch_yfinance_csv(spec: SeriesSpec, start: date, ceiling: date) -> bytes:
-    import yfinance  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # optional-dep pattern, matches financial_data.py
-    from yfinance.exceptions import YFException  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+    import yfinance  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # optional-dep pattern, matches financial_data.py
+    from yfinance.exceptions import YFException  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
 
     try:
         # end is EXCLUSIVE in yfinance 1.x → ceiling + 1 day makes the ceiling inclusive.

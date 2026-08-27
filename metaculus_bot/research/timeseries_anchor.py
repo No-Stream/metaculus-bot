@@ -119,7 +119,9 @@ def _maybe_stash_single_chart(
     only the plain level shape, where the ribbon reads cleanly — a derived MoM/monthly-avg
     band is on a different quantity than the level history this charts). Chart-render
     failures are swallowed so a plotting hiccup never breaks the text section — the chart
-    is a strict add-on and the caller's soft-fail only guards the text.
+    is a strict add-on and the caller's soft-fail only guards the text. An unimportable
+    chart module (matplotlib absent under --no-dev) degrades the same way but logs at
+    ERROR: that's a misconfigured flag flip affecting the whole run, not one question.
     """
     if not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
         return
@@ -153,10 +155,21 @@ def _maybe_stash_single_chart(
         # Import inside the guard: matplotlib is a dev-only dependency, and the bot
         # workflows install with --no-dev, so flipping the chart flag on in prod must
         # degrade to the text-only anchor rather than kill the provider.
-        from metaculus_bot.research.ts_chart import (  # noqa: PLC0415  # matplotlib kept off the cold path
+        from metaculus_bot.research.ts_chart import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # matplotlib kept off the cold path
             render_anchor_chart,
         )
+    except ImportError as exc:  # HARNESS-SCAN-EXEMPT-defensive-fallback
+        # A missing chart module is a run-level misconfiguration (the flag is on but
+        # matplotlib isn't installed), not a per-question render hiccup — log it at
+        # ERROR so it stands out from the WARN below, then degrade to text-only.
+        logger.error(
+            "ts_anchor: chart module unavailable — matplotlib is dev-only and absent under "
+            "`uv sync --no-dev`, so no chart will attach for ANY question this run: %s",
+            exc,
+        )
+        return
 
+    try:
         _session_charts[qid] = render_anchor_chart(
             charted,
             as_of=as_of_ts,
@@ -164,7 +177,7 @@ def _maybe_stash_single_chart(
             band=band,
             title=route.label,
         )
-    except (ImportError, ValueError, RuntimeError) as exc:  # HARNESS-SCAN-EXEMPT-defensive-fallback
+    except (ValueError, RuntimeError) as exc:
         logger.warning("ts_anchor: chart render failed for qid=%s (%s): %s", qid, type(exc).__name__, exc)
 
 

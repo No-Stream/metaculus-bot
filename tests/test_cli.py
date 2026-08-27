@@ -234,7 +234,7 @@ class TestCliExitStatus:
         """
         # Simulate the wrapper having fired a generic (non-404) donated->personal
         # fallback during the run. cli.main reads this AFTER forecast returns.
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
         try:
@@ -263,7 +263,7 @@ class TestCliExitStatus:
         regression. This is the only test that actually pins the no-double-count
         invariant (the diff's headline correctness claim).
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         # Mirror FallbackOpenRouterLlm.invoke: a 404 fallback bumps the generic
         # counter AND the 404 subset.
@@ -501,7 +501,7 @@ class TestCliCreditAlertSuppression:
         credit subset (mirroring the wrapper), and the subtraction takes
         ``alertable`` back to 0 — the empty-wallet case the operator exempted.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
         fb_module._credit_key_fallback_count = 1
@@ -518,7 +518,7 @@ class TestCliCreditAlertSuppression:
         summary drops the suppression clause rather than reporting "0 suppressed
         until <a date in the past>".
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
         fb_module._credit_key_fallback_count = 1
@@ -549,7 +549,7 @@ class TestCliCreditAlertSuppression:
         ``cause`` is only a label — both errors land in the same counter; the
         wrapper-side classification is pinned in test_fallback_openrouter.py.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
         try:
@@ -574,7 +574,7 @@ class TestCliCreditAlertSuppression:
         ``alertable`` is exactly 1 — not 0 (over-subtracted) and not 2 (added
         twice). The rendered count in the WARNING is the only way to see this.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
         fb_module._donated_404_fallback_count = 1
@@ -598,7 +598,7 @@ class TestCliCreditAlertSuppression:
         Only the credit event is exempt, so alertable is 1 and the run still exits
         non-zero on the 404's account.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 2
         fb_module._credit_key_fallback_count = 1
@@ -639,7 +639,7 @@ class TestCliCreditAlertSuppression:
         donated call falling back, so the credit subset cancels the entire generic
         total — would leave no trace of either the degradation or the verdict.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 7
         fb_module._credit_key_fallback_count = 7
@@ -673,7 +673,7 @@ class TestCliCreditAlertSuppression:
         Without the probe, "Key limit exceeded" alone would have exempted a revoked
         or re-capped-to-zero donated key from alerting for six weeks.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 7
         fb_module._credit_key_fallback_count = 0
@@ -772,7 +772,7 @@ class TestCliCreditAlertSuppression:
 
     def test_a_deprecation_alert_run_is_not_labelled_clean(self, caplog: pytest.LogCaptureFixture) -> None:
         """Same complement rule for the post-summary deprecation tripwire."""
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._DEPRECATION_ALERTS.append(("openrouter/x-ai/grok-4.1-fast", "deprecated"))
         try:
@@ -794,7 +794,7 @@ class TestCliCreditAlertSuppression:
         """The "clean" phrase is load-bearing telemetry, so it must not leak onto a
         run that fell back. One suppressed credit fallback exits zero, which is the
         nearest neighbour of the clean path and the easiest one to mislabel."""
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
         fb_module._credit_key_fallback_count = 1
@@ -820,7 +820,7 @@ class TestCliCreditAlertSuppression:
         exempted because the key was genuinely drained. (The fully-suppressed green
         counterpart is ``test_drained_donated_key_alone_exits_zero``.)
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 2
         fb_module._credit_key_fallback_count = 1
@@ -842,7 +842,7 @@ class TestCliCreditAlertSuppression:
         """No key-limit failure means no probe ran, and "unknown" would read as a
         failed probe rather than "never needed one" — so the clause is omitted.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
         try:
@@ -861,7 +861,7 @@ class TestCliCreditAlertSuppression:
         """A drained donated key must not launder real bot-side degradation into a
         green run: the subtraction is scoped to the credit subset only.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 7
         fb_module._credit_key_fallback_count = 7
@@ -882,7 +882,7 @@ class TestCliCreditAlertSuppression:
         (forecaster drop, stacker fallback) still exits non-zero mid-window even
         if a credit fallback happened in the same run.
         """
-        import metaculus_bot.fallback_openrouter as fb_module
+        import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
         fb_module._credit_key_fallback_count = 1
@@ -935,7 +935,7 @@ def _bot_with_real_alertable_count() -> _RealAlertableCountBot:
     and prediction-market properties, and the bot-side counters start at zero so the
     provider-degradation summand is the only thing that can move the total.
     """
-    from metaculus_bot.research.orchestrator import (
+    from metaculus_bot.research.orchestrator import (  # HARNESS-SCAN-EXEMPT-function-level-import
         ResearchOrchestrator,
     )
 
@@ -1103,7 +1103,7 @@ class TestCliProviderDegradationExit:
         assert the counters directly — the same reasoning as
         ``test_donated_404_fallback_triggers_sys_exit_without_double_counting``.
         """
-        import metaculus_bot.research.prediction_market as pmp
+        import metaculus_bot.research.prediction_market as pmp  # HARNESS-SCAN-EXEMPT-function-level-import
 
         bot = _bot_with_real_alertable_count()
         pmp._bump_source_loss()

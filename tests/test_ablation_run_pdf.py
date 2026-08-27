@@ -507,6 +507,36 @@ class TestMultipleChoice:
         assert result["success"] is True
         assert result["n_forecasters_used"] == 2
 
+    def test_a_degenerate_ballot_fails_that_question_not_the_stage(self, tmp_path: Any) -> None:
+        """An option no forecaster declared errors THIS question, not the whole paid stage."""
+        from metaculus_bot.ablation.run_pdf import ARM_PDF, run_pdf_for_qid
+
+        cache = AblationCache(str(tmp_path))
+        question = _make_mc_q(qid=502)
+        no_green = {"Red": 0.6, "Blue": 0.4}  # schema-valid (sums to 1); Green undeclared
+        options = [{"option_name": name, "probability": prob} for name, prob in no_green.items()]
+        payloads: dict[str, dict] = {
+            f"model_{key}": _make_forecaster_payload(
+                _mc_reasoning(no_green),
+                prediction_value={"type": "multiple_choice", "options": options},
+            )
+            for key in ("a", "b")
+        }
+        result = asyncio.run(
+            run_pdf_for_qid(
+                qid=502,
+                question=question,
+                forecaster_payloads=payloads,
+                cache=cache,
+                force=False,
+            )
+        )
+        assert result["success"] is False
+        assert result["reason"] == "degenerate_mc_ballot"
+        assert any("Green" in err for err in result["errors"])
+        # The error payload is cached, so a resume doesn't re-run the question.
+        assert cache.read_stacker_output(qid=502, arm=ARM_PDF) is not None
+
 
 # ---------------------------------------------------------------------------
 # Tests: Numeric — discrete grid length (cdf_size != 201)

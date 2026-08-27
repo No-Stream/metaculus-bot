@@ -35,6 +35,7 @@ from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
     GeneralLlm,
+    MetaculusQuestion,
     MultipleChoiceQuestion,
     ReasonedPrediction,
 )
@@ -1540,7 +1541,7 @@ class TestOversizedCommentReportConstruction:
     prove no ValidationError fires — the exact 2026-06-05 crash on Q578/Q20683.
     """
 
-    def _oversized_explanation(self, question: object) -> str:
+    def _oversized_explanation(self, question: MetaculusQuestion) -> str:
         summary = "\n".join(f"*Forecaster {i}*: {60 + i}.0%" for i in range(1, 7))
         rationales = "\n".join(
             f"## R1: Forecaster {i} Reasoning\nModel: openrouter/provider/m{i}\nrationale body {i}" for i in range(1, 7)

@@ -251,7 +251,7 @@ async def _resolve_discrete_vote(
     Fall back to the OutcomeTypeResult parser call when the block is missing or doesn't
     declare outcome_type.
     """
-    from metaculus_bot.structured_output_schema import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+    from metaculus_bot.structured_output_schema import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # function-scoped: see AGENTS.md
         NumericStructured,
         parse_structured_block,
     )

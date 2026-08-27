@@ -11,7 +11,6 @@ Prefer ``backtest.py`` which scores against actual question resolutions.
 
 import argparse
 import asyncio
-import http.client
 import logging
 import os
 import random
@@ -31,9 +30,7 @@ from forecasting_tools import (
     run_benchmark_streamlit_page,
 )
 from forecasting_tools.data_models.questions import QuestionBasicType
-from requests import exceptions as req_exc
 from tqdm import tqdm
-from urllib3 import exceptions as ul3_exc
 
 from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
@@ -57,6 +54,7 @@ from metaculus_bot.constants import (
     TYPE_MIX,
 )
 from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
+from metaculus_bot.http_status import is_transient_question_fetch_error
 from metaculus_bot.scoring_patches import (
     apply_scoring_patches,
     log_score_scale_validation,
@@ -82,24 +80,6 @@ _progress_state = {
 
 
 install_benchmarker_heartbeat(HEARTBEAT_INTERVAL, _progress_state)
-
-
-def _is_retryable_fetch_error(err: Exception) -> bool:
-    """True for transport-level failures worth another attempt.
-
-    The string check is best-effort: transient HTTP statuses often arrive wrapped in a
-    generic exception whose type carries no signal.
-    """
-    retryables = (
-        req_exc.ConnectionError,
-        req_exc.Timeout,
-        ul3_exc.ProtocolError,
-        http.client.RemoteDisconnected,
-    )
-    if isinstance(err, retryables):
-        return True
-    msg = str(err).lower()
-    return any(tok in msg for tok in ["429", "too many requests", "502", "503", "504", "timeout"])
 
 
 async def _fetch_type_with_retries(question_type: str, count: int, *, base_filter_kwargs: dict) -> list:
@@ -133,10 +113,10 @@ async def _fetch_type_with_retries(question_type: str, count: int, *, base_filte
             if not questions:
                 raise RuntimeError("API returned 0 questions")
             return questions
-        # Broad on purpose: the retry decision is made by _is_retryable_fetch_error,
+        # Broad on purpose: the retry decision is made by is_transient_question_fetch_error,
         # and anything it rejects is re-raised as a RuntimeError below.
         except Exception as e:
-            if attempts < 2 and _is_retryable_fetch_error(e):
+            if attempts < 2 and is_transient_question_fetch_error(e):
                 sleep_s = backoffs[attempts] if attempts < len(backoffs) else backoffs[-1]
                 logger.warning(
                     f"Retryable error fetching {question_type} questions (attempt {attempts + 1}/3): {e}. "

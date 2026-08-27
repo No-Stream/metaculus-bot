@@ -5,7 +5,6 @@ import ipaddress
 import logging
 import os
 import re
-import socket
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -416,7 +415,7 @@ async def _asknews_search_with_retry(sdk: Any, query: str, tries: int, backoff: 
 
 
 async def _call_asknews_search(query: str) -> list[Any]:
-    from asknews_sdk import AsyncAskNewsSDK  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+    from asknews_sdk import AsyncAskNewsSDK  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
 
     client_id = os.getenv(ASKNEWS_CLIENT_ID_ENV)
     secret = os.getenv(ASKNEWS_SECRET_ENV)
@@ -432,8 +431,8 @@ async def _call_asknews_search(query: str) -> list[Any]:
 
 
 async def _run_exa_search(query: str, end_published_date: str | None) -> Any:
-    import httpx  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-    from exa_py import AsyncExa  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+    import httpx  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
+    from exa_py import AsyncExa  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
 
     api_key = os.getenv(EXA_API_KEY_ENV)
     if not api_key:
@@ -773,40 +772,13 @@ def _pinnable_url_host(url: str) -> str | None:
     return parsed.hostname or None
 
 
-async def _resolve_host_to_one_public_ip(host: str) -> str | None:
-    """Resolve ``host`` once off the event loop and return the FIRST address to pin.
-
-    Returns None when resolution fails or ANY resolved address is disallowed —
-    same rebinding-defense stance as the per-request preflight.
-    """
-    try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
-    except (socket.gaierror, OSError):
-        return None
-    vetted_ip: str | None = None
-    for info in infos:
-        # sockaddr shape: IPv4 = (ip, port); IPv6 = (ip, port, flowinfo, scopeid).
-        sockaddr = info[4] if len(info) >= 5 else None
-        if not sockaddr:
-            return None
-        try:
-            resolved = ipaddress.ip_address(sockaddr[0])
-        except ValueError:
-            return None
-        if resolution_source._ip_is_disallowed(resolved):
-            return None
-        if vetted_ip is None:
-            vetted_ip = str(resolved)
-    return vetted_ip
-
-
 async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
     """Vet ``url``'s host and resolve it to ONE public IP for Chromium DNS pinning.
 
     Returns ``(host, vetted_ip)`` — the ``--host-resolver-rules=MAP`` operands — or
     ``None`` when the URL is non-public, unresolvable, or ANY resolved address is
     disallowed. Mirrors :func:`resolution_source.is_public_http_url`'s classification
-    (scheme, userinfo, and the shared :func:`resolution_source._ip_is_disallowed`
+    (scheme, userinfo, and the shared :func:`resolution_source.resolve_vetted_public_ip`
     predicate) so Chromium can only dial an address the airtight aiohttp
     ``FilteringResolver`` path would also accept.
 
@@ -833,7 +805,7 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
             return None
         return host, str(literal)
 
-    vetted_ip = await _resolve_host_to_one_public_ip(host)
+    vetted_ip = await resolution_source.resolve_vetted_public_ip(host)
     if vetted_ip is None:
         return None
     return host, vetted_ip
@@ -841,10 +813,10 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
 
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     try:
-        from playwright.async_api import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        from playwright.async_api import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
             Error as PlaywrightError,
         )
-        from playwright.async_api import async_playwright  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        from playwright.async_api import async_playwright  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # optional-dep import boundary: playwright missing/broken degrades the rendered rung, never the run
         _warn_playwright_unavailable_once(exc)
         return None
@@ -979,8 +951,8 @@ def _run_document_read_sync(url: str, ask: str) -> tuple[str, int]:
     renderer has. Same reader the grounded-search provider uses for the same reason (see
     ``research/url_context_telemetry``).
     """
-    from google import genai  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-    from google.genai import types as genai_types  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+    from google import genai  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
+    from google.genai import types as genai_types  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
 
     api_key = os.getenv(GOOGLE_API_KEY_ENV)
     if not api_key:

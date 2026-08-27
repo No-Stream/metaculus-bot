@@ -1130,7 +1130,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         """
         if qid is None or not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
             return None
-        from metaculus_bot.research.timeseries_anchor import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # optional provider; matplotlib off the cold path
+        from metaculus_bot.research.timeseries_anchor import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # optional provider; matplotlib off the cold path
             _session_charts,
         )
 

@@ -2948,6 +2948,78 @@ class TestPerStackerCacheKeying:
             assert (cache.root / "stacker_outputs" / str(qid) / f"arm_{ARM_STACK_AUG}__{slug}.json").exists()
             assert not (cache.root / "stacker_outputs" / str(qid) / f"arm_{ARM_STACK_AUG}.json").exists()
 
+    @pytest.mark.parametrize(("scenario", "qid"), [("nonfinite", 960), ("median_failed", 961)])
+    def test_error_paths_write_only_the_slugged_cell(
+        self,
+        cache: AblationCache,
+        stacker_llm: MagicMock,
+        fallback_stacker_llm: MagicMock,
+        parser_llm: MagicMock,
+        scenario: str,
+        qid: int,
+    ) -> None:
+        """Both ``write_error`` triggers must write ONLY the slugged cell.
+
+        Regression pin for the bug recorded in ``_StackerArmCell``'s docstring: the
+        non-finite path once omitted ``stacker_slug`` and wrote the legacy unslugged
+        filename, so a resume cache-MISSed the slugged cell and re-spent the paid
+        stacker call. ``nonfinite`` drives ``_payload_from_stacker_result`` (the
+        stacker returns NaN); ``median_failed`` drives ``_median_fallback_payload``
+        (both stackers raise and the median fallback itself raises). The
+        directory-equality assertion also catches any EXTRA file a future write
+        site might drop beside the cell.
+        """
+        slug = model_slug_to_filename("openrouter/anthropic/claude-opus-4.8")
+
+        if scenario == "nonfinite":
+
+            def _stacker(*_args: Any, **_kwargs: Any) -> tuple[float, str]:
+                return float("nan"), "meta nan"
+        else:
+
+            def _stacker(*_args: Any, **_kwargs: Any) -> tuple[float, str]:
+                raise RuntimeError("both stackers boom")
+
+        with (
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.run_tools_for_forecaster",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.build_cross_model_aggregation",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.stacking.run_stacking_binary",
+                new=AsyncMock(side_effect=_stacker),
+            ),
+            # Only reached in the median_failed scenario (the nonfinite stacker
+            # "succeeds", so no fallback fires); harmless otherwise.
+            patch(
+                "metaculus_bot.ablation.run_stacker._median_fallback_prediction",
+                side_effect=RuntimeError("median boom"),
+            ),
+        ):
+            payload = _run(
+                run_stacker_for_arm(
+                    question=_make_binary_q(qid=qid),
+                    research_blob="R",
+                    forecaster_payloads=_three_binary_forecasters(),
+                    arm=ARM_STACK,
+                    cache=cache,
+                    stacker_llm=stacker_llm,
+                    fallback_stacker_llm=fallback_stacker_llm,
+                    parser_llm=parser_llm,
+                    stacker_slug=slug,
+                )
+            )
+
+        assert payload["success"] is False
+        expected_reason = "stacker_nonfinite_output" if scenario == "nonfinite" else "stacker_failed"
+        assert payload["reason"] == expected_reason
+        qdir = cache.root / "stacker_outputs" / str(qid)
+        assert sorted(path.name for path in qdir.iterdir()) == [f"arm_{ARM_STACK}__{slug}.json"]
+
 
 # ===========================================================================
 # M3 — Tertiary MEDIAN fallback when both stackers fail
@@ -3195,7 +3267,7 @@ class TestStackerPromptSizeGuard:
         """4 rationales x 200k chars -> WARNING log + each truncated to a
         per-rationale share of the budget. The truncation must keep the
         LAST chars (conclusion), not the head."""
-        import logging
+        import logging  # HARNESS-SCAN-EXEMPT-function-level-import  # test-local
 
         big_chunk = "a" * 200_000
         # Distinctive end marker so we can confirm the tail survived truncation.
@@ -3260,7 +3332,7 @@ class TestStackerPromptSizeGuard:
         parser_llm: MagicMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        import logging
+        import logging  # HARNESS-SCAN-EXEMPT-function-level-import
 
         captured_base_texts: list[list[str]] = []
 

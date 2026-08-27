@@ -328,13 +328,17 @@ class EnsembleSimulator:
         fake_report = SimpleNamespace(question=question, prediction=pred_obj)
         return calculate_multiple_choice_baseline_score(fake_report, self.baseline_score_cache)
 
-    def _score_numeric_question(self, q_id: Any, question: Any, preds: list[Any], strategy: str) -> float | None:
-        """Aggregate member CDFs pointwise (via the safe-CDF ladder) and score the result."""
+    def _score_numeric_question(self, question: Any, members: list[tuple[str, Any]], strategy: str) -> float | None:
+        """Aggregate member CDFs pointwise (via the safe-CDF ladder) and score the result.
+
+        ``members`` pairs each prediction with its model name, which is the safe-CDF
+        cache's key alongside the question id.
+        """
         cdfs = []
-        for pred in preds:
+        for model_name, pred in members:
             # Use safe CDF accessor that rebuilds from declared percentiles if needed
             cdf_list = self._cdf_cache.get_safe_numeric_cdf(
-                model_name=self.infer_model_name_from_prediction(q_id, pred),
+                model_name=model_name,
                 question=question,
                 prediction=pred,
             )
@@ -352,15 +356,16 @@ class EnsembleSimulator:
         return calculate_numeric_baseline_score(fake_report, self.baseline_score_cache)
 
     def _score_aggregated_question(
-        self, q_id: Any, question: Any, preds: list[Any], *, q_type: str, strategy: str
+        self, question: Any, members: list[tuple[str, Any]], *, q_type: str, strategy: str
     ) -> float | None:
         """Score one question's aggregate, dispatched on its type. None = not scoreable."""
+        preds = [pred for _, pred in members]
         if q_type == "binary":
             return self._score_binary_question(question, preds, strategy)
         if q_type == "multiple_choice":
             return self._score_multiple_choice_question(question, preds, strategy)
         if q_type == "numeric":
-            return self._score_numeric_question(q_id, question, preds, strategy)
+            return self._score_numeric_question(question, members, strategy)
         return None
 
     def simulate_ensemble_performance(
@@ -376,10 +381,10 @@ class EnsembleSimulator:
             if len(data["individual_preds"]) != len(models):
                 continue
             # Aggregate in the ensemble's configured order, not the order reports arrived.
-            preds = [data["individual_preds"][m] for m in models]
+            members = [(m, data["individual_preds"][m]) for m in models]
             try:
                 score = self._score_aggregated_question(
-                    q_id, data["question"], preds, q_type=data["question_type"], strategy=strategy
+                    data["question"], members, q_type=data["question_type"], strategy=strategy
                 )
             except Exception as e:  # noqa: BLE001  # soft-fail boundary: one unaggregatable question must not abort the simulation
                 logger.warning(f"Failed to aggregate predictions for question {q_id}: {e}")
@@ -391,22 +396,6 @@ class EnsembleSimulator:
         result = float(np.mean(ensemble_scores)) if ensemble_scores else 0.0
         logger.debug(f"Ensemble {models} with {strategy}: {len(ensemble_scores)} questions, avg score {result:.2f}")
         return result
-
-    def infer_model_name_from_prediction(self, q_id: int, pred: Any) -> str:
-        """Best-effort resolve model name for stats when only prediction object is available.
-
-        We search benchmarks mapping for a report with matching question id and same prediction object reference.
-        Fallback to 'unknown' if not found. This is only used for logging counters.
-        """
-        try:
-            for benchmark in self._benchmarks:
-                name = extract_model_name(benchmark)
-                for r in benchmark.forecast_reports:
-                    if r.question.id_of_question == q_id and r.prediction is pred:
-                        return name
-        except Exception:  # noqa: BLE001  # soft-fail boundary: best-effort name for a log counter, never worth failing a scored question
-            logger.debug(f"Failed to infer model name for question {q_id}")
-        return "unknown"
 
     def aggregate_predictions(
         self,

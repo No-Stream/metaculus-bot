@@ -339,7 +339,7 @@ async def _run_ladder[T](
     # --- Rung 3: LLM parser salvage ---------------------------------------
     try:
         value = validate(await llm_extract())
-    except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # terminal rung: fold ANY parser failure into the typed ladder error so callers see one exception type
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # terminal rung: fold ANY parser failure into the typed ladder error so callers see one exception type
         failures.append(f"llm: {type(exc).__name__}: {exc}")
     else:
         logger.warning(

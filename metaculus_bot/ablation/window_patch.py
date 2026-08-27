@@ -12,12 +12,13 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot import prompts as prompts_module
+from metaculus_bot.research import targeted
 
 __all__ = [
     "compute_mid_window_today",
@@ -100,30 +101,47 @@ def patched_window_for_question(question: MetaculusQuestion | Any) -> Iterator[N
 
 @contextmanager
 def patched_gap_fill_year_for_question(question: MetaculusQuestion | Any) -> Iterator[None]:
-    """Patch ``gap_fill_analyzer_prompt`` to neutralize the ``{datetime.now().year}`` leak.
+    """Patch ``gap_fill_analyzer_prompt`` to neutralize the ``{datetime.now(UTC).year}`` leak.
 
     The analyzer prompt interpolates the current year into a "stale info"
     rubric ("e.g., no 2026 data on a near-term question"). For ablation
     backtests we substitute a year that does not leak the question's
     resolution timing: ``scheduled_resolution_time.year - 1``.
+
+    ``research.targeted`` does ``from metaculus_bot.prompts import
+    gap_fill_analyzer_prompt`` at module scope, binding the function in its own
+    namespace; patching only ``prompts`` would leave the production call in
+    ``run_gap_fill_pass`` un-intercepted. Patch both and restore both in
+    ``finally`` (same pattern as ``_patched_gap_fill_max_gaps`` in
+    ``ablation/research.py``).
     """
     assert question.scheduled_resolution_time is not None, "question.scheduled_resolution_time is required"
     replacement_year = question.scheduled_resolution_time.year - 1
     original = prompts_module.gap_fill_analyzer_prompt
+    original_targeted = targeted.gap_fill_analyzer_prompt
 
     def _patched(*args: Any, **kwargs: Any) -> str:
         rendered = original(*args, **kwargs)
         # The year must match whatever ``prompts.gap_fill_analyzer_prompt`` interpolated,
-        # which is the LOCAL current year; astimezone() makes it tz-aware without
-        # shifting the wall clock, so the pattern keeps matching.
-        pattern = rf"\bno {datetime.now().astimezone().year} data\b"
-        return re.sub(pattern, f"no {replacement_year} data", rendered)
+        # which is the UTC year (rubric item 8 renders ``datetime.now(UTC).year``).
+        pattern = rf"\bno {datetime.now(UTC).year} data\b"
+        rendered, substitutions = re.subn(pattern, f"no {replacement_year} data", rendered)
+        if substitutions == 0:
+            # Rubric item 8 is unconditional in the prompt template, so zero matches
+            # always means the template and this guard have drifted apart. Raise
+            # rather than silently leak the real current year; run_gap_fill_pass's
+            # soft-fail turns this into a GAP_FILL_ANALYZER_FAILED WARN and the
+            # ablation continues without gap-fill.
+            raise RuntimeError(f"gap-fill year leak not neutralized: {pattern!r} did not match the analyzer prompt")
+        return rendered
 
     prompts_module.gap_fill_analyzer_prompt = _patched
+    targeted.gap_fill_analyzer_prompt = _patched
     try:
         yield
     finally:
         prompts_module.gap_fill_analyzer_prompt = original
+        targeted.gap_fill_analyzer_prompt = original_targeted
 
 
 @contextmanager

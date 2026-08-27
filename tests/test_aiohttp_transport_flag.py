@@ -13,7 +13,7 @@ import os
 
 def test_disable_aiohttp_transport_set_after_import() -> None:
     """Importing the package leaves DISABLE_AIOHTTP_TRANSPORT set to a truthy value."""
-    import metaculus_bot  # noqa: F401, HARNESS-SCAN-EXEMPT-function-level-import  # import for env side effect
+    import metaculus_bot  # noqa: F401  # HARNESS-SCAN-EXEMPT-function-level-import  # import for env side effect
 
     assert os.environ.get("DISABLE_AIOHTTP_TRANSPORT") == "true"
 

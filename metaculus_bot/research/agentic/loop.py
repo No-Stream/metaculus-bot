@@ -1733,7 +1733,7 @@ async def run_agentic_loop(
             # end-of-line, so an embedded newline would truncate the harvest.
             state.telemetry.error = repr(exc).replace("\n", " ")
         return _finalize_loop_exit(state, now_fn, log_prefix)
-    except Exception as exc:
+    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # sanctioned package boundary: mirror v1 soft-fail contract and never raise past the harness except on cancellation
         logger.exception("%sAgentic loop failed; soft-failing to banked findings if any", log_prefix)
         # Stamp the crash so the completion marker (error=...) and the
         # orchestrator's alertable counter can tell this apart from an idle

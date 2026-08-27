@@ -35,7 +35,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
@@ -178,12 +178,13 @@ class _PageProjection:
     per segment. As one loop it was a ~60-statement, 24-branch state machine whose segments could
     only be read by tracing which ``continue`` they fell through.
 
-    ``kept`` collects the projected events; ``state`` carries ``saw_events_array`` and ``cursor``
-    back out, because the caller needs both after the stream has closed.
+    ``kept`` collects the projected events; ``saw_events_array`` and ``cursor`` are the page's
+    other two results, read off the projection after the stream has closed.
     """
 
-    kept: list[dict[str, Any]]
-    state: dict[str, Any]
+    kept: list[dict[str, Any]] = field(default_factory=list)
+    saw_events_array: bool = False
+    cursor: str | None = None
     event: dict[str, Any] | None = None
     market: dict[str, Any] | None = None
     source: dict[str, Any] | None = None
@@ -193,10 +194,10 @@ class _PageProjection:
         open source shadows the market segment, and both shadow the event's own scalars."""
         if prefix == "events":
             if parse_event == "start_array":
-                self.state["saw_events_array"] = True
+                self.saw_events_array = True
             return
         if prefix == "cursor" and parse_event == "string":
-            self.state["cursor"] = value
+            self.cursor = value
             return
         if prefix == "events.item":
             self._event_boundary(parse_event)
@@ -270,7 +271,7 @@ class _PageProjection:
             event[key] = value
 
 
-def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) -> Any:
+def _kalshi_page_collector(projection: _PageProjection) -> Any:
     """An ijson push target that projects an ``/events`` page down as it streams.
 
     Parses at the EVENT level rather than materializing each event object, for two reasons.
@@ -282,7 +283,6 @@ def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) ->
 
     The projection itself is ``_PageProjection``; this is only the push-parser plumbing around it.
     """
-    projection = _PageProjection(kept=kept, state=state)
 
     @ijson.coroutine
     def _collect():  # untyped ijson push-parser target
@@ -293,7 +293,7 @@ def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) ->
     return _collect()
 
 
-async def _stream_projected_page(resp: Any, kept: list[dict[str, Any]], state: dict[str, Any]) -> tuple[str, int]:
+async def _stream_projected_page(resp: Any, projection: _PageProjection) -> tuple[str, int]:
     """Stream one ``/events`` body through the projection. Returns ``(reason, bytes_read)``.
 
     ``reason`` is empty when the whole body streamed in, and otherwise names the guard that stopped
@@ -304,7 +304,7 @@ async def _stream_projected_page(resp: Any, kept: list[dict[str, Any]], state: d
     Transport failures are deliberately not caught here — they belong to the caller's ``except``,
     which reports them retryable.
     """
-    parser = ijson.parse_coro(_kalshi_page_collector(kept, state))
+    parser = ijson.parse_coro(_kalshi_page_collector(projection))
     total = 0
     try:
         async for chunk in resp.content.iter_chunked(_KALSHI_READ_CHUNK_BYTES):
@@ -335,8 +335,7 @@ async def _kalshi_fetch_events_page(
     0.5s later is not a retry, it is a second violation, so the pull stops early and refuses
     to cache.
     """
-    kept: list[dict[str, Any]] = []
-    state: dict[str, Any] = {"saw_events_array": False, "cursor": None}
+    projection = _PageProjection()
 
     timeout = aiohttp.ClientTimeout(total=timeout_s, sock_read=timeout_s)
     total = 0
@@ -347,20 +346,20 @@ async def _kalshi_fetch_events_page(
                 logger.warning(f"Kalshi events HTTP {resp.status}: {snippet}")
                 retryable = resp.status != 429 and (resp.status in _KALSHI_RETRYABLE_STATUSES or resp.status >= 500)
                 return None, None, f"error(http_{resp.status})", retryable
-            reason, total = await _stream_projected_page(resp, kept, state)
+            reason, total = await _stream_projected_page(resp, projection)
             if reason:
                 return None, None, reason, False
     except (TimeoutError, aiohttp.ClientError) as exc:
         logger.warning(f"Kalshi events transient error: {type(exc).__name__}: {exc}")
         return None, None, f"error({type(exc).__name__})", True
 
-    if not state["saw_events_array"]:
+    if not projection.saw_events_array:
         logger.warning(
             f"Kalshi events payload carried no top-level 'events' array ({total} bytes); "
             f"treating as a lost catalogue, not an empty one"
         )
         return None, None, "error(no_events_array)", True
-    return kept, state["cursor"], "", False
+    return projection.kept, projection.cursor, "", False
 
 
 async def _kalshi_fetch_page_with_retries(

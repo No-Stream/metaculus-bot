@@ -6,7 +6,6 @@ so bots see clean OPEN-state questions with no resolution info.
 
 import asyncio
 import copy
-import http.client
 import logging
 import random
 import re
@@ -24,8 +23,6 @@ from forecasting_tools.data_models.questions import (
     NumericQuestion,
     QuestionState,
 )
-from requests import exceptions as req_exc
-from urllib3 import exceptions as ul3_exc
 
 from metaculus_bot.backtest.scoring import GroundTruth
 from metaculus_bot.constants import (
@@ -35,6 +32,7 @@ from metaculus_bot.constants import (
     BACKTEST_OVERFETCH_RATIO,
     FETCH_RETRY_BACKOFFS,
 )
+from metaculus_bot.http_status import is_transient_question_fetch_error
 from metaculus_bot.time_utils import _as_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -435,7 +433,7 @@ async def _fetch_with_retries(
     count: int,
     min_forecasters: int,
 ) -> list[MetaculusQuestion]:
-    """Fetch resolved questions with retry logic matching community_benchmark.py."""
+    """Fetch resolved questions, retrying via the shared benchmark/backtest transient predicate."""
     api_filter = ApiFilter(
         allowed_statuses=["resolved"],
         allowed_tournaments=[tournament],
@@ -448,18 +446,6 @@ async def _fetch_with_retries(
         # (DiscreteQuestion subclasses NumericQuestion), so it needs no separate slot.
         allowed_types=["binary", "multiple_choice", "numeric"],
     )
-
-    def _is_retryable_error(err: Exception) -> bool:
-        retryables = (
-            req_exc.ConnectionError,
-            req_exc.Timeout,
-            ul3_exc.ProtocolError,
-            http.client.RemoteDisconnected,
-        )
-        if isinstance(err, retryables):
-            return True
-        msg = str(err).lower()
-        return any(tok in msg for tok in ["429", "too many requests", "502", "503", "504", "timeout"])
 
     attempts = 0
     insufficient_retried = False
@@ -499,7 +485,7 @@ async def _fetch_with_retries(
                     insufficient_retried = True
                     count = actual_count
                     continue  # retry without sleep, without consuming retry budget
-            if attempts < 2 and _is_retryable_error(e):
+            if attempts < 2 and is_transient_question_fetch_error(e):
                 retry_sleep_s = backoffs[attempts] if attempts < len(backoffs) else backoffs[-1]
                 logger.warning(
                     f"Retryable error fetching resolved questions (attempt {attempts + 1}/3): {e}. "

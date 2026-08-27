@@ -52,6 +52,7 @@ from metaculus_bot.ablation.stage_payload import make_error_payload, make_succes
 from metaculus_bot.prob_math_utils import sigmoid
 from metaculus_bot.probabilistic_tools.base_rate import beta_binomial_update
 from metaculus_bot.probabilistic_tools.survival import prob_event_before
+from metaculus_bot.question_types import question_type_of
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
     MultipleChoiceStructured,
@@ -276,13 +277,10 @@ def _compute_mc_prediction(block: MultipleChoiceStructured) -> dict[str, float] 
 def _question_type_label(
     question: MetaculusQuestion,
 ) -> Literal["binary", "numeric", "multiple_choice"]:
-    if isinstance(question, BinaryQuestion):
-        return "binary"
-    if isinstance(question, MultipleChoiceQuestion):
-        return "multiple_choice"
-    if isinstance(question, NumericQuestion):
-        return "numeric"
-    raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    qtype = question_type_of(question)
+    if qtype is None:
+        raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    return qtype
 
 
 # ---------------------------------------------------------------------------

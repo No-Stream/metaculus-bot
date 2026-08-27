@@ -294,9 +294,10 @@ extend_exclude = [
 # DEP003 — imported but only a transitive dependency. Both are guaranteed present by a
 # declared direct dependency, and both are imported for exception types that surface
 # through that dependency's own API rather than for their own client:
-#   urllib3 <- requests. `from urllib3 import exceptions` in backtest/question_prep.py
-#     and community_benchmark.py exists to catch ul3_exc.ProtocolError next to requests'
-#     own exceptions, because requests re-raises urllib3's type unwrapped.
+#   urllib3 <- requests. `from urllib3 import exceptions` in metaculus_bot/http_status.py
+#     (the one importer, since the shared is_transient_question_fetch_error absorbed the
+#     per-file copies) exists to catch ul3_exc.ProtocolError next to requests' own
+#     exceptions, because requests re-raises urllib3's type unwrapped.
 #   httpx <- openai (and asknews, exa-py, google-genai, litellm — five declared deps
 #     require it). Used directly in credit_telemetry.py, check_openrouter_credits.py and
 #     research/agentic/tools.py.
@@ -308,12 +309,13 @@ DEP003 = ["urllib3", "httpx"]
 #   calibration/fit_platt_cli.py imports it inside try/except ImportError and returns a
 #     skip note that lands in the report, so the CLI works without it.
 #   research/ts_chart.py imports it at module scope, but ts_chart itself is imported
-#     lazily and only after _maybe_stash_single_chart clears the TS_ANCHOR_CHART_ENABLED
-#     gate, which is 'false' in all five bot workflows.
-# The gate is a flag, not an ImportError handler, so matplotlib has to move to
-# [project].dependencies BEFORE TS_ANCHOR_CHART_ENABLED is flipped on in a workflow —
-# those runs install with `uv sync --no-dev` and the module-scope import would raise
-# ModuleNotFoundError past the ValueError/RuntimeError the caller catches.
+#     lazily inside an ImportError guard in _maybe_stash_single_chart, only after the
+#     TS_ANCHOR_CHART_ENABLED gate ('false' in all five bot workflows). Under
+#     `uv sync --no-dev` that guard logs one ERROR naming matplotlib and degrades to
+#     the text-only anchor (pinned by tests/test_ts_chart.py::TestProviderChartHook::
+#     test_missing_matplotlib_degrades_to_text_only_anchor). So matplotlib must move to
+#     [project].dependencies when the flag is flipped on in a workflow — not to keep the
+#     run alive, but because otherwise the flag renders no chart at all.
 DEP004 = ["matplotlib"]
 
 # Import-direction contracts. Every contract below was derived from the real graph

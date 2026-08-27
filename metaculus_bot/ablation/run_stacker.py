@@ -259,7 +259,7 @@ def _is_finite_prediction(prediction_value: Any) -> bool:
     NaN/inf values explicitly so they don't poison the cross-model
     aggregator and bootstrap CIs downstream.
     """
-    import math  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # keep import resilient against formatter strip
+    import math  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # keep import resilient against formatter strip
 
     if not isinstance(prediction_value, dict):
         return False
@@ -345,11 +345,11 @@ async def _dispatch_stacker(
         from metaculus_bot.exceptions import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             UnitMismatchError,  # HARNESS-SCAN-EXEMPT-function-level-import
         )
-        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # function-scoped: see AGENTS.md
             build_numeric_distribution,
             sanitize_percentiles,
         )
-        from metaculus_bot.numeric.validation import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        from metaculus_bot.numeric.validation import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # function-scoped: see AGENTS.md
             detect_unit_mismatch,
         )
 
@@ -404,7 +404,7 @@ def _median_fallback_prediction(
     Marks the failure mode in the caller's logs; no internal logging
     here so the surrounding context (qid, arm) appears in one place.
     """
-    from metaculus_bot.aggregation_strategies import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+    from metaculus_bot.aggregation_strategies import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # function-scoped: see AGENTS.md
         AggregationStrategy,
         combine_binary_predictions,
         combine_multiple_choice_predictions,
@@ -618,7 +618,7 @@ async def _stack_with_fallback(
                     ),
                     timeout=STACKER_SOFT_DEADLINE,
                 )
-            except Exception as primary_exc:
+            except Exception as primary_exc:  # HARNESS-SCAN-EXEMPT-broad-except  # translated to cached error payload
                 logger.exception("Primary stacker failed for qid=%s arm=%s", qid, arm)
                 errors.append(f"primary: {type(primary_exc).__name__}: {primary_exc!r}")
             else:
@@ -640,7 +640,7 @@ async def _stack_with_fallback(
                     ),
                     timeout=STACKER_FALLBACK_SOFT_DEADLINE,
                 )
-            except Exception as fallback_exc:
+            except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except  # translated to cached error payload
                 logger.exception("Fallback stacker failed for qid=%s arm=%s", qid, arm)
                 errors.append(f"fallback: {type(fallback_exc).__name__}: {fallback_exc!r}")
                 return None, None, errors
@@ -671,7 +671,7 @@ def _median_fallback_payload(
             model_used="median_fallback",
             errors=errors,
         )
-    except Exception as median_exc:
+    except Exception as median_exc:  # HARNESS-SCAN-EXEMPT-broad-except  # degrade gracefully to error payload
         logger.exception("Median fallback failed for qid=%s arm=%s", cell.qid, cell.arm)
         errors.append(f"median_fallback: {type(median_exc).__name__}: {median_exc!r}")
         return cell.write_error(reason="stacker_failed", model_used=model_used, errors=errors)

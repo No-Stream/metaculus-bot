@@ -35,12 +35,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from forecasting_tools import (
-    BinaryQuestion,
     GeneralLlm,
     MetaculusQuestion,
-    MultipleChoiceQuestion,
     NumericDistribution,
-    NumericQuestion,
     PredictedOptionList,
     ReasonedPrediction,
 )
@@ -62,6 +59,7 @@ from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import RESEARCHER_LLM, SUMMARIZER_LLM
 from metaculus_bot.llm_retry import llm_status_code
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
+from metaculus_bot.question_types import question_type_of
 
 logger = logging.getLogger(__name__)
 
@@ -284,14 +282,13 @@ def question_type_for_serialization(question: MetaculusQuestion) -> str:
 
     Exposed (rather than ``_question_type``) so sibling modules in
     ``metaculus_bot.ablation`` can serialize prediction values consistently.
+    The returned strings double as the wire-format discriminator in cached arm
+    payloads, so they must stay aligned with ``question_types.question_type_of``.
     """
-    if isinstance(question, BinaryQuestion):
-        return "binary"
-    if isinstance(question, MultipleChoiceQuestion):
-        return "multiple_choice"
-    if isinstance(question, NumericQuestion):
-        return "numeric"
-    raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    qtype = question_type_of(question)
+    if qtype is None:
+        raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    return qtype
 
 
 def serialize_prediction_value(value: Any, question_type: str) -> dict[str, Any]:

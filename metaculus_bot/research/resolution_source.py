@@ -205,31 +205,49 @@ async def is_public_http_url(url: str) -> bool:
     return await _every_resolved_address_is_public(host)
 
 
-async def _every_resolved_address_is_public(host: str) -> bool:
-    """True iff ``host`` resolves and EVERY resolved address is publicly routable.
+async def resolve_vetted_public_ip(host: str) -> str | None:
+    """Resolve ``host`` off the event loop and return its FIRST address — but only
+    after vetting EVERY resolved address.
 
-    Resolves via getaddrinfo off the event loop. Any disallowed address rejects the
-    whole hostname (DNS rebinding defense); a resolution failure rejects too, since
-    an unfetchable host should reach the caller as one uniform ``ssrf_blocked``.
+    The contract is reject-if-ANY-address-disallowed: a single disallowed address
+    among the results rejects the whole hostname (DNS rebinding defense), as does a
+    resolution failure, an unparseable sockaddr, or an empty result — an unfetchable
+    host must reach the caller as one uniform rejection. Only when every address is
+    publicly routable does the first one come back, so a caller may safely pin a
+    connection to it.
+
+    The one DNS-vetting predicate for both SSRF-guarded fetchers: the Tier-1
+    preflight (:func:`is_public_http_url`) consumes the bool view below, and the
+    agentic rendered rung pins Chromium's DNS to the returned IP.
     """
     try:
         infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
     except (socket.gaierror, OSError):
-        return False
-
+        return None
+    vetted_ip: str | None = None
     for info in infos:
         # sockaddr shape: IPv4 = (ip, port); IPv6 = (ip, port, flowinfo, scopeid).
         sockaddr = info[4] if len(info) >= 5 else None
         if not sockaddr:
-            return False
+            return None
         try:
             resolved = ipaddress.ip_address(sockaddr[0])
         except ValueError:
-            return False
+            return None
         if _ip_is_disallowed(resolved):
-            return False
+            return None
+        if vetted_ip is None:
+            vetted_ip = str(resolved)
+    return vetted_ip
 
-    return True
+
+async def _every_resolved_address_is_public(host: str) -> bool:
+    """True iff ``host`` resolves and EVERY resolved address is publicly routable.
+
+    Bool view of :func:`resolve_vetted_public_ip`; a rejection surfaces to the
+    caller as one uniform ``ssrf_blocked``.
+    """
+    return await resolve_vetted_public_ip(host) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +283,19 @@ FetchStatus = Literal[
     "stale_data",
     "empty_body",
 ]
+
+# HTTP status -> FetchStatus for non-OK terminal responses — the ONE table both the
+# Tier-1 page fetch (_resolution_status_outcome) and the Tier-2 Datawrapper CDN hop
+# (_datawrapper_hop_status) read, so a future addition (451, 503, ...) cannot land on
+# one surface only. 3xx is deliberately absent: Tier-1 vets redirects upstream via
+# _resolution_redirect_outcome, and the CDN hop intentionally maps a 3xx to `error`.
+_NON_OK_FETCH_STATUS: dict[int, FetchStatus] = {
+    403: "blocked",
+    406: "blocked",
+    429: "blocked",
+    404: "not_found",
+    410: "not_found",
+}
 
 
 @dataclass
@@ -931,35 +962,17 @@ async def _resolution_redirect_outcome(resp: Any, current_url: str, content_type
 
 def _resolution_status_outcome(status: int, current_url: str, content_type: str) -> FetchResult | None:
     """Terminal result for a non-200 status, or None when the body should be read."""
-    netloc = urlparse(current_url).netloc
-    if status in (403, 406, 429):
-        logger.info(f"resolution_source fetched {netloc} (blocked http={status})")
-        return FetchResult(
-            url=current_url,
-            status="blocked",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-        )
-    if status in (404, 410):
-        logger.info(f"resolution_source fetched {netloc} (not_found http={status})")
-        return FetchResult(
-            url=current_url,
-            status="not_found",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-        )
-    if status != 200:
-        logger.info(f"resolution_source fetched {netloc} (error http={status})")
-        return FetchResult(
-            url=current_url,
-            status="error",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-        )
-    return None
+    if status == 200:
+        return None
+    fetch_status = _NON_OK_FETCH_STATUS.get(status, "error")
+    logger.info(f"resolution_source fetched {urlparse(current_url).netloc} ({fetch_status} http={status})")
+    return FetchResult(
+        url=current_url,
+        status=fetch_status,
+        text="",
+        http_status=status,
+        content_type=content_type or None,
+    )
 
 
 async def _resolution_html_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult:
@@ -1184,13 +1197,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
 
 def _datawrapper_hop_status(status: int) -> FetchStatus:
     """Map the CDN's HTTP status onto a FetchStatus (200 -> ``success``)."""
-    if status in (404, 410):
-        return "not_found"
-    if status in (403, 406, 429):
-        return "blocked"
-    if status != 200:
-        return "error"
-    return "success"
+    return "success" if status == 200 else _NON_OK_FETCH_STATUS.get(status, "error")
 
 
 def _datawrapper_last_modified(resp: Any) -> datetime | None:

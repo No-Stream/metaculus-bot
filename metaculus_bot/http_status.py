@@ -10,8 +10,12 @@ cannot land on one surface only.
 
 from __future__ import annotations
 
+import http.client
 import re
 from collections.abc import Iterator
+
+from requests import exceptions as req_exc
+from urllib3 import exceptions as ul3_exc
 
 # ft's message-only HTTPError embeds the status as literal text ("Status code:
 # 405"). Anchored on that phrase so an unrelated 3-digit number in a server
@@ -47,3 +51,45 @@ def http_status_from_exception(exc: BaseException) -> int | None:
             return status
     match = _STATUS_IN_MESSAGE.search(str(exc))
     return int(match.group("status")) if match else None
+
+
+# Transport-level failures worth another attempt regardless of any HTTP status.
+# ProtocolError/RemoteDisconnected sit beside requests' own types because requests
+# re-raises urllib3's (and httplib's) exceptions unwrapped.
+_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    req_exc.ConnectionError,
+    req_exc.Timeout,
+    ul3_exc.ProtocolError,
+    http.client.RemoteDisconnected,
+)
+
+_TRANSIENT_FETCH_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Consulted only when no status could be read anywhere: a statusless transient
+# failure almost always self-describes as a throttle or a timeout.
+_TRANSIENT_MESSAGE_TOKENS = ("too many requests", "timed out", "timeout")
+
+
+def is_transient_question_fetch_error(exc: BaseException) -> bool:
+    """True when a question-fetch failure is worth another attempt.
+
+    This is the BENCHMARK/BACKTEST outer-loop retry policy (community_benchmark's
+    and backtest/question_prep's fetch loops), deliberately WITHOUT the 403
+    carve-out — that belongs to the hardened prod fetch path
+    (``fetch_hardening._is_retryable``), and the two policies must not be
+    mistaken for one.
+
+    Transport errors anywhere in the cause chain are retryable. Otherwise the
+    decision keys on the real status via :func:`http_status_from_exception`
+    (which reads ``response.status_code`` or ft's anchored "Status code: NNN"
+    message text) — never on bare digits in the message, which ft's re-raise
+    pollutes with URLs, question ids, and echoed response bodies. Only a fully
+    statusless exception falls back to a narrow throttle/timeout text check.
+    """
+    if any(isinstance(cause, _TRANSPORT_ERRORS) for cause in iter_cause_chain(exc)):
+        return True
+    status = http_status_from_exception(exc)
+    if status is not None:
+        return status in _TRANSIENT_FETCH_STATUSES
+    message = str(exc).lower()
+    return any(token in message for token in _TRANSIENT_MESSAGE_TOKENS)
