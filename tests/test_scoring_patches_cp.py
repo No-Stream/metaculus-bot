@@ -65,7 +65,7 @@ def _make_numeric_question(cdf_values, range_min=0.0, range_max=1.0, zero_point=
 
 
 class _Perc:
-    __slots__ = ("value", "percentile")
+    __slots__ = ("percentile", "value")
 
     def __init__(self, value: float, percentile: float):
         self.value = value

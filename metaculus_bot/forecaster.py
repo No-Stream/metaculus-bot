@@ -2,8 +2,9 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Sequence, cast
+from collections.abc import Callable, Coroutine, Sequence
+from datetime import UTC, datetime
+from typing import Any, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryQuestion,
@@ -81,7 +82,7 @@ logger = logging.getLogger(__name__)
 
 # Sort sentinel for a question with no close time, so the tightest-close-first
 # ordering in forecast_questions never compares None against a datetime.
-_CLOSE_TIME_MAX = datetime.max.replace(tzinfo=timezone.utc)
+_CLOSE_TIME_MAX = datetime.max.replace(tzinfo=UTC)
 
 load_environment()
 
@@ -677,7 +678,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # question and rides at the top of the stacker prompt. No-ops when
         # PROBABILISTIC_TOOLS_ENABLED is unset.
         from metaculus_bot.tool_runner import (
-            build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            build_cross_model_aggregation,  # function-scoped: see AGENTS.md
         )
 
         aggregated_tool_output = (
@@ -720,7 +721,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         """
         report = await super()._run_individual_question(question)
         if self.publish_reports_to_metaculus:
-            marker = format_close_margin_marker(question, datetime.now(timezone.utc))
+            marker = format_close_margin_marker(question, datetime.now(UTC))
             if marker is not None:
                 logger.info(marker)
         return report
@@ -1001,7 +1002,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 self._make_prediction(question, research, llm, chart_b64),
                 timeout=FORECASTER_SOFT_DEADLINE,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             elapsed = time.monotonic() - start
             self._record_forecaster_drop(model=llm.model, qid=qid, cause=DROP_CAUSE_TIMEOUT_SOFT_DEADLINE)
             logger.warning(
@@ -1049,7 +1050,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # tool runner no-ops when PROBABILISTIC_TOOLS_ENABLED is off or no
         # block was emitted; callers don't gate.
         from metaculus_bot.tool_runner import (
-            run_tools_for_forecaster,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            run_tools_for_forecaster,  # function-scoped: see AGENTS.md
         )
 
         computed_md = run_tools_for_forecaster(

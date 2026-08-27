@@ -1,6 +1,6 @@
 import json
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Literal
 
 from forecasting_tools import (
@@ -126,7 +126,7 @@ def _forecasting_window_str(
     # value raises TypeError. ``datetime.now(timezone.utc)`` also fixes 0.2.54's
     # latent naive-local-vs-naive-UTC skew (harmless only when the host runs UTC,
     # e.g. CI). The rendered dates are unchanged for current naive UTC inputs.
-    today = datetime.now(timezone.utc)
+    today = datetime.now(UTC)
     open_time = _as_utc(question.open_time)
     scheduled_resolution_time = _as_utc(question.scheduled_resolution_time)
     elapsed_days = (today - open_time).days
@@ -151,7 +151,7 @@ def _today_str() -> str:
     UTC so it agrees with ``_forecasting_window_str`` (which normalizes to UTC)
     within the same prompt bundle, regardless of host timezone.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
 def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:

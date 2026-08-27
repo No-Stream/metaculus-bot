@@ -531,7 +531,7 @@ class TestNumericDiscreteGridLength:
 
     def _discrete_min_step(self, n: int) -> float:
         # Server min-step for an n-point CDF: max(MIN_CDF_PROB_STEP, 0.01 / (n - 1)).
-        from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP  # noqa: PLC0415
+        from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP
 
         return max(MIN_CDF_PROB_STEP, 0.01 / (n - 1))
 
@@ -541,9 +541,9 @@ class TestNumericDiscreteGridLength:
 
     def test_discrete_question_produces_cdf_size_length(self, tmp_path: Any) -> None:
         """A cdf_size=17 discrete question yields a 17-point CDF with the scaled min-step."""
-        import numpy as np  # noqa: PLC0415
+        import numpy as np
 
-        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid
 
         cache = AblationCache(str(tmp_path))
         question = _make_numeric_q(
@@ -578,9 +578,9 @@ class TestNumericDiscreteGridLength:
         exercises the grid-scaled max-step (1.0 at cdf_size=17): the old cap would have
         clipped the peaked integer to 20% and shoved the excess onto higher integers.
         """
-        import numpy as np  # noqa: PLC0415
+        import numpy as np
 
-        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid
 
         cache = AblationCache(str(tmp_path))
         question = _make_numeric_q(
@@ -616,7 +616,7 @@ class TestNumericDiscreteGridLength:
 
     def test_continuous_question_stays_201(self, tmp_path: Any) -> None:
         """A cdf_size=201 continuous question still yields a 201-point CDF."""
-        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid
 
         cache = AblationCache(str(tmp_path))
         question = _make_numeric_q(qid=770, cdf_size=201)
@@ -645,21 +645,21 @@ class TestNumericDiscreteGridLength:
         call is bit-for-bit the old call. We assert both that precondition AND that the emitted
         201-point CDF equals a verbatim replay of the legacy body.
         """
-        import numpy as np  # noqa: PLC0415
+        import numpy as np
 
-        from metaculus_bot.ablation.run_pdf import _compute_numeric_prediction  # noqa: PLC0415
-        from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP  # noqa: PLC0415
-        from metaculus_bot.numeric.config import (  # noqa: PLC0415
+        from metaculus_bot.ablation.run_pdf import _compute_numeric_prediction
+        from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
+        from metaculus_bot.numeric.config import (
             MAX_CDF_PROB_STEP,
             MIN_CDF_PROB_STEP,
             grid_step_constraints,
         )
-        from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds  # noqa: PLC0415
-        from metaculus_bot.probabilistic_tools.distributions import (  # noqa: PLC0415
+        from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
+        from metaculus_bot.probabilistic_tools.distributions import (
             eval_cdf,
             fit_student_t_from_percentiles,
         )
-        from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block  # noqa: PLC0415
+        from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 
         assert grid_step_constraints(201) == (MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP) == (NUM_MIN_PROB_STEP, NUM_MAX_STEP)
 
@@ -688,14 +688,14 @@ class TestNumericDiscreteGridLength:
         assert np.array_equal(new_probs, legacy)
 
     def test_resolve_cdf_size_prefers_payload_cdf_size(self) -> None:
-        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size  # noqa: PLC0415
+        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size
 
         question = _make_numeric_q(cdf_size=201)  # shim default; payload is authoritative
         surviving = {"a": _make_forecaster_payload("r", prediction_value=_numeric_prediction_value(17))}
         assert _resolve_numeric_cdf_size(surviving, question) == 17
 
     def test_resolve_cdf_size_uses_cdf_probabilities_len_when_no_size_key(self) -> None:
-        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size  # noqa: PLC0415
+        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size
 
         question = _make_numeric_q(cdf_size=201)
         pv = _numeric_prediction_value(17)
@@ -704,7 +704,7 @@ class TestNumericDiscreteGridLength:
         assert _resolve_numeric_cdf_size(surviving, question) == 17
 
     def test_resolve_cdf_size_falls_back_to_question_when_no_numeric_payload(self) -> None:
-        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size  # noqa: PLC0415
+        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size
 
         question = _make_numeric_q(cdf_size=17)
         surviving = {"a": _make_forecaster_payload("r", prediction_value={"type": "binary", "prob": 0.5})}
@@ -718,11 +718,11 @@ class TestNumericDiscreteGridLength:
         the arm under ``no_network`` (the offline-replay zero-API guard). Output must be 17 points
         with the scaled min-step — the arm now scores against the right bucket count.
         """
-        import numpy as np  # noqa: PLC0415
-        from forecasting_tools import NumericQuestion  # noqa: PLC0415
+        import numpy as np
+        from forecasting_tools import NumericQuestion
 
-        from metaculus_bot.ablation.offline_replay import no_network  # noqa: PLC0415
-        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+        from metaculus_bot.ablation.offline_replay import no_network
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid
 
         qid = 42752
         question = NumericQuestion(

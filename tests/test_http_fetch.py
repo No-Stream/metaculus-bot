@@ -22,7 +22,7 @@ import ipaddress
 import logging
 import socket
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -68,9 +68,9 @@ class FakeInnerResolver(AbstractResolver):
         family: socket.AddressFamily = socket.AF_INET,
     ) -> list[Any]:
         del host, port, family
-        return list(self._entries)  # noqa: ASYNC910
+        return list(self._entries)
 
-    async def close(self) -> None:  # noqa: ASYNC910
+    async def close(self) -> None:
         self.close_called = True
 
 
@@ -90,7 +90,7 @@ class FakeStreamContent:
         self._chunks = chunks
         self.chunks_consumed = 0
 
-    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:
         del n  # chunk boundaries are dictated by the test's pre-set chunks
         for chunk in self._chunks:
             self.chunks_consumed += 1
@@ -428,7 +428,7 @@ class TestDatawrapperLiveDataUrl:
 class TestParseHttpLastModified:
     def test_parses_rfc7231_to_aware_utc(self):
         parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 GMT")
-        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
+        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=UTC)
         assert parsed is not None and parsed.tzinfo is not None
 
     def test_malformed_returns_none(self):
@@ -442,7 +442,7 @@ class TestParseHttpLastModified:
         # naive operand — so the UTC stamp is what keeps an odd CDN header
         # producing a `stale_data` verdict instead of a crashed hop.
         parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 -0000")
-        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
+        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=UTC)
         assert parsed is not None and parsed.tzinfo is not None
 
 

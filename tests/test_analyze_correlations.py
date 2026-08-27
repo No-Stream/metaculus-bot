@@ -275,9 +275,8 @@ def test_main_with_insufficient_benchmarks(mock_load):
     # Mock loading only one benchmark (need 2+ for correlation)
     mock_load.return_value = [Mock()]
 
-    with patch("sys.argv", ["analyze_correlations.py", "test.jsonl"]):
-        with pytest.raises(SystemExit):
-            analyze_correlations.main()
+    with patch("sys.argv", ["analyze_correlations.py", "test.jsonl"]), pytest.raises(SystemExit):
+        analyze_correlations.main()
 
 
 def test_timestamped_output_filename():

@@ -52,7 +52,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -201,7 +201,7 @@ def _apply_window(live: list[dict], since_days: int) -> list[dict]:
     """Keep artifacts created within ``since_days``; ``since_days <= 0`` keeps everything."""
     if since_days <= 0:
         return live
-    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    cutoff = datetime.now(UTC) - timedelta(days=since_days)
     before = len(live)
     windowed = [a for a in live if (_parse_created_at(a.get("created_at", "")) or cutoff) >= cutoff]
     logger.info(f"--since-days={since_days} post-filter: {len(windowed)}/{before} live artifacts within window")

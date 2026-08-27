@@ -9,7 +9,7 @@ backtest scores would silently get polluted with prediction-market data.
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -688,7 +688,7 @@ class TestStatusQuoDerivation:
         # datetime.now(timezone.utc) to stay tz-aware against ft's aware question
         # datetimes), so assert the UTC date too — a naive datetime.now() flakes
         # in the evening-local/next-day-UTC window.
-        assert datetime.now(timezone.utc).strftime("%Y-%m-%d") in prompt
+        assert datetime.now(UTC).strftime("%Y-%m-%d") in prompt
         # Moving off the status quo requires naming a post-open trigger.
         assert "post-open event" in lowered
         # And an explicit commitment about the window.

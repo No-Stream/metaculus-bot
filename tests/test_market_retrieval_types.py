@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from metaculus_bot.research.market_retrieval.types import (
     MarketChild,
@@ -23,7 +23,7 @@ from metaculus_bot.research.market_retrieval.types import (
     SettlementSource,
 )
 
-_CLOSE = datetime(2026, 8, 31, tzinfo=timezone.utc)
+_CLOSE = datetime(2026, 8, 31, tzinfo=UTC)
 
 
 def _positional_row() -> MarketMatch:

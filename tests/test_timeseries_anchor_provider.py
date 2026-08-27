@@ -1309,7 +1309,7 @@ class TestNoBandNoSection:
         # than trusting the arithmetic, so a constant change can't quietly make the tests
         # below pass for the wrong reason.
         clock = series_clock(pd.DatetimeIndex(self._short_history().index))
-        assert self._HISTORY_OBSERVATIONS <= horizon_steps(clock, self._HORIZON_CALENDAR_DAYS)
+        assert horizon_steps(clock, self._HORIZON_CALENDAR_DAYS) >= self._HISTORY_OBSERVATIONS
         assert (self._RESOLVES.date() - self._AS_OF.date()).days == self._HORIZON_CALENDAR_DAYS
 
     def test_section_suppressed_when_horizon_exceeds_history(self, monkeypatch, caplog):

@@ -232,7 +232,7 @@ async def _targeted_research_for_crux(
             extract_disagreement_crux(analyzer_llm, question.question_text, base_texts),
             timeout=crux_timeout,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         bot._conditional_stacking_crux_failures += 1
         logger.warning(
             "CRUX_SOFT_DEADLINE: crux extraction exceeded %.0fs for Q %s; skipping targeted research",

@@ -319,9 +319,9 @@ async def _invoke_market_llm(
     # `research/orchestrator.py` and `ablation/leakage_screen.py`. Deliberately NOT `Exception`:
     # the TypeError/AttributeError family must still crash (§2 fail-fast), and `CancelledError`
     # subclasses neither root so the `wait_for` boundary stays intact.
-    except (openai.APIError, asyncio.TimeoutError, RuntimeError):
+    except (TimeoutError, openai.APIError, RuntimeError):
         logger.warning(f"{label} LLM call failed", exc_info=True)
-        return ""  # noqa: ASYNC910
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +346,7 @@ async def _kalshi_catalogue(session: Any, *, qid: int | None) -> tuple[list[dict
         if (time.monotonic() - timestamp) < KALSHI_CACHE_TTL_S:
             if qid is not None:
                 record_catalogue_size(qid=qid, source="kalshi_events", entries=len(events), fetch_ok=True)
-            return events, f"ok({len(events)})" if events else "none"  # noqa: ASYNC910
+            return events, f"ok({len(events)})" if events else "none"
 
     pull = await venues.kalshi_prefetch_events(session)
     if pull.complete:
@@ -376,7 +376,7 @@ async def _predictit_universe(session: Any, *, qid: int | None) -> tuple[list[di
         if (time.monotonic() - timestamp) < PREDICTIT_CACHE_TTL_S:
             if qid is not None:
                 record_catalogue_size(qid=qid, source="predictit_markets", entries=len(markets), fetch_ok=True)
-            return markets, _FetchTally(ok=1)  # noqa: ASYNC910
+            return markets, _FetchTally(ok=1)
 
     markets = await venues.predictit_prefetch(session)
     if markets is None:
@@ -548,7 +548,7 @@ async def fetch_market_snapshot(
     if cache_key is not None:
         cached_snap = _SNAPSHOT_CACHE.get(cache_key)
         if cached_snap is not None:
-            return cached_snap  # noqa: ASYNC910
+            return cached_snap
 
     # Session lifecycle: create the aiohttp session at the orchestrator level so cleanup
     # happens OUTSIDE the wait_for cancellation boundary. wait_for kills inner work cleanly,
@@ -561,7 +561,7 @@ async def fetch_market_snapshot(
                     _fetch_market_snapshot_impl(question, session=session, platforms=platforms, as_of=as_of),
                     timeout=timeout,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(f"Prediction-market snapshot TIMEOUT after {timeout}s for qid={qid}")
                 # A whole-provider failure needs its own loss token: with an empty `sources`
                 # map the diagnostics line renders no suffix at all, so a dead snapshot is
@@ -569,14 +569,14 @@ async def fetch_market_snapshot(
                 # alertable_count — losing every source at once is strictly worse than losing
                 # one, which already alerts.
                 _bump_source_loss()
-                return MarketSnapshot(matches=[], sources={"snapshot": "error(timeout)"})  # noqa: ASYNC910
+                return MarketSnapshot(matches=[], sources={"snapshot": "error(timeout)"})
     except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except
         # Outer safety net; should not normally fire -- investigate if seen. Re-raising after
         # logging would defeat the soft-fail contract the rest of the bot depends on, so we
         # swallow + log here. Inner narrow handlers in the venue helpers cover the common paths.
         logger.warning("Prediction-market snapshot FAILED (soft-fail returning empty)", exc_info=True)
         _bump_source_loss()
-        return MarketSnapshot(matches=[], sources={"snapshot": f"error({type(e).__name__})"})  # noqa: ASYNC910
+        return MarketSnapshot(matches=[], sources={"snapshot": f"error({type(e).__name__})"})
 
     if cache_key is not None:
         _SNAPSHOT_CACHE[cache_key] = snapshot
@@ -925,9 +925,9 @@ def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallabl
 
     async def _fetch(question: MetaculusQuestion) -> str:
         if is_benchmarking:
-            return ""  # noqa: ASYNC910
+            return ""
         if not env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
-            return ""  # noqa: ASYNC910
+            return ""
 
         snapshot = await fetch_market_snapshot(question, as_of=None, timeout=PREDICTION_MARKET_TIMEOUT)
         # Surface per-source outcomes so the orchestrator's diagnostics line shows partial

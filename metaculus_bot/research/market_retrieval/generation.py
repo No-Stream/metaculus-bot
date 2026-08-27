@@ -44,9 +44,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any
 
 from metaculus_bot.research.market_retrieval import venues
 from metaculus_bot.research.market_retrieval.http import flatten_results
@@ -406,7 +407,7 @@ async def enrich_manifold(
     """
     rows = [row for row in candidates if row.platform == "manifold" and row.venue_market_id]
     if not rows:
-        return EnrichmentResult()  # noqa: ASYNC910
+        return EnrichmentResult()
 
     semaphore = asyncio.Semaphore(concurrency)
     n_ok = 0
@@ -436,10 +437,10 @@ async def enrich_manifold(
         for outcome in await asyncio.wait_for(gathered, wall_s):
             if isinstance(outcome, BaseException):
                 logger.warning(f"Manifold detail enrichment raised: {type(outcome).__name__}: {outcome}")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             f"Manifold detail enrichment hit its {wall_s}s wall with {n_ok}/{len(rows)} returned; "
             f"keeping what completed"
         )
     logger.info(f"manifold detail enrichment: attempted={len(rows)} ok={n_ok}")
-    return EnrichmentResult(n_attempted=len(rows), n_ok=n_ok)  # noqa: ASYNC910
+    return EnrichmentResult(n_attempted=len(rows), n_ok=n_ok)

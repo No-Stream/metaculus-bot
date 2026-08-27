@@ -50,7 +50,7 @@ def load_benchmarks_from_path(benchmark_path: str) -> list[BenchmarkForBot]:
     if path.is_file():
         # Single file - handle both .json and .jsonl
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 if path.suffix == ".jsonl":
                     # JSON Lines format - one benchmark per line
                     for line in f:
@@ -574,7 +574,7 @@ def _run_ablation(analyzer: CorrelationAnalyzer, args: argparse.Namespace) -> No
     try:
         benches_filtered = getattr(analyzer, "benchmarks", [])
         top_k = min(5, len(optimal_ensembles))
-        print("\nENSEMBLE ABLATIONS (Top {} by Overall)".format(top_k))
+        print(f"\nENSEMBLE ABLATIONS (Top {top_k} by Overall)")
         for idx in range(top_k):
             ens = optimal_ensembles[idx]
             base_models = list(ens.model_names)

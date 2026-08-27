@@ -5,7 +5,8 @@ user-friendly bound messages so that the core forecaster class stays small.
 """
 
 import logging
-from typing import Literal, Sequence
+from collections.abc import Sequence
+from typing import Literal
 
 import numpy as np
 from forecasting_tools import PredictedOptionList
@@ -22,11 +23,11 @@ from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 __all__ = [
-    "aggregate_numeric",
     "aggregate_binary_mean",
+    "aggregate_numeric",
     "bound_messages",
-    "nominal_bounds",
     "clamp_and_renormalize_mc",
+    "nominal_bounds",
 ]
 
 

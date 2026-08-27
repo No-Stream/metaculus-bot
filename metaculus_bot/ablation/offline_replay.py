@@ -274,11 +274,11 @@ def no_network() -> Iterator[None]:
 
     # setattr (not direct assignment) so the type checker doesn't flag the deliberate
     # module-attribute swap as an incompatible reassignment of the stdlib signature.
-    setattr(socket, "getaddrinfo", _blocked_getaddrinfo)
+    socket.getaddrinfo = _blocked_getaddrinfo
     try:
         yield
     finally:
-        setattr(socket, "getaddrinfo", real_getaddrinfo)
+        socket.getaddrinfo = real_getaddrinfo
 
 
 # Data loading (zero-API)
@@ -405,7 +405,7 @@ def _build_mc_record(
         predicted = deserialize_prediction_value(payload["prediction_value"], question)
         if not isinstance(predicted, PredictedOptionList):
             raise TypeError(f"qid {qid}: expected PredictedOptionList, got {type(predicted).__name__}")
-        vec = {name: 0.0 for name in option_order}
+        vec = dict.fromkeys(option_order, 0.0)
         for opt in predicted.predicted_options:
             if opt.option_name in vec:
                 vec[opt.option_name] = float(opt.probability)

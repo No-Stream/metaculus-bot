@@ -195,7 +195,7 @@ class ResearchOrchestrator:
         index to the events catalogue — a strictly more load-bearing thing, since the
         catalogue feeds both the settlement-source join and the fuzzy channel."""
         from metaculus_bot.research.prediction_market import (
-            kalshi_catalogue_fetch_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            kalshi_catalogue_fetch_failures,
         )
 
         return kalshi_catalogue_fetch_failures()
@@ -219,7 +219,7 @@ class ResearchOrchestrator:
         blackout. The provider soft-fails every venue internally, so without this the
         forecasters silently run on zero market data while CI stays green."""
         from metaculus_bot.research.prediction_market import (
-            prediction_market_source_losses,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            prediction_market_source_losses,
         )
 
         return prediction_market_source_losses()
@@ -251,7 +251,7 @@ class ResearchOrchestrator:
         ride the PROVIDER_DEGRADATION marker (see
         constants.provider_degradation_alerts_active)."""
         from metaculus_bot.research.provider_health import (
-            provider_degradation_count,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            provider_degradation_count,
         )
 
         return provider_degradation_count()
@@ -264,7 +264,7 @@ class ResearchOrchestrator:
         a positive statement of provider health, the same reasoning behind
         FORECASTERS_SURVIVED existing next to FORECASTER_DROPS."""
         from metaculus_bot.research.provider_health import (
-            log_provider_degradation_summary,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            log_provider_degradation_summary,
         )
 
         log_provider_degradation_summary()
@@ -282,7 +282,7 @@ class ResearchOrchestrator:
             reset_source_loss_counter,
         )
         from metaculus_bot.research.provider_health import (
-            reset_provider_health,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            reset_provider_health,
         )
 
         reset_series_degradation_counter()
@@ -371,7 +371,7 @@ class ResearchOrchestrator:
                         return ""
                     try:
                         from metaculus_bot.research.targeted import (
-                            run_gap_fill_pass,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                            run_gap_fill_pass,
                         )
 
                         # Bounded by whatever the research phase has left, so a pass
@@ -381,7 +381,7 @@ class ResearchOrchestrator:
                             run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking),
                             timeout=_remaining_research_phase_s(time_budget),
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # Its own branch (like v2's below) because it is not a failure:
                         # falling into the generic except would log a traceback under
                         # "stage failed" for a deliberate budget cut.
@@ -415,7 +415,7 @@ class ResearchOrchestrator:
                         return ""
                     try:
                         from metaculus_bot.research.agentic_gap_fill import (
-                            run_gap_fill_v2,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                            run_gap_fill_v2,
                         )
 
                         # Same research-phase bound as v1 above, on top of v2's own
@@ -431,7 +431,7 @@ class ResearchOrchestrator:
                             ),
                             timeout=_remaining_research_phase_s(time_budget),
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # NOT a v2 crash: we cut it to protect the prediction POST, so
                         # this must not bump gap_fill_v2_error_count (which exists to
                         # redden CI on a dead v2 feature) — the budget decision is
@@ -488,30 +488,29 @@ class ResearchOrchestrator:
             self._store_research_cache(cache_key, research)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
 
-            if self._research_sink is not None:
-                if qid is not None:
-                    try:
-                        # provider_results is the authoritative per-provider outcome;
-                        # providers_used is kept only for legacy archive readers.
-                        self._research_sink(
-                            qid=qid,
-                            post_id=getattr(question, "id_of_post", None),
-                            page_url=question.page_url,
-                            question_text=question.question_text,
-                            research_text=research,
-                            providers_used=provider_names,
-                            gap_fill_used=gap_fill_used,
-                            provider_results=[asdict(r) for r in provider_results],
-                            providers_attempted=provider_names,
-                            providers_succeeded=[r.name for r in provider_results if r.status in SUCCEEDED_STATUSES],
-                            gap_fill_v2=gap_fill_v2_payload,
-                            provider_diagnostics_block=diagnostics_block,
-                            asknews_raw=asknews_raw,
-                        )
-                    except (
-                        Exception
-                    ):  # HARNESS-SCAN-EXEMPT-broad-except — archive write is best-effort; never blocks the forecast
-                        logger.exception("Research sink failed for qid=%d; continuing", qid)
+            if self._research_sink is not None and qid is not None:
+                try:
+                    # provider_results is the authoritative per-provider outcome;
+                    # providers_used is kept only for legacy archive readers.
+                    self._research_sink(
+                        qid=qid,
+                        post_id=getattr(question, "id_of_post", None),
+                        page_url=question.page_url,
+                        question_text=question.question_text,
+                        research_text=research,
+                        providers_used=provider_names,
+                        gap_fill_used=gap_fill_used,
+                        provider_results=[asdict(r) for r in provider_results],
+                        providers_attempted=provider_names,
+                        providers_succeeded=[r.name for r in provider_results if r.status in SUCCEEDED_STATUSES],
+                        gap_fill_v2=gap_fill_v2_payload,
+                        provider_diagnostics_block=diagnostics_block,
+                        asknews_raw=asknews_raw,
+                    )
+                except (
+                    Exception
+                ):  # HARNESS-SCAN-EXEMPT-broad-except — archive write is best-effort; never blocks the forecast
+                    logger.exception("Research sink failed for qid=%d; continuing", qid)
 
             return research
 
@@ -660,7 +659,7 @@ class ResearchOrchestrator:
 
         if not fast_path and env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
             from metaculus_bot.research.gemini_search import (
-                gemini_search_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                gemini_search_provider,
             )
 
             gemini_model = os.getenv(GEMINI_SEARCH_MODEL_ENV)
@@ -673,28 +672,28 @@ class ResearchOrchestrator:
 
         if env_flag_enabled(FINANCIAL_DATA_ENABLED_ENV):
             from metaculus_bot.research.financial_data import (
-                financial_data_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                financial_data_provider,
             )
 
             providers.append((financial_data_provider(is_benchmarking=self._is_benchmarking), "financial_data"))
 
         if env_flag_enabled(TS_ANCHOR_ENABLED_ENV):
             from metaculus_bot.research.timeseries_anchor import (
-                timeseries_anchor_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                timeseries_anchor_provider,
             )
 
             providers.append((timeseries_anchor_provider(is_benchmarking=self._is_benchmarking), "timeseries_anchor"))
 
         if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
             from metaculus_bot.research.prediction_market import (
-                prediction_market_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                prediction_market_provider,
             )
 
             providers.append((prediction_market_provider(is_benchmarking=self._is_benchmarking), "prediction_market"))
 
         if env_flag_enabled(RESOLUTION_SOURCE_ENABLED_ENV):
             from metaculus_bot.research.resolution_source import (
-                resolution_source_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                resolution_source_provider,
             )
 
             providers.append((resolution_source_provider(is_benchmarking=self._is_benchmarking), "resolution_source"))
@@ -711,7 +710,7 @@ class ResearchOrchestrator:
         time_budget: QuestionTimeBudget | None = None,
     ) -> tuple[str, list[ProviderResult], str]:
         from metaculus_bot.research.providers import (
-            is_asknews_subscription_error,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            is_asknews_subscription_error,
         )
 
         # Raw pre-summarization AskNews article text, captured for the research

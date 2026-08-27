@@ -139,4 +139,4 @@ class FakeLlm:
         response_or_exc = self._responses.pop(0)
         if isinstance(response_or_exc, Exception):
             raise response_or_exc
-        return response_or_exc  # noqa: ASYNC910 - scripted double; async-by-contract, no checkpoint needed
+        return response_or_exc

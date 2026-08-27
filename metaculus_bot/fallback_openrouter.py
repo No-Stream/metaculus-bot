@@ -722,8 +722,8 @@ class FallbackOpenRouterLlm(GeneralLlm):
                 # output; on cancellation the secondary is cancelled too. The
                 # primary's exception is intentionally discarded because the
                 # caller asked for a fallback, not a re-raise.
-                await record_donated_key_fallback(self.model, e)  # noqa: ASYNC120
-                return await self._invoke_once_using_secondary(prompt, system_prompt)  # noqa: ASYNC120
+                await record_donated_key_fallback(self.model, e)
+                return await self._invoke_once_using_secondary(prompt, system_prompt)
             raise
 
     async def _invoke_once_using_primary(self, prompt: Any, system_prompt: str | None = None) -> str:

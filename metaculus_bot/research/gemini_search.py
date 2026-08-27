@@ -37,8 +37,8 @@ from metaculus_bot.research.url_context_telemetry import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "extract_url_context_telemetry",
     "build_gemini_client",
+    "extract_url_context_telemetry",
     "gemini_search_provider",
     "invoke_gemini_grounded",
 ]
@@ -276,7 +276,7 @@ async def invoke_gemini_grounded(
             client.aio.models.generate_content(model=model, contents=prompt, config=config),
             timeout=GEMINI_SEARCH_TIMEOUT,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(f"GeminiSearch: {model} timed out after {GEMINI_SEARCH_TIMEOUT}s")
         raise
 
@@ -316,7 +316,7 @@ def gemini_search_provider(
     Mirrors the `_native_search_provider` contract (`MetaculusQuestion -> str`).
     """
 
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:
         prompt = web_research_prompt(
             question.question_text,
             # The MC ballot (None on other types): grounded search can only query candidate

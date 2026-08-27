@@ -75,7 +75,7 @@ def pristine_report_publish(monkeypatch: pytest.MonkeyPatch):
             publish_hardening._PUBLISH_METHOD,
             report_type.__dict__[publish_hardening._PUBLISH_METHOD],
         )
-    yield
+    return
 
 
 class TestPublishDoesNotBlockTheEventLoop:

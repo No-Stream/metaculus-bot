@@ -380,11 +380,11 @@ class DummyReport(ForecastReport):
     prediction: list[str] = Field(default_factory=list)
 
     @classmethod
-    def make_readable_prediction(cls, prediction: "list[str]") -> str:
+    def make_readable_prediction(cls, prediction: list[str]) -> str:
         return "N/A"
 
     @classmethod
-    async def aggregate_predictions(cls: type, predictions: list, question: MetaculusQuestion) -> "DummyReport":
+    async def aggregate_predictions(cls: type, predictions: list, question: MetaculusQuestion) -> DummyReport:
         raise NotImplementedError()
 
     async def publish_report_to_metaculus(self, metaculus_client: MetaculusClient | None = None) -> None:

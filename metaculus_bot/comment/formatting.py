@@ -8,7 +8,8 @@ orchestration.
 from __future__ import annotations
 
 import logging
-from typing import Literal, Sequence
+from collections.abc import Sequence
+from typing import Literal
 
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
 

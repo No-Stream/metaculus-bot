@@ -69,7 +69,7 @@ def percentile_family_consistency(
     """
     if not declared_percentiles or len(declared_percentiles) < 2:
         raise ValueError("declared_percentiles must have at least 2 entries")
-    for p in declared_percentiles.keys():
+    for p in declared_percentiles:
         if not (0.0 < float(p) < 1.0):
             raise ValueError(f"percentile keys must be in (0, 1) (got {p})")
 
@@ -194,10 +194,9 @@ def stated_base_rate_consistency(
         if abs(log_lr) > _WEAK_EVIDENCE_LR_BOUND:
             flag = True
             reason = f"evidence=weak but implied LR={lr:.3f} exceeds |log(3)| bound"
-    elif evidence_strength_max == "moderate":
-        if abs(log_lr) > _MODERATE_EVIDENCE_LR_BOUND:
-            flag = True
-            reason = f"evidence=moderate but implied LR={lr:.3f} exceeds |log(10)| bound"
+    elif evidence_strength_max == "moderate" and abs(log_lr) > _MODERATE_EVIDENCE_LR_BOUND:
+        flag = True
+        reason = f"evidence=moderate but implied LR={lr:.3f} exceeds |log(10)| bound"
     # evidence=strong: never flag.
 
     return ConsistencyResult(flag=flag, flag_reason=reason, details=details)

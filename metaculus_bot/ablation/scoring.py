@@ -730,7 +730,7 @@ def _group_seed(
     is set. SHA-256 keeps the seed reproducible across distinct Python processes.
     """
     qtype_str = question_type if question_type is not None else "__overall__"
-    key = f"{metric}|{qtype_str}|{comparison}|{subgroup}".encode("utf-8")
+    key = f"{metric}|{qtype_str}|{comparison}|{subgroup}".encode()
     digest_int = int.from_bytes(hashlib.sha256(key).digest()[:4], "big")
     seed_seq = np.random.SeedSequence([parent_seed, digest_int])
     return int(seed_seq.generate_state(1)[0])

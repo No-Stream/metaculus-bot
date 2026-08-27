@@ -157,8 +157,7 @@ async def test_research_cache_different_questions_separate_cache_entries(test_ll
     async def mock_provider(question):
         if "Question 1" in question.question_text:
             return "Research for Q1"
-        else:
-            return "Research for Q2"
+        return "Research for Q2"
 
     bot._research._custom_provider = mock_provider
 

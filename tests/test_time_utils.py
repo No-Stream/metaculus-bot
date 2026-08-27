@@ -10,13 +10,13 @@ never as a silently-defaulted datetime that would file the record into the wrong
 era.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from metaculus_bot.time_utils import parse_iso_utc
 
-EXPECTED = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+EXPECTED = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
 
 
 class TestParseIsoUtc:

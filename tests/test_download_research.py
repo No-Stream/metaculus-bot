@@ -622,7 +622,7 @@ class TestCompletenessCheckWatchesThePersistedStore:
         store = tmp_path / "store"
         store.mkdir()
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             run_dir = Path(dest_dir) / str(run_id)
             run_dir.mkdir(parents=True)
             (run_dir / "research_100.jsonl").write_text(json.dumps({"qid": 44220, "run_id": "100"}) + "\n")

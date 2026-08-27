@@ -1795,7 +1795,7 @@ class TestSummaryWithSaturation:
         # Numeric floor is at -220 (empirical).
         # Binary floor is much more negative (probability scale uses 100x scaling).
         # Brier floor is near 1.0.
-        assert NUMERIC_LOG_SCORE_FLOOR == pytest.approx(-220.0, abs=1e-9)
+        assert pytest.approx(-220.0, abs=1e-9) == NUMERIC_LOG_SCORE_FLOOR
         assert BINARY_LOG_SCORE_FLOOR < NUMERIC_LOG_SCORE_FLOOR  # binary much more negative
         assert 0.9 < BRIER_FLOOR < 1.0
 

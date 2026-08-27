@@ -353,8 +353,8 @@ async def test_gap_fill_max_gaps_monkey_patched(
     assert captured["targeted_research"] == 2
 
     # After the call, both are restored to original values.
-    assert constants.GAP_FILL_MAX_GAPS == original_constants
-    assert targeted.GAP_FILL_MAX_GAPS == original_tr
+    assert original_constants == constants.GAP_FILL_MAX_GAPS
+    assert original_tr == targeted.GAP_FILL_MAX_GAPS
 
 
 @pytest.mark.asyncio
@@ -385,8 +385,8 @@ async def test_gap_fill_max_gaps_restored_on_exception(
     # Gap-fill failure is absorbed (matches production soft-fail), so this returns normally.
     await run_gemini_only_research(question, cache, gap_fill_max_gaps=2)
 
-    assert constants.GAP_FILL_MAX_GAPS == original_constants
-    assert targeted.GAP_FILL_MAX_GAPS == original_tr
+    assert original_constants == constants.GAP_FILL_MAX_GAPS
+    assert original_tr == targeted.GAP_FILL_MAX_GAPS
 
 
 @pytest.mark.asyncio

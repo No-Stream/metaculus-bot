@@ -204,4 +204,4 @@ def _maybe_widen_tails(percentile_list: list[Percentile], question: NumericQuest
     )
 
 
-__all__ = ["sanitize_percentiles", "build_numeric_distribution"]
+__all__ = ["build_numeric_distribution", "sanitize_percentiles"]

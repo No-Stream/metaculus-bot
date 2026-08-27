@@ -14,8 +14,9 @@ import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 import aiohttp
 
@@ -85,7 +86,7 @@ def parse_iso(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def parse_iso_guarded(value: Any) -> datetime | None:
@@ -200,16 +201,16 @@ async def http_get_with_backoff(
                     logger.warning(f"{label} HTTP {status} non-retryable: {snippet}")
                     return None
                 return await read_json_capped(resp, label)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             if attempt + 1 >= max_attempts:
                 logger.warning(f"{label} transient error after {attempt + 1} attempts: {exc}")
-                return None  # noqa: ASYNC910
+                return None
             logger.warning(
                 f"{label} transient error: {exc}; retry {attempt + 2}/{max_attempts} "
                 f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
             )
             await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
-    return None  # noqa: ASYNC910
+    return None
 
 
 def flatten_results(results: Sequence[Any], platform: str) -> tuple[list[MarketMatch], _FetchTally]:

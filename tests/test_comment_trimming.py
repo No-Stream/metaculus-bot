@@ -745,7 +745,7 @@ class TestAgainstCheckedInMiniComments:
 
     def _load_mini_comments(self) -> list[str]:
         from pathlib import (
-            Path,  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # matches this file's local style
+            Path,  # HARNESS-SCAN-EXEMPT-function-level-import  # matches this file's local style
         )
 
         path = Path(__file__).parent / "data" / "performance_comments_mini.jsonl"

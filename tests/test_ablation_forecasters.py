@@ -56,7 +56,7 @@ def _make_mc_question(qid: int = 2345) -> MultipleChoiceQuestion:
     # ignores the extra kwarg at runtime. Splat via a ``dict[str, Any]`` so the type
     # checker doesn't flag the undeclared field while preserving the runtime no-op.
     from typing import (
-        Any,  # noqa: PLC0415  - kept function-scoped so the formatter cannot strip an otherwise-unused import
+        Any,
     )
 
     fields: dict[str, Any] = dict(
@@ -425,9 +425,9 @@ async def test_window_patch_active_during_make_prediction(
     q = _make_binary_question(qid=1005)
     flags_during_call: list[bool] = []
 
-    async def observer(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
+    async def observer(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]
         flags_during_call.append(wp_module._window_patch_active)
-        return ReasonedPrediction(prediction_value=0.42, reasoning="rationale")  # noqa: ASYNC910
+        return ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
 
     with patch.object(TemplateForecaster, "_make_prediction", new=observer):
         await run_forecasters_for_question(
@@ -458,10 +458,10 @@ async def test_per_forecaster_failure_caches_error_and_continues(
     failing_model = six_forecaster_llms[0].model
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
 
-    async def selective(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
+    async def selective(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]
         if llm.model == failing_model:
             raise RuntimeError("model exploded")
-        return canned  # noqa: ASYNC910
+        return canned
 
     with patch.object(TemplateForecaster, "_make_prediction", new=selective):
         result = await run_forecasters_for_question(
@@ -759,10 +759,10 @@ async def test_one_serialize_failure_does_not_drop_other_forecaster_payloads(
     healthy_pred = ReasonedPrediction(prediction_value=distribution, reasoning="ok")
     broken_pred = ReasonedPrediction(prediction_value="not-a-distribution", reasoning="bad")  # type: ignore[arg-type]
 
-    async def selective(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
+    async def selective(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]
         if llm.model == healthy_model:
-            return healthy_pred  # noqa: ASYNC910
-        return broken_pred  # noqa: ASYNC910
+            return healthy_pred
+        return broken_pred
 
     with patch.object(TemplateForecaster, "_make_prediction", new=selective):
         result = await run_forecasters_for_question(
@@ -972,11 +972,11 @@ async def test_forecast_stage_disables_tools_env_var_during_make_prediction(
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
     observed_env_values: list[str | None] = []
 
-    async def env_observer(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
-        import os  # noqa: PLC0415  - intentional in-fixture observation
+    async def env_observer(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]
+        import os
 
         observed_env_values.append(os.environ.get("PROBABILISTIC_TOOLS_ENABLED"))
-        return canned  # noqa: ASYNC910
+        return canned
 
     with patch.object(TemplateForecaster, "_make_prediction", new=env_observer):
         await run_forecasters_for_question(
@@ -994,7 +994,7 @@ async def test_forecast_stage_disables_tools_env_var_during_make_prediction(
     )
 
     # After the runner returns, the operator's original "1" must be restored.
-    import os  # noqa: PLC0415
+    import os
 
     assert os.environ.get("PROBABILISTIC_TOOLS_ENABLED") == "1"
 
@@ -1081,8 +1081,8 @@ async def test_run_one_forecaster_removes_notepad_after_make_prediction_raises(
         parser_llm=parser_llm,
     )
 
-    async def boom(self, question, research, llm, chart_b64=None) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
-        raise RuntimeError("simulated forecaster failure")  # noqa: ASYNC910
+    async def boom(self, question, research, llm, chart_b64=None) -> ReasonedPrediction:  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated forecaster failure")
 
     semaphore = asyncio.Semaphore(1)
     with (
@@ -1118,7 +1118,7 @@ def _build_rate_limit_exc(retry_after: int | float | None = 13) -> Exception:
     # Import from the public ``litellm.exceptions`` path (litellm's top-level ``__init__``
     # re-export is untyped, which trips ``reportPrivateImportUsage``); matches the product
     # import in metaculus_bot/ablation/forecasters.py.
-    from litellm.exceptions import RateLimitError  # noqa: PLC0415  - at use to avoid module-load cost
+    from litellm.exceptions import RateLimitError
 
     if retry_after is None:
         # Omit the retry_after_seconds field so the parser falls back to exponential backoff.
@@ -1464,9 +1464,9 @@ async def test_run_one_forecaster_enforces_soft_deadline_timeout(
     q = _make_binary_question(qid=9501)
     one_llm = _make_forecaster_llms(count=1)[0]
 
-    async def stall(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
+    async def stall(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]
         await asyncio.sleep(8)
-        return ReasonedPrediction(prediction_value=0.42, reasoning="never reached")  # noqa: ASYNC910
+        return ReasonedPrediction(prediction_value=0.42, reasoning="never reached")
 
     semaphore = asyncio.Semaphore(1)
     start = asyncio.get_event_loop().time()
@@ -1504,11 +1504,11 @@ async def test_run_one_forecaster_soft_deadline_does_not_retry_after_timeout(
     one_llm = _make_forecaster_llms(count=1)[0]
     invocations = 0
 
-    async def stall(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
+    async def stall(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]
         nonlocal invocations
         invocations += 1
         await asyncio.sleep(5)
-        return ReasonedPrediction(prediction_value=0.42, reasoning="never")  # noqa: ASYNC910
+        return ReasonedPrediction(prediction_value=0.42, reasoning="never")
 
     semaphore = asyncio.Semaphore(1)
     with patch.object(TemplateForecaster, "_make_prediction", new=stall):
@@ -1573,9 +1573,9 @@ async def test_run_forecasters_batch_threads_max_retries(
     q1 = _make_binary_question(qid=9207)
     captured_kwargs: list[dict] = []
 
-    async def spy_runner(question, *args, **kwargs):  # type: ignore[no-untyped-def]  # noqa: ASYNC124
+    async def spy_runner(question, *args, **kwargs):  # type: ignore[no-untyped-def]
         captured_kwargs.append(kwargs)
-        return {}  # noqa: ASYNC910
+        return {}
 
     with patch.object(forecasters_module, "run_forecasters_for_question", new=spy_runner):
         await run_forecasters_batch(
@@ -1689,7 +1689,7 @@ async def test_retry_log_includes_provider_name_and_attempt(
     their own throttling windows. When several free-tier forecasters all share an
     upstream provider, the operator needs to see which provider is causing pain.
     """
-    import logging  # noqa: PLC0415  - test-local import
+    import logging
 
     from metaculus_bot.ablation.forecasters import _run_one_forecaster
 

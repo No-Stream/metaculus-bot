@@ -1,7 +1,5 @@
 import argparse
 import asyncio
-
-# ruff: noqa: F401
 import logging
 import os
 import sys

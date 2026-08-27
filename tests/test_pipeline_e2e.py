@@ -6,7 +6,6 @@ and the min-forecasters guard through the full _research_and_make_predictions fl
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -139,7 +138,7 @@ class TestBinaryStackerPrimaryFailsFallbackSucceeds:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
             return 0.35
 
         with (

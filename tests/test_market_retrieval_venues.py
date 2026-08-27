@@ -24,7 +24,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -2064,7 +2064,7 @@ class TestPredictIt:
         """
         parsed = parse_iso_guarded("2026-11-03T23:59:59.1234567")
 
-        assert parsed == datetime(2026, 11, 3, 23, 59, 59, 123456, tzinfo=timezone.utc)
+        assert parsed == datetime(2026, 11, 3, 23, 59, 59, 123456, tzinfo=UTC)
 
     @pytest.mark.parametrize(
         "unparseable_tail",
@@ -2082,10 +2082,10 @@ class TestPredictIt:
         and losing the guard would raise inside `to_thread` and zero all four venues."""
         parsed = parse_iso_guarded(unparseable_tail)
 
-        assert parsed == datetime(2026, 11, 3, tzinfo=timezone.utc)
+        assert parsed == datetime(2026, 11, 3, tzinfo=UTC)
 
     def test_a_plain_timestamp_keeps_its_time_of_day(self) -> None:
-        assert parse_iso_guarded("2026-11-03T23:59:59") == datetime(2026, 11, 3, 23, 59, 59, tzinfo=timezone.utc)
+        assert parse_iso_guarded("2026-11-03T23:59:59") == datetime(2026, 11, 3, 23, 59, 59, tzinfo=UTC)
 
     def test_the_row_carries_the_parsed_close_time(self, captured_payloads: dict[str, Any]) -> None:
         market = copy.deepcopy(captured_payloads["predictit_all"]["markets"][0])
@@ -2161,7 +2161,7 @@ class TestPredictIt:
 
         children = venues.predictit_contract_children(contracts)
 
-        assert children[0].close_time == datetime(2026, 11, 3, 23, 59, 59, tzinfo=timezone.utc)
+        assert children[0].close_time == datetime(2026, 11, 3, 23, 59, 59, tzinfo=UTC)
         assert children[1].close_time is None
 
     def test_contract_names_become_the_rules_text(self, captured_payloads: dict[str, Any]) -> None:

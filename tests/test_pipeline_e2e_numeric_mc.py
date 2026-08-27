@@ -574,7 +574,7 @@ class TestMultiQuestionBatchPartialFailure:
 
             if isinstance(question, NumericQuestion):
                 raise RuntimeError("All numeric forecasters failed")
-            elif isinstance(question, BinaryQuestion):
+            if isinstance(question, BinaryQuestion):
                 fut: asyncio.Future = asyncio.get_event_loop().create_future()
                 fut.set_result(
                     ResearchWithPredictions(
@@ -585,7 +585,7 @@ class TestMultiQuestionBatchPartialFailure:
                     )
                 )
                 return fut.result()
-            elif isinstance(question, MultipleChoiceQuestion):
+            if isinstance(question, MultipleChoiceQuestion):
                 fut2: asyncio.Future = asyncio.get_event_loop().create_future()
                 fut2.set_result(
                     ResearchWithPredictions(

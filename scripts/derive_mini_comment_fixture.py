@@ -137,7 +137,7 @@ def _shrink_rationale_block(block: str) -> str:
     """
     lines = block.split("\n")
     keep: set[int] = {index for index, line in enumerate(lines) if _VALUE_LINE_RE.match(line)}
-    keep.update(range(0, min(2, len(lines))))  # header + Model: line
+    keep.update(range(min(2, len(lines))))  # header + Model: line
     keep.update(index for index, line in enumerate(lines) if line.startswith("## "))
     keep.update(range(max(0, len(lines) - 2), len(lines)))
 

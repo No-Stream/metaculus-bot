@@ -434,7 +434,7 @@ class TestGammaProbEventBefore:
 
         class _FakeGamma:
             @staticmethod
-            def cdf(x, a, scale):  # noqa: ARG004 — args mirror scipy
+            def cdf(x, a, scale):
                 # Pretend F(elapsed=10) = 0.9999999, F(total=11) = 1.00000005
                 # → diff = 1.0000000600000005e-7, survival = 1e-7, ratio > 1.
                 if x == 11.0:
@@ -1630,7 +1630,7 @@ class TestFitMixtureFromPercentiles:
         )
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
-        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
+        def _always_fail(objective, x0, **kwargs):
             fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
             return OptimizeResult(**fields)
 
@@ -1658,7 +1658,7 @@ class TestFitMixtureFromPercentiles:
         )
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
-        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
+        def _always_fail(objective, x0, **kwargs):
             fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
             return OptimizeResult(**fields)
 
@@ -1685,7 +1685,7 @@ class TestFitMixtureFromPercentiles:
         from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
-        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001
+        def _always_fail(objective, x0, **kwargs):
             fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
             return OptimizeResult(**fields)
 
@@ -1714,7 +1714,7 @@ class TestFitMixtureFromPercentiles:
         bad_log_sd = -50.0
         x_bad = np.concatenate([np.zeros(n), np.array([10.0, 20.0, 30.0]), np.full(n, bad_log_sd)])
 
-        def _success_with_tiny_sd(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
+        def _success_with_tiny_sd(objective, x0, **kwargs):
             fields: dict[str, Any] = dict(success=True, message="ok", x=x_bad, fun=0.0, nit=1)
             return OptimizeResult(**fields)
 

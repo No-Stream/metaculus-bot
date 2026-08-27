@@ -16,7 +16,8 @@ import logging
 import os
 import re
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from forecasting_tools import GeneralLlm, SmartSearcher
@@ -139,7 +140,7 @@ def is_asknews_subscription_error(exc: BaseException) -> bool:
 def _asknews_provider() -> ResearchCallable:
     get_asknews_semaphore()
 
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:
         # Hard wall-clock timeout around the full provider. AskNews's internal
         # retry loop fails fast on non-retryable errors, but a genuine network
         # hang (connect stall, DNS hang, server not closing the stream) is
@@ -343,7 +344,7 @@ def _format_asknews_dual_sections(
 
 
 def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:
         searcher = SmartSearcher(
             # temperature ignored when model is a preconfigured GeneralLlm; None
             # keeps litellm from applying a sampling param on the fallback str path.
@@ -372,7 +373,7 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
 
 
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:
         model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
@@ -504,7 +505,7 @@ def _native_search_provider(
 ) -> ResearchCallable:
     """Research provider using models with native web search capability via OpenRouter :online suffix."""
 
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:
         from metaculus_bot.constants import NATIVE_SEARCH_WALL_TIMEOUT
 
         llm = build_native_search_llm(model_slug)
@@ -607,7 +608,7 @@ def choose_provider_with_name(
             return openrouter_callback, "openrouter"
         return _perplexity_provider(True, is_benchmarking), "openrouter"
 
-    async def _empty(_: MetaculusQuestion) -> str:  # noqa: D401
+    async def _empty(_: MetaculusQuestion) -> str:
         return ""
 
     return _empty, "none"

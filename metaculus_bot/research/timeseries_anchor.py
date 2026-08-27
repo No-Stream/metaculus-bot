@@ -149,7 +149,7 @@ def _maybe_stash_single_chart(
     band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
 
     from metaculus_bot.research.ts_chart import (
-        render_anchor_chart,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # matplotlib off the cold path
+        render_anchor_chart,
     )
 
     as_of_ts = pd.Timestamp(as_of).tz_localize(None) if pd.Timestamp(as_of).tzinfo else pd.Timestamp(as_of)
@@ -335,9 +335,9 @@ def timeseries_anchor_provider(is_benchmarking: bool = False) -> ResearchCallabl
 
     async def _fetch(question: MetaculusQuestion) -> str:
         if not env_flag_enabled(TS_ANCHOR_ENABLED_ENV):
-            return ""  # noqa: ASYNC910
+            return ""
         if not isinstance(question, NumericQuestion):
-            return ""  # noqa: ASYNC910
+            return ""
 
         if is_benchmarking:
             open_time = getattr(question, "open_time", None)
@@ -346,7 +346,7 @@ def timeseries_anchor_provider(is_benchmarking: bool = False) -> ResearchCallabl
                     "ts_anchor: is_benchmarking but qid=%s has no open_time; skipping (leakage-safe)",
                     getattr(question, "id_of_question", None),
                 )
-                return ""  # noqa: ASYNC910
+                return ""
             as_of = open_time
         else:
             as_of = datetime.now(UTC)
@@ -354,16 +354,16 @@ def timeseries_anchor_provider(is_benchmarking: bool = False) -> ResearchCallabl
         qid = getattr(question, "id_of_question", None)
         cache_key = (qid, _as_of_iso(as_of)) if qid is not None else None
         if cache_key is not None and cache_key in _SECTION_CACHE:
-            return _SECTION_CACHE[cache_key]  # noqa: ASYNC910
+            return _SECTION_CACHE[cache_key]
 
         try:
             section = await asyncio.wait_for(
                 asyncio.to_thread(build_anchor_section, question, as_of),
                 timeout=TS_ANCHOR_TIMEOUT,
             )
-        except (FetchError, ValueError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, FetchError, ValueError) as exc:
             logger.warning("ts_anchor: soft-fail for qid=%s (%s): %s", qid, type(exc).__name__, exc)
-            return ""  # noqa: ASYNC910
+            return ""
 
         if cache_key is not None:
             _SECTION_CACHE[cache_key] = section

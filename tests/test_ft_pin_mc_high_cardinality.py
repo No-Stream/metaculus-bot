@@ -89,7 +89,7 @@ def _near_floor_ballot(floor_share: float) -> dict[str, float]:
     the clamp untouched.
     """
     dominant = 1.0 - floor_share * len(_NEAR_FLOOR)
-    return {_DOMINANT: dominant, **{name: floor_share for name in _NEAR_FLOOR}}
+    return {_DOMINANT: dominant, **dict.fromkeys(_NEAR_FLOOR, floor_share)}
 
 
 class TestHighCardinalityMcSurvivesRealPipeline:

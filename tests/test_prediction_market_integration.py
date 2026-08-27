@@ -40,7 +40,6 @@ rather than a fact about today's market listings.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from unittest.mock import MagicMock, patch
@@ -97,7 +96,7 @@ async def test_polymarket_real_search_returns_parseable_response():
     async with aiohttp.ClientSession() as session:
         try:
             matches = await polymarket_search(session, "Trump president 2026", width=10)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             pytest.skip(f"Polymarket transient error: {e}")
 
     # `None` and `[]` are different answers and only one of them is a reason not to run. A lost
@@ -134,7 +133,7 @@ async def test_manifold_real_search_returns_parseable_response():
     async with aiohttp.ClientSession() as session:
         try:
             matches = await manifold_search(session, "Trump president 2026", width=10)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             pytest.skip(f"Manifold transient error: {e}")
 
     # No skip-on-empty here, deliberately. This test used to
@@ -176,7 +175,7 @@ async def test_manifold_search_term_is_still_a_strict_conjunction():
             baseline = await manifold_search(session, "gas prices", width=10)
             with_impossible_token = await manifold_search(session, "gas prices zzzqqqxyz", width=10)
             reordered = await manifold_search(session, "prices gas", width=10)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             pytest.skip(f"Manifold transient error: {e}")
 
     if baseline is None or with_impossible_token is None or reordered is None:
@@ -198,7 +197,7 @@ async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
     async with aiohttp.ClientSession() as session:
         try:
             pull = await kalshi_prefetch_events(session, event_limit=500, max_pages=3)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             pytest.skip(f"Kalshi prefetch transient error: {e}")
 
     # The catalogue pull carries RICHER discriminators than the None-vs-`[]` leaf contract, so the
@@ -255,7 +254,7 @@ async def test_predictit_real_prefetch_and_search_returns_parseable_response():
     async with aiohttp.ClientSession() as session:
         try:
             markets = await predictit_prefetch(session)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             pytest.skip(f"PredictIt prefetch transient error: {e}")
 
     # Same split as the Polymarket leg. `None` is a lost fetch (retry-exhausted 5xx, or a 200
@@ -291,7 +290,7 @@ async def test_predictit_real_prefetch_and_search_returns_parseable_response():
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
-async def test_full_orchestrator_against_real_apis():  # noqa: ASYNC910
+async def test_full_orchestrator_against_real_apis():
     from metaculus_bot.research import prediction_market as pmp
 
     q = _build_integration_question()
@@ -304,7 +303,7 @@ async def test_full_orchestrator_against_real_apis():  # noqa: ASYNC910
     with patch.object(pmp, "_invoke_market_llm", _canned_market_llm):
         try:
             snapshot = await pmp.fetch_market_snapshot(q, timeout=pmp.PREDICTION_MARKET_TIMEOUT)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             pytest.skip(f"Orchestrator transient error: {e}")
 
     # Every source must have reported, and none of the four venues may be a loss: this is the

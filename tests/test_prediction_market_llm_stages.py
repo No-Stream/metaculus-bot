@@ -82,9 +82,9 @@ class TestMarketLlmStages:
 
         # Both suppressions are structural: this stands in for an `async def` production seam, so
         # it cannot be sync and has no checkpoint to offer.
-        async def _spy(config: dict, prompt: str, **kwargs: Any) -> str:  # noqa: ASYNC124
+        async def _spy(config: dict, prompt: str, **kwargs: Any) -> str:
             calls.append({"config": config, **kwargs})
-            return "[]" if _RANKER_CUE in prompt else _AUTHOR_JSON  # noqa: ASYNC910
+            return "[]" if _RANKER_CUE in prompt else _AUTHOR_JSON
 
         with (
             patch.object(pmp, "_invoke_market_llm", _spy),

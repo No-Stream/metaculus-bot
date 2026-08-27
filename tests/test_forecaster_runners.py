@@ -230,9 +230,9 @@ class TestForecasterBroadRetry:
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
             patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)),
             patch.object(forecaster_llm, "invoke", new=invoke),
+            pytest.raises(litellm_exc.Timeout),
         ):
-            with pytest.raises(litellm_exc.Timeout):
-                await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
 
         assert invoke.await_count == 1
 

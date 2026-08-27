@@ -28,7 +28,7 @@ import json
 import logging
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from scripts.gha_artifacts import (
@@ -78,7 +78,7 @@ def build_workflow_map(repo: str) -> dict[int, str]:
     map alone; the map is manifest-bucketing convenience, never load-bearing for the
     markers.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=_RUNS_ENUMERATION_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(UTC) - timedelta(days=_RUNS_ENUMERATION_WINDOW_DAYS)).strftime("%Y-%m-%d")
     cmd = [
         "gh",
         "api",

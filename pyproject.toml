@@ -88,10 +88,122 @@ module-root = ""
 
 [tool.ruff]
 line-length = 120
+target-version = "py312"
+extend-exclude = [
+    "REFERENCE_COPY_OF_*",
+    "scratch",
+    "scratch_docs_and_planning",
+    "benchmarks",
+    "backtests",
+    "report",
+]
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
-ignore = ["E501"]
+# Preview is scoped: explicit-preview-rules means prefix selectors (S, B, PL*)
+# activate only stable rules; preview rules activate only when named in select.
+preview = true
+explicit-preview-rules = true
+select = [
+    # fundamentals
+    "E",
+    "F",
+    "W",
+    "I",
+    "UP",
+    # correctness / Python footguns
+    "B",
+    "RUF",
+    "PLE",
+    "PLW",
+    "BLE",
+    "RET",
+    "A",
+    # concurrency / IO / time
+    "ASYNC",
+    "DTZ",
+    # security
+    "S",
+    # maintainability / structure
+    "C90",
+    "SIM",
+    "C4",
+    "ERA",
+    "PIE",
+    # logging
+    "LOG",
+    "G",
+    # tests
+    "PT",
+    # suppression hygiene (blanket noqa / type: ignore)
+    "PGH",
+    # debugger / print residue
+    "T10",
+    "T20",
+    # API readability at call sites
+    "FBT003",
+    # imports at module scope (deliberate exceptions carry noqa, see AGENTS.md)
+    "PLC0415",
+    # structural limits (stable)
+    "PLR0912",
+    "PLR0915",
+    # structural limits (preview, explicitly opted in)
+    "PLR0914",
+    "PLR0916",
+    "PLR0917",
+    "PLR1702",
+]
+ignore = [
+    "E501", # formatter owns line length
+    "S101", # asserts are legitimate internal invariants (and ubiquitous in tests)
+    "G004", # repo logging convention is f-strings with {var=}
+]
+# MULTIPLICATION SIGN is deliberate math typography in prompts/docstrings ("5× cost").
+allowed-confusables = ["×"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-branches = 10
+max-statements = 50
+max-positional-args = 4
+max-bool-expr = 5
+max-locals = 15
+max-nested-blocks = 4
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    # Test functions are linear scenario scripts; structural limits fit production code.
+    "C901",
+    "PLR0912",
+    "PLR0914",
+    "PLR0915",
+    "PLR0916",
+    "PLR0917",
+    "PLR1702",
+    "FBT003",   # bool positionals into local test helpers read fine
+    "S105",     # fake credentials in fixtures
+    "S106",
+    "DTZ",      # fixture datetimes follow whatever prod semantics require
+    "ASYNC230", # blocking IO inside async tests is harmless
+    "ASYNC240",
+    "PLC0415",  # function-scoped imports scope monkeypatches
+]
+# CLI entry points print by design.
+"scripts/**" = ["T201"]
+"analyze_correlations.py" = ["T201"]
+"backtest.py" = ["T201"]
+"community_benchmark.py" = ["T201"]
+"main.py" = ["T201"]
+"metaculus_bot/ablation/cli.py" = ["T201"]
+"metaculus_bot/check_openrouter_credits.py" = ["T201"]
+"metaculus_bot/performance_analysis/cli.py" = ["T201"]
+# Monkey-patch modules: module-global state IS the design (patch flags, counters
+# whose bytecode-atomic increments are documented load-bearing in AGENTS.md).
+"metaculus_bot/scoring_patches.py" = ["PLW0603"]
+"metaculus_bot/publish_hardening.py" = ["PLW0603"]
+"metaculus_bot/publish_gate.py" = ["PLW0603"]
+"metaculus_bot/ablation/window_patch.py" = ["PLW0603"]
 
 [tool.pytest.ini_options]
 # pythonpath=["."] replaces the legacy PYTHONPATH=. env hack so tests can import

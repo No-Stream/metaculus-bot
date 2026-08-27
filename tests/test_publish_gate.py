@@ -21,7 +21,7 @@ Three invariants here, and the third is the one that keeps this cheap:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -44,8 +44,8 @@ from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 from metaculus_bot import publish_gate, publish_hardening
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
-_NOW = datetime(2026, 8, 3, 12, 5, 6, tzinfo=timezone.utc)
-_CLOSE = datetime(2026, 8, 3, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 8, 3, 12, 5, 6, tzinfo=UTC)
+_CLOSE = datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
 _DECLARED_VALUES = [5, 8, 12, 18, 28, 42, 50, 58, 72, 82, 88, 92, 96]
 
 
@@ -60,7 +60,7 @@ def _question(
         id_of_question=qid,
         id_of_post=45058,
         close_time=close_time,
-        open_time=datetime(2026, 8, 3, 11, 0, 0, tzinfo=timezone.utc),
+        open_time=datetime(2026, 8, 3, 11, 0, 0, tzinfo=UTC),
         state=state,
     )
 
@@ -223,7 +223,7 @@ class TestSkipPublishIfClosed:
 
     def test_defaults_to_wall_clock_when_no_now_is_passed(self):
         # Prod passes no `now`; a close time far in the past must still gate.
-        q = _question(close_time=datetime(2020, 1, 1, tzinfo=timezone.utc))
+        q = _question(close_time=datetime(2020, 1, 1, tzinfo=UTC))
         assert publish_gate.skip_publish_if_closed(q) is True
 
 
@@ -255,7 +255,7 @@ class TestGateRidesTheRealPublishSeam:
 
     @pytest.mark.asyncio
     async def test_closed_question_never_reaches_the_post(self, offloaded_publish: list[Any]) -> None:
-        report = self._Report(_question(close_time=datetime(2020, 1, 1, tzinfo=timezone.utc)))
+        report = self._Report(_question(close_time=datetime(2020, 1, 1, tzinfo=UTC)))
         result = await BinaryReport.publish_report_to_metaculus(report)  # type: ignore[arg-type]
         assert result is None, "a skipped publish returns None, matching ft's own return type"
         assert offloaded_publish == [], "the closed question must not have been POSTed"
@@ -263,7 +263,7 @@ class TestGateRidesTheRealPublishSeam:
 
     @pytest.mark.asyncio
     async def test_open_question_publishes_unchanged(self, offloaded_publish: list[Any]) -> None:
-        report = self._Report(_question(close_time=datetime.now(timezone.utc) + timedelta(days=1)))
+        report = self._Report(_question(close_time=datetime.now(UTC) + timedelta(days=1)))
         result = await BinaryReport.publish_report_to_metaculus(report)  # type: ignore[arg-type]
         assert result == "published", "an open question must take the pre-gate path verbatim"
         assert offloaded_publish == [report]
@@ -285,7 +285,7 @@ class TestGateRidesTheRealPublishSeam:
             monkeypatch.setattr(report_type, publish_hardening._PUBLISH_METHOD, recording_publish)
         publish_hardening.apply_report_publish_offload()
         try:
-            closed = self._Report(_question(close_time=datetime(2020, 1, 1, tzinfo=timezone.utc)))
+            closed = self._Report(_question(close_time=datetime(2020, 1, 1, tzinfo=UTC)))
             for report_type in publish_hardening._PATCHED_REPORT_TYPES:
                 await report_type.publish_report_to_metaculus(closed)  # type: ignore[arg-type]
             assert posted == [], f"these report types published a closed question: {posted}"
@@ -344,8 +344,8 @@ class TestGateRidesTheRealPublishSeam:
     async def test_a_skip_does_not_stop_the_next_question(self, offloaded_publish: list[Any]) -> None:
         # The whole point of skipping rather than raising: q45085 took its run's
         # end-of-run summary down with it. Siblings must be unaffected.
-        closed = self._Report(_question(close_time=datetime(2020, 1, 1, tzinfo=timezone.utc), qid=45085))
-        still_open = self._Report(_question(close_time=datetime.now(timezone.utc) + timedelta(days=1), qid=45093))
+        closed = self._Report(_question(close_time=datetime(2020, 1, 1, tzinfo=UTC), qid=45085))
+        still_open = self._Report(_question(close_time=datetime.now(UTC) + timedelta(days=1), qid=45093))
         await BinaryReport.publish_report_to_metaculus(closed)  # type: ignore[arg-type]
         await BinaryReport.publish_report_to_metaculus(still_open)  # type: ignore[arg-type]
         assert offloaded_publish == [still_open]

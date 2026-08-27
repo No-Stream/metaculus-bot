@@ -1113,7 +1113,7 @@ class TestStackingGuardsAndReasoning:
         )
 
         question = Mock(spec=BinaryQuestion)
-        setattr(question, "id_of_question", 999)
+        question.id_of_question = 999
 
         pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
         pred2 = ReasonedPrediction(prediction_value=0.8, reasoning="Analysis 2")

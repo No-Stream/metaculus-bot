@@ -115,9 +115,9 @@ from metaculus_bot.probabilistic_tools.survival import (
 )
 
 __all__ = [
+    "DEFAULT_INFORMATIVE_PRIOR_STRENGTH",
     "BetaBinomialResult",
     "ConsistencyResult",
-    "DEFAULT_INFORMATIVE_PRIOR_STRENGTH",
     "DirichletCI",
     "FitType",
     "GammaFit",
@@ -137,9 +137,9 @@ __all__ = [
     "dirichlet_with_other",
     "fit_gamma_from_gaps",
     "fit_lognormal_from_percentiles",
+    "fit_mixture_from_percentiles",
     "fit_normal_from_percentiles",
     "fit_student_t_from_percentiles",
-    "fit_mixture_from_percentiles",
     "fit_to_standard_percentiles",
     "gamma_prob_event_before",
     "implied_likelihood_ratio",

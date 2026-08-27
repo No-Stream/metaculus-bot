@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from metaculus_bot.research.providers import is_asknews_subscription_error
@@ -52,7 +50,7 @@ class TestIsAsknewsSubscriptionError:
 
     def test_asyncio_timeout_error_does_not_match(self) -> None:
         # Timeout is an operational failure we DO want to alert on, not silence.
-        exc = asyncio.TimeoutError()
+        exc = TimeoutError()
         assert is_asknews_subscription_error(exc) is False
 
 
@@ -63,7 +61,7 @@ class TestIsAsknewsSubscriptionError:
         (_FakeForbiddenError("some other error"), False),
         (RuntimeError("403 Forbidden"), False),
         (PermissionError("forbidden path /tmp"), False),
-        (asyncio.TimeoutError(), False),
+        (TimeoutError(), False),
     ],
 )
 def test_is_asknews_subscription_error_parametrized(exc: BaseException, expected: bool) -> None:

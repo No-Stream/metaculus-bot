@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from forecasting_tools.data_models.questions import MetaculusQuestion, QuestionState
 
@@ -168,7 +168,7 @@ def skip_publish_if_closed(question: MetaculusQuestion | None, now: datetime | N
     if question is None:
         return False
 
-    moment = now if now is not None else datetime.now(timezone.utc)
+    moment = now if now is not None else datetime.now(UTC)
     verdict = closed_to_forecasting(question, moment)
     if verdict is None:
         return False

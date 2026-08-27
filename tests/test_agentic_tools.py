@@ -21,7 +21,7 @@ class _FakeResponse:
         self.status = status
         self.headers = headers or {}
 
-    async def __aenter__(self) -> "_FakeResponse":
+    async def __aenter__(self) -> _FakeResponse:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -39,7 +39,7 @@ class _FakeSession:
         self._responses = list(responses)
         self.calls: list[tuple[str, bool]] = []
 
-    async def __aenter__(self) -> "_FakeSession":
+    async def __aenter__(self) -> _FakeSession:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -237,7 +237,7 @@ async def test_search_news_happy_path_uses_gate_and_semaphore(monkeypatch: pytes
             return None
 
     class FakeSdk:
-        async def __aenter__(self) -> "FakeSdk":
+        async def __aenter__(self) -> FakeSdk:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -278,7 +278,7 @@ class _FakeAskNewsSdk:
     def __init__(self, search_news_mock: AsyncMock) -> None:
         self.news = SimpleNamespace(search_news=search_news_mock)
 
-    async def __aenter__(self) -> "_FakeAskNewsSdk":
+    async def __aenter__(self) -> _FakeAskNewsSdk:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -768,7 +768,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             # Runs strictly after _try_rendered_fetch acquires the host gate.
             events.append("rendered_started")
             return self
@@ -883,7 +883,7 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1302,7 +1302,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1394,7 +1394,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1500,7 +1500,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1648,7 +1648,7 @@ async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: p
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1709,7 +1709,7 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:

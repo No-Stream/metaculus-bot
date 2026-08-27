@@ -16,6 +16,6 @@ import os
 # before forecasting_tools/litellm) is imported.
 os.environ.setdefault("DISABLE_AIOHTTP_TRANSPORT", "true")
 
-from metaculus_bot.question_patches import apply_question_patches  # noqa: E402  # must follow the env setdefault above
+from metaculus_bot.question_patches import apply_question_patches  # must follow the env setdefault above
 
 apply_question_patches()

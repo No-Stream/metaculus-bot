@@ -82,7 +82,7 @@ def pool_mc(
     n_forecasters = len(option_prob_vectors)
 
     # Geometric mean per option in log space (floor zeros so log stays finite).
-    log_sums = {k: 0.0 for k in keys}
+    log_sums = dict.fromkeys(keys, 0.0)
     for vec in option_prob_vectors:
         for k in keys:
             log_sums[k] += np.log(clamp_prob(vec[k], eps=PROB_CLAMP_EPS))

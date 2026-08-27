@@ -2,9 +2,8 @@
 
 import logging
 import math
-from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
-from typing import Callable
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
 
 import numpy as np
 from scipy.stats import spearmanr
@@ -344,7 +343,7 @@ def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: f
 # truth for this era boundary across the package: width_monitor's ``TS_ANCHOR_ENABLE``
 # aliases it, and every screen gated on the bundle's contents keys on it. Era
 # boundaries are merge-to-main COMMITTER timestamps, never authoring dates.
-B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
 
 # ``9f1175c`` (grid-scaled max-step for discrete CDF resampling) rode that merge.
 # Before this instant a flat 0.2 per-bin cap applied at EVERY grid size; after it,

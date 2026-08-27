@@ -100,9 +100,8 @@ class TestZeroNetwork:
     def test_no_network_blocks_outbound_resolution(self):
         # Inside no_network(), any attempt to resolve a real hostname (the first step of
         # every outbound HTTP/LLM/provider call) must raise — making a live call impossible.
-        with no_network():
-            with pytest.raises(NetworkAccessDuringReplayError):
-                socket.getaddrinfo("openrouter.ai", 443)
+        with no_network(), pytest.raises(NetworkAccessDuringReplayError):
+            socket.getaddrinfo("openrouter.ai", 443)
 
     def test_no_network_allows_localhost(self):
         # Local tooling resolution stays allowed so the guard is targeted at the live providers.

@@ -374,7 +374,7 @@ class TestAnnualizationBasis:
         first and cleared the second by arithmetic accident (margin zero on real
         windows)."""
         assert FINANCIAL_YFINANCE_LOOKBACK_DAYS >= 365 + 14
-        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS >= math.ceil((252 + 7) * 365.25 / 252)
+        assert math.ceil((252 + 7) * 365.25 / 252) <= FINANCIAL_YFINANCE_LOOKBACK_DAYS
         # Documented crypto tolerance: end-inclusive window dates minus the 366 rows the
         # 1y lookup wants on a gap-free frame.
         assert (FINANCIAL_YFINANCE_LOOKBACK_DAYS + 1) - 366 >= 24
@@ -1255,8 +1255,8 @@ class TestAllowlistPromptConsistency:
             assert identifier in CLASSIFIER_PROMPT, f"{identifier} missing from CLASSIFIER_PROMPT reference table"
 
     def test_frozensets_derived_from_label_dicts(self) -> None:
-        assert KNOWN_TICKERS == frozenset(TICKER_LABELS)
-        assert KNOWN_FRED_SERIES == frozenset(FRED_LABELS)
+        assert frozenset(TICKER_LABELS) == KNOWN_TICKERS
+        assert frozenset(FRED_LABELS) == KNOWN_FRED_SERIES
 
 
 # ---------------------------------------------------------------------------

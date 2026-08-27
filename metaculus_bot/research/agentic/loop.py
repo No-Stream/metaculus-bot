@@ -1141,7 +1141,7 @@ async def _execute_one_tool_call(
             handler = tools_by_name[tool_call.name].handler(**arguments)
         raw_outcome = await asyncio.wait_for(handler, timeout=timeout_s)
         outcome = ToolOutcome.model_validate(raw_outcome)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         outcome = ToolOutcome(
             content_markdown=f"Tool timed out after {timeout_s:.2f}s.",
             method="internal",
@@ -1235,10 +1235,10 @@ def _harvest_verification_tiers(tool_name: str, arguments: dict[str, Any], outco
         requested = arguments.get("url")
         if not isinstance(requested, str):
             return {}
-        return {normalized: tier for normalized in _iter_normalized_urls(requested)}
+        return dict.fromkeys(_iter_normalized_urls(requested), tier)
     # snippet: every surfaced URL was seen only as an excerpt. Reuse provenance's
     # URL set so tier and provenance can't drift (F7).
-    return {normalized: tier for normalized in _surfaced_urls(arguments, outcome)}
+    return dict.fromkeys(_surfaced_urls(arguments, outcome), tier)
 
 
 def _normalized_call_key(tool_call: _ToolCall) -> tuple[str, str]:
@@ -1526,7 +1526,7 @@ async def _run_ghost_phase(
         response = await asyncio.wait_for(llm_call(state.messages, None), timeout=60.0)
         assistant_message = _parse_response_message(response)
         state.messages.append(assistant_message)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("%sGhost phase timed out after 60s", log_prefix)
         return None
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # telemetry-only phase
@@ -1655,7 +1655,7 @@ async def run_agentic_loop(
         )
     except asyncio.CancelledError:
         raise
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         # asyncio.TimeoutError == builtin TimeoutError on 3.11+, so a bare
         # connection-level timeout from inside the unguarded driver call lands
         # here too — NOT just a genuine outer wait_for deadline. Classify by
@@ -1671,7 +1671,7 @@ async def run_agentic_loop(
             # end-of-line, so an embedded newline would truncate the harvest.
             state.telemetry.error = repr(exc).replace("\n", " ")
         return _finalize_loop_exit(state, now_fn, log_prefix)
-    except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # sanctioned package boundary: mirror v1 soft-fail contract and never raise past the harness except on cancellation
+    except Exception as exc:
         logger.exception("%sAgentic loop failed; soft-failing to banked findings if any", log_prefix)
         # Stamp the crash so the completion marker (error=...) and the
         # orchestrator's alertable counter can tell this apart from an idle

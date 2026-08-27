@@ -427,7 +427,7 @@ def _format_buckets_table(buckets: dict[str, dict[str, float | int]] | None) -> 
 def _format_section(outcome: FitOutcome | None, title: str) -> str:
     lines: list[str] = [f"## {title} fit"]
     if outcome is None:
-        lines.append("\n_Not run (no `--{0}-from` argument)._".format(title.lower()))
+        lines.append(f"\n_Not run (no `--{title.lower()}-from` argument)._")
         return "\n".join(lines)
 
     lines.append(f"\n- n_train: **{outcome.n_train}**")

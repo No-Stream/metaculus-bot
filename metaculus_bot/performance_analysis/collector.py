@@ -614,7 +614,7 @@ def rescore_records(records: list[dict]) -> int:
     for record in records:
         if not _rescorable(record):
             continue
-        fresh = {**record, **{field: None for field in _SCORE_FIELDS}}
+        fresh = {**record, **dict.fromkeys(_SCORE_FIELDS)}
         _compute_scores(fresh)
         record_changed = False
         for field in _SCORE_FIELDS:

@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
 from forecasting_tools.data_models.multiple_choice_report import PredictedOptionList
@@ -69,7 +69,7 @@ class PlattParams:
     slope: float
 
     @classmethod
-    def identity(cls) -> "PlattParams":
+    def identity(cls) -> PlattParams:
         return cls(bias=0.0, slope=1.0)
 
     def is_identity(self) -> bool:

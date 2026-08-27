@@ -82,8 +82,8 @@ from metaculus_bot.performance_analysis.stacker_detection import (
 )
 
 __all__ = [
-    "DetectorVerdict",
     "MIN_SCOREABLE_ANCHORS",
+    "DetectorVerdict",
     "PerModelRankingCohort",
     "annotate_forecaster_bullets_with_models",
     "anonymous_model_key",

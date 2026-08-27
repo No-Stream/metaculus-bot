@@ -30,7 +30,7 @@ The orchestrator's contract under test:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -479,8 +479,8 @@ def _install_full_stack_mocks(
 
     # Default qa_iterate stub: clean verifier verdict for every qid so the stage no-ops cleanly.
     # Tests can monkeypatch a different fake verifier/redactor to exercise iterate behavior.
-    import json as _json  # noqa: PLC0415
-    import re as _re  # noqa: PLC0415
+    import json as _json
+    import re as _re
 
     async def _default_clean_verifier(prompt: str, **_kwargs: Any) -> str:
         await asyncio.sleep(0)
@@ -5297,7 +5297,7 @@ class TestGroundTruthOutOfBoundsRoundTrip:
 
         serialized = _serialize_ground_truth(original)
         # Round-trip via JSON to mimic the cache writer's behavior (default=str).
-        import json  # noqa: PLC0415  - intentional in-test JSON round-trip
+        import json
 
         round_tripped = json.loads(json.dumps(serialized, default=str))
         restored = _deserialize_ground_truth(round_tripped)
@@ -5345,7 +5345,7 @@ class TestQuestionShimTimeFields:
         entry = _build_manifest_entry(q, gt, "spring-aib-2026")
 
         # Round-trip through JSON to mirror what cache.write does.
-        import json  # noqa: PLC0415  - intentional in-test JSON round-trip
+        import json
 
         round_tripped_entry = json.loads(json.dumps(entry, default=str))
         shim = _build_question_shim_from_manifest_entry(8501, round_tripped_entry)
@@ -5359,8 +5359,8 @@ class TestQuestionShimTimeFields:
         # ft 0.2.92's add_timezone_to_dates validator coerces the naive manifest
         # datetimes to tz-aware UTC when the shim is constructed (old on-disk manifests
         # still hold naive ISO strings), so the rehydrated values are aware UTC.
-        assert shim.open_time == original_open.replace(tzinfo=timezone.utc)
-        assert shim.scheduled_resolution_time == original_resolve.replace(tzinfo=timezone.utc)
+        assert shim.open_time == original_open.replace(tzinfo=UTC)
+        assert shim.scheduled_resolution_time == original_resolve.replace(tzinfo=UTC)
         # Sanity: subtraction (the operation that would crash on a sub-MagicMock) works.
         delta = shim.scheduled_resolution_time - shim.open_time
         assert delta.days > 0
@@ -5464,7 +5464,7 @@ class TestQuestionShimContentFields:
         gt = _make_binary_ground_truth(9501, outcome=True)
         entry = _build_manifest_entry(q, gt, "spring-aib-2026")
 
-        import json  # noqa: PLC0415  - intentional in-test JSON round-trip
+        import json
 
         round_tripped_entry = json.loads(json.dumps(entry, default=str))
         shim = _build_question_shim_from_manifest_entry(9501, round_tripped_entry)
@@ -5490,7 +5490,7 @@ class TestQuestionShimContentFields:
         gt = _make_binary_ground_truth(9502, outcome=True)
         entry = _build_manifest_entry(q, gt, "spring-aib-2026")
 
-        import json  # noqa: PLC0415
+        import json
 
         round_tripped_entry = json.loads(json.dumps(entry, default=str))
         shim = _build_question_shim_from_manifest_entry(9502, round_tripped_entry)
@@ -5514,7 +5514,7 @@ class TestQuestionShimContentFields:
         gt = _make_binary_ground_truth(9503, outcome=True)
         entry = _build_manifest_entry(q, gt, "spring-aib-2026")
 
-        import json  # noqa: PLC0415
+        import json
 
         round_tripped_entry = json.loads(json.dumps(entry, default=str))
         shim = _build_question_shim_from_manifest_entry(9503, round_tripped_entry)
@@ -5539,7 +5539,7 @@ class TestQuestionShimContentFields:
         gt = _make_numeric_ground_truth(9504, value=42.0)
         entry = _build_manifest_entry(q, gt, "spring-aib-2026")
 
-        import json  # noqa: PLC0415
+        import json
 
         round_tripped_entry = json.loads(json.dumps(entry, default=str))
         shim = _build_question_shim_from_manifest_entry(9504, round_tripped_entry)
@@ -5568,7 +5568,7 @@ class TestQuestionShimContentFields:
         gt = _make_binary_ground_truth(9505, outcome=True)
         entry = _build_manifest_entry(q, gt, "spring-aib-2026")
 
-        import json  # noqa: PLC0415
+        import json
 
         round_tripped_entry = json.loads(json.dumps(entry, default=str))
         shim = _build_question_shim_from_manifest_entry(9505, round_tripped_entry)
@@ -6361,9 +6361,9 @@ class TestFilterHandlesTzAwareResolutionTime:
         real API-sourced questions; the naive one exercises OUR ``_as_utc`` normalization
         of a naive value (the tz-robust path that must stay covered).
         """
-        from forecasting_tools.data_models.questions import QuestionState  # noqa: PLC0415
+        from forecasting_tools.data_models.questions import QuestionState
 
-        from metaculus_bot.backtest.question_prep import fetch_resolved_questions  # noqa: PLC0415
+        from metaculus_bot.backtest.question_prep import fetch_resolved_questions
 
         def _binary(qid: int, resolved_at: datetime) -> BinaryQuestion:
             return BinaryQuestion(
@@ -6376,8 +6376,8 @@ class TestFilterHandlesTzAwareResolutionTime:
                 actual_resolution_time=resolved_at,
             )
 
-        aware_in_window = _binary(9101, datetime(2026, 3, 1, tzinfo=timezone.utc))
-        aware_after_upper = _binary(9102, datetime(2026, 6, 1, tzinfo=timezone.utc))  # >= upper => excluded
+        aware_in_window = _binary(9101, datetime(2026, 3, 1, tzinfo=UTC))
+        aware_after_upper = _binary(9102, datetime(2026, 6, 1, tzinfo=UTC))  # >= upper => excluded
         naive_in_window = _binary(9103, datetime(2026, 3, 15))  # naive => _as_utc must normalize
 
         mock_fetch = AsyncMock(return_value=[aware_in_window, aware_after_upper, naive_in_window])

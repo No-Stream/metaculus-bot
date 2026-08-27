@@ -279,18 +279,16 @@ class TestProbabilisticToolsEnabled:
 
     def test_env_var_restored_on_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(FEATURE_FLAG, raising=False)
-        with pytest.raises(RuntimeError, match="boom"):
-            with probabilistic_tools_enabled(True):
-                assert os.environ[FEATURE_FLAG] == "1"
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"), probabilistic_tools_enabled(True):
+            assert os.environ[FEATURE_FLAG] == "1"
+            raise RuntimeError("boom")
         assert FEATURE_FLAG not in os.environ
 
     def test_env_var_restored_on_exception_when_previously_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(FEATURE_FLAG, "preset")
-        with pytest.raises(ValueError):
-            with probabilistic_tools_enabled(False):
-                assert FEATURE_FLAG not in os.environ
-                raise ValueError("boom")
+        with pytest.raises(ValueError), probabilistic_tools_enabled(False):
+            assert FEATURE_FLAG not in os.environ
+            raise ValueError("boom")
         assert os.environ[FEATURE_FLAG] == "preset"
 
 
@@ -3191,7 +3189,7 @@ class TestStackerPromptSizeGuard:
         """4 rationales x 200k chars -> WARNING log + each truncated to a
         per-rationale share of the budget. The truncation must keep the
         LAST chars (conclusion), not the head."""
-        import logging  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  - test-local
+        import logging
 
         big_chunk = "a" * 200_000
         # Distinctive end marker so we can confirm the tail survived truncation.
@@ -3256,7 +3254,7 @@ class TestStackerPromptSizeGuard:
         parser_llm: MagicMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        import logging  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        import logging
 
         captured_base_texts: list[list[str]] = []
 

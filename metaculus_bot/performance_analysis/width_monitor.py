@@ -57,7 +57,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 from scipy import stats
@@ -118,7 +118,7 @@ class Era:
 # there. A branch can sit for days, and keying on the authoring date files every
 # run in that gap under the wrong config. Re-derive with
 # `TZ=UTC git log -1 --date=iso-local --format='%h %cd' <merge-sha>`.
-WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=timezone.utc)  # 0e85e1b: k_tail 1.25 -> 1.0
+WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=UTC)  # 0e85e1b: k_tail 1.25 -> 1.0
 # b4e9df0 (july15 bundle) — aliased so this boundary and the max-step clamp screen's
 # era gate can never disagree; the timestamp's single home is analysis.py.
 TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
@@ -476,7 +476,7 @@ def compute_all_eras(
     excluded = exclude_qids or frozenset()
     order = [e.label for e in eras] + [NO_TIMESTAMP_LABEL]
     buckets: dict[str, list[dict]] = {lbl: [] for lbl in order}
-    excluded_counts: dict[str, int] = {lbl: 0 for lbl in order}
+    excluded_counts: dict[str, int] = dict.fromkeys(order, 0)
     numeric_records: list[dict] = []
     n_excluded_total = 0
     for r in data:

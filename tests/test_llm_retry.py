@@ -142,9 +142,8 @@ async def test_slow_transient_failure_not_retried() -> None:
     # elapsed forces the slow-failure branch regardless of internal clock samples.
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        with pytest.raises(litellm_exc.Timeout):
-            await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(litellm_exc.Timeout):
+        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="t")
 
     assert awaitable.await_count == 1
 
@@ -301,9 +300,8 @@ async def test_warning_logged_on_each_retry(caplog: pytest.LogCaptureFixture) ->
     """Each retry emits a WARNING carrying the label so retries are auditable in logs."""
     awaitable = AsyncMock(side_effect=_timeout("blip"))
 
-    with caplog.at_level("WARNING", logger="metaculus_bot.llm_retry"):
-        with pytest.raises(litellm_exc.Timeout):
-            await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="my_label")
+    with caplog.at_level("WARNING", logger="metaculus_bot.llm_retry"), pytest.raises(litellm_exc.Timeout):
+        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="my_label")
 
     retry_warnings = [r for r in caplog.records if "my_label" in r.message]
     # One warning per retry = len(backoffs) (the final attempt does not warn).
@@ -408,7 +406,7 @@ def test_market_retrieval_stage_budgets_fit_the_snapshot_timeout() -> None:
     # The provider recomputes the same chain to WARN when an env override sits below it, so the
     # two derivations must agree — otherwise the warning fires (or stays silent) on a number
     # nothing else in the codebase believes.
-    assert SNAPSHOT_STAGE_BUDGET_S == chain, (
+    assert chain == SNAPSHOT_STAGE_BUDGET_S, (
         f"prediction_market.SNAPSHOT_STAGE_BUDGET_S ({SNAPSHOT_STAGE_BUDGET_S}s) disagrees with the "
         f"independently derived chain ({chain}s)"
     )
@@ -454,7 +452,7 @@ def test_stacker_soft_deadline_sits_above_the_reasoning_model_timeout() -> None:
     error, and the fallback chain loses the reason it fired.
     """
     model_timeout = REASONING_MODEL_CONFIG["timeout"]
-    assert STACKER_SOFT_DEADLINE > model_timeout, (
+    assert model_timeout < STACKER_SOFT_DEADLINE, (
         f"STACKER_SOFT_DEADLINE={STACKER_SOFT_DEADLINE} must exceed the stacker's litellm "
         f"timeout={model_timeout} so the model's own timeout fires first"
     )
@@ -482,7 +480,7 @@ def test_summarizer_wall_timeout_matches_the_utility_model_timeout() -> None:
     request budget expire together, so a breach means the request really is stuck
     rather than the wrapper being impatient.
     """
-    assert SUMMARIZER_WALL_TIMEOUT == UTILITY_MODEL_CONFIG["timeout"], (
+    assert UTILITY_MODEL_CONFIG["timeout"] == SUMMARIZER_WALL_TIMEOUT, (
         f"SUMMARIZER_WALL_TIMEOUT={SUMMARIZER_WALL_TIMEOUT} must equal the summarizer's "
         f"litellm timeout={UTILITY_MODEL_CONFIG['timeout']}"
     )
@@ -497,7 +495,7 @@ def test_crux_soft_deadline_is_tighter_than_the_analyzer_model_timeout() -> None
     arrives too late is worthless even if it arrives, so this one inverts the
     backstop relationship on purpose — pin it so the intent survives.
     """
-    assert CRUX_SOFT_DEADLINE < UTILITY_MODEL_CONFIG["timeout"], (
+    assert UTILITY_MODEL_CONFIG["timeout"] > CRUX_SOFT_DEADLINE, (
         f"CRUX_SOFT_DEADLINE={CRUX_SOFT_DEADLINE} must undercut the analyzer's litellm "
         f"timeout={UTILITY_MODEL_CONFIG['timeout']} so the wrapper bounds a stalled crux"
     )
@@ -512,7 +510,7 @@ def test_forecaster_soft_deadline_caps_the_model_retry_ladder() -> None:
     being the binding constraint and the drop-with-a-WARNING path would go dead.
     """
     ladder_worst_case = REASONING_MODEL_CONFIG["timeout"] * REASONING_MODEL_CONFIG["allowed_tries"]
-    assert FORECASTER_SOFT_DEADLINE < ladder_worst_case, (
+    assert ladder_worst_case > FORECASTER_SOFT_DEADLINE, (
         f"FORECASTER_SOFT_DEADLINE={FORECASTER_SOFT_DEADLINE} must cap the model's own "
         f"{ladder_worst_case}s retry ladder, else the wrapper never binds"
     )
@@ -543,7 +541,7 @@ def test_stacking_min_budget_clears_both_publish_posts() -> None:
     the reserve too small to publish inside.
     """
     publish_worst_case = 2 * PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1)
-    assert WALL_CLOCK_STACKING_MIN_BUDGET > publish_worst_case, (
+    assert publish_worst_case < WALL_CLOCK_STACKING_MIN_BUDGET, (
         f"WALL_CLOCK_STACKING_MIN_BUDGET={WALL_CLOCK_STACKING_MIN_BUDGET} must exceed the "
         f"{publish_worst_case}s two-POST publish worst case"
     )
@@ -630,9 +628,8 @@ async def test_broad_retry_does_not_retry_slow_failure_of_any_type() -> None:
     awaitable = AsyncMock(side_effect=ValueError("slow generic failure"))
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        with pytest.raises(ValueError):
-            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(ValueError):
+        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -646,12 +643,11 @@ async def test_broad_retry_does_not_retry_asyncio_timeout() -> None:
     the wall-cap firing as an asyncio.TimeoutError raised after the gate elapses
     (deterministic clock), rather than racing a real tiny wait_for timeout.
     """
-    awaitable = AsyncMock(side_effect=asyncio.TimeoutError())
+    awaitable = AsyncMock(side_effect=TimeoutError())
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        with pytest.raises(asyncio.TimeoutError):
-            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(asyncio.TimeoutError):
+        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -819,9 +815,8 @@ async def test_slow_non_empty_runtimeerror_not_exempted() -> None:
     awaitable = AsyncMock(side_effect=RuntimeError("some unrelated runtime failure"))
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        with pytest.raises(RuntimeError):
-            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(RuntimeError):
+        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -840,9 +835,8 @@ async def test_slow_permanent_error_not_retried_even_slow() -> None:
     )
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        with pytest.raises(litellm_exc.BadRequestError):
-            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(litellm_exc.BadRequestError):
+        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
 
     assert awaitable.await_count == 1
 
@@ -860,9 +854,8 @@ async def test_transient_predicate_does_not_exempt_zero_output() -> None:
     awaitable = AsyncMock(side_effect=_api_error(_PROD_WHITESPACE_BODY_MESSAGE))
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        with pytest.raises(litellm_exc.APIError):
-            await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="stacker_binary")
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(litellm_exc.APIError):
+        await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="stacker_binary")
 
     assert awaitable.await_count == 1
 
@@ -1121,8 +1114,7 @@ async def test_slow_403_is_not_rescued_by_the_zero_output_exemption() -> None:
     awaitable = AsyncMock(side_effect=_api_error_with_status(403, _PROD_WHITESPACE_BODY_MESSAGE))
     clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
 
-    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
-        with pytest.raises(litellm_exc.APIError):
-            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_binary")
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock), pytest.raises(litellm_exc.APIError):
+        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_binary")
 
     assert awaitable.await_count == 1

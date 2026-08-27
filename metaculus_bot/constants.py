@@ -60,8 +60,6 @@ def gemini_use_donated_openrouter_key() -> bool:
 class TournamentExpiredError(Exception):
     """Raised when the tournament has ended and the ID needs to be updated."""
 
-    pass
-
 
 def check_tournament_dates(logger: logging.Logger | None = None) -> None:
     """Check if tournament dates are stale and warn/error accordingly.
@@ -88,7 +86,7 @@ def check_tournament_dates(logger: logging.Logger | None = None) -> None:
             f"date ({hard_stop_date.date()}) has passed. Please update TOURNAMENT_ID, "
             f"TOURNAMENT_END_DATE, and TOURNAMENT_HARD_STOP_WEEKS in constants.py for the new season."
         )
-    elif today > end_date:
+    if today > end_date:
         days_past = (today - end_date).days
         days_until_error = (hard_stop_date - today).days
         log.warning(

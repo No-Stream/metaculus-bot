@@ -11,16 +11,16 @@ from forecasting_tools import GeneralLlm
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 
 __all__ = [
+    "DISAGREEMENT_ANALYZER_LLM",
     "FORECASTER_LLMS",
     "FORECASTER_MODEL_NAMES",
-    "SUMMARIZER_LLM",
-    "PARSER_LLM",
-    "RESEARCHER_LLM",
-    "STACKER_LLM",
-    "STACKER_FALLBACK_LLM",
-    "DISAGREEMENT_ANALYZER_LLM",
     "MARKET_QUERY_AUTHOR_LLM_CONFIG",
     "MARKET_RANKER_LLM_CONFIG",
+    "PARSER_LLM",
+    "RESEARCHER_LLM",
+    "STACKER_FALLBACK_LLM",
+    "STACKER_LLM",
+    "SUMMARIZER_LLM",
 ]
 # Reasoning models ignore (or degrade under) explicit sampling params, so we
 # defer to provider defaults. temperature=None is explicit but redundant on

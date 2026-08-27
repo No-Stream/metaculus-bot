@@ -142,7 +142,7 @@ class AggregationPipeline:
             self.meta_reasoning[qid] = meta_text
             logger.info(f"Stacked binary prediction for {page_url}: {value}")
             return value
-        elif isinstance(question, MultipleChoiceQuestion):
+        if isinstance(question, MultipleChoiceQuestion):
             pol, meta_text = await stacking.run_stacking_mc(
                 stacker_llm,
                 self.parser_llm,
@@ -155,7 +155,7 @@ class AggregationPipeline:
             self.meta_reasoning[qid] = meta_text
             logger.info(f"Stacked multiple choice prediction for {page_url}: {pol}")
             return pol
-        elif isinstance(question, NumericQuestion):
+        if isinstance(question, NumericQuestion):
             upper_msg, lower_msg = bound_messages(question)
             perc_list, meta_text = await stacking.run_stacking_numeric(
                 stacker_llm,
@@ -186,8 +186,7 @@ class AggregationPipeline:
             log_final_prediction(prediction, question)
             logger.info(f"Stacked numeric prediction for {page_url}")
             return prediction
-        else:
-            raise ValueError(f"Unsupported question type for stacking: {type(question)}")
+        raise ValueError(f"Unsupported question type for stacking: {type(question)}")
 
     async def aggregate(
         self,

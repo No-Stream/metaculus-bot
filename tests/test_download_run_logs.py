@@ -9,7 +9,7 @@ here monkeypatch that module's seams; the enumeration internals are tested there
 import json
 import logging
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import scripts.download_run_logs as dl
@@ -276,9 +276,7 @@ class TestDownloadTimeoutResilience:
         monkeypatch.setattr(dl.subprocess, "run", _capture)
         dl.build_workflow_map("owner/repo")
 
-        expected_cutoff = (datetime.now(timezone.utc) - timedelta(days=dl._RUNS_ENUMERATION_WINDOW_DAYS)).strftime(
-            "%Y-%m-%d"
-        )
+        expected_cutoff = (datetime.now(UTC) - timedelta(days=dl._RUNS_ENUMERATION_WINDOW_DAYS)).strftime("%Y-%m-%d")
         assert f"created=>={expected_cutoff}" in seen["cmd"]
         assert "/repos/owner/repo/actions/runs" in seen["cmd"]
 

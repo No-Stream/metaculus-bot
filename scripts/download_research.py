@@ -48,7 +48,7 @@ import argparse
 import json
 import logging
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # One page-url id parser for the whole repo: the archive reader validates identity with
@@ -236,8 +236,8 @@ def _parse_timestamp(value: object) -> datetime:
     try:
         parsed = datetime.fromisoformat(str(value))  # 3.11+ parses the Z suffix natively
     except (TypeError, ValueError):
-        return datetime.min.replace(tzinfo=timezone.utc)
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 # Descending precedence for latest/<qid>.json. Artifact-always-wins over comment backfill

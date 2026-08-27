@@ -645,7 +645,7 @@ class TestOrchestratorBothFlags:
 
         captured: dict = {}
 
-        def sink(**kwargs) -> None:  # noqa: ANN003
+        def sink(**kwargs) -> None:
             captured.update(kwargs)
 
         orch = ResearchOrchestrator(
@@ -679,7 +679,7 @@ class TestOrchestratorBothFlags:
 
         captured: dict = {}
 
-        def sink(**kwargs) -> None:  # noqa: ANN003
+        def sink(**kwargs) -> None:
             captured.update(kwargs)
 
         orch = ResearchOrchestrator(

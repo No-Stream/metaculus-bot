@@ -234,7 +234,7 @@ async def benchmark_forecast_bot(
     if mode == "display":
         run_benchmark_streamlit_page()
         return
-    elif mode == "run":
+    if mode == "run":
         # Confirm the host is the real Metaculus before the token-sending fetch.
         verify_metaculus_api_identity()
         api_filter = ApiFilter(

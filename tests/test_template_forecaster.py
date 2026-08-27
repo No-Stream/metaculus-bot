@@ -540,7 +540,7 @@ async def test_min_forecasters_guard_reraises_exception_group_when_present(mock_
 
     bot._forecaster_with_soft_deadline = cast(Any, mixed_results)
 
-    with pytest.raises(ExceptionGroup) as exc_info:  # noqa: F821  # 3.11+ builtin
+    with pytest.raises(ExceptionGroup) as exc_info:  # 3.11+ builtin
         await bot._research_and_make_predictions(mock_binary_question)
 
     # The framework helper wraps the exception group with a prepended message

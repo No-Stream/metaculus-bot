@@ -389,7 +389,7 @@ async def _invoke_claude_redactor(
             proc.communicate(input=prompt.encode("utf-8")),
             timeout=timeout_seconds,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # asyncio.wait_for cancels the awaitable but does NOT terminate the
         # underlying OS subprocess. Without proc.kill(), the orphan keeps
         # running until the model finishes on its own. At 50q x 3 iterations
@@ -401,14 +401,13 @@ async def _invoke_claude_redactor(
         )
         proc.kill()
         try:
-            # noqa: ASYNC120 — checkpoint inside except is intentional. We must
             # await proc.wait() here to reap the killed child; the surrounding
             # `raise` re-raises the original TimeoutError after cleanup. If the
             # task itself is cancelled mid-await we still want the kill to have
             # been issued (already done above), so the leak is bounded either
             # way.
-            await asyncio.wait_for(proc.wait(), timeout=5.0)  # noqa: ASYNC120
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except TimeoutError:
             logger.error("claude -p subprocess pid=%s refused SIGKILL within 5s", proc.pid)
         raise
 
@@ -477,7 +476,7 @@ def _parse_redactor_response(
     are dropped with a warning and excluded from the return dict.
     """
     expected_set = set(expected_qids)
-    out: dict[int, tuple[str, list[dict]] | None] = {qid: None for qid in expected_qids}
+    out: dict[int, tuple[str, list[dict]] | None] = dict.fromkeys(expected_qids)
 
     payload = json.loads(raw_stdout)
 
@@ -598,7 +597,7 @@ async def _process_batch(
     """
     await asyncio.sleep(0)
     qids = [_require_qid(q) for q, _gt, _blob in batch]
-    out: dict[int, tuple[str, dict] | None] = {qid: None for qid in qids}
+    out: dict[int, tuple[str, dict] | None] = dict.fromkeys(qids)
 
     prompt = _build_redactor_prompt(batch)
     total_prompt_chars = len(prompt) + len(REDACTOR_SYSTEM_PROMPT)
@@ -671,7 +670,7 @@ async def _process_batch(
             stdout_text,
         )
         return out
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         logger.error("Redactor subprocess timed out for qids=%s: %s", qids, exc, exc_info=True)
         return out
     except Exception as exc:

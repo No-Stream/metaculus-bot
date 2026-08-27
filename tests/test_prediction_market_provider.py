@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
 
@@ -95,7 +95,7 @@ class TestProviderFactory:
         and render nothing because of it. The benchmarking guard is the leakage defence.
         """
         monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "true")
-        mock_question.scheduled_resolution_time = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        mock_question.scheduled_resolution_time = datetime(2026, 8, 1, tzinfo=UTC)
         handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
 
         captured: list[datetime | None] = []

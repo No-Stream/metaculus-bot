@@ -516,7 +516,7 @@ def _load_records(perf_json: str | None, tournament: str | None) -> list[dict]:
     """Load resolved-question records from a perf JSON, else a live read-only pull, else []."""
     if perf_json:
         from metaculus_bot.performance_analysis.collector import (
-            load_dataset,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the pure scoring core decoupled from the collector's import chain
+            load_dataset,
         )
 
         records = load_dataset(perf_json)
@@ -524,10 +524,10 @@ def _load_records(perf_json: str | None, tournament: str | None) -> list[dict]:
         return records
     if tournament:
         from metaculus_bot.api_preflight import (
-            verify_metaculus_api_identity,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: api_preflight pulls forecasting_tools; keep the scoring core decoupled
+            verify_metaculus_api_identity,
         )
         from metaculus_bot.performance_analysis.collector import (
-            build_performance_dataset,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the pure scoring core decoupled from the collector's import chain
+            build_performance_dataset,
         )
 
         # Confirm the host is the real Metaculus before the token-sending pull.

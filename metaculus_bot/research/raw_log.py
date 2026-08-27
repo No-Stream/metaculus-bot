@@ -23,7 +23,7 @@ import dataclasses
 import json
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from metaculus_bot.constants import (
@@ -113,7 +113,7 @@ def record_raw_research(
         "qid": qid,
         "provider": provider,
         "phase": phase,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "payload_chars": payload_chars,
         "truncated": truncated,
         "payload": payload_field,

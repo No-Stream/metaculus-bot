@@ -43,7 +43,7 @@ from metaculus_bot.numeric.utils import aggregate_numeric
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-__all__ = ["run_mean_for_qid", "run_median_for_qid", "SIMPLE_AGGREGATION_LABEL"]
+__all__ = ["SIMPLE_AGGREGATION_LABEL", "run_mean_for_qid", "run_median_for_qid"]
 
 SIMPLE_AGGREGATION_LABEL = "simple_aggregation"
 

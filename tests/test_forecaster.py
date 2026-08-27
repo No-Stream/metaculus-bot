@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -23,7 +23,7 @@ async def test_run_research_priority():
     question = MetaculusQuestion(
         question_text="Test question",
         page_url="http://example.com",
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
         # Required by the diagnostics seam: the comment-bound block is stashed per-qid.
         id_of_question=777,
     )

@@ -41,7 +41,7 @@ from metaculus_bot.constants import (
     BENCHMARK_BATCH_SIZE,
     HEARTBEAT_INTERVAL,
 )
-from metaculus_bot.forecaster import TemplateForecaster  # noqa: F401  # used in annotations below
+from metaculus_bot.forecaster import TemplateForecaster  # used in annotations below
 from metaculus_bot.performance_analysis.id_mapping import QuestionIds
 from metaculus_bot.scoring_patches import apply_scoring_patches
 

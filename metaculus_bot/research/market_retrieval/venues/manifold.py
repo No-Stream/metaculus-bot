@@ -34,7 +34,7 @@ escapes this bug because it happens to publish ``probability`` null today.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from metaculus_bot.research.market_retrieval.http import http_get_with_backoff, safe_float, safe_int
@@ -185,7 +185,7 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | N
         close_time: datetime | None = None
         if isinstance(close_ms, (int, float)):
             try:
-                close_time = datetime.fromtimestamp(float(close_ms) / 1000.0, tz=timezone.utc)
+                close_time = datetime.fromtimestamp(float(close_ms) / 1000.0, tz=UTC)
             except (OverflowError, OSError, ValueError):
                 close_time = None
 

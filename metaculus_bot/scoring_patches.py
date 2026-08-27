@@ -376,10 +376,9 @@ def _extract_mc_community_probs(question: Any) -> tuple[list[float] | None, str]
                     return None, "pyc_bad_sum"
                 logger.debug("MC q=%s: using rw.latest.probability_yes_per_category", qid)
                 return probs, "probability_yes_per_category"
-            else:
-                logger.info("MC q=%s: options unavailable; cannot align pyc", qid)
-                _MC_MISSING_COMMUNITY += 1
-                return None, "pyc_no_options"
+            logger.info("MC q=%s: options unavailable; cannot align pyc", qid)
+            _MC_MISSING_COMMUNITY += 1
+            return None, "pyc_no_options"
 
         logger.info(
             "MC q=%s: neither forecast_values nor pyc available in rw.latest (keys=%s)",
@@ -422,9 +421,8 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
             if cached_score is not None:
                 logger.debug(f"MC Question {q_id}: using cached baseline score {cached_score:.2f}")
                 return cached_score
-            else:
-                # Cached None result (calculation previously failed), but don't re-log vector mismatch
-                return None
+            # Cached None result (calculation previously failed), but don't re-log vector mismatch
+            return None
 
     try:
         _MC_ATTEMPTS += 1
@@ -626,9 +624,8 @@ def calculate_numeric_baseline_score(report: Any, cache: dict | None = None) -> 
             if cached_score is not None:
                 logger.debug(f"Numeric Question {q_id}: using cached baseline score {cached_score:.2f}")
                 return cached_score
-            else:
-                # Cached None result (calculation previously failed)
-                return None
+            # Cached None result (calculation previously failed)
+            return None
 
     try:
         # Try to obtain model CDF percentiles (list of objects with .percentile in [0,1])
@@ -785,7 +782,7 @@ def _calculate_relative_numeric_score(
 
         # Bin-aware normalization so uniform vs uniform anchors near -50 for any bin count:
         # Solve 100 * (-ln(n)/norm + 1) = -50  =>  norm = ln(n)/1.5
-        num_bins = max(2, int(len(bot_pmf)))
+        num_bins = max(2, len(bot_pmf))
         normalization = math.log(num_bins) / 1.5
         final_score = 100.0 * (expected_log_score / normalization + 1.0)
 
@@ -850,7 +847,7 @@ def patch_numeric_scoring():
 def patch_error_handling():
     """Monkey patch ForecastReport.calculate_average_expected_baseline_score to fix UnboundLocalError"""
     try:
-        from typing import Sequence
+        from collections.abc import Sequence
 
         import typeguard
         from forecasting_tools.data_models.forecast_report import ForecastReport

@@ -184,7 +184,7 @@ def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) ->
     """
 
     @ijson.coroutine
-    def _collect():  # noqa: ANN202  # untyped ijson push-parser target
+    def _collect():  # untyped ijson push-parser target
         event: dict[str, Any] | None = None
         market: dict[str, Any] | None = None
         source: dict[str, Any] | None = None
@@ -199,7 +199,7 @@ def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) ->
                 continue
             if prefix == "events.item":
                 if parse_event == "start_map":
-                    event = {field: None for field in KALSHI_EVENT_FIELDS}
+                    event = dict.fromkeys(KALSHI_EVENT_FIELDS)
                     event["settlement_sources"] = []
                     event["markets"] = []
                 elif parse_event == "end_map":
@@ -231,7 +231,7 @@ def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) ->
                     # Tiered off the list already being built, which reads the index for free:
                     # the first nested market gets the full set, every later one the tail.
                     fields = KALSHI_MARKET_FIELDS if not event["markets"] else KALSHI_NESTED_TAIL_FIELDS
-                    market = {field: None for field in fields}
+                    market = dict.fromkeys(fields)
                 elif parse_event == "end_map":
                     if market is not None:
                         event["markets"].append(market)
@@ -290,9 +290,9 @@ async def _kalshi_fetch_events_page(
             except ijson.JSONError as exc:
                 logger.warning(f"Kalshi events stream parse failed: {type(exc).__name__}: {exc}")
                 return None, None, "error(parse)", False
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+    except (TimeoutError, aiohttp.ClientError) as exc:
         logger.warning(f"Kalshi events transient error: {type(exc).__name__}: {exc}")
-        return None, None, f"error({type(exc).__name__})", True  # noqa: ASYNC910
+        return None, None, f"error({type(exc).__name__})", True
 
     if not state["saw_events_array"]:
         logger.warning(
@@ -414,9 +414,7 @@ async def kalshi_prefetch_events(
     logger.info(
         f"Kalshi catalogue: events={len(all_events)} pages={pages_ok} complete={complete} token={token or 'ok'}"
     )
-    return CataloguePull(  # noqa: ASYNC910
-        events=all_events, token=token, tally=_FetchTally(pages_ok, pages_failed), complete=complete
-    )
+    return CataloguePull(events=all_events, token=token, tally=_FetchTally(pages_ok, pages_failed), complete=complete)
 
 
 def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | None]:

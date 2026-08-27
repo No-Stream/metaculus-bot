@@ -120,8 +120,8 @@ def beta_binomial_ceiling_percentiles(
 
 __all__ = [
     "DirichletCI",
+    "beta_binomial_ceiling_percentiles",
     "dirichlet_with_other",
     "negative_binomial_percentiles",
     "poisson_percentiles",
-    "beta_binomial_ceiling_percentiles",
 ]

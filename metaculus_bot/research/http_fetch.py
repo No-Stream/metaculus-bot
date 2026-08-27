@@ -17,10 +17,11 @@ import ipaddress
 import logging
 import re
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable
+from typing import Any
 
 import aiohttp
 import aiohttp.abc
@@ -403,7 +404,7 @@ def parse_http_last_modified(value: str) -> datetime | None:
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
+        return parsed.replace(tzinfo=UTC)
     return parsed
 
 

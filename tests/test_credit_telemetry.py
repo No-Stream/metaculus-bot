@@ -190,7 +190,7 @@ class TestCreditAlertSuppressionWindow:
 
     def test_resume_date_is_2026_09_10(self) -> None:
         """The hardcoded default is the contract; the env var is only an override."""
-        assert CREDIT_ALERT_RESUME_DATE == date(2026, 9, 10)
+        assert date(2026, 9, 10) == CREDIT_ALERT_RESUME_DATE
 
     def test_inactive_before_resume_date(self) -> None:
         assert credit_alerts_active(date(2026, 7, 25)) is False
@@ -204,9 +204,9 @@ class TestCreditAlertSuppressionWindow:
 
     def test_resume_date_is_after_tournament_close(self) -> None:
         """The suppression must not outlive the season it exists for."""
-        from metaculus_bot.constants import TOURNAMENT_END_DATE  # noqa: PLC0415
+        from metaculus_bot.constants import TOURNAMENT_END_DATE
 
-        assert CREDIT_ALERT_RESUME_DATE > date.fromisoformat(TOURNAMENT_END_DATE)
+        assert date.fromisoformat(TOURNAMENT_END_DATE) < CREDIT_ALERT_RESUME_DATE
 
     def test_today_defaults_to_system_clock_at_call_time(self) -> None:
         """No argument → same answer as passing today's real date explicitly."""

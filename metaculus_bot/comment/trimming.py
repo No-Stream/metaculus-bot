@@ -519,4 +519,4 @@ def trim_comment(text: str, *, config: TrimConfig | None = None) -> str:
     return trimmed
 
 
-__all__ = ["TrimConfig", "trim_comment", "trim_section", "TRIM_NOTICE"]
+__all__ = ["TRIM_NOTICE", "TrimConfig", "trim_comment", "trim_section"]

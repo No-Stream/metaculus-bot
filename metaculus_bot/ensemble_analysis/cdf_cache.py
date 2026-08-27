@@ -81,7 +81,7 @@ class NumericCdfCache:
                 if has_percentile and has_value:
                     self._safe_cdf_cache[key] = list(raw)
                     return list(raw)
-                elif has_percentile:
+                if has_percentile:
                     lower = question.lower_bound
                     upper = question.upper_bound
                     n = len(raw)
@@ -91,15 +91,14 @@ class NumericCdfCache:
                         out.append(SimpleNamespace(value=float(xi), percentile=float(p.percentile)))
                     self._safe_cdf_cache[key] = out
                     return out
-                else:
-                    # Percentiles as bare floats
-                    lower = question.lower_bound
-                    upper = question.upper_bound
-                    n = len(raw)
-                    x = np.linspace(float(lower), float(upper), n)
-                    out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, raw)]
-                    self._safe_cdf_cache[key] = out
-                    return out
+                # Percentiles as bare floats
+                lower = question.lower_bound
+                upper = question.upper_bound
+                n = len(raw)
+                x = np.linspace(float(lower), float(upper), n)
+                out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, raw)]
+                self._safe_cdf_cache[key] = out
+                return out
         except Exception as e:
             if key not in stats["first_warnings_emitted"]:
                 logger.warning(

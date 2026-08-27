@@ -148,7 +148,7 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
             raise AssertionError("Percentiles at indices are too close")
 
         @property
-        def cdf(self):  # noqa: D401
+        def cdf(self):
             return self.get_cdf()
 
     with (
@@ -245,9 +245,9 @@ async def test_numeric_percentile_set_validation():
             "metaculus_bot.forecaster_runners.extract_numeric",
             new=AsyncMock(return_value=ExtractionOutcome(value=bad, rung="block", block_present=True)),
         ),
+        pytest.raises(ValidationError),
     ):
-        with pytest.raises(ValidationError):
-            await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
+        await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -23,7 +23,7 @@ def _supported_question(done: bool = False, closes_in: timedelta | None = None) 
     """
     q = MagicMock(spec=BinaryQuestion)
     q.already_forecasted = done
-    q.close_time = datetime.now(timezone.utc) + (closes_in if closes_in is not None else timedelta(days=1))
+    q.close_time = datetime.now(UTC) + (closes_in if closes_in is not None else timedelta(days=1))
     return cast(MetaculusQuestion, q)
 
 

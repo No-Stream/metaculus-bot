@@ -25,7 +25,7 @@ class DummyLLM:  # minimal async LLM for tests
         self._reasoning = reasoning
         self.model = "dummy-test-model"
 
-    async def invoke(self, prompt: str):  # noqa: D401
+    async def invoke(self, prompt: str):
         return self._reasoning
 
 
@@ -128,6 +128,6 @@ async def test_fallback_reraises_when_insufficient_numbers(dummy_forecaster):
             "metaculus_bot.value_extraction.parse_structured",
             new=AsyncMock(return_value=insufficient),
         ),
+        pytest.raises(ValueExtractionError),
     ):
-        with pytest.raises(ValueExtractionError):
-            await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
+        await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,7 +17,7 @@ class DummyArticle:
     def __init__(self, url: str, title: str = "", pub_date: datetime | None = None) -> None:
         self.article_url = url
         self.eng_title = title
-        self.pub_date = pub_date or datetime.now(tz=timezone.utc)
+        self.pub_date = pub_date or datetime.now(tz=UTC)
         self.summary = f"Summary for {title}"
         self.language = "en"
         self.source_id = "test-source"
@@ -161,8 +161,8 @@ class TestFormatAsknewsDualSections:
         assert "Mobile Duplicate B" not in result
 
     def test_articles_sorted_by_date_within_sections(self) -> None:
-        older = datetime(2025, 1, 1, tzinfo=timezone.utc)
-        newer = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        older = datetime(2025, 1, 1, tzinfo=UTC)
+        newer = datetime(2025, 6, 1, tzinfo=UTC)
 
         hist = [
             DummyArticle("https://example.com/old", title="Older Hist", pub_date=older),

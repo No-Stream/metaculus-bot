@@ -172,9 +172,8 @@ class TestPerplexityRetryHardening:
             llm.invoke = _invoke
             return llm
 
-        with patch.object(providers, "GeneralLlm", _dead_llm):
-            with pytest.raises(litellm.exceptions.APIError):
-                await providers._perplexity_provider()(question)
+        with patch.object(providers, "GeneralLlm", _dead_llm), pytest.raises(litellm.exceptions.APIError):
+            await providers._perplexity_provider()(question)
 
         assert attempts["n"] == 1
 
@@ -208,7 +207,7 @@ class TestPerplexityModelIsOneConstant:
         # One model, two routes: the OpenRouter form must be the direct slug with
         # the ``openrouter/`` prefix that get_openrouter_api_key routes on, not an
         # independently-chosen model.
-        assert PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER == f"openrouter/{PERPLEXITY_RESEARCH_MODEL}"
+        assert f"openrouter/{PERPLEXITY_RESEARCH_MODEL}" == PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

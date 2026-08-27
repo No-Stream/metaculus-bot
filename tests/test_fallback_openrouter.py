@@ -109,7 +109,7 @@ class TestPredicates:
     def test_donated_key_providers_set(self) -> None:
         # Pin the membership so any drift surfaces in code review rather than
         # silently changing routing.
-        assert DONATED_KEY_PROVIDERS == frozenset({"openai", "anthropic", "google"})
+        assert frozenset({"openai", "anthropic", "google"}) == DONATED_KEY_PROVIDERS
 
     @pytest.mark.parametrize(
         "message, expected",
@@ -920,7 +920,7 @@ class TestDeprecationTripwire:
         msg = "Grok 4.1 Fast is deprecated. xAI recommends switching to Grok 4.3"
         matched = _record_deprecation_if_matched("x-ai/grok-4.1-fast", msg)
         assert matched is True
-        assert _DEPRECATION_ALERTS == [("x-ai/grok-4.1-fast", msg)]
+        assert [("x-ai/grok-4.1-fast", msg)] == _DEPRECATION_ALERTS
         clear_deprecation_alerts()
 
     def test_does_not_record_unrelated_error(self) -> None:

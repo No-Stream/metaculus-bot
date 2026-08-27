@@ -10,9 +10,10 @@ restoring the originals on exit.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Iterator
+from typing import Any
 
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
@@ -88,12 +89,12 @@ def patched_window_for_question(question: MetaculusQuestion | Any) -> Iterator[N
             f"interpret it as asking about the open→resolution window, not all of history."
         )
 
-    setattr(prompts_module, "_forecasting_window_str", _patched)
+    prompts_module._forecasting_window_str = _patched
     _window_patch_active = True
     try:
         yield
     finally:
-        setattr(prompts_module, "_forecasting_window_str", original)
+        prompts_module._forecasting_window_str = original
         _window_patch_active = False
 
 
@@ -115,11 +116,11 @@ def patched_gap_fill_year_for_question(question: MetaculusQuestion | Any) -> Ite
         pattern = rf"\bno {datetime.now().year} data\b"
         return re.sub(pattern, f"no {replacement_year} data", rendered)
 
-    setattr(prompts_module, "gap_fill_analyzer_prompt", _patched)
+    prompts_module.gap_fill_analyzer_prompt = _patched
     try:
         yield
     finally:
-        setattr(prompts_module, "gap_fill_analyzer_prompt", original)
+        prompts_module.gap_fill_analyzer_prompt = original
 
 
 @contextmanager

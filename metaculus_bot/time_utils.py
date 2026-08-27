@@ -7,7 +7,7 @@ the naive-vs-aware handling lives in one place rather than being duplicated.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def _as_utc(moment: datetime) -> datetime:
@@ -21,8 +21,8 @@ def _as_utc(moment: datetime) -> datetime:
     a naive one is stamped UTC.
     """
     if moment.tzinfo is None:
-        return moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
+        return moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC)
 
 
 def parse_iso_utc(raw: str | None) -> datetime | None:

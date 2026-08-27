@@ -54,9 +54,9 @@ changes how a row is chosen, not what a forecaster is told to verify.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Sequence
 
 from metaculus_bot.research.market_retrieval.ranking import (
     DEGRADED_RANKING_MARKER,
@@ -661,7 +661,7 @@ def _ladder_hard_bound(rest: Sequence[MarketChild], *, cap: int = LADDER_ROW_MAX
     by_content = sorted(
         range(len(rest)), key=lambda position: _ladder_content_key(rest[position], cumulative=cumulative)
     )
-    # noqa justification: not sub-sampling — the most informative term is the one this row GUARANTEES,
+
     # and the loop below then adds every further term that fits.
     kept: set[int] = set(by_content[:1])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
     for index in by_content[1:]:

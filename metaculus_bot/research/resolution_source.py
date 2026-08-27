@@ -53,7 +53,7 @@ import re
 import socket
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
@@ -1117,7 +1117,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                         http_status=status,
                         content_type=content_type or None,
                     )
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except (TimeoutError, aiohttp.ClientError) as e:
                 logger.info(f"resolution_source fetch error for {current_url}: {type(e).__name__}: {e}")
                 return FetchResult(
                     url=current_url,
@@ -1253,7 +1253,7 @@ async def _fetch_datawrapper_dataset(
 
                 last_modified_raw = resp.headers.get("Last-Modified") if resp.headers else None
                 last_modified = parse_http_last_modified(last_modified_raw) if last_modified_raw else None
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 # Two-sided, deliberately. The lead this stamp authorizes asserts a
                 # publication date, and a FUTURE one means a broken clock or a misparse on
                 # one side — so it is unusable as a freshness claim, not maximally fresh.
@@ -1318,7 +1318,7 @@ async def _fetch_datawrapper_dataset(
                     parent_url=parent_url,
                     data_last_modified=last_modified.isoformat(),
                 )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.info(f"resolution_source datawrapper hop {chart.chart_id} error: {type(e).__name__}: {e}")
             return FetchResult(
                 url=url,
@@ -1443,7 +1443,7 @@ async def fetch_resolution_sources(urls: list[str]) -> list[FetchResult]:
                         asyncio.gather(*dataset_tasks, return_exceptions=False), timeout=hop_budget_s
                     )
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "resolution_source: datawrapper hop timed out after %.1fs; serving %d Tier-1 "
                     "page result(s) without datasets",
@@ -1487,22 +1487,22 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
 
     async def _fetch(question: MetaculusQuestion) -> str:
         if is_benchmarking:
-            return ""  # noqa: ASYNC910
+            return ""
         if not env_flag_enabled(RESOLUTION_SOURCE_ENABLED_ENV):
-            return ""  # noqa: ASYNC910
+            return ""
 
         urls = select_fetchable_urls(question.resolution_criteria, question.fine_print)
         if not urls:
-            return ""  # noqa: ASYNC910
+            return ""
 
         try:
             results = await asyncio.wait_for(
                 fetch_resolution_sources(urls),
                 timeout=RESOLUTION_SOURCE_WALL_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"resolution_source: wall-clock timeout after {RESOLUTION_SOURCE_WALL_TIMEOUT}s")
-            return ""  # noqa: ASYNC910
+            return ""
 
         # CITED pages only. A withheld Tier-2 dataset is a hop artifact, not an
         # unfetched cited URL, and counting it here inflated the ratio with
@@ -1523,6 +1523,6 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
         # returns a non-empty notice (all URLs failed → status `ok`), this surfaces
         # WHICH sources were lost so the block doesn't read as fully healthy.
         record_provider_detail(qid, "resolution_source", {"sources": _fetch_result_sources(results)})
-        return format_resolution_sections(results, datetime.now(timezone.utc))
+        return format_resolution_sections(results, datetime.now(UTC))
 
     return _fetch

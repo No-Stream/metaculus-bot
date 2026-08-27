@@ -62,7 +62,8 @@ import functools
 import logging
 import random
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import requests
 from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client

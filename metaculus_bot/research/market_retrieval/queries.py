@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 from rapidfuzz import fuzz, process
@@ -63,9 +63,32 @@ _DIGIT_GROUP_RE = re.compile(r"\d+")
 _DAY_NUMBER_RE = re.compile(r"\d{1,2}(?:st|nd|rd|th)?", re.IGNORECASE)
 _PLAUSIBLE_YEARS = range(1900, 2100)
 _MONTH_WORDS: frozenset[str] = frozenset(
-    """january february march april may june july august september october november december
-    jan feb mar apr jun jul aug sep sept oct nov dec
-    """.split()
+    [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "jan",
+        "feb",
+        "mar",
+        "apr",
+        "jun",
+        "jul",
+        "aug",
+        "sep",
+        "sept",
+        "oct",
+        "nov",
+        "dec",
+    ]
 )
 
 # Content-word stopwords for Manifold's conjunction-relaxation ladder. Kept byte-identical to
@@ -74,13 +97,111 @@ _MONTH_WORDS: frozenset[str] = frozenset(
 # content word: stopwords measurably do not narrow a `term` ("gas prices" and "gas prices in the"
 # both return 10 results).
 _RELEVANCE_STOPWORDS: frozenset[str] = frozenset(
-    """a an the of in on at to for by with will be is are was were before after during between
-    and or not no yes if then than as from into over under above below more less most least
-    what which who whom whose when where why how this that these those there here it its
-    do does did done have has had having get gets got question market resolve resolves resolved
-    resolution against per any all each both other another same different new old first last
-    2025 2026 2027 january february march april may june july august september october november december
-    """.split()
+    [
+        "a",
+        "an",
+        "the",
+        "of",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "by",
+        "with",
+        "will",
+        "be",
+        "is",
+        "are",
+        "was",
+        "were",
+        "before",
+        "after",
+        "during",
+        "between",
+        "and",
+        "or",
+        "not",
+        "no",
+        "yes",
+        "if",
+        "then",
+        "than",
+        "as",
+        "from",
+        "into",
+        "over",
+        "under",
+        "above",
+        "below",
+        "more",
+        "less",
+        "most",
+        "least",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "when",
+        "where",
+        "why",
+        "how",
+        "this",
+        "that",
+        "these",
+        "those",
+        "there",
+        "here",
+        "it",
+        "its",
+        "do",
+        "does",
+        "did",
+        "done",
+        "have",
+        "has",
+        "had",
+        "having",
+        "get",
+        "gets",
+        "got",
+        "question",
+        "market",
+        "resolve",
+        "resolves",
+        "resolved",
+        "resolution",
+        "against",
+        "per",
+        "any",
+        "all",
+        "each",
+        "both",
+        "other",
+        "another",
+        "same",
+        "different",
+        "new",
+        "old",
+        "first",
+        "last",
+        "2025",
+        "2026",
+        "2027",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ]
 )
 
 

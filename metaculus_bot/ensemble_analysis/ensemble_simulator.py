@@ -373,12 +373,11 @@ class EnsembleSimulator:
             predictions = [individual_preds[model] for model in models]
             if strategy == "mean":
                 return float(np.mean(predictions))
-            elif strategy == "median":
+            if strategy == "median":
                 return float(np.median(predictions))
-            else:
-                raise ValueError(f"Unknown aggregation strategy: {strategy}")
+            raise ValueError(f"Unknown aggregation strategy: {strategy}")
 
-        elif question_type == "multiple_choice":
+        if question_type == "multiple_choice":
             # Aggregate probability distributions
             predictions = [individual_preds[model] for model in models]
 
@@ -421,7 +420,7 @@ class EnsembleSimulator:
             # Return max probability as representative value for scoring
             return max(aggregated_probs) if aggregated_probs else 0.5
 
-        elif question_type == "numeric":
+        if question_type == "numeric":
             # Use median values for numeric questions
             median_values = []
             for model in models:
@@ -440,13 +439,11 @@ class EnsembleSimulator:
 
             if strategy == "mean":
                 return float(np.mean(median_values))
-            elif strategy == "median":
+            if strategy == "median":
                 return float(np.median(median_values))
-            else:
-                raise ValueError(f"Unknown aggregation strategy: {strategy}")
+            raise ValueError(f"Unknown aggregation strategy: {strategy}")
 
-        else:
-            raise ValueError(f"Unknown question type: {question_type}")
+        raise ValueError(f"Unknown question type: {question_type}")
 
     def calculate_baseline_score(
         self, prediction_value: float, community_prediction: Any, question_type: str
@@ -468,7 +465,7 @@ class EnsembleSimulator:
 
                 return 100.0 * (c * (math.log2(p) + 1.0) + (1.0 - c) * (math.log2(1.0 - p) + 1.0))
 
-            elif question_type in ["multiple_choice", "numeric"]:
+            if question_type in ["multiple_choice", "numeric"]:
                 # For now, use a simplified scoring approach
                 # This could be improved by implementing full PDF-based scoring for numeric
                 # and log scoring for multiple choice, but this provides a reasonable proxy
@@ -477,8 +474,7 @@ class EnsembleSimulator:
                 # This ensures ensemble comparison still works while avoiding complex scoring
                 return 15.0  # Approximate average score
 
-            else:
-                return None
+            return None
 
         except (ValueError, TypeError, ZeroDivisionError) as e:
             logger.warning(f"Error calculating baseline score: {e}")

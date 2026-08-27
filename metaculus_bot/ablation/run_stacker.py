@@ -167,8 +167,8 @@ __all__ = [
     "ARM_PDF",
     "ARM_PDF_MIN1",
     "ARM_PDF_MIN2",
-    "ARM_STACK_AUG",
     "ARM_STACK",
+    "ARM_STACK_AUG",
     "DEFAULT_PARSER_MODEL",
     "DEFAULT_STACKER_FALLBACK_MODEL",
     "DEFAULT_STACKER_MODEL",
@@ -343,7 +343,7 @@ async def _dispatch_stacker(
         # in the same edit as their usage; see AGENTS.md note on ``main.py``'s
         # function-scoped imports for the same reason.
         from metaculus_bot.exceptions import (
-            UnitMismatchError,  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            UnitMismatchError,  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
         )
         from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
             build_numeric_distribution,
@@ -600,7 +600,7 @@ async def run_stacker_for_arm(
                         timeout=STACKER_SOFT_DEADLINE,
                     )
                     stacker_model_used = "primary"
-                except Exception as primary_exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # translated to cached error payload
+                except Exception as primary_exc:
                     logger.exception("Primary stacker failed for qid=%s arm=%s", qid, arm)
                     errors_list.append(f"primary: {type(primary_exc).__name__}: {primary_exc!r}")
                     if fallback_stacker_llm is not None:
@@ -622,7 +622,7 @@ async def run_stacker_for_arm(
                                 timeout=STACKER_FALLBACK_SOFT_DEADLINE,
                             )
                             stacker_model_used = "fallback"
-                        except Exception as fallback_exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # translated to cached error payload
+                        except Exception as fallback_exc:
                             logger.exception("Fallback stacker failed for qid=%s arm=%s", qid, arm)
                             errors_list.append(f"fallback: {type(fallback_exc).__name__}: {fallback_exc!r}")
                             result = None
@@ -683,7 +683,7 @@ async def run_stacker_for_arm(
             )
             cache.write_stacker_output(qid=qid, arm=arm, payload=median_payload, stacker_slug=stacker_slug)
             return median_payload
-        except Exception as median_exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # degrade gracefully to error payload
+        except Exception as median_exc:
             logger.exception("Median fallback failed for qid=%s arm=%s", qid, arm)
             errors_list.append(f"median_fallback: {type(median_exc).__name__}: {median_exc!r}")
             error_payload = make_error_payload(

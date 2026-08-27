@@ -18,7 +18,7 @@ import ipaddress
 import socket as _socket
 import time
 from collections.abc import AsyncIterator, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
 from urllib.parse import urlparse
@@ -67,10 +67,10 @@ class _FakeContent:
     body-must-not-be-read assertion) keep working against the streaming path.
     """
 
-    def __init__(self, resp: "FakeResponse"):
+    def __init__(self, resp: FakeResponse):
         self._resp = resp
 
-    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:
         body = await self._resp.read()
         for i in range(0, len(body), n):
             yield body[i : i + n]
@@ -98,16 +98,16 @@ class FakeResponse:
         self.content = _FakeContent(self)
 
     async def read(self) -> bytes:
-        return self._body  # noqa: ASYNC910
+        return self._body
 
     async def text(self) -> str:
-        return self._text  # noqa: ASYNC910
+        return self._text
 
-    async def __aenter__(self) -> "FakeResponse":
-        return self  # noqa: ASYNC910
+    async def __aenter__(self) -> FakeResponse:
+        return self
 
     async def __aexit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
-        return None  # noqa: ASYNC910
+        return None
 
 
 # A handler is either a ready-made FakeResponse, a callable returning one, or a
@@ -128,7 +128,7 @@ class FakeSession:
         self._handlers: dict[str, list[_Handler]] = {
             k: (v if isinstance(v, list) else [v]) for k, v in handlers.items()
         }
-        self._call_counts: dict[str, int] = {k: 0 for k in handlers}
+        self._call_counts: dict[str, int] = dict.fromkeys(handlers, 0)
         self.closed = False
         # host_inflight[host] = current concurrent count; peak observed value
         # captured in host_peak[host]. Provider must keep per-host peak == 1.
@@ -138,7 +138,7 @@ class FakeSession:
         # (and, critically for the Datawrapper hop, were NOT) fetched.
         self.requested: list[str] = []
 
-    def get(self, url: str, **_kwargs: Any) -> "_TrackingResponse":
+    def get(self, url: str, **_kwargs: Any) -> _TrackingResponse:
         self.requested.append(url)
         for prefix, handler_list in self._handlers.items():
             if url.startswith(prefix):
@@ -153,11 +153,11 @@ class FakeSession:
                 return _TrackingResponse(inner, host, self)
         raise AssertionError(f"no handler for URL {url}")
 
-    async def close(self) -> None:  # noqa: ASYNC910
+    async def close(self) -> None:
         self.closed = True
 
-    async def __aenter__(self) -> "FakeSession":
-        return self  # noqa: ASYNC910
+    async def __aenter__(self) -> FakeSession:
+        return self
 
     async def __aexit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
         await self.close()
@@ -530,7 +530,7 @@ class TestFetchResultInvariant:
 
 class TestFormatResolutionSections:
     def test_empty_results_returns_empty_string(self):
-        assert format_resolution_sections([], datetime(2026, 7, 9, tzinfo=timezone.utc)) == ""
+        assert format_resolution_sections([], datetime(2026, 7, 9, tzinfo=UTC)) == ""
 
     def test_all_failed_renders_unreachable_notice(self):
         # URLs were attempted but every fetch failed — surface it instead of
@@ -552,7 +552,7 @@ class TestFormatResolutionSections:
                 content_type="text/html",
             ),
         ]
-        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         assert out  # no longer empty
         assert "2 resolution source(s) could not be fetched" in out
         assert "a.com: blocked" in out
@@ -578,7 +578,7 @@ class TestFormatResolutionSections:
             FetchResult(url="https://bad.com/y", status="blocked", text="", http_status=403, content_type=None),
         ]
 
-        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
 
         assert "2 resolution source(s) could not be fetched" in out
         assert "empty.example.com: empty_body" in out
@@ -605,7 +605,7 @@ class TestFormatResolutionSections:
                 content_type=None,
             ),
         ]
-        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         # Success content still rendered.
         assert "### https://ok.com/data" in out
         assert "the reading is 3.2%" in out
@@ -626,7 +626,7 @@ class TestFormatResolutionSections:
                 content_type="text/html",
             ),
         ]
-        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         assert "primary grading evidence" in out
         assert "### https://www.bls.gov/cpi/" in out
         assert "fetched 2026-07-09" in out
@@ -644,7 +644,7 @@ class TestFormatResolutionSections:
             )
             for i in range(4)
         ]
-        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         # First section fits; later ones must be trimmed or dropped.
         assert "https://example.com/0" in out
         # We should NOT see all four full 300-char blocks packed together.
@@ -668,7 +668,7 @@ class TestFormatResolutionSections:
             )
         ]
 
-        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
 
         # The section is cut, and the cut says so rather than ending mid-body.
         assert "[truncated at 400 chars — full source at https://example.com/long]" in out
@@ -688,7 +688,7 @@ class TestFormatResolutionSections:
             )
             for i in range(4)
         ]
-        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         # The dropped-section note must appear, naming the dropped count.
         assert "additional source(s) omitted — section budget" in out
         assert "3 additional" in out
@@ -711,7 +711,7 @@ class TestFormatResolutionSections:
                 content_type="text/html",
             ),
         ]
-        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         assert "omitted" not in out
 
 
@@ -795,7 +795,7 @@ class TestFetchOne:
         assert result.text == ""
 
     async def test_timeout_maps_to_error(self):
-        session = FakeSession({"https://slow.example.com/x": asyncio.TimeoutError()})
+        session = FakeSession({"https://slow.example.com/x": TimeoutError()})
         result = await _fetch_one(session, "https://slow.example.com/x", {})
         assert result.status == "error"
         assert result.http_status is None
@@ -878,9 +878,7 @@ class TestFetchOne:
         """The Tier-1 half of the Datawrapper budget fix: the same class of input (a delimited
         table whose cells carry styled anchors) reaches this branch whenever a source serves its
         data as CSV directly, and the per-URL char budget should buy rows rather than markup."""
-        body = (
-            "Dates,Pollster,Approve\n8/16,<a href='https://x.test/p' style='color:#000'>Emerson College</a>,36.4\n"
-        ).encode("utf-8")
+        body = b"Dates,Pollster,Approve\n8/16,<a href='https://x.test/p' style='color:#000'>Emerson College</a>,36.4\n"
         session = FakeSession(
             {"https://poll.example.com/rows.csv": FakeResponse(200, body=body, content_type="text/csv")}
         )
@@ -907,7 +905,7 @@ class TestFetchOne:
     async def test_pdf_content_type_is_unsupported(self):
         # PDF: body is NEVER read (per the plan). A read() that raises verifies that.
         class UnreadableResponse(FakeResponse):
-            async def read(self) -> bytes:  # noqa: ASYNC910
+            async def read(self) -> bytes:
                 raise AssertionError("body must not be read for unsupported types")
 
         session = FakeSession(
@@ -1256,7 +1254,7 @@ class TestIsPublicHttpUrl:
     async def test_rejects_hostname_resolving_to_private(self, monkeypatch):
         # Patch getaddrinfo to return a private IP for the hostname.
         async def _fake_ainfo(host, port, family=0, type=0, proto=0, flags=0):
-            del host, port, family, type, proto, flags  # noqa: A001,A002
+            del host, port, family, type, proto, flags
             return [_addrinfo("10.0.0.5")]
 
         # is_public_http_url should call asyncio.to_thread(socket.getaddrinfo, ...);

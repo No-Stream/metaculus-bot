@@ -19,10 +19,10 @@ def test_standard_percentiles_is_13_with_p1_and_p99():
     express probability mass below an open lower bound (the Minions & Monsters miss).
     """
     expected = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
-    assert numeric_config.STANDARD_PERCENTILES == expected
+    assert expected == numeric_config.STANDARD_PERCENTILES
     assert numeric_config.EXPECTED_PERCENTILE_COUNT == 13
     assert len(numeric_config.STANDARD_PERCENTILES) == 13
-    assert numeric_config.STANDARD_PERCENTILES == sorted(numeric_config.STANDARD_PERCENTILES)
+    assert sorted(numeric_config.STANDARD_PERCENTILES) == numeric_config.STANDARD_PERCENTILES
     assert 0.01 in numeric_config.STANDARD_PERCENTILES
     assert 0.99 in numeric_config.STANDARD_PERCENTILES
 
@@ -31,8 +31,8 @@ def test_standard_percentiles_csv_is_generated_from_constant():
     """The CSV label string used in prompts/errors is derived from STANDARD_PERCENTILES, not hardcoded."""
     assert numeric_config.STANDARD_PERCENTILES_CSV == "1,2.5,5,10,20,40,50,60,80,90,95,97.5,99"
     # Must track the constant: every label is its percentile * 100 formatted with %g.
-    assert numeric_config.STANDARD_PERCENTILES_CSV == ",".join(
-        f"{p * 100:g}" for p in numeric_config.STANDARD_PERCENTILES
+    assert (
+        ",".join(f"{p * 100:g}" for p in numeric_config.STANDARD_PERCENTILES) == numeric_config.STANDARD_PERCENTILES_CSV
     )
 
 

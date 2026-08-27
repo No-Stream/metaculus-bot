@@ -466,13 +466,12 @@ class CorrelationAnalyzer:
             return float(prediction)
 
         # Numeric questions: use median or mean of distribution
-        if isinstance(prediction, NumericDistribution):
-            if prediction.declared_percentiles:
-                percentiles = prediction.declared_percentiles
-                median_percentile = next((p for p in percentiles if p.percentile == 50), None)
-                if median_percentile:
-                    return float(median_percentile.value)
-                return float(np.mean([p.value for p in percentiles]))
+        if isinstance(prediction, NumericDistribution) and prediction.declared_percentiles:
+            percentiles = prediction.declared_percentiles
+            median_percentile = next((p for p in percentiles if p.percentile == 50), None)
+            if median_percentile:
+                return float(median_percentile.value)
+            return float(np.mean([p.value for p in percentiles]))
 
         # Multiple choice: convert to single numeric score (entropy or max probability)
         if isinstance(prediction, PredictedOptionList):

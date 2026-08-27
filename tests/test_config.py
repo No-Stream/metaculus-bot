@@ -12,7 +12,7 @@ def test_load_environment_idempotent(monkeypatch):
 
     calls: list[tuple[str | None, bool]] = []
 
-    def fake_load(path: str | None = None, override: bool = False) -> bool:  # noqa: D401 - simple stub
+    def fake_load(path: str | None = None, override: bool = False) -> bool:
         calls.append((path, override))
         return True
 
@@ -30,7 +30,7 @@ def test_load_environment_handles_failure_once(monkeypatch, caplog):
     caplog.set_level(logging.WARNING)
     call_count = {"value": 0}
 
-    def failing_load(*_args, **_kwargs):  # noqa: D401 - simple stub
+    def failing_load(*_args, **_kwargs):
         call_count["value"] += 1
         raise RuntimeError("boom")
 

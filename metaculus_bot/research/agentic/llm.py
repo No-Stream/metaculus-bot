@@ -70,7 +70,7 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
                 # PERSONAL-KEY FALLBACK. Without this the highest-volume donated-key
                 # path in the bot — v2 runs on every question in all four prod
                 # workflows — failed over to the paid key completely silently.
-                await record_donated_key_fallback(model, exc)  # noqa: ASYNC120
+                await record_donated_key_fallback(model, exc)
                 return await _call_once(messages, tools_json, personal_key)
 
         api_key = donated_key if should_route_via_donated_key(model) and donated_key else personal_key

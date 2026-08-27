@@ -41,7 +41,8 @@ def install_benchmarker_heartbeat(interval_seconds: int, progress_state: dict) -
             update_progress_final(progress_state)
         return await task
 
-    setattr(_run_with_heartbeat, "_has_heartbeat", True)
+    # setattr: pyright rejects direct attribute assignment on a function object.
+    setattr(_run_with_heartbeat, "_has_heartbeat", True)  # noqa: B010
     # Monkey-patch: reattach as the batch method. setattr keeps ty from nominally
     # comparing the two method types (the # type: ignore covers pyright).
     setattr(Benchmarker, "_run_a_batch", _run_with_heartbeat)  # type: ignore[assignment]  # noqa: B010

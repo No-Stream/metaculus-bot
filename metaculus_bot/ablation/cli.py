@@ -27,7 +27,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -70,7 +70,7 @@ from metaculus_bot.ablation.qa_iterate import (
     write_manual_rejects,
 )
 from metaculus_bot.ablation.research import run_gemini_research_for_qids
-from metaculus_bot.ablation.run_pdf import (  # noqa: E402
+from metaculus_bot.ablation.run_pdf import (
     ARM_PDF_MIN1,
     ARM_PDF_MIN2,
     run_pdf_for_qid,
@@ -95,7 +95,7 @@ from metaculus_bot.ablation.scoring import (
     score_arm_for_qid,
 )
 from metaculus_bot.ablation.scoring_report import render_summary_markdown
-from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose  # noqa: F401
+from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.backtest.question_prep import (
     BacktestQuestionSet,
@@ -1073,7 +1073,7 @@ async def _stage_qa_iterate(
         logger.info("stage=qa_iterate SKIPPED (mode=skip)")
         return {}, None
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     summary_path, manual_rejects_path = _qa_iterate_paths(cache, timestamp=timestamp)
 
     if force and manual_rejects_path.exists():
@@ -1487,7 +1487,7 @@ def _stage_qa_research_dump(
     working: WorkingSet,
 ) -> Path:
     """Dump first N qids' question, ground truth, research blob, leakage verdict."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     target_path = cache.root / f"qa_research_{timestamp}.md"
 
     qids_in_order = sorted(working.questions.keys())
@@ -1725,7 +1725,7 @@ def _stage_score(
 
     stats = aggregate_paired(paired_scores, n_bootstrap=5000, seed=args.seed)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     metadata = {
         "timestamp": timestamp,
         "n_questions": n_scored,

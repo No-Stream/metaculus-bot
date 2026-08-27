@@ -31,7 +31,7 @@ import logging
 import random
 import re
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from forecasting_tools import (
@@ -143,7 +143,7 @@ def _parse_retry_after_seconds(exc: BaseException) -> float | None:
       nothing and retries immediately.
     """
     import email.utils  # noqa: PLC0415  - keeps import resilient against ruff auto-strip during partial edits
-    from datetime import datetime, timezone  # noqa: PLC0415
+    from datetime import datetime  # noqa: PLC0415
 
     text = str(exc)
     match = _RETRY_AFTER_REGEX.search(text)
@@ -161,8 +161,8 @@ def _parse_retry_after_seconds(exc: BaseException) -> float | None:
     if target is None:
         return None
     if target.tzinfo is None:
-        target = target.replace(tzinfo=timezone.utc)
-    delta = (target - datetime.now(timezone.utc)).total_seconds()
+        target = target.replace(tzinfo=UTC)
+    delta = (target - datetime.now(UTC)).total_seconds()
     return max(0.0, delta)
 
 
@@ -739,7 +739,7 @@ async def run_forecasters_for_question(
         succeeded,
         len(forecaster_llms),
     )
-    return results  # noqa: ASYNC910 -- all-cached path is intentionally checkpoint-free
+    return results
 
 
 # ---------------------------------------------------------------------------

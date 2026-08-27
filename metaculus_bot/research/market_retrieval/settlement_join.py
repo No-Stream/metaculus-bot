@@ -31,9 +31,10 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
+from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 from urllib.parse import urlparse
 
 # Reuses the SHIPPED extractor and the SHIPPED Metaculus self-reference test rather than

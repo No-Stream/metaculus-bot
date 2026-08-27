@@ -136,6 +136,6 @@ def log_open_bound_piling_diagnostics(
 def log_pchip_fallback(question: NumericQuestion, error: Exception) -> None:
     """Log when PCHIP CDF construction fails and fallback is used."""
     logger.warning(
-        f"Question {getattr(question, 'id_of_question', 'N/A')}: PCHIP CDF construction failed ({str(error)}), "
+        f"Question {getattr(question, 'id_of_question', 'N/A')}: PCHIP CDF construction failed ({error!s}), "
         "falling back to forecasting-tools default"
     )

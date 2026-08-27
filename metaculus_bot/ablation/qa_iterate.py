@@ -35,19 +35,19 @@ from metaculus_bot.ablation.prune import verbatim_leak_check_passes
 from metaculus_bot.backtest.scoring import GroundTruth
 
 __all__ = [
-    "DEFAULT_LEAKAGE_THRESHOLD",
     "DEFAULT_FORECASTABILITY_THRESHOLD",
+    "DEFAULT_LEAKAGE_THRESHOLD",
     "DEFAULT_MAX_ITERATIONS",
-    "VERIFIER_SYSTEM_PROMPT",
     "RE_REDACTOR_SYSTEM_PROMPT",
-    "VerifierScore",
+    "VERIFIER_SYSTEM_PROMPT",
     "IterateOutcome",
-    "run_qa_iterate_for_qid",
-    "run_qa_iterate_batch",
+    "VerifierScore",
     "read_manual_rejects",
-    "write_manual_rejects",
     "render_qa_summary",
+    "run_qa_iterate_batch",
+    "run_qa_iterate_for_qid",
     "serialize_outcome",
+    "write_manual_rejects",
 ]
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -197,7 +197,7 @@ async def _run_claude_subprocess(
             proc.communicate(input=prompt.encode("utf-8")),
             timeout=timeout_seconds,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # asyncio.wait_for cancels the awaitable but does NOT terminate the
         # underlying OS subprocess. Without proc.kill(), the orphan keeps
         # running until the model finishes on its own. At 50q x 3 iterations
@@ -209,13 +209,12 @@ async def _run_claude_subprocess(
         )
         proc.kill()
         try:
-            # noqa: ASYNC120 — checkpoint inside except is intentional. We
             # must await proc.wait() here to reap the killed child; the
             # outer `raise` re-raises the original TimeoutError after
             # cleanup. Bounded by an inner 5s timeout so a child that
             # refuses SIGKILL doesn't pin us.
-            await asyncio.wait_for(proc.wait(), timeout=5.0)  # noqa: ASYNC120
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except TimeoutError:
             logger.error("claude -p subprocess pid=%s refused SIGKILL within 5s", proc.pid)
         raise
 

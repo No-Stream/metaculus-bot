@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict
 from unittest import mock
@@ -33,8 +33,8 @@ def _artifact(name: str, run_id: int, created: datetime, expired: bool = False) 
     return {
         "id": run_id * 10,
         "name": name,
-        "created_at": created.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_at": (created + timedelta(days=90)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": created.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (created + timedelta(days=90)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "expired": expired,
         "size_in_bytes": 1234,
         "run_id": run_id,
@@ -99,14 +99,14 @@ class TestSinglePassDriver:
         only run_logs/ (telemetry only). The prod run
         must appear exactly once in the download calls despite three consumers reading it.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=1)),
             _artifact("logs-300", 300, now - timedelta(days=2)),
             _artifact("benchmark-results", 400, now - timedelta(days=1)),  # not a run-log family
         ]
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             if run_id == 100:
                 return _write_research_run_dir(dest_dir, 100, qid=43613)
             if run_id == 300:
@@ -150,13 +150,13 @@ class TestSinglePassDriver:
         The surviving run must still land in all three archives; the failed run in none —
         and the whole sync completes without raising.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=2)),  # download "fails"
             _artifact("research-200", 200, now - timedelta(days=1)),  # succeeds
         ]
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             if run_id == 100:
                 return None  # simulate a TimeoutExpired-skipped artifact
             return _write_research_run_dir(dest_dir, 200, qid=50001)
@@ -183,14 +183,14 @@ class TestSinglePassDriver:
 
     def test_expired_artifacts_reported_and_split_by_family(self, tmp_path: Path) -> None:
         """Expired run-log artifacts are surfaced in the summary, split research-* vs logs-*."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=1)),
             _artifact("research-900", 900, now - timedelta(days=95), expired=True),
             _artifact("logs-901", 901, now - timedelta(days=96), expired=True),
         ]
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             return _write_research_run_dir(dest_dir, 100, qid=1)
 
         dirs = _dirs(tmp_path)
@@ -219,13 +219,13 @@ class TestOfflineReharvestFromTheStore:
 
     def _seed_store(self, tmp_path: Path, dirs: SyncDirs) -> None:
         """Run one ONLINE sync so the store holds two artifacts, exactly as a real pull leaves it."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=2)),
             _artifact("research-200", 200, now - timedelta(days=1)),
         ]
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             return _write_research_run_dir(dest_dir, run_id, qid=40000 + run_id)
 
         with (
@@ -276,7 +276,7 @@ class TestOfflineReharvestFromTheStore:
         """A second online pull re-enumerates but re-fetches nothing already in the store."""
         dirs = _dirs(tmp_path)
         self._seed_store(tmp_path, dirs)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=2)),
             _artifact("research-200", 200, now - timedelta(days=1)),
@@ -298,7 +298,7 @@ class TestOfflineReharvestFromTheStore:
         archived label, while GitHub wins for the in-window run (200)."""
         dirs = _dirs(tmp_path)
         self._seed_store(tmp_path, dirs)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=30)),  # aged out of the runs window
             _artifact("research-200", 200, now - timedelta(days=1)),  # still inside it

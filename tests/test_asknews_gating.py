@@ -1,5 +1,6 @@
 import types
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -31,7 +32,7 @@ def _install_asknews_stub(monkeypatch: pytest.MonkeyPatch, on_search: Callable[[
                 result = await result  # type: ignore[assignment]
             return result
 
-    class AsyncAskNewsSDK:  # noqa: N801 - match import name in provider
+    class AsyncAskNewsSDK:
         def __init__(self, *_, **__):  # type: ignore[no-untyped-def]
             self.news = _News()
 

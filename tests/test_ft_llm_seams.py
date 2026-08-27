@@ -343,8 +343,8 @@ class TestFallbackOpenRouterKeySwap:
             allowed_tries=1,
         )
         # The fallback secondary is a real, separate GeneralLlm carrying the personal key.
-        assert isinstance(llm._secondary_llm, GeneralLlm)  # noqa: SLF001  # pinning the two-instance funnel
-        assert llm._secondary_llm.litellm_kwargs["api_key"] == "personal-key"  # noqa: SLF001
+        assert isinstance(llm._secondary_llm, GeneralLlm)  # pinning the two-instance funnel
+        assert llm._secondary_llm.litellm_kwargs["api_key"] == "personal-key"
 
         calls = _install_acompletion(
             monkeypatch,

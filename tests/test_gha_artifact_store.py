@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -47,8 +47,8 @@ def _artifact(name: str, run_id: int, created: datetime) -> dict:
     return {
         "id": run_id * 10,
         "name": name,
-        "created_at": created.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_at": (created + timedelta(days=90)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": created.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (created + timedelta(days=90)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "expired": False,
         "size_in_bytes": 1234,
         "run_id": run_id,
@@ -64,7 +64,7 @@ def _selection(*artifacts: dict) -> ArtifactSelection:
 def _fake_gh_download(payload: str = "research payload"):
     """A stand-in for ``gh run download``: writes ``dest_dir/<run_id>/research_<run_id>.jsonl``."""
 
-    def download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+    def download(run_id, repo, artifact_name, dest_dir):
         run_dir = Path(dest_dir) / str(run_id)
         (run_dir / "research_outputs").mkdir(parents=True, exist_ok=True)
         (run_dir / "research_outputs" / f"research_{run_id}.jsonl").write_text(
@@ -90,7 +90,7 @@ class TestHarvestedRunDirsOutliveTheHarvest:
 
     def test_run_dir_still_readable_after_the_generator_is_exhausted(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        selection = _selection(_artifact("research-100", 100, datetime.now(timezone.utc)))
+        selection = _selection(_artifact("research-100", 100, datetime.now(UTC)))
 
         with mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=_fake_gh_download()):
             harvested = list(persisted_run_dirs(selection, REPO, store_dir=store))
@@ -101,7 +101,7 @@ class TestHarvestedRunDirsOutliveTheHarvest:
 
     def test_the_dir_is_the_store_path_not_a_temp_copy(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        selection = _selection(_artifact("research-100", 100, datetime.now(timezone.utc)))
+        selection = _selection(_artifact("research-100", 100, datetime.now(UTC)))
 
         with mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=_fake_gh_download()):
             (_run_id, _art, run_dir) = next(iter(persisted_run_dirs(selection, REPO, store_dir=store)))
@@ -111,7 +111,7 @@ class TestHarvestedRunDirsOutliveTheHarvest:
     def test_no_staging_dirs_are_left_behind(self, tmp_path: Path) -> None:
         """Extraction happens in a ``.staging-*`` sibling that must not outlive the grab."""
         store = tmp_path / "store"
-        _persist_one(_artifact("research-100", 100, datetime.now(timezone.utc)), store)
+        _persist_one(_artifact("research-100", 100, datetime.now(UTC)), store)
 
         assert [p.name for p in store.iterdir()] == ["research-100"]
 
@@ -126,7 +126,7 @@ class TestStoreLayoutMatchesTheLiveStore:
 
     def test_meta_carries_the_four_fields(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        created = datetime(2026, 5, 29, 13, 31, 49, tzinfo=timezone.utc)
+        created = datetime(2026, 5, 29, 13, 31, 49, tzinfo=UTC)
         _persist_one(_artifact("research-26639832588", 26639832588, created), store)
 
         meta = read_store_meta(store_run_dir(store, "research-26639832588"))
@@ -139,7 +139,7 @@ class TestStoreLayoutMatchesTheLiveStore:
 
     def test_meta_ids_are_strings_as_the_live_store_writes_them(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        _persist_one(_artifact("research-100", 100, datetime.now(timezone.utc)), store)
+        _persist_one(_artifact("research-100", 100, datetime.now(UTC)), store)
 
         meta = read_store_meta(store_run_dir(store, "research-100"))
         assert meta is not None
@@ -149,7 +149,7 @@ class TestStoreLayoutMatchesTheLiveStore:
     def test_a_dir_with_meta_reads_back_as_an_artifact_object(self, tmp_path: Path) -> None:
         """``store_artifacts`` is the offline stand-in for the artifacts endpoint."""
         store = tmp_path / "store"
-        _persist_one(_artifact("research-100", 100, datetime(2026, 7, 1, tzinfo=timezone.utc)), store)
+        _persist_one(_artifact("research-100", 100, datetime(2026, 7, 1, tzinfo=UTC)), store)
 
         assert store_artifacts(store) == [
             {
@@ -164,7 +164,7 @@ class TestStoreLayoutMatchesTheLiveStore:
     def test_store_keys_on_artifact_name_so_one_run_can_hold_two_artifacts(self, tmp_path: Path) -> None:
         """A pre-rename test run uploaded both ``research-<id>`` and ``logs-<id>``."""
         store = tmp_path / "store"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         _persist_one(_artifact("research-100", 100, now), store)
         _persist_one(_artifact("logs-100", 100, now), store)
 
@@ -176,7 +176,7 @@ class TestSkipIfPresentIdempotency:
 
     def test_second_grab_downloads_nothing(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        selection = _selection(_artifact("research-100", 100, datetime.now(timezone.utc)))
+        selection = _selection(_artifact("research-100", 100, datetime.now(UTC)))
 
         with mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=_fake_gh_download()) as dl:
             first = ensure_store_current(selection, REPO, store_dir=store)
@@ -188,7 +188,7 @@ class TestSkipIfPresentIdempotency:
 
     def test_re_grab_leaves_the_payload_byte_identical(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        art = _artifact("research-100", 100, datetime.now(timezone.utc))
+        art = _artifact("research-100", 100, datetime.now(UTC))
         _persist_one(art, store)
         before = (store_run_dir(store, "research-100") / "research_outputs" / "research_100.jsonl").read_text()
 
@@ -201,7 +201,7 @@ class TestSkipIfPresentIdempotency:
 
     def test_no_duplicate_dirs_accumulate(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        art = _artifact("research-100", 100, datetime.now(timezone.utc))
+        art = _artifact("research-100", 100, datetime.now(UTC))
         for _ in range(3):
             _persist_one(art, store)
 
@@ -217,7 +217,7 @@ class TestSkipIfPresentIdempotency:
 
         with mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=_fake_gh_download()) as dl:
             stats = ensure_store_current(
-                _selection(_artifact("research-100", 100, datetime.now(timezone.utc))), REPO, store_dir=store
+                _selection(_artifact("research-100", 100, datetime.now(UTC))), REPO, store_dir=store
             )
 
         assert (dl.call_count, stats.downloaded) == (1, 1)
@@ -230,7 +230,7 @@ class TestAFailedGrabDamagesNothing:
 
     def test_failed_download_leaves_an_existing_copy_intact(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        art = _artifact("research-100", 100, datetime.now(timezone.utc))
+        art = _artifact("research-100", 100, datetime.now(UTC))
         _persist_one(art, store, payload="the good copy")
 
         # Called directly, bypassing skip-if-present, to prove the write path itself is safe.
@@ -244,21 +244,21 @@ class TestAFailedGrabDamagesNothing:
     def test_failed_download_persists_nothing_and_writes_no_meta(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
         with mock.patch("scripts.gha_artifacts._download_artifact_to", return_value=None):
-            assert persist_artifact(_artifact("research-100", 100, datetime.now(timezone.utc)), REPO, store) is None
+            assert persist_artifact(_artifact("research-100", 100, datetime.now(UTC)), REPO, store) is None
 
         assert not store_run_dir(store, "research-100").exists()
         assert not is_persisted(store, "research-100")
 
     def test_one_failure_does_not_abort_the_rest_of_the_grab(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         selection = _selection(
             _artifact("research-100", 100, now - timedelta(days=2)),
             _artifact("research-200", 200, now - timedelta(days=1)),
         )
         succeed = _fake_gh_download()
 
-        def flaky(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def flaky(run_id, repo, artifact_name, dest_dir):
             return None if run_id == 100 else succeed(run_id, repo, artifact_name, dest_dir)
 
         with mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=flaky):
@@ -269,7 +269,7 @@ class TestAFailedGrabDamagesNothing:
 
     def test_a_selected_artifact_missing_from_the_store_is_skipped_by_the_harvest(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         present = _artifact("research-200", 200, now)
         _persist_one(present, store)
 
@@ -279,7 +279,7 @@ class TestAFailedGrabDamagesNothing:
 
     def test_an_unreadable_meta_is_treated_as_not_persisted(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        _persist_one(_artifact("research-100", 100, datetime.now(timezone.utc)), store)
+        _persist_one(_artifact("research-100", 100, datetime.now(UTC)), store)
         (store_run_dir(store, "research-100") / STORE_META_FILENAME).write_text("{ truncated")
 
         assert not is_persisted(store, "research-100")
@@ -300,7 +300,7 @@ class TestOfflineSelectionTouchesNoNetwork:
 
     def test_selection_and_harvest_run_entirely_off_disk(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         # Pre-populating goes through the same mocked download seam every other test uses,
         # so even this setup proves the store path never shells out.
         _persist_one(_artifact("research-100", 100, now - timedelta(days=1)), store)
@@ -314,7 +314,7 @@ class TestOfflineSelectionTouchesNoNetwork:
     def test_family_prefixes_filter_the_store(self, tmp_path: Path) -> None:
         """A future artifact family in the store must not be handed to a research harvest."""
         store = tmp_path / "store"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         _persist_one(_artifact("research-100", 100, now), store)
         _persist_one(_artifact("benchmark-results-400", 400, now), store)
 
@@ -325,7 +325,7 @@ class TestOfflineSelectionTouchesNoNetwork:
 
     def test_since_days_still_windows_an_offline_harvest(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         _persist_one(_artifact("research-old", 100, now - timedelta(days=40)), store)
         _persist_one(_artifact("research-new", 200, now - timedelta(days=2)), store)
 
@@ -336,7 +336,7 @@ class TestOfflineSelectionTouchesNoNetwork:
     def test_harvest_order_is_oldest_upload_first(self, tmp_path: Path) -> None:
         """Deterministic order keeps replace-by-run merges reproducible across runs."""
         store = tmp_path / "store"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         _persist_one(_artifact("research-newest", 300, now), store)
         _persist_one(_artifact("research-oldest", 100, now - timedelta(days=5)), store)
         _persist_one(_artifact("research-middle", 200, now - timedelta(days=2)), store)

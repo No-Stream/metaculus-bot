@@ -171,7 +171,7 @@ class TestQuestionDomains:
         assert question_domains("") == set()
 
     def test_self_reference_domains_are_the_two_measured_ones(self):
-        assert SELF_REFERENCE_DOMAINS == frozenset({"kalshi.com", "metaculus.com"})
+        assert frozenset({"kalshi.com", "metaculus.com"}) == SELF_REFERENCE_DOMAINS
 
 
 class TestSettlementDomainIndex:

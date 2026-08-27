@@ -76,9 +76,8 @@ class TestPassesOnRealApiSignature:
             verify_metaculus_api_identity()  # no raise
 
     def test_success_logs_info_line(self, caplog: pytest.LogCaptureFixture) -> None:
-        with _mock_transport(status=403, body="Permission Error"):
-            with caplog.at_level("INFO"):
-                verify_metaculus_api_identity()
+        with _mock_transport(status=403, body="Permission Error"), caplog.at_level("INFO"):
+            verify_metaculus_api_identity()
         assert any("preflight passed" in r.message for r in caplog.records)
 
 
@@ -86,20 +85,17 @@ class TestRaisesOnImposterHost:
     """A host that doesn't behave like the real API must fail fast with a diagnostic."""
 
     def test_404_empty_body_raises_and_names_status(self) -> None:
-        with _mock_transport(status=404, body=""):
-            with pytest.raises(MetaculusApiIdentityError, match="404"):
-                verify_metaculus_api_identity()
+        with _mock_transport(status=404, body=""), pytest.raises(MetaculusApiIdentityError, match="404"):
+            verify_metaculus_api_identity()
 
     def test_200_html_lander_raises(self) -> None:
         html = '<html><head><script>window.location.href="/lander"</script></head></html>'
-        with _mock_transport(status=200, body=html):
-            with pytest.raises(MetaculusApiIdentityError):
-                verify_metaculus_api_identity()
+        with _mock_transport(status=200, body=html), pytest.raises(MetaculusApiIdentityError):
+            verify_metaculus_api_identity()
 
     def test_200_json_without_results_raises(self) -> None:
-        with _mock_transport(status=200, body='{"detail": "nope"}'):
-            with pytest.raises(MetaculusApiIdentityError):
-                verify_metaculus_api_identity()
+        with _mock_transport(status=200, body='{"detail": "nope"}'), pytest.raises(MetaculusApiIdentityError):
+            verify_metaculus_api_identity()
 
     def test_302_redirect_raises_and_is_not_followed(self) -> None:
         with _mock_transport(status=302, body="") as captured:
@@ -115,16 +111,14 @@ class TestRaisesOnImposterHost:
 
     def test_connection_error_raises_chained(self) -> None:
         original = requests.ConnectionError("dns down")
-        with _mock_transport(exc=original):
-            with pytest.raises(MetaculusApiIdentityError) as excinfo:
-                verify_metaculus_api_identity()
+        with _mock_transport(exc=original), pytest.raises(MetaculusApiIdentityError) as excinfo:
+            verify_metaculus_api_identity()
         assert excinfo.value.__cause__ is original
 
     def test_timeout_raises_chained(self) -> None:
         original = requests.Timeout("slow")
-        with _mock_transport(exc=original):
-            with pytest.raises(MetaculusApiIdentityError) as excinfo:
-                verify_metaculus_api_identity()
+        with _mock_transport(exc=original), pytest.raises(MetaculusApiIdentityError) as excinfo:
+            verify_metaculus_api_identity()
         assert excinfo.value.__cause__ is original
 
 
@@ -223,7 +217,7 @@ class TestPerformanceCliInvokesPreflight:
             patch.object(perf_cli, "build_performance_dataset") as build,
             patch.object(perf_cli, "save_dataset"),
             patch.object(perf_cli, "generate_report", return_value=""),
+            pytest.raises(MetaculusApiIdentityError),
         ):
-            with pytest.raises(MetaculusApiIdentityError):
-                perf_cli.main([])
+            perf_cli.main([])
         build.assert_not_called()

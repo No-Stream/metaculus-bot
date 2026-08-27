@@ -396,36 +396,35 @@ async def _call_asknews_search(query: str) -> list[Any]:
     backoff = float(ASKNEWS_BACKOFF_SECS)
     semaphore = research_providers.get_asknews_semaphore()
 
-    async with semaphore:
-        async with AsyncAskNewsSDK(client_id=client_id, client_secret=secret, scopes={"news"}) as sdk:
-            last_exc: Exception | None = None
-            for attempt in range(1, tries + 1):
-                try:
-                    await research_providers.asknews_rate_gate()
-                    response = await sdk.news.search_news(
-                        query=query,
-                        n_articles=6,
-                        return_type="both",
-                        strategy="news knowledge",
-                    )
-                    return list(response.as_dicts or [])
-                except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
-                    last_exc = exc
-                    # Transient-only retry, matching the primary provider's ``_is_retryable``
-                    # (``providers.py``). The 403011 subscription-inactive error is PERMANENT —
-                    # off-season billing, not throttling — so it must NOT be exempted here: re-rolling
-                    # it burns the whole ``ASKNEWS_MAX_TRIES`` ladder of ``ASKNEWS_BACKOFF_SECS``
-                    # sleeps (a double-digit fraction of GAP_FILL_V2_WALL_DEADLINE, since the sleep
-                    # below grows as 3**attempt) on a call that can never succeed.
-                    if not _is_rate_limited_error(exc):
-                        msg = str(exc).lower()
-                        if "concurrency limit" not in msg:
-                            raise
-                    if attempt >= tries:
+    async with semaphore, AsyncAskNewsSDK(client_id=client_id, client_secret=secret, scopes={"news"}) as sdk:
+        last_exc: Exception | None = None
+        for attempt in range(1, tries + 1):
+            try:
+                await research_providers.asknews_rate_gate()
+                response = await sdk.news.search_news(
+                    query=query,
+                    n_articles=6,
+                    return_type="both",
+                    strategy="news knowledge",
+                )
+                return list(response.as_dicts or [])
+            except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+                last_exc = exc
+                # Transient-only retry, matching the primary provider's ``_is_retryable``
+                # (``providers.py``). The 403011 subscription-inactive error is PERMANENT —
+                # off-season billing, not throttling — so it must NOT be exempted here: re-rolling
+                # it burns the whole ``ASKNEWS_MAX_TRIES`` ladder of ``ASKNEWS_BACKOFF_SECS``
+                # sleeps (a double-digit fraction of GAP_FILL_V2_WALL_DEADLINE, since the sleep
+                # below grows as 3**attempt) on a call that can never succeed.
+                if not _is_rate_limited_error(exc):
+                    msg = str(exc).lower()
+                    if "concurrency limit" not in msg:
                         raise
-                    await asyncio.sleep(backoff * (10 + 3**attempt))
-            if last_exc is not None:
-                raise last_exc
+                if attempt >= tries:
+                    raise
+                await asyncio.sleep(backoff * (10 + 3**attempt))
+        if last_exc is not None:
+            raise last_exc
     return []
 
 
@@ -685,7 +684,7 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
                             url=current_url,
                             content_type=content_type or None,
                         )
-                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                except (TimeoutError, aiohttp.ClientError) as exc:
                     return PlainFetchResult(
                         status="error",
                         method="plain",
@@ -784,7 +783,7 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     try:
         from playwright.async_api import (
-            Error as PlaywrightError,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            Error as PlaywrightError,
         )
         from playwright.async_api import async_playwright  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
@@ -802,104 +801,103 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     host, vetted_ip = pinned
 
     try:
-        async with _host_gate(url), _RENDERED_FETCH_GLOBAL_SEMAPHORE:
-            async with async_playwright() as playwright:
-                # --host-resolver-rules pins the browser's own resolution to the IP we
-                # vetted above, so Chromium's socket connect cannot independently
-                # re-resolve `host` to a private address (the DNS-rebinding TOCTOU that
-                # the per-request preflight in _guard_route alone cannot close). A fresh
-                # browser is launched per call, so per-launch host-resolver-rules is clean.
-                browser = await playwright.chromium.launch(
-                    headless=True,
-                    args=[_host_resolver_rule(host, vetted_ip)],
-                )
-                context = await browser.new_context(
-                    user_agent=BROWSER_HEADERS["User-Agent"],
-                    extra_http_headers={key: value for key, value in BROWSER_HEADERS.items() if key != "User-Agent"},
-                )
+        async with _host_gate(url), _RENDERED_FETCH_GLOBAL_SEMAPHORE, async_playwright() as playwright:
+            # --host-resolver-rules pins the browser's own resolution to the IP we
+            # vetted above, so Chromium's socket connect cannot independently
+            # re-resolve `host` to a private address (the DNS-rebinding TOCTOU that
+            # the per-request preflight in _guard_route alone cannot close). A fresh
+            # browser is launched per call, so per-launch host-resolver-rules is clean.
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=[_host_resolver_rule(host, vetted_ip)],
+            )
+            context = await browser.new_context(
+                user_agent=BROWSER_HEADERS["User-Agent"],
+                extra_http_headers={key: value for key, value in BROWSER_HEADERS.items() if key != "User-Agent"},
+            )
 
-                # Defense-in-depth on top of the main-frame pin above. The route guard
-                # re-checks EVERY request Chromium makes (main-frame goto, server and
-                # client-side redirects, subresources) against is_public_http_url.
-                # Threat model: these fetches run on GitHub-hosted Azure runners, where a
-                # request to a link-local / RFC1918 host (Azure IMDS at 169.254.169.254,
-                # localhost services, the internal runner network) would exfiltrate
-                # internal content into the research prompt AND the public Metaculus
-                # comment. The main-frame host is now pinned, so its rebinding TOCTOU is
-                # closed; subresource / redirect hosts remain guarded only by this
-                # per-request preflight (whose getaddrinfo resolves independently of
-                # Chromium's connect), so their rebinding TOCTOU is a documented residual
-                # — a filtering forward proxy would close it, deferred as its own change.
-                async def _guard_route(route: Any, request: Any) -> None:
-                    try:
-                        if await resolution_source.is_public_http_url(request.url):
-                            await route.continue_()
-                        else:
-                            await route.abort("blockedbyclient")
-                    except PlaywrightError as exc:
-                        # A request can still be in flight when the page/context tears
-                        # down (typically after a goto timeout): continue_/abort then
-                        # races the close and raises TargetClosedError in this detached
-                        # event-listener task — the unhandled-error storm seen
-                        # 2026-07-25. Swallow it: a closed target has no live socket, so
-                        # an abort that "fails" because the target is already gone still
-                        # lets nothing through — the SSRF guarantee is unaffected.
-                        # unroute_all in the finally is the primary drain; this is the
-                        # residual-race backstop. Only Playwright's own Error is caught,
-                        # so a genuine bug (a Python exception) still propagates.
-                        logger.debug("agentic route guard race during teardown: %s", exc)
-
-                await context.route("**/*", _guard_route)
-                page = await context.new_page()
+            # Defense-in-depth on top of the main-frame pin above. The route guard
+            # re-checks EVERY request Chromium makes (main-frame goto, server and
+            # client-side redirects, subresources) against is_public_http_url.
+            # Threat model: these fetches run on GitHub-hosted Azure runners, where a
+            # request to a link-local / RFC1918 host (Azure IMDS at 169.254.169.254,
+            # localhost services, the internal runner network) would exfiltrate
+            # internal content into the research prompt AND the public Metaculus
+            # comment. The main-frame host is now pinned, so its rebinding TOCTOU is
+            # closed; subresource / redirect hosts remain guarded only by this
+            # per-request preflight (whose getaddrinfo resolves independently of
+            # Chromium's connect), so their rebinding TOCTOU is a documented residual
+            # — a filtering forward proxy would close it, deferred as its own change.
+            async def _guard_route(route: Any, request: Any) -> None:
                 try:
-                    response = await page.goto(url, wait_until="networkidle", timeout=_RENDERED_FETCH_TIMEOUT_MS)
-                    content_type = (
-                        (response.headers.get("content-type") or "").lower()
-                        if response is not None and hasattr(response, "headers")
-                        else ""
-                    )
-                    if _content_type_is_document(content_type):
-                        return PlainFetchResult(
-                            status="ok",
-                            method="document_needed",
-                            text="This URL is a PDF or image — use read_document(url, ask) to read it.",
-                            links=[],
-                            url=url,
-                            content_type=content_type or None,
-                        )
-                    html = await page.content()
-                    body = html.encode("utf-8", errors="replace")
-                    extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, url)
-                    links = _extract_links_from_html(html, url)
-                    text = (extracted or "").strip()
-                    if not text:
-                        return PlainFetchResult(status="error", method="rendered", text="", links=links, url=url)
+                    if await resolution_source.is_public_http_url(request.url):
+                        await route.continue_()
+                    else:
+                        await route.abort("blockedbyclient")
+                except PlaywrightError as exc:
+                    # A request can still be in flight when the page/context tears
+                    # down (typically after a goto timeout): continue_/abort then
+                    # races the close and raises TargetClosedError in this detached
+                    # event-listener task — the unhandled-error storm seen
+                    # 2026-07-25. Swallow it: a closed target has no live socket, so
+                    # an abort that "fails" because the target is already gone still
+                    # lets nothing through — the SSRF guarantee is unaffected.
+                    # unroute_all in the finally is the primary drain; this is the
+                    # residual-race backstop. Only Playwright's own Error is caught,
+                    # so a genuine bug (a Python exception) still propagates.
+                    logger.debug("agentic route guard race during teardown: %s", exc)
+
+            await context.route("**/*", _guard_route)
+            page = await context.new_page()
+            try:
+                response = await page.goto(url, wait_until="networkidle", timeout=_RENDERED_FETCH_TIMEOUT_MS)
+                content_type = (
+                    (response.headers.get("content-type") or "").lower()
+                    if response is not None and hasattr(response, "headers")
+                    else ""
+                )
+                if _content_type_is_document(content_type):
                     return PlainFetchResult(
                         status="ok",
-                        method="rendered",
-                        text=text,
-                        links=links,
+                        method="document_needed",
+                        text="This URL is a PDF or image — use read_document(url, ask) to read it.",
+                        links=[],
                         url=url,
                         content_type=content_type or None,
                     )
-                finally:
-                    # Drain in-flight route handlers BEFORE teardown. Without this, a
-                    # request still in flight when we close (common after a goto
-                    # timeout) fires _guard_route against the closing context and raises
-                    # TargetClosedError in a detached event listener — the unhandled
-                    # traceback storm seen 2026-07-25 that buries real fetch failures in
-                    # the logs. unroute_all(ignoreErrors) removes the handlers and
-                    # silently swallows any still mid-flight (Playwright's own remedy for
-                    # this exact message). SSRF is unaffected: the guard already ran for
-                    # every request dialed while the page was live, and a request racing
-                    # teardown has no live target to exfiltrate through. Guarded so a
-                    # teardown-race error here can't skip context/browser close (leak).
-                    try:
-                        await context.unroute_all(behavior="ignoreErrors")
-                    except PlaywrightError as exc:
-                        logger.debug("agentic rendered fetch unroute_all race: %s", exc)
-                    await context.close()
-                    await browser.close()
+                html = await page.content()
+                body = html.encode("utf-8", errors="replace")
+                extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, url)
+                links = _extract_links_from_html(html, url)
+                text = (extracted or "").strip()
+                if not text:
+                    return PlainFetchResult(status="error", method="rendered", text="", links=links, url=url)
+                return PlainFetchResult(
+                    status="ok",
+                    method="rendered",
+                    text=text,
+                    links=links,
+                    url=url,
+                    content_type=content_type or None,
+                )
+            finally:
+                # Drain in-flight route handlers BEFORE teardown. Without this, a
+                # request still in flight when we close (common after a goto
+                # timeout) fires _guard_route against the closing context and raises
+                # TargetClosedError in a detached event listener — the unhandled
+                # traceback storm seen 2026-07-25 that buries real fetch failures in
+                # the logs. unroute_all(ignoreErrors) removes the handlers and
+                # silently swallows any still mid-flight (Playwright's own remedy for
+                # this exact message). SSRF is unaffected: the guard already ran for
+                # every request dialed while the page was live, and a request racing
+                # teardown has no live target to exfiltrate through. Guarded so a
+                # teardown-race error here can't skip context/browser close (leak).
+                try:
+                    await context.unroute_all(behavior="ignoreErrors")
+                except PlaywrightError as exc:
+                    logger.debug("agentic rendered fetch unroute_all race: %s", exc)
+                await context.close()
+                await browser.close()
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
         _warn_playwright_unavailable_once(exc)
         return None
@@ -1028,7 +1026,7 @@ async def read_document(url: str, ask: str) -> ToolOutcome:
         text, n_url_success = await asyncio.wait_for(
             asyncio.to_thread(_run_document_read_sync, url, ask), timeout=_READ_DOCUMENT_TIMEOUT_S
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return _format_fetch_error("Document read timed out.", method="document")
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
         return _format_fetch_error(f"Document read failed: {type(exc).__name__}: {exc}", method="document")

@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Sequence
+from typing import Any
 
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _liquidity_label
 from metaculus_bot.structured_output_schema import extract_json_block

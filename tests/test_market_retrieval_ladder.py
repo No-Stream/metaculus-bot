@@ -344,7 +344,7 @@ class TestCompactionStages:
         constructing a fixture that happens to land there — a fixture that stops testing the thing the
         moment a budget constant moves.
         """
-        from metaculus_bot.research.market_retrieval.rendering import _ladder_at_stage  # noqa: PLC0415
+        from metaculus_bot.research.market_retrieval.rendering import _ladder_at_stage
 
         return _ladder_at_stage(children, stage=stage).title
 
@@ -413,7 +413,7 @@ class TestCompactionStages:
         settled span — the withheld-price-as-real-zero shape 58175a7 fixed at the venue
         parsers. A loud failure beats a wrong span.
         """
-        from metaculus_bot.research.market_retrieval.rendering import _quoted_price  # noqa: PLC0415
+        from metaculus_bot.research.market_retrieval.rendering import _quoted_price
 
         with pytest.raises(ValueError, match="unquoted outcome reached price arithmetic"):
             _quoted_price(MarketChild(title="unquoted", price_withheld=True))
@@ -440,7 +440,7 @@ class TestCompactionStages:
         title and the section loop would not terminate usefully."""
         assert list(LADDER_PRICE_FLOORS) == sorted(LADDER_PRICE_FLOORS)
         assert LADDER_PRICE_FLOORS[0] == 0.0, "stage 2 must collapse no open outcome"
-        assert LADDER_MAX_STAGE == 2 + len(LADDER_PRICE_FLOORS) - 1
+        assert 2 + len(LADDER_PRICE_FLOORS) - 1 == LADDER_MAX_STAGE
 
     def test_a_cumulative_ladder_collapses_both_tails_and_keeps_its_crossing(self) -> None:
         """The one place family SHAPE has to be read, and the defect that made it necessary.
@@ -604,7 +604,7 @@ class TestLadderSectionBudget:
             MarketChild(title=f"rung {index:03d}", implied_prob_yes=0.90)
             for index in range(200)  # noqa: HARNESS-SCAN-EXEMPT-subsampling
         )
-        from metaculus_bot.research.market_retrieval.rendering import _ladder_at_stage  # noqa: PLC0415
+        from metaculus_bot.research.market_retrieval.rendering import _ladder_at_stage
 
         for stage in range(LADDER_MAX_STAGE + 1):
             row = _ladder_at_stage(children, stage=stage)

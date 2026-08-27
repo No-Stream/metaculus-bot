@@ -121,9 +121,9 @@ async def test_numeric_parsing_raises_on_wrong_count():
             "metaculus_bot.value_extraction.parse_structured",
             new=AsyncMock(return_value=bad),
         ),
+        pytest.raises(ValueExtractionError),
     ):
-        with pytest.raises(ValueExtractionError):
-            await bot._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
+        await bot._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -265,7 +265,7 @@ async def test_mc_additional_instructions_include_options():
 
     seen = {}
 
-    async def _fake_extract_mc(*args, **kwargs):  # noqa: D401
+    async def _fake_extract_mc(*args, **kwargs):
         seen["prompt_notes"] = kwargs.get("prompt_notes", "")
         pol = PredictedOptionList(
             predicted_options=[

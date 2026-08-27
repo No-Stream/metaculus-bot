@@ -157,7 +157,7 @@ class TestRunResearch:
     @pytest.mark.asyncio
     async def test_provider_failure_count_also_counts_genuine_timeouts(self, orchestrator, question):
         """A real timeout is a provider failure too — the rename widens the name, not the set."""
-        failing = AsyncMock(side_effect=asyncio.TimeoutError())
+        failing = AsyncMock(side_effect=TimeoutError())
         working = AsyncMock(return_value="ok")
 
         with patch.object(
@@ -261,7 +261,7 @@ class TestAskNewsSummarization:
                 orchestrator._summarizer_llm,
                 "invoke",
                 new_callable=AsyncMock,
-                side_effect=asyncio.TimeoutError("summarizer timed out"),
+                side_effect=TimeoutError("summarizer timed out"),
             ),
         ):
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
@@ -288,9 +288,9 @@ class TestAskNewsSummarization:
                 new_callable=AsyncMock,
                 side_effect=AttributeError("prompt builder bug"),
             ),
+            pytest.raises(AttributeError),
         ):
-            with pytest.raises(AttributeError):
-                await orchestrator._summarize_asknews(question, "raw asknews articles")
+            await orchestrator._summarize_asknews(question, "raw asknews articles")
 
     @pytest.mark.asyncio
     async def test_fast_blip_on_summarizer_invoke_retries_then_succeeds(self, orchestrator, question):
@@ -352,7 +352,7 @@ class TestAskNewsSummarization:
                 orchestrator._summarizer_llm,
                 "invoke",
                 new_callable=AsyncMock,
-                side_effect=asyncio.TimeoutError("summarizer timed out"),
+                side_effect=TimeoutError("summarizer timed out"),
             ),
         ):
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
@@ -404,7 +404,7 @@ class TestAskNewsSummarization:
                 orch._summarizer_llm,
                 "invoke",
                 new_callable=AsyncMock,
-                side_effect=asyncio.TimeoutError("summarizer timed out"),
+                side_effect=TimeoutError("summarizer timed out"),
             ),
         ):
             _, results, _ = await orch._run_providers_parallel(question, [(asknews, "asknews")])
@@ -638,7 +638,7 @@ class TestConcurrencyLimiter:
         active = {"count": 0, "max_seen": 0}
         lock = asyncio.Lock()
 
-        async def slow_provider(q):  # noqa: ASYNC910 - intentionally simple test helper
+        async def slow_provider(q):
             async with lock:
                 active["count"] += 1
                 active["max_seen"] = max(active["max_seen"], active["count"])
@@ -728,7 +728,7 @@ class TestIntegrationWithTemplateForecaster:
                 bot._research._summarizer_llm,
                 "invoke",
                 new_callable=AsyncMock,
-                side_effect=asyncio.TimeoutError("summarizer timed out"),
+                side_effect=TimeoutError("summarizer timed out"),
             ),
         ):
             await bot._research._summarize_asknews(question, "raw asknews articles")
@@ -767,7 +767,7 @@ class TestProviderDiagnosticsCapture:
         (qid, provider) registry and _run_one pops it into details."""
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
 
-        async def provider(q):  # noqa: ASYNC910 - simple test provider
+        async def provider(q):
             record_provider_detail(
                 q.id_of_question,
                 "prediction_market",
@@ -788,7 +788,7 @@ class TestProviderDiagnosticsCapture:
         (so it can't leak into a later call) — the errored result carries the error, not details."""
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
 
-        async def provider(q):  # noqa: ASYNC910 - simple test provider
+        async def provider(q):
             record_provider_detail(q.id_of_question, "resolution_source", {"sources": {"a.gov": "blocked"}})
             raise RuntimeError("boom after recording")
 
@@ -804,7 +804,7 @@ class TestProviderDiagnosticsCapture:
         withholds the whole block from research holds for the per-source detail too."""
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
 
-        async def provider(q):  # noqa: ASYNC910 - simple test provider
+        async def provider(q):
             record_provider_detail(
                 q.id_of_question,
                 "prediction_market",
@@ -1017,7 +1017,7 @@ class TestProviderDiagnosticsCapture:
 
         captured: dict = {}
 
-        def sink(**kwargs) -> None:  # noqa: ANN003
+        def sink(**kwargs) -> None:
             captured.update(kwargs)
 
         orch = ResearchOrchestrator(
@@ -1072,7 +1072,7 @@ class TestProviderDiagnosticsCapture:
 
         captured: dict = {}
 
-        def sink(**kwargs) -> None:  # noqa: ANN003
+        def sink(**kwargs) -> None:
             captured.update(kwargs)
 
         orch = ResearchOrchestrator(
@@ -1106,7 +1106,7 @@ class TestProviderDiagnosticsCapture:
 
         captured: dict = {}
 
-        def sink(**kwargs) -> None:  # noqa: ANN003
+        def sink(**kwargs) -> None:
             captured.update(kwargs)
 
         orch = ResearchOrchestrator(

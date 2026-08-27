@@ -54,7 +54,7 @@ def extract_model_name(benchmark: BenchmarkForBot) -> str:
                 return extract_clean_model_name(model_path)
 
         # Legacy format: check forecasters array
-        if "forecasters" in llms and llms["forecasters"]:
+        if llms.get("forecasters"):
             forecasters = llms["forecasters"]
 
             # For single model bots, use the model name
@@ -64,7 +64,7 @@ def extract_model_name(benchmark: BenchmarkForBot) -> str:
                     if "original_model" in first_forecaster:
                         model_path = first_forecaster["original_model"]
                         return extract_clean_model_name(model_path)
-                    elif "model" in first_forecaster:
+                    if "model" in first_forecaster:
                         model_path = first_forecaster["model"]
                         return extract_clean_model_name(model_path)
 
@@ -97,7 +97,7 @@ def extract_model_name(benchmark: BenchmarkForBot) -> str:
                         strategy = config["aggregation_strategy"]
                         if isinstance(strategy, Enum):
                             return f"{ensemble_base}_{strategy.value}"
-                        elif isinstance(strategy, str):
+                        if isinstance(strategy, str):
                             return f"{ensemble_base}_{strategy}"
                     return ensemble_base
 

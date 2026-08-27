@@ -250,9 +250,8 @@ def generate_pchip_cdf(
     if upper_bound <= lower_bound:
         raise ValueError(f"Upper bound ({upper_bound}) must be greater than lower bound ({lower_bound})")
 
-    if zero_point is not None:
-        if abs(zero_point - lower_bound) < 1e-6 or abs(zero_point - upper_bound) < 1e-6:
-            raise ValueError(f"zero_point ({zero_point}) too close to bounds [{lower_bound}, {upper_bound}]")
+    if zero_point is not None and (abs(zero_point - lower_bound) < 1e-6 or abs(zero_point - upper_bound) < 1e-6):
+        raise ValueError(f"zero_point ({zero_point}) too close to bounds [{lower_bound}, {upper_bound}]")
 
     # Clean and validate percentile values.
     #

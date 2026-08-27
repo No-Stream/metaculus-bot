@@ -18,7 +18,7 @@ import requests
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.backfill_research_from_logs import detect_gap_fill, detect_providers  # noqa: E402
+from scripts.backfill_research_from_logs import detect_gap_fill, detect_providers
 
 logger = logging.getLogger(__name__)
 
