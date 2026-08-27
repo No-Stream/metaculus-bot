@@ -1,6 +1,13 @@
-# SMELL-EXEMPT-monolithic-file-loc: three documented layers (pure helpers /
-# network / factory); splitting the Tier-2 hop out would force FetchResult +
-# the SSRF guard into a shared module — a cross-cutting refactor for its own PR.
+# SMELL-EXEMPT-monolithic-file-loc: what stays here is fixed by the test suites'
+# monkeypatch surface, not by the layer diagram. Ten `RESOLUTION_SOURCE_*` caps
+# plus `_get_session`, `is_public_http_url`, `_extract_main_text` and
+# `_sem_for_host` are patched on THIS module (tests/test_resolution_source_*.py,
+# tests/test_agentic_tools.py), so every reader of one has to stay here to resolve
+# it as a module global at call time — which pins the network layer, the section
+# renderer and the provider factory. Everything with no patched read moved out:
+# `resolution_url_scan` (URL extraction + skip predicates), `resolution_fetch_result`
+# (FetchStatus/FetchResult, the vacuity rule, the result-list reductions), and
+# `resolution_body_text` (markup stripping + the two truncators).
 """Resolution-source fetcher: Tier-1 cited pages + a Tier-2 Datawrapper hop.
 
 Fetches the URL(s) explicitly cited in a Metaculus question's resolution
@@ -49,12 +56,10 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
-import re
 import socket
 import time
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -81,7 +86,6 @@ from metaculus_bot.constants import (
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     MAX_REDIRECTS,
-    MAX_UNDECODABLE_CHAR_RATIO,
     REDIRECT_STATUSES,
     DatawrapperChartRef,
     FilteringResolver,
@@ -95,6 +99,27 @@ from metaculus_bot.research.http_fetch import (
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
+from metaculus_bot.research.resolution_body_text import (
+    _truncate_csv_middle,
+    _truncate_with_marker,
+    strip_html_tags,
+)
+from metaculus_bot.research.resolution_fetch_result import (
+    _NON_OK_FETCH_STATUS,
+    FetchResult,
+    FetchStatus,
+    _fetch_result_sources,
+    _render_fetch_failures,
+    looks_like_csv_rows,  # noqa: F401  # re-export: the Tier-1 suite imports the row-shape check from this module path
+    vacuous_body_status,
+)
+from metaculus_bot.research.resolution_url_scan import (
+    extract_source_urls,
+    is_fred_url,
+    is_metaculus_self_ref,
+    is_yahoo_ticker_url,
+    strip_markdown_escapes,  # noqa: F401  # re-export: the Tier-1 suite imports the markdown unescaper from this module path
+)
 
 
 def _make_filtering_resolver() -> FilteringResolver:
@@ -251,206 +276,8 @@ async def _every_resolved_address_is_public(host: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Status enum + result dataclass (the Tier-2 seam)
-# ---------------------------------------------------------------------------
-
-
-# How far ahead of our clock a dataset's `Last-Modified` may sit before the freshness
-# guard treats it as unusable rather than as freshest-possible. Small on purpose: this
-# tolerates ordinary CDN/host clock skew and nothing more, because the only thing a
-# future date can mean past that is a broken clock or a misparse — and the lead the
-# stamp authorizes asserts a publication date to forecasters.
-_DATAWRAPPER_CLOCK_SKEW_TOLERANCE = timedelta(hours=6)
-
-# `stale_data` is Tier-2-only: the Datawrapper hop reached a dataset whose
-# Last-Modified is outside the freshness window — older than the bound, missing,
-# unparseable, or implausibly far in the FUTURE — withheld rather than served as live.
-#
-# `empty_body` is the 200-with-nothing-in-it case: a body that is empty or
-# whitespace-only carries no information, so calling it `success` published an
-# empty "primary grading evidence" section, suppressed the all-failed notice for
-# every sibling URL, and reported `ok` to provider diagnostics. It is a FAILURE
-# status for the same reason the HTML branch treats an empty extraction as
-# `js_wall`: content is what makes a fetch a success.
-FetchStatus = Literal[
-    "success",
-    "blocked",
-    "not_found",
-    "js_wall",
-    "error",
-    "unsupported_type",
-    "ssrf_blocked",
-    "stale_data",
-    "empty_body",
-]
-
-# HTTP status -> FetchStatus for non-OK terminal responses — the ONE table both the
-# Tier-1 page fetch (_resolution_status_outcome) and the Tier-2 Datawrapper CDN hop
-# (_datawrapper_hop_status) read, so a future addition (451, 503, ...) cannot land on
-# one surface only. 3xx is deliberately absent: Tier-1 vets redirects upstream via
-# _resolution_redirect_outcome, and the CDN hop intentionally maps a 3xx to `error`.
-_NON_OK_FETCH_STATUS: dict[int, FetchStatus] = {
-    403: "blocked",
-    406: "blocked",
-    429: "blocked",
-    404: "not_found",
-    410: "not_found",
-}
-
-
-@dataclass
-class FetchResult:
-    url: str
-    status: FetchStatus
-    text: str  # extracted + truncated; "" unless status == "success"
-    http_status: int | None
-    content_type: str | None
-    # Charts seen in a fetched page's raw HTML (set on Tier-1 HTML results,
-    # including js_wall pages — a JS-walled page still exposes its embeds).
-    datawrapper_charts: list[DatawrapperChartRef] = field(default_factory=list)
-    # Provenance for Tier-2 dataset results (None on ordinary page fetches).
-    chart_id: str | None = None
-    chart_title: str | None = None
-    parent_url: str | None = None
-    data_last_modified: str | None = None  # ISO-8601; None when the header was missing/unparseable
-
-    def __post_init__(self) -> None:
-        """Enforce the ``text`` invariant the field comment states.
-
-        A `success` carrying blank text is the defect this guard exists for: the
-        JSON/text/CSV branch used to ship an empty 200 body as `success`, which
-        rendered an empty section under the "primary grading evidence" caveat,
-        suppressed the all-failed notice, and told provider diagnostics `ok`.
-        Every construction site now decides vacuity BEFORE it picks a status
-        (:func:`vacuous_body_status`), so a blank success can only come from a
-        future edit — and it should crash the provider (the orchestrator turns a
-        provider exception into one `errored` provider result) rather than quietly
-        publish a hole in the grading evidence.
-        """
-        if self.status == "success" and not self.text.strip():
-            raise ValueError(f"FetchResult(status='success') with blank text for {self.url}")
-
-
-# ---------------------------------------------------------------------------
 # Pure helpers — no I/O
 # ---------------------------------------------------------------------------
-
-
-# Metaculus-injected markdown escapes: `\_`, `\.`, `\&`, `\-`, `\#`, `\(`, `\)`.
-# FINDINGS: 3.4% of URLs carry these; one flips 404→success once unescaped.
-_MARKDOWN_ESCAPE_RE = re.compile(r"\\([_&.\-#()])")
-
-# Markdown link: [label](https://...) — capture only the URL.
-_MARKDOWN_LINK_URL_RE = re.compile(r"\[[^\]]*\]\((https?://[^)\s]+)\)")
-
-# Bare URL — stops at whitespace and common closers.
-_BARE_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
-
-# Trailing punctuation to strip from an extracted URL.
-_TRAILING_PUNCT = ".,;:)]}>\"'"
-
-
-def strip_markdown_escapes(url: str) -> str:
-    """Remove markdown backslash escapes Metaculus injects into rendered URLs."""
-    return _MARKDOWN_ESCAPE_RE.sub(r"\1", url)
-
-
-def extract_source_urls(text: str) -> list[str]:
-    """Extract http(s) URLs from ``text``.
-
-    Handles markdown links ``[label](https://…)`` and bare URLs. Strips trailing
-    punctuation, applies backslash-unescape, dedupes preserving order (case-
-    insensitive scheme+host; exact path and query — query params stay in the
-    key because we may need them, e.g. for FRED graph_id; fragments are
-    excluded because they're never sent over HTTP). Returns the FULL deduped
-    list — the ``RESOLUTION_SOURCE_MAX_URLS`` cap is applied downstream by
-    :func:`select_fetchable_urls`, AFTER the self-ref/FRED/Yahoo skip filter,
-    so a run of leading self-refs doesn't starve the real sources out of the
-    fetch budget.
-    """
-    if not text:
-        return []
-
-    # Collect (start_pos, url) from both regex families so the final order
-    # tracks appearance in the source text — not extraction order. Markdown
-    # link URLs are typically ALSO matched by the bare-URL regex (its match
-    # sits inside the `[label](URL)` parens); the earlier position wins after
-    # sort, and dedup drops the duplicate.
-    positioned: list[tuple[int, str]] = []
-    for match in _MARKDOWN_LINK_URL_RE.finditer(text):
-        # Anchor at the URL group's start, not the link's start, so a
-        # markdown link and a same-position bare URL rank identically.
-        positioned.append((match.start(1), match.group(1)))
-    for match in _BARE_URL_RE.finditer(text):
-        positioned.append((match.start(), match.group(0)))
-    positioned.sort(key=lambda pair: pair[0])
-
-    cleaned: list[str] = []
-    for _pos, raw in positioned:
-        u = raw
-        # Strip trailing punctuation (may repeat: "foo.,").
-        while u and u[-1] in _TRAILING_PUNCT:
-            u = u[:-1]
-        u = strip_markdown_escapes(u)
-        if not u.lower().startswith(("http://", "https://")):
-            continue
-        cleaned.append(u)
-
-    # Dedup preserving order (first-seen URL string wins). Case-insensitive
-    # scheme+netloc; exact path/query. Fragments are excluded — they're never
-    # sent over HTTP, so URLs differing only by fragment are the same fetch.
-    # A bare host and a bare host + "/" collapse to one entry (real questions
-    # cite both forms of the same root page — observed on childmortality.org
-    # in the 2026-07-09 smoke test, burning a duplicate fetch slot).
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for u in cleaned:
-        try:
-            parsed = urlparse(u)
-        except ValueError:
-            continue
-        key = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path or '/'}?{parsed.query}"
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(u)
-    return deduped
-
-
-def is_metaculus_self_ref(url: str) -> bool:
-    """A URL that points back at Metaculus is a self-reference (no new info).
-
-    Uses ``.hostname`` (not ``.netloc``) so a port or userinfo can't slip a
-    metaculus URL past the check — ``.netloc`` keeps ``:443`` / ``user@``, which
-    would defeat the exact-host and suffix comparisons below.
-    """
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return host == "metaculus.com" or host.endswith(".metaculus.com")
-
-
-def is_fred_url(url: str) -> bool:
-    """FRED series URLs are already served by the financial-data provider."""
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return host == "fred.stlouisfed.org"
-
-
-def is_yahoo_ticker_url(url: str) -> bool:
-    """Yahoo Finance `/quote/…` URLs are yfinance-served; skip.
-
-    Generic Yahoo article / news URLs remain fetchable — only the ticker
-    quote pages overlap with the financial-data provider.
-    """
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return False
-    return (parsed.hostname or "").lower() == "finance.yahoo.com" and parsed.path.startswith("/quote/")
 
 
 def select_fetchable_urls(criteria: str | None, fine_print: str | None) -> list[str]:
@@ -472,260 +299,6 @@ def looks_like_js_wall(text: str) -> bool:
     """A 200 OK whose extracted text is shorter than the JS-wall threshold is a
     strong signal the page needs JS to render — Tier-2 candidate."""
     return len(text.strip()) < RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
-
-
-# Tag names an allow-list, not `[A-Za-z]+`, and the character after the name
-# must be `>`, `/`, or whitespace-then-an-attribute-assignment. Both halves are
-# load-bearing: the naive `</?[A-Za-z][^>]*>` form eats a CSV cell reading
-# `x <a and y > b` (measured on the 2026-08-26 diagnosis), and requiring an `=`
-# in the attribute region is what keeps that same cell out of the allow-listed
-# form — `<a and y >` names no attribute. A real tag either closes immediately
-# (`<br/>`, `</a>`, `<td>`) or assigns something (`href=`, `style=`).
-_HTML_TAG_NAMES: tuple[str, ...] = (
-    "a",
-    "b",
-    "i",
-    "u",
-    "p",
-    "em",
-    "strong",
-    "span",
-    "div",
-    "br",
-    "td",
-    "tr",
-    "th",
-    "table",
-    "font",
-    "small",
-    "sub",
-    "sup",
-)
-# The pre-`=` attribute region excludes `=` so there is exactly ONE way to reach the
-# first delimiter. With `[^<>]*` on both sides of the `=`, a non-matching body (an
-# allow-listed lookalike like `<b ` followed by an angle-bracket-free run of URL cells
-# carrying query-string `=` signs) backtracks quadratically: 3.4s at 200 KiB, ~35 min
-# at the 5 MiB response cap — synchronously on the event loop, wedging the sibling
-# fetches past every wall timeout. Same matched language: any match via a later `=`
-# is also a match via the first one, since the post-`=` region admits more `=`s.
-_HTML_TAG_RE = re.compile(
-    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s*/?>|\s+[^<>=]*=[^<>]*>)",
-    re.IGNORECASE,
-)
-
-# An anchor whose inner text is empty carries its content in the href (a bare
-# link cell), so the href is kept where the inner text would have been.
-_EMPTY_ANCHOR_RE = re.compile(
-    r"<a\s+[^<>]*href\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s<>]+))[^<>]*>\s*</a\s*>",
-    re.IGNORECASE,
-)
-
-# Delimiters a Datawrapper "Get the data" export uses. Checked on the HEADER
-# line only: a dataset's first row names its columns, so a header with no
-# delimiter at all is not the CSV this route is supposed to serve.
-_CSV_DELIMITERS: tuple[str, ...] = (",", ";", "\t", "|")
-
-
-def strip_html_tags(text: str) -> str:
-    """Remove allow-listed HTML tags from ``text``, keeping their inner text.
-
-    For the RAW-body branches only (CSV / plain text) — trafilatura owns real
-    HTML pages. Datawrapper poll tables embed a styled ``<a href=…>`` per
-    pollster row, and 69% of one live tracker's 33k-char CSV was tag markup: at
-    that run's actual 2,853-char budget, 9 rows survived with the tags against 30
-    with them stripped (measured 2026-08-26). The tags carry nothing a forecaster
-    reads — the pollster name inside them is the content — so the budget should
-    buy rows.
-
-    A no-op (byte-identical) on any text with no allow-listed tag in it, which
-    covers every numeric tracker CSV checked (zero ``<`` characters).
-    """
-    if "<" not in text:
-        return text
-    without_bare_links = _EMPTY_ANCHOR_RE.sub(
-        lambda m: m.group(1) or m.group(2) or m.group(3) or "",
-        text,
-    )
-    return _HTML_TAG_RE.sub("", without_bare_links)
-
-
-def looks_like_csv_rows(text: str) -> bool:
-    """True when ``text`` is shaped like a dataset: a delimited header + ≥1 row.
-
-    The precondition for asserting a dataset is LIVE. The Tier-2 lead stamps
-    ``Dataset published <ts>`` off the ``Last-Modified`` header alone, so without
-    this an empty or soft-404 CDN body renders under an authoritative freshness
-    claim — the same shape as a venue's manufactured $0.50 price.
-
-    Markup is rejected outright (a body whose first non-blank character is ``<``
-    is an error page, not a dataset) because an HTML error page can easily carry
-    a comma somewhere and pass the delimiter test.
-    """
-    lines = [line for line in text.strip().splitlines() if line.strip()]
-    if len(lines) < 2:
-        return False
-    header = lines[0].lstrip()
-    if header.startswith("<"):
-        return False
-    return any(delimiter in header for delimiter in _CSV_DELIMITERS)
-
-
-def vacuous_body_status(text: str, undecodable_ratio: float, *, require_csv_rows: bool) -> FetchStatus | None:
-    """The failure status a 200 body earns for carrying no usable content, else None.
-
-    The one place "does this body carry information?" is decided, so every
-    ``FetchResult(status="success")`` on a raw-body branch is predicated on
-    content rather than on the status line. Three ways a 200 carries nothing:
-
-    - it could not be DECODED (``undecodable_ratio`` above the bound) — mojibake
-      like ``0�.�4�2�`` type-checks as text and rendered as grading evidence;
-    - it is empty or whitespace-only;
-    - (Tier-2 datasets only) it is not row-shaped, so nothing may claim it is the
-      chart's live series.
-    """
-    if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO:
-        return "unsupported_type"
-    if not text.strip():
-        return "empty_body"
-    if require_csv_rows and not looks_like_csv_rows(text):
-        return "unsupported_type"
-    return None
-
-
-def _truncate_with_marker(text: str, cap: int, url: str) -> str:
-    """Return ``text`` bounded at ``cap`` chars; on truncation, append a marker
-    line naming the cap and URL so forecasters can tell the snapshot is partial.
-
-    Invariant: ``len(return) <= cap``. When truncation fires, the emitted text
-    is trimmed to ``cap - len(marker)`` before the marker is appended so the
-    total stays within budget. If the marker itself is longer than the cap
-    (pathologically small cap in tests), returns the raw truncation without
-    the marker rather than emitting only-marker text.
-    """
-    if cap <= 0:
-        # No budget at all — the caller's arithmetic (section allowance minus a lead line
-        # minus a very long parent URL) can go negative. ``text[:cap]`` on a negative cap
-        # returns nearly the WHOLE text while the invariant claims a bound, so a
-        # zero-budget slot would have rendered a full page.
-        return ""
-    if len(text) <= cap:
-        return text
-    marker = f"\n[truncated at {cap} chars — full source at {url}]"
-    if len(marker) >= cap:
-        # Cap is too small to even fit the marker; degrade to plain truncation.
-        return text[:cap]
-    body_budget = cap - len(marker)
-    return text[:body_budget].rstrip() + marker
-
-
-def _truncate_csv_middle(text: str, cap: int, url: str) -> str:
-    """Bound a CSV at ``cap`` chars, keeping the header + BOTH ends of the rows.
-
-    The resolution-relevant rows are the most recent ones, but Datawrapper
-    datasets run in either direction — the tracker model-average series are
-    chronological (newest LAST) while the poll-input tables on the same pages
-    are newest FIRST (observed live on both natesilver.net trackers,
-    2026-08-25). Keeping both ends is ordering-agnostic: the newest rows
-    survive whichever end they sit at, and only the middle is omitted. Plain
-    head truncation would cut the current level off an ascending series — the
-    stale-as-live failure in a different coat.
-
-    Invariant: ``len(return) <= cap``. Degrades to plain head truncation when
-    the text has too few lines to be row-shaped or the cap is too small to fit
-    the header + marker + at least one row.
-    """
-    if len(text) <= cap:
-        return text
-    lines = text.rstrip("\n").split("\n")
-    if len(lines) < 4:
-        return _truncate_with_marker(text, cap, url)
-    header = lines[0]
-    rows = lines[1:]
-    marker_template = "[... {} middle rows omitted — full data at {}]"
-    # Reserve marker space at its worst-case width (all rows omitted).
-    worst_marker = marker_template.format(len(rows), url)
-    row_budget = cap - len(header) - len(worst_marker) - 4  # joining newlines
-    if row_budget <= 0:
-        return _truncate_with_marker(text, cap, url)
-    head_budget = row_budget // 2
-    head: list[str] = []
-    used_head = 0
-    for line in rows:
-        cost = len(line) + 1
-        if used_head + cost > head_budget:
-            break
-        head.append(line)
-        used_head += cost
-    tail: list[str] = []
-    used_tail = 0
-    for line in reversed(rows[len(head) :]):
-        cost = len(line) + 1
-        if used_head + used_tail + cost > row_budget:
-            break
-        tail.append(line)
-        used_tail += cost
-    if not head and not tail:
-        return _truncate_with_marker(text, cap, url)
-    tail.reverse()
-    marker = marker_template.format(len(rows) - len(head) - len(tail), url)
-    return "\n".join([header, *head, marker, *tail])
-
-
-def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
-    """Per-URL outcome map for provider diagnostics: ``{domain: "ok" | <FetchStatus>}``.
-
-    A fetched URL normalizes to ``"ok"`` (the shared "contributed" token the
-    diagnostics formatter recognizes); every other ``FetchStatus``
-    (``blocked`` / ``js_wall`` / ``not_found`` / ``error`` / ``unsupported_type`` /
-    ``ssrf_blocked``) is kept verbatim as the loss token so the reason survives
-    into the ``lost=`` segment. Duplicate domains are disambiguated with a ``#N``
-    suffix so no per-URL outcome is silently overwritten.
-
-    Tier-2 dataset results are keyed ``datawrapper:<chart_id>`` — they are hop
-    artifacts, not cited sources, and every dataset URL shares one CDN netloc, so
-    domain keys would collapse them into ``static.dwcdn.net#N`` noise. Their
-    ``stale_data`` verdict maps to the benign ``"none"``: that is the freshness
-    guard REFUSING to serve months-old data as live, i.e. the feature working as
-    designed, and reporting it in ``lost=`` would dress a by-design withhold as a
-    lost cited source. A genuinely failed hop (``error``/``blocked``/``not_found``/
-    ``empty_body``/``unsupported_type``) keeps its verbatim loss token — that is
-    real signal about the CDN, and it is the reason the content check runs BEFORE
-    the freshness guard: an empty CDN body must not borrow ``stale_data``'s
-    by-design amnesty.
-    """
-    sources: dict[str, str] = {}
-    for r in results:
-        if r.chart_id is not None:
-            key = f"datawrapper:{r.chart_id}"
-        else:
-            try:
-                key = urlparse(r.url).netloc or r.url
-            except ValueError:
-                key = r.url
-        if key in sources:
-            n = 2
-            while f"{key}#{n}" in sources:
-                n += 1
-            key = f"{key}#{n}"
-        if r.status == "success":
-            sources[key] = "ok"
-        elif r.chart_id is not None and r.status == "stale_data":
-            sources[key] = "none"
-        else:
-            sources[key] = r.status
-    return sources
-
-
-def _render_fetch_failures(failures: list[FetchResult]) -> str:
-    """Render failed fetches as a compact ``"domain: status, domain: status"`` list."""
-    parts: list[str] = []
-    for r in failures:
-        try:
-            domain = urlparse(r.url).netloc or r.url
-        except ValueError:
-            domain = r.url
-        parts.append(f"{domain}: {r.status}")
-    return ", ".join(parts)
 
 
 def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -> tuple[list[str], int]:
@@ -1204,6 +777,14 @@ def _datawrapper_last_modified(resp: Any) -> datetime | None:
     """The dataset's parsed ``Last-Modified``, or None when absent or unparseable."""
     raw = resp.headers.get("Last-Modified") if resp.headers else None
     return parse_http_last_modified(raw) if raw else None
+
+
+# How far ahead of our clock a dataset's `Last-Modified` may sit before the freshness
+# guard treats it as unusable rather than as freshest-possible. Small on purpose: this
+# tolerates ordinary CDN/host clock skew and nothing more, because the only thing a
+# future date can mean past that is a broken clock or a misparse — and the lead the
+# stamp authorizes asserts a publication date to forecasters.
+_DATAWRAPPER_CLOCK_SKEW_TOLERANCE = timedelta(hours=6)
 
 
 def _datawrapper_freshness_failure(last_modified: datetime | None) -> str | None:
