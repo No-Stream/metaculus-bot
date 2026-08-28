@@ -57,6 +57,7 @@ dev = [
     "pyyaml>=6.0.3",
     "deptry>=0.25.1",
     "import-linter>=2.13",
+    "pytest-timeout>=2.4.0",
 ]
 
 [tool.uv]

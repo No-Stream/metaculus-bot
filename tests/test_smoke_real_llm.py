@@ -24,6 +24,7 @@ from forecasting_tools import (
 from forecasting_tools.data_models.binary_report import BinaryPrediction
 
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
+from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 
 FREE_MODEL = "openrouter/google/gemma-4-31b-it:free"
 SKIP_REASON = "OPENROUTER_API_KEY not set"
@@ -112,12 +113,18 @@ async def test_free_model_numeric_percentiles():
 
     response = await llm.invoke(prompt)
 
-    percentile_pattern = re.compile(r"Percentile\s+[\d.]+:\s*([\d.]+)", re.IGNORECASE)
-    matches = percentile_pattern.findall(response)
-    assert len(matches) >= 5, f"Expected >=5 percentile lines, found {len(matches)}"
+    # The modern numeric prompt (2026-07-10 block-authoritative redesign) demands the
+    # fenced ```json STRUCTURED FORECAST block LAST and bans trailing prose value
+    # lines, so asserting prose "Percentile X: v" lines pinned a retired contract
+    # (and failed against a compliant model). Pin the real contract instead: the
+    # deterministic rung-1 parse of the block yields usable declared percentiles.
+    structured = parse_structured_block(response, "numeric")
+    assert structured is not None, f"No parseable STRUCTURED FORECAST block (response tail: {response[-300:]!r})"
+    assert isinstance(structured, NumericStructured)
+    declared = structured.declared_percentiles or {}
+    assert len(declared) >= 5, f"Expected >=5 declared percentiles in the block, found {len(declared)}"
 
-    values = [float(m) for m in matches]
-    assert all(isinstance(v, float) for v in values)
+    values = [float(v) for _, v in sorted(declared.items())]
     inversions = sum(1 for i in range(len(values) - 1) if values[i] > values[i + 1])
     assert inversions <= 2, f"Too many inversions ({inversions}) — values not roughly monotonic"
 

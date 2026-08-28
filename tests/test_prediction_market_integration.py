@@ -84,6 +84,11 @@ def _build_integration_question() -> MagicMock:
     q.title = "Will Donald Trump remain US president through 2026?"
     q.short_title = "Trump president 2026"
     q.resolution_criteria = "Resolves Yes if Donald Trump is still in office on December 31, 2026."
+    # A bare MagicMock auto-attr is truthy, so the ranker prompt's
+    # `getattr(question, "fine_print", "") or ""` keeps the mock and re.sub
+    # rejects it — real questions carry str/None here. Same for unit_of_measure.
+    q.fine_print = ""
+    q.unit_of_measure = None
     q.page_url = "https://metaculus.com/q/99999"
     return q
 
