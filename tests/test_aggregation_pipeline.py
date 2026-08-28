@@ -8,7 +8,6 @@ Exercises AggregationPipeline's three main paths:
 
 from __future__ import annotations
 
-import asyncio
 from collections import defaultdict
 from typing import cast
 from unittest.mock import AsyncMock, patch
@@ -231,7 +230,7 @@ class TestStackingFallbackChain:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise asyncio.TimeoutError("primary timed out")
+                raise TimeoutError("primary timed out")
             return 0.55
 
         with patch.object(pipeline, "run_stacking", side_effect=mock_run_stacking):
@@ -258,7 +257,7 @@ class TestStackingFallbackChain:
             ReasonedPrediction(prediction_value=0.50, reasoning="Model: m3\n\nMid"),
         ]
 
-        with patch.object(pipeline, "run_stacking", side_effect=asyncio.TimeoutError("timed out")):
+        with patch.object(pipeline, "run_stacking", side_effect=TimeoutError("timed out")):
             result = await pipeline.aggregate(
                 predictions=predictions,
                 question=question,

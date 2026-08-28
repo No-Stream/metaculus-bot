@@ -19,7 +19,7 @@ def load_environment() -> None:
     invocation triggers calls into python-dotenv. Subsequent calls are no-ops.
     """
 
-    global _ENV_LOADED
+    global _ENV_LOADED  # noqa: PLW0603  # one-shot process-wide init flag, guarded by _LOCK
 
     if _ENV_LOADED:
         return
@@ -31,7 +31,9 @@ def load_environment() -> None:
         try:
             load_dotenv()
             load_dotenv(".env.local", override=True)
-        except Exception as exc:  # pragma: no cover - defensive logging only
+        # Boundary: .env files are optional (in CI the env comes from Actions secrets), so a
+        # dotenv read failure must never block process startup.
+        except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # pragma: no cover
             _logger.warning("Failed to load environment files: %s", exc)
         finally:
             _ENV_LOADED = True

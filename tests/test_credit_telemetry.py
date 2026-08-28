@@ -190,7 +190,7 @@ class TestCreditAlertSuppressionWindow:
 
     def test_resume_date_is_2026_09_10(self) -> None:
         """The hardcoded default is the contract; the env var is only an override."""
-        assert CREDIT_ALERT_RESUME_DATE == date(2026, 9, 10)
+        assert date(2026, 9, 10) == CREDIT_ALERT_RESUME_DATE
 
     def test_inactive_before_resume_date(self) -> None:
         assert credit_alerts_active(date(2026, 7, 25)) is False
@@ -204,9 +204,9 @@ class TestCreditAlertSuppressionWindow:
 
     def test_resume_date_is_after_tournament_close(self) -> None:
         """The suppression must not outlive the season it exists for."""
-        from metaculus_bot.constants import TOURNAMENT_END_DATE  # noqa: PLC0415
+        from metaculus_bot.constants import TOURNAMENT_END_DATE
 
-        assert CREDIT_ALERT_RESUME_DATE > date.fromisoformat(TOURNAMENT_END_DATE)
+        assert date.fromisoformat(TOURNAMENT_END_DATE) < CREDIT_ALERT_RESUME_DATE
 
     def test_today_defaults_to_system_clock_at_call_time(self) -> None:
         """No argument → same answer as passing today's real date explicitly."""
@@ -539,7 +539,7 @@ class TestDonatedKeyStateProbe:
             assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
 
     @pytest.mark.parametrize(
-        "limit, limit_remaining",
+        ("limit", "limit_remaining"),
         [
             (850.0, float("nan")),
             (float("nan"), 0.0),
@@ -741,7 +741,7 @@ class TestDonatedKeyStateProbe:
         assert get_probed_donated_key_state() is None
 
     @pytest.mark.parametrize(
-        "responses, expected_state",
+        ("responses", "expected_state"),
         [
             ({DONATED_KEY: [_http_status_error(401)]}, "revoked"),
             ({DONATED_KEY: [_payload(0.0, 4.39, limit=0.0)]}, "zeroed"),
@@ -763,9 +763,11 @@ class TestDonatedKeyStateProbe:
         WARNING would train the operator to ignore the marker that matters.
         """
         _set_keys(monkeypatch, personal=None)
-        with _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=850.0)]}):
-            with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
-                classify_donated_key_state()
+        with (
+            _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=850.0)]}),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"),
+        ):
+            classify_donated_key_state()
 
         assert any("DONATED_KEY_STATE: state=drained" in r.getMessage() for r in caplog.records)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

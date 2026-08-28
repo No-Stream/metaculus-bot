@@ -44,7 +44,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from metaculus_bot.performance_analysis.id_mapping import QuestionIds
@@ -84,7 +84,7 @@ _ABSENT_TAGS: dict[str, None] = {
 # number predates the key by ~3 weeks (see the module docstring's ternary note).
 _GFV2_PAYLOAD_SCHEMA_VERSION = 2
 _GFV2_PAYLOAD_SOURCE = "artifact"
-_GFV2_PAYLOAD_ERA_START = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+_GFV2_PAYLOAD_ERA_START = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
 
 
 def _writer_can_carry_gfv2_payload(record: dict) -> bool:
@@ -104,7 +104,7 @@ def _writer_can_carry_gfv2_payload(record: dict) -> bool:
     except ValueError:
         return False
     if written_at.tzinfo is None:
-        written_at = written_at.replace(tzinfo=timezone.utc)
+        written_at = written_at.replace(tzinfo=UTC)
     return written_at >= _GFV2_PAYLOAD_ERA_START
 
 

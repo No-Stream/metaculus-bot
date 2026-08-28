@@ -24,6 +24,37 @@ class ForecasterSetup:
     predictions_per_report: int
 
 
+def _pop_forecaster_llms(normalized_llms: dict[str, Any]) -> list[GeneralLlm]:
+    """Pop the ``forecasters`` roster off the llms dict.
+
+    Returns ``[]`` when the key is absent, holds an empty list, or holds the wrong type.
+    An empty list is accepted SILENTLY (the caller falls back to its defaults); only a
+    wrong type warrants the warning.
+    """
+    if "forecasters" not in normalized_llms:
+        return []
+    value = normalized_llms.pop("forecasters")
+    if isinstance(value, list) and all(isinstance(x, GeneralLlm) for x in value):
+        return list(value)
+    logger.warning("'forecasters' key in llms must be a list of GeneralLlm objects.")
+    return []
+
+
+def _pop_single_llm(normalized_llms: dict[str, Any], key: str) -> GeneralLlm | None:
+    """Pop a single-model role (``stacker`` / ``analyzer``) off the llms dict.
+
+    Returns None when the key is absent or holds something other than a GeneralLlm; the
+    key is removed either way so it never reaches the framework's own llms mapping.
+    """
+    if key not in normalized_llms:
+        return None
+    value = normalized_llms.pop(key)
+    if isinstance(value, GeneralLlm):
+        return value
+    logger.warning("'%s' key in llms must be a GeneralLlm object.", key)
+    return None
+
+
 def prepare_llm_config(
     *,
     llms: dict[str, Any] | None,
@@ -47,37 +78,14 @@ def prepare_llm_config(
 
     normalized_llms: dict[str, Any] = dict(llms)
 
-    forecaster_llms: list[GeneralLlm] = []
+    forecaster_llms = _pop_forecaster_llms(normalized_llms)
     effective_predictions = predictions_per_report
+    if forecaster_llms:
+        normalized_llms["default"] = forecaster_llms[0]
+        effective_predictions = len(forecaster_llms)
 
-    if "forecasters" in normalized_llms:
-        value = normalized_llms["forecasters"]
-        if isinstance(value, list) and all(isinstance(x, GeneralLlm) for x in value):
-            if value:
-                forecaster_llms = list(value)
-                normalized_llms["default"] = forecaster_llms[0]
-                effective_predictions = len(forecaster_llms)
-        else:
-            logger.warning("'forecasters' key in llms must be a list of GeneralLlm objects.")
-        normalized_llms.pop("forecasters", None)
-
-    stacker_llm: GeneralLlm | None = None
-    if "stacker" in normalized_llms:
-        value = normalized_llms["stacker"]
-        if isinstance(value, GeneralLlm):
-            stacker_llm = value
-        else:
-            logger.warning("'stacker' key in llms must be a GeneralLlm object.")
-        normalized_llms.pop("stacker", None)
-
-    analyzer_llm: GeneralLlm | None = None
-    if "analyzer" in normalized_llms:
-        value = normalized_llms["analyzer"]
-        if isinstance(value, GeneralLlm):
-            analyzer_llm = value
-        else:
-            logger.warning("'analyzer' key in llms must be a GeneralLlm object.")
-        normalized_llms.pop("analyzer", None)
+    stacker_llm = _pop_single_llm(normalized_llms, "stacker")
+    analyzer_llm = _pop_single_llm(normalized_llms, "analyzer")
 
     required_keys = {"default", "parser", "researcher", "summarizer"}
     missing = sorted(k for k in required_keys if k not in normalized_llms)

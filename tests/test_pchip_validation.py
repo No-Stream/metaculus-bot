@@ -164,7 +164,7 @@ class TestPchipValidation:
 
     @pytest.mark.parametrize("open_bounds", [False, True], ids=["closed_bounds", "open_bounds"])
     @pytest.mark.parametrize(
-        "shape,percentile_values",
+        ("shape", "percentile_values"),
         [
             ("spread", {1.0: 1.0, 25.0: 25.0, 50.0: 50.0, 75.0: 75.0, 99.0: 99.0}),
             ("concentrated", {1.0: 49.0, 25.0: 49.8, 50.0: 50.0, 75.0: 50.2, 99.0: 51.0}),

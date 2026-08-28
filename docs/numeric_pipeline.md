@@ -321,7 +321,7 @@ that grounds numeric forecasts whose resolution series is a fetchable FRED or yf
 series. It renders a deterministic empirical anchor with no LLM: the latest value, a
 multi-resolution history, a 52-week range, and a horizon-matched empirical band. Its
 section header in the briefing is `## Time Series Anchor` (`TS_ANCHOR_SECTION_HEADER`,
-rendered by `_provider_header` in `research/orchestrator.py`). Gated by
+rendered by `provider_header` in `research/section_format.py`). Gated by
 `TS_ANCHOR_ENABLED` (`_select_research_providers` in `research/orchestrator.py`); on in
 all four workflows.
 

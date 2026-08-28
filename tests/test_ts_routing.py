@@ -29,6 +29,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+from typing import ClassVar
 
 import pytest
 
@@ -811,7 +812,7 @@ class TestWidenedDerivationVocabulary:
     # stripped — "mom " and " add " carry deliberate delimiter spaces, so stripping them would
     # test a token the registry doesn't hold). The sentences read a little stiff for the
     # multi-word tokens; the token's presence is the point, not the prose.
-    _GATE_TOKEN_CARRIERS: dict[tuple[str, str], str] = {
+    _GATE_TOKEN_CARRIERS: ClassVar[dict[tuple[str, str], str]] = {
         (
             "PAYEMS",
             "mom_diff",

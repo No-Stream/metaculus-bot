@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -92,7 +92,7 @@ from metaculus_bot.research import gemini_search, prediction_market, resolution_
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import llm as agentic_llm
 
-_NOW = datetime.now(timezone.utc)
+_NOW = datetime.now(UTC)
 _OPEN = _NOW - timedelta(days=30)
 _RESOLVE = _NOW + timedelta(days=180)
 
@@ -359,7 +359,7 @@ class _FakeArticle:
         self.eng_title = title
         self.summary = "Unemployment held at 4.1% in the latest monthly print."
         self.language = "en"
-        self.pub_date = datetime(2026, 4, 14, 9, 0, tzinfo=timezone.utc)
+        self.pub_date = datetime(2026, 4, 14, 9, 0, tzinfo=UTC)
         self.source_id = "reuters"
         self.article_url = url
 
@@ -380,7 +380,7 @@ class _FakeAskNewsSDK:
             )
         )
 
-    async def __aenter__(self) -> "_FakeAskNewsSDK":
+    async def __aenter__(self) -> _FakeAskNewsSDK:
         return self
 
     async def __aexit__(self, *_exc: Any) -> None:
@@ -416,7 +416,7 @@ def _fake_gemini_client() -> MagicMock:
 
 
 class _FakeContent:
-    def __init__(self, resp: "_FakeHttpResponse") -> None:
+    def __init__(self, resp: _FakeHttpResponse) -> None:
         self._resp = resp
 
     async def iter_chunked(self, n: int) -> Any:
@@ -441,7 +441,7 @@ class _FakeHttpResponse:
     async def json(self) -> Any:
         return json.loads(self._body)
 
-    async def __aenter__(self) -> "_FakeHttpResponse":
+    async def __aenter__(self) -> _FakeHttpResponse:
         return self
 
     async def __aexit__(self, *_exc: Any) -> None:
@@ -612,7 +612,7 @@ class _FakeHttpSession:
     async def close(self) -> None:
         self.closed = True
 
-    async def __aenter__(self) -> "_FakeHttpSession":
+    async def __aenter__(self) -> _FakeHttpSession:
         return self
 
     async def __aexit__(self, *_exc: Any) -> None:
@@ -651,8 +651,8 @@ def _install_provider_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gemini_search, "build_gemini_client", _fake_gemini_client)
 
     # Prediction-market + resolution-source aiohttp sessions.
-    monkeypatch.setattr(prediction_market, "_get_session", lambda: _FakeHttpSession())
-    monkeypatch.setattr(resolution_source, "_get_session", lambda: _FakeHttpSession())
+    monkeypatch.setattr(prediction_market, "_get_session", _FakeHttpSession)
+    monkeypatch.setattr(resolution_source, "_get_session", _FakeHttpSession)
     # resolution_source runs a getaddrinfo SSRF preflight on every URL; example.gov
     # has no real DNS, so return a public IP (mirrors test_resolution_source_provider).
     monkeypatch.setattr(

@@ -16,6 +16,7 @@ import os
 import random
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 from typing import Literal, cast
 
@@ -52,6 +53,8 @@ from metaculus_bot.constants import (
     HEARTBEAT_INTERVAL,
     TYPE_MIX,
 )
+from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
+from metaculus_bot.http_status import is_transient_question_fetch_error
 from metaculus_bot.scoring_patches import (
     apply_scoring_patches,
     log_score_scale_validation,
@@ -79,6 +82,67 @@ _progress_state = {
 install_benchmarker_heartbeat(HEARTBEAT_INTERVAL, _progress_state)
 
 
+async def _fetch_type_with_retries(question_type: str, count: int, *, base_filter_kwargs: dict) -> list:
+    """Fetch ``count`` questions of one type, retrying transient failures with backoff.
+
+    Raises RuntimeError once the retries are spent or the error isn't retryable — a
+    missing question type would silently skew the type mix, so this fails the run
+    instead. An empty result counts as a failure for the same reason.
+    """
+    # For numeric questions, include discrete types as well. ``question_type`` is always
+    # one of the QuestionBasicType literals at the call site; cast to satisfy ApiFilter's
+    # invariant list type.
+    if question_type == "numeric":
+        allowed_types: list[QuestionBasicType] = ["numeric", "discrete"]
+    else:
+        allowed_types = [cast(QuestionBasicType, question_type)]
+
+    api_filter = ApiFilter(allowed_types=allowed_types, **base_filter_kwargs.copy())
+
+    attempts = 0
+    backoffs = list(FETCH_RETRY_BACKOFFS)  # seconds
+    while True:
+        try:
+            logger.info(f"🔍 Attempt {attempts + 1}: fetching {count} {question_type} questions...")
+            sys.stdout.flush()
+            questions = await MetaculusApi.get_questions_matching_filter(
+                api_filter,
+                num_questions=count,
+                randomly_sample=False,
+            )
+            if not questions:
+                raise RuntimeError("API returned 0 questions")
+            return questions
+        # Broad on purpose: the retry decision is made by is_transient_question_fetch_error,
+        # and anything it rejects is re-raised as a RuntimeError below.
+        except Exception as e:
+            if attempts < 2 and is_transient_question_fetch_error(e):
+                sleep_s = backoffs[attempts] if attempts < len(backoffs) else backoffs[-1]
+                logger.warning(
+                    f"Retryable error fetching {question_type} questions (attempt {attempts + 1}/3): {e}. "
+                    f"Backing off {sleep_s}s before retry."
+                )
+                sys.stdout.flush()
+                await asyncio.sleep(sleep_s)
+                attempts += 1
+                continue
+            # Final failure or non-retryable
+            logger.error(f"❌ Failed to fetch {question_type} questions: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            sys.stdout.flush()
+            raise RuntimeError(
+                f"Aborting benchmark: unable to fetch {question_type} questions after {attempts + 1} attempts"
+            ) from e
+
+
+def _question_type_counts(questions: list) -> dict[str, int]:
+    """Count of questions per concrete ft question class."""
+    counts: dict[str, int] = {}
+    for question in questions:
+        counts[type(question).__name__] = counts.get(type(question).__name__, 0) + 1
+    return counts
+
+
 async def _get_mixed_question_types(total_questions: int, one_year_from_now: datetime) -> list:
     """Get mixed question types with 50/25/25 distribution (binary/numeric/multiple-choice).
 
@@ -101,78 +165,10 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
         "num_forecasters_gte": 40,
         "scheduled_resolve_time_lt": one_year_from_now,
         "includes_bots_in_aggregates": False,
-        "open_time_gt": datetime.now() - timedelta(days=90),
+        "open_time_gt": datetime.now().astimezone() - timedelta(days=90),
     }
 
     all_questions = []
-
-    # Helper: fetch with retries and backoff
-    async def _fetch_type_with_retries(question_type: str, count: int) -> list:
-        import http.client
-
-        from requests import exceptions as req_exc  # type: ignore
-        from urllib3 import exceptions as ul3_exc  # type: ignore
-
-        # Build filter per type
-        filter_kwargs = base_filter_kwargs.copy()
-
-        # For numeric questions, include discrete types as well.
-        # question_type is always one of the QuestionBasicType literals at call sites
-        # (see types_and_counts below); cast to satisfy ApiFilter's invariant list type.
-        if question_type == "numeric":
-            allowed_types: list[QuestionBasicType] = ["numeric", "discrete"]
-        else:
-            allowed_types = [cast(QuestionBasicType, question_type)]
-
-        api_filter = ApiFilter(allowed_types=allowed_types, **filter_kwargs)
-
-        def _is_retryable_error(err: Exception) -> bool:
-            retryables = (
-                req_exc.ConnectionError,
-                req_exc.Timeout,
-                ul3_exc.ProtocolError,
-                http.client.RemoteDisconnected,
-            )
-            if isinstance(err, retryables):
-                return True
-            # Best-effort string check for common transient statuses when wrapped
-            msg = str(err).lower()
-            return any(tok in msg for tok in ["429", "too many requests", "502", "503", "504", "timeout"])  # type: ignore[return-value]
-
-        attempts = 0
-        backoffs = list(FETCH_RETRY_BACKOFFS)  # seconds
-        while True:
-            try:
-                logger.info(f"🔍 Attempt {attempts + 1}: fetching {count} {question_type} questions...")
-                sys.stdout.flush()
-                questions = await MetaculusApi.get_questions_matching_filter(
-                    api_filter,
-                    num_questions=count,
-                    randomly_sample=False,
-                )
-                if not questions:
-                    raise RuntimeError("API returned 0 questions")
-                return questions
-            except Exception as e:  # Retry on transient errors, otherwise raise
-                if attempts < 2 and _is_retryable_error(e):
-                    sleep_s = backoffs[attempts] if attempts < len(backoffs) else backoffs[-1]
-                    logger.warning(
-                        f"Retryable error fetching {question_type} questions (attempt {attempts + 1}/3): {e}. "
-                        f"Backing off {sleep_s}s before retry."
-                    )
-                    sys.stdout.flush()
-                    await asyncio.sleep(sleep_s)
-                    attempts += 1
-                    continue
-                # Final failure or non-retryable
-                logger.error(f"❌ Failed to fetch {question_type} questions: {e}")
-                import traceback
-
-                logger.error(f"Full traceback: {traceback.format_exc()}")
-                sys.stdout.flush()
-                raise RuntimeError(
-                    f"Aborting benchmark: unable to fetch {question_type} questions after {attempts + 1} attempts"
-                ) from e
 
     # Fetch each question type separately with pacing and validation
     types_and_counts = [
@@ -185,7 +181,7 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
             continue
         logger.info(f"[{i}/3] Fetching {count} {question_type} questions...")
         sys.stdout.flush()
-        questions = await _fetch_type_with_retries(question_type, count)
+        questions = await _fetch_type_with_retries(question_type, count, base_filter_kwargs=base_filter_kwargs)
         logger.info(f"✅ Successfully fetched {len(questions)} {question_type} questions")
         if questions:
             logger.info(f"📋 Sample {question_type} question: {questions[0].question_text[:100]}...")
@@ -203,19 +199,190 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
     for question in all_questions:
         question.background_info = None
 
-    # Log final distribution
-    type_counts = {}
-    for q in all_questions:
-        q_type = type(q).__name__
-        type_counts[q_type] = type_counts.get(q_type, 0) + 1
-
-    logger.info(f"Final mixed question distribution: {type_counts}")
+    logger.info(f"Final mixed question distribution: {_question_type_counts(all_questions)}")
     return all_questions
+
+
+async def _fetch_questions_for_mode(mode: str, number_of_questions: int, *, mixed_types: bool) -> list:
+    """Fetch the question set for a run/custom benchmark mode.
+
+    ``run`` pulls recently-opened binary questions; ``custom`` either fans out across the
+    50/25/25 type mix or falls back to binary-only, and clears ``background_info`` so the
+    bots have to find current information themselves. Identity is verified before either
+    fetch because the request carries the Metaculus token.
+    """
+    if mode == "run":
+        verify_metaculus_api_identity()
+        api_filter = ApiFilter(
+            allowed_statuses=["open"],
+            allowed_types=["binary"],
+            num_forecasters_gte=30,
+            includes_bots_in_aggregates=False,
+            open_time_gt=datetime.now().astimezone() - timedelta(days=90),
+        )
+        return await MetaculusApi.get_questions_matching_filter(
+            api_filter,
+            num_questions=number_of_questions,
+            randomly_sample=False,
+        )
+
+    if mode != "custom":
+        raise ValueError(f"Invalid mode: {mode}")
+
+    verify_metaculus_api_identity()
+    one_year_from_now = datetime.now().astimezone() + timedelta(days=365)
+
+    if mixed_types:
+        questions = await _get_mixed_question_types(number_of_questions, one_year_from_now)
+    else:
+        api_filter = ApiFilter(
+            allowed_statuses=["open"],
+            allowed_types=["binary"],
+            num_forecasters_gte=40,
+            scheduled_resolve_time_lt=one_year_from_now,
+            includes_bots_in_aggregates=False,
+            open_time_gt=datetime.now().astimezone() - timedelta(days=90),
+        )
+        questions = await MetaculusApi.get_questions_matching_filter(
+            api_filter,
+            num_questions=number_of_questions,
+            randomly_sample=False,
+        )
+
+    for question in questions:
+        question.background_info = None  # Test ability to find new information
+    return questions
+
+
+def _build_benchmark_bots(batch_size: int) -> tuple[list, list]:
+    """Build the individual + stacking bots, sharing one research cache.
+
+    The shared cache is what keeps N bots from each paying for the same question's
+    research. Returns (all bots, stacking bots) — the stacking subset is kept separately
+    so the end-of-run fallback summary can report on just those.
+    """
+    research_cache: dict[int, str] = {}
+    individual_specs = INDIVIDUAL_MODEL_SPECS
+    base_forecasters = [spec["forecaster"] for spec in individual_specs]
+    if len(base_forecasters) < 2:
+        logger.warning(
+            "STACKING configuration: fewer than 2 base forecasters (%d). Stacking quality may suffer.",
+            len(base_forecasters),
+        )
+
+    stacking_specs = STACKING_MODEL_SPECS
+    bots = create_individual_bots(
+        individual_specs,
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=batch_size,
+        research_cache=research_cache,
+    )
+    stacking_bots = create_stacking_bots(
+        stacking_specs,
+        list(base_forecasters),
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=batch_size,
+        research_cache=research_cache,
+    )
+    bots.extend(stacking_bots)
+
+    logger.info(
+        f"Created {len(bots)} total bots for benchmarking: {len(individual_specs)} individual models + {len(stacking_specs)} stacking models. "
+        f"Traditional ensembles will be generated post-hoc by correlation analysis."
+    )
+    return typeguard.check_type(bots, list[ForecastBot]), stacking_bots
+
+
+def _log_benchmark_headlines(benchmarks: list) -> None:
+    """Log each benchmark's baseline score, cost and wall clock.
+
+    ``average_expected_baseline_score`` raises ValueError when a benchmark holds no
+    reports at all, which in practice means every research provider failed; that gets
+    re-raised with the actionable message rather than a bare ValueError.
+    """
+    try:
+        for i, benchmark in enumerate(benchmarks):
+            logger.info(f"Benchmark {i + 1} of {len(benchmarks)}: {benchmark.name}")
+            logger.info(
+                f"- Final Metaculus Baseline Score: {benchmark.average_expected_baseline_score:.4f} (based on log score, 0=always predict same, https://www.metaculus.com/help/scores-faq/#baseline-score )"
+            )
+            logger.info(f"- Total Cost: {benchmark.total_cost:.2f}")
+            logger.info(f"- Time taken: {benchmark.time_taken_in_minutes:.4f}")
+        log_benchmarker_headline_note()
+    except ValueError as ve:
+        raise RuntimeError(
+            "Benchmark produced no forecast reports.Fallback is disabled for benchmarks by design."
+        ) from ve
+
+
+def _run_post_hoc_correlation_analysis(
+    benchmarks: list,
+    include_models: list[str] | None,
+    exclude_models: list[str] | None,
+) -> None:
+    """Correlation report + post-hoc ensemble recommendations over the finished benchmarks."""
+    analyzer = CorrelationAnalyzer()
+    analyzer.add_benchmark_results(benchmarks)
+
+    # Optional model filtering prior to report/ensembles
+    if include_models and exclude_models:
+        logger.warning("Both include and exclude provided; include takes precedence, excludes still applied.")
+    if include_models or exclude_models:
+        summary = analyzer.filter_models_inplace(include=include_models, exclude=exclude_models)
+        try:
+            logger.info("Model filters applied:")
+            if include_models:
+                logger.info(f"  include tokens: {include_models}")
+                if summary.get("unmatched_includes"):
+                    logger.info(f"  unmatched include tokens: {summary['unmatched_includes']}")
+            if exclude_models:
+                logger.info(f"  exclude tokens: {exclude_models}")
+                if summary.get("unmatched_excludes"):
+                    logger.info(f"  unmatched exclude tokens: {summary['unmatched_excludes']}")
+            logger.info(f"  remaining models: {analyzer.get_model_names()}")
+        except Exception:
+            logger.debug("Model filter logging failed", exc_info=True)
+
+    # Generate and log correlation report
+    report = analyzer.generate_correlation_report("benchmarks/correlation_analysis.md")
+    logger.info("\n%s", "=" * 50)
+    logger.info("CORRELATION ANALYSIS")
+    logger.info("=" * 50)
+    logger.info(report)
+
+    # Generate all possible ensemble combinations with different aggregation strategies
+    logger.info("\n%s", "=" * 50)
+    logger.info("ENSEMBLE GENERATION (Post-hoc)")
+    logger.info("=" * 50)
+    optimal_ensembles = analyzer.find_optimal_ensembles(max_ensemble_size=6, max_cost_per_question=1.0)
+    if optimal_ensembles:
+        logger.info(
+            f"Generated {len(optimal_ensembles)} ensemble combinations from {len(benchmarks)} individual models"
+        )
+        logger.info("\nTop 10 Recommended Ensembles (Both Aggregation Strategies, Cost ≤ $1.0/question):")
+        for i, ensemble in enumerate(optimal_ensembles[:10], 1):
+            models = " + ".join(ensemble.model_names)
+            logger.info(f"{i}. {models} ({ensemble.aggregation_strategy.upper()})")
+            logger.info(
+                f"   Score: {ensemble.avg_performance:.2f} | "
+                f"Cost: ${ensemble.avg_cost:.3f} | "
+                f"Diversity: {ensemble.diversity_score:.3f} | "
+                f"Overall: {ensemble.ensemble_score:.3f}"
+            )
+
+        logger.info(
+            f"\n💡 Use 'python analyze_correlations.py benchmarks/' to explore all {len(optimal_ensembles)} ensemble combinations"
+        )
+    else:
+        logger.info("No viable ensemble combinations found within cost constraints")
 
 
 async def benchmark_forecast_bot(
     mode: str,
     number_of_questions: int = 2,
+    *,
     mixed_types: bool = False,
     include_models: list[str] | None = None,
     exclude_models: list[str] | None = None,
@@ -234,50 +401,8 @@ async def benchmark_forecast_bot(
     if mode == "display":
         run_benchmark_streamlit_page()
         return
-    elif mode == "run":
-        # Confirm the host is the real Metaculus before the token-sending fetch.
-        verify_metaculus_api_identity()
-        api_filter = ApiFilter(
-            allowed_statuses=["open"],
-            allowed_types=["binary"],
-            num_forecasters_gte=30,
-            includes_bots_in_aggregates=False,
-            open_time_gt=datetime.now() - timedelta(days=90),
-        )
-        questions = await MetaculusApi.get_questions_matching_filter(
-            api_filter,
-            num_questions=number_of_questions,
-            randomly_sample=False,
-        )
-    elif mode == "custom":
-        # Confirm the host is the real Metaculus before the token-sending fetch.
-        verify_metaculus_api_identity()
-        # Below is an example of getting custom questions
-        one_year_from_now = datetime.now() + timedelta(days=365)
 
-        if mixed_types:
-            # Get mixed question types with 50/25/25 distribution
-            questions = await _get_mixed_question_types(number_of_questions, one_year_from_now)
-        else:
-            # Original binary-only approach
-            api_filter = ApiFilter(
-                allowed_statuses=["open"],
-                allowed_types=["binary"],
-                num_forecasters_gte=40,
-                scheduled_resolve_time_lt=one_year_from_now,
-                includes_bots_in_aggregates=False,
-                open_time_gt=datetime.now() - timedelta(days=90),
-            )
-            questions = await MetaculusApi.get_questions_matching_filter(
-                api_filter,
-                num_questions=number_of_questions,
-                randomly_sample=False,
-            )
-
-        for question in questions:
-            question.background_info = None  # Test ability to find new information
-    else:
-        raise ValueError(f"Invalid mode: {mode}")
+    questions = await _fetch_questions_for_mode(mode, number_of_questions, mixed_types=mixed_types)
 
     # Apply scoring patches for mixed question types and reset counters
     apply_scoring_patches()
@@ -287,42 +412,7 @@ async def benchmark_forecast_bot(
         # Keep benchmark and bot research concurrency aligned
         batch_size = BENCHMARK_BATCH_SIZE
 
-        # Shared research cache for all bots to avoid duplicate API calls
-        research_cache: dict[int, str] = {}
-        individual_specs = INDIVIDUAL_MODEL_SPECS
-        base_forecasters = [spec["forecaster"] for spec in individual_specs]
-        if len(base_forecasters) < 2:
-            logger.warning(
-                "STACKING configuration: fewer than 2 base forecasters (%d). Stacking quality may suffer.",
-                len(base_forecasters),
-            )
-
-        stacking_specs = STACKING_MODEL_SPECS
-
-        bots = create_individual_bots(
-            individual_specs,
-            DEFAULT_HELPER_LLMS,
-            BENCHMARK_BOT_CONFIG,
-            batch_size=batch_size,
-            research_cache=research_cache,
-        )
-
-        stacking_bots = create_stacking_bots(
-            stacking_specs,
-            list(base_forecasters),
-            DEFAULT_HELPER_LLMS,
-            BENCHMARK_BOT_CONFIG,
-            batch_size=batch_size,
-            research_cache=research_cache,
-        )
-
-        bots.extend(stacking_bots)
-
-        logger.info(
-            f"Created {len(bots)} total bots for benchmarking: {len(individual_specs)} individual models + {len(stacking_specs)} stacking models. "
-            f"Traditional ensembles will be generated post-hoc by correlation analysis."
-        )
-        bots = typeguard.check_type(bots, list[ForecastBot])
+        bots, stacking_bots = _build_benchmark_bots(batch_size)
 
         # Log progress info
         total_predictions = len(bots) * len(questions)
@@ -365,20 +455,7 @@ async def benchmark_forecast_bot(
 
         logger.info("✅ Benchmarker.run_benchmark() completed, processing results...")
         sys.stdout.flush()
-        try:
-            for i, benchmark in enumerate(benchmarks):
-                logger.info(f"Benchmark {i + 1} of {len(benchmarks)}: {benchmark.name}")
-                logger.info(
-                    f"- Final Metaculus Baseline Score: {benchmark.average_expected_baseline_score:.4f} (based on log score, 0=always predict same, https://www.metaculus.com/help/scores-faq/#baseline-score )"
-                )
-                logger.info(f"- Total Cost: {benchmark.total_cost:.2f}")
-                logger.info(f"- Time taken: {benchmark.time_taken_in_minutes:.4f}")
-            log_benchmarker_headline_note()
-        except ValueError as ve:
-            # Provide clearer guidance when no reports exist (likely research provider failures)
-            raise RuntimeError(
-                "Benchmark produced no forecast reports.Fallback is disabled for benchmarks by design."
-            ) from ve
+        _log_benchmark_headlines(benchmarks)
         logger.info(f"Total Cost: {cost_manager.current_usage}")
 
         # Log score scale validation for mixed question types
@@ -390,62 +467,7 @@ async def benchmark_forecast_bot(
         # TODO: refactor out this logic, jank to have here.
         # Perform correlation analysis if we have multiple models
         if len(benchmarks) > 1:
-            from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
-
-            analyzer = CorrelationAnalyzer()
-            analyzer.add_benchmark_results(benchmarks)
-
-            # Optional model filtering prior to report/ensembles
-            if include_models and exclude_models:
-                logger.warning("Both include and exclude provided; include takes precedence, excludes still applied.")
-            if include_models or exclude_models:
-                summary = analyzer.filter_models_inplace(include=include_models, exclude=exclude_models)
-                try:
-                    logger.info("Model filters applied:")
-                    if include_models:
-                        logger.info(f"  include tokens: {include_models}")
-                        if summary.get("unmatched_includes"):
-                            logger.info(f"  unmatched include tokens: {summary['unmatched_includes']}")
-                    if exclude_models:
-                        logger.info(f"  exclude tokens: {exclude_models}")
-                        if summary.get("unmatched_excludes"):
-                            logger.info(f"  unmatched exclude tokens: {summary['unmatched_excludes']}")
-                    logger.info(f"  remaining models: {analyzer.get_model_names()}")
-                except Exception:
-                    logger.debug("Model filter logging failed", exc_info=True)
-
-            # Generate and log correlation report
-            report = analyzer.generate_correlation_report("benchmarks/correlation_analysis.md")
-            logger.info("\n" + "=" * 50)
-            logger.info("CORRELATION ANALYSIS")
-            logger.info("=" * 50)
-            logger.info(report)
-
-            # Generate all possible ensemble combinations with different aggregation strategies
-            logger.info("\n" + "=" * 50)
-            logger.info("ENSEMBLE GENERATION (Post-hoc)")
-            logger.info("=" * 50)
-            optimal_ensembles = analyzer.find_optimal_ensembles(max_ensemble_size=6, max_cost_per_question=1.0)
-            if optimal_ensembles:
-                logger.info(
-                    f"Generated {len(optimal_ensembles)} ensemble combinations from {len(benchmarks)} individual models"
-                )
-                logger.info("\nTop 10 Recommended Ensembles (Both Aggregation Strategies, Cost ≤ $1.0/question):")
-                for i, ensemble in enumerate(optimal_ensembles[:10], 1):
-                    models = " + ".join(ensemble.model_names)
-                    logger.info(f"{i}. {models} ({ensemble.aggregation_strategy.upper()})")
-                    logger.info(
-                        f"   Score: {ensemble.avg_performance:.2f} | "
-                        f"Cost: ${ensemble.avg_cost:.3f} | "
-                        f"Diversity: {ensemble.diversity_score:.3f} | "
-                        f"Overall: {ensemble.ensemble_score:.3f}"
-                    )
-
-                logger.info(
-                    f"\n💡 Use 'python analyze_correlations.py benchmarks/' to explore all {len(optimal_ensembles)} ensemble combinations"
-                )
-            else:
-                logger.info("No viable ensemble combinations found within cost constraints")
+            _run_post_hoc_correlation_analysis(benchmarks, include_models, exclude_models)
         else:
             logger.info("Skipping correlation analysis (need multiple models)")
 
@@ -503,7 +525,7 @@ if __name__ == "__main__":
         benchmark_forecast_bot(
             mode,
             args.num_questions,
-            args.mixed,
+            mixed_types=args.mixed,
             include_models=args.include_models,
             exclude_models=args.exclude_models,
         )

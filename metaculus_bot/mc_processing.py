@@ -73,6 +73,18 @@ def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
         raise ValueError(_ZERO_MASS_MESSAGE.format(n=n))
     probs = [p / total for p in probs]
 
+    return _repair_bound_violations(probs)
+
+
+def _repair_bound_violations(probs: list[float]) -> list[float]:
+    """Pin out-of-bounds options at their bound and rescale only the still-free mass.
+
+    Iterates because pinning changes the free budget, which can push a previously in-bounds
+    option out. Mutates and returns ``probs``; the caller has already clamped + renormalized
+    once, so this only fires when the naive divide dragged a floored option back under
+    ``MC_PROB_MIN``.
+    """
+    n = len(probs)
     pinned = [False] * n
     for _ in range(n):
         violators = [i for i in range(n) if not pinned[i] and not (MC_PROB_MIN <= probs[i] <= MC_PROB_MAX)]
@@ -106,7 +118,7 @@ def _normalize_name(name: str) -> str:
     stripped = name.strip()
     # Remove leading "Option" labels if present
     lowered = stripped.lower()
-    if lowered.startswith("option ") or lowered.startswith("option:"):
+    if lowered.startswith(("option ", "option:")):
         # drop leading token up to colon/space
         parts = stripped.split(":", 1)
         if len(parts) == 2:
@@ -170,7 +182,9 @@ def build_mc_prediction(
     # already-in-bounds, sum-1 values and is a no-op.
     clamped = clamp_and_renormalize_probs([p for _, p in pairs])
     return PredictedOptionList(
-        predicted_options=[PredictedOption(option_name=n, probability=p) for (n, _), p in zip(pairs, clamped)]
+        predicted_options=[
+            PredictedOption(option_name=n, probability=p) for (n, _), p in zip(pairs, clamped, strict=True)
+        ]
     )
 
 

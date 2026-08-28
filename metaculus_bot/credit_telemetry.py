@@ -182,7 +182,7 @@ def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
             remaining_usd=_as_float(data.get("limit_remaining")),
             usage_usd=_as_float(data.get("usage")),
         )
-    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         # Broad by design, not defensiveness: the module contract is that telemetry cannot
         # fail a run, and this sits under a cli.main ``finally``. See the docstring.
         logger.warning(
@@ -349,7 +349,7 @@ def get_probed_donated_key_state() -> DonatedKeyState | None:
 
 def reset_donated_key_state_cache() -> None:
     """Clear the cached verdict. Used by tests; not for production code."""
-    global _probed_donated_key_state
+    global _probed_donated_key_state  # noqa: PLW0603  # once-per-process probe cache is the design
     _probed_donated_key_state = None
 
 
@@ -410,7 +410,7 @@ def classify_donated_key_state() -> DonatedKeyState:
     most once per process (lock-guarded, so concurrent callers share one verdict); every
     subsequent call reads the cache.
     """
-    global _probed_donated_key_state
+    global _probed_donated_key_state  # noqa: PLW0603  # once-per-process probe cache is the design
     cached = _probed_donated_key_state
     if cached is not None:
         return cached

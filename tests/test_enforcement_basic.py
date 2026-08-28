@@ -44,7 +44,7 @@ def _numeric_question(*, lower: float, upper: float, cdf_size: int = 201, open_u
 
 def _declared_13(values: list[float]) -> list[Percentile]:
     assert len(values) == len(STANDARD_PERCENTILES) == 13
-    return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values)]
+    return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
 
 
 def test_unit_mismatch_detector_flags_tiny_span():
@@ -63,7 +63,7 @@ def test_cluster_parameters_use_span_based_delta():
     span = 100_000.0
     count_like = True
 
-    value_eps, base_delta, spread_delta = compute_cluster_parameters(range_size, count_like, span)
+    _value_eps, base_delta, spread_delta = compute_cluster_parameters(range_size, count_like, span)
 
     # Base delta is range * 1e-6 = 1.0; span-based is 2000.0
     assert base_delta >= 1.0

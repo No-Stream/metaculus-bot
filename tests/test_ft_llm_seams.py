@@ -226,7 +226,8 @@ class TestProductionKwargShapesReachAcompletion:
         sent = calls[0]
         # A pydantic MODEL CLASS (not a dict) must arrive — this is what enables strict json_schema.
         assert sent["response_format"] is PercentileListWrapper
-        assert isinstance(sent["response_format"], type) and issubclass(sent["response_format"], PercentileListWrapper)
+        assert isinstance(sent["response_format"], type)
+        assert issubclass(sent["response_format"], PercentileListWrapper)
         assert sent["extra_body"] == {"provider": {"require_parameters": True}}
         assert sent["reasoning"] == {"effort": "low"}
         assert sent["temperature"] is None
@@ -343,8 +344,8 @@ class TestFallbackOpenRouterKeySwap:
             allowed_tries=1,
         )
         # The fallback secondary is a real, separate GeneralLlm carrying the personal key.
-        assert isinstance(llm._secondary_llm, GeneralLlm)  # noqa: SLF001  # pinning the two-instance funnel
-        assert llm._secondary_llm.litellm_kwargs["api_key"] == "personal-key"  # noqa: SLF001
+        assert isinstance(llm._secondary_llm, GeneralLlm)  # pinning the two-instance funnel
+        assert llm._secondary_llm.litellm_kwargs["api_key"] == "personal-key"
 
         calls = _install_acompletion(
             monkeypatch,
@@ -517,6 +518,7 @@ class TestAgenticToolsPathExecutesUnderLitellm:
         # exercising the fastapi gate (e.g. if the wrapper's kwarg plumbing drifts).
         assert forwarded_calls, "wrapper never forwarded a call to litellm.acompletion"
         forwarded_tools = forwarded_calls[-1].get("tools")
-        assert isinstance(forwarded_tools, list) and forwarded_tools, (
+        assert isinstance(forwarded_tools, list), (
             f"tools= did not reach litellm.acompletion as a non-empty list: {forwarded_tools!r}"
         )
+        assert forwarded_tools, f"tools= did not reach litellm.acompletion as a non-empty list: {forwarded_tools!r}"

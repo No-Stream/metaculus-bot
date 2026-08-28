@@ -18,6 +18,7 @@ from forecasting_tools import (
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
+    Percentile,
     PredictedOptionList,
     ReasonedPrediction,
     clean_indents,
@@ -35,6 +36,7 @@ from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_
 from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc
 from metaculus_bot.numeric.validation import detect_unit_mismatch
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
+from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 from metaculus_bot.structured_parse import parse_structured
 from metaculus_bot.value_extraction import extract_binary, extract_mc, extract_numeric
 
@@ -121,6 +123,7 @@ async def run_binary_forecast(
     research: str,
     forecaster_llm: GeneralLlm,
     parser_llm: GeneralLlm,
+    *,
     chart_b64: str | None = None,
 ) -> ReasonedPrediction[float]:
     prompt = binary_prompt(question, research)
@@ -160,6 +163,7 @@ async def run_mc_forecast(
     research: str,
     forecaster_llm: GeneralLlm,
     parser_llm: GeneralLlm,
+    *,
     chart_b64: str | None = None,
 ) -> ReasonedPrediction[PredictedOptionList]:
     prompt = multiple_choice_prompt(question, research)
@@ -203,6 +207,7 @@ async def run_numeric_forecast(
     research: str,
     forecaster_llm: GeneralLlm,
     parser_llm: GeneralLlm,
+    *,
     chart_b64: str | None = None,
 ) -> tuple[ReasonedPrediction[NumericDistribution], bool | None]:
     """Run a numeric forecast and return (prediction, discrete_vote).
@@ -223,16 +228,31 @@ async def run_numeric_forecast(
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
 
     qid = question.id_of_question
-    discrete_vote: bool | None = None
+    discrete_vote = await _resolve_discrete_vote(reasoning, parser_llm, forecaster_llm, qid)
 
-    # C3: try to read outcome_type from the structured JSON block first (saves
-    # a parser LLM call). Fall back to the OutcomeTypeResult parser call when
-    # the block is missing or doesn't declare outcome_type.
-    from metaculus_bot.structured_output_schema import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
-        NumericStructured,
-        parse_structured_block,
+    parse_notes = build_parse_notes(question)
+
+    outcome = await extract_numeric(
+        reasoning,
+        parser_llm,
+        prompt_notes=parse_notes,
+        question_id=qid,
+        model_name=forecaster_llm.model,
     )
+    prediction = _build_guarded_numeric_distribution(outcome.value, question, forecaster_llm)
+    return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning), discrete_vote
 
+
+async def _resolve_discrete_vote(
+    reasoning: str, parser_llm: GeneralLlm, forecaster_llm: GeneralLlm, qid: int | None
+) -> bool | None:
+    """This forecaster's DISCRETE-vs-CONTINUOUS vote, or None when it could not be read.
+
+    C3: read outcome_type from the structured JSON block first (saves a parser LLM call).
+    Fall back to the OutcomeTypeResult parser call when the block is missing or doesn't
+    declare outcome_type.
+    """
+    discrete_vote: bool | None = None
     block = parse_structured_block(reasoning, "numeric")
     if isinstance(block, NumericStructured) and block.outcome_type is not None:
         discrete_vote = block.outcome_type == "discrete_integer"
@@ -266,16 +286,20 @@ async def run_numeric_forecast(
             vote_label,
         )
 
-    parse_notes = build_parse_notes(question)
+    return discrete_vote
 
-    outcome = await extract_numeric(
-        reasoning,
-        parser_llm,
-        prompt_notes=parse_notes,
-        question_id=qid,
-        model_name=forecaster_llm.model,
+
+def _build_guarded_numeric_distribution(
+    declared_percentiles: list[Percentile], question: NumericQuestion, forecaster_llm: GeneralLlm
+) -> NumericDistribution:
+    """Sanitize -> build the PCHIP CDF -> withhold on a unit mismatch.
+
+    The unit-mismatch guard fails SHUT: it raises rather than returning a distribution, so an
+    order-of-magnitude error can never reach publish.
+    """
+    sanitized_percentiles, zero_point = sanitize_percentiles(
+        declared_percentiles, question, model_name=forecaster_llm.model
     )
-    sanitized_percentiles, zero_point = sanitize_percentiles(outcome.value, question, model_name=forecaster_llm.model)
 
     prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
 
@@ -291,4 +315,4 @@ async def run_numeric_forecast(
 
     log_final_prediction(prediction, question)
     log_open_bound_piling_diagnostics(prediction, question, forecaster_llm.model, sanitized_percentiles)
-    return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning), discrete_vote
+    return prediction

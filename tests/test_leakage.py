@@ -114,7 +114,7 @@ class TestProcessSingleQuestion:
         gt = _make_ground_truth(42)
 
         qid, research_text, is_leaked = await _process_single_question(
-            question, gt, research_provider, detector_llm, semaphore
+            question, gt, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
         )
 
         assert qid == 42
@@ -132,7 +132,7 @@ class TestProcessSingleQuestion:
         gt = _make_ground_truth(42)
 
         qid, research_text, is_leaked = await _process_single_question(
-            question, gt, research_provider, detector_llm, semaphore
+            question, gt, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
         )
 
         assert qid == 42
@@ -149,7 +149,7 @@ class TestProcessSingleQuestion:
         gt = _make_ground_truth(42)
 
         qid, research_text, is_leaked = await _process_single_question(
-            question, gt, research_provider, detector_llm, semaphore
+            question, gt, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
         )
 
         assert qid == 42
@@ -163,9 +163,9 @@ class TestProcessSingleQuestion:
         # access (open_time, scheduled_resolution_time) that silently no-ops on a str.
         received: list[Any] = []
 
-        async def recording_provider(arg: Any) -> str:  # noqa: ASYNC124  # test double; awaited by code under test
+        async def recording_provider(arg: Any) -> str:  # test double; awaited by code under test
             received.append(arg)
-            return "research"  # noqa: ASYNC910
+            return "research"
 
         detector_llm = AsyncMock()
         detector_llm.invoke.return_value = "NO"
@@ -174,7 +174,9 @@ class TestProcessSingleQuestion:
         question = _make_question(42, text="Will X resolve?")
         gt = _make_ground_truth(42)
 
-        await _process_single_question(question, gt, recording_provider, detector_llm, semaphore)
+        await _process_single_question(
+            question, gt, research_provider=recording_provider, detector_llm=detector_llm, semaphore=semaphore
+        )
 
         assert received == [question]  # the object itself, not question.question_text
         assert received[0].question_text == "Will X resolve?"  # attribute access works on it
@@ -200,8 +202,12 @@ class TestProcessSingleQuestion:
         gt2 = _make_ground_truth(2)
 
         await asyncio.gather(
-            _process_single_question(q1, gt1, research_provider, detector_llm, semaphore),
-            _process_single_question(q2, gt2, research_provider, detector_llm, semaphore),
+            _process_single_question(
+                q1, gt1, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
+            ),
+            _process_single_question(
+                q2, gt2, research_provider=research_provider, detector_llm=detector_llm, semaphore=semaphore
+            ),
         )
 
         assert call_order == ["start", "end", "start", "end"]
@@ -222,11 +228,11 @@ class TestScreenResearchForLeakage:
             3: "NO - clean",
         }
 
-        async def invoke_side_effect(prompt: str) -> str:  # noqa: ASYNC124  # test double; awaited by code under test
+        async def invoke_side_effect(prompt: str) -> str:  # test double; awaited by code under test
             for qid, resp in responses.items():
                 if f"Question {qid}" in prompt or f"question_{qid}" in prompt:
-                    return resp  # noqa: ASYNC910
-            return "NO"  # noqa: ASYNC910
+                    return resp
+            return "NO"
 
         mock_detector.invoke = invoke_side_effect
         mock_llm_class.return_value = mock_detector
@@ -287,12 +293,12 @@ class TestScreenResearchForLeakage:
     async def test_research_failure_keeps_question_no_cache(self, mock_choose_provider_with_name, mock_llm_class):
         call_count = 0
 
-        async def research_side_effect(text: str) -> str:  # noqa: ASYNC124  # test double; awaited by code under test
+        async def research_side_effect(text: str) -> str:  # test double; awaited by code under test
             nonlocal call_count
             call_count += 1
             if call_count == 2:
                 raise RuntimeError("API error")
-            return "research text"  # noqa: ASYNC910
+            return "research text"
 
         mock_choose_provider_with_name.return_value = (research_side_effect, "mock")
 

@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch backtest_with_cache
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -28,6 +28,20 @@ lock:
 
 lint:
 	uv run ruff check .
+
+# Dependency hygiene (deptry): an import of a package nothing declares, or a dev-only
+# package imported by the shipped code. The second class is the one that bites — CI
+# installs with `uv sync --dev` and the bot workflows install with `uv sync --no-dev`,
+# so a misplaced dev dependency is green here and a ModuleNotFoundError in prod.
+# Config + every per-rule ignore's justification live in [tool.deptry] in pyproject.toml.
+deps:
+	uv run deptry .
+
+# Import-direction contracts (import-linter). Six forbidden-direction contracts derived
+# from the real grimp graph; see [tool.importlinter] in pyproject.toml for the rationale
+# on each. Sub-second, so it belongs in the normal loop rather than a pre-merge ritual.
+lint_imports:
+	uv run lint-imports
 
 format:
 	uv run ruff format .
@@ -75,7 +89,10 @@ test_verbose:
 # you can see which test failed and why without wading through bare pass/fail.
 # Recipes run sequentially (default make behavior); if any step fails the
 # subsequent steps don't run, so failures surface immediately.
-all: format lint typecheck test_verbose
+# deps + lint_imports sit here rather than only in CI because both are sub-second and
+# both are things CI will reject: without them the first sign of a misplaced dependency
+# or a wrong-direction import is a red required check after a push.
+all: format lint deps lint_imports typecheck test_verbose
 
 run:
 	$(call RUN_UNBUFFERED,main.py)

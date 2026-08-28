@@ -34,7 +34,7 @@ escapes this bug because it happens to publish ``probability`` null today.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from metaculus_bot.research.market_retrieval.http import http_get_with_backoff, safe_float, safe_int
@@ -185,7 +185,7 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | N
         close_time: datetime | None = None
         if isinstance(close_ms, (int, float)):
             try:
-                close_time = datetime.fromtimestamp(float(close_ms) / 1000.0, tz=timezone.utc)
+                close_time = datetime.fromtimestamp(float(close_ms) / 1000.0, tz=UTC)
             except (OverflowError, OSError, ValueError):
                 close_time = None
 
@@ -264,7 +264,7 @@ async def manifold_search(session: Any, query: str, *, width: int) -> list[Marke
         {"term": query, "contractType": "ALL", "limit": str(VENUE_SEARCH_LIMIT)},
         max_attempts=MANIFOLD_MAX_ATTEMPTS,
         retryable_statuses=(429, 500, 502, 503, 504),
-        label=f"Manifold q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
+        label=f"Manifold q={query[:40]!r}",  # HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
         return None
@@ -285,7 +285,7 @@ async def manifold_market_detail(session: Any, market_id: str) -> dict[str, Any]
         {},
         max_attempts=1,
         retryable_statuses=(429, 500, 502, 503, 504),
-        label=f"Manifold detail id={market_id[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
+        label=f"Manifold detail id={market_id[:40]!r}",  # HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     return payload if isinstance(payload, dict) else None
 

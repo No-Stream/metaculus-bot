@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from itertools import pairwise
 
 import numpy as np
 from forecasting_tools import NumericDistribution
@@ -30,7 +31,10 @@ _pchip_stats: dict[str, int] = {
 
 def reset_pchip_stats() -> None:
     """Reset PCHIP statistics counters (call at start of each run)."""
-    global _pchip_stats
+    # Deliberate module-global run counter (same pattern as the fallback counters in
+    # fallback_openrouter). The reset REBINDS rather than mutates, so `global` is required;
+    # readers get a copy from get_pchip_stats(), so nothing holds the old dict.
+    global _pchip_stats  # noqa: PLW0603
     _pchip_stats = {
         "total_attempts": 0,
         "successful_without_enforcement": 0,
@@ -73,9 +77,11 @@ def generate_pchip_cdf_with_smoothing(
     zero_point: float | None,
 ) -> tuple[list[float], bool, bool]:
     """Generate PCHIP CDF with optional ramp smoothing."""
-    from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+    from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415  # function-scoped: call-time lookup keeps tests patching metaculus_bot.numeric.pchip_cdf.* effective
+        generate_pchip_cdf,
+        percentiles_to_pchip_format,
+    )
 
-    global _pchip_stats
     _pchip_stats["total_attempts"] += 1
 
     pchip_percentiles = percentiles_to_pchip_format(percentile_list)
@@ -166,7 +172,7 @@ def _validate_pchip_cdf(pchip_cdf: list[float], question: NumericQuestion) -> No
         invalid_probs = [p for p in pchip_cdf if not (0.0 <= p <= 1.0)]
         raise ValueError(f"PCHIP CDF contains invalid probabilities outside [0,1]: {invalid_probs}")
 
-    if not all(a <= b for a, b in zip(pchip_cdf[:-1], pchip_cdf[1:])):
+    if not all(a <= b for a, b in pairwise(pchip_cdf)):
         raise ValueError("PCHIP CDF is not monotonic")
 
     min_step = np.min(np.diff(pchip_cdf))
@@ -234,7 +240,7 @@ def create_pchip_numeric_distribution(
             x_vals = np.linspace(self.lower_bound, self.upper_bound, len(self._pchip_cdf_values))
             return [
                 Percentile(percentile=prob_val, value=question_val)
-                for question_val, prob_val in zip(x_vals, self._pchip_cdf_values)
+                for question_val, prob_val in zip(x_vals, self._pchip_cdf_values, strict=True)
             ]
 
         @property
@@ -308,7 +314,7 @@ def create_fallback_numeric_distribution(
                 min_step=min_step,
                 max_step=max_step,
             )
-            return [Percentile(percentile=float(prob), value=p.value) for prob, p in zip(safe, base)]
+            return [Percentile(percentile=float(prob), value=p.value) for prob, p in zip(safe, base, strict=False)]
 
         @property
         def cdf(self) -> list[Percentile]:

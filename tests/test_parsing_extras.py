@@ -101,7 +101,7 @@ async def test_numeric_parsing_raises_on_wrong_count():
     # surfaces the failure as ValueExtractionError (the new failure-type contract
     # after the extraction-ladder refactor; the old parser ValidationError path
     # is gone).
-    bad = [Percentile(value=v, percentile=p) for v, p in zip([1, 2, 3, 4, 5], [0.1, 0.2, 0.4, 0.6, 0.8])]
+    bad = [Percentile(value=v, percentile=p) for v, p in zip([1, 2, 3, 4, 5], [0.1, 0.2, 0.4, 0.6, 0.8], strict=False)]
 
     llm = SimpleNamespace(model="dummy")
     llm.invoke = AsyncMock(return_value="rationale")
@@ -121,9 +121,9 @@ async def test_numeric_parsing_raises_on_wrong_count():
             "metaculus_bot.value_extraction.parse_structured",
             new=AsyncMock(return_value=bad),
         ),
+        pytest.raises(ValueExtractionError),
     ):
-        with pytest.raises(ValueExtractionError):
-            await bot._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
+        await bot._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -150,6 +150,7 @@ async def test_parser_llm_used_for_structured_output():
         for v, p in zip(
             [0.25, 0.5, 1, 2, 4, 6, 7, 8, 10, 12, 13, 14, 15],
             [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99],
+            strict=False,
         )
     ]
 
@@ -265,7 +266,7 @@ async def test_mc_additional_instructions_include_options():
 
     seen = {}
 
-    async def _fake_extract_mc(*args, **kwargs):  # noqa: D401
+    async def _fake_extract_mc(*args, **kwargs):
         seen["prompt_notes"] = kwargs.get("prompt_notes", "")
         pol = PredictedOptionList(
             predicted_options=[
@@ -279,4 +280,5 @@ async def test_mc_additional_instructions_include_options():
         await bot._run_forecast_on_multiple_choice(q, "", llm)
 
     ai = seen["prompt_notes"] or ""
-    assert "Alpha" in ai and "Beta" in ai
+    assert "Alpha" in ai
+    assert "Beta" in ai

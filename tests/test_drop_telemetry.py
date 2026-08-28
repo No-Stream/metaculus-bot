@@ -80,7 +80,7 @@ class TestDropSiteAttribution:
         bot._make_prediction = AsyncMock(side_effect=slow_make_prediction)
 
         with pytest.raises(asyncio.TimeoutError):
-            await bot._forecaster_with_soft_deadline(mock_binary_question, "research", bot._forecaster_llms[0], 999)
+            await bot._forecaster_with_soft_deadline(mock_binary_question, "research", bot._forecaster_llms[0], qid=999)
 
         assert bot._forecasters_dropped_count == 1
         assert bot._forecaster_drops == [
@@ -88,7 +88,7 @@ class TestDropSiteAttribution:
         ]
 
     @pytest.mark.parametrize(
-        "exc,expected_cause",
+        ("exc", "expected_cause"),
         [
             (ValueExtractionError("all extraction rungs failed"), "parse_extraction"),
             (RuntimeError("LLM answer is an empty string. The model was prov/model-b"), "zero_output"),

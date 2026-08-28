@@ -206,7 +206,9 @@ class TestCatalogueCaching:
         await _fetch(mock_question, handlers)
         pmp._bump_kalshi_catalogue_failure()
         pmp._bump_source_loss()
-        assert pmp._KALSHI_CACHE and pmp._PREDICTIT_CACHE and pmp._SNAPSHOT_CACHE
+        assert pmp._KALSHI_CACHE
+        assert pmp._PREDICTIT_CACHE
+        assert pmp._SNAPSHOT_CACHE
 
         _reset_session_caches()
 

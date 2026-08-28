@@ -1,7 +1,7 @@
 """Timezone-robustness pinning tests for ``prompts._forecasting_window_str``.
 
-Seam: ``_forecasting_window_str`` computes ``today − question.open_time`` (and
-``scheduled_resolution_time − today``) to render the "days ago" / "days from
+Seam: ``_forecasting_window_str`` computes ``today - question.open_time`` (and
+``scheduled_resolution_time - today``) to render the "days ago" / "days from
 now" window anchor injected into every forecasting prompt. On the currently
 installed forecasting-tools 0.2.54, ``MetaculusQuestion._parse_api_date`` uses
 ``datetime.strptime`` with the trailing ``Z`` as a literal character, so
@@ -28,7 +28,7 @@ monkeypatched clock so the deltas are deterministic.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import cast
 
@@ -39,7 +39,7 @@ from metaculus_bot import prompts as prompts_module
 
 # Frozen "now" the window helper will see. Chosen so both deltas are clean,
 # positive round numbers regardless of the host machine's clock or timezone.
-_FROZEN_NOW_UTC = datetime(2026, 3, 2, 12, 0, 0, tzinfo=timezone.utc)
+_FROZEN_NOW_UTC = datetime(2026, 3, 2, 12, 0, 0, tzinfo=UTC)
 _OPEN = datetime(2026, 1, 1, 0, 0, 0)  # 60 full days before frozen now (UTC)
 _RESOLVE = datetime(2026, 5, 1, 0, 0, 0)  # 59 full days after frozen now (UTC)
 
@@ -102,7 +102,7 @@ class TestForecastingWindowTzRobustness:
         render the SAME string as the naive fixture (naive == UTC assumption)."""
         naive_output = prompts_module._forecasting_window_str(_question(_OPEN, _RESOLVE))
         aware_output = prompts_module._forecasting_window_str(
-            _question(_OPEN.replace(tzinfo=timezone.utc), _RESOLVE.replace(tzinfo=timezone.utc))
+            _question(_OPEN.replace(tzinfo=UTC), _RESOLVE.replace(tzinfo=UTC))
         )
 
         assert aware_output == naive_output
@@ -114,7 +114,7 @@ class TestForecastingWindowTzRobustness:
         questions, but the per-operand ``_as_utc`` normalization means a mixed pair
         must not raise either — proving both sides are normalized, not just one.
         """
-        output = prompts_module._forecasting_window_str(_question(_OPEN, _RESOLVE.replace(tzinfo=timezone.utc)))
+        output = prompts_module._forecasting_window_str(_question(_OPEN, _RESOLVE.replace(tzinfo=UTC)))
         assert f"({_EXPECTED_ELAPSED_DAYS} days ago)" in output
         assert f"({_EXPECTED_REMAINING_DAYS} days from now)" in output
 
@@ -145,11 +145,11 @@ class TestAsUtcHelper:
     def test_naive_assumed_utc(self) -> None:
         naive = datetime(2026, 1, 1, 6, 30, 0)
         result = prompts_module._as_utc(naive)
-        assert result.tzinfo is timezone.utc
-        assert result == datetime(2026, 1, 1, 6, 30, 0, tzinfo=timezone.utc)
+        assert result.tzinfo is UTC
+        assert result == datetime(2026, 1, 1, 6, 30, 0, tzinfo=UTC)
 
     def test_aware_utc_unchanged(self) -> None:
-        aware = datetime(2026, 1, 1, 6, 30, 0, tzinfo=timezone.utc)
+        aware = datetime(2026, 1, 1, 6, 30, 0, tzinfo=UTC)
         assert prompts_module._as_utc(aware) == aware
 
     def test_aware_non_utc_converted(self) -> None:
@@ -157,5 +157,5 @@ class TestAsUtcHelper:
         plus_two = timezone(timedelta(hours=2))
         aware = datetime(2026, 1, 1, 8, 30, 0, tzinfo=plus_two)
         result = prompts_module._as_utc(aware)
-        assert result.tzinfo is timezone.utc
-        assert result == datetime(2026, 1, 1, 6, 30, 0, tzinfo=timezone.utc)
+        assert result.tzinfo is UTC
+        assert result == datetime(2026, 1, 1, 6, 30, 0, tzinfo=UTC)

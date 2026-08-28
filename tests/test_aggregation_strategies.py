@@ -157,7 +157,7 @@ def test_combine_binary_predictions_mean_and_median():
     assert combine_binary_predictions(probs, AggregationStrategy.MEAN) == pytest.approx(0.3)
     assert combine_binary_predictions(probs, AggregationStrategy.MEDIAN) == pytest.approx(0.3)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Unsupported binary aggregation strategy"):
         combine_binary_predictions(probs, AggregationStrategy.STACKING)
 
 
@@ -181,7 +181,7 @@ def test_combine_multiple_choice_predictions_dispatch():
     median_result = combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.MEDIAN)
     assert {opt.option_name: opt.probability for opt in median_result.predicted_options}["A"] == pytest.approx(0.7)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Unsupported multiple-choice aggregation strategy"):
         combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.STACKING)
 
 
@@ -205,5 +205,5 @@ def test_combine_numeric_predictions_dispatch(monkeypatch):
     fake_aggregate.assert_called_once_with(predictions, question, "mean")
     assert result_mean == "mean_result"
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Unsupported numeric aggregation strategy"):
         combine_numeric_predictions(predictions, question, AggregationStrategy.STACKING)

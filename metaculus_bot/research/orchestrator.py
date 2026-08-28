@@ -1,21 +1,30 @@
 """Research orchestration extracted from TemplateForecaster.
 
-Encapsulates provider selection, parallel execution, caching, gap-fill, and
-fallback logic. The TemplateForecaster delegates run_research to an instance of
-this class. AskNews output is summarized into an analyst briefing inline (it's
-the only provider that returns raw article text rather than LLM-written prose);
-all other providers pass through raw.
+Encapsulates provider selection, the primary provider's fallback ladder, caching, the
+diagnostics seam, and the per-question time budget. The TemplateForecaster delegates
+run_research to an instance of this class.
+
+The stages that are self-contained live in sibling modules as plain functions, called
+from here. The two that produce accounting RETURN it (a soft-fail reason, a
+``GapFillOutcome``) and this class owns the counters, which is what keeps the counters
+in one place while the stages stay callable without an orchestrator:
+
+* ``provider_fanout`` — running the selected providers under the research-phase deadline.
+* ``section_format`` — provider headers and heading levels in the assembled bundle.
+* ``asknews_summarization`` — the AskNews-only summarizer pass (it's the one provider
+  that returns raw article text rather than LLM-written prose; all others pass through).
+* ``gap_fill_stages`` — the two optional gap-fill passes and their budget accounting.
+* ``degradation_views`` — read-only views onto the research side's module counters,
+  re-exposed below as orchestrator attributes for the consumers that read them there.
 """
 
 import asyncio
 import logging
 import os
-import re
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from dataclasses import asdict
 
-import openai
 from forecasting_tools import GeneralLlm, SmartSearcher, clean_indents
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
@@ -24,9 +33,6 @@ from metaculus_bot.constants import (
     DEFAULT_MAX_CONCURRENT_RESEARCH,
     EXA_API_KEY_ENV,
     FINANCIAL_DATA_ENABLED_ENV,
-    GAP_FILL_ENABLED_ENV,
-    GAP_FILL_MIN_RESEARCH_CHARS,
-    GAP_FILL_V2_ENABLED_ENV,
     GEMINI_SEARCH_ENABLED_ENV,
     GEMINI_SEARCH_MODEL_ENV,
     NATIVE_SEARCH_ENABLED_ENV,
@@ -38,16 +44,14 @@ from metaculus_bot.constants import (
     PERPLEXITY_WALL_TIMEOUT,
     PREDICTION_MARKETS_ENABLED_ENV,
     RESOLUTION_SOURCE_ENABLED_ENV,
-    SUMMARIZER_WALL_TIMEOUT,
     TS_ANCHOR_ENABLED_ENV,
     env_flag_enabled,
 )
-from metaculus_bot.llm_retry import invoke_with_broad_retry, invoke_with_transient_retry
-from metaculus_bot.prompts import (
-    SUMMARIZER_SOFT_FAIL_BANNER,
-    TS_ANCHOR_SECTION_HEADER,
-    asknews_summarizer_prompt,
-)
+from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
+from metaculus_bot.llm_retry import invoke_with_transient_retry
+from metaculus_bot.research import degradation_views
+from metaculus_bot.research.asknews_summarization import summarize_asknews
+from metaculus_bot.research.gap_fill_stages import run_gap_fill_passes
 from metaculus_bot.research.provider_diagnostics import (
     SUCCEEDED_STATUSES,
     ProviderResult,
@@ -55,59 +59,24 @@ from metaculus_bot.research.provider_diagnostics import (
     pop_provider_detail,
     record_provider_detail,
 )
+from metaculus_bot.research.provider_fanout import _empty_provider, await_providers_within_deadline
 from metaculus_bot.research.providers import (
     ResearchCallable,
     choose_provider_with_name,
+    is_asknews_subscription_error,
     native_search_provider,
 )
+from metaculus_bot.research.section_format import _demote_inner_headings, assemble_provider_sections
 from metaculus_bot.time_budget import QuestionTimeBudget
+
+# ``_demote_inner_headings`` moved to section_format but is still imported from this
+# module path by callers outside the package; the re-export keeps that working (and
+# keeps the auto-formatter from stripping an otherwise-unused import).
+__all__ = ["ResearchOrchestrator", "_demote_inner_headings"]
 
 _PROVIDER_ERROR_MESSAGE_MAX_CHARS = 300
 
 logger = logging.getLogger(__name__)
-
-
-async def _empty_provider(_: MetaculusQuestion) -> str:
-    """Stand-in provider for a selection that produced nothing to run."""
-    return ""
-
-
-def _remaining_research_phase_s(time_budget: QuestionTimeBudget | None) -> float | None:
-    """Seconds the research phase may still spend, or None for unbounded.
-
-    ``None`` is both "this caller has no budget" and the value ``asyncio.wait`` /
-    ``asyncio.wait_for`` already take to mean "no timeout", so it passes straight
-    through to them without a sentinel translation.
-    """
-    if time_budget is None:
-        return None
-    return time_budget.research_phase_deadline_s()
-
-
-# Summarizer failures that legitimately soft-fail to the raw AskNews articles:
-# transient LLM-provider hiccups (``openai.APIError`` is the common base for
-# litellm's connection/timeout/rate-limit/service-unavailable wrappers) and
-# asyncio timeouts. Anything outside this set — a prompt-construction bug, an
-# AttributeError from a refactor, a credential-routing regression — is a real
-# bug and must propagate rather than silently degrade every forecast's research.
-_SUMMARIZER_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
-    asyncio.TimeoutError,
-    openai.APIError,
-)
-
-_LEADING_HEADING_RE = re.compile(r"^(#{1,2})(?=\s|$)", re.MULTILINE)
-
-
-def _demote_inner_headings(text: str) -> str:
-    """Shift any in-body h1/h2 heading down by two levels (h1→h3, h2→h4).
-
-    Provider headers are h2 (``_provider_header``). If an LLM-written body emits
-    its own h1/h2 (e.g. ``# Historical Context``), it sits at/above the provider
-    header and breaks the framework's ``report_sections_to_markdown``
-    renormalization, which degrades to the ugly ``[Hashtag]`` fallback. Demoting
-    keeps every provider header the minimum-level section.
-    """
-    return _LEADING_HEADING_RE.sub(lambda m: "##" + m.group(1), text)
 
 
 class ResearchOrchestrator:
@@ -181,114 +150,6 @@ class ResearchOrchestrator:
         self._research_budget_cut_seen.add(key)
         self.research_budget_cut_count += 1
 
-    @property
-    def prediction_market_degraded_count(self) -> int:
-        """Per-run Kalshi CATALOGUE fetch failures, read from the prediction-market
-        module counter and folded into the forecaster's alertable_count.
-
-        The prediction-market provider soft-fails internally (a lost catalogue pull still
-        returns whatever the venue-search channel found), so this sub-path failure never
-        raises and never bumps provider_failure_count. Reading the module counter here is
-        the only way it reddens CI (the 2026-07-25 hole where
-        research_provider_failures=0 while the path was dead). The property and marker
-        names predate the ranked pipeline, where the counter moved from the retired /series
-        index to the events catalogue — a strictly more load-bearing thing, since the
-        catalogue feeds both the settlement-source join and the fuzzy channel."""
-        from metaculus_bot.research.prediction_market import (
-            kalshi_catalogue_fetch_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
-        return kalshi_catalogue_fetch_failures()
-
-    @property
-    def prediction_market_source_loss_count(self) -> int:
-        """Per-run count of LOST prediction-market sources, read from the module
-        counter and folded into alertable_count.
-
-        A "source" is anything the snapshot depends on: one per venue whose
-        search/prefetch fan-out lost a sub-fetch, one per whole-provider failure, and
-        one each when the query author or the RANKING call comes back unusable. Those
-        last two are why this counts sources rather than venues — a dead ranker
-        degrades every venue's contribution without any venue going down. The
-        distinguishing detail is durable per-source in ``MarketSnapshot.sources``
-        (``ranking:error(...)`` vs ``polymarket:error(...)``), which rides the
-        published comment and the schema-v2 research archive; this scalar
-        deliberately stays one number.
-
-        Operator decision 2026-07-25: alert on ANY source loss, not only a total
-        blackout. The provider soft-fails every venue internally, so without this the
-        forecasters silently run on zero market data while CI stays green."""
-        from metaculus_bot.research.prediction_market import (
-            prediction_market_source_losses,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
-        return prediction_market_source_losses()
-
-    @property
-    def provider_degradation_count(self) -> int:
-        """Per-run count of ALERTABLE provider-degradation findings, folded into
-        alertable_count.
-
-        One finding per (signal, venue), over the two signals provider_health
-        defines: a declared liquidity field dead across 100% of the pool rows a
-        venue produced (``market_field_contract``), or a prefetch reporting success
-        while returning an empty catalogue (``catalogue_empty``). Each is a
-        100%-of-denominator conjunction over the whole run, so a single question
-        with no matching market stays silent — the denominators are a venue's own
-        pool rows and a catalogue's own size, never questions-in-a-run (prod runs
-        carry 1-2 questions, so a rate over those IS a per-question flag).
-
-        The first is the signal that would have caught Kalshi's liquidity labels
-        blank on 100% of rows for weeks in prod while every counter read zero; the
-        second closes its blind spot, since a catalogue that silently empties out
-        looks to it like a venue with nothing to say. A third rule (Signal B, a
-        venue contributing nothing while >=2 siblings answered) was deleted
-        2026-08-04 as unsound under ranked retrieval — see provider_health's module
-        docstring and FUTURE.md; the surviving cross-run intent is unjudgeable
-        inside one question.
-
-        Suppressed findings are excluded here but still logged in full and still
-        ride the PROVIDER_DEGRADATION marker (see
-        constants.provider_degradation_alerts_active)."""
-        from metaculus_bot.research.provider_health import (
-            provider_degradation_count,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
-        return provider_degradation_count()
-
-    def log_provider_degradation_summary(self) -> None:
-        """Emit the per-run PROVIDER_DEGRADATION marker + one WARN per finding.
-
-        Called from forecast_questions after publishing completes, alongside the
-        other end-of-run summaries. Fires even at zero findings — a measured zero is
-        a positive statement of provider health, the same reasoning behind
-        FORECASTERS_SURVIVED existing next to FORECASTER_DROPS."""
-        from metaculus_bot.research.provider_health import (
-            log_provider_degradation_summary,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
-        log_provider_degradation_summary()
-
-    def reset_run_degradation_counters(self) -> None:
-        """Zero per-run degradation counters at run start (called by
-        forecast_questions alongside reset_pchip_stats). The prediction-market
-        series and source-loss counters, and the provider-health observation store,
-        are module globals — resetting them here keeps them clean per-run metrics
-        instead of leaking across runs/tests that share a process. The
-        orchestrator's own instance counters are fresh per bot, so they need no
-        reset here."""
-        from metaculus_bot.research.prediction_market import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-            reset_series_degradation_counter,
-            reset_source_loss_counter,
-        )
-        from metaculus_bot.research.provider_health import (
-            reset_provider_health,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
-        reset_series_degradation_counter()
-        reset_source_loss_counter()
-        reset_provider_health()
-
     async def run_research(self, question: MetaculusQuestion, time_budget: QuestionTimeBudget | None = None) -> str:
         """Build one question's research bundle, inside its time budget if it has one.
 
@@ -324,150 +185,9 @@ class ResearchOrchestrator:
                 # _record_research_budget_cut).
                 self._record_research_budget_cut(question, fast_path=fast_path)
 
-            # Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
-            # CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
-            # is max(v1, v2), not the sum — v2's GAP_FILL_V2_WALL_DEADLINE fits
-            # inside v1's worst-case envelope only under this parallelism).
-            # Consequence: the v2 driver's brief sees the bundle WITHOUT v1's
-            # addendum. v2's section appends after v1's.
-            #
-            # Both are OPTIONAL, and they are the research phase's largest optional
-            # cost: v1's configured worst case is 555s (analyzer 135 + resolver wave
-            # 420) and v2 measures 84s at p50 / 293s at its observed max. So the
-            # fast path drops both — that is where the time for a thin window comes
-            # from, far more than provider selection.
-            gap_fill_budget_s = _remaining_research_phase_s(time_budget)
-            skip_optional_gap_fill = fast_path or (gap_fill_budget_s is not None and gap_fill_budget_s <= 0.0)
-            gap_fill_v1_active = (
-                env_flag_enabled(GAP_FILL_ENABLED_ENV)
-                and not skip_optional_gap_fill
-                and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
+            research, gap_fill_v2_payload = await self._run_gap_fill_passes(
+                question, research, fast_path=fast_path, time_budget=time_budget
             )
-            gap_fill_v2_active = env_flag_enabled(GAP_FILL_V2_ENABLED_ENV) and not skip_optional_gap_fill
-            if skip_optional_gap_fill and (
-                env_flag_enabled(GAP_FILL_ENABLED_ENV) or env_flag_enabled(GAP_FILL_V2_ENABLED_ENV)
-            ):
-                logger.warning(
-                    "GAP_FILL_SKIPPED_FOR_BUDGET: question=%s fast_path=%s research_phase_remaining=%s",
-                    getattr(question, "id_of_question", None),
-                    str(fast_path).lower(),
-                    "n/a" if gap_fill_budget_s is None else f"{gap_fill_budget_s:.0f}s",
-                )
-                self._record_research_budget_cut(question, fast_path=fast_path)
-            gap_fill_v2_payload: dict | None = None
-
-            if gap_fill_v1_active or gap_fill_v2_active:
-                # v1 and v2 import + run inside their own guards so each pass
-                # degrades independently: a v2 code defect (import error in the
-                # agentic package, unhandled raise) must never zero v1's
-                # addendum in prod, and vice versa. The single gather keeps the
-                # research-phase wall-clock at max(v1, v2), not the sum.
-                def _capture_gap_fill_v2(payload: dict) -> None:
-                    nonlocal gap_fill_v2_payload
-                    gap_fill_v2_payload = payload
-
-                async def _run_v1() -> str:
-                    if not gap_fill_v1_active:
-                        return ""
-                    try:
-                        from metaculus_bot.research.targeted import (
-                            run_gap_fill_pass,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-                        )
-
-                        # Bounded by whatever the research phase has left, so a pass
-                        # that overruns its own internal deadlines still cannot spend
-                        # the forecast's time.
-                        return await asyncio.wait_for(
-                            run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking),
-                            timeout=_remaining_research_phase_s(time_budget),
-                        )
-                    except asyncio.TimeoutError:
-                        # Its own branch (like v2's below) because it is not a failure:
-                        # falling into the generic except would log a traceback under
-                        # "stage failed" for a deliberate budget cut.
-                        logger.warning(
-                            "GAP_FILL_V1_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
-                            getattr(question, "id_of_question", None),
-                        )
-                        self._record_research_budget_cut(question, fast_path=fast_path)
-                        return ""
-                    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
-                        logger.exception("Gap-fill v1 stage failed; proceeding without it")
-                        return ""
-
-                def _count_gap_fill_v2_error(_exc: BaseException) -> None:
-                    # Bumped ONLY on a genuine v2 crash, never on an idle
-                    # "found nothing" run or a deadline hit. Three
-                    # mutually-exclusive crash paths, one bump each (no
-                    # double-count): (a) the loop-internal soft-fail — detected
-                    # post-gather via the archive payload's telemetry["error"];
-                    # (b) this seam's construction-error soft-fail — via
-                    # run_gap_fill_v2's on_error callback; (c) the import/escape
-                    # error in _run_v2's except — counted directly there. (a) and
-                    # (b) are exclusive because (b)'s error means the loop never
-                    # ran (no payload), and (c) is exclusive of both because the
-                    # seam swallows all Exception, so nothing escapes it once
-                    # construction succeeds.
-                    self.gap_fill_v2_error_count += 1
-
-                async def _run_v2() -> str:
-                    if not gap_fill_v2_active:
-                        return ""
-                    try:
-                        from metaculus_bot.research.agentic_gap_fill import (
-                            run_gap_fill_v2,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-                        )
-
-                        # Same research-phase bound as v1 above, on top of v2's own
-                        # GAP_FILL_V2_WALL_DEADLINE (which measures as never binding:
-                        # 0 of 103 triple-era records report deadline_hit).
-                        return await asyncio.wait_for(
-                            run_gap_fill_v2(
-                                question,
-                                research,
-                                is_benchmarking=self._is_benchmarking,
-                                archive_sink=_capture_gap_fill_v2,
-                                on_error=_count_gap_fill_v2_error,
-                            ),
-                            timeout=_remaining_research_phase_s(time_budget),
-                        )
-                    except asyncio.TimeoutError:
-                        # NOT a v2 crash: we cut it to protect the prediction POST, so
-                        # this must not bump gap_fill_v2_error_count (which exists to
-                        # redden CI on a dead v2 feature) — the budget decision is
-                        # alertable via research_budget_cut_count (fast-path questions
-                        # never reach here; gap-fill is skipped upstream for them).
-                        logger.warning(
-                            "GAP_FILL_V2_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
-                            getattr(question, "id_of_question", None),
-                        )
-                        self._record_research_budget_cut(question, fast_path=fast_path)
-                        return ""
-                    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
-                        logger.exception("Gap-fill v2 stage failed; proceeding without it")
-                        # Path (c): an import failure (or any escape past the
-                        # seam's own soft-fail) is a crash — count it directly
-                        # here since no payload/on_error fires on this path.
-                        self.gap_fill_v2_error_count += 1
-                        return ""
-
-                addendum, v2_findings = await asyncio.gather(_run_v1(), _run_v2())
-                # Path (a): the loop ran but hit its catch-all soft-fail. The
-                # loop swallows the crash and returns findings normally, so the
-                # only crash signal is the stamped telemetry["error"] on the
-                # archive payload. Checked here (not in _run_v2) so it can't
-                # double-count with the on_error/except paths above — those
-                # produce no payload with a non-None telemetry error.
-                if gap_fill_v2_payload is not None:
-                    v2_telemetry = gap_fill_v2_payload.get("telemetry")
-                    if isinstance(v2_telemetry, dict) and v2_telemetry.get("error") is not None:
-                        self.gap_fill_v2_error_count += 1
-                if addendum:
-                    research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
-                if v2_findings:
-                    # v2_findings carries its own "## Agentic Research Findings"
-                    # header (render_findings) — distinct from v1's section.
-                    research = f"{research}\n\n---\n\n{v2_findings}"
 
             gap_fill_used = "## Targeted Gap-Fill (second pass)" in research
 
@@ -488,30 +208,29 @@ class ResearchOrchestrator:
             self._store_research_cache(cache_key, research)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
 
-            if self._research_sink is not None:
-                if qid is not None:
-                    try:
-                        # provider_results is the authoritative per-provider outcome;
-                        # providers_used is kept only for legacy archive readers.
-                        self._research_sink(
-                            qid=qid,
-                            post_id=getattr(question, "id_of_post", None),
-                            page_url=question.page_url,
-                            question_text=question.question_text,
-                            research_text=research,
-                            providers_used=provider_names,
-                            gap_fill_used=gap_fill_used,
-                            provider_results=[asdict(r) for r in provider_results],
-                            providers_attempted=provider_names,
-                            providers_succeeded=[r.name for r in provider_results if r.status in SUCCEEDED_STATUSES],
-                            gap_fill_v2=gap_fill_v2_payload,
-                            provider_diagnostics_block=diagnostics_block,
-                            asknews_raw=asknews_raw,
-                        )
-                    except (
-                        Exception
-                    ):  # HARNESS-SCAN-EXEMPT-broad-except — archive write is best-effort; never blocks the forecast
-                        logger.exception("Research sink failed for qid=%d; continuing", qid)
+            if self._research_sink is not None and qid is not None:
+                try:
+                    # provider_results is the authoritative per-provider outcome;
+                    # providers_used is kept only for legacy archive readers.
+                    self._research_sink(
+                        qid=qid,
+                        post_id=getattr(question, "id_of_post", None),
+                        page_url=question.page_url,
+                        question_text=question.question_text,
+                        research_text=research,
+                        providers_used=provider_names,
+                        gap_fill_used=gap_fill_used,
+                        provider_results=[asdict(r) for r in provider_results],
+                        providers_attempted=provider_names,
+                        providers_succeeded=[r.name for r in provider_results if r.status in SUCCEEDED_STATUSES],
+                        gap_fill_v2=gap_fill_v2_payload,
+                        provider_diagnostics_block=diagnostics_block,
+                        asknews_raw=asknews_raw,
+                    )
+                except (
+                    Exception
+                ):  # HARNESS-SCAN-EXEMPT-broad-except — archive write is best-effort; never blocks the forecast
+                    logger.exception("Research sink failed for qid=%d; continuing", qid)
 
             return research
 
@@ -527,73 +246,6 @@ class ResearchOrchestrator:
         if qid is None:
             return ""
         return self._comment_diagnostics.pop(qid, "")
-
-    def _degraded_to_raw_articles(self, question: MetaculusQuestion, research: str, reason: str) -> str:
-        """Return the raw articles under a visible banner, counting the soft-fail.
-
-        Three destinations, because the loss was invisible in all three before
-        2026-07-26: the forecaster sees the banner in its research bundle, CI sees
-        ``summarizer_failures`` in the end-of-run degradation line, and the published
-        comment / research archive see a ``summarizer`` source loss on the AskNews
-        diagnostics line (whose ``status`` is computed from POST-summarizer text and
-        therefore still reads ``ok``).
-        """
-        self.summarizer_failure_count += 1
-        record_provider_detail(
-            getattr(question, "id_of_question", None),
-            "asknews",
-            {"sources": {"summarizer": f"error({reason})"}},
-        )
-        return f"{SUMMARIZER_SOFT_FAIL_BANNER}\n\n{research}"
-
-    async def _summarize_asknews(self, question: MetaculusQuestion, research: str) -> str:
-        """Compress raw AskNews article markdown into an analyst briefing.
-
-        Only AskNews output flows here — it's the one provider that returns raw
-        article text rather than LLM-written prose. Soft-fails to the raw input
-        (under a banner, see _degraded_to_raw_articles) so a summarizer hiccup never
-        drops the news entirely.
-        """
-        if not research.strip():
-            return research
-        # Real API-fetched questions always populate open_time; a missing value
-        # means broken upstream data and the forecaster prompts assert on it
-        # anyway (_forecasting_window_str), so fail loudly here too.
-        assert question.open_time is not None, "question.open_time is required for window-stamping"
-        # Prompt text lives in prompts.py (asknews_summarizer_prompt) so it shares
-        # the source-tier tag vocabulary with web_research_prompt.
-        prompt = asknews_summarizer_prompt(
-            question_text=question.question_text,
-            resolution_criteria=question.resolution_criteria or "",
-            fine_print=question.fine_print or "",
-            open_date=question.open_time.strftime("%Y-%m-%d"),
-            research=research,
-            # The MC ballot (None on other types): the relevance screen needs the candidate
-            # names to judge which articles bear on the resolution (q44952).
-            options=getattr(question, "options", None),
-        )
-        try:
-            # Broad retry under the TRANSIENT_RETRY_MAX_ELAPSED_S elapsed gate
-            # (SUMMARIZER_LLM is allowed_tries=1 in llm_configs.py): recovers a fast
-            # blip / empty-response while obeying the universal "don't retry a slow
-            # failure" deadline rule. Adds the wall-clock cap this call previously
-            # lacked. A slow/permanent failure still propagates to the soft-fail
-            # below (raw AskNews articles).
-            summary = await invoke_with_broad_retry(
-                lambda: self._summarizer_llm.invoke(prompt),
-                wall_timeout=SUMMARIZER_WALL_TIMEOUT,
-                label="asknews_summarizer",
-            )
-        except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
-            logger.warning(
-                "AskNews summarization failed (%s); using raw articles under a degradation banner",
-                type(exc).__name__,
-            )
-            return self._degraded_to_raw_articles(question, research, type(exc).__name__)
-        if not summary.strip():
-            logger.warning("AskNews summarization returned blank output; using raw articles under a banner")
-            return self._degraded_to_raw_articles(question, research, "blank_output")
-        return summary
 
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
         cache_key = getattr(question, "id_of_question", None)
@@ -641,7 +293,7 @@ class ResearchOrchestrator:
         reached 292 s against the primary's 110 s measured worst case
         (scratch/residual_2026-08-24/time_budget_design.md). Anything still
         straggling past the research window is cancelled by
-        ``_await_providers_within_deadline`` with its partial bundle kept.
+        ``await_providers_within_deadline`` with its partial bundle kept.
         """
         providers: list[tuple[ResearchCallable, str]] = []
 
@@ -659,8 +311,8 @@ class ResearchOrchestrator:
             )
 
         if not fast_path and env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
-            from metaculus_bot.research.gemini_search import (
-                gemini_search_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            from metaculus_bot.research.gemini_search import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # gated google-genai provider
+                gemini_search_provider,
             )
 
             gemini_model = os.getenv(GEMINI_SEARCH_MODEL_ENV)
@@ -672,29 +324,29 @@ class ResearchOrchestrator:
             )
 
         if env_flag_enabled(FINANCIAL_DATA_ENABLED_ENV):
-            from metaculus_bot.research.financial_data import (
-                financial_data_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            from metaculus_bot.research.financial_data import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # gated pandas/yfinance/fredapi provider
+                financial_data_provider,
             )
 
             providers.append((financial_data_provider(is_benchmarking=self._is_benchmarking), "financial_data"))
 
         if env_flag_enabled(TS_ANCHOR_ENABLED_ENV):
-            from metaculus_bot.research.timeseries_anchor import (
-                timeseries_anchor_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            from metaculus_bot.research.timeseries_anchor import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # gated numpy/pandas provider
+                timeseries_anchor_provider,
             )
 
             providers.append((timeseries_anchor_provider(is_benchmarking=self._is_benchmarking), "timeseries_anchor"))
 
         if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
-            from metaculus_bot.research.prediction_market import (
-                prediction_market_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            from metaculus_bot.research.prediction_market import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # gated rapidfuzz/aiohttp provider
+                prediction_market_provider,
             )
 
             providers.append((prediction_market_provider(is_benchmarking=self._is_benchmarking), "prediction_market"))
 
         if env_flag_enabled(RESOLUTION_SOURCE_ENABLED_ENV):
-            from metaculus_bot.research.resolution_source import (
-                resolution_source_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            from metaculus_bot.research.resolution_source import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # gated aiohttp/trafilatura provider
+                resolution_source_provider,
             )
 
             providers.append((resolution_source_provider(is_benchmarking=self._is_benchmarking), "resolution_source"))
@@ -704,16 +356,41 @@ class ResearchOrchestrator:
 
         return providers
 
+    def _failed_provider_result(self, name: str, exc: Exception, latency_ms: int) -> ProviderResult:
+        """Classify a provider that raised: ``inactive`` for expected off-season AskNews, else ``errored``.
+
+        Only ``errored`` bumps ``provider_failure_count`` (which reddens CI) and
+        feeds the deprecation matcher; an inactive subscription is a known
+        off-season state, not degradation.
+        """
+        if name == "asknews" and is_asknews_subscription_error(exc):
+            status = "inactive"
+            logger.info(
+                "Research provider %s inactive (expected off-season): %s: %s",
+                name,
+                type(exc).__name__,
+                exc,
+            )
+        else:
+            status = "errored"
+            self.provider_failure_count += 1
+            logger.warning(f"Research provider {name} failed ({type(exc).__name__}): {exc}")
+            _record_deprecation_if_matched(f"<provider:{name}>", str(exc))
+        return ProviderResult(
+            name=name,
+            status=status,
+            chars=0,
+            latency_ms=latency_ms,
+            error_type=type(exc).__name__,
+            error_message=str(exc)[:_PROVIDER_ERROR_MESSAGE_MAX_CHARS],
+        )
+
     async def _run_providers_parallel(
         self,
         question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
         time_budget: QuestionTimeBudget | None = None,
     ) -> tuple[str, list[ProviderResult], str]:
-        from metaculus_bot.research.providers import (
-            is_asknews_subscription_error,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
         # Raw pre-summarization AskNews article text, captured for the research
         # archive (2026-07-18 audit hygiene: the archive otherwise stores only the
         # post-summarization briefing, so FETCH-vs-SUMMARIZE attribution and
@@ -775,154 +452,56 @@ class ResearchOrchestrator:
                 # the cancellation as status="deadline".
                 pop_provider_detail(qid, name)
                 raise
-            except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
+            except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
                 # Drain-and-discard any partial detail the provider recorded before
                 # raising: an errored result carries the error, not source detail,
                 # and a stale entry must not leak into a later same-key call.
                 pop_provider_detail(qid, name)
                 latency_ms = int((time.monotonic() - started) * 1000)
-                if name == "asknews" and is_asknews_subscription_error(e):
-                    status = "inactive"
-                    logger.info(
-                        "Research provider %s inactive (expected off-season): %s: %s",
-                        name,
-                        type(e).__name__,
-                        e,
-                    )
-                else:
-                    status = "errored"
-                    self.provider_failure_count += 1
-                    logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
-                    from metaculus_bot.fallback_openrouter import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-                        _record_deprecation_if_matched,
-                    )
+                return ("", self._failed_provider_result(name, e, latency_ms))
 
-                    _record_deprecation_if_matched(f"<provider:{name}>", str(e))
-                result = ProviderResult(
-                    name=name,
-                    status=status,
-                    chars=0,
-                    latency_ms=latency_ms,
-                    error_type=type(e).__name__,
-                    error_message=str(e)[:_PROVIDER_ERROR_MESSAGE_MAX_CHARS],
-                )
-                return ("", result)
-
-        results = await self._await_providers_within_deadline(providers, _run_one, time_budget)
-
-        combined_parts = []
-        provider_results: list[ProviderResult] = []
-        for raw, provider_result in results:
-            provider_results.append(provider_result)
-            if raw and raw.strip():
-                # Label the section with whoever actually produced the text. On a
-                # fallback that is NOT provider_result.name (which keeps the primary's
-                # identity for the diagnostics line) — rendering Perplexity prose under
-                # "## News Articles (AskNews)" mislabelled the source in the published
-                # comment and in the archive.
-                header = self._provider_header(provider_result.fallback_provider or provider_result.name)
-                combined_parts.append(f"{header}\n{_demote_inner_headings(raw)}")
-
-        combined = "\n\n---\n\n".join(combined_parts) if combined_parts else ""
+        results = await await_providers_within_deadline(providers, _run_one, time_budget)
+        combined, provider_results = assemble_provider_sections(results)
         return combined, provider_results, asknews_raw_holder.get("text", "")
 
-    @staticmethod
-    async def _await_providers_within_deadline(
-        providers: list[tuple[ResearchCallable, str]],
-        run_one: Callable[[ResearchCallable, str], Coroutine[object, object, tuple[str, ProviderResult]]],
-        time_budget: QuestionTimeBudget | None,
-    ) -> list[tuple[str, ProviderResult]]:
-        """Run every provider concurrently, cancelling any still running at the deadline.
+    async def _summarize_asknews(self, question: MetaculusQuestion, research: str) -> str:
+        """Summarize raw AskNews articles, counting a soft-fail on the way through.
 
-        Replaces a bare ``asyncio.gather``, which had no outer bound at all: each
-        provider carries its own wall timeout, but the PHASE carried none, so one
-        provider whose internal timeout failed to fire could hold the question past
-        its close with nothing to stop it. Stragglers are cancelled and recorded as
-        ``status="deadline"``, so the partial bundle is used rather than lost and the
-        cut providers are named in the diagnostics block and the research archive.
-
-        A cancelled provider does NOT bump ``provider_failure_count``: it did not
-        fail, we stopped it. The budget decision is alertable instead through
-        ``research_budget_cut_count`` (bumped by the caller when any result comes
-        back ``status="deadline"`` off the fast path; fast-path questions are
-        already counted by the forecaster's ``time_budget_fast_path`` counter).
-        Keeping the two apart is what lets ``research_provider_failures`` keep
-        meaning "a provider broke".
-
-        With no budget (every caller outside the per-question pipeline) the wait is
-        unbounded and behavior is identical to the old gather.
+        ``summarize_asknews`` reports the degradation instead of counting it, so the
+        ``summarizer_failure_count`` the end-of-run degradation line reads is bumped
+        here. Kept as a method because it is the suite's class-level patch surface.
         """
-        if not providers:
-            # ``asyncio.gather()`` returned [] on an empty list; ``asyncio.wait(set())``
-            # raises. Selection always yields at least the "none" stub, so this is the
-            # direct-call path only.
-            return []
+        text, soft_fail_reason = await summarize_asknews(question, research, summarizer_llm=self._summarizer_llm)
+        if soft_fail_reason is not None:
+            self.summarizer_failure_count += 1
+        return text
 
-        tasks = [asyncio.create_task(run_one(provider, name), name=f"research:{name}") for provider, name in providers]
-        task_name = {task: name for task, (_, name) in zip(tasks, providers, strict=True)}
+    async def _run_gap_fill_passes(
+        self,
+        question: MetaculusQuestion,
+        research: str,
+        *,
+        fast_path: bool,
+        time_budget: QuestionTimeBudget | None,
+    ) -> tuple[str, dict | None]:
+        """Run both gap-fill passes and absorb their accounting into this bot's counters.
 
-        deadline_s = time_budget.research_phase_deadline_s() if time_budget is not None else None
-        _done, pending = await asyncio.wait(tasks, timeout=deadline_s, return_when=asyncio.ALL_COMPLETED)
-        for task in pending:
-            task.cancel()
-        if pending:
-            # Let the cancellations land so no "task was destroyed but it is pending"
-            # warning escapes into the run log.
-            await asyncio.wait(pending, timeout=2.0)
-            logger.warning(
-                "RESEARCH_PHASE_DEADLINE: cancelled %d/%d providers after %.0fs (%s)",
-                len(pending),
-                len(tasks),
-                deadline_s or 0.0,
-                ",".join(sorted(task_name.get(task, "unknown") for task in pending)),
-            )
-
-        # Provider order is the section order in the research bundle and the row order
-        # in the diagnostics block, so rebuild it from `providers` rather than from
-        # asyncio.wait's unordered sets.
-        results: list[tuple[str, ProviderResult]] = []
-        for task, (_, name) in zip(tasks, providers, strict=True):
-            if task in pending:
-                # Latency IS the deadline for a cancelled provider: every task starts
-                # at phase start, so one still running when the deadline lands ran for
-                # exactly that long.
-                results.append(
-                    (
-                        "",
-                        ProviderResult(
-                            name=name,
-                            status="deadline",
-                            chars=0,
-                            latency_ms=round((deadline_s or 0.0) * 1000),
-                        ),
-                    )
-                )
-                continue
-            exc = task.exception()
-            if exc is not None:
-                # _run_one converts every provider exception into a ProviderResult, so
-                # reaching here means the wrapper itself broke — a bug, not a provider
-                # failure, and it must not be swallowed into a fake result.
-                raise exc
-            results.append(task.result())
-        return results
-
-    @staticmethod
-    def _provider_header(name: str) -> str:
-        headers = {
-            "asknews": "## News Articles (AskNews)",
-            "native_search": "## Web Research (Native Search)",
-            "gemini_search": "## Web Research (Google Search via Gemini)",
-            "financial_data": "## Financial & Economic Data",
-            "timeseries_anchor": TS_ANCHOR_SECTION_HEADER,
-            "prediction_market": "## Prediction Market Snapshot",
-            "resolution_source": "## Resolution Source Snapshot",
-            "exa": "## Web Research (Exa)",
-            "perplexity": "## Web Research (Perplexity)",
-            "openrouter": "## Web Research (OpenRouter)",
-            "custom": "## Research (Custom)",
-        }
-        return headers.get(name, f"## Research ({name})")
+        ``gap_fill_stages`` returns what happened rather than counting it, so this is
+        the one place a v2 crash bumps ``gap_fill_v2_error_count`` and the one place a
+        budget cut reaches ``_record_research_budget_cut`` (whose per-question dedup and
+        fast-path suppression then apply once, however many stages were cut).
+        """
+        outcome = await run_gap_fill_passes(
+            question,
+            research,
+            fast_path=fast_path,
+            is_benchmarking=self._is_benchmarking,
+            time_budget=time_budget,
+        )
+        self.gap_fill_v2_error_count += outcome.v2_errors
+        if outcome.budget_cut:
+            self._record_research_budget_cut(question, fast_path=fast_path)
+        return outcome.research, outcome.v2_payload
 
     async def _fetch_research_with_fallback(
         self,
@@ -983,7 +562,7 @@ class ResearchOrchestrator:
         # expensive path). The primary selector orders by index quality, not cost,
         # which is why the two lists diverge by design.
         #
-        # The names returned here are the same keys ``_provider_header`` maps, so the
+        # The names returned here are the same keys ``provider_header`` maps, so the
         # section header follows the vendor automatically.
         try:
             if os.getenv(OPENROUTER_API_KEY_ENV):
@@ -995,7 +574,7 @@ class ResearchOrchestrator:
             if os.getenv(EXA_API_KEY_ENV):
                 logger.info("Falling back to Exa search for research")
                 return (await self._call_exa_smart_searcher(question_text), "exa")
-        except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except — best-effort fallback; logs and returns None so the primary error propagates
+        except Exception as fallback_exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except — best-effort fallback; logs and returns None so the primary error propagates
             logger.warning(f"Fallback research provider also failed: {type(fallback_exc).__name__}: {fallback_exc}")
         return (None, None)
 
@@ -1066,3 +645,25 @@ class ResearchOrchestrator:
             f"\n\nThe question is: {question_text}"
         )
         return await searcher.invoke(prompt)
+
+    # The research side's degradation counters live in ``degradation_views``, along with
+    # their long "why is this alertable" rationales; these five one-liners are the
+    # orchestrator-attribute surface forecaster.py / cli.py / degradation_counters.py
+    # read them through.
+    @property
+    def prediction_market_degraded_count(self) -> int:
+        return degradation_views.prediction_market_degraded_count()
+
+    @property
+    def prediction_market_source_loss_count(self) -> int:
+        return degradation_views.prediction_market_source_loss_count()
+
+    @property
+    def provider_degradation_count(self) -> int:
+        return degradation_views.provider_degradation_count()
+
+    def log_provider_degradation_summary(self) -> None:
+        degradation_views.log_provider_degradation_summary()
+
+    def reset_run_degradation_counters(self) -> None:
+        degradation_views.reset_run_degradation_counters()

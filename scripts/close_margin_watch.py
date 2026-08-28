@@ -138,7 +138,7 @@ def _render(summaries: list[WeekSummary], below_red: list[dict], skipped: int, r
             margin_h = f"{margin_s / 3600:.1f}" if isinstance(margin_s, (int, float)) else "n/a"
             print(
                 f"{week_key(rec.get('submitted_at')) or 'n/a':10s} "
-                f"{str(rec.get('qid')):>10s} {rec.get('margin_frac'):>12.4f} {margin_h:>10s}"
+                f"{rec.get('qid')!s:>10s} {rec.get('margin_frac'):>12.4f} {margin_h:>10s}"
             )
     else:
         print("\nNo questions under the red line.")

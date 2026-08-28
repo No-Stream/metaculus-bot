@@ -108,7 +108,7 @@ def _make_real_asknews_article(
     must all be present or `model_validate(...)` raises.
     """
     if pub_date is None:
-        pub_date = _dt.datetime(2026, 5, 12, 14, 0, tzinfo=_dt.timezone.utc)
+        pub_date = _dt.datetime(2026, 5, 12, 14, 0, tzinfo=_dt.UTC)
     return SearchResponseDictItem(
         article_url=cast(AnyUrl, article_url),  # pydantic coerces str → AnyUrl at construction
         article_id=uuid.uuid4(),
@@ -369,21 +369,21 @@ class TestAskNewsFormatterAgainstRealTypes:
             eng_title="Background article from a year ago",
             summary="Long-running context that frames the question.",
             article_url="https://example.com/news/historical-1",
-            pub_date=_dt.datetime(2025, 6, 1, 12, 0, tzinfo=_dt.timezone.utc),
+            pub_date=_dt.datetime(2025, 6, 1, 12, 0, tzinfo=_dt.UTC),
             source_id="Reuters",
         )
         hist_recent = _make_real_asknews_article(
             eng_title="More recent background article",
             summary="Slightly more recent piece that still belongs in historical.",
             article_url="https://example.com/news/historical-2",
-            pub_date=_dt.datetime(2026, 1, 15, 12, 0, tzinfo=_dt.timezone.utc),
+            pub_date=_dt.datetime(2026, 1, 15, 12, 0, tzinfo=_dt.UTC),
             source_id="AP",
         )
         hot = _make_real_asknews_article(
             eng_title="Breaking development today",
             summary="Hot off the press.",
             article_url="https://example.com/news/hot-1",
-            pub_date=_dt.datetime(2026, 5, 13, 9, 0, tzinfo=_dt.timezone.utc),
+            pub_date=_dt.datetime(2026, 5, 13, 9, 0, tzinfo=_dt.UTC),
             source_id="BBC",
         )
 
@@ -421,21 +421,21 @@ class TestAskNewsFormatterAgainstRealTypes:
             eng_title="Historical version of the same story",
             summary="Historical framing.",
             article_url=url,
-            pub_date=_dt.datetime(2026, 1, 1, 12, 0, tzinfo=_dt.timezone.utc),
+            pub_date=_dt.datetime(2026, 1, 1, 12, 0, tzinfo=_dt.UTC),
             source_id="HistoricalSource",
         )
         hot_dup = _make_real_asknews_article(
             eng_title="Hot version of the same story",
             summary="Hot framing of identical URL.",
             article_url=url,
-            pub_date=_dt.datetime(2026, 5, 13, 12, 0, tzinfo=_dt.timezone.utc),
+            pub_date=_dt.datetime(2026, 5, 13, 12, 0, tzinfo=_dt.UTC),
             source_id="HotSource",
         )
         hot_unique = _make_real_asknews_article(
             eng_title="Genuinely new hot article",
             summary="Different URL, retained.",
             article_url="https://example.com/news/unique-hot",
-            pub_date=_dt.datetime(2026, 5, 13, 13, 0, tzinfo=_dt.timezone.utc),
+            pub_date=_dt.datetime(2026, 5, 13, 13, 0, tzinfo=_dt.UTC),
             source_id="UniqueSource",
         )
 
@@ -522,8 +522,8 @@ class TestAskNewsSDKResponseShapeContract:
         sdk_cm.__aexit__ = AsyncMock(return_value=None)
 
         # Skip the 10-second sleeps in the provider — they're not under test here.
-        async def _no_sleep(_seconds: float) -> None:  # noqa: ASYNC124
-            return None  # noqa: ASYNC910
+        async def _no_sleep(_seconds: float) -> None:
+            return None
 
         with (
             patch("asknews_sdk.AsyncAskNewsSDK", return_value=sdk_cm),

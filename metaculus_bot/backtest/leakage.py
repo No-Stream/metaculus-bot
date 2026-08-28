@@ -34,7 +34,13 @@ async def screen_research_for_leakage(
     semaphore = asyncio.Semaphore(concurrency)
 
     tasks = [
-        _process_single_question(q, ground_truths[_question_id(q)], research_provider, detector_llm, semaphore)
+        _process_single_question(
+            q,
+            ground_truths[_question_id(q)],
+            research_provider=research_provider,
+            detector_llm=detector_llm,
+            semaphore=semaphore,
+        )
         for q in questions
     ]
     results = await asyncio.gather(*tasks)
@@ -68,6 +74,7 @@ async def screen_research_for_leakage(
 async def _process_single_question(
     question: MetaculusQuestion,
     ground_truth: GroundTruth,
+    *,
     research_provider: Any,
     detector_llm: GeneralLlm,
     semaphore: asyncio.Semaphore,
@@ -80,7 +87,7 @@ async def _process_single_question(
             # provider reads question.open_time / scheduled_resolution_time), which
             # silently no-op on a bare string.
             research_text = await research_provider(question)
-    except Exception:
+    except Exception:  # noqa: BLE001  # soft-fail boundary: any research-provider failure must not drop the question from the backtest
         logger.warning(f"Research failed for Q{qid}, keeping question without cached research")
         return (qid, None, False)
 
@@ -108,6 +115,6 @@ async def _check_single_question_leakage(
     try:
         response = await detector_llm.invoke(prompt)
         return response.strip().upper().startswith("YES")
-    except Exception:
+    except Exception:  # noqa: BLE001  # soft-fail boundary: a detector-LLM failure must not drop the question; keep it and let scoring see it
         logger.warning(f"Leakage check failed for Q{question.id_of_question}, conservatively keeping question")
         return False

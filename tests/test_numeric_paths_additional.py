@@ -4,6 +4,7 @@ Concise scenarios to increase confidence in complex numeric forecast flow.
 """
 
 from datetime import datetime, timedelta
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -55,23 +56,23 @@ def _make_forecaster():
 
 
 def _make_question(**overrides):
-    opts = dict(
-        open_upper_bound=False,
-        open_lower_bound=False,
-        upper_bound=100.0,
-        lower_bound=0.0,
-        zero_point=None,
-        id_of_question=4242,
-        question_text="num?",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-        unit_of_measure="units",
-        page_url="https://example/q/4242",
-        cdf_size=201,
-        open_time=_stub_open_time(),
-        scheduled_resolution_time=_stub_resolve_time(),
-    )
+    opts = {
+        "open_upper_bound": False,
+        "open_lower_bound": False,
+        "upper_bound": 100.0,
+        "lower_bound": 0.0,
+        "zero_point": None,
+        "id_of_question": 4242,
+        "question_text": "num?",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+        "unit_of_measure": "units",
+        "page_url": "https://example/q/4242",
+        "cdf_size": 201,
+        "open_time": _stub_open_time(),
+        "scheduled_resolution_time": _stub_resolve_time(),
+    }
     opts.update(overrides)
     return SimpleNamespace(**opts)
 
@@ -98,6 +99,7 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
         for p, v in zip(
             [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
             [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
+            strict=False,
         )
     ]
 
@@ -118,7 +120,7 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
     # Fallback NumericDistribution returns a cdf that is monotone
     c = result.prediction_value.cdf  # type: ignore[attr-defined]
     probs = [p.percentile for p in c]
-    assert all(a <= b for a, b in zip(probs[:-1], probs[1:]))
+    assert all(a <= b for a, b in pairwise(probs))
 
 
 @pytest.mark.asyncio
@@ -133,6 +135,7 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
         for p, v in zip(
             [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
             [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            strict=False,
         )
     ]
 
@@ -148,7 +151,7 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
             raise AssertionError("Percentiles at indices are too close")
 
         @property
-        def cdf(self):  # noqa: D401
+        def cdf(self):
             return self.get_cdf()
 
     with (
@@ -190,6 +193,7 @@ async def test_smoothing_respects_open_bounds(mock_format, caplog):
             for p, v in zip(
                 [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
                 [0, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 100],
+                strict=False,
             )
         ]
         with (
@@ -226,6 +230,7 @@ async def test_numeric_percentile_set_validation():
         for p, v in zip(
             [0.01, 0.03, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
             [1, 3, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
+            strict=False,
         )
     ]
 
@@ -245,9 +250,9 @@ async def test_numeric_percentile_set_validation():
             "metaculus_bot.forecaster_runners.extract_numeric",
             new=AsyncMock(return_value=ExtractionOutcome(value=bad, rung="block", block_present=True)),
         ),
+        pytest.raises(ValidationError),
     ):
-        with pytest.raises(ValidationError):
-            await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
+        await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
 
 @pytest.mark.asyncio
@@ -266,6 +271,7 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
         for p, v in zip(
             [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
             [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
+            strict=False,
         )
     ]
 
@@ -279,7 +285,7 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
         await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
     # Capture the call arguments to ensure zero_point=None was used
-    args, kwargs = mock_generate.call_args
+    _args, kwargs = mock_generate.call_args
     assert kwargs.get("zero_point", "sentinel") is None
 
 
@@ -314,7 +320,7 @@ def test_lower_bound_adjacent_cluster(caplog):
 
     vals = [p.value for p in adjusted]
     assert all(q.lower_bound <= v <= q.upper_bound for v in vals)
-    assert all(b > a for a, b in zip(vals, vals[1:])), vals
+    assert all(b > a for a, b in pairwise(vals)), vals
     msgs = [rec.message for rec in caplog.records]
     assert any("Cluster spread applied" in m for m in msgs)
     assert any("Corrected numeric distribution" in m for m in msgs)
@@ -353,4 +359,5 @@ async def test_binary_parse_additional_instructions_capture():
 
     ai = seen.get("prompt_notes", "")
     assert "decimal in [0,1]" in ai
-    assert "NN%" in ai and "NN/100" in ai
+    assert "NN%" in ai
+    assert "NN/100" in ai

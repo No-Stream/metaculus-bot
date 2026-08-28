@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import patch
 
@@ -270,7 +270,7 @@ class TestFetchMarketSnapshot:
             async def invoke(self, prompt: str) -> str:
                 if _RANKER_CUE in prompt:
                     raise exception_factory()
-                return _AUTHOR_JSON  # noqa: ASYNC910
+                return _AUTHOR_JSON
 
         handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
         with (
@@ -399,8 +399,8 @@ class TestFetchMarketSnapshot:
         at as_of=B. The provider path passes None, which is finally what makes this cache
         hittable — the old `datetime.now(utc)` default changed the key on every call."""
         handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
-        as_of_a = datetime(2026, 5, 1, tzinfo=timezone.utc)
-        as_of_b = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        as_of_a = datetime(2026, 5, 1, tzinfo=UTC)
+        as_of_b = datetime(2026, 6, 1, tzinfo=UTC)
 
         await _fetch(mock_question, handlers, as_of=as_of_a)
         await _fetch(mock_question, handlers, as_of=as_of_b)
@@ -421,13 +421,13 @@ class TestFetchMarketSnapshot:
         snapshot computed at the wrong `as_of`.
         """
         naive = datetime(2026, 8, 4, 12, 0, 0)
-        utc = datetime(2026, 8, 4, 12, 0, 0, tzinfo=timezone.utc)
+        utc = datetime(2026, 8, 4, 12, 0, 0, tzinfo=UTC)
         offset = datetime(2026, 8, 4, 5, 0, 0, tzinfo=timezone(timedelta(hours=-7)))
 
         keys = {pmp._as_of_cache_key(moment) for moment in (naive, utc, offset)}
         assert len(keys) == 1, f"one instant must yield one key; got {keys}"
         assert pmp._as_of_cache_key(None) == "none"
-        assert pmp._as_of_cache_key(utc) != pmp._as_of_cache_key(datetime(2026, 8, 4, 13, tzinfo=timezone.utc))
+        assert pmp._as_of_cache_key(utc) != pmp._as_of_cache_key(datetime(2026, 8, 4, 13, tzinfo=UTC))
 
     @pytest.mark.asyncio
     async def test_an_explicit_as_of_filters_the_pool_before_the_ranker_sees_it(self, mock_question):
@@ -457,9 +457,7 @@ class TestFetchMarketSnapshot:
             captured.append(prompt)
             return _rank_one_per_venue(prompt)
 
-        snapshot = await _fetch(
-            mock_question, handlers, ranking=_capture, as_of=datetime(2026, 5, 1, tzinfo=timezone.utc)
-        )
+        snapshot = await _fetch(mock_question, handlers, ranking=_capture, as_of=datetime(2026, 5, 1, tzinfo=UTC))
 
         assert "kalshi" not in {row.platform for row in snapshot.matches}
         assert not any("KXSTAR-PAST" in prompt or "reach orbit in 2026" in prompt for prompt in captured)
@@ -568,7 +566,8 @@ class TestFetchMarketSnapshot:
         expected = ",".join(f"{venue}:{index}@{rank}" for rank, (venue, index) in enumerate(first_of.items()))
 
         assert f"rendered={expected}" in line, line
-        assert len(first_of) > 1 and any(index > 0 for index in first_of.values()), (
+        assert len(first_of) > 1
+        assert any(index > 0 for index in first_of.values()), (
             f"the fixture must span several venue blocks so a nonzero index is under test; got {first_of}"
         )
 
@@ -749,8 +748,8 @@ class TestAFamilyReachesTheForecasterWhole:
         # And the whole ladder plus the instruction for reading it land in ONE forecaster prompt. The
         # render half is what makes the distribution available; the prompt sentence is what stops a model
         # reading one bracket as an equality constraint on a tail (the q45189 failure).
-        question.open_time = datetime.now(timezone.utc) - timedelta(days=30)
-        question.scheduled_resolution_time = datetime.now(timezone.utc) + timedelta(days=120)
+        question.open_time = datetime.now(UTC) - timedelta(days=30)
+        question.scheduled_resolution_time = datetime.now(UTC) + timedelta(days=120)
         prompt = binary_prompt(question, research=research)
 
         for label, _ in self._BRACKETS:

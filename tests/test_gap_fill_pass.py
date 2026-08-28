@@ -488,7 +488,7 @@ async def test_analyzer_timeout_returns_empty() -> None:
 
     fake_search = AsyncMock()
     with (
-        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(side_effect=asyncio.TimeoutError())),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(side_effect=TimeoutError())),
         _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")

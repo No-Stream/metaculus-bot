@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 import pytest
@@ -755,10 +755,11 @@ class TestInterpolatePitOutOfGrid:
     grid the PIT must come off the members' declared-percentile curves instead.
     """
 
-    _LOWER, _UPPER = 100.0, 200.0
+    _LOWER: ClassVar[float] = 100.0
+    _UPPER: ClassVar[float] = 200.0
     # 90% of the mass below the open lower bound (F(100) = 0.90), like q44218's 0.9168.
-    _CDF = list(np.linspace(0.90, 0.975, 201))
-    _PERCENTILES = {
+    _CDF: ClassVar[list[float]] = list(np.linspace(0.90, 0.975, 201))
+    _PERCENTILES: ClassVar[dict[str, list[list[float]]]] = {
         "model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]],
         "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
     }
@@ -873,7 +874,7 @@ class TestDeclaredPercentileCurveTolerance:
     surviving curves or fall back to the grid read.
     """
 
-    _GOOD = [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]]
+    _GOOD: ClassVar[list[list[float]]] = [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]]
 
     def test_non_numeric_declared_value_drops_only_that_curve(self):
         # A percentile line that parsed to a non-number: the median is taken over the
@@ -941,21 +942,29 @@ class TestMaxStepClampScreen:
     discrete that legitimately holds a 0.2 bin must NOT fire."""
 
     # 11-point integer grid; steps[1] (the [1, 2] bin) is exactly 0.20.
-    _GRID = [float(v) for v in range(11)]
-    _CDF = [0.0, 0.05, 0.25, 0.45, 0.65, 0.85, 0.90, 0.93, 0.96, 0.98, 1.0]
+    _GRID: ClassVar[list[float]] = [float(v) for v in range(11)]
+    _CDF: ClassVar[list[float]] = [0.0, 0.05, 0.25, 0.45, 0.65, 0.85, 0.90, 0.93, 0.96, 0.98, 1.0]
     # Both members concentrate ~0.70 of their mass on the [1, 2] bin. Curves are
     # 11-ANCHOR on purpose: the screen now drops any member under
     # MIN_SCOREABLE_ANCHORS, because its verdict turns on the MINIMUM member bin mass
     # and a 3-anchor interpolation across one bin is not the declared distribution.
-    _LABELS = [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0]
-    _MEMBERS = {
+    _LABELS: ClassVar[list[float]] = [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0]
+    _MEMBERS: ClassVar[dict[str, list[list[float]]]] = {
         "model-a": [
             [label, value]
-            for label, value in zip(_LABELS, [0.90, 1.00, 1.15, 1.30, 1.45, 1.55, 1.70, 1.85, 2.00, 2.30, 2.60])
+            for label, value in zip(
+                _LABELS,
+                [0.90, 1.00, 1.15, 1.30, 1.45, 1.55, 1.70, 1.85, 2.00, 2.30, 2.60],
+                strict=True,
+            )
         ],
         "model-b": [
             [label, value]
-            for label, value in zip(_LABELS, [0.95, 1.05, 1.18, 1.32, 1.46, 1.56, 1.72, 1.90, 2.05, 2.35, 2.65])
+            for label, value in zip(
+                _LABELS,
+                [0.95, 1.05, 1.18, 1.32, 1.46, 1.56, 1.72, 1.90, 2.05, 2.35, 2.65],
+                strict=True,
+            )
         ],
     }
     _PRE_FIX_TS = "2026-06-11T00:00:00Z"
@@ -1004,6 +1013,7 @@ class TestMaxStepClampScreen:
                 for label, value in zip(
                     self._LABELS,
                     [99.90, 100.00, 100.15, 100.30, 100.45, 100.55, 100.70, 100.85, 101.00, 101.30, 101.60],
+                    strict=True,
                 )
             ],
             "model-b": [
@@ -1011,6 +1021,7 @@ class TestMaxStepClampScreen:
                 for label, value in zip(
                     self._LABELS,
                     [99.95, 100.05, 100.18, 100.32, 100.46, 100.56, 100.72, 100.90, 101.05, 101.35, 101.65],
+                    strict=True,
                 )
             ],
         }
@@ -1206,7 +1217,7 @@ class TestRescoreRecords:
     score VALUES are whatever the scorer computed when the file was written — a
     scorer fix never reaches previously-saved files. The checked-in q38991
     fixture is the real record that carried a linear-bucket numeric_log_score of
-    −193.29 for a month after the zero_point coercion fix, against a platform
+    -193.29 for a month after the zero_point coercion fix, against a platform
     spot_baseline_score of 165.54.
     """
 
@@ -1435,3 +1446,108 @@ class TestResolveNumericScoreInputsZeroPoint:
         inputs = resolve_numeric_record_to_score_inputs(self._record(50, 0.0, 100.0))
         assert inputs is not None
         assert inputs[3] == 50.0
+
+
+class TestGenerateReport:
+    """Pins the markdown skeleton of ``generate_report`` — the CLI's whole output.
+
+    Each section is gated on its own count, so an empty cut must leave no heading
+    behind, and the section ORDER (binary, per-model, numeric, MC) is what a reader
+    diffs across residual rounds.
+    """
+
+    @staticmethod
+    def _mc_record(post_id: int, log_score: float) -> dict:
+        return {
+            "post_id": post_id,
+            "type": "multiple_choice",
+            "mc_log_score": log_score,
+            "resolution_parsed": "B",
+            "options": ["A", "B"],
+            "our_forecast_values": [0.3, 0.7],
+            "brier_score": None,
+            "log_score": None,
+            "numeric_log_score": None,
+            "per_model_forecasts": {},
+            "metadata": {"category": None},
+        }
+
+    def test_empty_dataset_renders_only_the_header(self):
+        report = performance_analysis.generate_report([])
+
+        assert report.splitlines()[0] == "# Performance Analysis Report"
+        assert "**Total questions:** 0" in report
+        assert "## Binary Questions" not in report
+        assert "## Per-Model Binary Scores" not in report
+        assert "## Numeric Questions" not in report
+        assert "## Multiple Choice Questions" not in report
+
+    def test_type_counts_are_listed_alphabetically(self):
+        data = [
+            _binary_record(1, 0.7, True),
+            self._mc_record(2, -0.5),
+            _numeric_record(3, list(np.linspace(0.0, 1.0, 201)), 50.0),
+        ]
+        report = performance_analysis.generate_report(data)
+
+        assert "**Total questions:** 3" in report
+        assert "- binary: 1" in report
+        assert "- multiple_choice: 1" in report
+        assert "- numeric: 1" in report
+        counts_block = report.split("**Total questions:** 3\n")[1].splitlines()[:3]
+        assert counts_block == ["- binary: 1", "- multiple_choice: 1", "- numeric: 1"]
+
+    def test_sections_appear_in_a_fixed_order(self):
+        data = [
+            _binary_record(1, 0.7, True, per_model={"model-a": "70.0%"}),
+            _binary_record(2, 0.2, False, per_model={"model-a": "20.0%"}),
+            self._mc_record(3, -0.5),
+            _numeric_record(4, list(np.linspace(0.0, 1.0, 201)), 50.0),
+        ]
+        report = performance_analysis.generate_report(data)
+
+        headings = [line for line in report.splitlines() if line.startswith("## ")]
+        assert headings == [
+            "## Binary Questions",
+            "## Per-Model Binary Scores",
+            "## Numeric Questions",
+            "## Multiple Choice Questions",
+        ]
+
+    def test_binary_section_carries_summary_lines_and_a_calibration_table(self):
+        data = [_binary_record(1, 0.7, True), _binary_record(2, 0.2, False)]
+        report = performance_analysis.generate_report(data)
+
+        assert "- Count: 2" in report
+        assert "- Mean Brier: 0.0650" in report
+        assert "- Direction Accuracy: 100.0%" in report
+        assert "- Base Rate: 50.0%" in report
+        assert "| Bucket | Predicted | Actual | Count |" in report
+
+    def test_per_model_section_lists_each_recovered_member(self):
+        data = [
+            _binary_record(1, 0.7, True, per_model={"model-a": "70.0%", "model-b": "60.0%"}),
+            _binary_record(2, 0.2, False, per_model={"model-a": "20.0%", "model-b": "30.0%"}),
+        ]
+        report = performance_analysis.generate_report(data)
+
+        assert "### Calibration" in report
+        assert "| model-a |" in report
+        assert "| model-b |" in report
+
+    def test_numeric_section_renders_ten_pit_histogram_bins(self):
+        data = [_numeric_record(1, list(np.linspace(0.0, 1.0, 201)), 50.0)]
+        report = performance_analysis.generate_report(data)
+
+        assert "### PIT Histogram" in report
+        assert "| 0.0-0.1 | 0 |" in report
+        assert "| 0.5-0.6 | 1 |" in report
+        assert sum(1 for line in report.splitlines() if line.startswith("| 0.")) == 10
+
+    def test_mc_section_reports_accuracy_and_mean_scores(self):
+        report = performance_analysis.generate_report([self._mc_record(1, -0.5)])
+
+        assert "## Multiple Choice Questions" in report
+        assert "- Accuracy (top pick correct): 100.0%" in report
+        assert "- Mean Prob on Correct: 0.70" in report
+        assert "- Mean MC Log Score: -0.50" in report

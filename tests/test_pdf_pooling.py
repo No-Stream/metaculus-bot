@@ -27,7 +27,7 @@ from tests.conftest import make_mock_numeric_question
 def _normal_cdf_on_grid(grid: np.ndarray, mean: float, sd: float) -> list[Percentile]:
     """Build a forecaster CDF (list[Percentile]) for N(mean, sd) sampled on a shared x-grid."""
     probs = norm.cdf(grid, loc=mean, scale=sd)
-    return [Percentile(value=float(x), percentile=float(p)) for x, p in zip(grid, probs)]
+    return [Percentile(value=float(x), percentile=float(p)) for x, p in zip(grid, probs, strict=True)]
 
 
 def _probs(cdf: list[Percentile]) -> np.ndarray:
@@ -53,7 +53,7 @@ def _vertical_average(cdfs: list[list[Percentile]]) -> list[Percentile]:
     vals = _values(cdfs[0])
     prob_matrix = np.array([_probs(c) for c in cdfs], dtype=float)
     mean_probs = np.maximum.accumulate(np.clip(prob_matrix.mean(axis=0), 0.0, 1.0))
-    return [Percentile(value=float(x), percentile=float(p)) for x, p in zip(vals, mean_probs)]
+    return [Percentile(value=float(x), percentile=float(p)) for x, p in zip(vals, mean_probs, strict=True)]
 
 
 def _assert_valid_cdf(
@@ -479,7 +479,7 @@ class TestNonStandardGridLength:
             _normal_cdf_on_grid(grid_a, mean=40.0, sd=10.0),
             _normal_cdf_on_grid(grid_b, mean=60.0, sd=10.0),
         ]
-        with pytest.raises(ValueError, match="same length|share one length|length"):
+        with pytest.raises(ValueError, match=r"same length|share one length|length"):
             log_pool_cdfs(mixed, question)
-        with pytest.raises(ValueError, match="same length|share one length|length"):
+        with pytest.raises(ValueError, match=r"same length|share one length|length"):
             vincentize_cdfs(mixed, question, method="mean")

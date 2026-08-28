@@ -83,7 +83,7 @@ async def test_template_forecaster_init_without_forecasters():
 
 @pytest.mark.asyncio
 async def test_template_forecaster_init_no_llms_provided():
-    with pytest.raises(ValueError, match="Either 'forecasters' or a 'default' LLM must be provided."):
+    with pytest.raises(ValueError, match=r"Either 'forecasters' or a 'default' LLM must be provided."):
         TemplateForecaster(llms=None)
 
 
@@ -174,7 +174,11 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
     assert bot._forecaster_with_soft_deadline.call_count == 2  # Called once for each forecaster
     # Trailing chart_b64 is None here (TS_ANCHOR_CHART_ENABLED off in the test env).
     bot._forecaster_with_soft_deadline.assert_any_call(
-        mock_binary_question, "mock research", mock_general_llm, mock_binary_question.id_of_question, None
+        mock_binary_question,
+        "mock research",
+        mock_general_llm,
+        qid=mock_binary_question.id_of_question,
+        chart_b64=None,
     )
     assert isinstance(result, ResearchWithPredictions)
     assert len(result.predictions) == 2
@@ -366,6 +370,7 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
         for v, p in zip(
             [0.25, 0.5, 1, 2, 4, 5, 6, 7, 8, 9, 9.5, 9.75, 9.9],
             [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99],
+            strict=True,
         )
     ]
     # Provide minimal numeric bounds attributes expected by NumericDistribution.from_question
@@ -465,7 +470,7 @@ async def test_forecaster_with_soft_deadline_times_out_and_bumps_counter(
     assert bot._forecasters_dropped_count == 0
     with pytest.raises(asyncio.TimeoutError):
         await bot._forecaster_with_soft_deadline(
-            mock_binary_question, "research", mock_general_llm, mock_binary_question.id_of_question
+            mock_binary_question, "research", mock_general_llm, qid=mock_binary_question.id_of_question
         )
     assert bot._forecasters_dropped_count == 1
 
@@ -540,7 +545,7 @@ async def test_min_forecasters_guard_reraises_exception_group_when_present(mock_
 
     bot._forecaster_with_soft_deadline = cast(Any, mixed_results)
 
-    with pytest.raises(ExceptionGroup) as exc_info:  # noqa: F821  # 3.11+ builtin
+    with pytest.raises(ExceptionGroup) as exc_info:  # 3.11+ builtin
         await bot._research_and_make_predictions(mock_binary_question)
 
     # The framework helper wraps the exception group with a prepended message

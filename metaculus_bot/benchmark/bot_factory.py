@@ -1,5 +1,10 @@
 """Configuration and helpers for assembling benchmark forecasting bots."""
 
+# ruff: noqa: ERA001
+# The commented-out MODEL_CATALOG / *_MODEL_SPECS entries below are a parked
+# roster of benchmark arms: uncommenting an entry is the intended way to add a
+# model to a sweep, so they stay in place rather than in git history.
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -186,8 +191,8 @@ __all__ = [
     "BENCHMARK_BOT_CONFIG",
     "DEFAULT_HELPER_LLMS",
     "INDIVIDUAL_MODEL_SPECS",
-    "MODEL_CONFIG",
     "MODEL_CATALOG",
+    "MODEL_CONFIG",
     "STACKING_MODEL_SPECS",
     "create_individual_bots",
     "create_stacking_bots",

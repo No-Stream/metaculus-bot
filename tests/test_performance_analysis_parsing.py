@@ -887,11 +887,13 @@ class TestParseResolution:
 
     def test_numeric_float(self):
         val, skip = parse_resolution("42.5", "numeric")
-        assert val == 42.5 and skip is False
+        assert val == 42.5
+        assert skip is False
 
     def test_numeric_above_upper(self):
         val, skip = parse_resolution("above_upper_bound", "numeric")
-        assert val == "above_upper_bound" and skip is False
+        assert val == "above_upper_bound"
+        assert skip is False
 
 
 # ---------------------------------------------------------------------------
@@ -957,7 +959,8 @@ class TestIterPerModelBlocks:
         # 1 stacker-meta entry + 2 base entries
         assert len(blocks) == 3
         assert blocks[0][2] is True  # stacker meta
-        assert blocks[1][2] is False and blocks[2][2] is False
+        assert blocks[1][2] is False
+        assert blocks[2][2] is False
         assert "stacker meta prose" in blocks[0][1]
         assert blocks[1][0] == "gpt-5.5"
         assert blocks[2][0] == "claude-opus-4.7"
@@ -1441,7 +1444,7 @@ _MANIFOLD_TRAILING_PERCENT_TRAP_LINE = (
 
 # A realistic STACKED multiple-choice bot comment carrying ALL FOUR new research
 # blocks. Section order mirrors the framework's unified layout
-# (# SUMMARY → ### Research Summary → # RESEARCH → # FORECASTS) and the
+# (SUMMARY, then Research Summary, then RESEARCH, then FORECASTS) and the
 # stacker-combined R1 body produced by combine_stacker_and_base_reasoning.
 _MC_COMMENT_WITH_NEW_RESEARCH_BLOCKS = f"""# SUMMARY
 *Question*: Which tier will the policy land in?

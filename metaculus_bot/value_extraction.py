@@ -53,7 +53,8 @@ import re
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Generic, Literal, TypeVar
+from itertools import pairwise
+from typing import Literal
 
 from forecasting_tools import BinaryPrediction, GeneralLlm, PredictedOptionList
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
@@ -80,7 +81,6 @@ from metaculus_bot.structured_parse import parse_structured
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
 Rung = Literal["block", "repair", "llm"]
 QuestionTypeStr = Literal["binary", "numeric", "multiple_choice"]
 
@@ -160,7 +160,7 @@ def _repair_infidelity_reason(candidate: str, repaired: str) -> str | None:
 
 
 @dataclass
-class ExtractionOutcome(Generic[T]):
+class ExtractionOutcome[T]:
     """A validated forecast value plus which ladder rung produced it."""
 
     value: T
@@ -169,7 +169,7 @@ class ExtractionOutcome(Generic[T]):
 
 
 @dataclass
-class _DeterministicHit(Generic[T]):
+class _DeterministicHit[T]:
     """A value recovered from ONE candidate body, plus the rung that produced it."""
 
     value: T
@@ -179,6 +179,7 @@ class _DeterministicHit(Generic[T]):
 def _log_extraction(
     qtype: QuestionTypeStr,
     rung: Rung,
+    *,
     block_present: bool,
     question_id: int | None,
     model_name: str,
@@ -193,7 +194,7 @@ def _log_extraction(
     )
 
 
-def _try_candidate(
+def _try_candidate[T](
     candidate: str,
     *,
     qtype: QuestionTypeStr,
@@ -264,7 +265,7 @@ def _try_candidate(
     return _DeterministicHit(value=value, rung="repair")
 
 
-async def _run_ladder(
+async def _run_ladder[T](
     *,
     text: str,
     qtype: QuestionTypeStr,
@@ -332,13 +333,13 @@ async def _run_ladder(
                 hit.rung,
                 " | ".join(failures),
             )
-        _log_extraction(qtype, hit.rung, block_present, question_id, model_name)
+        _log_extraction(qtype, hit.rung, block_present=block_present, question_id=question_id, model_name=model_name)
         return ExtractionOutcome(value=hit.value, rung=hit.rung, block_present=block_present)
 
     # --- Rung 3: LLM parser salvage ---------------------------------------
     try:
         value = validate(await llm_extract())
-    except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # terminal rung: fold ANY parser failure into the typed ladder error so callers see one exception type
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # terminal rung: fold ANY parser failure into the typed ladder error so callers see one exception type
         failures.append(f"llm: {type(exc).__name__}: {exc}")
     else:
         logger.warning(
@@ -350,7 +351,7 @@ async def _run_ladder(
             block_present,
             " | ".join(failures),
         )
-        _log_extraction(qtype, "llm", block_present, question_id, model_name)
+        _log_extraction(qtype, "llm", block_present=block_present, question_id=question_id, model_name=model_name)
         return ExtractionOutcome(value=value, rung="llm", block_present=block_present)
 
     # --- Rung 4: typed failure --------------------------------------------
@@ -450,7 +451,7 @@ def _validate_numeric(percentiles: list[Percentile]) -> list[Percentile]:
     non_finite = [(float(p.percentile), float(p.value)) for p in ordered if not math.isfinite(float(p.value))]
     if non_finite:
         raise ValueError(f"non-finite percentile value(s) {non_finite}")
-    for previous, current in zip(ordered, ordered[1:]):
+    for previous, current in pairwise(ordered):
         if float(current.value) < float(previous.value):
             raise ValueError(
                 f"value {float(current.value)} at percentile {float(current.percentile)} is below "
@@ -521,7 +522,8 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], Predi
         clamped = clamp_and_renormalize_probs([prob for _, prob in ordered])
         return PredictedOptionList(
             predicted_options=[
-                PredictedOption(option_name=name, probability=prob) for (name, _), prob in zip(ordered, clamped)
+                PredictedOption(option_name=name, probability=prob)
+                for (name, _), prob in zip(ordered, clamped, strict=True)
             ]
         )
 

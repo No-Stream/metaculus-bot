@@ -14,8 +14,10 @@ import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 import aiohttp
 
@@ -85,7 +87,7 @@ def parse_iso(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def parse_iso_guarded(value: Any) -> datetime | None:
@@ -106,9 +108,9 @@ def parse_iso_guarded(value: Any) -> datetime | None:
     if len(text) < 10 or text[4] != "-" or text[7] != "-":
         return None
     # Calendar-date field slices, not data sampling.
-    if not (text[:4].isdigit() and text[5:7].isdigit() and text[8:10].isdigit()):  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+    if not (text[:4].isdigit() and text[5:7].isdigit() and text[8:10].isdigit()):  # HARNESS-SCAN-EXEMPT-subsampling
         return None
-    return parse_iso(text) or parse_iso(text[:10])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+    return parse_iso(text) or parse_iso(text[:10])  # HARNESS-SCAN-EXEMPT-subsampling
 
 
 def settlement_sources(raw: Any) -> tuple[SettlementSource, ...]:
@@ -156,6 +158,43 @@ async def read_json_capped(resp: Any, label: str) -> Any | None:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class _RetryableStatus:
+    """One attempt's verdict when the status says "ask again": the status, and nothing else.
+
+    A sentinel rather than ``None`` because ``None`` is already the *give-up* answer a decoded
+    body can legitimately be, so the retry decision has to be a distinct type or the two collapse.
+    """
+
+    status: int
+
+
+async def _read_one_attempt(
+    session: Any,
+    url: str,
+    params: dict[str, str],
+    *,
+    client_timeout: aiohttp.ClientTimeout,
+    retryable: set[int],
+    label: str,
+) -> Any | None | _RetryableStatus:
+    """One GET: the parsed body, ``None`` on a non-retryable outcome, or a ``_RetryableStatus``.
+
+    Split out of ``http_get_with_backoff`` so the retry bookkeeping and the response reading are
+    each one level of nesting deep. One incidental improvement falls out: the response is released
+    when this returns, so a retryable status no longer holds it open across the backoff sleep.
+    """
+    async with session.get(url, params=params, timeout=client_timeout) as resp:
+        status = resp.status
+        if status in retryable or status >= 500:
+            return _RetryableStatus(status)
+        if status != 200:
+            snippet = await read_body_snippet(resp)
+            logger.warning(f"{label} HTTP {status} non-retryable: {snippet}")
+            return None
+        return await read_json_capped(resp, label)
+
+
 async def http_get_with_backoff(
     session: Any,
     url: str,
@@ -183,33 +222,29 @@ async def http_get_with_backoff(
 
     for attempt in range(max_attempts):
         try:
-            async with session.get(url, params=params, timeout=timeout) as resp:
-                status = resp.status
-                if status in retryable or status >= 500:
-                    if attempt + 1 >= max_attempts:
-                        logger.warning(f"{label} HTTP {status} after {attempt + 1} attempts; giving up")
-                        return None
-                    logger.warning(
-                        f"{label} HTTP {status}; retry {attempt + 2}/{max_attempts} "
-                        f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
-                    )
-                    await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
-                    continue
-                if status != 200:
-                    snippet = await read_body_snippet(resp)
-                    logger.warning(f"{label} HTTP {status} non-retryable: {snippet}")
-                    return None
-                return await read_json_capped(resp, label)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            outcome = await _read_one_attempt(
+                session, url, params, client_timeout=timeout, retryable=retryable, label=label
+            )
+        except (TimeoutError, aiohttp.ClientError) as exc:
             if attempt + 1 >= max_attempts:
                 logger.warning(f"{label} transient error after {attempt + 1} attempts: {exc}")
-                return None  # noqa: ASYNC910
+                return None
             logger.warning(
                 f"{label} transient error: {exc}; retry {attempt + 2}/{max_attempts} "
                 f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
             )
             await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
-    return None  # noqa: ASYNC910
+            continue
+        if not isinstance(outcome, _RetryableStatus):
+            return outcome
+        if attempt + 1 >= max_attempts:
+            logger.warning(f"{label} HTTP {outcome.status} after {attempt + 1} attempts; giving up")
+            return None
+        logger.warning(
+            f"{label} HTTP {outcome.status}; retry {attempt + 2}/{max_attempts} after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
+        )
+        await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
+    return None
 
 
 def flatten_results(results: Sequence[Any], platform: str) -> tuple[list[MarketMatch], _FetchTally]:

@@ -13,9 +13,10 @@ Workflow per batch (default 10 questions per ``claude -p`` invocation):
 1. Build a single multi-question prompt describing the redactor's role,
    showing per-qid {question, resolution criteria, ground truth, raw blob},
    and demanding strict JSON output.
-2. Spawn ``claude -p`` via ``asyncio.create_subprocess_exec`` with flags
-   that disable hooks, plugins, and tools entirely (``--bare``, no
-   ``--allowedTools``, ``--max-turns 1``). Send the prompt on stdin.
+2. Spawn ``claude -p`` via the shared driver in ``ablation.claude_cli``
+   (``--max-turns 1``, and deliberately neither ``--bare`` nor
+   ``--allowedTools`` — see ``claude_cli._build_argv`` for why). Send the
+   prompt on stdin.
 3. Parse the JSON, validate per-qid:
    - qid must be in the input batch (drop unknowns with a warning).
    - sanitized_blob must be non-empty.
@@ -38,12 +39,18 @@ import logging
 import re
 import secrets
 import subprocess
-from datetime import datetime
-from typing import Any, cast
+from datetime import UTC, datetime
 
 from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.ablation.cache import AblationCache
+from metaculus_bot.ablation.claude_cli import (
+    DEFAULT_CLAUDE_EXECUTABLE,
+    DEFAULT_TIMEOUT_SECONDS,
+    _build_argv,
+    _extract_inner_result,  # noqa: F401  # re-export: tests/test_ablation_prune.py imports prune._extract_inner_result
+    _run_claude_subprocess,
+)
 from metaculus_bot.backtest.scoring import GroundTruth
 
 __all__ = ["run_prune_for_qids", "verbatim_leak_check_passes"]
@@ -51,8 +58,6 @@ __all__ = ["run_prune_for_qids", "verbatim_leak_check_passes"]
 logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 10
-DEFAULT_TIMEOUT_SECONDS = 600
-DEFAULT_CLAUDE_EXECUTABLE = "claude"
 
 # Approximate cap on combined prompt + system-prompt characters before the
 # redactor invocation is expected to bust Claude's input context window. At
@@ -276,10 +281,10 @@ def _build_redactor_prompt(batch: list[tuple[MetaculusQuestion, GroundTruth, str
     parts.append("# Redactor batch task")
     parts.append("")
     parts.append(
-        "You are about to receive %d question(s). For each, the ground truth "
+        f"You are about to receive {len(batch)} question(s). For each, the ground truth "
         "is shown ONLY so you know what to redact. The ground truth MUST NOT "
         "appear anywhere in your sanitized output — not verbatim, not "
-        "paraphrased numerically, not case-shifted." % len(batch)
+        "paraphrased numerically, not case-shifted."
     )
     parts.append("")
     parts.append(
@@ -329,140 +334,15 @@ async def _invoke_claude_redactor(
 ) -> str:
     """Run ``claude -p`` headless with the redactor prompt on stdin; return stdout.
 
-    Flags:
-      -p / --print                 headless single-shot
-      --output-format text         plain text output (canonical pattern from a
-                                   sibling headless-Claude research harness; the
-                                   redactor's response IS JSON because we ask
-                                   for it in the prompt — we don't need an outer
-                                   JSON envelope wrapping it).
-      --max-turns 1                one shot
-      --permission-mode bypassPermissions   no permission prompts
-      --settings '{...}'           force-disable prompt-caching 1H beta (the
-                                   headless gateway rejects the
-                                   ``prompt-caching-2025-XX-XX`` beta header,
-                                   producing 400 invalid-beta-flag → exit 1).
-                                   Diagnosed 2026-05-06.
-      --append-system-prompt <s>   redactor system prompt
-
-    NOTE: we deliberately do NOT pass ``--bare``. The successful run #5 of this
-    pipeline DID use ``--bare`` but a follow-up run with the same flag set
-    failed — the precise cause is unclear, but the canonical pattern in that
-    sibling harness runs without ``--bare`` and is known to work for thousands
-    of headless invocations against the same gateway. Cargo-culting that
-    pattern.
-
-    Tools are NOT explicitly disabled here either — ``--max-turns 1`` already
-    constrains the model to one shot, and the system prompt instructs it to
-    output JSON only. Adding ``--allowedTools ""`` is a known-fragile flag in
-    non-interactive mode (per OpenRouter / Anthropic GitHub issues) and was the
-    only differing flag between run #5 (worked) and the latest failures —
-    dropping it.
+    Argv construction (including why we pass neither ``--bare`` nor
+    ``--allowedTools``) and the timeout/orphan-reap contract live in
+    ``ablation.claude_cli``.
 
     Raises ``subprocess.CalledProcessError`` on non-zero exit. Raises
     ``asyncio.TimeoutError`` if the subprocess exceeds ``timeout_seconds``.
     """
-    settings_json = json.dumps({"env": {"ENABLE_PROMPT_CACHING_1H": "0"}})
-    argv = [
-        claude_executable,
-        "-p",
-        "--output-format",
-        "text",
-        "--max-turns",
-        "1",
-        "--permission-mode",
-        "bypassPermissions",
-        "--settings",
-        settings_json,
-        "--append-system-prompt",
-        REDACTOR_SYSTEM_PROMPT,
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode("utf-8")),
-            timeout=timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        # asyncio.wait_for cancels the awaitable but does NOT terminate the
-        # underlying OS subprocess. Without proc.kill(), the orphan keeps
-        # running until the model finishes on its own. At 50q x 3 iterations
-        # the leaked FDs + process slots compound until fork() starts failing.
-        logger.warning(
-            "claude -p subprocess timeout (%ss); killing pid=%s",
-            timeout_seconds,
-            proc.pid,
-        )
-        proc.kill()
-        try:
-            # noqa: ASYNC120 — checkpoint inside except is intentional. We must
-            # await proc.wait() here to reap the killed child; the surrounding
-            # `raise` re-raises the original TimeoutError after cleanup. If the
-            # task itself is cancelled mid-await we still want the kill to have
-            # been issued (already done above), so the leak is bounded either
-            # way.
-            await asyncio.wait_for(proc.wait(), timeout=5.0)  # noqa: ASYNC120
-        except asyncio.TimeoutError:
-            logger.error("claude -p subprocess pid=%s refused SIGKILL within 5s", proc.pid)
-        raise
-
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(
-            returncode=proc.returncode if proc.returncode is not None else -1,
-            cmd=argv,
-            output=stdout_bytes,
-            stderr=stderr_bytes,
-        )
-
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-    return _extract_inner_result(stdout_text)
-
-
-def _extract_inner_result(stdout_text: str) -> str:
-    """Pull the inner ``result`` field out of ``claude -p --output-format json``.
-
-    Empirically (``claude --version 2.1.140``), ``claude -p --output-format json``
-    emits a JSON ARRAY of stream events, the last of which is the result envelope:
-    ``[{"type":"system",...}, {"type":"assistant",...}, {"type":"result", "result":"<text>", ...}]``.
-    Older versions (or future revisions) may emit a single dict envelope. Handle both:
-
-    * list of events → find the last ``{"type":"result"}`` entry, return its ``result`` field.
-    * dict envelope → return its ``result`` field.
-    * anything else (e.g. test stubs returning raw redactor JSON) → pass through unchanged.
-    """
-    stripped = stdout_text.strip()
-    if not stripped:
-        return stripped
-    try:
-        envelope: Any = json.loads(stripped)
-    except json.JSONDecodeError:
-        # Passthrough preserved for backwards compat with raw-JSON test stubs;
-        # log a warning so a Claude-CLI envelope-shape change doesn't surface
-        # as a misleading downstream parser error.
-        logger.warning(
-            "claude -p stdout was not parseable JSON; returning raw (first 200 chars: %r)",
-            stripped[:200],
-        )
-        return stripped
-    if isinstance(envelope, list):
-        for raw_event in reversed(envelope):
-            if not isinstance(raw_event, dict):
-                continue
-            event = cast(dict[str, Any], raw_event)
-            if event.get("type") == "result" and isinstance(event.get("result"), str):
-                return event["result"]
-        return stripped
-    if isinstance(envelope, dict):
-        env_dict = cast(dict[str, Any], envelope)
-        if "result" in env_dict and isinstance(env_dict["result"], str):
-            return env_dict["result"]
-    return stripped
+    argv = _build_argv(REDACTOR_SYSTEM_PROMPT, claude_executable=claude_executable)
+    return await _run_claude_subprocess(argv, prompt, timeout_seconds=timeout_seconds)
 
 
 def _parse_redactor_response(
@@ -477,7 +357,7 @@ def _parse_redactor_response(
     are dropped with a warning and excluded from the return dict.
     """
     expected_set = set(expected_qids)
-    out: dict[int, tuple[str, list[dict]] | None] = {qid: None for qid in expected_qids}
+    out: dict[int, tuple[str, list[dict]] | None] = dict.fromkeys(expected_qids)
 
     payload = json.loads(raw_stdout)
 
@@ -532,7 +412,7 @@ def _build_meta(
         "sanitized_chars": sanitized_chars,
         "redactions": redactions,
         "redactor_invocation_id": redactor_invocation_id,
-        "pruned_at": datetime.now().isoformat(),
+        "pruned_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -556,7 +436,7 @@ async def _write_redactor_failure_dump(
     artifact alongside the rest of the run's diagnostic output.
     """
     qid_label = str(qids[0]) if qids else "empty"
-    ts = int(datetime.now().timestamp())
+    ts = int(datetime.now(UTC).timestamp())
     failures_dir = cache.root / "redactor_failures"
     debug_path = failures_dir / f"batch_{qid_label}_{ts}.log"
 
@@ -579,6 +459,71 @@ async def _write_redactor_failure_dump(
     return str(debug_path)
 
 
+def _exception_stream_bytes(stream: bytes | str | None) -> bytes:
+    """Normalize a ``CalledProcessError`` stdout/stderr field to bytes."""
+    if stream is None:
+        return b""
+    return stream if isinstance(stream, bytes) else str(stream).encode()
+
+
+async def _report_redactor_subprocess_failure(
+    cache: AblationCache,
+    qids: list[int],
+    exc: subprocess.CalledProcessError,
+) -> None:
+    """Dump the full redactor output to disk and log the truncated streams.
+
+    ``CalledProcessError`` captures stderr in ``exc.stderr`` but Python's default
+    ``__str__`` only renders the argv. Surface the actual stderr bytes (decoded,
+    truncated) in the log AND dump the full stdout/stderr to a debug file under
+    the cache root so the result envelope (which often carries the real failure
+    detail) is diagnosable without re-running the subprocess.
+    """
+    stderr_bytes = _exception_stream_bytes(exc.stderr)
+    stdout_bytes = _exception_stream_bytes(exc.output)
+
+    debug_path = await _write_redactor_failure_dump(cache, qids, stderr_bytes, stdout_bytes)
+
+    logger.error(
+        "Redactor subprocess failed for qids=%s: exit=%s\n"
+        "(full output dumped to %s)\n"
+        "stderr (truncated): %s\nstdout (truncated): %s",
+        qids,
+        exc.returncode,
+        debug_path,
+        stderr_bytes.decode("utf-8", errors="replace")[:2000],
+        stdout_bytes.decode("utf-8", errors="replace")[:2000],
+    )
+
+
+def _persist_parsed_batch(
+    cache: AblationCache,
+    parsed: dict[int, tuple[str, list[dict]] | None],
+    raw_blobs: dict[int, str],
+) -> dict[int, tuple[str, dict]]:
+    """Write each successfully-redacted blob to cache and build its return entry.
+
+    One ``redactor_invocation_id`` is shared across the batch so a cached meta
+    record can be traced back to the ``claude -p`` call that produced it.
+    """
+    invocation_id = secrets.token_hex(8)
+    persisted: dict[int, tuple[str, dict]] = {}
+    for qid, result in parsed.items():
+        if result is None:
+            continue
+        sanitized_blob, redactions = result
+        meta = _build_meta(
+            qid=qid,
+            original_chars=len(raw_blobs[qid]),
+            sanitized_chars=len(sanitized_blob),
+            redactions=redactions,
+            redactor_invocation_id=invocation_id,
+        )
+        cache.write_pruned_research(qid=qid, sanitized_blob=sanitized_blob, meta=meta)
+        persisted[qid] = (sanitized_blob, {**meta, "cache_schema_version": 1})
+    return persisted
+
+
 async def _process_batch(
     batch: list[tuple[MetaculusQuestion, GroundTruth, str]],
     cache: AblationCache,
@@ -598,7 +543,7 @@ async def _process_batch(
     """
     await asyncio.sleep(0)
     qids = [_require_qid(q) for q, _gt, _blob in batch]
-    out: dict[int, tuple[str, dict] | None] = {qid: None for qid in qids}
+    out: dict[int, tuple[str, dict] | None] = dict.fromkeys(qids)
 
     prompt = _build_redactor_prompt(batch)
     total_prompt_chars = len(prompt) + len(REDACTOR_SYSTEM_PROMPT)
@@ -644,38 +589,13 @@ async def _process_batch(
             timeout_seconds=timeout_seconds,
         )
     except subprocess.CalledProcessError as exc:
-        # CalledProcessError captures stderr in `exc.stderr` but Python's default
-        # __str__ only renders the argv. Surface the actual stderr bytes (decoded,
-        # truncated) in the log AND dump the full stdout/stderr to a debug file
-        # under the cache root so the result envelope (which often carries the
-        # real failure detail) is diagnosable without re-running the subprocess.
-        stderr_bytes = b""
-        if exc.stderr is not None:
-            stderr_bytes = exc.stderr if isinstance(exc.stderr, bytes) else str(exc.stderr).encode()
-        stdout_bytes = b""
-        if exc.output is not None:
-            stdout_bytes = exc.output if isinstance(exc.output, bytes) else str(exc.output).encode()
-
-        debug_path = await _write_redactor_failure_dump(cache, qids, stderr_bytes, stdout_bytes)
-
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:2000]
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")[:2000]
-        logger.error(
-            "Redactor subprocess failed for qids=%s: exit=%s\n"
-            "(full output dumped to %s)\n"
-            "stderr (truncated): %s\nstdout (truncated): %s",
-            qids,
-            exc.returncode,
-            debug_path,
-            stderr_text,
-            stdout_text,
-        )
+        await _report_redactor_subprocess_failure(cache, qids, exc)
         return out
-    except asyncio.TimeoutError as exc:
-        logger.error("Redactor subprocess timed out for qids=%s: %s", qids, exc, exc_info=True)
+    except TimeoutError as exc:
+        logger.exception("Redactor subprocess timed out for qids=%s: %s", qids, exc)
         return out
     except Exception as exc:
-        logger.error("Redactor subprocess raised unexpected error for qids=%s: %s", qids, exc, exc_info=True)
+        logger.exception("Redactor subprocess raised unexpected error for qids=%s: %s", qids, exc)
         return out
 
     ground_truths = {_require_qid(q): gt for q, gt, _ in batch}
@@ -692,22 +612,7 @@ async def _process_batch(
         )
         return out
 
-    invocation_id = secrets.token_hex(8)
-    for qid, result in parsed.items():
-        if result is None:
-            continue
-        sanitized_blob, redactions = result
-        original_chars = len(raw_blobs[qid])
-        meta = _build_meta(
-            qid=qid,
-            original_chars=original_chars,
-            sanitized_chars=len(sanitized_blob),
-            redactions=redactions,
-            redactor_invocation_id=invocation_id,
-        )
-        cache.write_pruned_research(qid=qid, sanitized_blob=sanitized_blob, meta=meta)
-        out[qid] = (sanitized_blob, {**meta, "cache_schema_version": 1})
-
+    out.update(_persist_parsed_batch(cache, parsed, raw_blobs))
     return out
 
 

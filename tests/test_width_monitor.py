@@ -4,7 +4,7 @@ The coverage math is verified against hand-computed values on synthetic
 records with linear CDFs (so PIT = (resolution - lower) / (upper - lower)).
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -193,7 +193,8 @@ class TestJeffreysCi:
         mean, lo, hi = jeffreys_ci(3, 5)
         assert mean == pytest.approx(3.5 / 6.0, abs=1e-9)
         assert lo < mean < hi
-        assert 0.0 < lo and hi < 1.0
+        assert lo > 0.0
+        assert hi < 1.0
 
     def test_all_successes(self):
         mean, lo, hi = jeffreys_ci(10, 10)
@@ -284,8 +285,8 @@ class TestEraBoundariesAreMergeDates:
             provider + prompt clause + the ``TS_ANCHOR_ENABLED: 'true'`` yaml
             flip, all authored 2026-07-17, four days earlier.
         """
-        assert WIDENING_FLIP == datetime(2026, 5, 18, 17, 21, 19, tzinfo=timezone.utc)
-        assert TS_ANCHOR_ENABLE == datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+        assert datetime(2026, 5, 18, 17, 21, 19, tzinfo=UTC) == WIDENING_FLIP
+        assert datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC) == TS_ANCHOR_ENABLE
 
     def test_pre_merge_roster_record_is_not_in_post_merge_era(self):
         """A record that provably ran the retired 6-model roster cannot be in the
@@ -532,7 +533,8 @@ class TestUnderpoweredPointMetrics:
 
     def test_underpowered_flag_and_raw_values_survive_in_json(self):
         m = compute_era_metrics("test", [_record_with_pit(0.5)])
-        assert m is not None and m.underpowered is True
+        assert m is not None
+        assert m.underpowered is True
         d = m.to_dict()
         assert d["underpowered"] is True
         assert d["pit_std"] == pytest.approx(0.0)  # kept for scripts, hidden from readers
@@ -540,7 +542,8 @@ class TestUnderpoweredPointMetrics:
     def test_row_at_the_threshold_renders_numbers(self):
         recs = [_record_with_pit(p) for p in np.linspace(0.05, 0.95, MIN_N_FOR_POINT_METRICS)]
         m = compute_era_metrics("test", recs)
-        assert m is not None and m.underpowered is False
+        assert m is not None
+        assert m.underpowered is False
         cells = _row_cells(render_markdown(compute_all_eras(recs)), "all")
         assert cells[10] == f"{m.pit_std:.3f}"
         assert "n/a" not in cells[7:12]
@@ -590,7 +593,7 @@ class TestExcludeQids:
         201-grid ceiling misapplied to an 11-point grid. Receipts in
         `scratch/residual_2026-08-24/dossiers/43913_dossier.md`.
         """
-        assert KNOWN_BUG_QIDS == frozenset({"43746", "43747", "43913"})
+        assert frozenset({"43746", "43747", "43913"}) == KNOWN_BUG_QIDS
 
     def test_43913_drops_from_the_rows_it_was_added_for(self):
         # The reclassification is only worth anything if the id actually matches: the
@@ -724,7 +727,8 @@ class TestBandMissSplit:
     def test_split_discriminates_tight_from_miscentered_at_identical_cov80(self):
         tight = compute_era_metrics("tight", self._records(n_low=3, n_high=3, n_inside=14))
         miscentered = compute_era_metrics("miscentered", self._records(n_low=0, n_high=6, n_inside=14))
-        assert tight is not None and miscentered is not None
+        assert tight is not None
+        assert miscentered is not None
         # The point of the new column: cov80 is IDENTICAL between the two cases,
         # so no cov80-based read can tell them apart.
         assert tight.cov80 == pytest.approx(miscentered.cov80)

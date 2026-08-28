@@ -22,32 +22,38 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import subprocess
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.ablation.cache import AblationCache, atomic_write_text
+from metaculus_bot.ablation.claude_cli import (
+    DEFAULT_CLAUDE_EXECUTABLE,
+    DEFAULT_TIMEOUT_SECONDS,
+    _build_argv,
+    _extract_inner_result,  # noqa: F401  # re-export: tests/test_ablation_qa_iterate.py imports qa_iterate._extract_inner_result
+    _run_claude_subprocess,
+)
 from metaculus_bot.ablation.prune import verbatim_leak_check_passes
 from metaculus_bot.backtest.scoring import GroundTruth
 
 __all__ = [
-    "DEFAULT_LEAKAGE_THRESHOLD",
     "DEFAULT_FORECASTABILITY_THRESHOLD",
+    "DEFAULT_LEAKAGE_THRESHOLD",
     "DEFAULT_MAX_ITERATIONS",
-    "VERIFIER_SYSTEM_PROMPT",
     "RE_REDACTOR_SYSTEM_PROMPT",
-    "VerifierScore",
+    "VERIFIER_SYSTEM_PROMPT",
     "IterateOutcome",
-    "run_qa_iterate_for_qid",
-    "run_qa_iterate_batch",
+    "VerifierScore",
     "read_manual_rejects",
-    "write_manual_rejects",
     "render_qa_summary",
+    "run_qa_iterate_batch",
+    "run_qa_iterate_for_qid",
     "serialize_outcome",
+    "write_manual_rejects",
 ]
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -60,8 +66,6 @@ DEFAULT_LEAKAGE_THRESHOLD = 0.3
 # the strict-less-than convention is intentional, not an off-by-one. Pick
 # the threshold so this alignment is what you want.
 DEFAULT_FORECASTABILITY_THRESHOLD = 0.2
-DEFAULT_TIMEOUT_SECONDS = 600
-DEFAULT_CLAUDE_EXECUTABLE = "claude"
 
 FinalStatus = Literal["clean", "rejected_leakage", "rejected_forecastability"]
 
@@ -159,114 +163,6 @@ def serialize_outcome(outcome: IterateOutcome) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _settings_payload() -> str:
-    return json.dumps({"env": {"ENABLE_PROMPT_CACHING_1H": "0"}})
-
-
-def _build_argv(system_prompt: str, *, claude_executable: str = DEFAULT_CLAUDE_EXECUTABLE) -> list[str]:
-    return [
-        claude_executable,
-        "-p",
-        "--output-format",
-        "text",
-        "--max-turns",
-        "1",
-        "--permission-mode",
-        "bypassPermissions",
-        "--settings",
-        _settings_payload(),
-        "--append-system-prompt",
-        system_prompt,
-    ]
-
-
-async def _run_claude_subprocess(
-    argv: list[str],
-    prompt: str,
-    *,
-    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode("utf-8")),
-            timeout=timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        # asyncio.wait_for cancels the awaitable but does NOT terminate the
-        # underlying OS subprocess. Without proc.kill(), the orphan keeps
-        # running until the model finishes on its own. At 50q x 3 iterations
-        # the leaked FDs + process slots compound until fork() starts failing.
-        logger.warning(
-            "claude -p subprocess timeout (%ss); killing pid=%s",
-            timeout_seconds,
-            proc.pid,
-        )
-        proc.kill()
-        try:
-            # noqa: ASYNC120 — checkpoint inside except is intentional. We
-            # must await proc.wait() here to reap the killed child; the
-            # outer `raise` re-raises the original TimeoutError after
-            # cleanup. Bounded by an inner 5s timeout so a child that
-            # refuses SIGKILL doesn't pin us.
-            await asyncio.wait_for(proc.wait(), timeout=5.0)  # noqa: ASYNC120
-        except asyncio.TimeoutError:
-            logger.error("claude -p subprocess pid=%s refused SIGKILL within 5s", proc.pid)
-        raise
-
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(
-            returncode=proc.returncode if proc.returncode is not None else -1,
-            cmd=argv,
-            output=stdout_bytes,
-            stderr=stderr_bytes,
-        )
-
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-    return _extract_inner_result(stdout_text)
-
-
-def _extract_inner_result(stdout_text: str) -> str:
-    """Pull the inner ``result`` field if Claude emitted a JSON envelope.
-
-    Mirrors ``prune._extract_inner_result``: ``--output-format text`` usually
-    returns the raw model output, but some Claude builds wrap it in a stream
-    of typed events. Handle both.
-    """
-    stripped = stdout_text.strip()
-    if not stripped:
-        return stripped
-    try:
-        envelope: Any = json.loads(stripped)
-    except json.JSONDecodeError:
-        # Passthrough preserved for backwards compat with raw-JSON test stubs;
-        # log a warning so a Claude-CLI envelope-shape change doesn't surface
-        # as a misleading downstream parser error.
-        logger.warning(
-            "claude -p stdout was not parseable JSON; returning raw (first 200 chars: %r)",
-            stripped[:200],
-        )
-        return stripped
-    if isinstance(envelope, list):
-        for raw_event in reversed(envelope):
-            if not isinstance(raw_event, dict):
-                continue
-            event = cast(dict[str, Any], raw_event)
-            if event.get("type") == "result" and isinstance(event.get("result"), str):
-                return event["result"]
-        return stripped
-    if isinstance(envelope, dict):
-        env_dict = cast(dict[str, Any], envelope)
-        if "result" in env_dict and isinstance(env_dict["result"], str):
-            return env_dict["result"]
-    return stripped
-
-
 async def _invoke_verifier(
     prompt: str,
     *,
@@ -322,6 +218,7 @@ def _build_verifier_prompt(
 def _build_re_redactor_prompt(
     qid: int,
     question: MetaculusQuestion,
+    *,
     ground_truth: GroundTruth,
     sanitized_blob: str,
     verifier_notes: str,
@@ -436,6 +333,7 @@ async def run_qa_iterate_for_qid(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     leakage_threshold: float = DEFAULT_LEAKAGE_THRESHOLD,
     forecastability_threshold: float = DEFAULT_FORECASTABILITY_THRESHOLD,
+    claude_executable: str = DEFAULT_CLAUDE_EXECUTABLE,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> IterateOutcome:
     """Run the verify → re-redact loop for a single qid.
@@ -469,6 +367,7 @@ async def run_qa_iterate_for_qid(
         iteration += 1
         verifier_raw = await _invoke_verifier(
             _build_verifier_prompt(qid, question, blob),
+            claude_executable=claude_executable,
             timeout_seconds=timeout_seconds,
         )
         entry = _parse_verifier_response(verifier_raw, qid)
@@ -507,7 +406,10 @@ async def run_qa_iterate_for_qid(
             break
 
         re_redactor_raw = await _invoke_re_redactor(
-            _build_re_redactor_prompt(qid, question, ground_truth, blob, score.notes),
+            _build_re_redactor_prompt(
+                qid, question, ground_truth=ground_truth, sanitized_blob=blob, verifier_notes=score.notes
+            ),
+            claude_executable=claude_executable,
             timeout_seconds=timeout_seconds,
         )
         new_blob = _parse_re_redactor_response(re_redactor_raw, qid, ground_truth)
@@ -521,7 +423,7 @@ async def run_qa_iterate_for_qid(
                 "sanitized_chars": len(blob),
                 "redactions": [],
                 "redactor_invocation_id": f"qa_iterate_iter_{iteration}",
-                "pruned_at": datetime.now().isoformat(),
+                "pruned_at": datetime.now(UTC).isoformat(),
                 "qa_iterate_iteration": iteration,
             },
         )
@@ -556,9 +458,18 @@ async def run_qa_iterate_batch(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     leakage_threshold: float = DEFAULT_LEAKAGE_THRESHOLD,
     forecastability_threshold: float = DEFAULT_FORECASTABILITY_THRESHOLD,
+    claude_executable: str = DEFAULT_CLAUDE_EXECUTABLE,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     concurrency: int = 4,
 ) -> dict[int, IterateOutcome]:
-    """Run ``run_qa_iterate_for_qid`` over a batch under a semaphore."""
+    """Run ``run_qa_iterate_for_qid`` over a batch under a semaphore.
+
+    ``claude_executable`` / ``timeout_seconds`` are threaded through so the
+    subprocess knobs are reachable from a caller, matching ``prune``'s
+    ``run_prune_for_qids``. Without them the whole stage was pinned to the
+    ``claude_cli`` defaults and ``_invoke_verifier``'s own parameters were
+    dead outside the test suite.
+    """
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _one(qid: int, payload: dict[str, Any]) -> tuple[int, IterateOutcome]:
@@ -574,6 +485,8 @@ async def run_qa_iterate_batch(
                     max_iterations=max_iterations,
                     leakage_threshold=leakage_threshold,
                     forecastability_threshold=forecastability_threshold,
+                    claude_executable=claude_executable,
+                    timeout_seconds=timeout_seconds,
                 )
             except (KeyboardInterrupt, SystemExit, MemoryError, asyncio.CancelledError):
                 # System-level resource exhaustion / operator interrupts /
@@ -606,7 +519,7 @@ async def run_qa_iterate_batch(
 
     tasks = [_one(qid, payload) for qid, payload in inputs.items()]
     results = await asyncio.gather(*tasks)
-    return {qid: outcome for qid, outcome in results}
+    return dict(results)
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +560,7 @@ def write_manual_rejects(outcomes: list[IterateOutcome], path: Path) -> None:
         if outcome.qid in existing:
             continue
         existing[outcome.qid] = {
-            "rejected_at": datetime.now().isoformat(),
+            "rejected_at": datetime.now(UTC).isoformat(),
             "reason": outcome.reject_reason or outcome.final_status,
             "verifier_scores": [asdict(s) for s in outcome.verifier_scores],
             "iterations": outcome.iterations,

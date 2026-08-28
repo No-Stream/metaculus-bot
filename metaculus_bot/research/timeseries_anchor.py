@@ -119,7 +119,9 @@ def _maybe_stash_single_chart(
     only the plain level shape, where the ribbon reads cleanly — a derived MoM/monthly-avg
     band is on a different quantity than the level history this charts). Chart-render
     failures are swallowed so a plotting hiccup never breaks the text section — the chart
-    is a strict add-on and the caller's soft-fail only guards the text.
+    is a strict add-on and the caller's soft-fail only guards the text. An unimportable
+    chart module (matplotlib absent under --no-dev) degrades the same way but logs at
+    ERROR: that's a misconfigured flag flip affecting the whole run, not one question.
     """
     if not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
         return
@@ -148,11 +150,25 @@ def _maybe_stash_single_chart(
     use_log = bool(np.all(y > 0.0))
     band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
 
-    from metaculus_bot.research.ts_chart import (
-        render_anchor_chart,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # matplotlib off the cold path
-    )
-
     as_of_ts = pd.Timestamp(as_of).tz_localize(None) if pd.Timestamp(as_of).tzinfo else pd.Timestamp(as_of)
+    try:
+        # Import inside the guard: matplotlib is a dev-only dependency, and the bot
+        # workflows install with --no-dev, so flipping the chart flag on in prod must
+        # degrade to the text-only anchor rather than kill the provider.
+        from metaculus_bot.research.ts_chart import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # matplotlib kept off the cold path
+            render_anchor_chart,
+        )
+    except ImportError as exc:  # HARNESS-SCAN-EXEMPT-defensive-fallback
+        # A missing chart module is a run-level misconfiguration (the flag is on but
+        # matplotlib isn't installed), not a per-question render hiccup — log it at
+        # ERROR so it stands out from the WARN below, then degrade to text-only.
+        logger.error(
+            "ts_anchor: chart module unavailable — matplotlib is dev-only and absent under "
+            "`uv sync --no-dev`, so no chart will attach for ANY question this run: %s",
+            exc,
+        )
+        return
+
     try:
         _session_charts[qid] = render_anchor_chart(
             charted,
@@ -177,7 +193,7 @@ def _finite_bound(v: float) -> bool:
 
 
 def _band_misses_bounds(question: NumericQuestion, band: tuple[float, float, float] | None) -> bool:
-    """Generic units/magnitude backstop: True when the rendered P10–P90 band lies ENTIRELY
+    """Generic units/magnitude backstop: True when the rendered P10-P90 band lies ENTIRELY
     outside the question's displayed range — a gross mismatch (level-vs-derived, or a
     wrong-country CPI magnitude) meaning the anchor describes a different quantity than the
     one that resolves. Returns False when no band was rendered — nothing to check.
@@ -231,7 +247,7 @@ def build_anchor_section(question: NumericQuestion, as_of: datetime) -> str:
 
     if route.kind == "spread":
         return _build_spread_anchor_section(question, route, ceiling, calendar_days)
-    return _build_single_anchor_section(question, route, as_of, ceiling, calendar_days)
+    return _build_single_anchor_section(question, route, as_of, ceiling=ceiling, calendar_days=calendar_days)
 
 
 def _build_spread_anchor_section(question: NumericQuestion, route: _Route, ceiling: date, calendar_days: int) -> str:
@@ -261,7 +277,7 @@ def _build_spread_anchor_section(question: NumericQuestion, route: _Route, ceili
 
 
 def _build_single_anchor_section(
-    question: NumericQuestion, route: _Route, as_of: datetime, ceiling: date, calendar_days: int
+    question: NumericQuestion, route: _Route, as_of: datetime, *, ceiling: date, calendar_days: int
 ) -> str:
     """Fetch one series, render it, and apply both no-payload-no-section guards."""
     series = fetch_series(route.spec, ceiling, lookback_years=TS_ANCHOR_LOOKBACK_YEARS)
@@ -335,9 +351,9 @@ def timeseries_anchor_provider(is_benchmarking: bool = False) -> ResearchCallabl
 
     async def _fetch(question: MetaculusQuestion) -> str:
         if not env_flag_enabled(TS_ANCHOR_ENABLED_ENV):
-            return ""  # noqa: ASYNC910
+            return ""
         if not isinstance(question, NumericQuestion):
-            return ""  # noqa: ASYNC910
+            return ""
 
         if is_benchmarking:
             open_time = getattr(question, "open_time", None)
@@ -346,7 +362,7 @@ def timeseries_anchor_provider(is_benchmarking: bool = False) -> ResearchCallabl
                     "ts_anchor: is_benchmarking but qid=%s has no open_time; skipping (leakage-safe)",
                     getattr(question, "id_of_question", None),
                 )
-                return ""  # noqa: ASYNC910
+                return ""
             as_of = open_time
         else:
             as_of = datetime.now(UTC)
@@ -354,16 +370,16 @@ def timeseries_anchor_provider(is_benchmarking: bool = False) -> ResearchCallabl
         qid = getattr(question, "id_of_question", None)
         cache_key = (qid, _as_of_iso(as_of)) if qid is not None else None
         if cache_key is not None and cache_key in _SECTION_CACHE:
-            return _SECTION_CACHE[cache_key]  # noqa: ASYNC910
+            return _SECTION_CACHE[cache_key]
 
         try:
             section = await asyncio.wait_for(
                 asyncio.to_thread(build_anchor_section, question, as_of),
                 timeout=TS_ANCHOR_TIMEOUT,
             )
-        except (FetchError, ValueError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, FetchError, ValueError) as exc:
             logger.warning("ts_anchor: soft-fail for qid=%s (%s): %s", qid, type(exc).__name__, exc)
-            return ""  # noqa: ASYNC910
+            return ""
 
         if cache_key is not None:
             _SECTION_CACHE[cache_key] = section

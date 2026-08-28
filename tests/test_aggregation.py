@@ -47,11 +47,17 @@ async def test_numeric_aggregation_configurable():
     # `dist1` is a uniform distribution.
     # `dist2` is skewed towards the upper bound.
     x_axis = [p * 100 for p in np.linspace(0, 1, 11) if 0 < p < 1]
-    dist1_percentiles = [Percentile(value=v, percentile=p) for v, p in zip(x_axis, np.linspace(0, 1, 11)[1:-1])]
-    dist2_percentiles = [Percentile(value=v, percentile=p**0.5) for v, p in zip(x_axis, np.linspace(0, 1, 11)[1:-1])]
+    dist1_percentiles = [
+        Percentile(value=v, percentile=p) for v, p in zip(x_axis, np.linspace(0, 1, 11)[1:-1], strict=False)
+    ]
+    dist2_percentiles = [
+        Percentile(value=v, percentile=p**0.5) for v, p in zip(x_axis, np.linspace(0, 1, 11)[1:-1], strict=False)
+    ]
 
     # Third distribution: quadratic skew towards lower bound.
-    dist3_percentiles = [Percentile(value=v, percentile=p**2) for v, p in zip(x_axis, np.linspace(0, 1, 11)[1:-1])]
+    dist3_percentiles = [
+        Percentile(value=v, percentile=p**2) for v, p in zip(x_axis, np.linspace(0, 1, 11)[1:-1], strict=False)
+    ]
 
     common_args = {
         "open_lower_bound": question.open_lower_bound,
@@ -135,7 +141,7 @@ _BASE_VALUES = [50.0, 90.0, 130.0, 180.0, 280.0, 420.0, 500.0, 580.0, 720.0, 830
 
 
 def _declared(values: list[float]) -> list[Percentile]:
-    return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values)]
+    return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=False)]
 
 
 def _pchip_prediction(values: list[float]) -> NumericDistribution:
@@ -156,7 +162,7 @@ class _ShortGridDistribution(NumericDistribution):
     def get_cdf(self) -> list[Percentile]:
         heights = np.linspace(0.0, 1.0, 51)
         x_values = np.linspace(self.lower_bound, self.upper_bound, 51)
-        return [Percentile(percentile=float(h), value=float(x)) for x, h in zip(x_values, heights)]
+        return [Percentile(percentile=float(h), value=float(x)) for x, h in zip(x_values, heights, strict=False)]
 
 
 class TestEnsembleCdfGridAlignment:

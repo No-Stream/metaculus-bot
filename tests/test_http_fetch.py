@@ -22,7 +22,7 @@ import ipaddress
 import logging
 import socket
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -68,9 +68,9 @@ class FakeInnerResolver(AbstractResolver):
         family: socket.AddressFamily = socket.AF_INET,
     ) -> list[Any]:
         del host, port, family
-        return list(self._entries)  # noqa: ASYNC910
+        return list(self._entries)
 
-    async def close(self) -> None:  # noqa: ASYNC910
+    async def close(self) -> None:
         self.close_called = True
 
 
@@ -90,7 +90,7 @@ class FakeStreamContent:
         self._chunks = chunks
         self.chunks_consumed = 0
 
-    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:
         del n  # chunk boundaries are dictated by the test's pre-set chunks
         for chunk in self._chunks:
             self.chunks_consumed += 1
@@ -279,7 +279,7 @@ class TestExtractDatawrapperCharts:
         # "Trump's net approval …" — a quote-class terminator would cut at the
         # apostrophe and label the chart just "Trump" (observed on the live page).
         charts = extract_datawrapper_charts(_TRUMP_TRACKER_SHAPED_HTML)
-        assert charts[2].title == "Trump’s net approval on the issues"
+        assert charts[2].title == "Trump’s net approval on the issues"  # noqa: RUF001  # pins the live page's own curly apostrophe
 
     def test_plain_iframe_embed_with_title_attribute(self):
         # Datawrapper's own responsive embed: title= sits BEFORE src in the tag.
@@ -428,8 +428,9 @@ class TestDatawrapperLiveDataUrl:
 class TestParseHttpLastModified:
     def test_parses_rfc7231_to_aware_utc(self):
         parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 GMT")
-        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
-        assert parsed is not None and parsed.tzinfo is not None
+        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=UTC)
+        assert parsed is not None
+        assert parsed.tzinfo is not None
 
     def test_malformed_returns_none(self):
         assert parse_http_last_modified("not a date") is None
@@ -442,8 +443,9 @@ class TestParseHttpLastModified:
         # naive operand — so the UTC stamp is what keeps an odd CDN header
         # producing a `stale_data` verdict instead of a crashed hop.
         parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 -0000")
-        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
-        assert parsed is not None and parsed.tzinfo is not None
+        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=UTC)
+        assert parsed is not None
+        assert parsed.tzinfo is not None
 
 
 class TestDecodeTextBody:
@@ -476,11 +478,11 @@ class TestDecodeTextBody:
     def test_a_declared_charset_is_honoured(self):
         """`charset=` was parsed for ROUTING and then ignored for decoding, so a Windows-1252
         pollster name lost its apostrophe to a replacement char."""
-        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")
+        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")  # noqa: RUF001  # cp1252 byte 0x92 is what this test decodes
 
         text, ratio = decode_text_body(body, "text/csv; charset=windows-1252")
 
-        assert "O’Brien Research" in text
+        assert "O’Brien Research" in text  # noqa: RUF001  # cp1252 byte 0x92 is what this test decodes
         assert ratio == 0.0
 
     def test_a_quoted_charset_is_honoured(self):
@@ -517,7 +519,7 @@ class TestDecodeTextBody:
         """The threshold has to sit far above real text's dirt: a page carrying one mis-encoded
         smart quote is evidence we want, not a body we failed to decode. This is why the bound is
         0.10 rather than something tight — a 37-char line with one bad byte already scores 0.027."""
-        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")
+        body = "Pollster,Approve\nO’Brien Research,44\n".encode("windows-1252")  # noqa: RUF001  # cp1252 byte 0x92 is what this test decodes
 
         _text, ratio = decode_text_body(body, "text/csv")
 

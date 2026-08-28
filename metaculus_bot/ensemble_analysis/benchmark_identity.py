@@ -20,6 +20,21 @@ from forecasting_tools.data_models.numeric_report import NumericDistribution
 
 logger = logging.getLogger(__name__)
 
+# A benchmark config is arbitrary archived JSON, so walking it can hit a missing key,
+# a string where a dict was expected, or a short list. Those are the failure modes the
+# naming helpers below absorb; anything else is a real bug and propagates.
+_MALFORMED_CONFIG_ERRORS = (AttributeError, KeyError, TypeError, IndexError)
+
+# Substring → family token used to name a multi-model ensemble. Order matters: the
+# first match wins, so a model name matching two needles takes the earlier token.
+_MODEL_FAMILY_TOKENS: tuple[tuple[str, str], ...] = (
+    ("qwen3", "qwen3"),
+    ("glm", "glm"),
+    ("gpt", "gpt5"),
+    ("claude", "claude"),
+    ("deepseek", "deepseek"),
+)
+
 
 def extract_clean_model_name(model_path: str) -> str:
     """Extract a clean model name from a model path like 'openrouter/deepseek/deepseek-r1-0528:free'."""
@@ -27,89 +42,128 @@ def extract_clean_model_name(model_path: str) -> str:
     return model_path.split("/")[-1].split(":")[0]
 
 
+def _looks_like_a_bare_model_name(name: str) -> bool:
+    """True for a name already shaped like a model id, e.g. ``qwen3-235b``."""
+    return bool(name) and "|" not in name and " " not in name and len(name.split("-")) <= 3
+
+
+def _model_family_token(model_name: str) -> str:
+    """The ensemble-name token for one model, e.g. ``glm-4.5`` → ``glm``."""
+    for needle, token in _MODEL_FAMILY_TOKENS:
+        if needle in model_name:
+            return token
+    return model_name.split("-")[0]
+
+
+def _name_from_default_llm_slot(llms: Any) -> str | None:
+    """Name off the modern ``llms.default`` slot; None when that slot says nothing."""
+    if not isinstance(llms, dict):
+        return None
+    default_config = llms.get("default")
+    if isinstance(default_config, dict) and "model" in default_config:
+        return extract_clean_model_name(default_config["model"])
+    return None
+
+
+def _ensemble_name_from_forecasters(forecasters: list, config: dict) -> str | None:
+    """Name a multi-model ensemble as its sorted family tokens plus the strategy."""
+    family_tokens: list[str] = []
+    for forecaster in forecasters:
+        if not isinstance(forecaster, dict):
+            continue
+        model_key = "original_model" if "original_model" in forecaster else "model"
+        if model_key in forecaster:
+            family_tokens.append(_model_family_token(forecaster[model_key].split("/")[-1]))
+
+    if not family_tokens:
+        return None
+
+    ensemble_base = "_".join(sorted(set(family_tokens)))
+    strategy = config.get("aggregation_strategy")
+    if isinstance(strategy, Enum):
+        return f"{ensemble_base}_{strategy.value}"
+    if isinstance(strategy, str):
+        return f"{ensemble_base}_{strategy}"
+    return ensemble_base
+
+
+def _name_from_legacy_forecasters(llms: Any, config: dict) -> str | None:
+    """Name off the legacy ``llms.forecasters`` array — one model, or an ensemble."""
+    forecasters = llms.get("forecasters") if isinstance(llms, dict) else None
+    if not forecasters:
+        return None
+
+    if len(forecasters) == 1:
+        first_forecaster = forecasters[0]
+        if isinstance(first_forecaster, dict):
+            for model_key in ("original_model", "model"):
+                if model_key in first_forecaster:
+                    return extract_clean_model_name(first_forecaster[model_key])
+        return None
+
+    return _ensemble_name_from_forecasters(forecasters, config)
+
+
 def extract_model_name(benchmark: BenchmarkForBot) -> str:
     """Extract clean model name from benchmark.
 
-    For the new ensemble configuration, this returns the bot name directly
-    (e.g., 'qwen3_glm_mean', 'qwen3-235b') rather than trying to parse
-    individual model names from the forecasters list.
+    Four sources, in precedence order: the bot name when it already looks like a
+    model id (the new ensemble configs name themselves, e.g. 'qwen3_glm_mean',
+    'qwen3-235b'), the modern ``llms.default`` slot, the legacy ``llms.forecasters``
+    array, then the third pipe-delimited field of the benchmark name. A hashed stub
+    is the last resort so every benchmark still gets a stable key.
     """
     try:
-        # First, try simple approach: if benchmark name looks like a model name, use it directly
         simple_name = benchmark.name.strip()
-        # Check if it's a simple model name without complex parsing
-        if (
-            simple_name and "|" not in simple_name and " " not in simple_name and len(simple_name.split("-")) <= 3
-        ):  # Simple model names like "qwen3-235b"
+        if _looks_like_a_bare_model_name(simple_name):
             return simple_name
 
-        # Extract from LLM config - handle both old and new formats
-        llms = benchmark.forecast_bot_config.get("llms", {})
+        config = benchmark.forecast_bot_config
+        llms = config.get("llms", {})
+        for name in (_name_from_default_llm_slot(llms), _name_from_legacy_forecasters(llms, config)):
+            if name is not None:
+                return name
 
-        # New format: check the "default" LLM which is used for forecasting
-        if "default" in llms and isinstance(llms["default"], dict):
-            forecaster_config = llms["default"]
-            if "model" in forecaster_config:
-                model_path = forecaster_config["model"]
-                return extract_clean_model_name(model_path)
-
-        # Legacy format: check forecasters array
-        if "forecasters" in llms and llms["forecasters"]:
-            forecasters = llms["forecasters"]
-
-            # For single model bots, use the model name
-            if len(forecasters) == 1:
-                first_forecaster = forecasters[0]
-                if isinstance(first_forecaster, dict):
-                    if "original_model" in first_forecaster:
-                        model_path = first_forecaster["original_model"]
-                        return extract_clean_model_name(model_path)
-                    elif "model" in first_forecaster:
-                        model_path = first_forecaster["model"]
-                        return extract_clean_model_name(model_path)
-
-            # For multi-model ensembles, generate ensemble name from components
-            elif len(forecasters) > 1:
-                model_components = []
-                for forecaster in forecasters:
-                    if isinstance(forecaster, dict):
-                        model_key = "original_model" if "original_model" in forecaster else "model"
-                        if model_key in forecaster:
-                            model_name = forecaster[model_key].split("/")[-1]
-                            if "qwen3" in model_name:
-                                model_components.append("qwen3")
-                            elif "glm" in model_name:
-                                model_components.append("glm")
-                            elif "gpt" in model_name:
-                                model_components.append("gpt5")
-                            elif "claude" in model_name:
-                                model_components.append("claude")
-                            elif "deepseek" in model_name:
-                                model_components.append("deepseek")
-                            else:
-                                # Fallback: use last part of model name
-                                model_components.append(model_name.split("-")[0])
-
-                if model_components:
-                    ensemble_base = "_".join(sorted(set(model_components)))
-                    config = benchmark.forecast_bot_config
-                    if "aggregation_strategy" in config:
-                        strategy = config["aggregation_strategy"]
-                        if isinstance(strategy, Enum):
-                            return f"{ensemble_base}_{strategy.value}"
-                        elif isinstance(strategy, str):
-                            return f"{ensemble_base}_{strategy}"
-                    return ensemble_base
-
-        # Fallback to benchmark name parsing
         name_parts = benchmark.name.split(" | ")
         if len(name_parts) >= 3:
             return name_parts[2]  # Model name is usually third part
 
-    except Exception as e:
+    except _MALFORMED_CONFIG_ERRORS as e:
         logger.warning(f"Could not extract model name from benchmark: {e}")
 
     return f"model_{hash(benchmark.name) % 10000}"
+
+
+def _model_paths_in_llm_config(llms: dict) -> list[str]:
+    """Every model path the config names, in default → forecasters → stacker order."""
+    paths: list[str] = []
+
+    default_config = llms.get("default")
+    if isinstance(default_config, dict) and default_config.get("model"):
+        paths.append(str(default_config["model"]))
+
+    forecasters = llms.get("forecasters")
+    if isinstance(forecasters, list):
+        for forecaster in forecasters:
+            if not isinstance(forecaster, dict):
+                continue
+            paths.extend(str(forecaster[key]) for key in ("original_model", "model") if forecaster.get(key))
+
+    stacker_config = llms.get("stacker")
+    if isinstance(stacker_config, dict) and stacker_config.get("model"):
+        paths.append(str(stacker_config["model"]))
+
+    return paths
+
+
+def _deduplicated_nonempty(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            unique.append(value)
+    return unique
 
 
 def identifiers_for_benchmark(benchmark: BenchmarkForBot, model_name: str) -> list[str]:
@@ -120,42 +174,17 @@ def identifiers_for_benchmark(benchmark: BenchmarkForBot, model_name: str) -> li
     - the benchmark's own name
     - any model path strings found in forecast_bot_config.llms (default/forecasters/stacker)
     """
-    idents: list[str] = []
+    idents: list[str] = [model_name]
     try:
-        idents.append(model_name)
         if getattr(benchmark, "name", None):
             idents.append(benchmark.name)
         cfg = getattr(benchmark, "forecast_bot_config", {}) or {}
         llms = cfg.get("llms", {}) if isinstance(cfg, dict) else {}
         if isinstance(llms, dict):
-            default_cfg = llms.get("default")
-            if isinstance(default_cfg, dict) and default_cfg.get("model"):
-                idents.append(str(default_cfg.get("model")))
-            # forecasters list
-            forecasters = llms.get("forecasters")
-            if isinstance(forecasters, list):
-                for f in forecasters:
-                    if isinstance(f, dict):
-                        if f.get("original_model"):
-                            idents.append(str(f.get("original_model")))
-                        if f.get("model"):
-                            idents.append(str(f.get("model")))
-            # stacker model
-            stacker_cfg = llms.get("stacker")
-            if isinstance(stacker_cfg, dict) and stacker_cfg.get("model"):
-                idents.append(str(stacker_cfg.get("model")))
-    except Exception:
+            idents.extend(_model_paths_in_llm_config(llms))
+    except _MALFORMED_CONFIG_ERRORS:
         logger.debug(f"Failed to extract identifiers for benchmark {model_name}: unexpected config structure")
-    # Deduplicate while preserving order
-    seen = set()
-    out = []
-    for s in idents:
-        if not s:
-            continue
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
+    return _deduplicated_nonempty(idents)
 
 
 def is_stacking_benchmark(benchmark: BenchmarkForBot | None) -> bool:
@@ -173,7 +202,7 @@ def is_stacking_benchmark(benchmark: BenchmarkForBot | None) -> bool:
             strat = strat.value
         if isinstance(strat, str):
             return strat.lower() == "stacking"
-    except Exception:
+    except _MALFORMED_CONFIG_ERRORS:
         logger.debug(f"Failed to detect stacking strategy for benchmark: {benchmark.name}")
     return False
 

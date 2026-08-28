@@ -23,7 +23,7 @@ import dataclasses
 import json
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from metaculus_bot.constants import (
@@ -83,7 +83,7 @@ def record_raw_research(
 
     try:
         payload_json = json.dumps(payload, default=_json_default, ensure_ascii=False)
-    except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # broad by contract: side-channel must never break a forecast (see module docstring)
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # broad by contract: side-channel must never break a forecast (see module docstring)
         # Serialization guard: a non-str dict key `default=` can't rescue (TypeError),
         # or an arbitrary error raised inside a payload's model_dump/__str__
         # (RuntimeError, AttributeError, ...) must not propagate into the forecast.
@@ -113,7 +113,7 @@ def record_raw_research(
         "qid": qid,
         "provider": provider,
         "phase": phase,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "payload_chars": payload_chars,
         "truncated": truncated,
         "payload": payload_field,
@@ -124,7 +124,7 @@ def record_raw_research(
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # broad by contract: side-channel must never break a forecast (see module docstring)
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # broad by contract: side-channel must never break a forecast (see module docstring)
         # Write guard: OSError from a bad path, but also UnicodeEncodeError (a
         # ValueError, not OSError) when a payload carries a lone surrogate that
         # survives json.dumps(ensure_ascii=False) and only fails at utf-8 encode.

@@ -39,11 +39,11 @@ def _tool_names(tools_json: list[dict[str, Any]] | None) -> list[str]:
 async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
 
-    async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+    async def fetch(**_: Any) -> ToolOutcome:
         # Reach a primary source: a rendered fetch tiers the URL "fetched", so the
         # conclude gate's fetch floor is satisfied by a real retrieval — not by the
         # accounting's fetch-verb prose alone.
-        return ToolOutcome(content_markdown="Authoritative page text.", method="rendered")  # noqa: ASYNC910
+        return ToolOutcome(content_markdown="Authoritative page text.", method="rendered")
 
     fake_llm = FakeLlm(
         [
@@ -140,8 +140,8 @@ async def test_duplicate_tool_calls_counted_and_warned(caplog: pytest.LogCapture
     append a gentle warning to the duplicate's tool result — no enforcement."""
     caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
 
-    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-        return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
+    async def search_web(**_: Any) -> ToolOutcome:
+        return ToolOutcome(content_markdown="done", method="search")
 
     # Same args with shuffled key order still count as the same call.
     fake_llm = FakeLlm(
@@ -175,8 +175,8 @@ async def test_duplicate_tool_calls_counted_and_warned(caplog: pytest.LogCapture
 
 @pytest.mark.asyncio
 async def test_rendered_fetch_outcomes_counted_in_telemetry() -> None:
-    async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-        return ToolOutcome(content_markdown="rendered body", method="rendered")  # noqa: ASYNC910
+    async def fetch(**_: Any) -> ToolOutcome:
+        return ToolOutcome(content_markdown="rendered body", method="rendered")
 
     fake_llm = FakeLlm(
         [
@@ -263,9 +263,9 @@ async def test_parallel_tool_calls_execute_concurrently_and_append_budget_line()
 async def test_budget_threshold_switches_to_conclude_mode_and_shrinks_tools() -> None:
     clock = FakeClock()
 
-    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+    async def search_web(**_: Any) -> ToolOutcome:
         clock.advance(95.0)
-        return ToolOutcome(content_markdown="late result", method="search")  # noqa: ASYNC910
+        return ToolOutcome(content_markdown="late result", method="search")
 
     fake_llm = FakeLlm(
         [
@@ -543,8 +543,8 @@ async def test_findings_sharing_source_but_distinct_claim_are_both_kept() -> Non
 
 @pytest.mark.asyncio
 async def test_cap_exhaustion_restricts_next_step_to_internal_tools() -> None:
-    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-        return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
+    async def search_web(**_: Any) -> ToolOutcome:
+        return ToolOutcome(content_markdown="done", method="search")
 
     # Budget of 2: the plan call (1) plus one external search (2) exhaust it, so
     # the conclude turn's tool schema shrinks to internals only.
@@ -585,9 +585,9 @@ async def test_external_tool_bind_error_extra_key_becomes_error_and_loop_continu
     abort the whole pass. The loop keeps running and banked findings survive."""
     invoked: list[str] = []
 
-    async def strict_tool(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+    async def strict_tool(*, query: str) -> ToolOutcome:
         invoked.append(query)
-        return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+        return ToolOutcome(content_markdown="ran", method="search")
 
     fake_llm = FakeLlm(
         [
@@ -622,9 +622,9 @@ async def test_external_tool_bind_error_missing_key_becomes_error_and_loop_conti
     error tool result, loop continues, banked findings survive."""
     invoked: list[str] = []
 
-    async def strict_tool(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+    async def strict_tool(*, query: str) -> ToolOutcome:
         invoked.append(query)
-        return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+        return ToolOutcome(content_markdown="ran", method="search")
 
     fake_llm = FakeLlm(
         [
@@ -662,9 +662,9 @@ async def test_batch_clamped_to_remaining_budget_rejects_overflow_external_calls
     (record_findings) keep working past the ceiling."""
     invoked: list[str] = []
 
-    async def search_web(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+    async def search_web(*, query: str) -> ToolOutcome:
         invoked.append(query)
-        return ToolOutcome(content_markdown=f"result {query}", method="search")  # noqa: ASYNC910
+        return ToolOutcome(content_markdown=f"result {query}", method="search")
 
     # Budget of 3: the plan call (1) leaves two external slots, so q1/q2 run and
     # the overflow q3 is budget-rejected — the shape this test exercises.
@@ -712,8 +712,8 @@ async def test_batch_clamped_to_remaining_budget_rejects_overflow_external_calls
 
 @pytest.mark.asyncio
 async def test_append_only_message_history_is_preserved_across_steps() -> None:
-    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-        return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
+    async def search_web(**_: Any) -> ToolOutcome:
+        return ToolOutcome(content_markdown="done", method="search")
 
     fake_llm = FakeLlm(
         [
@@ -731,7 +731,7 @@ async def test_append_only_message_history_is_preserved_across_steps() -> None:
         llm_call=fake_llm,
     )
 
-    for earlier, later in zip(fake_llm.calls, fake_llm.calls[1:]):
+    for earlier, later in zip(fake_llm.calls, fake_llm.calls[1:], strict=False):
         assert later["messages"][: len(earlier["messages"])] == earlier["messages"]
 
 
@@ -771,8 +771,8 @@ async def test_soft_fail_preserves_banked_findings_on_broken_llm_response() -> N
 
 @pytest.mark.asyncio
 async def test_soft_fail_returns_empty_result_on_injected_loop_bug(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-        return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
+    async def search_web(**_: Any) -> ToolOutcome:
+        return ToolOutcome(content_markdown="done", method="search")
 
     fake_llm = FakeLlm([_response(tool_calls=[_tool_call("search1", "search_web")])])
     monkeypatch.setattr(
@@ -982,7 +982,8 @@ async def test_ghost_phase_numeric_emits_no_qtype_mismatch_warnings(caplog: pyte
         "system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm, ghost_prompt="ghost now"
     )
 
-    assert result.ghost is not None and result.ghost.qtype == "numeric"
+    assert result.ghost is not None
+    assert result.ghost.qtype == "numeric"
     assert [r for r in caplog.records if "question_type mismatch" in r.getMessage()] == []
 
 
@@ -1125,10 +1126,10 @@ class TestFetchFloorCountsSuccessfulRetrievals:
 
     @pytest.mark.asyncio
     async def test_two_blocked_fetches_do_not_clear_the_global_floor(self) -> None:
-        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        async def fetch(**_: Any) -> ToolOutcome:
             # Both fetches 403 (status=blocked): no fetched tier is granted, so
             # url_best_tier stays empty and the global floor is unmet.
-            return ToolOutcome(content_markdown="Fetch blocked with HTTP 403.", method="plain", status="blocked")  # noqa: ASYNC910
+            return ToolOutcome(content_markdown="Fetch blocked with HTTP 403.", method="plain", status="blocked")
 
         # One gap; the accounting cites "searched" (no fetch verb), so the per-gap
         # clause fails too. With two fetch CALLS but zero successful retrievals,

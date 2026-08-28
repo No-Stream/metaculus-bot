@@ -510,9 +510,9 @@ class TestEstimatorMath:
 
     def test_build_spread_series_relative_returns(self):
         # a=[10,20,25], b=[5,5,10] on aligned dates. rel = 100*[(logA-logA0)-(logB-logB0)]:
-        #   t0: 0
-        #   t1: 100*(log2 - 0)        = 100*ln(2)    ~= 69.3147
-        #   t2: 100*(log2.5 - log2)   = 100*ln(1.25) ~= 22.3144
+        #   t0 -> 0
+        #   t1 -> 100*(log2 - 0)        = 100*ln(2)    ~= 69.3147
+        #   t2 -> 100*(log2.5 - log2)   = 100*ln(1.25) ~= 22.3144
         idx = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
         a = pd.Series([10.0, 20.0, 25.0], index=idx)
         b = pd.Series([5.0, 5.0, 10.0], index=idx)
@@ -656,7 +656,8 @@ class TestSeriesClockAndCalendarBases:
 
         assert band is not None
         assert "all 13-week change windows" in out
-        assert "trading-day" not in out and "calendar-day" not in out
+        assert "trading-day" not in out
+        assert "calendar-day" not in out
         assert "volatility" not in out
 
     def test_realized_vol_line_annualizes_on_the_observed_density(self):
@@ -1309,7 +1310,7 @@ class TestNoBandNoSection:
         # than trusting the arithmetic, so a constant change can't quietly make the tests
         # below pass for the wrong reason.
         clock = series_clock(pd.DatetimeIndex(self._short_history().index))
-        assert self._HISTORY_OBSERVATIONS <= horizon_steps(clock, self._HORIZON_CALENDAR_DAYS)
+        assert horizon_steps(clock, self._HORIZON_CALENDAR_DAYS) >= self._HISTORY_OBSERVATIONS
         assert (self._RESOLVES.date() - self._AS_OF.date()).days == self._HORIZON_CALENDAR_DAYS
 
     def test_section_suppressed_when_horizon_exceeds_history(self, monkeypatch, caplog):

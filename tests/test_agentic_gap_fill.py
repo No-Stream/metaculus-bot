@@ -416,7 +416,8 @@ class TestDriverSystemPromptConcludeGate:
 
     def test_step3_describes_what_gets_rejected(self) -> None:
         collapsed = " ".join(build_system_prompt("2026-07-21").split())
-        assert "An EARLY conclude" in collapsed and "REJECTED" in collapsed
+        assert "An EARLY conclude" in collapsed
+        assert "REJECTED" in collapsed
         assert "a plan gap is missing from the accounting" in collapsed
         assert "fewer external tool calls than you have plan gaps" in collapsed
         assert "the fetch floor is unmet" in collapsed
@@ -645,7 +646,7 @@ class TestOrchestratorBothFlags:
 
         captured: dict = {}
 
-        def sink(**kwargs) -> None:  # noqa: ANN003
+        def sink(**kwargs) -> None:
             captured.update(kwargs)
 
         orch = ResearchOrchestrator(
@@ -679,7 +680,7 @@ class TestOrchestratorBothFlags:
 
         captured: dict = {}
 
-        def sink(**kwargs) -> None:  # noqa: ANN003
+        def sink(**kwargs) -> None:
             captured.update(kwargs)
 
         orch = ResearchOrchestrator(
@@ -760,7 +761,7 @@ class TestGapFillV2CrashCounter:
     byte-identical to a legitimate idle run — nothing reddened CI. A genuine
     crash must now bump an alertable counter; an idle "found nothing" run and a
     deadline hit must NOT. Three mutually-exclusive crash paths, one bump each
-    (see orchestrator._count_gap_fill_v2_error). A dead-on-arrival bug bumps it
+    (see gap_fill_stages._run_gap_fill_v2). A dead-on-arrival bug bumps it
     on every question; a rare transient bumps it once (accepted false alarm).
     """
 

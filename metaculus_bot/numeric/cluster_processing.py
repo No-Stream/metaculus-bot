@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from itertools import pairwise
 
 import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
@@ -51,7 +52,7 @@ def is_degenerate_cluster(values: list[float], value_eps: float) -> bool:
     """
     if len(values) < 2:
         return False
-    return all(abs(b - a) <= value_eps for a, b in zip(values, values[1:]))
+    return all(abs(b - a) <= value_eps for a, b in pairwise(values))
 
 
 def compute_cluster_parameters(
@@ -61,17 +62,69 @@ def compute_cluster_parameters(
     value_eps = max(range_size * NUM_VALUE_EPSILON_MULT, CLUSTER_DETECTION_ATOL)
     base_delta = max(range_size * NUM_SPREAD_DELTA_MULT, CLUSTER_SPREAD_BASE_DELTA)
     # Prefer a spread relative to the raw span when available to avoid range-driven explosions
-    if span is not None and span > 0:
-        span_based = max(0.02 * span, CLUSTER_SPREAD_BASE_DELTA)
-    else:
-        span_based = base_delta
+    span_based = max(0.02 * span, CLUSTER_SPREAD_BASE_DELTA) if span is not None and span > 0 else base_delta
     spread_delta = max(base_delta, span_based, COUNT_LIKE_DELTA_MULTIPLIER if count_like else base_delta)
     return value_eps, base_delta, spread_delta
+
+
+def _cluster_end_index(values: list[float], start: int, value_eps: float) -> int:
+    """Last index of the epsilon-chained run beginning at ``start`` (``start`` if none)."""
+    end = start
+    while end + 1 < len(values) and abs(values[end + 1] - values[end]) <= value_eps:
+        end += 1
+    return end
+
+
+def _spread_cluster_values(
+    values: list[float],
+    start: int,
+    end: int,
+    question: NumericQuestion,
+    *,
+    value_eps: float,
+    spread_delta: float,
+    range_size: float,
+) -> list[float]:
+    """Replacement values for the cluster ``values[start:end + 1]``, symmetric about its mean.
+
+    Bound-clamped, then shifted up if it would collide with the preceding value, then
+    compressed if it would overrun the following one. The compression is what keeps the
+    spread from reordering the set when the next declared value sits close by.
+    """
+    size = end - start + 1
+
+    center = float(np.mean(values[start : end + 1]))
+
+    # Offsets symmetric around center. For size=3: -d, 0, +d; size=4: -1.5d..+1.5d.
+    offsets = [((idx - (size - 1) / 2.0) * spread_delta) for idx in range(size)]
+    new_vals = [center + off for off in offsets]
+
+    # Enforce bounds softly during spread to avoid later large clamps
+    tiny = max(MIN_BOUNDARY_DISTANCE * range_size, CLUSTER_DETECTION_ATOL)
+    if not question.open_lower_bound:
+        new_vals = [max(v, question.lower_bound + tiny) for v in new_vals]
+    if not question.open_upper_bound:
+        new_vals = [min(v, question.upper_bound - tiny) for v in new_vals]
+
+    # If a previous value exists and is >= first new, shift all up minimally
+    if start - 1 >= 0 and new_vals[0] <= values[start - 1]:
+        shift = (values[start - 1] + max(STRICT_ORDERING_EPSILON, value_eps)) - new_vals[0]
+        new_vals = [v + shift for v in new_vals]
+
+    # If a next value exists and the last new exceeds it, compress into the available gap
+    if end + 1 < len(values) and new_vals[-1] >= values[end + 1]:
+        available = max(values[end + 1] - new_vals[0], value_eps, STRICT_ORDERING_EPSILON)
+        if size > 1:
+            step = available / size
+            new_vals = [new_vals[0] + step * idx for idx in range(size)]
+
+    return new_vals
 
 
 def apply_cluster_spreading(
     modified_values: list[float],
     question: NumericQuestion,
+    *,
     value_eps: float,
     spread_delta: float,
     range_size: float,
@@ -86,6 +139,8 @@ def apply_cluster_spreading(
     the CDF format needs, and ``detect_unit_mismatch`` then sees the honest
     (essentially zero) span and withholds the forecaster. See
     ``is_degenerate_cluster``.
+
+    Mutates and returns ``modified_values``.
     """
     if is_degenerate_cluster(modified_values, value_eps):
         return modified_values, 0
@@ -94,55 +149,23 @@ def apply_cluster_spreading(
     i = 0
 
     while i < len(modified_values) - 1:
-        j = i
-        # Grow cluster while adjacent values within epsilon
-        while j + 1 < len(modified_values) and abs(modified_values[j + 1] - modified_values[j]) <= value_eps:
-            j += 1
-
-        if j > i:
-            # We have a cluster from i..j inclusive
-            clusters_applied += 1
-            k = j - i + 1
-
-            # Base center value: mean of the cluster
-            center = float(np.mean(modified_values[i : j + 1]))
-
-            # Offsets: symmetric around center
-            # Example for k=3: -d, 0, +d; for k=4: -1.5d, -0.5d, +0.5d, +1.5d
-            offsets = [((idx - (k - 1) / 2.0) * spread_delta) for idx in range(k)]
-            new_vals = [center + off for off in offsets]
-
-            # Enforce bounds softly during spread to avoid later large clamps
-            tiny = max(MIN_BOUNDARY_DISTANCE * range_size, CLUSTER_DETECTION_ATOL)
-            if not question.open_lower_bound:
-                new_vals = [max(v, question.lower_bound + tiny) for v in new_vals]
-            if not question.open_upper_bound:
-                new_vals = [min(v, question.upper_bound - tiny) for v in new_vals]
-
-            # Apply while preserving non-decreasing relation to neighbors
-            # If previous value exists and is >= first new, shift all up minimally
-            if i - 1 >= 0 and new_vals[0] <= modified_values[i - 1]:
-                shift = (modified_values[i - 1] + max(STRICT_ORDERING_EPSILON, value_eps)) - new_vals[0]
-                new_vals = [v + shift for v in new_vals]
-
-            # If next value exists and last new exceeds it, compress offsets
-            if j + 1 < len(modified_values) and new_vals[-1] >= modified_values[j + 1]:
-                # Compress spread to fit in available gap
-                available = max(
-                    modified_values[j + 1] - (new_vals[0]),
-                    max(value_eps, STRICT_ORDERING_EPSILON),
-                )
-                if k > 1:
-                    step = available / k
-                    new_vals = [new_vals[0] + step * idx for idx in range(k)]
-
-            # Assign new values
-            for t in range(k):
-                modified_values[i + t] = new_vals[t]
-
-            i = j + 1
-        else:
+        cluster_end = _cluster_end_index(modified_values, i, value_eps)
+        if cluster_end == i:
             i += 1
+            continue
+
+        clusters_applied += 1
+        new_vals = _spread_cluster_values(
+            modified_values,
+            i,
+            cluster_end,
+            question,
+            value_eps=value_eps,
+            spread_delta=spread_delta,
+            range_size=range_size,
+        )
+        modified_values[i : cluster_end + 1] = new_vals
+        i = cluster_end + 1
 
     return modified_values, clusters_applied
 

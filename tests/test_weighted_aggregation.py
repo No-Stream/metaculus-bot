@@ -72,13 +72,13 @@ class TestWeightedQuantile:
         assert weighted_quantile(x, np.array([0.0, 0.0, 1.0]), 0.5) == pytest.approx(9.0)
 
     def test_negative_and_zero_total_weights_raise(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="weights must be non-negative"):
             weighted_quantile([1.0, 2.0], [-1.0, 1.0], 0.5)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="weights must sum to a positive value"):
             weighted_quantile([1.0, 2.0], [0.0, 0.0], 0.5)
 
     def test_shape_mismatch_raises(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="must be equal-length 1-D arrays"):
             weighted_quantile([1.0, 2.0, 3.0], [1.0, 1.0], 0.5)
 
 
@@ -111,7 +111,8 @@ class TestWeightedCdfMedian:
         mat = self._random_cdf_matrix(rng, 6)
         out = np.array(weighted_cdf_median(mat, np.array([0.4, 0.1, 0.1, 0.1, 0.1, 0.2])))
         assert np.all(np.diff(out) >= -1e-12)
-        assert out.min() >= 0.0 and out.max() <= 1.0
+        assert out.min() >= 0.0
+        assert out.max() <= 1.0
 
 
 # --- Config-level nesting (the arm-vs-baseline guarantee) --------------------
@@ -143,7 +144,10 @@ def _mc_record(vectors: list[dict[str, float]], order: list[str], models: tuple[
 
 def _numeric_record(cdfs_probs: list[np.ndarray], models: tuple[str, ...]) -> NumericRecord:
     grid = np.linspace(0.0, 1.0, cdfs_probs[0].size)
-    cdfs = [[Percentile(value=float(x), percentile=float(p)) for x, p in zip(grid, probs)] for probs in cdfs_probs]
+    cdfs = [
+        [Percentile(value=float(x), percentile=float(p)) for x, p in zip(grid, probs, strict=False)]
+        for probs in cdfs_probs
+    ]
     return NumericRecord(
         qid=1,
         question=cast(NumericQuestion, object()),
@@ -181,7 +185,7 @@ class TestConfigNesting:
         for _ in range(5):
             v = rng.uniform(0.05, 1.0, size=3)
             v = v / v.sum()
-            vectors.append({o: float(p) for o, p in zip(order, v)})
+            vectors.append({o: float(p) for o, p in zip(order, v, strict=True)})
         rec = _mc_record(vectors, order, models)
         equal = {(1, m): 1.0 for m in models}
         base = build_mc_configs()[MEDIAN_BASELINE](rec)

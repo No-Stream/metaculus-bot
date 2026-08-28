@@ -10,13 +10,13 @@ never as a silently-defaulted datetime that would file the record into the wrong
 era.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from metaculus_bot.time_utils import parse_iso_utc
 
-EXPECTED = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+EXPECTED = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
 
 
 class TestParseIsoUtc:
@@ -32,7 +32,8 @@ class TestParseIsoUtc:
     def test_every_archived_shape_reads_the_same_instant(self, raw: str):
         parsed = parse_iso_utc(raw)
         assert parsed == EXPECTED
-        assert parsed is not None and parsed.tzinfo is not None
+        assert parsed is not None
+        assert parsed.tzinfo is not None
 
     def test_subsecond_precision_survives(self):
         assert parse_iso_utc("2026-07-21T17:07:37.123456Z") == EXPECTED.replace(microsecond=123456)

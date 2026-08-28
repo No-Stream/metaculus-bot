@@ -57,7 +57,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 from scipy import stats
@@ -101,11 +101,7 @@ class Era:
     end: datetime | None
 
     def contains(self, dt: datetime) -> bool:
-        if self.start is not None and dt < self.start:
-            return False
-        if self.end is not None and dt >= self.end:
-            return False
-        return True
+        return (self.start is None or dt >= self.start) and (self.end is None or dt < self.end)
 
 
 # Config-flip boundaries that plausibly shift the numeric width distribution.
@@ -118,7 +114,7 @@ class Era:
 # there. A branch can sit for days, and keying on the authoring date files every
 # run in that gap under the wrong config. Re-derive with
 # `TZ=UTC git log -1 --date=iso-local --format='%h %cd' <merge-sha>`.
-WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=timezone.utc)  # 0e85e1b: k_tail 1.25 -> 1.0
+WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=UTC)  # 0e85e1b: k_tail 1.25 -> 1.0
 # b4e9df0 (july15 bundle) — aliased so this boundary and the max-step clamp screen's
 # era gate can never disagree; the timestamp's single home is analysis.py.
 TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
@@ -374,19 +370,32 @@ def _n_effective_clusters(post_ids: list[object]) -> int:
     return len(clusters)
 
 
-def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) -> EraWidthMetrics | None:
-    """Compute width/calibration metrics for one era's records. Returns None if
-    no numeric/discrete records in the era yield a PIT.
+@dataclass(frozen=True, slots=True)
+class _EraSamples:
+    """The per-record readings one era contributes: PITs, their posts, and band widths."""
 
-    ``n_excluded`` is carried through for reporting only — the caller has
-    already filtered those records out. It exists so the rendered table can say
-    that rows were dropped rather than silently reporting a smaller n.
+    pits: list[float]
+    pit_post_ids: list[object]
+    widths: list[float]
+    n_oob_low: int
+    n_oob_high: int
+
+
+def _collect_era_samples(records: list[dict]) -> _EraSamples:
+    """Read every numeric/discrete record's PIT and relative band width.
+
+    OOB is a property of the RESOLUTION (beyond the grid), not of the PIT value: an
+    out-of-grid resolution scored off the declared-percentile curves rarely lands at
+    exactly 0.0/1.0, and an in-grid PIT of exactly 0.0 (closed bound, resolution at the
+    minimum) is not OOB — which is why the side comes from ``compute_pit_details`` rather
+    than from comparing the PIT against 0 or 1.
     """
     pits: list[float] = []
     pit_post_ids: list[object] = []
     widths: list[float] = []
     n_oob_low = 0
     n_oob_high = 0
+
     for r in records:
         if r.get("type") not in NUMERIC_TYPES:
             continue
@@ -394,10 +403,6 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
         if pit is not None:
             pits.append(pit)
             pit_post_ids.append(r.get("post_id"))
-            # OOB is a property of the resolution (beyond the grid), not of the PIT
-            # value: an out-of-grid resolution scored off the declared-percentile
-            # curves rarely lands at exactly 0.0/1.0, and an in-grid PIT of exactly
-            # 0.0 (closed bound, resolution at the minimum) is not OOB.
             if oob_side == "low":
                 n_oob_low += 1
             elif oob_side == "high":
@@ -406,10 +411,28 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
         if w is not None:
             widths.append(w)
 
-    if not pits:
+    return _EraSamples(
+        pits=pits,
+        pit_post_ids=pit_post_ids,
+        widths=widths,
+        n_oob_low=n_oob_low,
+        n_oob_high=n_oob_high,
+    )
+
+
+def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) -> EraWidthMetrics | None:
+    """Compute width/calibration metrics for one era's records. Returns None if
+    no numeric/discrete records in the era yield a PIT.
+
+    ``n_excluded`` is carried through for reporting only — the caller has
+    already filtered those records out. It exists so the rendered table can say
+    that rows were dropped rather than silently reporting a smaller n.
+    """
+    samples = _collect_era_samples(records)
+    if not samples.pits:
         return None
 
-    arr = np.asarray(pits, dtype=float)
+    arr = np.asarray(samples.pits, dtype=float)
     n = len(arr)
     cov80_k = int(((arr >= 0.10) & (arr <= 0.90)).sum())
     cov50_k = int(((arr >= 0.25) & (arr <= 0.75)).sum())
@@ -423,7 +446,7 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
     # reflects n_eff, via jeffreys_ci(round(cov_k * n_eff / n), n_eff). On every
     # archived pull n_eff == n, so this is a no-op there — see
     # ``_n_effective_clusters`` and the per-row ``ci_clustered`` marker.
-    n_eff = _n_effective_clusters(pit_post_ids)
+    n_eff = _n_effective_clusters(samples.pit_post_ids)
     cov80 = jeffreys_ci(round(cov80_k * n_eff / n), n_eff)
     cov50 = jeffreys_ci(round(cov50_k * n_eff / n), n_eff)
 
@@ -439,10 +462,10 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
         label=label,
         n_pit=n,
         n_eff=n_eff,
-        n_width=len(widths),
+        n_width=len(samples.widths),
         n_excluded=n_excluded,
-        n_oob_low=n_oob_low,
-        n_oob_high=n_oob_high,
+        n_oob_low=samples.n_oob_low,
+        n_oob_high=samples.n_oob_high,
         cov80=cov80,
         cov50=cov50,
         cov_at_10=float((arr <= 0.10).mean()),
@@ -450,7 +473,7 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
         cov_at_90=float((arr <= 0.90).mean()),
         pit_std=float(arr.std()),
         mean_pit=float(arr.mean()),
-        median_rel_width=(float(np.median(widths)) if widths else None),
+        median_rel_width=(float(np.median(samples.widths)) if samples.widths else None),
         band_miss=band_lo + band_hi,
         band_lo=band_lo,
         band_hi=band_hi,
@@ -476,7 +499,7 @@ def compute_all_eras(
     excluded = exclude_qids or frozenset()
     order = [e.label for e in eras] + [NO_TIMESTAMP_LABEL]
     buckets: dict[str, list[dict]] = {lbl: [] for lbl in order}
-    excluded_counts: dict[str, int] = {lbl: 0 for lbl in order}
+    excluded_counts: dict[str, int] = dict.fromkeys(order, 0)
     numeric_records: list[dict] = []
     n_excluded_total = 0
     for r in data:
@@ -626,7 +649,9 @@ def main(argv: list[str] | None = None) -> None:
     metrics = compute_all_eras(data, exclude_qids=exclude_qids)
     if exclude_qids:
         logger.info(f"Excluding question ids from every row: {sorted(exclude_qids)}")
-    print(render_markdown(metrics))
+    # The rendered markdown IS this CLI's product and belongs on stdout; logging above
+    # is deliberately pinned to stderr so the report can be piped on its own.
+    print(render_markdown(metrics))  # noqa: T201
 
     if args.output_json:
         with open(args.output_json, "w") as f:

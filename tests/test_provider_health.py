@@ -157,7 +157,8 @@ def test_the_family_liquidity_kalshi_fixture_is_committed_and_still_straddles_it
 
     collapsed = next(event for event in payload["events"] if event["event_ticker"] == "KXNETANYAHUPARDON-26")
     live = [market for market in collapsed["markets"] if market["status"] == "active"]
-    assert len(live) == 1 and live[0] is not collapsed["markets"][0], (
+    assert len(live) == 1, "the fixture's collapsed family must keep its ONE live strike out of position 0"
+    assert live[0] is not collapsed["markets"][0], (
         "the fixture's collapsed family must keep its ONE live strike out of position 0"
     )
 
@@ -182,11 +183,13 @@ def test_the_manifold_multi_outcome_fixture_is_committed_and_still_splits_search
     assert payload["_provenance"]["endpoints"].keys() == {"manifold"}
 
     multi = [row for row in payload["search_all"] if row["outcomeType"] != "BINARY"]
-    assert len(multi) >= 2 and [row["outcomeType"] for row in payload["search_all"]].count("BINARY") >= 1, (
+    assert len(multi) >= 2, "the search capture must keep BOTH shapes, or it cannot show what the flip admits"
+    assert [row["outcomeType"] for row in payload["search_all"]].count("BINARY") >= 1, (
         "the search capture must keep BOTH shapes, or it cannot show what the flip admits"
     )
     for row in multi:
-        assert row.get("probability") is None and "answers" not in row
+        assert row.get("probability") is None
+        assert "answers" not in row
         assert row.get("uniqueBettorCount") is not None, "the liquidity label must stay measurable on these rows"
 
     for key in ("detail_multiple_choice", "detail_multi_numeric"):

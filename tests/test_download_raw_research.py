@@ -37,7 +37,8 @@ class TestFilenameRegex:
 
     def test_extracts_local_run_id(self):
         m = RAW_LOG_FILENAME_RE.search("raw_research_local.jsonl")
-        assert m is not None and m.group("run_id") == "local"
+        assert m is not None
+        assert m.group("run_id") == "local"
 
     def test_does_not_match_research_outputs(self):
         assert RAW_LOG_FILENAME_RE.search("research_20260719T000000Z.jsonl") is None

@@ -107,7 +107,8 @@ def test_numeric_prompt_bounds_and_research():
         zero_point=None,
     )
     prompt = numeric_prompt(question, "num research", "lower", "upper")
-    assert "widgets" in prompt and "num research" in prompt
+    assert "widgets" in prompt
+    assert "num research" in prompt
 
 
 def test_numeric_prompt_declared_percentiles_block_has_all_thirteen_keys():
@@ -172,7 +173,7 @@ def test_aggregate_numeric_mean_and_median():
     )
     # Note: numeric distribution will add 0% and 100% percentiles if they are not present,
     # so the values being tested are not at the boundaries.
-    percentiles = [Percentile(value=v, percentile=p) for v, p in zip([10, 50, 90], [0.1, 0.5, 0.9])]
+    percentiles = [Percentile(value=v, percentile=p) for v, p in zip([10, 50, 90], [0.1, 0.5, 0.9], strict=True)]
     dist_a = NumericDistribution(declared_percentiles=percentiles, **question.model_dump())
     dist_b = NumericDistribution(declared_percentiles=percentiles, **question.model_dump())
 
@@ -239,17 +240,21 @@ def test_bound_messages_open_vs_closed_semantics():
     upper, lower = bound_messages(open_q)
     # Open: explicitly licenses resolving past the displayed range, and directs
     # percentiles at/beyond the bound when warranted (the Toy Story 5 fix).
-    assert "open" in upper.lower() and "can resolve above" in upper
+    assert "open" in upper.lower()
+    assert "can resolve above" in upper
     assert "at or above" in upper
-    assert "open" in lower.lower() and "can resolve below" in lower
+    assert "open" in lower.lower()
+    assert "can resolve below" in lower
     assert "at or below" in lower
 
     closed_q = open_q.model_copy(update={"open_lower_bound": False, "open_upper_bound": False})
     upper_c, lower_c = bound_messages(closed_q)
     # Closed: hard limit, no "can resolve beyond" language.
-    assert "closed" in upper_c.lower() and "can not be higher" in upper_c
+    assert "closed" in upper_c.lower()
+    assert "can not be higher" in upper_c
     assert "can resolve above" not in upper_c
-    assert "closed" in lower_c.lower() and "can not be lower" in lower_c
+    assert "closed" in lower_c.lower()
+    assert "can not be lower" in lower_c
     assert "can resolve below" not in lower_c
 
 
@@ -275,7 +280,8 @@ def test_bound_messages_uses_nominal_bounds():
     )
 
     upper, lower = bound_messages(q)
-    assert "42" in upper and "5" in lower
+    assert "42" in upper
+    assert "5" in lower
 
 
 def test_bound_messages_discrete_fallback():
@@ -303,7 +309,8 @@ def test_bound_messages_discrete_fallback():
     upper, lower = bound_messages(q)
     # Should derive nominal bounds: step = (9.5 - (-0.5)) / (11 - 1) = 1.0
     # nominal_lower = -0.5 + 1.0/2 = 0.0, nominal_upper = 9.5 - 1.0/2 = 9.0
-    assert "9.0" in upper and "0.0" in lower
+    assert "9.0" in upper
+    assert "0.0" in lower
 
 
 def _numeric_bounds_q(
@@ -380,11 +387,11 @@ class DummyReport(ForecastReport):
     prediction: list[str] = Field(default_factory=list)
 
     @classmethod
-    def make_readable_prediction(cls, prediction: "list[str]") -> str:
+    def make_readable_prediction(cls, prediction: list[str]) -> str:
         return "N/A"
 
     @classmethod
-    async def aggregate_predictions(cls: type, predictions: list, question: MetaculusQuestion) -> "DummyReport":
+    async def aggregate_predictions(cls: type, predictions: list, question: MetaculusQuestion) -> DummyReport:
         raise NotImplementedError()
 
     async def publish_report_to_metaculus(self, metaculus_client: MetaculusClient | None = None) -> None:

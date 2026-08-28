@@ -1,7 +1,5 @@
 import argparse
 import asyncio
-
-# ruff: noqa: F401
 import logging
 import os
 import sys
@@ -40,18 +38,20 @@ from metaculus_bot.llm_configs import (
     SUMMARIZER_LLM,
 )
 from metaculus_bot.publish_hardening import apply_publish_hardening
+from metaculus_bot.research.persistence import ResearchPersistenceWriter
 
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
-    """Command-line entry-point for running the TemplateForecaster.
+RunMode = Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"]
 
-    This code was moved verbatim from the bottom of main.py so external behaviour
-    (e.g. GitHub Actions invoking `python main.py`) remains identical.  The only
-    difference is that main.py now delegates to this function.
+
+def _configure_process() -> None:
+    """Set up logging levels and install the client hardening / identity preflight.
+
+    Done here (the runtime entry point) rather than at module import so test imports and
+    library consumers don't inherit these global mutations.
     """
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -63,9 +63,7 @@ def main() -> None:
     litellm_logger.propagate = False
 
     # Forecaster module logs at DEBUG for full per-question tracing; the
-    # openai-agents logger is noisy at INFO so pin it to ERROR. Configured here
-    # (the runtime entry point) rather than at module import so test imports
-    # and library consumers don't inherit these global level mutations.
+    # openai-agents logger is noisy at INFO so pin it to ERROR.
     logging.getLogger("metaculus_bot.forecaster").setLevel(logging.DEBUG)
     logging.getLogger("openai.agents").setLevel(logging.ERROR)
 
@@ -85,6 +83,9 @@ def main() -> None:
     # METACULUS_TOKEN to a hijacked host.
     verify_metaculus_api_identity()
 
+
+def _parse_run_mode() -> RunMode:
+    """Read ``--mode`` off argv."""
     parser = argparse.ArgumentParser(description="Run the Q1TemplateBot forecasting system")
     parser.add_argument(
         "--mode",
@@ -94,16 +95,78 @@ def main() -> None:
         help="Specify the run mode (default: tournament)",
     )
     args = parser.parse_args()
-    run_mode: Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"] = args.mode
+    run_mode: RunMode = args.mode
+    return run_mode
+
+
+def _forecast_test_questions(template_bot: TemplateForecaster) -> list[Any]:
+    """Forecast the evergreen example set, or a TEST_QUESTIONS_OVERRIDE list."""
+    EXAMPLE_QUESTIONS = [
+        "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
+        "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
+        # "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice  # noqa: ERA001  # parked test question, kept for one-line re-enable
+        "https://www.metaculus.com/questions/20683/which-ai-world/",  # Scott Aaronson's five AI worlds
+        "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
+    ]
+    template_bot.skip_previously_forecasted_questions = (
+        False  # obviously, we need to rerun test q predictions to test them :)
+    )
+    # Optional override (test_bot_basic workflow): a comma/whitespace-
+    # separated list of Metaculus URLs to forecast instead of the full
+    # evergreen set. Unset -> the hardcoded EXAMPLE_QUESTIONS above.
+    override_urls = os.environ.get(TEST_QUESTIONS_OVERRIDE_ENV, "").replace(",", " ").split()
+    question_urls = override_urls or EXAMPLE_QUESTIONS
+    if override_urls:
+        logger.info(
+            "TEST_QUESTIONS_OVERRIDE set: forecasting %d override question(s) instead of the evergreen set",
+            len(override_urls),
+        )
+    questions = [MetaculusApi.get_question_by_url(url) for url in question_urls]
+    return asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
+
+
+def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
+    """Dispatch one run mode to its question source and forecast it.
+
+    Every tournament-shaped mode pins ``skip_previously_forecasted_questions`` on so a
+    re-run can't re-spend on questions already forecast.
+    """
+    if run_mode == "tournament":
+        check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
+        # to not risk explosive spend, we won't update preds
+        template_bot.skip_previously_forecasted_questions = True
+        return asyncio.run(template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True))
+    if run_mode == "minibench":
+        # to not risk explosive spend, we won't update preds
+        template_bot.skip_previously_forecasted_questions = True
+        return asyncio.run(
+            template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+        )
+    if run_mode in ("quarterly_cup", "metaculus_cup"):
+        # The metaculus cup is a good way to test the bot's performance on regularly open questions
+        # to not risk explosive spend, we won't update preds
+        template_bot.skip_previously_forecasted_questions = True
+        return asyncio.run(template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True))
+    if run_mode == "test_questions":
+        # Example questions are a good way to test the bot's performance on a single question
+        return _forecast_test_questions(template_bot)
+    raise ValueError(f"Invalid run mode: {run_mode}")
+
+
+def main() -> None:
+    """Command-line entry-point for running the TemplateForecaster.
+
+    This code was moved verbatim from the bottom of main.py so external behaviour
+    (e.g. GitHub Actions invoking `python main.py`) remains identical.  The only
+    difference is that main.py now delegates to this function.
+    """
+    _configure_process()
+    run_mode = _parse_run_mode()
 
     # Wire research persistence if enabled (production GHA runs set this env var)
     research_writer = None
     research_sink = None
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
-        from metaculus_bot.research.persistence import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-            ResearchPersistenceWriter,
-        )
-
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,
             tournament_id=str(TOURNAMENT_ID),
@@ -143,50 +206,7 @@ def main() -> None:
     credit_telemetry.log_start()
     donated_below_floor = False
     try:
-        if run_mode == "tournament":
-            check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
-            # to not risk explosive spend, we won't update preds
-            template_bot.skip_previously_forecasted_questions = True
-            forecast_reports = asyncio.run(template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True))
-        elif run_mode == "minibench":
-            # to not risk explosive spend, we won't update preds
-            template_bot.skip_previously_forecasted_questions = True
-            forecast_reports = asyncio.run(
-                template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
-            )
-        elif run_mode in ("quarterly_cup", "metaculus_cup"):
-            # The metaculus cup is a good way to test the bot's performance on regularly open questions
-            # to not risk explosive spend, we won't update preds
-            template_bot.skip_previously_forecasted_questions = True
-            forecast_reports = asyncio.run(
-                template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
-            )
-        elif run_mode == "test_questions":
-            # Example questions are a good way to test the bot's performance on a single question
-            EXAMPLE_QUESTIONS = [
-                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
-                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
-                # "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
-                "https://www.metaculus.com/questions/20683/which-ai-world/",  # Scott Aaronson's five AI worlds
-                "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
-            ]
-            template_bot.skip_previously_forecasted_questions = (
-                False  # obviously, we need to rerun test q predictions to test them :)
-            )
-            # Optional override (test_bot_basic workflow): a comma/whitespace-
-            # separated list of Metaculus URLs to forecast instead of the full
-            # evergreen set. Unset -> the hardcoded EXAMPLE_QUESTIONS above.
-            override_urls = os.environ.get(TEST_QUESTIONS_OVERRIDE_ENV, "").replace(",", " ").split()
-            question_urls = override_urls or EXAMPLE_QUESTIONS
-            if override_urls:
-                logger.info(
-                    "TEST_QUESTIONS_OVERRIDE set: forecasting %d override question(s) instead of the evergreen set",
-                    len(override_urls),
-                )
-            questions = [MetaculusApi.get_question_by_url(url) for url in question_urls]
-            forecast_reports = asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
-        else:
-            raise ValueError(f"Invalid run mode: {run_mode}")
+        forecast_reports = _run_forecasts(template_bot, run_mode)
     finally:
         donated_below_floor = credit_telemetry.log_end_and_check_floor()
         # Flush inside the finally: records accumulate in memory for the whole run,
@@ -210,17 +230,37 @@ def main() -> None:
     # exception keeps its traceback and CI stays exactly as red as before.
     report_summary_error: Exception | None = None
     try:
-        TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
-    except Exception as exc:  # noqa: HARNESS-SCAN-EXEMPT-broad-except  # held only until the breakdown is emitted, then re-raised below
+        TemplateForecaster.log_report_summary(forecast_reports)
+    # Boundary: holding ANY summary error (not narrowing it) is the point — the breakdown
+    # below must be emitted first, then this is re-raised with its original traceback.
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # held until the breakdown is emitted, then re-raised
         report_summary_error = exc
 
-    # Alert on degraded runs. Publication has already happened inside
-    # forecast_on_tournament / forecast_questions above, so every Q that met
-    # MIN_FORECASTERS_TO_PUBLISH is on Metaculus regardless of exit status.
-    # Non-zero exit here just triggers the GitHub Actions red-check alert so
-    # the operator knows to investigate (forecaster drops, stacker fallback
-    # usage, research provider failures, etc. — see
-    # `forecaster.py` `alertable_count`).
+    _report_degradation_and_exit(
+        template_bot,
+        report_summary_error=report_summary_error,
+        donated_below_floor=donated_below_floor,
+    )
+
+
+def _report_degradation_and_exit(
+    template_bot: TemplateForecaster,
+    *,
+    report_summary_error: Exception | None,
+    donated_below_floor: bool,
+) -> None:
+    """Emit the one-line degradation breakdown and decide the process exit status.
+
+    Alert on degraded runs. Publication has already happened inside
+    forecast_on_tournament / forecast_questions before this is called, so every Q that met
+    MIN_FORECASTERS_TO_PUBLISH is on Metaculus regardless of exit status. Non-zero exit
+    here just triggers the GitHub Actions red-check alert so the operator knows to
+    investigate (forecaster drops, stacker fallback usage, research provider failures,
+    etc. — see ``forecaster.py`` ``alertable_count``).
+
+    EVERY non-zero exit path lives in this function, which is what lets the ``run_clean``
+    predicate below be their exact complement.
+    """
     bot_alertable = template_bot.alertable_count
     # Donated->personal key fallback: counted in fallback_openrouter at the
     # wrapper level (process-global, since the wrapper has no link back to the

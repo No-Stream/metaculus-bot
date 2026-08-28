@@ -37,7 +37,7 @@ def _last_kwargs(mock: AsyncMock) -> Any:
     return mock.await_args.kwargs
 
 
-@pytest.fixture()
+@pytest.fixture
 def acompletion(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     mock = AsyncMock(return_value={"ok": True})
     monkeypatch.setattr(agentic_llm, "acompletion", mock)

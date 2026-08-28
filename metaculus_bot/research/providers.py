@@ -16,7 +16,8 @@ import logging
 import os
 import re
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from forecasting_tools import GeneralLlm, SmartSearcher
@@ -31,6 +32,16 @@ from metaculus_bot.constants import (
     ASKNEWS_SECRET_ENV,
     ASKNEWS_WALL_TIMEOUT,
     EXA_API_KEY_ENV,
+    NATIVE_SEARCH_CONTEXT_SIZE,
+    NATIVE_SEARCH_DEFAULT_MODEL,
+    NATIVE_SEARCH_MAX_RESULTS,
+    NATIVE_SEARCH_MAX_TOKENS,
+    NATIVE_SEARCH_MODEL_ENV,
+    NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
+    NATIVE_SEARCH_REASONING_EFFORT_ENV,
+    NATIVE_SEARCH_TIMEOUT,
+    NATIVE_SEARCH_VERBOSITY_DEFAULT,
+    NATIVE_SEARCH_VERBOSITY_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
     PERPLEXITY_RESEARCH_MODEL,
@@ -79,14 +90,14 @@ def _get_asknews_rate_lock() -> asyncio.Lock:
     exactly the case that later fails, so the check would be reassuring rather than
     effective.
     """
-    global _ASKNEWS_RATE_LOCK
+    global _ASKNEWS_RATE_LOCK  # noqa: PLW0603  # sole lazy-init of the process-wide AskNews lock; see docstring
     if _ASKNEWS_RATE_LOCK is None:
         _ASKNEWS_RATE_LOCK = asyncio.Lock()
     return _ASKNEWS_RATE_LOCK
 
 
 async def _asknews_rate_gate() -> None:
-    global _ASKNEWS_LAST_CALL_TS
+    global _ASKNEWS_LAST_CALL_TS  # noqa: PLW0603  # process-wide AskNews RPS clock, shared by the provider and agentic tools
     if ASKNEWS_MAX_RPS <= 0:
         return
     min_interval = 1.0 / ASKNEWS_MAX_RPS
@@ -116,7 +127,7 @@ def get_asknews_semaphore() -> asyncio.Semaphore:
     caller (the two-phase provider here and ``research.agentic.tools``)
     contends on the same throttle.
     """
-    global _ASKNEWS_GLOBAL_SEMAPHORE
+    global _ASKNEWS_GLOBAL_SEMAPHORE  # noqa: PLW0603  # sole lazy-init of the process-wide AskNews semaphore; see docstring
     if _ASKNEWS_GLOBAL_SEMAPHORE is None:
         _ASKNEWS_GLOBAL_SEMAPHORE = asyncio.Semaphore(max(1, int(ASKNEWS_MAX_CONCURRENCY)))
     return _ASKNEWS_GLOBAL_SEMAPHORE
@@ -130,16 +141,90 @@ def is_asknews_subscription_error(exc: BaseException) -> bool:
     code 403011 or "subscription is not currently active" when billing lapses.
     """
     msg = str(exc).lower()
-    if "forbiddenerror" in type(exc).__name__.lower():
-        if "403011" in msg or "subscription is not currently active" in msg:
-            return True
-    return False
+    return "forbiddenerror" in type(exc).__name__.lower() and (
+        "403011" in msg or "subscription is not currently active" in msg
+    )
+
+
+# Per-phase AskNews search parameters: (log label, SDK strategy, n_articles).
+# HOT is the latest-news sweep, HISTORICAL the deeper knowledge pull.
+_ASKNEWS_PHASES: dict[str, tuple[str, str, int]] = {
+    "hot": ("HOT", "latest news", 6),
+    "historical": ("HIST", "news knowledge", 10),
+}
+
+# Extra spacing before each phase, on top of the RPS gate: the vendor still
+# returns 429s at our nominal rate, so each phase eats a fixed wait first.
+_ASKNEWS_PHASE_WAIT_SEC = 10.1
+
+
+# Retry predicate: only retry on known transient rate/concurrency errors.
+# Text-matched on purpose, unlike the LLM paths that read ``llm_status_code``:
+# the AskNews SDK raises its own ``asknews_sdk.errors`` classes carrying a
+# ``.code`` (429000 / 429001 / 403011) and never subclasses ``openai.APIError``,
+# so a status-based primitive reads None here and would disable this retry.
+def _is_asknews_retryable(err: Exception) -> bool:
+    msg = str(err).lower()
+    return ("429" in msg) or ("rate limit" in msg) or ("concurrency limit" in msg)
+
+
+async def _asknews_phase(
+    sdk: Any,
+    question_text: str,
+    *,
+    phase: str,
+    tries: int,
+    backoff: float,
+    qid: int | None,
+) -> tuple[Any, int]:
+    """Run one AskNews search phase with its own retry loop; returns ``(articles, attempts_used)``.
+
+    ``attempts_used`` is what lets the HISTORICAL phase spend only the budget HOT
+    left over, so a phase that burned retries can't double the wall-clock cost.
+    Only transient rate/concurrency errors are retried; anything else raises
+    immediately, and an exhausted ladder re-raises the last error.
+    """
+    label, strategy, n_articles = _ASKNEWS_PHASES[phase]
+    last_exc: Exception | None = None
+    attempt_used = 0
+    for attempt in range(1, tries + 1):
+        attempt_used = attempt
+        try:
+            if phase == "historical":
+                logger.info(
+                    f"AskNews {label} attempt {attempt}/{tries}: Passing rate gate before historical news call..."
+                )
+                await _asknews_rate_gate()
+                logger.info(f"AskNews {label} attempt {attempt}/{tries}: Calling historical news...")
+            else:
+                logger.info(f"AskNews {label} attempt {attempt}/{tries}: Calling latest news...")
+                await _asknews_rate_gate()
+            response = await sdk.news.search_news(
+                query=question_text,
+                n_articles=n_articles,
+                return_type="both",
+                strategy=strategy,
+            )
+            articles = response.as_dicts
+            record_raw_research(qid=qid, provider="asknews", phase=phase, payload=articles)
+            return articles, attempt_used
+        except Exception as e:
+            last_exc = e
+            if not _is_asknews_retryable(e):
+                raise
+            if attempt < tries:
+                sleep_for = backoff * (10 + 3**attempt)
+                await asyncio.sleep(sleep_for)
+            else:
+                assert last_exc is not None
+                raise last_exc  # noqa: B904  # re-raises the exception being handled; `from` would self-reference
+    raise AssertionError("unreachable: the retry ladder either returns or raises")
 
 
 def _asknews_provider() -> ResearchCallable:
     get_asknews_semaphore()
 
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:
         # Hard wall-clock timeout around the full provider. AskNews's internal
         # retry loop fails fast on non-retryable errors, but a genuine network
         # hang (connect stall, DNS hang, server not closing the stream) is
@@ -155,18 +240,11 @@ def _asknews_provider() -> ResearchCallable:
         tries = max(1, int(ASKNEWS_MAX_TRIES))
         backoff = float(ASKNEWS_BACKOFF_SECS)
 
-        # Retry helper: only retry on known transient rate/concurrency errors.
-        # Text-matched on purpose, unlike the LLM paths that read ``llm_status_code``:
-        # the AskNews SDK raises its own ``asknews_sdk.errors`` classes carrying a
-        # ``.code`` (429000 / 429001 / 403011) and never subclasses ``openai.APIError``,
-        # so a status-based primitive reads None here and would disable this retry.
-        def _is_retryable(err: Exception) -> bool:
-            msg = str(err).lower()
-            return ("429" in msg) or ("rate limit" in msg) or ("concurrency limit" in msg)
-
         async with _ASKNEWS_GLOBAL_SEMAPHORE:
             # Use custom AskNews integration with proper rate limiting between API calls
-            from asknews_sdk import AsyncAskNewsSDK
+            from asknews_sdk import (  # noqa: PLC0415  # late import: tests patch asknews_sdk.AsyncAskNewsSDK at source
+                AsyncAskNewsSDK,
+            )
 
             client_id = os.getenv(ASKNEWS_CLIENT_ID_ENV)
             secret = os.getenv(ASKNEWS_SECRET_ENV)
@@ -178,81 +256,27 @@ def _asknews_provider() -> ResearchCallable:
             async with AsyncAskNewsSDK(
                 client_id=client_id,
                 client_secret=secret,
-                scopes=set(["news"]),
+                scopes={"news"},
             ) as sdk:
-                # Phase 1: HOT (latest news) with its own retry loop, consuming from total budget
-                hot_articles = None
-                last_exc: Exception | None = None
-                hot_attempt_used = 0
                 # Hack: despite including rate limits in our asknews logic, we still get rate limits; manually massage addl waits to handle
-                WAIT_FOR_HOT_SEC = 10.1
-                logger.info(f"AskNews: Waiting {WAIT_FOR_HOT_SEC}s before hot news call...")
-                await asyncio.sleep(WAIT_FOR_HOT_SEC)
-                for hot_attempt in range(1, tries + 1):
-                    hot_attempt_used = hot_attempt
-                    try:
-                        logger.info(f"AskNews HOT attempt {hot_attempt}/{tries}: Calling latest news...")
-                        await _asknews_rate_gate()
-                        hot_response = await sdk.news.search_news(
-                            query=question_text,
-                            n_articles=6,
-                            return_type="both",
-                            strategy="latest news",
-                        )
-                        hot_articles = hot_response.as_dicts
-                        record_raw_research(qid=qid, provider="asknews", phase="hot", payload=hot_articles)
-                        break
-                    except Exception as e:
-                        last_exc = e
-                        if not _is_retryable(e):
-                            raise
-                        if hot_attempt < tries:
-                            sleep_for = backoff * (10 + 3 ** (hot_attempt))
-                            await asyncio.sleep(sleep_for)
-                        else:
-                            assert last_exc is not None
-                            raise last_exc
-
+                logger.info(f"AskNews: Waiting {_ASKNEWS_PHASE_WAIT_SEC}s before hot news call...")
+                await asyncio.sleep(_ASKNEWS_PHASE_WAIT_SEC)
+                hot_articles, hot_attempt_used = await _asknews_phase(
+                    sdk, question_text, phase="hot", tries=tries, backoff=backoff, qid=qid
+                )
                 assert hot_articles is not None
 
                 # Phase 2: HISTORICAL (news knowledge), reuse HOT results; do not re-call HOT on retries
-                WAIT_FOR_HISTORICAL_SEC = 10.1
-                logger.info(f"AskNews: Waiting {WAIT_FOR_HISTORICAL_SEC}s before historical news call...")
-                await asyncio.sleep(WAIT_FOR_HISTORICAL_SEC)
-
-                remaining_hist_tries = max(1, tries - (hot_attempt_used - 1))
-                historical_articles = None
-                for hist_attempt in range(1, remaining_hist_tries + 1):
-                    try:
-                        logger.info(
-                            f"AskNews HIST attempt {hist_attempt}/{remaining_hist_tries}: Passing rate gate before historical news call..."
-                        )
-                        await _asknews_rate_gate()
-                        logger.info(
-                            f"AskNews HIST attempt {hist_attempt}/{remaining_hist_tries}: Calling historical news..."
-                        )
-                        historical_response = await sdk.news.search_news(
-                            query=question_text,
-                            n_articles=10,
-                            return_type="both",
-                            strategy="news knowledge",
-                        )
-                        historical_articles = historical_response.as_dicts
-                        record_raw_research(
-                            qid=qid, provider="asknews", phase="historical", payload=historical_articles
-                        )
-                        break
-                    except Exception as e:
-                        last_exc = e
-                        if not _is_retryable(e):
-                            raise
-                        if hist_attempt < remaining_hist_tries:
-                            sleep_for = backoff * (10 + 3 ** (hist_attempt))
-                            await asyncio.sleep(sleep_for)
-                        else:
-                            assert last_exc is not None
-                            raise last_exc
-
+                logger.info(f"AskNews: Waiting {_ASKNEWS_PHASE_WAIT_SEC}s before historical news call...")
+                await asyncio.sleep(_ASKNEWS_PHASE_WAIT_SEC)
+                historical_articles, _ = await _asknews_phase(
+                    sdk,
+                    question_text,
+                    phase="historical",
+                    tries=max(1, tries - (hot_attempt_used - 1)),
+                    backoff=backoff,
+                    qid=qid,
+                )
                 assert historical_articles is not None
 
                 logger.info(
@@ -343,7 +367,7 @@ def _format_asknews_dual_sections(
 
 
 def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:
         searcher = SmartSearcher(
             # temperature ignored when model is a preconfigured GeneralLlm; None
             # keeps litellm from applying a sampling param on the fallback str path.
@@ -372,7 +396,7 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
 
 
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:
         model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
@@ -432,31 +456,18 @@ def build_native_search_llm(
     env-driven LOW. An empty string (from either the override or the env)
     disables passing the corresponding kwarg.
     """
-    from metaculus_bot.constants import (
-        NATIVE_SEARCH_CONTEXT_SIZE,
-        NATIVE_SEARCH_DEFAULT_MODEL,
-        NATIVE_SEARCH_MAX_RESULTS,
-        NATIVE_SEARCH_MAX_TOKENS,
-        NATIVE_SEARCH_MODEL_ENV,
-        NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
-        NATIVE_SEARCH_REASONING_EFFORT_ENV,
-        NATIVE_SEARCH_TIMEOUT,
-        NATIVE_SEARCH_VERBOSITY_DEFAULT,
-        NATIVE_SEARCH_VERBOSITY_ENV,
-    )
-
     base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
     model_with_search = f"openrouter/{base_model}"
 
-    kwargs: dict = dict(
-        model=model_with_search,
+    kwargs: dict = {
+        "model": model_with_search,
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
         # kept to pin provider-default sampling against a future default flip. reasoning
         # models defer to provider defaults. top_p left unset.
-        temperature=None,
-        max_tokens=NATIVE_SEARCH_MAX_TOKENS,
-        timeout=NATIVE_SEARCH_TIMEOUT,
+        "temperature": None,
+        "max_tokens": NATIVE_SEARCH_MAX_TOKENS,
+        "timeout": NATIVE_SEARCH_TIMEOUT,
         # allowed_tries=1: a malformed-whitespace response from OpenRouter (the
         # 2026-05-20 incident) won't be cured by retrying the same call, and
         # the wall-clock guard at the caller (asyncio.wait_for in _fetch) is
@@ -464,10 +475,10 @@ def build_native_search_llm(
         # NATIVE_SEARCH_WALL_TIMEOUT window instead of forecasting-tools'
         # default ``allowed_tries`` multiplied by NATIVE_SEARCH_TIMEOUT (which
         # resets per HTTP request).
-        allowed_tries=1,
-        plugins=[{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
-        web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
-    )
+        "allowed_tries": 1,
+        "plugins": [{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
+        "web_search_options": {"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
+    }
 
     effort = (
         reasoning_effort
@@ -504,8 +515,10 @@ def _native_search_provider(
 ) -> ResearchCallable:
     """Research provider using models with native web search capability via OpenRouter :online suffix."""
 
-    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
-        from metaculus_bot.constants import NATIVE_SEARCH_WALL_TIMEOUT
+    async def _fetch(question: MetaculusQuestion) -> str:
+        from metaculus_bot.constants import (  # noqa: PLC0415  # late read: tests patch this constant on the constants module
+            NATIVE_SEARCH_WALL_TIMEOUT,
+        )
 
         llm = build_native_search_llm(model_slug)
         prompt = web_research_prompt(
@@ -547,46 +560,48 @@ native_search_provider = _native_search_provider
 # ---------------------------------------------------------------------------
 
 
-def choose_provider_with_name(
-    default_llm: GeneralLlm | None = None,
-    exa_callback: ResearchCallable | None = None,
-    perplexity_callback: ResearchCallable | None = None,
-    openrouter_callback: ResearchCallable | None = None,
-    is_benchmarking: bool = False,
+def _forced_provider_choice(
+    forced_lc: str,
+    *,
+    default_llm: GeneralLlm | None,
+    exa_callback: ResearchCallable | None,
+    perplexity_callback: ResearchCallable | None,
+    openrouter_callback: ResearchCallable | None,
+    is_benchmarking: bool,
+) -> tuple[ResearchCallable, str] | None:
+    """Resolve an explicit ``RESEARCH_PROVIDER`` override, or None to fall through to auto."""
+    if forced_lc == "asknews":
+        # Fail fast if creds missing to make misconfig obvious
+        if not (os.getenv(ASKNEWS_CLIENT_ID_ENV) and os.getenv(ASKNEWS_SECRET_ENV)):
+            raise ValueError("RESEARCH_PROVIDER=asknews requires ASKNEWS_CLIENT_ID and ASKNEWS_SECRET to be set")
+        return _asknews_provider(), "asknews"
+    if forced_lc == "exa":
+        if exa_callback is not None:
+            return exa_callback, "exa"
+        if default_llm is None:
+            raise ValueError("RESEARCH_PROVIDER=exa requires default_llm or exa_callback to be provided")
+        return _exa_provider(default_llm), "exa"
+    if forced_lc == "perplexity":
+        if perplexity_callback is not None:
+            return perplexity_callback, "perplexity"
+        return _perplexity_provider(use_open_router=False, is_benchmarking=is_benchmarking), "perplexity"
+    if forced_lc == "openrouter":
+        if openrouter_callback is not None:
+            return openrouter_callback, "openrouter"
+        return _perplexity_provider(use_open_router=True, is_benchmarking=is_benchmarking), "openrouter"
+    # Any other value behaves as auto
+    return None
+
+
+def _auto_provider_choice(
+    *,
+    default_llm: GeneralLlm | None,
+    exa_callback: ResearchCallable | None,
+    perplexity_callback: ResearchCallable | None,
+    openrouter_callback: ResearchCallable | None,
+    is_benchmarking: bool,
 ) -> tuple[ResearchCallable, str]:
-    """Return a research coroutine and its provider name.
-
-    Priority order replicates pre-refactor behaviour:
-    1. AskNews (ASKNEWS_CLIENT_ID & ASKNEWS_SECRET)
-    2. Exa.ai (EXA_API_KEY)
-    3. Perplexity (PERPLEXITY_API_KEY)
-    4. Perplexity via OpenRouter (OPENROUTER_API_KEY)
-    5. Fallback stub that returns an empty string.
-    """
-    forced = os.getenv(RESEARCH_PROVIDER_ENV)
-    if forced:
-        forced_lc = forced.strip().lower()
-        if forced_lc == "asknews":
-            # Fail fast if creds missing to make misconfig obvious
-            if not (os.getenv(ASKNEWS_CLIENT_ID_ENV) and os.getenv(ASKNEWS_SECRET_ENV)):
-                raise ValueError("RESEARCH_PROVIDER=asknews requires ASKNEWS_CLIENT_ID and ASKNEWS_SECRET to be set")
-            return _asknews_provider(), "asknews"
-        if forced_lc == "exa":
-            if exa_callback is not None:
-                return exa_callback, "exa"
-            if default_llm is None:
-                raise ValueError("RESEARCH_PROVIDER=exa requires default_llm or exa_callback to be provided")
-            return _exa_provider(default_llm), "exa"
-        if forced_lc == "perplexity":
-            if perplexity_callback is not None:
-                return perplexity_callback, "perplexity"
-            return _perplexity_provider(False, is_benchmarking), "perplexity"
-        if forced_lc == "openrouter":
-            if openrouter_callback is not None:
-                return openrouter_callback, "openrouter"
-            return _perplexity_provider(True, is_benchmarking), "openrouter"
-        # Any other value behaves as auto
-
+    """First provider whose credentials are present, in the documented priority order."""
     if os.getenv(ASKNEWS_CLIENT_ID_ENV) and os.getenv(ASKNEWS_SECRET_ENV):
         return _asknews_provider(), "asknews"
 
@@ -600,17 +615,59 @@ def choose_provider_with_name(
     if os.getenv(PERPLEXITY_API_KEY_ENV):
         if perplexity_callback is not None:
             return perplexity_callback, "perplexity"
-        return _perplexity_provider(False, is_benchmarking), "perplexity"
+        return _perplexity_provider(use_open_router=False, is_benchmarking=is_benchmarking), "perplexity"
 
     if os.getenv(OPENROUTER_API_KEY_ENV):
         if openrouter_callback is not None:
             return openrouter_callback, "openrouter"
-        return _perplexity_provider(True, is_benchmarking), "openrouter"
+        return _perplexity_provider(use_open_router=True, is_benchmarking=is_benchmarking), "openrouter"
 
-    async def _empty(_: MetaculusQuestion) -> str:  # noqa: D401
+    async def _empty(_: MetaculusQuestion) -> str:
         return ""
 
     return _empty, "none"
+
+
+def choose_provider_with_name(
+    default_llm: GeneralLlm | None = None,
+    *,
+    exa_callback: ResearchCallable | None = None,
+    perplexity_callback: ResearchCallable | None = None,
+    openrouter_callback: ResearchCallable | None = None,
+    is_benchmarking: bool = False,
+) -> tuple[ResearchCallable, str]:
+    """Return a research coroutine and its provider name.
+
+    Priority order replicates pre-refactor behaviour:
+    1. AskNews (ASKNEWS_CLIENT_ID & ASKNEWS_SECRET)
+    2. Exa.ai (EXA_API_KEY)
+    3. Perplexity (PERPLEXITY_API_KEY)
+    4. Perplexity via OpenRouter (OPENROUTER_API_KEY)
+    5. Fallback stub that returns an empty string.
+
+    ``RESEARCH_PROVIDER`` forces a specific provider; an unrecognized value falls
+    through to the priority order above.
+    """
+    forced = os.getenv(RESEARCH_PROVIDER_ENV)
+    if forced:
+        choice = _forced_provider_choice(
+            forced.strip().lower(),
+            default_llm=default_llm,
+            exa_callback=exa_callback,
+            perplexity_callback=perplexity_callback,
+            openrouter_callback=openrouter_callback,
+            is_benchmarking=is_benchmarking,
+        )
+        if choice is not None:
+            return choice
+
+    return _auto_provider_choice(
+        default_llm=default_llm,
+        exa_callback=exa_callback,
+        perplexity_callback=perplexity_callback,
+        openrouter_callback=openrouter_callback,
+        is_benchmarking=is_benchmarking,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -672,13 +729,12 @@ def _normalize_url_for_dedup(url: str) -> str:
     # Normalize query: remove tracking keys; sort remaining
     drop_keys = {"gclid", "fbclid", "igshid", "ref", "mc_cid", "mc_eid"}
     q = []
-    for k, v in parse_qsl(parts.query, keep_blank_values=True):
+    for k, raw_value in parse_qsl(parts.query, keep_blank_values=True):
         if k.startswith("utm_") or k in drop_keys:
             continue
         # Normalize trivial trailing slashes in parameter values (e.g., b=2/ -> b=2)
-        if isinstance(v, str) and v.endswith("/"):
-            v = v.rstrip("/")
-        q.append((k, v))
+        value = raw_value.rstrip("/") if isinstance(raw_value, str) and raw_value.endswith("/") else raw_value
+        q.append((k, value))
     # Sort for canonical order
     q.sort()
     query = urlencode(q, doseq=True)
@@ -698,11 +754,7 @@ def _dedup_articles_by_url(articles: list[Any]) -> list[Any]:
     seen: set[str] = set()
     result: list[Any] = []
     for item in articles:
-        url = None
-        if isinstance(item, dict):  # type: ignore[unreachable]
-            url = item.get("article_url")
-        else:
-            url = getattr(item, "article_url", None)
+        url = item.get("article_url") if isinstance(item, dict) else getattr(item, "article_url", None)  # type: ignore[unreachable]
 
         if not url:
             result.append(item)

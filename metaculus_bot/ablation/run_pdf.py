@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from forecasting_tools import (
@@ -49,15 +49,30 @@ from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.forecasters import question_type_for_serialization, serialize_prediction_value
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviving_forecasters
 from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
+from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 from metaculus_bot.prob_math_utils import sigmoid
 from metaculus_bot.probabilistic_tools.base_rate import beta_binomial_update
+from metaculus_bot.probabilistic_tools.distributions import (
+    FitType,
+    eval_cdf,
+    fit_normal_from_percentiles,
+    fit_student_t_from_percentiles,
+)
 from metaculus_bot.probabilistic_tools.survival import prob_event_before
+from metaculus_bot.question_types import question_type_of
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
     MultipleChoiceStructured,
     NumericStructured,
     parse_structured_block,
 )
+
+if TYPE_CHECKING:
+    # run_state imports ARM_PDF_MIN1 / ARM_PDF_MIN2 from this module, so importing it back
+    # at runtime would be a cycle; SpendReport is only ever needed as an annotation.
+    from metaculus_bot.ablation.run_state import SpendReport
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -173,8 +188,6 @@ def _resolve_numeric_cdf_size(surviving: dict[str, dict], question: NumericQuest
     (correct for manifests that persist it) only when no surviving numeric prediction carries a
     CDF — unreachable for a real numeric question, where every survivor is a numeric prediction.
     """
-    from metaculus_bot.numeric.config import PCHIP_CDF_POINTS  # noqa: PLC0415
-
     for payload in surviving.values():
         pv = payload.get("prediction_value")
         if not isinstance(pv, dict) or pv.get("type") != "numeric":
@@ -201,15 +214,6 @@ def _compute_numeric_prediction(
     201-point ones. At ``cdf_size == 201`` the constraints are exactly the historical
     constants, so that path is byte-identical to the pre-parameterization behavior.
     """
-    from metaculus_bot.numeric.config import grid_step_constraints  # noqa: PLC0415
-    from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds  # noqa: PLC0415
-    from metaculus_bot.probabilistic_tools.distributions import (  # noqa: PLC0415
-        FitType,
-        eval_cdf,
-        fit_normal_from_percentiles,
-        fit_student_t_from_percentiles,
-    )
-
     percentiles = block.declared_percentiles
     if not percentiles or len(percentiles) < 2:
         return None
@@ -276,18 +280,111 @@ def _compute_mc_prediction(block: MultipleChoiceStructured) -> dict[str, float] 
 def _question_type_label(
     question: MetaculusQuestion,
 ) -> Literal["binary", "numeric", "multiple_choice"]:
-    if isinstance(question, BinaryQuestion):
-        return "binary"
-    if isinstance(question, MultipleChoiceQuestion):
-        return "multiple_choice"
-    if isinstance(question, NumericQuestion):
-        return "numeric"
-    raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    qtype = question_type_of(question)
+    if qtype is None:
+        raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    return qtype
 
 
 # ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
+
+
+class DegenerateMcBallotError(ValueError):
+    """An MC ballot left an option with no declared share from any forecaster.
+
+    Subclasses ValueError because that is what ``aggregate_mc`` raises; the distinct
+    type lets ``run_pdf_for_qid`` turn this one question's defect into an attributed
+    error payload while an unsupported-question-type ValueError still aborts the stage.
+    """
+
+
+def _structured_predictions(question: MetaculusQuestion, surviving: dict[str, dict]) -> list[Any]:
+    """Per-forecaster predictions computed from each survivor's structured block.
+
+    Forecasters whose rationale carries no parseable block, or whose block yields no
+    finite prediction, are simply dropped — the min-forecasters guard downstream
+    decides whether enough survived.
+    """
+    qtype_label = _question_type_label(question)
+    # The numeric CDF grid length follows the question's real cdf_size (201 for continuous,
+    # smaller for discrete). Resolve it once from the surviving forecasters' cached CDFs so a
+    # discrete question doesn't silently get a 201-point CDF from the shim's default cdf_size.
+    numeric_cdf_size = _resolve_numeric_cdf_size(surviving, question) if isinstance(question, NumericQuestion) else None
+
+    predictions: list[Any] = []
+    for payload in surviving.values():
+        block = parse_structured_block(payload.get("reasoning", ""), qtype_label)
+        if block is None:
+            continue
+
+        if isinstance(block, BinaryStructured) and isinstance(question, BinaryQuestion):
+            binary_pred = _compute_binary_prediction(block)
+            if binary_pred is not None and math.isfinite(binary_pred):
+                predictions.append(binary_pred)
+        elif isinstance(block, NumericStructured) and isinstance(question, NumericQuestion):
+            assert numeric_cdf_size is not None  # set above whenever question is a NumericQuestion
+            numeric_pred = _compute_numeric_prediction(block, question, cdf_size=numeric_cdf_size)
+            if numeric_pred is not None:
+                predictions.append(numeric_pred)
+        elif isinstance(block, MultipleChoiceStructured) and isinstance(question, MultipleChoiceQuestion):
+            mc_pred = _compute_mc_prediction(block)
+            if mc_pred is not None:
+                predictions.append(mc_pred)
+    return predictions
+
+
+async def _aggregate_structured_predictions(
+    question: MetaculusQuestion,
+    structured_predictions: list[Any],
+    *,
+    aggregation: Literal["mean", "median"],
+) -> Any:
+    """Pointwise central tendency of the per-forecaster structured predictions.
+
+    Raises :class:`DegenerateMcBallotError` when an MC option ends up with no declared
+    share, and a plain ``ValueError`` for an unsupported question type (a genuine
+    programming error, which should abort the stage).
+    """
+    if isinstance(question, BinaryQuestion):
+        return aggregate_binary(structured_predictions, method=aggregation)
+    if isinstance(question, MultipleChoiceQuestion):
+        option_order = list(question.options)
+        per_option_values: dict[str, list[float]] = {name: [] for name in option_order}
+        for pred in structured_predictions:
+            for name in option_order:
+                if name in pred:
+                    per_option_values[name].append(pred[name])
+        try:
+            return aggregate_mc(per_option_values, option_order, method=aggregation)
+        except ValueError as exc:
+            raise DegenerateMcBallotError(str(exc)) from exc
+    if isinstance(question, NumericQuestion):
+        return await _aggregate_numeric_predictions(structured_predictions, question, aggregation)
+    raise ValueError(f"Unsupported question type: {type(question).__name__}")
+
+
+def _write_arm_error(
+    cache: AblationCache,
+    *,
+    qid: int,
+    arm_label: str,
+    reason: str,
+    n_forecasters: int,
+    errors: list[str] | None = None,
+) -> dict:
+    """Build, cache and return this arm's error payload for one question."""
+    payload = make_error_payload(
+        arm=arm_label,
+        reason=reason,
+        model_used=STRUCTURED_MATH_LABEL,
+        n_forecasters=n_forecasters,
+        cross_model_aggregation=None,
+        errors=errors,
+    )
+    cache.write_stacker_output(qid=qid, arm=arm_label, payload=payload)
+    return payload
 
 
 async def run_pdf_for_qid(
@@ -300,6 +397,7 @@ async def run_pdf_for_qid(
     min_forecasters: int = ABLATION_MIN_FORECASTERS,
     arm_label: str = ARM_PDF,
     aggregation: Literal["mean", "median"] = "median",
+    spend: SpendReport | None = None,
 ) -> dict:
     """Run the ARM_PDF deterministic structured-math arm for one question.
 
@@ -314,100 +412,58 @@ async def run_pdf_for_qid(
 
     The ``arm_label`` kwarg controls the arm name written to cache and to the
     output payload. Use ``ARM_PDF_MIN1`` / ``ARM_PDF_MIN2`` / ``ARM_PDF_MIN1_MEAN``
-    to write separate cache files for the dual-panel pdf analysis.
+    to write separate cache files for the dual-panel pdf analysis. This function is
+    the only cache authority for the pdf sub-arms: each label reads and writes its
+    own ``arm_<label>.json``, so no caller may read a pdf payload under another key.
+
+    ``spend`` is optional so the ~20 direct test call sites stay unaffected; when a
+    stage passes one, a cache hit bumps ``spend.cached_stacker_hits[arm_label]`` here,
+    where the read actually happens, so the reported hit counts cover every sub-arm.
     """
     if not force:
         cached = cache.read_stacker_output(qid=qid, arm=arm_label)
         if cached is not None:
+            if spend is not None:
+                spend.cached_stacker_hits[arm_label] = spend.cached_stacker_hits.get(arm_label, 0) + 1
             await asyncio.sleep(0)
             return cached
 
     surviving = _surviving_forecasters(forecaster_payloads)
-    qtype_label = _question_type_label(question)
-
-    structured_predictions: list[Any] = []
-
-    # The numeric CDF grid length follows the question's real cdf_size (201 for continuous,
-    # smaller for discrete). Resolve it once from the surviving forecasters' cached CDFs so a
-    # discrete question doesn't silently get a 201-point CDF from the shim's default cdf_size.
-    numeric_cdf_size: int | None = None
-    if isinstance(question, NumericQuestion):
-        numeric_cdf_size = _resolve_numeric_cdf_size(surviving, question)
-
-    for slug, payload in surviving.items():
-        reasoning = payload.get("reasoning", "")
-        block = parse_structured_block(reasoning, qtype_label)
-        if block is None:
-            continue
-
-        if isinstance(block, BinaryStructured) and isinstance(question, BinaryQuestion):
-            pred = _compute_binary_prediction(block)
-            if pred is not None and math.isfinite(pred):
-                structured_predictions.append(pred)
-
-        elif isinstance(block, NumericStructured) and isinstance(question, NumericQuestion):
-            assert numeric_cdf_size is not None  # set above whenever question is a NumericQuestion
-            pred = _compute_numeric_prediction(block, question, cdf_size=numeric_cdf_size)
-            if pred is not None:
-                structured_predictions.append(pred)
-
-        elif isinstance(block, MultipleChoiceStructured) and isinstance(question, MultipleChoiceQuestion):
-            pred = _compute_mc_prediction(block)
-            if pred is not None:
-                structured_predictions.append(pred)
-
+    structured_predictions = _structured_predictions(question, surviving)
     n_structured = len(structured_predictions)
 
     if n_structured < min_forecasters:
-        error_payload = make_error_payload(
-            arm=arm_label,
+        payload = _write_arm_error(
+            cache,
+            qid=qid,
+            arm_label=arm_label,
             reason="insufficient_structured_forecasters",
-            model_used=STRUCTURED_MATH_LABEL,
             n_forecasters=n_structured,
-            cross_model_aggregation=None,
         )
-        cache.write_stacker_output(qid=qid, arm=arm_label, payload=error_payload)
         await asyncio.sleep(0)
-        return error_payload
+        return payload
 
-    aggregated: Any
-    if isinstance(question, BinaryQuestion):
-        aggregated = aggregate_binary(structured_predictions, method=aggregation)
-    elif isinstance(question, MultipleChoiceQuestion):
-        option_order = list(question.options)
-        per_option_values: dict[str, list[float]] = {name: [] for name in option_order}
-        for pred in structured_predictions:
-            for name in option_order:
-                if name in pred:
-                    per_option_values[name].append(pred[name])
-        try:
-            aggregated = aggregate_mc(per_option_values, option_order, method=aggregation)
-        except ValueError as exc:
-            # aggregate_mc raises rather than imputing a share no model declared. One
-            # degenerate ballot is that QUESTION's defect — cache an attributed error
-            # payload instead of aborting a stage whose other questions' forecaster
-            # calls are already paid for.
-            error_payload = make_error_payload(
-                arm=arm_label,
-                reason="degenerate_mc_ballot",
-                model_used=STRUCTURED_MATH_LABEL,
-                n_forecasters=n_structured,
-                cross_model_aggregation=None,
-                errors=[str(exc)],
-            )
-            cache.write_stacker_output(qid=qid, arm=arm_label, payload=error_payload)
-            await asyncio.sleep(0)
-            return error_payload
-    elif isinstance(question, NumericQuestion):
-        aggregated = await _aggregate_numeric_predictions(structured_predictions, question, aggregation)
-    else:
-        raise ValueError(f"Unsupported question type: {type(question).__name__}")
-
-    serialized_prediction = serialize_prediction_value(aggregated, question_type_for_serialization(question))
+    try:
+        aggregated = await _aggregate_structured_predictions(question, structured_predictions, aggregation=aggregation)
+    except DegenerateMcBallotError as exc:
+        # aggregate_mc raises rather than imputing a share no model declared. One
+        # degenerate ballot is that QUESTION's defect — cache an attributed error
+        # payload instead of aborting a stage whose other questions' forecaster
+        # calls are already paid for.
+        payload = _write_arm_error(
+            cache,
+            qid=qid,
+            arm_label=arm_label,
+            reason="degenerate_mc_ballot",
+            n_forecasters=n_structured,
+            errors=[str(exc)],
+        )
+        await asyncio.sleep(0)
+        return payload
 
     success_payload = make_success_payload(
         arm=arm_label,
-        prediction=serialized_prediction,
+        prediction=serialize_prediction_value(aggregated, question_type_for_serialization(question)),
         model_used=STRUCTURED_MATH_LABEL,
         n_forecasters=n_structured,
         cross_model_aggregation=None,
@@ -439,14 +495,10 @@ async def _aggregate_numeric_predictions(
     Takes the pointwise median or mean, then wraps the result.
     """
     await asyncio.sleep(0)  # cooperative yield for flake8-async ASYNC910
-    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415
 
     n_points = len(predictions[0])
     prob_arrays = np.array([[p.percentile for p in perc_list] for perc_list in predictions], dtype=float)
-    if aggregation == "mean":
-        median_probs = np.mean(prob_arrays, axis=0)
-    else:
-        median_probs = np.median(prob_arrays, axis=0)
+    median_probs = np.mean(prob_arrays, axis=0) if aggregation == "mean" else np.median(prob_arrays, axis=0)
 
     median_probs = np.clip(median_probs, 0.0, 1.0)
     median_probs = np.maximum.accumulate(median_probs)

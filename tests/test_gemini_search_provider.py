@@ -557,6 +557,67 @@ async def test_ungrounded_suppression_records_a_provider_loss_token(monkeypatch:
     assert "ungrounded" in token
 
 
+@pytest.mark.asyncio
+async def test_url_context_read_survives_zero_search_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful url_context read IS grounding, so the text passes the chunk floor.
+
+    Google's search tool grounded nothing (no chunks), but url_context retrieved a
+    page, so this is genuine retrieval rather than the Q38195 parametric case. The
+    text comes back unmodified — there are no chunks to cite, so no inline markers
+    and no ``### Sources`` block.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response(
+        "Read straight off the resolving page.",
+        chunks=None,
+        supports=None,
+        url_metadata=[CannedUrlMeta("https://gov.example/report", CannedStatus("URL_RETRIEVAL_STATUS_SUCCESS"))],
+    )
+    fake_client = _make_client_with_response(response)
+
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=1)
+
+    assert "Read straight off the resolving page." in out
+    assert "### Sources" not in out
+
+
+@pytest.mark.asyncio
+async def test_malformed_supports_fall_back_to_unspliced_text(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A support whose end_index is not an integer must not cost us the response.
+
+    The splice raises TypeError partway through mutating the byte buffer; the
+    formatter falls back to the ORIGINAL text (never a half-spliced buffer), still
+    renders the Sources block, and leaves a greppable WARN.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AbC123"
+    bad_support = CannedSupport(cast(CannedSegment, SimpleNamespace(end_index="not-an-int", text="x")), [0])
+    response = _make_response(
+        "body text",
+        chunks=[CannedWebChunk(uri=blob, title="Example One", domain="example.com")],
+        supports=[bad_support],
+    )
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("WARNING"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt")
+
+    assert out.startswith("body text")
+    assert "[1] Example One — example.com" in out
+    assert "could not splice inline citations" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # url_context telemetry: extract_url_context_telemetry
 # ---------------------------------------------------------------------------

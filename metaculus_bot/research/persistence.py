@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,7 @@ class ResearchPersistenceWriter:
 
     def record(
         self,
+        *,
         qid: int,
         page_url: str,
         question_text: str,
@@ -83,7 +84,7 @@ class ResearchPersistenceWriter:
             "provider_results": provider_results if provider_results is not None else [],
             "run_mode": self._run_mode,
             "tournament_id": self._tournament_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "run_id": self._run_id,
             "research_chars": len(research_text),
             "gap_fill_used": gap_fill_used,
@@ -105,7 +106,7 @@ class ResearchPersistenceWriter:
         out_path = Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         filename = out_path / f"research_{timestamp}.jsonl"
 
         with open(filename, "w", encoding="utf-8") as f:

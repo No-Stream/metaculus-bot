@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -109,10 +110,10 @@ class TestPredicates:
     def test_donated_key_providers_set(self) -> None:
         # Pin the membership so any drift surfaces in code review rather than
         # silently changing routing.
-        assert DONATED_KEY_PROVIDERS == frozenset({"openai", "anthropic", "google"})
+        assert frozenset({"openai", "anthropic", "google"}) == DONATED_KEY_PROVIDERS
 
     @pytest.mark.parametrize(
-        "message, expected",
+        ("message", "expected"),
         [
             ("HTTP 402 Payment Required", True),
             ("payment required", True),
@@ -920,7 +921,7 @@ class TestDeprecationTripwire:
         msg = "Grok 4.1 Fast is deprecated. xAI recommends switching to Grok 4.3"
         matched = _record_deprecation_if_matched("x-ai/grok-4.1-fast", msg)
         assert matched is True
-        assert _DEPRECATION_ALERTS == [("x-ai/grok-4.1-fast", msg)]
+        assert [("x-ai/grok-4.1-fast", msg)] == _DEPRECATION_ALERTS
         clear_deprecation_alerts()
 
     def test_does_not_record_unrelated_error(self) -> None:
@@ -1540,7 +1541,7 @@ class TestProbeFailureCannotVetoRouting:
     hold for the wrong reason there while passing locally off the repo's ``.env``.
     """
 
-    _BOOMS = [RuntimeError("transport wedged"), FileNotFoundError("bad SSL_CERT_FILE")]
+    _BOOMS: ClassVar[list[Exception]] = [RuntimeError("transport wedged"), FileNotFoundError("bad SSL_CERT_FILE")]
 
     @pytest.fixture(autouse=True)
     def _clean_counters(self, monkeypatch: pytest.MonkeyPatch):

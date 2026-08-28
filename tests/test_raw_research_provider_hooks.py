@@ -10,7 +10,7 @@ Gemini need (their raw payload and the question live in different scopes).
 
 import asyncio
 import dataclasses
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -47,8 +47,8 @@ async def test_asknews_emits_raw_records_for_both_phases(monkeypatch: pytest.Mon
     monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
     monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 
-    hot = [_StubArticle("Hot", "s", "en", datetime(2026, 7, 19, tzinfo=timezone.utc), "src", "http://a")]
-    hist = [_StubArticle("Hist", "s", "en", datetime(2026, 7, 18, tzinfo=timezone.utc), "src", "http://b")]
+    hot = [_StubArticle("Hot", "s", "en", datetime(2026, 7, 19, tzinfo=UTC), "src", "http://a")]
+    hist = [_StubArticle("Hist", "s", "en", datetime(2026, 7, 18, tzinfo=UTC), "src", "http://b")]
 
     async def mock_search_news(*_args, **kwargs):
         await asyncio.sleep(0)

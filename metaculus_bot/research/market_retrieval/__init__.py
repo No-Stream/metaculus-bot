@@ -13,8 +13,14 @@ consumer already imports the submodules directly:
 - `generation` — the three retrieval channels unioned into one candidate pool.
 - `ranking` — the ranker prompt, the parser, and the deterministic fail-open slate.
 - `rendering` — the markdown snapshot in the ranker's order.
+- `session_state` — the per-session caches, the per-run degradation counters, the aiohttp
+  session factory, and the two whole-catalogue prefetches that read those caches.
+- `snapshot_stages` — the per-question context and source ledger, plus the pipeline stages
+  that make no LLM call: venue search, pool assembly, and the post-rank accounting.
 
 `metaculus_bot.research.prediction_market` stays the seam module every consumer OUTSIDE this
-package imports from: it owns the provider factory, the caches and degradation counters, the
-aiohttp session factory, and it re-exports the row types from `types`.
+package imports from: it owns the provider factory, the snapshot orchestrator, the two LLM
+stages and their shared invoker, and it re-exports the row types from `types` plus the state and
+stage helpers named above — so a patch or an assertion against the seam still lands on the one
+instance of each.
 """

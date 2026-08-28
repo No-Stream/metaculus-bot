@@ -44,9 +44,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any
 
 from metaculus_bot.research.market_retrieval import venues
 from metaculus_bot.research.market_retrieval.http import flatten_results
@@ -214,6 +215,35 @@ def _kalshi_universe_channel(queries: Sequence[str], kalshi_events: Sequence[dic
             yield match
 
 
+def _venue_search_channel(
+    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None | BaseException]],
+) -> tuple[list[MarketMatch], dict[str, _FetchTally]]:
+    """Every venue's search hits in ``VENUE_ORDER``, plus the per-venue lost-sub-query tally.
+
+    A venue absent from the mapping ran no search at all and gets no tally; a venue whose entry
+    holds a ``None`` or a raised task ran one and lost sub-queries, which is the distinction
+    ``flatten_results`` keeps and the only degradation signal the pool carries.
+    """
+    search_rows: list[MarketMatch] = []
+    tallies: dict[str, _FetchTally] = {}
+    for venue in VENUE_ORDER:
+        results = venue_search_results.get(venue)
+        if results is None:
+            continue
+        matches, tally = flatten_results(list(results), venue)
+        # Ordered by the venue's OWN inverted rank before anything can cut it. `flatten_results`
+        # concatenates the per-query lists in QUERY order, so an early query's rank-9 row sat ahead
+        # of a later query's rank-0 exact hit and took its width slot — a truncation bias keyed on
+        # which query happened to be issued first. Stable, so equal ranks keep query precedence:
+        # the deterministic query set is ordered precision-descending and that tiebreak is worth
+        # keeping. Only this channel is re-ordered; the settlement join has already re-ranked
+        # itself with `fuzzy_best`, and re-ordering a whole venue POOL would break channel order.
+        matches.sort(key=lambda match: match.match_confidence, reverse=True)
+        search_rows.extend(matches)
+        tallies[venue] = tally
+    return search_rows, tallies
+
+
 def _predictit_universe_channel(predictit_markets: Sequence[dict[str, Any]]) -> list[MarketMatch]:
     """Every PredictIt market, in dump order. No scorer and no width, deliberately.
 
@@ -230,6 +260,73 @@ def _predictit_universe_channel(predictit_markets: Sequence[dict[str, Any]]) -> 
         if match is not None:
             out.append(match)
     return out
+
+
+def _fill_pools(
+    *,
+    join_rows: Sequence[MarketMatch],
+    search_rows: Sequence[MarketMatch],
+    kalshi_universe: Iterator[MarketMatch],
+    predictit_rows: Sequence[MarketMatch],
+    as_of_utc: datetime | None,
+) -> tuple[dict[str, list[MarketMatch]], dict[str, int]]:
+    """Every channel's rows into per-venue pools, first-seen-wins. Returns ``(pools, channel_counts)``.
+
+    **The call order below IS the ranking** — see the module docstring. ``pools`` is pre-width, so
+    ``channel_counts`` counts what entered the pool rather than what survived the cut.
+    """
+    pools: dict[str, list[MarketMatch]] = {venue: [] for venue in VENUE_ORDER}
+    seen: set[tuple[str, str]] = set()
+    channel_counts: dict[str, int] = {}
+
+    def add(match: MarketMatch) -> None:
+        if match.platform not in pools:
+            logger.warning(f"pool assembly: dropping row from unknown venue {match.platform!r}")
+            return
+        # Ahead of every write below, so an ineligible row consumes no width, no dedup slot and no
+        # channel count. `parse_iso` returns aware datetimes for all four venues, and `as_of_utc`
+        # went through `_as_utc` in `assemble_pool`, so the comparison cannot raise on a mixed pair.
+        if as_of_utc is not None and match.close_time is not None and match.close_time <= as_of_utc:
+            return
+        key = _dedup_key(match)
+        if key in seen:
+            return
+        seen.add(key)
+        pools[match.platform].append(match)
+        channel_counts[match.retrieval_channel] = channel_counts.get(match.retrieval_channel, 0) + 1
+
+    for match in join_rows:
+        add(match)
+    for match in search_rows:
+        add(match)
+    # The Kalshi universe generator is consumed only as far as the width; see the channel's own
+    # docstring for the measurement. The stop condition reads the POOL count rather than the rows
+    # consumed, so a dedup hit or an `as_of` drop still frees its slot — and a venue absent from
+    # `RETRIEVAL_WIDTH` stays unbounded here too.
+    kalshi_width = RETRIEVAL_WIDTH.get("kalshi")
+    for match in kalshi_universe:
+        if kalshi_width is not None and len(pools["kalshi"]) >= kalshi_width:
+            break
+        add(match)
+    for match in predictit_rows:
+        add(match)
+    return pools, channel_counts
+
+
+def _apply_widths(pools: Mapping[str, list[MarketMatch]]) -> tuple[list[MarketMatch], dict[str, int]]:
+    """The pool cut to ``RETRIEVAL_WIDTH``, flat and venue-major, plus the counts kept per venue.
+
+    A venue absent from ``RETRIEVAL_WIDTH`` is unbounded, which is PredictIt's whole-universe
+    statement rather than an oversight.
+    """
+    candidates: list[MarketMatch] = []
+    per_venue_counts: dict[str, int] = {}
+    for venue in VENUE_ORDER:
+        width = RETRIEVAL_WIDTH.get(venue)
+        rows = pools[venue] if width is None else pools[venue][:width]
+        per_venue_counts[venue] = len(rows)
+        candidates.extend(rows)
+    return candidates, per_venue_counts
 
 
 def assemble_pool(
@@ -275,68 +372,15 @@ def assemble_pool(
     """
     as_of_utc = None if as_of is None else _as_utc(as_of)
     join_rows, domains = _settlement_join_channel(criteria_text, queries, kalshi_events)
-
-    search_rows: list[MarketMatch] = []
-    tallies: dict[str, _FetchTally] = {}
-    for venue in VENUE_ORDER:
-        results = venue_search_results.get(venue)
-        if results is None:
-            continue
-        matches, tally = flatten_results(list(results), venue)
-        # Ordered by the venue's OWN inverted rank before anything can cut it. `flatten_results`
-        # concatenates the per-query lists in QUERY order, so an early query's rank-9 row sat ahead
-        # of a later query's rank-0 exact hit and took its width slot — a truncation bias keyed on
-        # which query happened to be issued first. Stable, so equal ranks keep query precedence:
-        # the deterministic query set is ordered precision-descending and that tiebreak is worth
-        # keeping. Only this channel is re-ordered; the settlement join has already re-ranked
-        # itself with `fuzzy_best`, and re-ordering a whole venue POOL would break channel order.
-        matches.sort(key=lambda match: match.match_confidence, reverse=True)
-        search_rows.extend(matches)
-        tallies[venue] = tally
-
-    pools: dict[str, list[MarketMatch]] = {venue: [] for venue in VENUE_ORDER}
-    seen: set[tuple[str, str]] = set()
-    channel_counts: dict[str, int] = {}
-
-    def add(match: MarketMatch) -> None:
-        if match.platform not in pools:
-            logger.warning(f"pool assembly: dropping row from unknown venue {match.platform!r}")
-            return
-        # Ahead of every write below, so an ineligible row consumes no width, no dedup slot and no
-        # channel count. `parse_iso` returns aware datetimes for all four venues, and `as_of_utc`
-        # went through `_as_utc` above, so the comparison cannot raise on a mixed pair.
-        if as_of_utc is not None and match.close_time is not None and match.close_time <= as_of_utc:
-            return
-        key = _dedup_key(match)
-        if key in seen:
-            return
-        seen.add(key)
-        pools[match.platform].append(match)
-        channel_counts[match.retrieval_channel] = channel_counts.get(match.retrieval_channel, 0) + 1
-
-    for match in join_rows:
-        add(match)
-    for match in search_rows:
-        add(match)
-    # The Kalshi universe generator is consumed only as far as the width; see the channel's own
-    # docstring for the measurement. The stop condition reads the POOL count rather than the rows
-    # consumed, so a dedup hit or an `as_of` drop still frees its slot — and a venue absent from
-    # `RETRIEVAL_WIDTH` stays unbounded here too.
-    kalshi_width = RETRIEVAL_WIDTH.get("kalshi")
-    for match in _kalshi_universe_channel(queries, kalshi_events):
-        if kalshi_width is not None and len(pools["kalshi"]) >= kalshi_width:
-            break
-        add(match)
-    for match in _predictit_universe_channel(predictit_markets):
-        add(match)
-
-    candidates: list[MarketMatch] = []
-    per_venue_counts: dict[str, int] = {}
-    for venue in VENUE_ORDER:
-        width = RETRIEVAL_WIDTH.get(venue)
-        rows = pools[venue] if width is None else pools[venue][:width]
-        per_venue_counts[venue] = len(rows)
-        candidates.extend(rows)
+    search_rows, tallies = _venue_search_channel(venue_search_results)
+    pools, channel_counts = _fill_pools(
+        join_rows=join_rows,
+        search_rows=search_rows,
+        kalshi_universe=_kalshi_universe_channel(queries, kalshi_events),
+        predictit_rows=_predictit_universe_channel(predictit_markets),
+        as_of_utc=as_of_utc,
+    )
+    candidates, per_venue_counts = _apply_widths(pools)
 
     degraded = [venue for venue, tally in tallies.items() if tally.failed]
     logger.info(
@@ -406,7 +450,7 @@ async def enrich_manifold(
     """
     rows = [row for row in candidates if row.platform == "manifold" and row.venue_market_id]
     if not rows:
-        return EnrichmentResult()  # noqa: ASYNC910
+        return EnrichmentResult()
 
     semaphore = asyncio.Semaphore(concurrency)
     n_ok = 0
@@ -436,10 +480,10 @@ async def enrich_manifold(
         for outcome in await asyncio.wait_for(gathered, wall_s):
             if isinstance(outcome, BaseException):
                 logger.warning(f"Manifold detail enrichment raised: {type(outcome).__name__}: {outcome}")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             f"Manifold detail enrichment hit its {wall_s}s wall with {n_ok}/{len(rows)} returned; "
             f"keeping what completed"
         )
     logger.info(f"manifold detail enrichment: attempted={len(rows)} ok={n_ok}")
-    return EnrichmentResult(n_attempted=len(rows), n_ok=n_ok)  # noqa: ASYNC910
+    return EnrichmentResult(n_attempted=len(rows), n_ok=n_ok)

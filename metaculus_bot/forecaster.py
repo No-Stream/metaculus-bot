@@ -2,8 +2,9 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Sequence, cast
+from collections.abc import Callable, Coroutine, Sequence
+from datetime import UTC, datetime
+from typing import Any, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryQuestion,
@@ -25,6 +26,7 @@ from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
 )
 from metaculus_bot.close_margin import format_close_margin_marker
+from metaculus_bot.comment.formatting import build_unified_explanation
 from metaculus_bot.comment.trimming import trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
@@ -52,6 +54,7 @@ from metaculus_bot.drop_telemetry import (
     classify_raised_drop_cause,
     emit_drop_telemetry,
 )
+from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import (
@@ -68,6 +71,7 @@ from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
     ResearchCallable,
 )
+from metaculus_bot.research.timeseries_anchor import _session_charts
 from metaculus_bot.stacking_route import route_after_forecasts
 from metaculus_bot.time_budget import (
     QuestionTimeBudget,
@@ -75,13 +79,14 @@ from metaculus_bot.time_budget import (
     format_time_budget_marker,
 )
 from metaculus_bot.time_utils import _as_utc
+from metaculus_bot.tool_runner import build_cross_model_aggregation, run_tools_for_forecaster
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
 
 # Sort sentinel for a question with no close time, so the tightest-close-first
 # ordering in forecast_questions never compares None against a datetime.
-_CLOSE_TIME_MAX = datetime.max.replace(tzinfo=timezone.utc)
+_CLOSE_TIME_MAX = datetime.max.replace(tzinfo=UTC)
 
 load_environment()
 
@@ -181,11 +186,68 @@ class TemplateForecaster(CompactLoggingForecastBot):
             discrete_integer_votes=self._discrete_integer_votes,
         )
 
-        # --- Alerting counters (consumed by cli.py to decide sys.exit status) ---
+        self._init_alerting_counters()
+
+        if max_concurrent_research <= 0:
+            raise ValueError("max_concurrent_research must be a positive integer")
+        # Persist for framework config introspection and logging
+        self.max_concurrent_research: int = max_concurrent_research
+        # Instance-level semaphore to avoid cross-instance throttling
+        self._concurrency_limiter: asyncio.Semaphore = asyncio.Semaphore(max_concurrent_research)
+
+        super().__init__(
+            research_reports_per_question=research_reports_per_question,
+            predictions_per_research_report=predictions_per_research_report,
+            publish_reports_to_metaculus=publish_reports_to_metaculus,
+            folder_to_save_reports_to=folder_to_save_reports_to,
+            skip_previously_forecasted_questions=skip_previously_forecasted_questions,
+            llms=normalized_llms,  # type: ignore[arg-type]  # dict value type lacks None but parent expects Optional
+            # 0.2.92 added an upstream success-rate gate in
+            # _handle_errors_in__run_individual_question: it raises when
+            # len(predictions) < expected_total_predictions * required_successful_predictions.
+            # Upstream's expected_total_predictions equals the
+            # predictions_per_research_report that prepare_llm_config sets to the
+            # configured roster width. At the 0.5 default the gate would reject a
+            # single-survivor publish on any roster
+            # wider than two, contradicting MIN_FORECASTERS_TO_PUBLISH. Pin it to 0.0 so OUR
+            # min_forecasters_to_publish guard (above) stays the sole arbiter of
+            # whether a degraded ensemble still publishes.
+            required_successful_predictions=0.0,
+        )
+
+        # Benchmark/backtest harnesses tag each bot instance with a display name
+        # (see benchmark/bot_factory.py, backtest.py). Declare it here so the
+        # attribute is statically known instead of needing scattered ignores.
+        self.name: str = getattr(self, "name", type(self).__name__)
+
+        # Now that super().__init__ has run, resolve the parser LLM and wire the
+        # stacking function so that mocking bot._run_stacking flows through.
+        # Use a lambda with dynamic attribute lookup so mock.patch replaces propagate.
+        self._pipeline.parser_llm = self.get_llm("parser", "llm")
+        self._pipeline.run_stacking_fn = lambda *args, **kwargs: self._run_stacking(*args, **kwargs)  # noqa: PLW0108  # deliberate: the lambda defers attribute lookup so mock.patch of _run_stacking propagates
+
+        self._research = ResearchOrchestrator(
+            default_llm=self.get_llm("default", "llm"),
+            summarizer_llm=self.get_llm("summarizer", "llm"),
+            custom_provider=research_provider,
+            research_cache=research_cache,
+            is_benchmarking=is_benchmarking,
+            allow_research_fallback=allow_research_fallback,
+            max_concurrent_research=max_concurrent_research,
+            research_sink=research_sink,
+        )
+
+        self._log_ensemble_configuration()
+
+    def _init_alerting_counters(self) -> None:
+        """Zero the run-level counters cli.py reads to decide the process exit status.
+
+        One bot instance == one run, so these are per-run totals rather than per-question.
+        """
         self._forecasters_dropped_count: int = 0
-        # Per-model drop attribution (same lifecycle as the scalar above — one
-        # bot instance == one run). _record_forecaster_drop is the single write
-        # path that keeps this list and the scalar in lockstep.
+        # Per-model drop attribution (same lifecycle as the scalar above).
+        # _record_forecaster_drop is the single write path that keeps this list and the
+        # scalar in lockstep.
         self._forecaster_drops: list[ForecasterDrop] = []
         self._questions_failed_to_publish: int = 0
         # Questions whose close time was too near for the full pipeline's worst case,
@@ -205,91 +267,50 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._conditional_stacking_skipped_count: int = 0
         # Skips from the single-forecaster short-circuit, kept in their own bucket so
         # the two skip reasons stay separable (mirroring the STACKER_OUTCOME split of
-        # "skipped_config_off" out of "skipped"). That branch returns above both
-        # increment sites below, so it has to bump its own counter or the per-question
-        # "SKIPPED: single forecaster survived" logs would end the run at "skipped=0".
+        # "skipped_config_off" out of "skipped"). That branch returns above both of
+        # stacking_route's increment sites, so it has to bump its own counter or the
+        # per-question "SKIPPED: single forecaster survived" logs would end the run at
+        # "skipped=0".
         self._conditional_stacking_skipped_single_forecaster_count: int = 0
         self._conditional_stacking_crux_failures: int = 0
         self._conditional_stacking_search_failures: int = 0
 
-        if max_concurrent_research <= 0:
-            raise ValueError("max_concurrent_research must be a positive integer")
-        # Persist for framework config introspection and logging
-        self.max_concurrent_research: int = max_concurrent_research
-        # Instance-level semaphore to avoid cross-instance throttling
-        self._concurrency_limiter: asyncio.Semaphore = asyncio.Semaphore(max_concurrent_research)
-
-        super().__init__(
-            research_reports_per_question=research_reports_per_question,
-            predictions_per_research_report=predictions_per_research_report,
-            publish_reports_to_metaculus=publish_reports_to_metaculus,
-            folder_to_save_reports_to=folder_to_save_reports_to,
-            skip_previously_forecasted_questions=skip_previously_forecasted_questions,
-            llms=normalized_llms,  # type: ignore[arg-type]  # dict value type lacks None but parent expects Optional
-            # 0.2.92 added an upstream success-rate gate in
-            # _handle_errors_in__run_individual_question: it raises when
-            # len(predictions) < expected_total_predictions * required_successful_predictions.
-            # expected_total_predictions == predictions_per_research_report, which
-            # prepare_llm_config sets to the configured roster width. At the 0.5
-            # default the gate would reject a single-survivor publish on any roster
-            # wider than two, contradicting MIN_FORECASTERS_TO_PUBLISH. Pin it to 0.0 so OUR
-            # min_forecasters_to_publish guard (above) stays the sole arbiter of
-            # whether a degraded ensemble still publishes.
-            required_successful_predictions=0.0,
-        )
-
-        # Benchmark/backtest harnesses tag each bot instance with a display name
-        # (see benchmark/bot_factory.py, backtest.py). Declare it here so the
-        # attribute is statically known instead of needing scattered ignores.
-        self.name: str = getattr(self, "name", type(self).__name__)
-
-        # Now that super().__init__ has run, resolve the parser LLM and wire the
-        # stacking function so that mocking bot._run_stacking flows through.
-        # Use a lambda with dynamic attribute lookup so mock.patch replaces propagate.
-        self._pipeline.parser_llm = self.get_llm("parser", "llm")
-        self._pipeline.run_stacking_fn = lambda *args, **kwargs: self._run_stacking(*args, **kwargs)
-
-        self._research = ResearchOrchestrator(
-            default_llm=self.get_llm("default", "llm"),
-            summarizer_llm=self.get_llm("summarizer", "llm"),
-            custom_provider=research_provider,
-            research_cache=research_cache,
-            is_benchmarking=is_benchmarking,
-            allow_research_fallback=allow_research_fallback,
-            max_concurrent_research=max_concurrent_research,
-            research_sink=research_sink,
-        )
-
-        # Log ensemble + aggregation configuration once on init
+    def _log_ensemble_configuration(self) -> None:
+        """Log the ensemble + aggregation configuration once on init."""
         num_models = len(self._forecaster_llms) if self._forecaster_llms else 1
         logger.info(
             "Ensemble configured: %s model(s) | Aggregation: %s",
             num_models,
             self.aggregation_strategy.value,
         )
+        if self.aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
+            return
+
+        stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
+        base_models = [m.model for m in self._forecaster_llms]
+        # Display truncation for one log line, not a computation over a sample.
+        short_list = (
+            base_models if len(base_models) <= 6 else [*base_models[:6], "..."]
+        )  # HARNESS-SCAN-EXEMPT-subsampling
+
         if self.aggregation_strategy == AggregationStrategy.STACKING:
-            stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
-            base_models = [m.model for m in self._forecaster_llms]
-            short_list = base_models if len(base_models) <= 6 else base_models[:6] + ["..."]
             logger.info(
                 "STACKING config | stacker=%s | base_forecasters(%d)=%s | final_outputs_per_question=1",
                 stacker_name,
                 len(base_models),
                 short_list,
             )
-        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
-            stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
-            analyzer_name = self._analyzer_llm.model if self._analyzer_llm else "<missing>"
-            base_models = [m.model for m in self._forecaster_llms]
-            short_list = base_models if len(base_models) <= 6 else base_models[:6] + ["..."]
-            logger.info(
-                "CONDITIONAL_STACKING config | stacker=%s | analyzer=%s | base_forecasters(%d)=%s | thresholds=%s",
-                stacker_name,
-                analyzer_name,
-                len(base_models),
-                short_list,
-                self._stacking_spread_thresholds,
-            )
+            return
+
+        analyzer_name = self._analyzer_llm.model if self._analyzer_llm else "<missing>"
+        logger.info(
+            "CONDITIONAL_STACKING config | stacker=%s | analyzer=%s | base_forecasters(%d)=%s | thresholds=%s",
+            stacker_name,
+            analyzer_name,
+            len(base_models),
+            short_list,
+            self._stacking_spread_thresholds,
+        )
 
     def _get_threshold_for_question(self, question: MetaculusQuestion) -> float:
         return self._pipeline.get_threshold_for_question(question)
@@ -532,6 +553,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         question: MetaculusQuestion,
         research: str,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
+        *,
         stacker_llm_override: GeneralLlm | None = None,
         aggregated_tool_output: str | None = None,
         stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
@@ -651,6 +673,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self,
         question: MetaculusQuestion,
         valid_predictions: list[ReasonedPrediction[PredictionTypes]],
+        *,
         research_for_stacking: str,
         research_report: str,
         summary_report: str,
@@ -676,10 +699,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Probabilistic tools: deterministic cross-model math runs once per
         # question and rides at the top of the stacker prompt. No-ops when
         # PROBABILISTIC_TOOLS_ENABLED is unset.
-        from metaculus_bot.tool_runner import (
-            build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
-        )
-
         aggregated_tool_output = (
             build_cross_model_aggregation(
                 question=question,
@@ -720,7 +739,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         """
         report = await super()._run_individual_question(question)
         if self.publish_reports_to_metaculus:
-            marker = format_close_margin_marker(question, datetime.now(timezone.utc))
+            marker = format_close_margin_marker(question, datetime.now(UTC))
             if marker is not None:
                 logger.info(marker)
         return report
@@ -803,7 +822,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         tasks = cast(
             list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
             [
-                self._forecaster_with_soft_deadline(question, research, llm_instance, qid_for_log, chart_b64)
+                self._forecaster_with_soft_deadline(
+                    question, research, llm_instance, qid=qid_for_log, chart_b64=chart_b64
+                )
                 for llm_instance in self._forecaster_llms
             ],
         )
@@ -917,7 +938,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
         text = super()._format_forecaster_rationales(report_number, researched_predictions).lstrip()
         return trim_section(text, f"report_{report_number}_rationales")
 
-    def _create_unified_explanation(
+    # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
+    # ForecastBot._create_unified_explanation, which forecasting-tools calls POSITIONALLY
+    # (forecast_bot.py: "self._create_unified_explanation(question, valid_prediction_set,
+    # aggregated_prediction, final_cost, time_spent_in_minutes)"). Making any of these
+    # keyword-only would break the framework's own call.
+    def _create_unified_explanation(  # noqa: PLR0917  # signature is fixed by the ft base class, see comment above
         self,
         question: MetaculusQuestion,
         research_prediction_collections: list[ResearchWithPredictions],
@@ -925,8 +951,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         final_cost: float,
         time_spent_in_minutes: float,
     ) -> str:
-        from metaculus_bot.comment.formatting import build_unified_explanation
-
         base_text = super()._create_unified_explanation(
             question,
             research_prediction_collections,
@@ -977,6 +1001,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         question: MetaculusQuestion,
         research: str,
         llm: GeneralLlm,
+        *,
         qid: int | None,
         chart_b64: str | None = None,
     ) -> ReasonedPrediction[PredictionTypes]:
@@ -1001,7 +1026,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 self._make_prediction(question, research, llm, chart_b64),
                 timeout=FORECASTER_SOFT_DEADLINE,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             elapsed = time.monotonic() - start
             self._record_forecaster_drop(model=llm.model, qid=qid, cause=DROP_CAUSE_TIMEOUT_SOFT_DEADLINE)
             logger.warning(
@@ -1048,10 +1073,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # the forecaster's structured JSON block (see tool_runner.py). The
         # tool runner no-ops when PROBABILISTIC_TOOLS_ENABLED is off or no
         # block was emitted; callers don't gate.
-        from metaculus_bot.tool_runner import (
-            run_tools_for_forecaster,  # noqa: PLC0415  # function-scoped: see AGENTS.md
-        )
-
         computed_md = run_tools_for_forecaster(
             question=question,
             rationale=prediction.reasoning,
@@ -1068,7 +1089,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
         return prediction  # type: ignore[return-value]
 
-    async def _aggregate_predictions(
+    # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
+    # ForecastBot._aggregate_predictions, which forecasting-tools calls POSITIONALLY
+    # (forecast_bot.py: "await self._aggregate_predictions(all_predictions, question)"). The params
+    # past ``question`` are ours, but narrowing the first two would break the framework's call.
+    async def _aggregate_predictions(  # noqa: PLR0917  # signature is fixed by the ft base class, see comment above
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
@@ -1077,7 +1102,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
         return await self._pipeline.aggregate(
-            predictions, question, research, reasoned_predictions, aggregated_tool_output
+            predictions,
+            question,
+            research=research,
+            reasoned_predictions=reasoned_predictions,
+            aggregated_tool_output=aggregated_tool_output,
         )
 
     def _pull_research_chart(self, qid: int | None) -> str | None:
@@ -1085,23 +1114,20 @@ class TemplateForecaster(CompactLoggingForecastBot):
         per-session cache and return the base64 PNG (or None).
 
         Popping keeps the provider cache from growing across a batch; the returned
-        value is handed straight down the fan-out. Gated on the chart flag so the
-        provider (and matplotlib) stays off the cold path when the feature is
-        disabled — the default in prod.
+        value is handed straight down the fan-out. The chart-flag gate short-circuits
+        the read when the feature is off (the default in prod), so a stale entry from
+        an earlier flag-on run is never attached. matplotlib is NOT on the import path
+        the module-level ``_session_charts`` import creates: it lives behind
+        ``ts_chart``, which ``timeseries_anchor`` imports inside its own render guard,
+        so a prod ``uv sync --no-dev`` install imports this fine.
         """
         if qid is None or not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
             return None
-        from metaculus_bot.research.timeseries_anchor import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # optional provider; matplotlib off the cold path
-            _session_charts,
-        )
-
         return _session_charts.pop(qid, None)
 
     async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
         self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[float]:
-        from metaculus_bot.forecaster_runners import run_binary_forecast
-
         return await run_binary_forecast(
             question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
         )
@@ -1109,15 +1135,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
     async def _run_forecast_on_multiple_choice(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
         self, question: MultipleChoiceQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[PredictedOptionList]:
-        from metaculus_bot.forecaster_runners import run_mc_forecast
-
         return await run_mc_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64)
 
     async def _run_forecast_on_numeric(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
         self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[NumericDistribution]:
-        from metaculus_bot.forecaster_runners import run_numeric_forecast
-
         prediction, discrete_vote = await run_numeric_forecast(
             question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
         )

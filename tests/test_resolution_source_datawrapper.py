@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from unittest.mock import MagicMock
 
@@ -63,12 +63,12 @@ def _http_date(dt: datetime) -> str:
 
 
 def _fresh_last_modified() -> str:
-    return _http_date(datetime.now(timezone.utc) - timedelta(hours=2))
+    return _http_date(datetime.now(UTC) - timedelta(hours=2))
 
 
 def _stale_last_modified() -> str:
     bound = resolution_source.RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS
-    return _http_date(datetime.now(timezone.utc) - timedelta(days=bound + 15))
+    return _http_date(datetime.now(UTC) - timedelta(days=bound + 15))
 
 
 def _tracker_page_html(*chart_ids: str) -> bytes:
@@ -92,7 +92,7 @@ def _tracker_page_html(*chart_ids: str) -> bytes:
         "<p>Methodology: polls are adjusted for house effects and recency; the "
         "downloadable data under the chart takes precedence over the prose.</p>"
         "</article></body></html>"
-    ).encode("utf-8")
+    ).encode()
 
 
 def _csv_body(n_rows: int) -> str:
@@ -255,7 +255,7 @@ class TestDatawrapperHop:
         # chart CSV is not a cited resolution source, so it must not ride the
         # "cited resolution source(s) could not be fetched" wording — and the
         # (fresh) page content still renders.
-        out = format_resolution_sections(results, datetime.now(timezone.utc))
+        out = format_resolution_sections(results, datetime.now(UTC))
         assert "[1 embedded chart dataset(s) not served (stale_data)" in out
         assert "could not be fetched" not in out
         assert "day-0019" not in out
@@ -294,7 +294,7 @@ class TestDatawrapperHop:
         """The freshness check is two-sided. A ``Last-Modified`` in the future means a broken
         clock or a misparse on one side, which makes it unusable as the publication date the
         lead asserts — the one-sided check passed any future date as maximally fresh."""
-        tomorrow = _http_date(datetime.now(timezone.utc) + timedelta(days=1))
+        tomorrow = _http_date(datetime.now(UTC) + timedelta(days=1))
         session = FakeSession(
             {
                 PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
@@ -311,7 +311,7 @@ class TestDatawrapperHop:
     async def test_a_dataset_inside_the_clock_skew_tolerance_is_still_served(self, monkeypatch):
         # Ordinary CDN/host clock skew must not cost us a live dataset, so the future side
         # carries a small tolerance rather than a hard `> now` bound.
-        skewed = _http_date(datetime.now(timezone.utc) + timedelta(minutes=30))
+        skewed = _http_date(datetime.now(UTC) + timedelta(minutes=30))
         session = FakeSession(
             {
                 PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
@@ -326,7 +326,7 @@ class TestDatawrapperHop:
 
     async def test_dataset_just_inside_bound_is_served(self, monkeypatch):
         bound = resolution_source.RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS
-        recent = _http_date(datetime.now(timezone.utc) - timedelta(days=bound - 1))
+        recent = _http_date(datetime.now(UTC) - timedelta(days=bound - 1))
         session = FakeSession(
             {
                 PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
@@ -346,7 +346,7 @@ class TestDatawrapperHop:
             '<div data-attrs="{&quot;url&quot;:&quot;'
             f"https://datawrapper.dwcdn.net/{CHART_ID}/11/&quot;,"
             '&quot;title&quot;:&quot;Walled chart&quot;}"></div></body></html>'
-        ).encode("utf-8")
+        ).encode()
         session = FakeSession(
             {
                 PAGE_URL: FakeResponse(200, body=shell, content_type="text/html"),
@@ -357,7 +357,7 @@ class TestDatawrapperHop:
 
         results = await fetch_resolution_sources([PAGE_URL])
         assert [r.status for r in results] == ["js_wall", "success"]
-        out = format_resolution_sections(results, datetime.now(timezone.utc))
+        out = format_resolution_sections(results, datetime.now(UTC))
         assert "day-0019,38.5,57.9" in out
         assert "js_wall" in out  # the walled page is still reported as unreachable
 
@@ -651,7 +651,7 @@ class TestDatawrapperHopFailureModes:
         assert result.chart_id == CHART_ID
 
     async def test_timeout_maps_to_error(self):
-        session = FakeSession({DATASET_URL: asyncio.TimeoutError()})
+        session = FakeSession({DATASET_URL: TimeoutError()})
         result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
         assert result.status == "error"
         assert result.http_status is None
@@ -809,7 +809,8 @@ class TestDatasetMarkupStripping:
         result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
 
         assert result.status == "success"
-        assert "Pollster 000" in result.text and "Pollster 004" in result.text
+        assert "Pollster 000" in result.text
+        assert "Pollster 004" in result.text
         assert "<a " not in result.text
         assert "style=" not in result.text
         assert "nofollow" not in result.text
@@ -936,7 +937,7 @@ class TestProviderEndToEnd:
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL, other_page])
-        out = format_resolution_sections(results, datetime.now(timezone.utc))
+        out = format_resolution_sections(results, datetime.now(UTC))
 
         # Both cited pages render despite two full-size datasets interleaved
         # before/between them in the walk order.

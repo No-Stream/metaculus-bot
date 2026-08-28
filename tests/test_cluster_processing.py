@@ -4,9 +4,11 @@ Unit tests for cluster processing utilities.
 Tests for cluster detection and spreading functions extracted from main.py.
 """
 
+from itertools import pairwise
 from types import SimpleNamespace
-from typing import cast
+from typing import ClassVar, cast
 
+import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
@@ -112,7 +114,7 @@ class TestClusterProcessing:
         # Check that clustered values are now different
         cluster_values = result[1:4]  # The cluster positions
         assert len(set(cluster_values)) == 3  # All different now
-        assert all(a < b for a, b in zip(cluster_values, cluster_values[1:]))  # Strictly increasing
+        assert all(a < b for a, b in pairwise(cluster_values))  # Strictly increasing
 
     def test_apply_cluster_spreading_boundary_constraints(self):
         """Test cluster spreading respects boundary constraints.
@@ -197,7 +199,7 @@ class TestIsDegenerateCluster:
         result = apply_jitter_for_duplicates(values.copy(), question, 100.0, percentiles)
 
         # Should be strictly increasing
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
 
     def test_apply_jitter_for_duplicates_boundary_respect(self):
         """Test jitter respects boundaries."""
@@ -211,7 +213,7 @@ class TestIsDegenerateCluster:
         result = apply_jitter_for_duplicates(values.copy(), question, 100.0, percentiles)
 
         # Should be strictly increasing and within bounds
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
         assert all(v <= question.upper_bound for v in result)
 
     def test_ensure_strictly_increasing_bounded_left_to_right(self):
@@ -222,7 +224,7 @@ class TestIsDegenerateCluster:
         result = ensure_strictly_increasing_bounded(values.copy(), question, 100.0)
 
         # Should be strictly increasing
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
 
     def test_ensure_strictly_increasing_bounded_right_to_left(self):
         """Test right-to-left adjustment for boundary cases."""
@@ -232,7 +234,7 @@ class TestIsDegenerateCluster:
         result = ensure_strictly_increasing_bounded(values.copy(), question, 100.0)
 
         # Should be strictly increasing and within bounds
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
         assert all(v <= question.upper_bound for v in result)
 
     def test_ensure_strictly_increasing_bounded_respects_boundaries(self):
@@ -243,5 +245,78 @@ class TestIsDegenerateCluster:
         result = ensure_strictly_increasing_bounded(values.copy(), question, 100.0)
 
         # Should be strictly increasing and above lower bound
-        assert all(a < b for a, b in zip(result, result[1:]))
+        assert all(a < b for a, b in pairwise(result))
         assert all(v >= question.lower_bound for v in result)
+
+
+class TestApplyClusterSpreadingGoldenOutputs:
+    """Exact-output pins over the spreader's whole shape space.
+
+    ``apply_cluster_spreading`` walks the value list with a hand-rolled index cursor,
+    grows each epsilon cluster, spreads it symmetrically around its mean, then applies a
+    shift-up against the previous neighbour and a compression against the next one. The
+    property tests above cover the individual rules; these goldens pin the composition
+    (multiple clusters in one pass, a cluster at each bound, a chained near-equal run)
+    so the walk can be restructured without moving a published value. Captured from the
+    implementation as of 2026-08-26.
+    """
+
+    SHAPES: ClassVar[dict[str, list[float]]] = {
+        "mid_cluster": [10.0, 20.0, 20.0, 20.0, 30.0],
+        "two_clusters": [1.0, 1.0, 5.0, 9.0, 9.0, 9.0, 9.0, 40.0],
+        "at_lower": [0.0, 0.0, 0.0, 50.0],
+        "trailing": [1.0, 4.0, 10.0, 10.0],
+        "tight_gap": [10.0, 20.0, 20.0, 20.000001, 20.0001, 60.0],
+        "near_upper": [10.0, 99.9, 99.9, 99.9, 99.95],
+    }
+
+    # (shape, open_lower, open_upper) -> (expected values, expected clusters_applied)
+    GOLDEN: ClassVar[dict[tuple[str, bool, bool], tuple[list[float], int]]] = {
+        ("mid_cluster", False, False): ([10.0, 19.0, 20.0, 21.0, 30.0], 1),
+        ("mid_cluster", True, True): ([10.0, 19.0, 20.0, 21.0, 30.0], 1),
+        ("two_clusters", False, False): ([0.5, 1.5, 5.0, 7.5, 8.5, 9.5, 10.5, 40.0], 2),
+        ("two_clusters", True, True): ([0.5, 1.5, 5.0, 7.5, 8.5, 9.5, 10.5, 40.0], 2),
+        ("at_lower", False, False): ([1.0000000000000001e-07, 1.0000000000000001e-07, 1.0, 50.0], 1),
+        ("at_lower", True, True): ([-1.0, 0.0, 1.0, 50.0], 1),
+        ("trailing", False, False): ([1.0, 4.0, 9.5, 10.5], 1),
+        ("trailing", True, True): ([1.0, 4.0, 9.5, 10.5], 1),
+        ("tight_gap", False, False): ([10.0, 19.5, 19.7500005, 20.000001, 20.0001, 60.0], 1),
+        ("tight_gap", True, True): ([10.0, 19.5, 19.7500005, 20.000001, 20.0001, 60.0], 1),
+        ("near_upper", False, False): (
+            [10.0, 98.90000000000002, 99.25000000000001, 99.60000000000001, 99.95],
+            1,
+        ),
+        ("near_upper", True, True): (
+            [10.0, 98.90000000000002, 99.25000000000001, 99.60000000000001, 99.95],
+            1,
+        ),
+    }
+
+    @pytest.mark.parametrize(("open_lower", "open_upper"), [(False, False), (True, True)])
+    @pytest.mark.parametrize("shape_name", list(SHAPES))
+    def test_golden_output(self, shape_name: str, open_lower: bool, open_upper: bool):
+        values = list(self.SHAPES[shape_name])
+        question = _make_question(open_lower=open_lower, open_upper=open_upper)
+
+        result, clusters_applied = apply_cluster_spreading(
+            values,
+            question,
+            value_eps=1e-6,
+            spread_delta=1.0,
+            range_size=100.0,
+        )
+
+        expected_values, expected_clusters = self.GOLDEN[shape_name, open_lower, open_upper]
+        assert clusters_applied == expected_clusters
+        for got, want in zip(result, expected_values, strict=True):
+            assert got == pytest.approx(want, rel=1e-12, abs=1e-15)
+
+    def test_spreading_mutates_the_caller_list_in_place(self):
+        """The spreader returns the SAME list object it was handed; the pipeline relies
+        on the return value, but a caller reusing its own list must see the mutation."""
+        values = [10.0, 20.0, 20.0, 20.0, 30.0]
+        question = _make_question()
+
+        result, _ = apply_cluster_spreading(values, question, value_eps=1e-6, spread_delta=1.0, range_size=100.0)
+
+        assert result is values

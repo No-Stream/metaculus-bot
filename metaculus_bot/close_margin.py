@@ -13,7 +13,7 @@ Emitted format (the source of truth for ``scripts/telemetry/markers.py``)::
     CLOSE_MARGIN: question=<id> close_time=<iso> submitted_at=<iso> \
         window_s=<int|n/a> margin_s=<int> margin_frac=<float|n/a>
 
-``margin_s`` (close − submit, seconds) is always computable once ``close_time``
+``margin_s`` (close - submit, seconds) is always computable once ``close_time``
 exists; ``window_s`` (open → close) and ``margin_frac`` (margin / window) need
 ``open_time`` and a positive window, else render ``n/a`` (matching the marker
 parser's None sentinel). Returns ``None`` — skip, emit nothing — when

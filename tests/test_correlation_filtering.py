@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
+
+from forecasting_tools.cp_benchmarking.benchmark_for_bot import BenchmarkForBot
 
 from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
@@ -41,7 +43,7 @@ class FakeBenchmark:
 def build_analyzer_with_models(names_and_paths: list[tuple[str, str]]) -> CorrelationAnalyzer:
     benches = [FakeBenchmark(n, p) for n, p in names_and_paths]
     analyzer = CorrelationAnalyzer()
-    analyzer.add_benchmark_results(benches)  # type: ignore[arg-type]
+    analyzer.add_benchmark_results(cast("list[BenchmarkForBot]", benches))
     return analyzer
 
 
@@ -93,3 +95,83 @@ def test_include_only_subset():
     analyzer.filter_models_inplace(include=["o3", "qwen3-235b"])  # include only two
     names = set(analyzer.get_model_names())
     assert names == {"qwen3-235b", "o3"}
+
+
+# What the filter REPORTS, not just what it keeps. A token that matched nothing is
+# the operator's typo signal, and the summary lines are what the correlation report
+# renders under "Filters Applied" — both are part of the contract.
+
+
+def _three_model_analyzer() -> CorrelationAnalyzer:
+    return build_analyzer_with_models(
+        [
+            ("qwen3-235b", "openrouter/qwen/qwen3-235b-a22b-thinking-2507"),
+            ("o3", "openrouter/openai/o3"),
+            ("grok-4", "openrouter/x-ai/grok-4"),
+        ]
+    )
+
+
+def test_no_tokens_is_a_no_op_with_empty_summary():
+    analyzer = _three_model_analyzer()
+    result = analyzer.filter_models_inplace()
+
+    assert result == {"included": [], "excluded": [], "unmatched_includes": [], "unmatched_excludes": []}
+    assert analyzer._filter_summary_lines == []
+    assert len(analyzer.get_model_names()) == 3
+
+
+def test_unmatched_tokens_are_reported_on_both_sides():
+    analyzer = _three_model_analyzer()
+    result = analyzer.filter_models_inplace(include=["o3", "nonexistent"], exclude=["also-missing"])
+
+    assert result["included"] == ["o3"]
+    assert result["excluded"] == []
+    assert result["unmatched_includes"] == ["nonexistent"]
+    assert result["unmatched_excludes"] == ["also-missing"]
+
+
+def test_exclude_wins_over_include_for_the_same_model():
+    analyzer = _three_model_analyzer()
+    result = analyzer.filter_models_inplace(include=["o3", "grok-4"], exclude=["grok"])
+
+    assert result["included"] == ["o3"]
+    assert result["excluded"] == ["grok-4"]
+    assert analyzer.get_model_names() == ["o3"]
+
+
+def test_summary_lines_name_every_token_and_the_remainder():
+    analyzer = _three_model_analyzer()
+    analyzer.filter_models_inplace(include=["o3", "nonexistent"], exclude=["grok"])
+
+    assert analyzer._filter_summary_lines == [
+        "Included by tokens:",
+        "- o3: o3",
+        "- nonexistent: (no match)",
+        "Excluded by tokens:",
+        "- grok: grok-4",
+        "Remaining models: o3",
+    ]
+
+
+def test_summary_says_none_when_everything_is_filtered_out():
+    analyzer = _three_model_analyzer()
+    analyzer.filter_models_inplace(exclude=["o3", "grok", "qwen"])
+
+    assert analyzer._filter_summary_lines[-1] == "Remaining models: (none)"
+    assert analyzer.get_model_names() == []
+
+
+def test_blank_and_non_string_tokens_are_ignored():
+    analyzer = _three_model_analyzer()
+    result = analyzer.filter_models_inplace(exclude=cast("list[str]", ["   ", None]))
+
+    assert result == {"included": [], "excluded": [], "unmatched_includes": [], "unmatched_excludes": []}
+    assert len(analyzer.get_model_names()) == 3
+
+
+def test_matching_is_case_insensitive():
+    analyzer = _three_model_analyzer()
+    analyzer.filter_models_inplace(exclude=["GROK"])
+
+    assert set(analyzer.get_model_names()) == {"qwen3-235b", "o3"}

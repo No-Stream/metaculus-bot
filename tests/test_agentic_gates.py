@@ -52,8 +52,8 @@ def _finding(source_url: str, *, quote: str = "Verbatim quote from the source.",
 
 
 def _search_returning(content: str, links: list[str] | None = None):
-    async def _search(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-        return ToolOutcome(content_markdown=content, links=links or [], method="search")  # noqa: ASYNC910
+    async def _search(**_: Any) -> ToolOutcome:
+        return ToolOutcome(content_markdown=content, links=links or [], method="search")
 
     return _search
 
@@ -63,10 +63,8 @@ def _returns_method(content: str, *, method: str, status: str = "ok", links: lis
     used by the W4 tier-stamping tests to drive fetched vs snippet vs failed
     retrievals through the loop."""
 
-    async def _handler(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-        return ToolOutcome(  # noqa: ASYNC910
-            content_markdown=content, links=links or [], method=method, status=status
-        )
+    async def _handler(**_: Any) -> ToolOutcome:
+        return ToolOutcome(content_markdown=content, links=links or [], method=method, status=status)
 
     return _handler
 
@@ -801,7 +799,10 @@ class TestProvenanceGate:
                                 "findings": [
                                     _finding(
                                         "https://agency.example/report",
-                                        quote="‘The rate was 4.1 percent.’",
+                                        # The curly single quotes ARE the fixture: this test pins that
+                                        # glyph deletion converges when the two sides use different
+                                        # quote families, so they must not be flattened to ASCII.
+                                        quote="‘The rate was 4.1 percent.’",  # noqa: RUF001
                                     )
                                 ]
                             },
@@ -1356,9 +1357,9 @@ class TestResearchPlanGate:
     async def test_external_tool_before_plan_is_rejected_with_nudge(self) -> None:
         invoked: list[str] = []
 
-        async def search_web(**kwargs: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        async def search_web(**kwargs: Any) -> ToolOutcome:
             invoked.append(kwargs.get("query", ""))
-            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+            return ToolOutcome(content_markdown="ran", method="search")
 
         # Turn 1 calls an external tool with no plan set -> rejected. Turn 2 sets
         # the plan. Turn 3's search then runs. Turn 4 concludes.
@@ -1397,9 +1398,9 @@ class TestResearchPlanGate:
     async def test_plan_accepted_then_external_tool_runs(self) -> None:
         invoked: list[str] = []
 
-        async def search_web(**kwargs: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        async def search_web(**kwargs: Any) -> ToolOutcome:
             invoked.append(kwargs.get("query", ""))
-            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+            return ToolOutcome(content_markdown="ran", method="search")
 
         fake_llm = FakeLlm(
             [
@@ -1557,9 +1558,9 @@ class TestResearchPlanGate:
         caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
         invoked: list[str] = []
 
-        async def search_web(**kwargs: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        async def search_web(**kwargs: Any) -> ToolOutcome:
             invoked.append(kwargs.get("query", ""))
-            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+            return ToolOutcome(content_markdown="ran", method="search")
 
         # Three external-only turns: turns 1 and 2 are plan-rejected (2 nudges ==
         # cap), turn 3 runs un-gated, turn 4 concludes.
@@ -1590,8 +1591,8 @@ class TestResearchPlanGate:
         """After a plan is set, the per-turn budget line lists the plan's gap ids
         as the driver's outstanding work-list (W1 coarse accounting)."""
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="ran", method="search")
 
         fake_llm = FakeLlm(
             [
@@ -1648,9 +1649,9 @@ class TestResearchPlanGate:
         call is still plan-rejected; the empty plan did not open the gate."""
         invoked: list[str] = []
 
-        async def search_web(**kwargs: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        async def search_web(**kwargs: Any) -> ToolOutcome:
             invoked.append(kwargs.get("query", ""))
-            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+            return ToolOutcome(content_markdown="ran", method="search")
 
         # Turn 1: empty-gap plan (rejected). Turn 2: an external tool that must
         # still be plan-gated (only 1 nudge so far, cap not yet hit). Turn 3: a
@@ -1720,8 +1721,8 @@ class TestConcludeGate:
         """A conclude whose accounting omits a plan gap is rejected (loop
         continues); a follow-up conclude that covers every gap is accepted."""
 
-        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+        async def fetch(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="body", method="rendered")
 
         # Plan has two gaps; two fetches meet the per-gap call count + fetch floor.
         fake_llm = FakeLlm(
@@ -1758,8 +1759,8 @@ class TestConcludeGate:
         """Two plan gaps but only one external tool call: the ≥1-call-per-gap
         invariant is unmet, so the conclude is rejected even with full accounting."""
 
-        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+        async def fetch(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="body", method="rendered")
 
         fake_llm = FakeLlm(
             [
@@ -1792,8 +1793,8 @@ class TestConcludeGate:
         """One gap, one external call, but it's a search (no fetch/read) and the
         accounting doesn't cite a fetch: both fetch-floor clauses fail -> reject."""
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="snippet", method="search")
 
         fake_llm = FakeLlm(
             [
@@ -1829,8 +1830,8 @@ class TestConcludeGate:
         even though the run's own fetch count is below the global floor (one
         rendered fetch). The conclude is accepted."""
 
-        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+        async def fetch(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="body", method="rendered")
 
         fake_llm = FakeLlm(
             [
@@ -1860,8 +1861,8 @@ class TestConcludeGate:
         """Fetch-floor clause (b): the run made ≥2 fetches/reads, so a conclude
         whose accounting does NOT cite a fetch per gap is still accepted."""
 
-        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+        async def fetch(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="body", method="rendered")
 
         fake_llm = FakeLlm(
             [
@@ -1897,10 +1898,10 @@ class TestConcludeGate:
         verbs, but every fetch 403'd (zero successful fetched-tier retrievals). The
         per-gap prose clause no longer clears the floor on its own -> reject."""
 
-        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        async def fetch(**_: Any) -> ToolOutcome:
             # Every fetch 403s (status=blocked): no fetched tier is granted, so
             # url_best_tier stays empty and fetches_reads is 0 despite the calls.
-            return ToolOutcome(content_markdown="Fetch blocked with HTTP 403.", method="plain", status="blocked")  # noqa: ASYNC910
+            return ToolOutcome(content_markdown="Fetch blocked with HTTP 403.", method="plain", status="blocked")
 
         fake_llm = FakeLlm(
             [
@@ -1952,11 +1953,11 @@ class TestConcludeGate:
         fetched-tier retrieval plus honest per-gap fetch citations is accepted even
         though the run's fetch count (1) is below the global 2-fetch floor."""
 
-        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+        async def fetch(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="body", method="rendered")
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="snippet", method="search")
 
         # Two gaps -> the per-gap external floor needs >=2 external calls: one
         # successful fetch (fetched tier) plus one search (snippet tier). That
@@ -2004,8 +2005,8 @@ class TestConcludeGate:
         """Budget exhaustion (_must_conclude) overrides the gate: a conclude with
         no gap_accounting at all is accepted, and the rejection counter stays 0."""
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="snippet", method="search")
 
         # max_tool_calls=2: plan (1) + one search (2) exhausts the budget, so the
         # conclude turn is in must-conclude mode and the gate is bypassed.
@@ -2031,8 +2032,8 @@ class TestConcludeGate:
         """After max_conclude_gate_rejections (2) blocked concludes, the third is
         accepted unconditionally so a pathological driver can't loop forever."""
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="snippet", method="search")
 
         # A single gap, one snippet-only search, and three bare concludes that all
         # fail the fetch floor. The first two are rejected; the third is accepted
@@ -2065,8 +2066,8 @@ class TestConcludeGate:
         """When the plan-nudge cap forced a soft-continue (plan_skipped), there is
         no plan to enforce, so the conclude gate is bypassed."""
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="snippet", method="search")
 
         # Two plan-less external turns hit the nudge cap; turn 3 runs un-gated;
         # turn 4 concludes with no accounting -> accepted (plan_skipped bypass).
@@ -2093,8 +2094,8 @@ class TestConcludeGate:
         with no plan set (plan_skipped still False). The gate now rejects that —
         planning can't be skipped by never calling set_research_plan."""
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="snippet", method="search")
 
         # Turn 1 concludes with no plan -> rejected; turn 2's bare conclude is
         # accepted by the rejection cap (=1), proving the loop can't wedge.
@@ -2126,8 +2127,8 @@ class TestConcludeGate:
         valid plan set after the plan-nudge cap fired stayed permanently exempt.
         Now a real plan re-arms the gate even once plan_skipped is True."""
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="snippet", method="search")
 
         # Turns 1-2: plan-less external calls hit the nudge cap (plan_skipped=True).
         # Turn 3: a real plan registers. Turn 4: an early conclude with no
@@ -2165,8 +2166,8 @@ class TestConcludeGate:
     async def test_conclude_gate_rejections_surface_in_marker(self, caplog: pytest.LogCaptureFixture) -> None:
         caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
 
-        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+        async def search_web(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="snippet", method="search")
 
         fake_llm = FakeLlm(
             [

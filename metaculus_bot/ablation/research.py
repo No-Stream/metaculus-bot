@@ -16,9 +16,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
-from typing import Iterator
+from datetime import UTC, datetime
 
 from forecasting_tools import MetaculusQuestion
 
@@ -114,7 +114,7 @@ def _build_meta(
         "gap_count": _count_gap_sections(gap_fill) if gap_fill_used else 0,
         "first_pass_chars": len(first_pass),
         "gap_fill_chars": len(gap_fill),
-        "researched_at": datetime.now().isoformat(),
+        "researched_at": datetime.now(UTC).isoformat(),
         "gemini_model": gemini_model,
         "gap_fill_max_gaps": gap_fill_max_gaps,
         "is_benchmarking": is_benchmarking,
@@ -186,10 +186,7 @@ async def run_gemini_only_research(
             gap_fill_blob = ""
             gap_fill_used = False
 
-    if gap_fill_blob:
-        blob = f"{first_pass}{_GAP_FILL_HEADER}{gap_fill_blob}"
-    else:
-        blob = first_pass
+    blob = f"{first_pass}{_GAP_FILL_HEADER}{gap_fill_blob}" if gap_fill_blob else first_pass
 
     meta = _build_meta(
         first_pass=first_pass,

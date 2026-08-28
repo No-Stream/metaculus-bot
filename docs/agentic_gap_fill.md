@@ -181,7 +181,7 @@ in the tool result so it can rephrase. The `lint_rejections` counter tracks how
 often this happens.
 
 Alongside the four research tools, the loop exposes its own internal ones
-(`_INTERNAL_TOOL_NAMES` in `loop.py`): `set_research_plan` registers the dry
+(`_INTERNAL_TOOL_NAMES` in `tool_schemas.py`): `set_research_plan` registers the dry
 run's ranked gaps, and external tool calls come back as a nudge to plan first
 until it has run; `record_findings` banks findings mid-run; `conclude` finishes
 the loop, optionally banking final findings and leaving pending leads. The two
@@ -300,7 +300,12 @@ level up:
 | File | What's in it |
 | --- | --- |
 | `agentic_gap_fill.py` (one level up) | The seam. `run_gap_fill_v2` owns prompt/tool/config construction and the outermost soft-fail boundary, keeping the orchestrator thin. |
-| `agentic/loop.py` | `run_agentic_loop` and the whole driver loop: message management, tool dispatch, budget/conclude logic, the ghost phase, telemetry, and the timeout/soft-fail wrapper. |
+| `agentic/loop.py` | `run_agentic_loop` and the turn loop: message management, the three internal tool handlers, per-call handler dispatch, the ghost phase, the `GAP_FILL_V2` completion marker, and the timeout/soft-fail wrapper. Everything that logs one of this loop's telemetry markers stays here so the markers keep their `...agentic.loop` logger. |
+| `agentic/tool_schemas.py` | `_INTERNAL_TOOL_NAMES` (the loop's own tools, and their timeout) plus the JSON-schema builders for the tool list advertised each turn. |
+| `agentic/loop_state.py` | `_LoopState` (the one mutable per-run record), the `_ToolCall` / `_ToolExecutionResult` per-turn records, the assistant-message parsers that produce them, and the budget arithmetic. |
+| `agentic/provenance.py` | URL and quote normalization, the quote-grounding span logic, and the per-call harvesters behind the provenance gate and the W4 verification tiers. |
+| `agentic/gates.py` | The W1 plan gate's nudge and gap coercion, the W2 conclude gate, the W3 `source_url` check, and W4 tier stamping plus idempotent findings banking. |
+| `agentic/dispatch.py` | One assistant turn's tool calls in, one tool message each out: batch admission (plan gate, call budget, duplicate detection), provenance absorption, and the tool-message/rejection rendering. |
 | `agentic/tools.py` | `build_gap_fill_tools` and the four tool handlers, including the escalating fetch ladder and its SSRF hardening. |
 | `agentic/driver_prompt.py` | The three prompt builders: `build_system_prompt`, `build_user_brief`, `build_ghost_prompt`, plus the `SupportedQuestion` type. |
 | `agentic/artifact.py` | `render_findings` (the output section) and `detachment_lint`. |

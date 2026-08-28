@@ -143,7 +143,7 @@ async def test_abort_with_fewer_than_min_forecasters_skips_publish(monkeypatch, 
     bot._forecaster_with_soft_deadline = mixed
 
     assert bot._questions_failed_to_publish == 0
-    with pytest.raises((RuntimeError, ExceptionGroup)):  # noqa: F821  # 3.11+ builtin
+    with pytest.raises((RuntimeError, ExceptionGroup)):  # 3.11+ builtin
         await bot._research_and_make_predictions(mock_binary_question)
     assert bot._questions_failed_to_publish == 1
     # 3 forecasters were cancelled.
@@ -247,7 +247,7 @@ def test_publish_hardening_retries_on_timeout_and_succeeds(monkeypatch):
         n_calls["n"] += 1
         if n_calls["n"] == 1:
             time.sleep(0.5)  # exceeds 0.05s timeout
-        return None
+        return
 
     wrapped = publish_hardening._wrap_with_timeout_retry("fake", fake_post)
     # Should succeed on retry (returns None).
@@ -267,7 +267,7 @@ def test_publish_hardening_gives_up_after_retry_exhausted(monkeypatch):
     def fake_post(*args, **kwargs):
         n_calls["n"] += 1
         time.sleep(0.5)
-        return None
+        return
 
     wrapped = publish_hardening._wrap_with_timeout_retry("fake", fake_post)
     with pytest.raises(concurrent.futures.TimeoutError):
@@ -287,7 +287,7 @@ def test_publish_hardening_retries_on_request_exception(monkeypatch):
         n_calls["n"] += 1
         if n_calls["n"] == 1:
             raise requests.ConnectionError("network down")
-        return None
+        return
 
     wrapped = publish_hardening._wrap_with_timeout_retry("fake", fake_post)
     assert wrapped("dummy") is None

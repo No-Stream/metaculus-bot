@@ -19,7 +19,7 @@ LAST occurrence silently changes what a degraded run publishes.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import pytest
@@ -339,7 +339,7 @@ class TestAsOfEligibility:
             for i in range(30)
         ]
 
-        result = _pool(kalshi_events=[*closed, *open_rows], as_of=datetime(2026, 5, 1, tzinfo=timezone.utc))
+        result = _pool(kalshi_events=[*closed, *open_rows], as_of=datetime(2026, 5, 1, tzinfo=UTC))
 
         assert result.per_venue_counts["kalshi"] == 30, "every eligible candidate must survive the width"
         assert {row.venue_market_id for row in result.candidates} == {f"NEW-{i}" for i in range(30)}
@@ -384,7 +384,7 @@ class TestDegradation:
         result = _pool(criteria_text=BLS_CRITERIA)
 
         assert result.candidates == ()
-        assert result.per_venue_counts == {venue: 0 for venue in VENUE_ORDER}
+        assert result.per_venue_counts == dict.fromkeys(VENUE_ORDER, 0)
         assert result.per_venue_tally == {}
 
     def test_no_question_urls_means_no_settlement_channel(self) -> None:
@@ -432,9 +432,9 @@ class TestManifoldEnrichment:
     async def test_the_description_becomes_the_rules_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
         row = _search_row("manifold", "m1", "Will gas prices exceed $4?")
 
-        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
+        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any]:
             assert market_id == "m1"
-            return {"textDescription": "Resolves per the AAA national average."}  # noqa: ASYNC910
+            return {"textDescription": "Resolves per the AAA national average."}
 
         monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
 
@@ -447,8 +447,8 @@ class TestManifoldEnrichment:
     async def test_a_description_that_only_restates_the_title_is_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         row = _search_row("manifold", "m1", "Will gas prices exceed $4 by June?")
 
-        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
-            return {"textDescription": "Will gas prices exceed $4"}  # noqa: ASYNC910
+        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:
+            return {"textDescription": "Will gas prices exceed $4"}
 
         monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
 
@@ -461,8 +461,8 @@ class TestManifoldEnrichment:
     async def test_the_stored_text_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         row = _search_row("manifold", "m1", "Q")
 
-        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
-            return {"textDescription": "x" * 5000}  # noqa: ASYNC910
+        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:
+            return {"textDescription": "x" * 5000}
 
         monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
 
@@ -478,8 +478,8 @@ class TestManifoldEnrichment:
         take the sibling rows or the snapshot down with it."""
         rows = [_search_row("manifold", "m1", "one"), _search_row("manifold", "m2", "two")]
 
-        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any] | None:  # noqa: ASYNC124
-            return None if market_id == "m1" else {"textDescription": "real rules"}  # noqa: ASYNC910
+        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any] | None:
+            return None if market_id == "m1" else {"textDescription": "real rules"}
 
         monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
 
@@ -493,10 +493,10 @@ class TestManifoldEnrichment:
     async def test_a_raising_detail_does_not_propagate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rows = [_search_row("manifold", "m1", "one"), _search_row("manifold", "m2", "two")]
 
-        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
+        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any]:
             if market_id == "m1":
                 raise RuntimeError("boom")
-            return {"textDescription": "real rules"}  # noqa: ASYNC910
+            return {"textDescription": "real rules"}
 
         monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
 
@@ -513,7 +513,7 @@ class TestManifoldEnrichment:
 
         async def fake_detail(_session: Any, market_id: str) -> dict[str, Any]:
             if market_id == "m0":
-                return {"textDescription": "fast rules"}  # noqa: ASYNC910
+                return {"textDescription": "fast rules"}
             await asyncio.sleep(30)
             return {"textDescription": "never arrives"}
 
@@ -575,9 +575,9 @@ class TestManifoldMultiOutcomeEnrichment:
         row = _search_row("manifold", "m1", "How high will the US national average gas price get in 2026?")
         calls: list[str] = []
 
-        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
+        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any]:
             calls.append(market_id)
-            return {  # noqa: ASYNC910
+            return {
                 "textDescription": "Resolves per the AAA national average.",
                 "answers": [
                     {"text": "Over $4.60", "probability": 0.4992},
@@ -602,8 +602,8 @@ class TestManifoldMultiOutcomeEnrichment:
         its own evidence — no ``answers`` key — rather than needing a branch to say so."""
         row = _search_row("manifold", "m1", "Will gas prices exceed $4?")
 
-        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
-            return {"textDescription": "Resolves per AAA.", "probability": 0.86}  # noqa: ASYNC910
+        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:
+            return {"textDescription": "Resolves per AAA.", "probability": 0.86}
 
         monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
 
@@ -623,8 +623,8 @@ class TestManifoldMultiOutcomeEnrichment:
 
         kept = {"answers": [{"text": "$3.80 - $4.19", "probability": 0.5083}]}
 
-        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any] | None:  # noqa: ASYNC124
-            return None if market_id == "m1" else kept  # noqa: ASYNC910
+        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any] | None:
+            return None if market_id == "m1" else kept
 
         monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
 
@@ -642,8 +642,8 @@ class TestManifoldMultiOutcomeEnrichment:
         and one of those must not lose its answers to a shared early return."""
         row = _search_row("manifold", "m1", "Price of Ethereum (ETH) by 2030?")
 
-        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
-            return {"textDescription": "", "answers": [{"text": "9000-10000", "probability": 0.224}]}  # noqa: ASYNC910
+        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:
+            return {"textDescription": "", "answers": [{"text": "9000-10000", "probability": 0.224}]}
 
         monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
 

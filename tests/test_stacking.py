@@ -286,7 +286,13 @@ class TestStackingPrompts:
         lower_bound_msg = "Lower bound: 0"
         upper_bound_msg = "Upper bound: 1000"
 
-        prompt = stacking_numeric_prompt(question, research, base_predictions, lower_bound_msg, upper_bound_msg)
+        prompt = stacking_numeric_prompt(
+            question,
+            research,
+            base_predictions,
+            lower_bound_message=lower_bound_msg,
+            upper_bound_message=upper_bound_msg,
+        )
 
         assert "How many people will attend?" in prompt
         assert "Historical attendance averages 500" in prompt
@@ -596,14 +602,16 @@ class TestStackingIntegration:
         )
 
         # Mock _run_stacking to raise an exception
-        with patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")):
-            with pytest.raises(RuntimeError, match="Stacking failed"):
-                await bot._aggregate_predictions(
-                    predictions=[0.4, 0.6],
-                    question=question,
-                    research="test research",
-                    reasoned_predictions=[Mock(), Mock()],
-                )
+        with (
+            patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")),
+            pytest.raises(RuntimeError, match="Stacking failed"),
+        ):
+            await bot._aggregate_predictions(
+                predictions=[0.4, 0.6],
+                question=question,
+                research="test research",
+                reasoned_predictions=[Mock(), Mock()],
+            )
 
 
 class TestStackingMethods:
@@ -671,11 +679,11 @@ class TestStackingMethods:
             mock_numeric.assert_not_called()
             assert result == 0.5
 
-            # Verify the call arguments for helper (stacker_llm, parser_llm, question, research, base_texts)
-            call_args = mock_binary.call_args[0]
-            assert call_args[2] == binary_question
-            assert call_args[3] == "research"
-            assert call_args[4] == ["test"]
+            # Verify the call arguments for the helper: (stacker_llm, parser_llm, question)
+            # positionally, then research + base_texts keyword-only.
+            assert mock_binary.call_args.args[2] == binary_question
+            assert mock_binary.call_args.kwargs["research"] == "research"
+            assert mock_binary.call_args.kwargs["base_texts"] == ["test"]
 
             # Reset mocks
             mock_binary.reset_mock()
@@ -1113,7 +1121,7 @@ class TestStackingGuardsAndReasoning:
         )
 
         question = Mock(spec=BinaryQuestion)
-        setattr(question, "id_of_question", 999)
+        question.id_of_question = 999
 
         pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
         pred2 = ReasonedPrediction(prediction_value=0.8, reasoning="Analysis 2")
@@ -1200,8 +1208,8 @@ class TestStackerTransientRetry:
                 stacker,
                 parser,
                 self._binary_question(),
-                "research",
-                ["base reasoning"],
+                research="research",
+                base_texts=["base reasoning"],
                 stacker_wall_timeout=500.0,
             )
 
@@ -1228,16 +1236,18 @@ class TestStackerTransientRetry:
 
         clock = iter([0.0] + [TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0] * 10)
 
-        with patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)):
-            with pytest.raises(litellm_exc.Timeout):
-                await run_stacking_binary(
-                    stacker,
-                    parser,
-                    self._binary_question(),
-                    "research",
-                    ["base reasoning"],
-                    stacker_wall_timeout=500.0,
-                )
+        with (
+            patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)),
+            pytest.raises(litellm_exc.Timeout),
+        ):
+            await run_stacking_binary(
+                stacker,
+                parser,
+                self._binary_question(),
+                research="research",
+                base_texts=["base reasoning"],
+                stacker_wall_timeout=500.0,
+            )
 
         assert stacker.invoke.await_count == 1
 
@@ -1286,10 +1296,10 @@ class TestStackingNumericParseNotes:
                 stacker,
                 parser,
                 question,
-                "research",
-                ["base reasoning"],
-                "lower msg",
-                "upper msg",
+                research="research",
+                base_texts=["base reasoning"],
+                lower_bound_message="lower msg",
+                upper_bound_message="upper msg",
                 stacker_wall_timeout=500.0,
             )
 

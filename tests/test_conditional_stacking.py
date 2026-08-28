@@ -264,7 +264,7 @@ def _make_numeric_distribution(median_value: float, spread_factor: float = 1.0) 
     offsets = [-24, -20, -17, -14, -10, -4, 0, 4, 10, 14, 17, 20, 24]
     percentiles = [
         Percentile(value=max(0.0, min(100.0, median_value + offset * spread_factor)), percentile=pct)
-        for offset, pct in zip(offsets, _STANDARD_PERCENTILES)
+        for offset, pct in zip(offsets, _STANDARD_PERCENTILES, strict=True)
     ]
     return NumericDistribution(
         declared_percentiles=percentiles,
@@ -1231,9 +1231,11 @@ class TestConditionalStackingSkipLogMessage:
         bot = _make_bot()
         question = _make_binary_question()
 
-        with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY):
-            with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
-                await bot._research_and_make_predictions(question)
+        with (
+            mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY),
+            caplog.at_level("INFO", logger="metaculus_bot.stacking_route"),
+        ):
+            await bot._research_and_make_predictions(question)
 
         skip_logs = [r.getMessage() for r in caplog.records if "Conditional stacking SKIPPED" in r.getMessage()]
         assert len(skip_logs) == 1
@@ -1256,9 +1258,11 @@ class TestConditionalStackingSkipLogMessage:
         bot = _make_bot()
         question = _make_binary_question()
 
-        with mock_stacking_pipeline(bot, predictions=_LOW_SPREAD_BINARY):
-            with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
-                await bot._research_and_make_predictions(question)
+        with (
+            mock_stacking_pipeline(bot, predictions=_LOW_SPREAD_BINARY),
+            caplog.at_level("INFO", logger="metaculus_bot.stacking_route"),
+        ):
+            await bot._research_and_make_predictions(question)
 
         skip_logs = [r.getMessage() for r in caplog.records if "Conditional stacking SKIPPED" in r.getMessage()]
         assert len(skip_logs) == 1
@@ -1289,10 +1293,12 @@ class TestUnmeasurableSpreadRoute:
         bot = _make_bot()
         question = _make_binary_question()
 
-        with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY) as mocks:
-            with patch("metaculus_bot.stacking_route.compute_spread", return_value=math.inf):
-                with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
-                    await bot._research_and_make_predictions(question)
+        with (
+            mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY) as mocks,
+            patch("metaculus_bot.stacking_route.compute_spread", return_value=math.inf),
+            caplog.at_level("INFO", logger="metaculus_bot.stacking_route"),
+        ):
+            await bot._research_and_make_predictions(question)
 
         # No stacker spend: inf must not be read as "disagreement above threshold".
         mocks["crux"].assert_not_called()
@@ -1308,10 +1314,12 @@ class TestUnmeasurableSpreadRoute:
         bot = _make_bot()
         question = _make_binary_question()
 
-        with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY):
-            with patch("metaculus_bot.stacking_route.compute_spread", return_value=math.inf):
-                with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
-                    await bot._research_and_make_predictions(question)
+        with (
+            mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY),
+            patch("metaculus_bot.stacking_route.compute_spread", return_value=math.inf),
+            caplog.at_level("INFO", logger="metaculus_bot.stacking_route"),
+        ):
+            await bot._research_and_make_predictions(question)
 
         skip_logs = [r.getMessage() for r in caplog.records if "Conditional stacking SKIPPED" in r.getMessage()]
         assert len(skip_logs) == 1
@@ -1378,9 +1386,11 @@ class TestSingleForecasterShortCircuit:
         else:
             question = make_mock_numeric_question(id_of_question=301)
 
-        with mock_stacking_pipeline(bot, predictions=[single_prediction]) as mocks:
-            with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
-                result = await bot._research_and_make_predictions(question)
+        with (
+            mock_stacking_pipeline(bot, predictions=[single_prediction]) as mocks,
+            caplog.at_level("INFO", logger="metaculus_bot.stacking_route"),
+        ):
+            result = await bot._research_and_make_predictions(question)
 
         # No spread-driven machinery ran (short-circuit fires before the branch).
         mocks["crux"].assert_not_called()

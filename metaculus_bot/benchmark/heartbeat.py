@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 
 from forecasting_tools import Benchmarker
 
@@ -22,18 +22,18 @@ def install_benchmarker_heartbeat(interval_seconds: int, progress_state: dict) -
         return
 
     async def _run_with_heartbeat(self, batch, _orig=original_run):  # type: ignore[no-untyped-def]
-        start_time = datetime.now()
+        start_time = datetime.now(UTC)
         task = asyncio.create_task(_orig(self, batch))
         while not task.done():
             await asyncio.sleep(interval_seconds)
-            elapsed_min = (datetime.now() - start_time).total_seconds() / 60.0
+            elapsed_min = (datetime.now(UTC) - start_time).total_seconds() / 60.0
             try:
                 if progress_state.get("pbar") is not None:
                     update_progress_estimate(batch, progress_state)
                 logger.info(
                     f"[HB] {batch.benchmark.name} | {len(batch.questions)} questions | elapsed {elapsed_min:.1f}m"
                 )
-            except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except  # must not abort the running batch
+            except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except  # noqa: BLE001  # cosmetic heartbeat must never abort the running batch
                 logger.debug(f"Heartbeat progress update failed: {e}")
 
         progress_state["completed_batches"] = progress_state.get("completed_batches", 0) + 1
@@ -41,7 +41,8 @@ def install_benchmarker_heartbeat(interval_seconds: int, progress_state: dict) -
             update_progress_final(progress_state)
         return await task
 
-    setattr(_run_with_heartbeat, "_has_heartbeat", True)
+    # setattr: pyright rejects direct attribute assignment on a function object.
+    setattr(_run_with_heartbeat, "_has_heartbeat", True)  # noqa: B010
     # Monkey-patch: reattach as the batch method. setattr keeps ty from nominally
     # comparing the two method types (the # type: ignore covers pyright).
     setattr(Benchmarker, "_run_a_batch", _run_with_heartbeat)  # type: ignore[assignment]  # noqa: B010

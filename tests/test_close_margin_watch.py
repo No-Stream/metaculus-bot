@@ -47,7 +47,7 @@ class TestPercentile:
         assert percentile([0.5], 0.10) == 0.5
 
     def test_empty_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="percentile of an empty sequence"):
             percentile([], 0.5)
 
 
@@ -63,7 +63,7 @@ class TestSummarizeWeeks:
         ]
 
     def test_weekly_buckets_and_stats(self):
-        summaries, below_red, skipped = summarize_weeks(self._records(), red_line=0.30)
+        summaries, _below_red, _skipped = summarize_weeks(self._records(), red_line=0.30)
         assert [s.week for s in summaries] == ["2026-W28", "2026-W29"]
 
         w28, w29 = summaries

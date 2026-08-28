@@ -21,7 +21,7 @@ _RESOLVE = datetime(2026, 5, 1)
 # socket.socketpair() are allowed unconditionally (they never carry an INET
 # address); asyncio's self-pipe / event-loop internals rely on them, so blocking
 # them would wedge the whole suite.
-_ALLOWED_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0", "::"})
+_ALLOWED_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0", "::"})  # noqa: S104  # allowlist of loopback hosts for the egress guard, not a bind address
 
 
 def _host_from_address(address: Any) -> str | None:
@@ -233,7 +233,7 @@ def make_mock_numeric_question(
     the test suite. Field defaults match the most common shape (closed [0, 100] in
     USD with question id 42); per-test overrides land via keyword args.
 
-    ``with_open_resolve_times=True`` populates ``open_time`` (now − 30d) and
+    ``with_open_resolve_times=True`` populates ``open_time`` (now - 30d) and
     ``scheduled_resolution_time`` (now + 365d), required by helpers that call
     ``_forecasting_window_str``.
     """

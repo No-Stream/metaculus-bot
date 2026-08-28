@@ -52,7 +52,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,9 @@ ARTIFACT_DOWNLOAD_TIMEOUT_S = 180
 def verify_gh_cli() -> None:
     """Ensure gh CLI is installed and authenticated."""
     try:
-        subprocess.run(["gh", "--version"], capture_output=True, check=True)
+        # `gh` is resolved off PATH on purpose: FileNotFoundError IS the "not installed"
+        # branch below, which a shutil.which() preflight would only restate.
+        subprocess.run(["gh", "--version"], capture_output=True, check=True)  # noqa: S607
     except FileNotFoundError:
         logger.error("gh CLI not found. Install from https://cli.github.com/")
         sys.exit(1)
@@ -87,7 +89,8 @@ def verify_gh_cli() -> None:
         logger.error("gh CLI returned an error. Check authentication with 'gh auth status'.")
         sys.exit(1)
 
-    result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    # Same PATH lookup as above; fixed argv, no shell, nothing caller-supplied.
+    result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, check=False)  # noqa: S607
     if result.returncode != 0:
         logger.error(f"gh CLI not authenticated: {result.stderr.strip()}")
         sys.exit(1)
@@ -126,7 +129,11 @@ def list_research_artifacts(repo: str) -> list[dict]:
         (".artifacts[] | {id, name, created_at, expires_at, expired, size_in_bytes, run_id: .workflow_run.id}"),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S)
+        # S603: fixed `gh api` argv, no shell. The only interpolation is ``repo``, an
+        # operator-supplied ``owner/name`` that lands inside a URL path, not an argv slot.
+        result = subprocess.run(  # noqa: S603
+            cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S, check=False
+        )
     except subprocess.TimeoutExpired:
         logger.error(f"gh api artifacts listing timed out ({GH_API_TIMEOUT_S}s) for {repo}")
         sys.exit(1)
@@ -135,8 +142,8 @@ def list_research_artifacts(repo: str) -> list[dict]:
         sys.exit(1)
 
     artifacts: list[dict] = []
-    for line_num, line in enumerate(result.stdout.splitlines(), 1):
-        line = line.strip()
+    for line_num, raw_line in enumerate(result.stdout.splitlines(), 1):
+        line = raw_line.strip()
         if not line:
             continue
         try:
@@ -201,7 +208,7 @@ def _apply_window(live: list[dict], since_days: int) -> list[dict]:
     """Keep artifacts created within ``since_days``; ``since_days <= 0`` keeps everything."""
     if since_days <= 0:
         return live
-    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    cutoff = datetime.now(UTC) - timedelta(days=since_days)
     before = len(live)
     windowed = [a for a in live if (_parse_created_at(a.get("created_at", "")) or cutoff) >= cutoff]
     logger.info(f"--since-days={since_days} post-filter: {len(windowed)}/{before} live artifacts within window")
@@ -241,7 +248,12 @@ def _download_artifact_to(run_id: int, repo: str, artifact_name: str, dest_dir: 
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["gh", "run", "download", str(run_id), "--repo", repo, "--name", artifact_name, "--dir", str(run_dir)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=ARTIFACT_DOWNLOAD_TIMEOUT_S)
+        # S603: fixed `gh run download` argv, no shell. Every interpolated value comes from
+        # the artifact objects GitHub itself returned (or an operator-supplied ``--repo``),
+        # and each occupies its own argv slot, so nothing can inject a flag or a command.
+        result = subprocess.run(  # noqa: S603
+            cmd, capture_output=True, text=True, timeout=ARTIFACT_DOWNLOAD_TIMEOUT_S, check=False
+        )
     except subprocess.TimeoutExpired:
         logger.warning(
             f"Timed out ({ARTIFACT_DOWNLOAD_TIMEOUT_S}s) downloading {artifact_name} (run {run_id}); skipping"
@@ -416,7 +428,7 @@ def iter_store_run_dirs(
         yield int(art["run_id"]), art, store_run_dir(store_dir, name)
     if missing:
         # The count above is exact; the tail is named for grep-ability, not analysis.
-        named = ", ".join(missing[:5])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        named = ", ".join(missing[:5])  # HARNESS-SCAN-EXEMPT-subsampling
         logger.warning(
             f"{len(missing)} selected artifact(s) are not in the store at {store_dir} and were NOT harvested "
             f"(first few: {named})"

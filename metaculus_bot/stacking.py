@@ -67,10 +67,10 @@ async def run_stacking_binary(
     stacker_llm: GeneralLlm,
     parser_llm: GeneralLlm,
     question: BinaryQuestion,
+    *,
     research: str,
     base_texts: Sequence[str],
     aggregated_tool_output: str | None = None,
-    *,
     stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
 ) -> tuple[float, str]:
     """Invoke the stacker for a binary question and parse to a decimal probability.
@@ -117,10 +117,10 @@ async def run_stacking_mc(
     stacker_llm: GeneralLlm,
     parser_llm: GeneralLlm,
     question: MultipleChoiceQuestion,
+    *,
     research: str,
     base_texts: Sequence[str],
     aggregated_tool_output: str | None = None,
-    *,
     stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
 ) -> tuple[PredictedOptionList, str]:
     """Invoke the stacker for a multiple choice question and parse options.
@@ -164,12 +164,12 @@ async def run_stacking_numeric(
     stacker_llm: GeneralLlm,
     parser_llm: GeneralLlm,
     question: NumericQuestion,
+    *,
     research: str,
     base_texts: Sequence[str],
     lower_bound_message: str,
     upper_bound_message: str,
     aggregated_tool_output: str | None = None,
-    *,
     stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
 ) -> tuple[list[Percentile], str]:
     """Invoke the stacker for a numeric question and parse percentiles.
@@ -183,8 +183,8 @@ async def run_stacking_numeric(
         question,
         research,
         list(base_texts),
-        lower_bound_message,
-        upper_bound_message,
+        lower_bound_message=lower_bound_message,
+        upper_bound_message=upper_bound_message,
         aggregated_tool_output=aggregated_tool_output,
     )
     meta_reasoning = await invoke_with_transient_retry(

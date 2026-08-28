@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 from datetime import datetime
@@ -16,10 +17,8 @@ class FlushingStreamHandler(logging.StreamHandler):
         try:
             self.flush()
         finally:
-            try:
+            with contextlib.suppress(Exception):  # pragma: no cover - best effort
                 sys.stderr.flush()
-            except Exception:  # pragma: no cover - best effort
-                pass
 
 
 def configure_benchmark_logging(log_dir: str = "benchmarks") -> Path:
@@ -29,7 +28,9 @@ def configure_benchmark_logging(log_dir: str = "benchmarks") -> Path:
     """
 
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    log_path = Path(log_dir) / f"log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    # astimezone() attaches the local zone without shifting the wall clock, so the
+    # filename stamp stays local-time (what the operator reads) and tz-aware.
+    log_path = Path(log_dir) / f"log_{datetime.now().astimezone().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 

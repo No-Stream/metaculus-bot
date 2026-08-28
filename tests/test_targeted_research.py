@@ -82,9 +82,11 @@ class TestExtractDisagreementCrux:
         mock_llm = AsyncMock()
         mock_llm.invoke.side_effect = RuntimeError("LLM timeout")
 
-        with patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()):
-            with pytest.raises(RuntimeError, match="LLM timeout"):
-                await extract_disagreement_crux(mock_llm, "question", ["pred1", "pred2"])
+        with (
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            pytest.raises(RuntimeError, match="LLM timeout"),
+        ):
+            await extract_disagreement_crux(mock_llm, "question", ["pred1", "pred2"])
 
         assert mock_llm.invoke.await_count == 4
 
@@ -95,9 +97,11 @@ class TestExtractDisagreementCrux:
         mock_llm.invoke.side_effect = RuntimeError("slow analyzer stall")
         clock = iter([0.0] + [TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0] * 20)
 
-        with patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)):
-            with pytest.raises(RuntimeError, match="slow analyzer stall"):
-                await extract_disagreement_crux(mock_llm, "question", ["pred1", "pred2"])
+        with (
+            patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)),
+            pytest.raises(RuntimeError, match="slow analyzer stall"),
+        ):
+            await extract_disagreement_crux(mock_llm, "question", ["pred1", "pred2"])
 
         assert mock_llm.invoke.await_count == 1
 
@@ -155,6 +159,8 @@ class TestRunTargetedSearch:
                 await asyncio.sleep(5)
                 return "should never reach here"
 
-        with patch("metaculus_bot.research.targeted.build_native_search_llm", return_value=HangingLlm()):
-            with pytest.raises(asyncio.TimeoutError):
-                await run_targeted_search("crux", "question text")
+        with (
+            patch("metaculus_bot.research.targeted.build_native_search_llm", return_value=HangingLlm()),
+            pytest.raises(asyncio.TimeoutError),
+        ):
+            await run_targeted_search("crux", "question text")

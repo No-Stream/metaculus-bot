@@ -12,6 +12,14 @@ coerces int→float, so this is not currently load-bearing — but we keep the
 narrowed coercion so the returned tuple honors its declared contract for any
 direct consumer of the classmethod.
 
+Import-order note: importing this module imports forecasting_tools, and so litellm.
+``metaculus_bot/__init__`` must therefore keep its ``DISABLE_AIOHTTP_TRANSPORT``
+setdefault ABOVE the ``from metaculus_bot.question_patches import ...`` line (it does,
+with a comment saying so). The mechanism is not an import-time read: litellm re-reads
+the variable on every transport construction, but the handlers it builds during its own
+import freeze onto the aiohttp transport if the default arrives late.
+``tests/test_aiohttp_transport_flag.py`` asserts the source order.
+
 Upstream: forecasting_tools/data_models/questions.py, BoundedQuestionMixin.
 Follow-on: full retirement is viable (verified — Pydantic coerces zero_point
 downstream, so NumericQuestion.from_metaculus_api_json builds fine from int
@@ -20,6 +28,8 @@ metaculus_bot/__init__.py once no consumer reads the raw tuple's zero_point.
 """
 
 import logging
+
+from forecasting_tools.data_models.questions import BoundedQuestionMixin
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -30,10 +40,6 @@ def apply_question_patches() -> None:
     Upstream 0.2.92 already float-casts range_max/range_min, so this narrowed
     patch coerces only the still-raw zero_point slot before delegating.
     """
-    from forecasting_tools.data_models.questions import (  # noqa: PLC0415  # function-scoped: patch applied post-env-setdefault from __init__
-        BoundedQuestionMixin,
-    )
-
     # Idempotency guard: metaculus_bot import applies this once, but a module
     # reload (importlib.reload, which some tests do) re-invokes it. Without the
     # guard the second call captures the already-installed _patched as its

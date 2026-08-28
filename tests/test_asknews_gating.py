@@ -1,5 +1,6 @@
 import types
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -31,7 +32,7 @@ def _install_asknews_stub(monkeypatch: pytest.MonkeyPatch, on_search: Callable[[
                 result = await result  # type: ignore[assignment]
             return result
 
-    class AsyncAskNewsSDK:  # noqa: N801 - match import name in provider
+    class AsyncAskNewsSDK:
         def __init__(self, *_, **__):  # type: ignore[no-untyped-def]
             self.news = _News()
 
@@ -122,7 +123,7 @@ async def test_global_semaphore_serializes_concurrent_requests(
     monkeypatch.setattr(rp, "_asknews_rate_gate", noop_gate, raising=True)
     monkeypatch.setattr(rp.asyncio, "sleep", noop_sleep, raising=True)
 
-    provider, _ = rp.choose_provider_with_name(forced_provider := None)  # type: ignore[arg-type]
+    provider, _ = rp.choose_provider_with_name(_forced_provider := None)  # type: ignore[arg-type]
     # Launch multiple requests concurrently; each request does 2 sequential calls
     await __import__("asyncio").gather(*(provider(_make_q(f"Q{i}")) for i in range(4)))
 

@@ -453,13 +453,13 @@ class TestParallelExecution:
         execution_order: list[str] = []
         completion_order: list[str] = []
 
-        async def slow_provider(q):  # noqa: ASYNC910
+        async def slow_provider(q):
             execution_order.append("slow_start")
             await asyncio.sleep(0.1)
             completion_order.append("slow")
             return "Slow result"
 
-        async def fast_provider(q):  # noqa: ASYNC910
+        async def fast_provider(q):
             execution_order.append("fast_start")
             await asyncio.sleep(0.01)
             completion_order.append("fast")
@@ -499,7 +499,7 @@ class TestAskNewsSubscriptionErrorHandling:
         class ForbiddenError(Exception):
             pass
 
-        async def asknews_provider(q):  # noqa: ASYNC910
+        async def asknews_provider(q):
             raise ForbiddenError("403011 - subscription is not currently active")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.orchestrator"):

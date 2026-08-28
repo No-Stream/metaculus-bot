@@ -99,13 +99,13 @@ _VALID_TYPES = frozenset({"binary", "multiple_choice", "numeric"})
 
 # Z-gap between P10 and P90 in a standard normal — mirrors
 # ``metaculus_bot.probabilistic_tools.distributions._P10_P90_Z_GAP``. Used to
-# derive an approximate σ from declared P10/P90 percentile pairs in the
+# derive an approximate sigma from declared P10/P90 percentile pairs in the
 # spread plausibility check.
 _P10_P90_Z_GAP: float = 2.5631
 
-# Per-forecaster σ ratio (vs ensemble median σ) below which we emit a
+# Per-forecaster sigma ratio (vs ensemble median sigma) below which we emit a
 # ⚠ Spread anomaly line. Calibrated to catch the qid 43171 GLM-4.5-air case
-# (σ=13K vs ensemble median σ ~965K, ratio ~1.3%) while being generous enough
+# (sigma=13K vs ensemble median sigma ~965K, ratio ~1.3%) while being generous enough
 # that legitimate-but-tighter forecasters don't get flagged. Defense-in-depth
 # atop the family-consistency check.
 _SPREAD_ANOMALY_RATIO_THRESHOLD: float = 0.10
@@ -150,7 +150,7 @@ def _format_beta_binom(result: BetaBinomialResult, ref_class: str) -> str:
         f"- **Beta-binomial (ref class: {ref_class})**: "
         f"posterior mean {result.posterior_mean:.3f}, "
         f"80% CI [{result.ci_80_low:.3f}, {result.ci_80_high:.3f}] "
-        f"(α={result.posterior_alpha:.1f}, β={result.posterior_beta:.1f})"
+        f"(α={result.posterior_alpha:.1f}, β={result.posterior_beta:.1f})"  # noqa: RUF001  # Greek math notation in rendered output
     )
 
 
@@ -309,50 +309,9 @@ def _run_binary_tools(block: BinaryStructured) -> list[str]:
     else:
         bb_result = None
 
-    # Declared scenario decomposition — surface a count-only line. The schema
-    # already enforces probs sum to ~1.0, and ``conditional_outcome`` is free
-    # text so we can't verify arithmetic alignment with the posterior.
-    if block.scenarios:
-        n_scenarios = len(block.scenarios)
-        scenario_names = ", ".join(s.name for s in block.scenarios[:3])
-        if n_scenarios > 3:
-            scenario_names += f", +{n_scenarios - 3} more"
-        lines.append(f"- **Declared scenario decomposition**: {n_scenarios} branches ({scenario_names})")
-
-    # Survival / hazard. Units cancel: ``window_duration_units`` is in the
-    # same units as ``rate_per_unit``.
-    if block.hazard is not None:
-        survival = prob_event_before(
-            hazard_rate=block.hazard.rate_per_unit,
-            elapsed_fraction=block.hazard.elapsed_fraction,
-            remaining_fraction=block.hazard.remaining_fraction,
-            window_length=block.hazard.window_duration_units,
-        )
-        lines.append(_format_survival(survival, block.hazard))
-
-    # Prior → posterior consistency check.
-    if block.prior is not None:
-        max_strength = _max_evidence_strength(block.evidence)
-        try:
-            cons_result = stated_base_rate_consistency(
-                stated_base_rate_prob=block.prior.prob,
-                stated_posterior_prob=block.posterior_prob,
-                evidence_strength_max=max_strength,
-            )
-            lines.append(_format_prior_posterior_check(cons_result, block.prior.prob, block.posterior_prob))
-        except ValueError as exc:
-            logger.debug("stated_base_rate_consistency skipped: %s", exc)
-    elif block.base_rate is not None:
-        br_mean = block.base_rate.k / max(block.base_rate.n, 1)
-        if 0.0 < br_mean < 1.0 and 0.0 < block.posterior_prob < 1.0:
-            try:
-                lr = implied_likelihood_ratio(br_mean, block.posterior_prob)
-                lines.append(
-                    f"- **Base-rate → posterior**: k/n = {block.base_rate.k}/{block.base_rate.n} = "
-                    f"{br_mean:.3f} → posterior {block.posterior_prob:.3f}, implied LR = {lr:.2f}"
-                )
-            except ValueError as exc:
-                logger.debug("implied_likelihood_ratio skipped: %s", exc)
+    lines.extend(_scenario_decomposition_lines(block))
+    lines.extend(_hazard_lines(block))
+    lines.extend(_prior_posterior_consistency_lines(block))
 
     # Bayesian combine of stated prior with Beta-binomial posterior — surfaced
     # only when both prior and base_rate are declared so the stacker can see
@@ -367,23 +326,94 @@ def _run_binary_tools(block: BinaryStructured) -> list[str]:
             f"Δ = {block.posterior_prob - bb_result.posterior_mean:+.3f}"
         )
 
-    # Evidence-LR-chained posterior from declared per-item likelihood ratios.
-    if block.prior is not None:
-        declared_lrs = [ev.likelihood_ratio for ev in block.evidence if ev.likelihood_ratio is not None]
-        if declared_lrs:
-            chained = _lr_chained_posterior(block.prior.prob, declared_lrs)
-            if chained is not None:
-                lines.append(
-                    f"- **Evidence-LR-chained posterior**: prior {block.prior.prob:.3f} × "
-                    f"{len(declared_lrs)} declared LR(s) ({', '.join(f'{lr:.2f}' for lr in declared_lrs)}) → "
-                    f"{chained:.3f}; declared posterior {block.posterior_prob:.3f}. "
-                    f"Δ = {block.posterior_prob - chained:+.3f}"
-                )
+    lines.extend(_lr_chained_posterior_lines(block))
 
     # Anchor / clause telemetry (2026-07-08): neutral measurement lines only.
     lines.extend(_anchor_and_clause_telemetry_lines(block))
 
     return lines
+
+
+def _scenario_decomposition_lines(block: BinaryStructured) -> list[str]:
+    """Count-only scenario line.
+
+    The schema already enforces that the branch probs sum to ~1.0, and
+    ``conditional_outcome`` is free text, so there is no arithmetic to verify against the
+    posterior — hence a count rather than a check.
+    """
+    if not block.scenarios:
+        return []
+    n_scenarios = len(block.scenarios)
+    scenario_names = ", ".join(s.name for s in block.scenarios[:3])
+    if n_scenarios > 3:
+        scenario_names += f", +{n_scenarios - 3} more"
+    return [f"- **Declared scenario decomposition**: {n_scenarios} branches ({scenario_names})"]
+
+
+def _hazard_lines(block: BinaryStructured) -> list[str]:
+    """Survival / hazard line. Units cancel: ``window_duration_units`` shares ``rate_per_unit``'s."""
+    if block.hazard is None:
+        return []
+    survival = prob_event_before(
+        hazard_rate=block.hazard.rate_per_unit,
+        elapsed_fraction=block.hazard.elapsed_fraction,
+        remaining_fraction=block.hazard.remaining_fraction,
+        window_length=block.hazard.window_duration_units,
+    )
+    return [_format_survival(survival, block.hazard)]
+
+
+def _prior_posterior_consistency_lines(block: BinaryStructured) -> list[str]:
+    """Prior -> posterior coherence check, or the base-rate -> posterior implied LR.
+
+    A declared prior takes precedence; the k/n implied-LR line is the fallback for a block
+    that declared a base rate but no prior.
+    """
+    if block.prior is not None:
+        max_strength = _max_evidence_strength(block.evidence)
+        try:
+            cons_result = stated_base_rate_consistency(
+                stated_base_rate_prob=block.prior.prob,
+                stated_posterior_prob=block.posterior_prob,
+                evidence_strength_max=max_strength,
+            )
+            return [_format_prior_posterior_check(cons_result, block.prior.prob, block.posterior_prob)]
+        except ValueError as exc:
+            logger.debug("stated_base_rate_consistency skipped: %s", exc)
+            return []
+
+    if block.base_rate is None:
+        return []
+    br_mean = block.base_rate.k / max(block.base_rate.n, 1)
+    if not (0.0 < br_mean < 1.0 and 0.0 < block.posterior_prob < 1.0):
+        return []
+    try:
+        lr = implied_likelihood_ratio(br_mean, block.posterior_prob)
+        return [
+            f"- **Base-rate → posterior**: k/n = {block.base_rate.k}/{block.base_rate.n} = "
+            f"{br_mean:.3f} → posterior {block.posterior_prob:.3f}, implied LR = {lr:.2f}"
+        ]
+    except ValueError as exc:
+        logger.debug("implied_likelihood_ratio skipped: %s", exc)
+        return []
+
+
+def _lr_chained_posterior_lines(block: BinaryStructured) -> list[str]:
+    """Posterior implied by chaining the declared per-item likelihood ratios off the prior."""
+    if block.prior is None:
+        return []
+    declared_lrs = [ev.likelihood_ratio for ev in block.evidence if ev.likelihood_ratio is not None]
+    if not declared_lrs:
+        return []
+    chained = _lr_chained_posterior(block.prior.prob, declared_lrs)
+    if chained is None:
+        return []
+    return [
+        f"- **Evidence-LR-chained posterior**: prior {block.prior.prob:.3f} × "
+        f"{len(declared_lrs)} declared LR(s) ({', '.join(f'{lr:.2f}' for lr in declared_lrs)}) → "
+        f"{chained:.3f}; declared posterior {block.posterior_prob:.3f}. "
+        f"Δ = {block.posterior_prob - chained:+.3f}"
+    ]
 
 
 def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> list[str]:
@@ -550,7 +580,7 @@ def _aggregate_binary_lines(prediction_probs: list[float], blocks: list[BinarySt
         ext = satopaa_extremize(prediction_probs, alpha=2.5)
         lines.append(
             f"- **Pools over {len(prediction_probs)} forecasters**: "
-            f"linear {lp:.3f}, log {logp:.3f}, Satopää α=2.5 {ext:.3f}"
+            f"linear {lp:.3f}, log {logp:.3f}, Satopää α=2.5 {ext:.3f}"  # noqa: RUF001  # Greek math notation in rendered output
         )
     except ValueError as exc:
         logger.debug("binary pools skipped: %s", exc)
@@ -564,7 +594,7 @@ def _aggregate_binary_lines(prediction_probs: list[float], blocks: list[BinarySt
             blended = base_rate_blend(base_rate_probs, method="linear")
             lines.append(
                 f"- **Blended base rate across {len(base_rate_probs)} forecasters**: "
-                f"{blended:.3f} (range {min(base_rate_probs):.3f}–{max(base_rate_probs):.3f})"
+                f"{blended:.3f} (range {min(base_rate_probs):.3f}–{max(base_rate_probs):.3f})"  # noqa: RUF001  # en dash range typography in rendered output
             )
         except ValueError as exc:
             logger.debug("base_rate_blend skipped: %s", exc)
@@ -576,15 +606,15 @@ def _aggregate_binary_lines(prediction_probs: list[float], blocks: list[BinarySt
         if priors and posteriors:
             lines.append(
                 f"- **Prior/posterior snapshot**: {len(priors)} forecasters declared priors, "
-                f"priors range {min(priors):.3f}–{max(priors):.3f}, "
-                f"posteriors range {min(posteriors):.3f}–{max(posteriors):.3f}"
+                f"priors range {min(priors):.3f}–{max(priors):.3f}, "  # noqa: RUF001  # en dash range typography in rendered output
+                f"posteriors range {min(posteriors):.3f}–{max(posteriors):.3f}"  # noqa: RUF001  # en dash range typography in rendered output
             )
 
     return lines
 
 
 def _derive_sigma_from_percentiles(pcts: list[Percentile]) -> float | None:
-    """Extract σ ≈ (P90 - P10) / z_gap. Returns None if either percentile is missing.
+    """Extract sigma ≈ (P90 - P10) / z_gap. Returns None if either percentile is missing.
 
     Preferred over fitting a parametric distribution because (a) it's cheap,
     (b) it's the same approximation used by ``_initial_normal_guess`` in
@@ -607,16 +637,16 @@ def _derive_sigma_from_percentiles(pcts: list[Percentile]) -> float | None:
 
 
 def _spread_plausibility_lines(prediction_percentiles: list[list[Percentile]]) -> list[str]:
-    """Per-forecaster σ vs ensemble median σ. ⚠ flag when ratio < threshold.
+    """Per-forecaster sigma vs ensemble median sigma. ⚠ flag when ratio < threshold.
 
     Defense-in-depth atop ``percentile_family_consistency`` — catches
     confidently-narrow forecasters whose claimed-vs-best-fit family looks
-    fine but whose σ is implausibly small relative to peers (qid 43171).
+    fine but whose sigma is implausibly small relative to peers (qid 43171).
 
     Skip semantics:
     * Forecasters missing P10 or P90 are recorded at DEBUG and excluded
-      from the σ pool (no crash). They still consume a forecaster_idx slot.
-    * If fewer than 2 forecasters have valid σ, the section is suppressed
+      from the sigma pool (no crash). They still consume a forecaster_idx slot.
+    * If fewer than 2 forecasters have valid sigma, the section is suppressed
       entirely (median undefined for n=1, and there's nothing to compare).
     """
     lines: list[str] = []
@@ -625,7 +655,7 @@ def _spread_plausibility_lines(prediction_percentiles: list[list[Percentile]]) -
         sigma = _derive_sigma_from_percentiles(pcts)
         if sigma is None:
             logger.debug(
-                "spread_plausibility: forecaster %d missing P10 or P90; skipping σ derivation",
+                "spread_plausibility: forecaster %d missing P10 or P90; skipping sigma derivation",
                 idx,
             )
             continue
@@ -644,18 +674,18 @@ def _spread_plausibility_lines(prediction_percentiles: list[list[Percentile]]) -
         ratio = sigma / median_sigma
         if ratio < _SPREAD_ANOMALY_RATIO_THRESHOLD:
             anomalies.append(
-                f"- ⚠ Spread anomaly (forecaster {idx}): σ={sigma:.3g} is "
-                f"{ratio * 100:.1f}% of ensemble median σ={median_sigma:.3g}"
+                f"- ⚠ Spread anomaly (forecaster {idx}): σ={sigma:.3g} is "  # noqa: RUF001  # Greek math notation in rendered output
+                f"{ratio * 100:.1f}% of ensemble median σ={median_sigma:.3g}"  # noqa: RUF001  # Greek math notation in rendered output
             )
 
     if anomalies:
         lines.extend(anomalies)
     else:
-        threshold_factor = int(round(1.0 / _SPREAD_ANOMALY_RATIO_THRESHOLD))
+        threshold_factor = round(1.0 / _SPREAD_ANOMALY_RATIO_THRESHOLD)
         lines.append(
             f"- **Spread plausibility**: all {len(sigmas)} forecasters within "
             f"{threshold_factor}× spread of ensemble median "
-            f"(σ range {min(sigmas):.3g}–{max(sigmas):.3g})"
+            f"(σ range {min(sigmas):.3g}–{max(sigmas):.3g})"  # noqa: RUF001  # Greek + en dash typography in rendered output
         )
     return lines
 

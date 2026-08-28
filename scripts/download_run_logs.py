@@ -28,7 +28,7 @@ import json
 import logging
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from scripts.gha_artifacts import (
@@ -78,7 +78,7 @@ def build_workflow_map(repo: str) -> dict[int, str]:
     map alone; the map is manifest-bucketing convenience, never load-bearing for the
     markers.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=_RUNS_ENUMERATION_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(UTC) - timedelta(days=_RUNS_ENUMERATION_WINDOW_DAYS)).strftime("%Y-%m-%d")
     cmd = [
         "gh",
         "api",
@@ -96,7 +96,11 @@ def build_workflow_map(repo: str) -> dict[int, str]:
         ".workflow_runs[] | {id, path}",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S)
+        # S603: fixed `gh api` argv, no shell. The interpolations are an operator-supplied
+        # ``repo`` inside a URL path and a date derived from the clock — neither is an argv flag.
+        result = subprocess.run(  # noqa: S603
+            cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S, check=False
+        )
     except subprocess.TimeoutExpired:
         logger.warning(
             f"workflow-runs enumeration timed out ({GH_API_TIMEOUT_S}s); falling back to the archive-derived map"
@@ -109,8 +113,8 @@ def build_workflow_map(repo: str) -> dict[int, str]:
         return {}
 
     workflow_map: dict[int, str] = {}
-    for line in result.stdout.splitlines():
-        line = line.strip()
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         try:

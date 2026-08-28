@@ -11,16 +11,16 @@ from forecasting_tools import GeneralLlm
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 
 __all__ = [
+    "DISAGREEMENT_ANALYZER_LLM",
     "FORECASTER_LLMS",
     "FORECASTER_MODEL_NAMES",
-    "SUMMARIZER_LLM",
-    "PARSER_LLM",
-    "RESEARCHER_LLM",
-    "STACKER_LLM",
-    "STACKER_FALLBACK_LLM",
-    "DISAGREEMENT_ANALYZER_LLM",
     "MARKET_QUERY_AUTHOR_LLM_CONFIG",
     "MARKET_RANKER_LLM_CONFIG",
+    "PARSER_LLM",
+    "RESEARCHER_LLM",
+    "STACKER_FALLBACK_LLM",
+    "STACKER_LLM",
+    "SUMMARIZER_LLM",
 ]
 # Reasoning models ignore (or degrade under) explicit sampling params, so we
 # defer to provider defaults. temperature=None is explicit but redundant on
@@ -134,7 +134,7 @@ FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FO
 # EDGE" with terra 2nd (one attribution blur, no fabrications), and 4/5 briefing
 # failures in the AskNews quality audit (scratch/asknews_quality_audit_2026-07-18/)
 # were prompt-era (mini summarizer + missing no-forecast rule), not model-tier.
-# Terra: −43% cost, ~50s vs ~118s wall. Effort stays low (latency).
+# Terra: -43% cost, ~50s vs ~118s wall. Effort stays low (latency).
 # allowed_tries=1 (Round-2): the summarizer invoke is wrapped in the broad,
 # elapsed-gated retry (orchestrator._summarize_asknews) to impose the universal
 # "never retry a slow failure" deadline rule. Per-instance override so PARSER_LLM (which
@@ -269,7 +269,7 @@ MARKET_QUERY_AUTHOR_LLM_CONFIG: dict = {
 # the targeted-search query downstream. Runs under CRUX_SOFT_DEADLINE;
 # effort deliberately low since 2026-05-20 for latency — the tier was upgraded
 # instead (smarter-model-at-lower-effort beats more effort on a smaller model).
-# 2026-07-17: sol→terra per the role audit; terra 2nd (sol 3rd) at −49% cost;
+# 2026-07-17: sol→terra per the role audit; terra 2nd (sol 3rd) at -49% cost;
 # the role fires rarely (stacking disabled in prod).
 # allowed_tries=1 (Round-2): the crux-analyzer invoke is wrapped in the broad,
 # elapsed-gated retry (targeted.extract_disagreement_crux) to impose the universal

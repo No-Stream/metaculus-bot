@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -66,7 +66,7 @@ class _FakeStreamContent:
         else:
             self._data = json.dumps(payload).encode()
 
-    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:
         step = max(1, n)
         for i in range(0, len(self._data), step):
             yield self._data[i : i + step]
@@ -87,7 +87,7 @@ class FakeResponse:
     async def json(self) -> Any:
         if self._payload is None:
             raise ValueError("no json payload")
-        return self._payload  # noqa: ASYNC910
+        return self._payload
 
     async def text(self) -> str:
         # Faithful to aiohttp: reads the WHOLE body (the memory trap the bounded snippet read
@@ -95,11 +95,11 @@ class FakeResponse:
         chunks = [chunk async for chunk in self.content.iter_chunked(65536)]
         return b"".join(chunks).decode("utf-8", errors="replace")
 
-    async def __aenter__(self) -> "FakeResponse":
-        return self  # noqa: ASYNC910
+    async def __aenter__(self) -> FakeResponse:
+        return self
 
     async def __aexit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
-        return None  # noqa: ASYNC910
+        return None
 
 
 # A handler is either a ready-made response or a callable that builds one from the GET params.
@@ -116,7 +116,7 @@ class FakeSession:
         self._handlers: dict[str, list[_Handler]] = {
             k: (v if isinstance(v, list) else [v]) for k, v in handlers.items()
         }
-        self._call_counts: dict[str, int] = {k: 0 for k in handlers}
+        self._call_counts: dict[str, int] = dict.fromkeys(handlers, 0)
         self.closed = False
 
     def get(self, url: str, params: dict | None = None, **_kwargs: Any) -> FakeResponse:
@@ -130,11 +130,11 @@ class FakeSession:
                 return handler
         raise AssertionError(f"no handler for URL {url}")
 
-    async def close(self) -> None:  # noqa: ASYNC910
+    async def close(self) -> None:
         self.closed = True
 
-    async def __aenter__(self) -> "FakeSession":
-        return self  # noqa: ASYNC910
+    async def __aenter__(self) -> FakeSession:
+        return self
 
     async def __aexit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
         await self.close()
@@ -197,7 +197,7 @@ def market_llm(
         async def invoke(self, prompt: str) -> str:
             if RANKER_CUE in prompt:
                 return ranking(prompt) if callable(ranking) else ranking
-            return author  # noqa: ASYNC910
+            return author
 
     return FakeLlm
 
@@ -439,7 +439,7 @@ async def fetch_snapshot(
     ranking: str | Callable[[str], str] = "[]",
     author: str = AUTHOR_JSON,
     as_of: datetime | None = None,
-    timeout: float = 5.0,
+    timeout: float = 5.0,  # noqa: ASYNC109  # mirrors the production fetch_market_snapshot timeout parameter
     configs: list[dict] | None = None,
 ) -> MarketSnapshot:
     """One snapshot through the real pipeline with both LLM stages stubbed."""
@@ -469,7 +469,7 @@ def market_row(
         ask=None,
         spread=None,
         volume_24h=None,
-        close_time=datetime(2026, 12, 31, tzinfo=timezone.utc),
+        close_time=datetime(2026, 12, 31, tzinfo=UTC),
         is_resolved=False,
         match_confidence=1.0,
         raw_rules=rules,

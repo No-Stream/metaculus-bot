@@ -2,9 +2,8 @@
 
 import logging
 import math
-from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
-from typing import Callable
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
 
 import numpy as np
 from scipy.stats import spearmanr
@@ -344,7 +343,7 @@ def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: f
 # truth for this era boundary across the package: width_monitor's ``TS_ANCHOR_ENABLE``
 # aliases it, and every screen gated on the bundle's contents keys on it. Era
 # boundaries are merge-to-main COMMITTER timestamps, never authoring dates.
-B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
 
 # ``9f1175c`` (grid-scaled max-step for discrete CDF resampling) rode that merge.
 # Before this instant a flat 0.2 per-bin cap applied at EVERY grid size; after it,
@@ -357,12 +356,49 @@ _CLAMP_CAP_ATOL = 1e-6
 _CLAMP_MEMBER_MARGIN = 0.10
 
 
+def _resolution_bin(grid: list[float], cdf: list[float], resolution: float) -> tuple[float, float, float]:
+    """``(bin_low, bin_high, published_mass)`` for the CDF bin the resolution lands in.
+
+    side="left": a resolution sitting exactly ON a grid point belongs to the bin BELOW
+    it, matching the platform scorer (``resolution_to_bucket_index`` assigns an exact
+    grid point to the lower bucket); side="right" screens the bin above and misses the
+    q43913 signature whenever the resolution lands on a grid edge.
+    """
+    grid_arr = np.asarray(grid, dtype=float)
+    cdf_arr = np.maximum.accumulate(np.clip(np.asarray(cdf, dtype=float), 0.0, 1.0))
+    steps = np.diff(cdf_arr)
+    index = int(np.clip(np.searchsorted(grid_arr, resolution, side="left") - 1, 0, len(steps) - 1))
+    return float(grid_arr[index]), float(grid_arr[index + 1]), float(steps[index])
+
+
+def _member_bin_masses(record: dict, bin_low: float, bin_high: float) -> dict[str, float]:
+    """Each attributed member curve's own mass on the ``[bin_low, bin_high]`` bin.
+
+    Two members are skipped rather than measured: an anonymous positional key, which on
+    a stacked record can hold the stacker's aggregate instead of a member curve (see
+    ``per_model_cohort``); and a curve under ``MIN_SCOREABLE_ANCHORS`` distinct anchors,
+    because the screen's verdict turns on the MINIMUM member bin mass, so one sparse
+    recovery can decide it — and a 3-anchor curve interpolated across a bin is not the
+    distribution the model declared. That is the same reason ranking_cohort gates its
+    log-scored curves; the shared floor lives in parsing so the two cannot drift.
+    """
+    masses: dict[str, float] = {}
+    for model, pairs in (record.get("per_model_numeric_percentiles") or {}).items():
+        if is_anonymous_model_key(model) or len(declared_anchors(pairs)[0]) < MIN_SCOREABLE_ANCHORS:
+            continue
+        low = _single_curve_pit(pairs, bin_low)
+        high = _single_curve_pit(pairs, bin_high)
+        if low is not None and high is not None:
+            masses[model] = high - low
+    return masses
+
+
 def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_MARGIN) -> dict:
     """Did a per-bin max-step cap, not the forecasters, decide the published mass at the truth?
 
     On a coarse discrete grid the pre-``9f1175c`` flat 0.2 cap can hold the realized
     bin far below what every member asked for (q43913: published 0.200 where members'
-    own curves wanted 0.575-0.823 — peer −38.67). That is a pipeline defect
+    own curves wanted 0.575-0.823 — peer -38.67). That is a pipeline defect
     masquerading as a forecast error, and it manufactures apparent dissent: each
     member keeps its concentrated mass while the published curve does not.
 
@@ -392,43 +428,18 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
         out["reason"] = "no usable grid"
         return out
 
-    grid_arr = np.asarray(grid, dtype=float)
-    cdf_arr = np.maximum.accumulate(np.clip(np.asarray(cdf, dtype=float), 0.0, 1.0))
-    steps = np.diff(cdf_arr)
-    # side="left": a resolution sitting exactly ON a grid point belongs to the bin
-    # BELOW it, matching the platform scorer (resolution_to_bucket_index assigns an
-    # exact grid point to the lower bucket); side="right" screens the bin above and
-    # misses the q43913 signature whenever the resolution lands on a grid edge.
-    index = int(np.clip(np.searchsorted(grid_arr, float(resolution), side="left") - 1, 0, len(steps) - 1))
-    published_bin_mass = float(steps[index])
-    bin_low, bin_high = float(grid_arr[index]), float(grid_arr[index + 1])
+    bin_low, bin_high, published_bin_mass = _resolution_bin(grid, cdf, float(resolution))
 
     submitted = parse_iso_utc(record.get("bot_comment_created_at"))
     before_fix = submitted is None or submitted < GRID_SCALED_MAX_STEP_MERGED_AT
-    cap = MAX_CDF_PROB_STEP if before_fix else grid_step_constraints(len(grid_arr))[1]
+    cap = MAX_CDF_PROB_STEP if before_fix else grid_step_constraints(len(grid))[1]
 
-    member_bin_masses: dict[str, float] = {}
-    for model, pairs in (record.get("per_model_numeric_percentiles") or {}).items():
-        if is_anonymous_model_key(model):
-            # A positional key on a stacked record can hold the stacker's aggregate,
-            # which is not a member curve (see per_model_cohort).
-            continue
-        if len(declared_anchors(pairs)[0]) < MIN_SCOREABLE_ANCHORS:
-            # The screen's verdict turns on the MINIMUM member bin mass, so one sparse
-            # recovery can decide it — and a 3-anchor curve interpolated across a bin is
-            # not the distribution the model declared. That is the same reason
-            # ranking_cohort gates its log-scored curves; the shared floor lives in
-            # parsing so the two cannot drift.
-            continue
-        low = _single_curve_pit(pairs, bin_low)
-        high = _single_curve_pit(pairs, bin_high)
-        if low is not None and high is not None:
-            member_bin_masses[model] = high - low
+    member_bin_masses = _member_bin_masses(record, bin_low, bin_high)
     min_member = min(member_bin_masses.values()) if member_bin_masses else None
 
     at_cap = abs(published_bin_mass - cap) <= _CLAMP_CAP_ATOL
     out |= {
-        "n_grid_points": len(grid_arr),
+        "n_grid_points": len(grid),
         "max_step_cap": cap,
         "submitted_before_grid_scaled_cap": before_fix,
         "resolution_bin": [bin_low, bin_high],
@@ -451,6 +462,7 @@ def _interpolate_pit(
     lower_bound: float,
     upper_bound: float,
     cdf_values: list[float],
+    *,
     value_grid: list[float] | None = None,
     zero_point: float | None = None,
     per_model_percentiles: Mapping[str, Sequence[Sequence[float]]] | None = None,
@@ -572,7 +584,8 @@ def no_bias_check(data: list[dict]) -> dict:
     outcomes = [1.0 if r["resolution_parsed"] else 0.0 for r in binary]
     mean_predicted = _mean(probs)
     actual_yes_rate = _mean(outcomes)
-    assert mean_predicted is not None and actual_yes_rate is not None
+    assert mean_predicted is not None
+    assert actual_yes_rate is not None
     bias_pp = (mean_predicted - actual_yes_rate) * 100.0
 
     low_range = [r for r in binary if 0.10 <= r["our_prob_yes"] <= 0.30]
@@ -582,7 +595,8 @@ def no_bias_check(data: list[dict]) -> dict:
         lr_outcomes = [1.0 if r["resolution_parsed"] else 0.0 for r in low_range]
         lr_mean_pred = _mean(lr_probs)
         lr_actual = _mean(lr_outcomes)
-        assert lr_mean_pred is not None and lr_actual is not None
+        assert lr_mean_pred is not None
+        assert lr_actual is not None
         low_range_summary = {
             "count": len(low_range),
             "mean_predicted": lr_mean_pred,
@@ -735,6 +749,102 @@ def disagreement_predicts_error(
     }
 
 
+def _question_count_lines(data: list[dict]) -> list[str]:
+    """Total question count plus the per-type breakdown, types alphabetical."""
+    type_counts: dict[str, int] = {}
+    for r in data:
+        type_counts[r["type"]] = type_counts.get(r["type"], 0) + 1
+
+    lines = [f"**Total questions:** {len(data)}"]
+    lines.extend(f"- {t}: {count}" for t, count in sorted(type_counts.items()))
+    lines.append("")
+    return lines
+
+
+def _binary_section_lines(data: list[dict]) -> list[str]:
+    """Binary headline scores plus the calibration-bucket table. Empty when no binaries."""
+    bs = binary_summary(data)
+    if bs["count"] <= 0:
+        return []
+
+    lines = [
+        "## Binary Questions",
+        f"- Count: {bs['count']}",
+        f"- Mean Brier: {bs['mean_brier']:.4f}",
+        f"- Mean Log Score: {bs['mean_log_score']:.2f}",
+        f"- Direction Accuracy: {bs['direction_accuracy']:.1%}",
+        f"- Base Rate: {bs['base_rate']:.1%}",
+        f"- Base Rate Brier: {bs['base_rate_brier']:.4f}",
+        "",
+        "### Calibration",
+        "| Bucket | Predicted | Actual | Count |",
+        "|--------|-----------|--------|-------|",
+    ]
+    lines.extend(
+        f"| {label} | {bucket['predicted_mean']:.2f} | {bucket['actual_rate']:.2f} | {bucket['count']} |"
+        for label, bucket in bs["calibration_buckets"].items()
+    )
+    lines.append("")
+    return lines
+
+
+def _per_model_section_lines(data: list[dict]) -> list[str]:
+    """Per-member binary scores. Empty when no record yields an attributed member."""
+    pm = per_model_binary_scores(data)
+    if not pm:
+        return []
+
+    lines = [
+        "## Per-Model Binary Scores",
+        "| Model | Mean Brier | Mean Log Score | Count |",
+        "|-------|-----------|----------------|-------|",
+    ]
+    lines.extend(
+        f"| {model_name} | {scores['mean_brier']:.4f} | {scores['mean_log_score']:.2f} | {scores['count']} |"
+        for model_name, scores in pm.items()
+    )
+    lines.append("")
+    return lines
+
+
+def _numeric_section_lines(data: list[dict]) -> list[str]:
+    """Numeric coverage headline plus the ten-bin PIT histogram. Empty when no PITs."""
+    na = numeric_pit_analysis(data)
+    if na["count"] <= 0:
+        return []
+
+    lines = [
+        "## Numeric Questions",
+        f"- Count: {na['count']}",
+        f"- Mean Numeric Log Score: {na['mean_numeric_log_score']:.2f}",
+        f"- 90% Coverage (PIT in [0.05, 0.95]): {na['coverage_90']:.1%}",
+        f"- 50% Coverage (PIT in [0.25, 0.75]): {na['coverage_50']:.1%}",
+        "",
+        "### PIT Histogram",
+        "| Bin | Count |",
+        "|-----|-------|",
+    ]
+    lines.extend(f"| {i / 10.0:.1f}-{(i + 1) / 10.0:.1f} | {count} |" for i, count in enumerate(na["histogram"]))
+    lines.append("")
+    return lines
+
+
+def _mc_section_lines(data: list[dict]) -> list[str]:
+    """Multiple-choice headline scores. Empty when no MC record carries a log score."""
+    ms = mc_summary(data)
+    if ms["count"] <= 0:
+        return []
+
+    return [
+        "## Multiple Choice Questions",
+        f"- Count: {ms['count']}",
+        f"- Accuracy (top pick correct): {ms['accuracy']:.1%}",
+        f"- Mean Prob on Correct: {ms['mean_prob_correct']:.2f}",
+        f"- Mean MC Log Score: {ms['mean_mc_log_score']:.2f}",
+        "",
+    ]
+
+
 def generate_report(data: list[dict]) -> str:
     """Baseline markdown report (binary, numeric, MC summaries + per-model binary).
 
@@ -742,79 +852,10 @@ def generate_report(data: list[dict]) -> str:
     disagreement-error correlation -- call those functions directly; see
     scratch/analysis_2026-04/compute_delta.py for an example.
     """
-    lines: list[str] = []
-    lines.append("# Performance Analysis Report")
-    lines.append("")
-
-    type_counts: dict[str, int] = {}
-    for r in data:
-        t = r["type"]
-        type_counts[t] = type_counts.get(t, 0) + 1
-
-    lines.append(f"**Total questions:** {len(data)}")
-    for t, count in sorted(type_counts.items()):
-        lines.append(f"- {t}: {count}")
-    lines.append("")
-
-    # Binary
-    bs = binary_summary(data)
-    if bs["count"] > 0:
-        lines.append("## Binary Questions")
-        lines.append(f"- Count: {bs['count']}")
-        lines.append(f"- Mean Brier: {bs['mean_brier']:.4f}")
-        lines.append(f"- Mean Log Score: {bs['mean_log_score']:.2f}")
-        lines.append(f"- Direction Accuracy: {bs['direction_accuracy']:.1%}")
-        lines.append(f"- Base Rate: {bs['base_rate']:.1%}")
-        lines.append(f"- Base Rate Brier: {bs['base_rate_brier']:.4f}")
-        lines.append("")
-
-        lines.append("### Calibration")
-        lines.append("| Bucket | Predicted | Actual | Count |")
-        lines.append("|--------|-----------|--------|-------|")
-        for label, bucket in bs["calibration_buckets"].items():
-            lines.append(
-                f"| {label} | {bucket['predicted_mean']:.2f} | {bucket['actual_rate']:.2f} | {bucket['count']} |"
-            )
-        lines.append("")
-
-    # Per-model
-    pm = per_model_binary_scores(data)
-    if pm:
-        lines.append("## Per-Model Binary Scores")
-        lines.append("| Model | Mean Brier | Mean Log Score | Count |")
-        lines.append("|-------|-----------|----------------|-------|")
-        for model_name, scores in pm.items():
-            lines.append(
-                f"| {model_name} | {scores['mean_brier']:.4f} | {scores['mean_log_score']:.2f} | {scores['count']} |"
-            )
-        lines.append("")
-
-    # Numeric
-    na = numeric_pit_analysis(data)
-    if na["count"] > 0:
-        lines.append("## Numeric Questions")
-        lines.append(f"- Count: {na['count']}")
-        lines.append(f"- Mean Numeric Log Score: {na['mean_numeric_log_score']:.2f}")
-        lines.append(f"- 90% Coverage (PIT in [0.05, 0.95]): {na['coverage_90']:.1%}")
-        lines.append(f"- 50% Coverage (PIT in [0.25, 0.75]): {na['coverage_50']:.1%}")
-        lines.append("")
-        lines.append("### PIT Histogram")
-        lines.append("| Bin | Count |")
-        lines.append("|-----|-------|")
-        for i, count in enumerate(na["histogram"]):
-            low = i / 10.0
-            high = (i + 1) / 10.0
-            lines.append(f"| {low:.1f}-{high:.1f} | {count} |")
-        lines.append("")
-
-    # MC
-    ms = mc_summary(data)
-    if ms["count"] > 0:
-        lines.append("## Multiple Choice Questions")
-        lines.append(f"- Count: {ms['count']}")
-        lines.append(f"- Accuracy (top pick correct): {ms['accuracy']:.1%}")
-        lines.append(f"- Mean Prob on Correct: {ms['mean_prob_correct']:.2f}")
-        lines.append(f"- Mean MC Log Score: {ms['mean_mc_log_score']:.2f}")
-        lines.append("")
-
+    lines: list[str] = ["# Performance Analysis Report", ""]
+    lines.extend(_question_count_lines(data))
+    lines.extend(_binary_section_lines(data))
+    lines.extend(_per_model_section_lines(data))
+    lines.extend(_numeric_section_lines(data))
+    lines.extend(_mc_section_lines(data))
     return "\n".join(lines)

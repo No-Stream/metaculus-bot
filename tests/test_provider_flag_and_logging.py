@@ -2,7 +2,7 @@ import asyncio
 import dataclasses
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -29,7 +29,7 @@ def _no_sleep(monkeypatch):
     keeps the fixture scoped to this file (no global conftest pollution).
     """
 
-    async def _instant(*args, **kwargs):  # noqa: ASYNC124 - must stay async: replaces asyncio.sleep
+    async def _instant(*args, **kwargs):
         return None
 
     monkeypatch.setattr("metaculus_bot.research.providers.asyncio.sleep", _instant)
@@ -55,7 +55,7 @@ async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
     q = MetaculusQuestion(
         question_text="Test",
         page_url="http://example.com",
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
     with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
@@ -70,9 +70,11 @@ async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
         # This test used to assert that sentence plus the header; both were the defect,
         # since an empty AskNews read then arrived as `ok` with chars>0 and the summarizer
         # was asked to brief from prose that carried no facts.
-        with patch.object(ResearchOrchestrator, "_summarize_asknews", new_callable=AsyncMock) as summarize:
-            with caplog.at_level(logging.INFO):
-                res = await bot.run_research(q)
+        with (
+            patch.object(ResearchOrchestrator, "_summarize_asknews", new_callable=AsyncMock) as summarize,
+            caplog.at_level(logging.INFO),
+        ):
+            res = await bot.run_research(q)
         assert "No articles were found for this query." not in res
         assert "## News Articles (AskNews)" not in res
         # The spend-saving half of the empty-read fix: nothing to brief from, so the
@@ -115,14 +117,14 @@ async def test_a_nonempty_asknews_read_is_summarized_exactly_once(mock_os_getenv
     q = MetaculusQuestion(
         question_text="Test",
         page_url="http://example.com",
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
     article = _StubArticle(
         eng_title="Something happened",
         summary="A decision-relevant fact.",
         language="en",
-        pub_date=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        pub_date=datetime(2026, 8, 20, tzinfo=UTC),
         source_id="src",
         article_url="http://example.com/article",
     )
@@ -167,7 +169,7 @@ async def test_gemini_search_flag_logs_provider_name(mock_os_getenv, caplog):
     q = MetaculusQuestion(
         question_text="Test",
         page_url="http://example.com",
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
     # Stub the AskNews SDK (primary provider) to return immediately.
@@ -184,12 +186,14 @@ async def test_gemini_search_flag_logs_provider_name(mock_os_getenv, caplog):
             await asyncio.sleep(0)
             return f"stub gemini research for {question_text[:0]}"
 
-        with patch(
-            "metaculus_bot.research.gemini_search.gemini_search_provider",
-            return_value=_fake_gemini,
+        with (
+            patch(
+                "metaculus_bot.research.gemini_search.gemini_search_provider",
+                return_value=_fake_gemini,
+            ),
+            caplog.at_level(logging.INFO),
         ):
-            with caplog.at_level(logging.INFO):
-                await bot.run_research(q)
+            await bot.run_research(q)
 
     provider_log_messages = [rec.message for rec in caplog.records if "Using research providers:" in rec.message]
     assert provider_log_messages, "expected a 'Using research providers:' log line"
@@ -221,7 +225,7 @@ async def test_gemini_search_params_passed_through(mock_os_getenv, caplog):
     q = MetaculusQuestion(
         question_text="Test",
         page_url="http://example.com",
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
     with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
@@ -267,7 +271,7 @@ async def test_gemini_search_flag_disabled_excludes_provider(mock_os_getenv, cap
     q = MetaculusQuestion(
         question_text="Test",
         page_url="http://example.com",
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
     with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
@@ -389,10 +393,10 @@ class _FakeContent:
     def __init__(self, payload):
         self._data = b"" if payload is None else json.dumps(payload).encode()
 
-    async def iter_chunked(self, n: int):  # noqa: ASYNC900, ASYNC911
+    async def iter_chunked(self, n: int):
         step = max(1, n)
         for i in range(0, len(self._data), step):
-            yield self._data[i : i + step]  # noqa: ASYNC911
+            yield self._data[i : i + step]
 
 
 class _FakeResponse:
@@ -415,7 +419,7 @@ class _FakeResponse:
 
     async def __aexit__(self, *_args):
         await asyncio.sleep(0)
-        return None
+        return
 
 
 class _FakeSession:
@@ -453,9 +457,8 @@ def _reset_pm_caches():
 
 
 @pytest.mark.asyncio
-async def test_prediction_market_provider_integrates_with_run_providers_parallel(
-    mock_os_getenv, caplog, _reset_pm_caches
-):
+@pytest.mark.usefixtures("_reset_pm_caches")
+async def test_prediction_market_provider_integrates_with_run_providers_parallel(mock_os_getenv, caplog):
     """Flag ON + ASKNEWS creds + GEMINI creds + PREDICTION_MARKETS_ENABLED:
     all three providers should run in parallel and combined research must
     contain blocks from each. Verifies end-to-end that:
@@ -485,10 +488,10 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
     q = MetaculusQuestion(
         question_text="Will SpaceX Starship reach orbit?",
         page_url="http://example.com/q/1",
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
     )
     q.id_of_question = 99999  # type: ignore[attr-defined]
-    q.scheduled_resolution_time = datetime(2027, 1, 1, tzinfo=timezone.utc)
+    q.scheduled_resolution_time = datetime(2027, 1, 1, tzinfo=UTC)
     q.resolution_criteria = "Resolves Yes if a SpaceX Starship reaches orbital velocity."
 
     # AskNews stub.
@@ -524,17 +527,17 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
         mock_sdk.news.search_news.return_value = mock_response
         mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
 
-        with patch(
-            "metaculus_bot.research.gemini_search.gemini_search_provider",
-            return_value=_fake_gemini,
+        with (
+            patch(
+                "metaculus_bot.research.gemini_search.gemini_search_provider",
+                return_value=_fake_gemini,
+            ),
+            patch.object(pmp, "build_llm_with_openrouter_fallback", _FakeMarketLlm),
+            patch.object(pmp, "_get_session", lambda: _FakeSession(handlers)),
+            patch.object(pmp, "fetch_market_snapshot", _capturing_fetch),
+            caplog.at_level(logging.INFO),
         ):
-            with (
-                patch.object(pmp, "build_llm_with_openrouter_fallback", _FakeMarketLlm),
-                patch.object(pmp, "_get_session", lambda: _FakeSession(handlers)),
-                patch.object(pmp, "fetch_market_snapshot", _capturing_fetch),
-            ):
-                with caplog.at_level(logging.INFO):
-                    research = await bot.run_research(q)
+            research = await bot.run_research(q)
 
     # F1 plumbing: the snapshot orchestrator received the real
     # MetaculusQuestion, not a string. Confirms the ResearchCallable signature
@@ -583,7 +586,7 @@ async def test_prediction_market_provider_disabled_flag_excludes_from_parallel(m
     q = MetaculusQuestion(
         question_text="Test",
         page_url="http://example.com",
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
     # Sentinel: if the provider runs, it would try to instantiate a session
@@ -601,16 +604,16 @@ async def test_prediction_market_provider_disabled_flag_excludes_from_parallel(m
         mock_sdk.news.search_news.return_value = mock_response
         mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
 
-        with patch.object(pmp, "_get_session", _should_not_be_called):
-            with caplog.at_level(logging.INFO):
-                await bot.run_research(q)
+        with patch.object(pmp, "_get_session", _should_not_be_called), caplog.at_level(logging.INFO):
+            await bot.run_research(q)
 
     provider_log = next(rec.message for rec in caplog.records if "Using research providers:" in rec.message)
     assert "prediction_market" not in provider_log
 
 
 @pytest.mark.asyncio
-async def test_prediction_market_provider_passes_no_as_of_through_the_orchestrator(mock_os_getenv, _reset_pm_caches):
+@pytest.mark.usefixtures("_reset_pm_caches")
+async def test_prediction_market_provider_passes_no_as_of_through_the_orchestrator(mock_os_getenv):
     """The provider path passes ``as_of=None``, even for a question that HAS a scheduled
     resolution — asserted here at the orchestrator level, where a future caller might inject one.
 
@@ -638,7 +641,7 @@ async def test_prediction_market_provider_passes_no_as_of_through_the_orchestrat
     )
     q = MetaculusQuestion(question_text="Will event X happen?", page_url="http://example.com/q/2")
     q.id_of_question = 7777  # type: ignore[attr-defined]
-    q.scheduled_resolution_time = datetime(2027, 8, 1, tzinfo=timezone.utc)
+    q.scheduled_resolution_time = datetime(2027, 8, 1, tzinfo=UTC)
     q.resolution_criteria = "Resolves yes if X happens by deadline."
 
     handlers = {

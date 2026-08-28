@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -47,6 +47,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.publish_gate import reset_publish_skipped_closed
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail, record_provider_detail
+from metaculus_bot.research.provider_fanout import await_providers_within_deadline
 from metaculus_bot.stacking_route import (
     _enrichment_timeout,
     _skip_stacking_for_budget,
@@ -74,7 +75,7 @@ def _isolate_publish_gate_counter():
 
 
 def _question(close_in: timedelta | None) -> BinaryQuestion:
-    close_time = datetime.now(timezone.utc) + close_in if close_in is not None else None
+    close_time = datetime.now(UTC) + close_in if close_in is not None else None
     return make_real_binary_question(qid=7001, close_time=close_time)
 
 
@@ -83,7 +84,7 @@ def _budget(total_s: float, *, close_limited: bool = True) -> QuestionTimeBudget
     return QuestionTimeBudget(
         total_s=total_s,
         started_at=time.monotonic(),
-        close_time=datetime.now(timezone.utc) + timedelta(seconds=total_s),
+        close_time=datetime.now(UTC) + timedelta(seconds=total_s),
         close_limited=close_limited,
     )
 
@@ -99,7 +100,7 @@ def _partly_spent_budget(total_s: float, *, spent_s: float, close_limited: bool 
     return QuestionTimeBudget(
         total_s=total_s,
         started_at=time.monotonic() - spent_s,
-        close_time=datetime.now(timezone.utc) + timedelta(seconds=total_s - spent_s),
+        close_time=datetime.now(UTC) + timedelta(seconds=total_s - spent_s),
         close_limited=close_limited,
     )
 
@@ -112,7 +113,7 @@ class TestBudgetMath:
         budget and skip the whole run, so ``close_aware=False`` must not consult the
         field at all — including on a question that closed years ago.
         """
-        question = make_real_binary_question(qid=7002, close_time=datetime(2020, 1, 1, tzinfo=timezone.utc))
+        question = make_real_binary_question(qid=7002, close_time=datetime(2020, 1, 1, tzinfo=UTC))
 
         budget = build_question_time_budget(
             question, close_aware=False, static_deadline_s=PER_QUESTION_WALL_CLOCK_DEADLINE
@@ -141,8 +142,8 @@ class TestBudgetMath:
         assert budget.close_time is None
 
     def test_a_near_close_shrinks_the_budget_by_the_publish_reserve(self):
-        now = datetime(2026, 8, 3, 11, 40, tzinfo=timezone.utc)
-        question = make_real_binary_question(qid=7003, close_time=datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc))
+        now = datetime(2026, 8, 3, 11, 40, tzinfo=UTC)
+        question = make_real_binary_question(qid=7003, close_time=datetime(2026, 8, 3, 12, 0, tzinfo=UTC))
 
         budget = build_question_time_budget(
             question, close_aware=True, static_deadline_s=PER_QUESTION_WALL_CLOCK_DEADLINE, now=now
@@ -159,7 +160,7 @@ class TestBudgetMath:
         A naive close time must not raise on the subtraction against an aware now, and
         must not silently shift the deadline by the local offset.
         """
-        now = datetime(2026, 8, 3, 11, 30, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 3, 11, 30, tzinfo=UTC)
         question = make_real_binary_question(qid=7004, close_time=datetime(2026, 8, 3, 12, 0))
 
         budget = build_question_time_budget(
@@ -172,8 +173,8 @@ class TestBudgetMath:
         """22 seconds of headroom: the prediction POST alone cannot fit, so no forecast
         this question could produce would be accepted. That is the 2026-08-03 q45085
         shape, which spent a full 3-forecaster ensemble and then took a 405."""
-        now = datetime(2026, 8, 3, 11, 59, 38, tzinfo=timezone.utc)
-        question = make_real_binary_question(qid=45085, close_time=datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc))
+        now = datetime(2026, 8, 3, 11, 59, 38, tzinfo=UTC)
+        question = make_real_binary_question(qid=45085, close_time=datetime(2026, 8, 3, 12, 0, tzinfo=UTC))
 
         budget = build_question_time_budget(
             question, close_aware=True, static_deadline_s=PER_QUESTION_WALL_CLOCK_DEADLINE, now=now
@@ -183,8 +184,8 @@ class TestBudgetMath:
         assert budget.close_limited is True
 
     def test_a_close_already_passed_is_exhausted(self):
-        now = datetime(2026, 8, 3, 12, 5, tzinfo=timezone.utc)
-        question = make_real_binary_question(qid=7005, close_time=datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc))
+        now = datetime(2026, 8, 3, 12, 5, tzinfo=UTC)
+        question = make_real_binary_question(qid=7005, close_time=datetime(2026, 8, 3, 12, 0, tzinfo=UTC))
 
         budget = build_question_time_budget(
             question, close_aware=True, static_deadline_s=PER_QUESTION_WALL_CLOCK_DEADLINE, now=now
@@ -252,8 +253,8 @@ class TestBudgetMath:
         assert budget.remaining_s() == pytest.approx(100 - budget.elapsed_s(), abs=0.5)
 
     def test_marker_line_states_the_budget_and_both_decisions(self):
-        now = datetime(2026, 8, 3, 11, 40, tzinfo=timezone.utc)
-        question = make_real_binary_question(qid=7006, close_time=datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc))
+        now = datetime(2026, 8, 3, 11, 40, tzinfo=UTC)
+        question = make_real_binary_question(qid=7006, close_time=datetime(2026, 8, 3, 12, 0, tzinfo=UTC))
         budget = build_question_time_budget(
             question, close_aware=True, static_deadline_s=PER_QUESTION_WALL_CLOCK_DEADLINE, now=now
         )
@@ -356,8 +357,10 @@ class TestFastPathProviderSelection:
             )
 
         fast_names, roomy_names = handed_downstream
-        assert "native_search" not in fast_names and "gemini_search" not in fast_names
-        assert "native_search" in roomy_names and "gemini_search" in roomy_names
+        assert "native_search" not in fast_names
+        assert "gemini_search" not in fast_names
+        assert "native_search" in roomy_names
+        assert "gemini_search" in roomy_names
 
     @pytest.mark.asyncio
     async def test_fast_path_with_nothing_configured_falls_back_to_the_empty_stub(self, monkeypatch):
@@ -462,15 +465,12 @@ class TestResearchPhaseDeadline:
         """``_run_one`` converts every PROVIDER exception into a ProviderResult, so an
         exception escaping it is a bug in our own wrapper. Swallowing it into a
         synthesized result would hide that class of defect entirely."""
-        orchestrator = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
 
         async def exploding_run_one(_provider, _name):
             raise ValueError("wrapper bug")
 
         with pytest.raises(ValueError, match="wrapper bug"):
-            await orchestrator._await_providers_within_deadline(
-                [(AsyncMock(), "native_search")], exploding_run_one, None
-            )
+            await await_providers_within_deadline([(AsyncMock(), "native_search")], exploding_run_one, None)
 
     @pytest.mark.asyncio
     async def test_an_empty_provider_list_yields_no_results_instead_of_raising(self):
@@ -480,7 +480,7 @@ class TestResearchPhaseDeadline:
         caller gets an exception where it used to get ``[]``."""
         never_run = AsyncMock(side_effect=AssertionError("no provider should have been started"))
 
-        assert await ResearchOrchestrator._await_providers_within_deadline([], never_run, None) == []
+        assert await await_providers_within_deadline([], never_run, None) == []
         never_run.assert_not_awaited()
 
 
@@ -664,7 +664,7 @@ class TestTightestCloseFirstOrdering:
         question = MagicMock(spec=BinaryQuestion)
         question.already_forecasted = False
         question.id_of_question = qid
-        question.close_time = datetime.now(timezone.utc) + close_in if close_in is not None else None
+        question.close_time = datetime.now(UTC) + close_in if close_in is not None else None
         return question
 
     @pytest.mark.asyncio
@@ -815,7 +815,11 @@ class TestStackingGateUnderACloseLimitedBudget:
             ),
         ):
             text = await _targeted_research_for_crux(
-                bot, make_real_binary_question(qid=7304), analyzer_llm, predictions, budget
+                bot,
+                make_real_binary_question(qid=7304),
+                analyzer_llm=analyzer_llm,
+                valid_predictions=predictions,
+                time_budget=budget,
             )
 
         assert text == "targeted findings"
@@ -856,7 +860,11 @@ class TestStackingGateUnderACloseLimitedBudget:
             caplog.at_level(logging.WARNING, logger="metaculus_bot.stacking_route"),
         ):
             text = await _targeted_research_for_crux(
-                bot, make_real_binary_question(qid=7305), analyzer_llm, predictions, budget
+                bot,
+                make_real_binary_question(qid=7305),
+                analyzer_llm=analyzer_llm,
+                valid_predictions=predictions,
+                time_budget=budget,
             )
 
         assert text == ""
@@ -889,7 +897,7 @@ class TestThinWindowThroughThePipeline:
     @pytest.mark.e2e
     async def test_a_thin_window_publishes_degraded_and_reddens_ci(self):
         bot = self._bot()
-        question = make_real_binary_question(qid=7401, close_time=datetime.now(timezone.utc) + timedelta(minutes=20))
+        question = make_real_binary_question(qid=7401, close_time=datetime.now(UTC) + timedelta(minutes=20))
         predictions = [
             ReasonedPrediction(prediction_value=0.30, reasoning="Model: m1\n\nthin window"),
             ReasonedPrediction(prediction_value=0.32, reasoning="Model: m2\n\nthin window"),
@@ -927,7 +935,7 @@ class TestThinWindowThroughThePipeline:
     @pytest.mark.e2e
     async def test_a_roomy_window_runs_the_full_pipeline(self):
         bot = self._bot()
-        question = make_real_binary_question(qid=7402, close_time=datetime.now(timezone.utc) + timedelta(hours=3))
+        question = make_real_binary_question(qid=7402, close_time=datetime.now(UTC) + timedelta(hours=3))
         predictions = [
             ReasonedPrediction(prediction_value=0.30, reasoning="Model: m1\n\nroomy"),
             ReasonedPrediction(prediction_value=0.32, reasoning="Model: m2\n\nroomy"),
@@ -963,7 +971,7 @@ class TestThinWindowThroughThePipeline:
         and then be refused by the publish gate; the budget check makes it cost nothing
         while producing the same skip and the same alertable counter."""
         bot = self._bot()
-        question = make_real_binary_question(qid=7403, close_time=datetime.now(timezone.utc) + timedelta(seconds=5))
+        question = make_real_binary_question(qid=7403, close_time=datetime.now(UTC) + timedelta(seconds=5))
         research = AsyncMock(return_value="Canned research")
         gather = AsyncMock()
 
@@ -999,7 +1007,7 @@ class TestThinWindowThroughThePipeline:
             publish_reports_to_metaculus=False,
             is_benchmarking=True,
         )
-        question = make_real_binary_question(qid=7407, close_time=datetime(2024, 6, 1, tzinfo=timezone.utc))
+        question = make_real_binary_question(qid=7407, close_time=datetime(2024, 6, 1, tzinfo=UTC))
         predictions = [
             ReasonedPrediction(prediction_value=0.30, reasoning="Model: m1\n\nbacktest"),
             ReasonedPrediction(prediction_value=0.32, reasoning="Model: m2\n\nbacktest"),
@@ -1053,7 +1061,7 @@ class TestThinWindowThroughThePipeline:
         )
         # Just over the publish reserve, so the budget is a fraction of a second.
         question = make_real_binary_question(
-            qid=7404, close_time=datetime.now(timezone.utc) + timedelta(seconds=PUBLISH_RESERVE_SECONDS + 0.6)
+            qid=7404, close_time=datetime.now(UTC) + timedelta(seconds=PUBLISH_RESERVE_SECONDS + 0.6)
         )
         started: list[int] = []
 
@@ -1088,8 +1096,8 @@ class TestThinWindowThroughThePipeline:
             ReasonedPrediction(prediction_value=0.32, reasoning="Model: m2\n\nresearch"),
             ReasonedPrediction(prediction_value=0.31, reasoning="Model: m3\n\nresearch"),
         ]
-        roomy = make_real_binary_question(qid=7405, close_time=datetime.now(timezone.utc) + timedelta(days=30))
-        thin = make_real_binary_question(qid=7406, close_time=datetime.now(timezone.utc) + timedelta(minutes=20))
+        roomy = make_real_binary_question(qid=7405, close_time=datetime.now(UTC) + timedelta(days=30))
+        thin = make_real_binary_question(qid=7406, close_time=datetime.now(UTC) + timedelta(minutes=20))
 
         with (
             patch.object(bot, "_get_notepad") as notepad,

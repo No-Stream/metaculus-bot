@@ -278,7 +278,7 @@ def test_wrapper_does_not_retry_on_unrelated_exception(monkeypatch):
         raise ValueError("some other bug")
 
     wrapped = fetch_hardening._wrap_with_retry("fake", fake_get)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="some other bug"):
         wrapped("dummy")
     assert n_calls["n"] == 1
 

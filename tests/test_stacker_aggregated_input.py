@@ -73,8 +73,8 @@ def _make_numeric_q() -> NumericQuestion:
 
 
 AGG_BLOCK = (
-    "- **Pools over 3 forecasters**: linear 0.400, log 0.370, Satopää α=2.5 0.420\n"
-    "- **Blended base rate across 2 forecasters**: 0.300 (range 0.250–0.333)"
+    "- **Pools over 3 forecasters**: linear 0.400, log 0.370, Satopää α=2.5 0.420\n"  # noqa: RUF001  # mirrors production output verbatim
+    "- **Blended base rate across 2 forecasters**: 0.300 (range 0.250–0.333)"  # noqa: RUF001
 )
 
 
@@ -338,10 +338,10 @@ class TestRunStackingNumericThreading:
 
 
 _RICH_AGG_BLOCK = (
-    "- **Pools over 4 forecasters**: linear 0.412, log 0.379, Satopää α=2.5 0.451\n"
-    "- **Blended base rate across 3 forecasters**: 0.302 (range 0.250–0.410)\n"
+    "- **Pools over 4 forecasters**: linear 0.412, log 0.379, Satopää α=2.5 0.451\n"  # noqa: RUF001  # mirrors tool_runner output verbatim
+    "- **Blended base rate across 3 forecasters**: 0.302 (range 0.250–0.410)\n"  # noqa: RUF001
     "- **Prior/posterior snapshot**: 4 forecasters declared priors, "
-    "priors range 0.180–0.330, posteriors range 0.250–0.460"
+    "priors range 0.180–0.330, posteriors range 0.250–0.460"  # noqa: RUF001
 )
 
 
@@ -379,9 +379,9 @@ class TestRunStackingBinaryFullPromptCapture:
         # verbatim (no truncation, no escaping).
         assert "Cross-model aggregation (deterministic math)" in prompt
         assert "Pools over 4 forecasters" in prompt
-        assert "linear 0.412, log 0.379, Satopää α=2.5 0.451" in prompt
+        assert "linear 0.412, log 0.379, Satopää α=2.5 0.451" in prompt  # noqa: RUF001
         assert "Blended base rate across 3 forecasters" in prompt
-        assert "range 0.250–0.410" in prompt
+        assert "range 0.250–0.410" in prompt  # noqa: RUF001
         assert "Prior/posterior snapshot" in prompt
 
         # Aggregation block precedes both expert analyses AND research context.

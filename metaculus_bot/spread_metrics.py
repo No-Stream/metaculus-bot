@@ -99,7 +99,7 @@ def _key_percentile_values(model_pcts: list[Percentile]) -> tuple[float, float, 
 
 
 def binary_prob_range_spread(prediction_values: list[float]) -> float:
-    """Compute the probability range (max − min) across binary predictions.
+    """Compute the probability range (max - min) across binary predictions.
 
     Active trigger metric for conditional stacking. Plain probability range
     avoids the log-odds failure mode where clamped-extreme predictions (~0 or ~1)

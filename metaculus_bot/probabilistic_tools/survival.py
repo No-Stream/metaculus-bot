@@ -84,6 +84,7 @@ def poisson_at_least_one(lambda_t: float) -> float:
 def base_rate_to_hazard(
     k: int,
     n: int,
+    *,
     years_per_ref_period: float = 1.0,
     prior_rate: float | None = None,
     prior_strength: float = 1.0,
@@ -94,12 +95,12 @@ def base_rate_to_hazard(
       - When ``prior_rate`` is None: Jeffreys-ish Gamma(0.5, 0) — improper
         but with well-defined posterior mean (0.5 + k) / (n·years) whenever
         data are present.
-      - When ``prior_rate`` is provided: Gamma(α, β) with
-        ``α = prior_strength * prior_rate`` and ``β = prior_strength``, so
+      - When ``prior_rate`` is provided: Gamma(alpha, beta) with
+        ``alpha = prior_strength * prior_rate`` and ``beta = prior_strength``, so
         the prior mean is ``prior_rate`` with strength ``prior_strength``
         pseudo-exposure-units (in the same units as ``n * years_per_ref_period``).
 
-    Posterior mean is ``(α + k) / (β + n·years_per_ref_period)``.
+    Posterior mean is ``(alpha + k) / (beta + n*years_per_ref_period)``.
     """
     if k < 0:
         raise ValueError(f"k must be >= 0 (got {k})")

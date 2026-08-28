@@ -80,7 +80,7 @@ class TestPolitenessPacing:
             for future in [pool.submit(record) for _ in range(4)]:
                 future.result()
 
-        gaps = [b - a for a, b in zip(sorted(fired), sorted(fired)[1:])]
+        gaps = [b - a for a, b in zip(sorted(fired), sorted(fired)[1:], strict=False)]
         assert len(gaps) == 3
         for gap in gaps:
             assert gap >= 0.04, f"consecutive requests must be spaced, got gaps {gaps}"

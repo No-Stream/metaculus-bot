@@ -54,9 +54,9 @@ changes how a row is chosen, not what a forecaster is told to verify.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Sequence
 
 from metaculus_bot.research.market_retrieval.ranking import (
     DEGRADED_RANKING_MARKER,
@@ -566,6 +566,36 @@ def _ladder_join(total: int, parts: Sequence[str]) -> str:
     return f"[remaining {total}] " + " / ".join(parts)
 
 
+def _settled_group(settled: Sequence[MarketChild]) -> str:
+    """The collapsed settled group: its count, its realized price span, and the last rung it names.
+
+    The group names its LAST member in family order. On an ordered threshold ladder that title is
+    the crossed floor — Manifold settles crossed rungs to exactly 1.0 while the market stays open —
+    so collapsing them to a bare count would delete the floor the series has already passed.
+
+    Prices come through ``_quoted_price`` rather than an ``or 0.0``: every caller filters on
+    ``implied_prob_yes is not None``, so a fallback here would be dead code covering exactly the
+    shape 58175a7 fixed — a withheld price re-entering the arithmetic as a real 0.00. A regression
+    in that filter now raises instead of rendering a fabricated span.
+    """
+    prices = [_quoted_price(child) for child in settled]
+    low, high = min(prices), max(prices)
+    span = f"{low:.2f}" if low == high else f"{low:.2f}-{high:.2f}"
+    last = _cell(settled[-1].title, limit=CHILD_TITLE_MAX_CHARS)
+    return f"+{len(settled)} settled at {span}, last {last}"
+
+
+def _cheap_group(cheap: Sequence[MarketChild], *, floor: float, cumulative: bool) -> str:
+    """The collapsed low-content group: its count, the floor it fell under, and its summed price.
+
+    "off by" rather than "under" on a cumulative ladder, because the group is BOTH of its tails —
+    the near-certain rungs and the near-impossible ones — and calling a 0.99 rung "under 0.20"
+    would read as a price claim that is simply false.
+    """
+    label = "off certainty by under" if cumulative else "under"
+    return f"+{len(cheap)} {label} {floor:.2f} ({_open_price_total(cheap):.2f} summed)"
+
+
 def _ladder_at_stage(rest: Sequence[MarketChild], *, stage: int) -> _LadderRow:
     """The ladder title for ``rest`` at one compaction stage. ``rest`` is in FAMILY order.
 
@@ -579,9 +609,8 @@ def _ladder_at_stage(rest: Sequence[MarketChild], *, stage: int) -> _LadderRow:
     hypothetical: it is what made the design's costing pass report the maxed fixture at 9,642 chars
     when the real figure was 13,306.
 
-    The settled group names its LAST member in family order. On an ordered threshold ladder that title
-    is the crossed floor — Manifold settles crossed rungs to exactly 1.0 while the market stays open —
-    so collapsing them to a bare count would delete the floor the series has already passed.
+    What each collapsed group has to say is ``_settled_group`` / ``_cheap_group``'s business; the
+    settled one's last-member rule in particular is stated there.
 
     Which OPEN outcomes a floor takes is decided by ``_forecast_content``, which reads the family's shape:
     on a partition the cheapest go first, and on a cumulative ladder BOTH tails go before the crossing.
@@ -619,23 +648,10 @@ def _ladder_at_stage(rest: Sequence[MarketChild], *, stage: int) -> _LadderRow:
         parts.append(f"+{len(unquoted)} unquoted")
         collapsed += len(unquoted)
     if collapse_settled and settled:
-        # `_quoted_price`, not `or 0.0`: ``settled`` is built with `implied_prob_yes is not
-        # None`, so a fallback here is dead code covering exactly the shape 58175a7 fixed —
-        # a withheld price re-entering the arithmetic as a real 0.00. A regression in that
-        # filter now raises instead of rendering a fabricated span.
-        prices = [_quoted_price(rest[index]) for index in settled]
-        low, high = min(prices), max(prices)
-        span = f"{low:.2f}" if low == high else f"{low:.2f}-{high:.2f}"
-        last = _cell(rest[settled[-1]].title, limit=CHILD_TITLE_MAX_CHARS)
-        parts.append(f"+{len(settled)} settled at {span}, last {last}")
+        parts.append(_settled_group([rest[index] for index in settled]))
         collapsed += len(settled)
     if cheap:
-        summed = _open_price_total([rest[index] for index in cheap])
-        # "off by" rather than "under" on a cumulative ladder, because the group is BOTH of its tails —
-        # the near-certain rungs and the near-impossible ones — and calling a 0.99 rung "under 0.20"
-        # would read as a price claim that is simply false.
-        label = "off certainty by under" if cumulative else "under"
-        parts.append(f"+{len(cheap)} {label} {floor:.2f} ({summed:.2f} summed)")
+        parts.append(_cheap_group([rest[index] for index in cheap], floor=floor, cumulative=cumulative))
         collapsed += len(cheap)
 
     return _LadderRow(title=_ladder_join(len(rest), parts), stage=stage, named=len(keep), collapsed=collapsed)
@@ -661,9 +677,9 @@ def _ladder_hard_bound(rest: Sequence[MarketChild], *, cap: int = LADDER_ROW_MAX
     by_content = sorted(
         range(len(rest)), key=lambda position: _ladder_content_key(rest[position], cumulative=cumulative)
     )
-    # noqa justification: not sub-sampling — the most informative term is the one this row GUARANTEES,
+
     # and the loop below then adds every further term that fits.
-    kept: set[int] = set(by_content[:1])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+    kept: set[int] = set(by_content[:1])  # HARNESS-SCAN-EXEMPT-subsampling
     for index in by_content[1:]:
         trial = kept | {index}
         body = " / ".join(_ladder_term(rest[position]) for position in sorted(trial))
@@ -848,13 +864,15 @@ def render_snapshot_with_stats(
     # title has to exist before any of them can be compacted.
     full_positions: list[list[int]] = []
     leftovers: list[list[MarketChild]] = []
-    for match, allowance in zip(matches, allowances):
+    for match, allowance in zip(matches, allowances, strict=False):
         order = _full_row_order(match.children)
         keep = set(order[:allowance])
         full_positions.append(order[:allowance])
         leftovers.append([child for index, child in enumerate(match.children) if index not in keep])
     ladder_families = [index for index, rest in enumerate(leftovers) if rest]
-    ladder_rows = dict(zip(ladder_families, _fit_ladder_section([leftovers[index] for index in ladder_families])))
+    ladder_rows = dict(
+        zip(ladder_families, _fit_ladder_section([leftovers[index] for index in ladder_families]), strict=False)
+    )
 
     lines: list[str] = []
     if ranking_degraded:

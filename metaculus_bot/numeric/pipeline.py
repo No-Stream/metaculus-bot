@@ -92,7 +92,10 @@ def build_numeric_distribution(
             zero_point,
         )
         prediction = create_pchip_numeric_distribution(pchip_cdf, percentile_list, question, zero_point)
-    except Exception as exc:
+    # Documented soft-fail boundary: ANY PCHIP build failure delegates the CDF to
+    # forecasting-tools' builder, which re-validates. Narrowing this would turn a
+    # recoverable build failure into a dropped forecast.
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         log_pchip_fallback(question, exc)
         prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point)
 
@@ -116,7 +119,9 @@ def build_numeric_distribution(
             question_url=getattr(question, "page_url", None),
         )
         x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)
-        declared_percentiles = [Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, resampled_cdf)]
+        declared_percentiles = [
+            Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, resampled_cdf, strict=False)
+        ]
         prediction = create_pchip_numeric_distribution(
             pchip_cdf=list(map(float, resampled_cdf)),
             percentile_list=declared_percentiles,
@@ -146,7 +151,7 @@ def _apply_jitter_and_clamp(
 
     count_like = detect_count_like_pattern(values)
     span = (max(values) - min(values)) if values else 0.0
-    value_eps, base_delta, spread_delta = compute_cluster_parameters(range_size, count_like, span)
+    value_eps, _base_delta, spread_delta = compute_cluster_parameters(range_size, count_like, span)
 
     if is_degenerate_cluster(values, value_eps):
         # A point mass: the model put (near-)identical values at every percentile,
@@ -168,9 +173,9 @@ def _apply_jitter_and_clamp(
     modified_values, clusters_applied = apply_cluster_spreading(
         modified_values,
         question,
-        value_eps,
-        spread_delta,
-        range_size,
+        value_eps=value_eps,
+        spread_delta=spread_delta,
+        range_size=range_size,
     )
 
     modified_values = apply_jitter_for_duplicates(modified_values, question, range_size, percentile_list)
@@ -180,16 +185,16 @@ def _apply_jitter_and_clamp(
         modified_values,
         values,
         question,
-        clusters_applied,
-        spread_delta,
-        count_like,
+        clusters_applied=clusters_applied,
+        spread_delta=spread_delta,
+        count_like=count_like,
     )
     log_corrections_summary(modified_values, values, question, corrections_made)
     log_heavy_clamping_diagnostics(modified_values, values, question, buffer)
 
     modified_values = ensure_strictly_increasing_bounded(modified_values, question, range_size)
 
-    return [Percentile(value=v, percentile=p.percentile) for v, p in zip(modified_values, percentile_list)]
+    return [Percentile(value=v, percentile=p.percentile) for v, p in zip(modified_values, percentile_list, strict=True)]
 
 
 def _maybe_widen_tails(percentile_list: list[Percentile], question: NumericQuestion) -> list[Percentile]:
@@ -204,4 +209,4 @@ def _maybe_widen_tails(percentile_list: list[Percentile], question: NumericQuest
     )
 
 
-__all__ = ["sanitize_percentiles", "build_numeric_distribution"]
+__all__ = ["build_numeric_distribution", "sanitize_percentiles"]

@@ -18,8 +18,7 @@ class AggregationStrategy(Enum):
     MEDIAN = "median"
     STACKING = "stacking"
     CONDITIONAL_STACKING = "conditional_stacking"
-    # Future: GEOMETRIC_MEAN = "geometric_mean"
-    # Future: TRIMMED_MEAN = "trimmed_mean"
+    # Future candidates: a geometric mean and a trimmed mean.
 
 
 def aggregate_binary_median(predictions: Sequence[float]) -> float:
@@ -60,7 +59,9 @@ def _aggregate_mc_options(
     names = list(option_probabilities.keys())
     clamped = clamp_and_renormalize_probs([agg_fn(option_probabilities[name]) for name in names])
     return PredictedOptionList(
-        predicted_options=[PredictedOption(option_name=name, probability=prob) for name, prob in zip(names, clamped)]
+        predicted_options=[
+            PredictedOption(option_name=name, probability=prob) for name, prob in zip(names, clamped, strict=True)
+        ]
     )
 
 

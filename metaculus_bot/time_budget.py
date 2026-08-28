@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
@@ -169,7 +169,7 @@ def build_question_time_budget(
             close_limited=False,
         )
 
-    moment = _as_utc(now) if now is not None else datetime.now(timezone.utc)
+    moment = _as_utc(now) if now is not None else datetime.now(UTC)
     close_allows_s = (close_utc - moment).total_seconds() - PUBLISH_RESERVE_SECONDS
     close_limited = close_allows_s < static_deadline_s
     return QuestionTimeBudget(

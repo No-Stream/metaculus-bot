@@ -282,7 +282,10 @@ assert CLAUSE_DIVERGENCE_MARKER_RE.search(format_clause_divergence_marker(-4.0))
 )
 _forecasters_used_match = FORECASTERS_USED_MARKER_RE.search(format_forecasters_used_marker(2, 3))
 assert _forecasters_used_match is not None, "FORECASTERS_USED_MARKER_RE does not match its own formatter output"
-assert _forecasters_used_match.group(1) == "2" and _forecasters_used_match.group(2) == "3", (
+assert _forecasters_used_match.group(1) == "2", (
+    f"FORECASTERS_USED_MARKER_RE captured {_forecasters_used_match.groups()!r}; expected ('2', '3')"
+)
+assert _forecasters_used_match.group(2) == "3", (
     f"FORECASTERS_USED_MARKER_RE captured {_forecasters_used_match.groups()!r}; expected ('2', '3')"
 )
 del _forecasters_used_match
@@ -294,34 +297,34 @@ assert STACKED_BASE_REASONING_HEADER.startswith("## "), (
 )
 
 __all__ = [
-    "STACKED_MARKER_TRUE",
-    "STACKED_MARKER_FALSE",
-    "STACKED_MARKER_RE",
-    "STACKER_OUTCOME_PRIMARY",
-    "STACKER_OUTCOME_FALLBACK_LLM",
-    "STACKER_OUTCOME_FALLBACK_MEDIAN",
-    "STACKER_OUTCOME_FALLBACK_MEAN",
-    "STACKER_OUTCOME_SKIPPED",
-    "STACKER_OUTCOME_SKIPPED_CONFIG_OFF",
-    "STACKER_OUTCOME_RE",
-    "STACKER_SKIP_REASONS",
-    "STACKER_SKIP_REASON_RE",
-    "format_stacker_skip_reason_marker",
-    "STACKER_META_ANALYSIS_HEADER",
-    "STACKED_BASE_REASONING_HEADER",
-    "BASE_MODEL_SUBBLOCK_SPLIT_RE",
-    "HISTORICAL_STACKER_META_HEADER",
-    "HISTORICAL_STACKER_SIGNATURE_RE",
-    "TOOLS_USED_MARKER_TRUE",
-    "TOOLS_USED_MARKER_FALSE",
-    "TOOLS_USED_MARKER_RE",
     "ANCHOR_OVERSHOOT_MARKER_PREFIX",
     "ANCHOR_OVERSHOOT_MARKER_RE",
+    "BASE_MODEL_SUBBLOCK_SPLIT_RE",
     "CLAUSE_DIVERGENCE_MARKER_PREFIX",
     "CLAUSE_DIVERGENCE_MARKER_RE",
-    "format_anchor_overshoot_marker",
-    "format_clause_divergence_marker",
     "FORECASTERS_USED_MARKER_PREFIX",
     "FORECASTERS_USED_MARKER_RE",
+    "HISTORICAL_STACKER_META_HEADER",
+    "HISTORICAL_STACKER_SIGNATURE_RE",
+    "STACKED_BASE_REASONING_HEADER",
+    "STACKED_MARKER_FALSE",
+    "STACKED_MARKER_RE",
+    "STACKED_MARKER_TRUE",
+    "STACKER_META_ANALYSIS_HEADER",
+    "STACKER_OUTCOME_FALLBACK_LLM",
+    "STACKER_OUTCOME_FALLBACK_MEAN",
+    "STACKER_OUTCOME_FALLBACK_MEDIAN",
+    "STACKER_OUTCOME_PRIMARY",
+    "STACKER_OUTCOME_RE",
+    "STACKER_OUTCOME_SKIPPED",
+    "STACKER_OUTCOME_SKIPPED_CONFIG_OFF",
+    "STACKER_SKIP_REASONS",
+    "STACKER_SKIP_REASON_RE",
+    "TOOLS_USED_MARKER_FALSE",
+    "TOOLS_USED_MARKER_RE",
+    "TOOLS_USED_MARKER_TRUE",
+    "format_anchor_overshoot_marker",
+    "format_clause_divergence_marker",
     "format_forecasters_used_marker",
+    "format_stacker_skip_reason_marker",
 ]

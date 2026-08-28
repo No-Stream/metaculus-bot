@@ -296,7 +296,8 @@ class TestQueryAuthorPrompt:
         assert "Recall is the objective" in prompt
         assert "Your queries are ADDED to a deterministic query set" in prompt
         assert "Do NOT include dates, years, or standalone numbers in any string" in prompt
-        assert '"synonyms"' in prompt and '"framings"' in prompt
+        assert '"synonyms"' in prompt
+        assert '"framings"' in prompt
 
     def test_the_ban_is_scoped_to_dates_and_invites_name_internal_digits(self):
         """The prompt's ban has to be scoped exactly as `has_date_like_token` scopes it. A prompt
@@ -319,7 +320,8 @@ class TestQueryAuthorPrompt:
         prompt = build_query_author_prompt("Will unemployment exceed 4.5%?", "c" * 5000)
 
         assert "title: Will unemployment exceed 4.5%?" in prompt
-        assert "{title}" not in prompt and "{rc}" not in prompt
+        assert "{title}" not in prompt
+        assert "{rc}" not in prompt
         assert "c" * QUERY_AUTHOR_RC_CHARS in prompt
         assert "c" * (QUERY_AUTHOR_RC_CHARS + 1) not in prompt
 

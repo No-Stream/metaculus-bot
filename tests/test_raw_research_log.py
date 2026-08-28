@@ -8,7 +8,7 @@ guard tests (unserializable payload, unwritable dir) are load-bearing.
 
 import dataclasses
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -111,7 +111,7 @@ class TestSerialization:
             name: str
             close_time: datetime | None
 
-        payload = [Match(name="m1", close_time=datetime(2026, 7, 19, tzinfo=timezone.utc))]
+        payload = [Match(name="m1", close_time=datetime(2026, 7, 19, tzinfo=UTC))]
         record_raw_research(qid=1, provider="prediction_market", payload=payload)
 
         rec = _read_records(enabled_log_dir)[0]

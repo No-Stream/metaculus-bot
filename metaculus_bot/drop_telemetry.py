@@ -12,7 +12,8 @@ catch-all.
 import json
 import logging
 from collections import defaultdict
-from typing import NamedTuple, Sequence
+from collections.abc import Sequence
+from typing import NamedTuple
 
 from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.llm_retry import is_zero_output_failure

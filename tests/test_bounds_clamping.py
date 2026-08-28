@@ -111,7 +111,7 @@ class TestBoundsClamping:
         question = _make_question(open_lower=False, lower=0.0, upper=100.0)
         buffer = 1.0  # Violation exceeds tolerance
 
-        with pytest.raises(ValueError) as exc_info:
+        with pytest.raises(ValueError, match="too far below lower bound") as exc_info:
             clamp_values_to_bounds(values.copy(), percentiles, question, buffer)
 
         assert "too far below lower bound" in str(exc_info.value)

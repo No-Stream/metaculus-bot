@@ -63,13 +63,32 @@ COMPARISONS_5ARM: tuple[str, ...] = (
 # remaining four pit the deterministic mean against each LLM/pdf arm. The arm
 # order in score_arm_for_qid for this mode is
 # [stack, stack_aug, pdf_min1, pdf_min2, median, mean].
-COMPARISONS_6ARM: tuple[str, ...] = COMPARISONS_5ARM + (
+COMPARISONS_6ARM: tuple[str, ...] = (
+    *COMPARISONS_5ARM,
     "mean-stack",
     "mean-stack_aug",
     "mean-pdf_min1",
     "mean-pdf_min2",
     "mean-median",
 )
+
+# Every arm label a PairedScore row carries a score for, in the canonical order the
+# ``arm_reports`` list must arrive in. 3- and 5-arm callers omit the trailing arms;
+# those land as None and are treated as absent.
+ALL_ARM_LABELS: tuple[str, ...] = ("stack", "stack_aug", "pdf_min1", "pdf_min2", "median", "mean")
+
+# The arm-count modes ``score_arm_for_qid`` accepts, and the comparison set each one
+# emits. Keyed by len(arm_reports) so the mode is read once, not re-derived per branch.
+_ARM_LABELS_BY_COUNT: dict[int, tuple[str, ...]] = {
+    3: ("stack", "stack_aug", "median"),
+    5: ("stack", "stack_aug", "pdf_min1", "pdf_min2", "median"),
+    6: ALL_ARM_LABELS,
+}
+_COMPARISONS_BY_ARM_COUNT: dict[int, tuple[str, ...]] = {
+    3: COMPARISONS_3ARM,
+    5: COMPARISONS_5ARM,
+    6: COMPARISONS_6ARM,
+}
 
 METRIC_DIRECTION: dict[str, bool] = {
     "brier": False,
@@ -275,6 +294,178 @@ def _saturation_for_metrics(metrics: dict[str, float], n_mc_options: int | None 
     return {metric: is_score_saturated(metric, score, n_mc_options) for metric, score in metrics.items()}
 
 
+def _index_arm_reports(
+    arm_reports: list[tuple[str, ForecastReport | None, dict | None]],
+) -> tuple[dict[str, ForecastReport | None], dict[str, dict | None]]:
+    """Key the caller's positional arm tuples by label, padding absent arms with None.
+
+    The incoming list is positional, so a mis-ordered list would silently mislabel
+    every score; both the count and the order are validated here. Returns reports and
+    payloads covering every label in ``ALL_ARM_LABELS`` so downstream code can read any
+    arm without re-deriving which arm-count mode the caller used.
+    """
+    expected_labels = _ARM_LABELS_BY_COUNT.get(len(arm_reports))
+    if expected_labels is None:
+        raise ValueError(f"score_arm_for_qid expects 3, 5, or 6 arm tuples, got {len(arm_reports)}")
+    actual_labels = [label for label, _report, _payload in arm_reports]
+    if actual_labels != list(expected_labels):
+        raise ValueError(f"score_arm_for_qid expects arms in order {list(expected_labels)}, got {actual_labels}")
+
+    supplied = {label: (report, payload) for label, report, payload in arm_reports}
+    reports = {label: supplied.get(label, (None, None))[0] for label in ALL_ARM_LABELS}
+    payloads = {label: supplied.get(label, (None, None))[1] for label in ALL_ARM_LABELS}
+    return reports, payloads
+
+
+def _report_type_of(report: ForecastReport) -> type[ForecastReport] | None:
+    """Concrete ft report class backing ``report``, or None when unsupported.
+
+    isinstance rather than ``type()`` comparison because ``MagicMock(spec=X)`` passes
+    ``isinstance(_, X)`` but ``type()`` returns a unique MagicMock subclass.
+    """
+    for report_type in (BinaryReport, NumericReport, MultipleChoiceReport):
+        if isinstance(report, report_type):
+            return report_type
+    return None
+
+
+def _question_type_for_resolution(report_type: type[ForecastReport], resolution: Any, qid: int) -> str | None:
+    """Question-type label for ``report_type``, or None (after a WARN) if the GT can't score.
+
+    The resolution has to match the report family: a bool resolution reaching the
+    numeric scorer is an upstream routing bug, not a scoreable question.
+    """
+    if report_type is BinaryReport:
+        if not isinstance(resolution, bool):
+            logger.warning(f"Q{qid}: expected bool for binary resolution, got {type(resolution).__name__}")
+            return None
+        return "binary"
+    if report_type is NumericReport:
+        if isinstance(resolution, bool):
+            logger.warning(
+                f"Q{qid}: bool resolution {resolution!r} routed to numeric scorer; skipping. "
+                "This indicates an upstream type-routing bug."
+            )
+            return None
+        if not isinstance(resolution, (int, float, OutOfBoundsResolution)):
+            logger.warning(
+                f"Q{qid}: expected numeric or OutOfBoundsResolution for numeric question, "
+                f"got {type(resolution).__name__}"
+            )
+            return None
+        return "numeric"
+    if not isinstance(resolution, str):
+        logger.warning(f"Q{qid}: expected str for MC resolution, got {type(resolution).__name__}")
+        return None
+    return "multiple_choice"
+
+
+def _score_one_arm(report: ForecastReport, *, question_type: str, resolution: Any) -> dict[str, float] | None:
+    """Metrics for one arm's report, or None when the report can't be scored."""
+    if question_type == "binary":
+        return _score_binary_arm(cast(BinaryReport, report), cast(bool, resolution))
+    if question_type == "numeric":
+        return _score_numeric_arm(cast(NumericReport, report), resolution)
+    return _score_mc_arm(cast(MultipleChoiceReport, report), cast(str, resolution))
+
+
+def _score_present_arms(
+    reports: dict[str, ForecastReport | None],
+    *,
+    question_type: str,
+    resolution: Any,
+    n_mc_options: int | None,
+) -> tuple[dict[str, dict[str, float] | None], dict[str, dict[str, bool] | None]]:
+    """Score every canonical arm; unscoreable arms map to None in both dicts.
+
+    An arm that is absent OR whose report fails to score (e.g. a numeric CDF the
+    scorer rejects) lands as None and is therefore treated as absent by the
+    comparison filter downstream.
+    """
+    arm_metrics: dict[str, dict[str, float] | None] = {}
+    arm_saturation: dict[str, dict[str, bool] | None] = {}
+    for label in ALL_ARM_LABELS:
+        report = reports[label]
+        metrics = (
+            _score_one_arm(report, question_type=question_type, resolution=resolution) if report is not None else None
+        )
+        arm_metrics[label] = metrics
+        arm_saturation[label] = (
+            _saturation_for_metrics(metrics, n_mc_options=n_mc_options) if metrics is not None else None
+        )
+    return arm_metrics, arm_saturation
+
+
+def _collect_confounders(payloads: dict[str, dict | None]) -> dict[str, Any]:
+    """Per-arm confounder fields from the cached stacker payloads.
+
+    The mean arm is a deterministic baseline with no dedicated PairedScore confounder
+    fields, so its payload is intentionally not surfaced.
+    """
+    confounders: dict[str, Any] = {}
+    for label in ("stack", "stack_aug", "pdf_min1", "pdf_min2", "median"):
+        confounders.update(_confounders_for_arm(payloads[label], label))
+    return confounders
+
+
+def _metric_or_nan(metrics: dict[str, float] | None, metric: str) -> float:
+    return metrics[metric] if metrics else float("nan")
+
+
+def _saturated_or_false(saturation: dict[str, bool] | None, metric: str) -> bool:
+    return saturation[metric] if saturation else False
+
+
+def _build_paired_rows(
+    *,
+    qid: int,
+    question_type: str,
+    active_comparisons: list[str],
+    arm_metrics: dict[str, dict[str, float] | None],
+    arm_saturation: dict[str, dict[str, bool] | None],
+    confounders: dict[str, Any],
+) -> list[PairedScore]:
+    """One PairedScore per (metric, active comparison).
+
+    Every row carries all six arm scores (NaN when the arm is absent) so per-arm raw
+    stats and the per-question diagnostic can be derived from any subset of rows. The
+    canonical metric set comes off the first scored arm; every arm of a given question
+    type produces the same metric keys.
+    """
+    canonical_metrics = next(metrics for metrics in arm_metrics.values() if metrics is not None)
+
+    paired: list[PairedScore] = []
+    for metric in canonical_metrics:
+        score = {label: _metric_or_nan(arm_metrics[label], metric) for label in ALL_ARM_LABELS}
+        saturated = {label: _saturated_or_false(arm_saturation[label], metric) for label in ALL_ARM_LABELS}
+        for comparison in active_comparisons:
+            left, right = comparison.split("-", 1)
+            paired.append(
+                PairedScore(
+                    qid=qid,
+                    question_type=question_type,
+                    metric=metric,
+                    comparison=comparison,
+                    score_stack=score["stack"],
+                    score_stack_aug=score["stack_aug"],
+                    score_median=score["median"],
+                    score_pdf_min1=score["pdf_min1"],
+                    score_pdf_min2=score["pdf_min2"],
+                    score_mean=score["mean"],
+                    delta=score[left] - score[right],
+                    higher_is_better=METRIC_DIRECTION[metric],
+                    is_saturated_stack=saturated["stack"],
+                    is_saturated_stack_aug=saturated["stack_aug"],
+                    is_saturated_pdf_min1=saturated["pdf_min1"],
+                    is_saturated_pdf_min2=saturated["pdf_min2"],
+                    is_saturated_median=saturated["median"],
+                    is_saturated_mean=saturated["mean"],
+                    **confounders,
+                )
+            )
+    return paired
+
+
 def score_arm_for_qid(
     arm_reports: list[tuple[str, ForecastReport | None, dict | None]],
     ground_truth: GroundTruth,
@@ -308,246 +499,58 @@ def score_arm_for_qid(
     Returns empty list if fewer than 2 arms are present, or if resolution type
     is incompatible (canceled, mismatched type, parse error).
     """
-    if len(arm_reports) == 3:
-        expected_labels = ["stack", "stack_aug", "median"]
-    elif len(arm_reports) == 5:
-        expected_labels = ["stack", "stack_aug", "pdf_min1", "pdf_min2", "median"]
-    elif len(arm_reports) == 6:
-        expected_labels = ["stack", "stack_aug", "pdf_min1", "pdf_min2", "median", "mean"]
-    else:
-        raise ValueError(f"score_arm_for_qid expects 3, 5, or 6 arm tuples, got {len(arm_reports)}")
+    reports, payloads = _index_arm_reports(arm_reports)
 
-    actual_labels = [t[0] for t in arm_reports]
-    if actual_labels != expected_labels:
-        raise ValueError(f"score_arm_for_qid expects arms in order {expected_labels}, got {actual_labels}")
-
-    is_five_arm = len(arm_reports) == 5
-    is_six_arm = len(arm_reports) == 6
-    has_pdf_arms = is_five_arm or is_six_arm
-
-    _, report_stack, payload_stack = arm_reports[0]
-    _, report_stack_aug, payload_stack_aug = arm_reports[1]
-    if has_pdf_arms:
-        _, report_pdf_min1, payload_pdf_min1 = arm_reports[2]
-        _, report_pdf_min2, payload_pdf_min2 = arm_reports[3]
-        _, report_median, payload_median = arm_reports[4]
-    else:
-        report_pdf_min1 = report_pdf_min2 = None
-        payload_pdf_min1 = payload_pdf_min2 = None
-        _, report_median, payload_median = arm_reports[2]
-    if is_six_arm:
-        # payload_mean is intentionally unused: the mean arm is a deterministic
-        # baseline with no dedicated PairedScore confounder fields.
-        _, report_mean, _payload_mean = arm_reports[5]
-    else:
-        report_mean = None
-
-    # Count present arms — need at least 2 for any comparison to be possible.
-    present_reports = [
-        r
-        for r in [report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median, report_mean]
-        if r is not None
-    ]
+    present_reports = [report for report in (reports[label] for label in ALL_ARM_LABELS) if report is not None]
     if len(present_reports) < 2:
         return []
 
     qid = ground_truth.question_id
     resolution = ground_truth.resolution
-    confounders: dict[str, Any] = {}
-    confounders.update(_confounders_for_arm(payload_stack, "stack"))
-    confounders.update(_confounders_for_arm(payload_stack_aug, "stack_aug"))
-    if has_pdf_arms:
-        confounders.update(_confounders_for_arm(payload_pdf_min1, "pdf_min1"))
-        confounders.update(_confounders_for_arm(payload_pdf_min2, "pdf_min2"))
-    confounders.update(_confounders_for_arm(payload_median, "median"))
-    # The mean arm is a deterministic baseline with no dedicated PairedScore
-    # confounder fields, so its payload is intentionally not surfaced here.
-
-    # Determine question type from the first non-None report.
     first_report = present_reports[0]
 
-    # Validate type consistency among non-None reports. Use isinstance against
-    # concrete types rather than type() comparison, because MagicMock(spec=X)
-    # passes isinstance(_, X) but type() returns a unique MagicMock subclass.
-    if isinstance(first_report, BinaryReport):
-        expected_type = BinaryReport
-    elif isinstance(first_report, NumericReport):
-        expected_type = NumericReport
-    elif isinstance(first_report, MultipleChoiceReport):
-        expected_type = MultipleChoiceReport
-    else:
+    expected_type = _report_type_of(first_report)
+    if expected_type is None:
         logger.warning(f"Q{qid}: unsupported report type: {type(first_report).__name__}")
         return []
-    for r in present_reports[1:]:
-        if not isinstance(r, expected_type):
-            logger.warning(f"Q{qid}: mismatched report types among present arms")
-            return []
-
-    # Score each present arm; collect metrics per arm label.
-    arm_metrics: dict[str, dict[str, float] | None] = {}
-    arm_saturation: dict[str, dict[str, bool] | None] = {}
-    n_mc_options: int | None = None
-
-    if isinstance(first_report, BinaryReport):
-        if not isinstance(resolution, bool):
-            logger.warning(f"Q{qid}: expected bool for binary resolution, got {type(resolution).__name__}")
-            return []
-        question_type = "binary"
-        for label, report in [
-            ("stack", report_stack),
-            ("stack_aug", report_stack_aug),
-            ("pdf_min1", report_pdf_min1),
-            ("pdf_min2", report_pdf_min2),
-            ("median", report_median),
-            ("mean", report_mean),
-        ]:
-            if report is not None:
-                metrics_for_arm = _score_binary_arm(cast(BinaryReport, report), resolution)
-                arm_metrics[label] = metrics_for_arm
-                arm_saturation[label] = _saturation_for_metrics(metrics_for_arm)
-            else:
-                arm_metrics[label] = None
-                arm_saturation[label] = None
-
-    elif isinstance(first_report, NumericReport):
-        if isinstance(resolution, bool):
-            logger.warning(
-                f"Q{qid}: bool resolution {resolution!r} routed to numeric scorer; skipping. "
-                "This indicates an upstream type-routing bug."
-            )
-            return []
-        if not isinstance(resolution, (int, float, OutOfBoundsResolution)):
-            logger.warning(
-                f"Q{qid}: expected numeric or OutOfBoundsResolution for numeric question, "
-                f"got {type(resolution).__name__}"
-            )
-            return []
-        question_type = "numeric"
-        for label, report in [
-            ("stack", report_stack),
-            ("stack_aug", report_stack_aug),
-            ("pdf_min1", report_pdf_min1),
-            ("pdf_min2", report_pdf_min2),
-            ("median", report_median),
-            ("mean", report_mean),
-        ]:
-            if report is not None:
-                scored = _score_numeric_arm(cast(NumericReport, report), resolution)
-                if scored is None:
-                    # Scoring failed (e.g., CDF issue) — treat this arm as absent.
-                    arm_metrics[label] = None
-                    arm_saturation[label] = None
-                else:
-                    arm_metrics[label] = scored
-                    arm_saturation[label] = _saturation_for_metrics(scored)
-            else:
-                arm_metrics[label] = None
-                arm_saturation[label] = None
-
-    elif isinstance(first_report, MultipleChoiceReport):
-        if not isinstance(resolution, str):
-            logger.warning(f"Q{qid}: expected str for MC resolution, got {type(resolution).__name__}")
-            return []
-        question_type = "multiple_choice"
-        n_mc_options = len(first_report.question.options)
-        for label, report in [
-            ("stack", report_stack),
-            ("stack_aug", report_stack_aug),
-            ("pdf_min1", report_pdf_min1),
-            ("pdf_min2", report_pdf_min2),
-            ("median", report_median),
-            ("mean", report_mean),
-        ]:
-            if report is not None:
-                scored = _score_mc_arm(cast(MultipleChoiceReport, report), resolution)
-                if scored is None:
-                    arm_metrics[label] = None
-                    arm_saturation[label] = None
-                else:
-                    arm_metrics[label] = scored
-                    arm_saturation[label] = _saturation_for_metrics(scored, n_mc_options=n_mc_options)
-            else:
-                arm_metrics[label] = None
-                arm_saturation[label] = None
-    else:
-        logger.warning(f"Q{qid}: unsupported report type: {type(first_report).__name__}")
+    if any(not isinstance(report, expected_type) for report in present_reports[1:]):
+        logger.warning(f"Q{qid}: mismatched report types among present arms")
         return []
 
-    # Determine which arms actually scored successfully.
-    scored_arms = {label for label, m in arm_metrics.items() if m is not None}
+    question_type = _question_type_for_resolution(expected_type, resolution, qid)
+    if question_type is None:
+        return []
+
+    n_mc_options = (
+        len(cast(MultipleChoiceReport, first_report).question.options) if question_type == "multiple_choice" else None
+    )
+    arm_metrics, arm_saturation = _score_present_arms(
+        reports,
+        question_type=question_type,
+        resolution=resolution,
+        n_mc_options=n_mc_options,
+    )
+
+    scored_arms = {label for label, metrics in arm_metrics.items() if metrics is not None}
     if len(scored_arms) < 2:
         return []
 
-    # Choose comparison set based on mode.
-    if is_six_arm:
-        comparisons = COMPARISONS_6ARM
-    elif is_five_arm:
-        comparisons = COMPARISONS_5ARM
-    else:
-        comparisons = COMPARISONS_3ARM
-
-    # Filter to comparisons where both arms scored successfully.
-    active_comparisons = []
-    for comparison in comparisons:
-        left, right = comparison.split("-", 1)
-        if left in scored_arms and right in scored_arms:
-            active_comparisons.append(comparison)
-
+    active_comparisons = [
+        comparison
+        for comparison in _COMPARISONS_BY_ARM_COUNT[len(arm_reports)]
+        if all(arm in scored_arms for arm in comparison.split("-", 1))
+    ]
     if not active_comparisons:
         return []
 
-    # Build PairedScore rows for active comparisons only.
-    # Collect the canonical metric set from the first scored arm.
-    first_scored_label = next(iter(scored_arms))
-    first_scored_metrics = arm_metrics[first_scored_label]
-    assert first_scored_metrics is not None  # guaranteed by scored_arms membership
-    metric_names = list(first_scored_metrics.keys())
-
-    paired: list[PairedScore] = []
-    for metric in metric_names:
-        # Extract scores for all arms (NaN for absent arms).
-        s_stack = arm_metrics["stack"][metric] if arm_metrics["stack"] else float("nan")
-        s_stack_aug = arm_metrics["stack_aug"][metric] if arm_metrics["stack_aug"] else float("nan")
-        s_pdf_min1 = arm_metrics["pdf_min1"][metric] if arm_metrics["pdf_min1"] else float("nan")
-        s_pdf_min2 = arm_metrics["pdf_min2"][metric] if arm_metrics["pdf_min2"] else float("nan")
-        s_median = arm_metrics["median"][metric] if arm_metrics["median"] else float("nan")
-        s_mean = arm_metrics["mean"][metric] if arm_metrics["mean"] else float("nan")
-
-        def _get_score(arm_label: str) -> float:
-            m = arm_metrics[arm_label]
-            return m[metric] if m else float("nan")
-
-        def _get_sat(arm_label: str) -> bool:
-            s = arm_saturation[arm_label]
-            return s[metric] if s else False
-
-        for comparison in active_comparisons:
-            left, right = comparison.split("-", 1)
-            delta = _get_score(left) - _get_score(right)
-            paired.append(
-                PairedScore(
-                    qid=qid,
-                    question_type=question_type,
-                    metric=metric,
-                    comparison=comparison,
-                    score_stack=s_stack,
-                    score_stack_aug=s_stack_aug,
-                    score_median=s_median,
-                    score_pdf_min1=s_pdf_min1,
-                    score_pdf_min2=s_pdf_min2,
-                    score_mean=s_mean,
-                    delta=delta,
-                    higher_is_better=METRIC_DIRECTION[metric],
-                    is_saturated_stack=_get_sat("stack"),
-                    is_saturated_stack_aug=_get_sat("stack_aug"),
-                    is_saturated_pdf_min1=_get_sat("pdf_min1"),
-                    is_saturated_pdf_min2=_get_sat("pdf_min2"),
-                    is_saturated_median=_get_sat("median"),
-                    is_saturated_mean=_get_sat("mean"),
-                    **confounders,
-                )
-            )
-    return paired
+    return _build_paired_rows(
+        qid=qid,
+        question_type=question_type,
+        active_comparisons=active_comparisons,
+        arm_metrics=arm_metrics,
+        arm_saturation=arm_saturation,
+        confounders=_collect_confounders(payloads),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +650,7 @@ def _stats_for_group(
     question_type: str | None,
     comparison: str,
     group: list[PairedScore],
+    *,
     n_bootstrap: int,
     mean_seed: int,
     median_seed: int,
@@ -716,6 +720,7 @@ def _group_seed(
     metric: str,
     question_type: str | None,
     comparison: str,
+    *,
     subgroup: str = "",
 ) -> int:
     """Derive a deterministic 32-bit per-group seed from (parent_seed, metric, qtype, comparison, subgroup).
@@ -730,7 +735,7 @@ def _group_seed(
     is set. SHA-256 keeps the seed reproducible across distinct Python processes.
     """
     qtype_str = question_type if question_type is not None else "__overall__"
-    key = f"{metric}|{qtype_str}|{comparison}|{subgroup}".encode("utf-8")
+    key = f"{metric}|{qtype_str}|{comparison}|{subgroup}".encode()
     digest_int = int.from_bytes(hashlib.sha256(key).digest()[:4], "big")
     seed_seq = np.random.SeedSequence([parent_seed, digest_int])
     return int(seed_seq.generate_state(1)[0])
@@ -764,7 +769,7 @@ def aggregate_paired(scores: list[PairedScore], n_bootstrap: int = 5000, seed: i
                 qtype,
                 comparison,
                 group,
-                n_bootstrap,
+                n_bootstrap=n_bootstrap,
                 mean_seed=_group_seed(seed, metric, qtype, comparison, subgroup="mean"),
                 median_seed=_group_seed(seed, metric, qtype, comparison, subgroup="median"),
             )
@@ -777,7 +782,7 @@ def aggregate_paired(scores: list[PairedScore], n_bootstrap: int = 5000, seed: i
                 None,
                 comparison,
                 group,
-                n_bootstrap,
+                n_bootstrap=n_bootstrap,
                 mean_seed=_group_seed(seed, metric, None, comparison, subgroup="mean"),
                 median_seed=_group_seed(seed, metric, None, comparison, subgroup="median"),
             )

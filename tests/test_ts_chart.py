@@ -12,6 +12,8 @@ No network, no LLM. Fetch is monkeypatched to a synthetic series.
 from __future__ import annotations
 
 import base64
+import logging
+import sys
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -121,6 +123,30 @@ class TestProviderChartHook:
         assert 8100 in ts._session_charts
         raw = base64.b64decode(ts._session_charts[8100], validate=True)
         assert raw.startswith(_PNG_MAGIC)
+
+    @pytest.mark.asyncio
+    async def test_missing_matplotlib_degrades_to_text_only_anchor(self, monkeypatch, caplog):
+        """Bot workflows install --no-dev, where matplotlib is absent: with the chart flag
+        on, the ImportError must degrade to the text-only anchor (no chart stashed) rather
+        than killing the provider — but LOUDLY, via one ERROR naming matplotlib, so a
+        misconfigured flag flip is distinguishable from a per-question render hiccup."""
+        monkeypatch.setenv("TS_ANCHOR_ENABLED", "true")
+        monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: _daily_series("DGS10"))
+        # None in sys.modules makes the function-scoped `from ... import` raise ImportError,
+        # simulating the ts_chart module being unimportable without matplotlib.
+        monkeypatch.setitem(sys.modules, "metaculus_bot.research.ts_chart", None)
+
+        q = _make_numeric_q(qid=8102, resolution_criteria=_DGS10_RC)
+        provider = ts.timeseries_anchor_provider()
+        with caplog.at_level(logging.ERROR, logger="metaculus_bot.research.timeseries_anchor"):
+            out = await provider(q)
+
+        assert out  # text section survives the chart failure
+        assert 8102 not in ts._session_charts
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "matplotlib" in errors[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_chart_not_populated_when_chart_flag_off(self, monkeypatch):

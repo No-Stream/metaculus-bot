@@ -1,4 +1,5 @@
-from typing import Sequence
+import logging
+from collections.abc import Sequence
 
 from forecasting_tools import ForecastBot, ForecastReport
 
@@ -20,8 +21,6 @@ def compact_log_report_summary(
         readable = type(r).make_readable_prediction(r.prediction).strip()
         return f"✅ {r.question.page_url} | Prediction: {readable} | Minor Errors: {len(r.errors)}"
 
-    import logging  # postponed import to keep module load light
-
     summary_lines = "\n".join(_line(r) for r in valid_reports)
 
     for exc in exceptions:
@@ -31,7 +30,7 @@ def compact_log_report_summary(
         summary_lines += f"\n❌ Exception: {exc.__class__.__name__} | {msg}"
 
     logger = logging.getLogger(__name__)
-    logger.info(summary_lines + "\n")
+    logger.info(f"{summary_lines}\n")
 
     minor_lists = [r.errors for r in valid_reports if r.errors]
     if minor_lists:

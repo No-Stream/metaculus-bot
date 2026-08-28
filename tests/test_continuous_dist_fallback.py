@@ -1,5 +1,5 @@
-# type: ignore
 from datetime import datetime, timedelta
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,7 +25,7 @@ class DummyLLM:  # minimal async LLM for tests
         self._reasoning = reasoning
         self.model = "dummy-test-model"
 
-    async def invoke(self, prompt: str):  # noqa: D401
+    async def invoke(self, prompt: str):
         return self._reasoning
 
 
@@ -78,6 +78,7 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
         for v, p in zip(
             [90, 95, 100, 110, 120, 130, 135, 140, 150, 160, 170, 175, 180],
             [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99],
+            strict=True,
         )
     ]
 
@@ -93,12 +94,13 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
     ):
         result = await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
 
-    values = [p.value for p in result.prediction_value.declared_percentiles]  # type: ignore
+    values = [p.value for p in result.prediction_value.declared_percentiles]
     # Basic sanity with tail widening enabled: monotone, median unchanged, tails not narrower
     assert len(values) == 13
-    assert all(b > a for a, b in zip(values, values[1:])), values
+    assert all(b > a for a, b in pairwise(values)), values
     assert values[6] == pytest.approx(135.0)
-    assert values[0] <= 95.0 and values[-1] >= 175.0
+    assert values[0] <= 95.0
+    assert values[-1] >= 175.0
 
 
 @pytest.mark.asyncio
@@ -128,6 +130,6 @@ async def test_fallback_reraises_when_insufficient_numbers(dummy_forecaster):
             "metaculus_bot.value_extraction.parse_structured",
             new=AsyncMock(return_value=insufficient),
         ),
+        pytest.raises(ValueExtractionError),
     ):
-        with pytest.raises(ValueExtractionError):
-            await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
+        await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]

@@ -47,7 +47,7 @@ def _open_question(*, open_lower: bool, open_upper: bool) -> NumericQuestion:
 
 class TestBoundMessagesConcreteGuidance:
     def test_open_lower_carries_concrete_percentile_placement_guidance(self):
-        upper, lower = bound_messages(_open_question(open_lower=True, open_upper=True))
+        _upper, lower = bound_messages(_open_question(open_lower=True, open_upper=True))
         low = " ".join(lower.lower().split())
         # Percentiles are the only channel: mass beyond the range is expressed through them,
         # not through the removed scalar tail-mass field (so the copy must not resurrect it).
@@ -63,7 +63,7 @@ class TestBoundMessagesConcreteGuidance:
         assert "do not pile" in low or "don't pile" in low
 
     def test_open_upper_carries_symmetric_concrete_guidance(self):
-        upper, lower = bound_messages(_open_question(open_lower=True, open_upper=True))
+        upper, _lower = bound_messages(_open_question(open_lower=True, open_upper=True))
         up = " ".join(upper.lower().split())
         assert "only way" in up or "only channel" in up
         assert "including mass beyond the displayed range" in up
@@ -77,9 +77,11 @@ class TestBoundMessagesConcreteGuidance:
         upper, lower = bound_messages(_open_question(open_lower=False, open_upper=False))
         for msg in (upper.lower(), lower.lower()):
             collapsed = " ".join(msg.split())
-            assert "only way" not in collapsed and "only channel" not in collapsed
+            assert "only way" not in collapsed
+            assert "only channel" not in collapsed
             assert "including mass beyond the displayed range" not in collapsed
-            assert "do not pile" not in collapsed and "don't pile" not in collapsed
+            assert "do not pile" not in collapsed
+            assert "don't pile" not in collapsed
             # Closed messages keep the hard-limit framing.
         assert "can not be higher" in upper
         assert "can not be lower" in lower

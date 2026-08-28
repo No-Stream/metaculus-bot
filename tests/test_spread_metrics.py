@@ -51,45 +51,45 @@ class TestBinaryProbRangeSpread:
 
 
 def _make_binary_question(**overrides) -> BinaryQuestion:
-    defaults: dict[str, Any] = dict(
-        question_text="Will it rain?",
-        id_of_question=1,
-        page_url="https://example.com/q/1",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-    )
+    defaults: dict[str, Any] = {
+        "question_text": "Will it rain?",
+        "id_of_question": 1,
+        "page_url": "https://example.com/q/1",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+    }
     defaults.update(overrides)
     return BinaryQuestion(**defaults)
 
 
 def _make_mc_question(**overrides) -> MultipleChoiceQuestion:
-    defaults: dict[str, Any] = dict(
-        question_text="What color?",
-        options=["Red", "Blue", "Green"],
-        id_of_question=2,
-        page_url="https://example.com/q/2",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-    )
+    defaults: dict[str, Any] = {
+        "question_text": "What color?",
+        "options": ["Red", "Blue", "Green"],
+        "id_of_question": 2,
+        "page_url": "https://example.com/q/2",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+    }
     defaults.update(overrides)
     return MultipleChoiceQuestion(**defaults)
 
 
 def _make_numeric_question(**overrides) -> NumericQuestion:
-    defaults: dict[str, Any] = dict(
-        question_text="How many?",
-        id_of_question=3,
-        page_url="https://example.com/q/3",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-        lower_bound=0.0,
-        upper_bound=100.0,
-        open_lower_bound=False,
-        open_upper_bound=False,
-    )
+    defaults: dict[str, Any] = {
+        "question_text": "How many?",
+        "id_of_question": 3,
+        "page_url": "https://example.com/q/3",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+    }
     defaults.update(overrides)
     return NumericQuestion(**defaults)
 
@@ -108,7 +108,7 @@ def _make_percentile_list(predicted_values: list[float]) -> list[Percentile]:
     p99_value = predicted_values[-1] + (predicted_values[-1] - predicted_values[-2])
     labels = [1.0, *_CORE_PERCENTILE_LABELS, 99.0]
     values = [p1_value, *predicted_values, p99_value]
-    return [Percentile(percentile=pct / 100.0, value=val) for pct, val in zip(labels, values)]
+    return [Percentile(percentile=pct / 100.0, value=val) for pct, val in zip(labels, values, strict=True)]
 
 
 # binary_log_odds_spread
@@ -295,7 +295,7 @@ class TestNumericPercentileSpread:
             numeric_percentile_spread([short_model, full_model], question)
 
 
-# compute_spread (dispatcher)
+# compute_spread dispatcher
 
 
 class TestComputeSpread:
@@ -371,7 +371,7 @@ _STANDARD_PERCENTILE_LABELS = [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 
 def _make_standard_percentile_list(values: list[float]) -> list[Percentile]:
     """Build a full standard-13 percentile list directly from 13 values (no tail extrapolation)."""
     assert len(values) == len(_STANDARD_PERCENTILE_LABELS)
-    return [Percentile(percentile=pct, value=val) for pct, val in zip(_STANDARD_PERCENTILE_LABELS, values)]
+    return [Percentile(percentile=pct, value=val) for pct, val in zip(_STANDARD_PERCENTILE_LABELS, values, strict=True)]
 
 
 def _build_discrete_resampled_declared(question: NumericQuestion, values: list[float]) -> list[Percentile]:
@@ -477,7 +477,7 @@ class TestOpenTailCdfGrid:
         # Grid spans cumulative probability [0.40, 1.0] over the displayed range [5.0, 20.0].
         labels = [0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0]
         values = [displayed_lower, 7.0, 9.0, 11.0, 13.0, 16.0, 20.0]
-        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values)]
+        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values, strict=True)]
 
         p10, p50, p90 = _key_percentile_values(model_pcts)
         # np.interp clamps: query 0.10 is below labels[0]=0.40, so returns values[0] = displayed_lower
@@ -493,7 +493,7 @@ class TestOpenTailCdfGrid:
         # Grid spans cumulative probability [0.0, 0.60] over the displayed range [5.0, 20.0].
         labels = [0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
         values = [5.0, 7.0, 9.0, 11.0, 13.0, 16.0, displayed_upper]
-        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values)]
+        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values, strict=True)]
 
         p10, p50, p90 = _key_percentile_values(model_pcts)
         # np.interp clamps: query 0.90 is above labels[-1]=0.60, so returns values[-1] = displayed_upper
@@ -508,7 +508,7 @@ class TestOpenTailCdfGrid:
         # is_plausible_grid=False (len<5) AND spans_key_percentiles=False.
         labels = [0.40, 0.50, 0.60]
         values = [10.0, 15.0, 20.0]
-        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values)]
+        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values, strict=True)]
 
         with pytest.raises(ValueError, match="neither the standard percentiles"):
             _key_percentile_values(model_pcts)
@@ -528,7 +528,7 @@ class TestDuplicateStandardLabelsHardening:
         # percentile_set.EXPECTED_KEYS on its own — the len check is what prevents the crash.
         standard_labels = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
         standard_values = [1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 15.0, 18.0, 22.0, 28.0, 32.0, 36.0, 40.0]
-        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(standard_labels, standard_values)]
+        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(standard_labels, standard_values, strict=True)]
         # Add a duplicate of the P50 entry
         model_pcts.append(Percentile(percentile=0.50, value=15.0))
         assert len(model_pcts) == 14
@@ -561,7 +561,7 @@ class TestUndefinedDenominator:
         """
         labels = [0.94, 0.96, 0.97, 0.98, 0.99, 1.0]
         values = [bound_value + offset * i for i in range(len(labels))]
-        return [Percentile(percentile=p, value=v) for p, v in zip(labels, values)]
+        return [Percentile(percentile=p, value=v) for p, v in zip(labels, values, strict=True)]
 
     def test_zero_iqr_denominator_reports_inf(self, caplog):
         question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)

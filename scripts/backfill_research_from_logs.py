@@ -13,6 +13,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The provider -> section-header map is the live pipeline's own; walking it backwards is
+# how a bundle is decoded, and a hand-copied inverse had already rotted two providers
+# (resolution_source, timeseries_anchor) out of every record this writer produced.
+from metaculus_bot.research.section_format import PROVIDER_SECTION_HEADERS
+
 # The archive's source-classification vocabulary lives with the merge stage that reads it,
 # so writer and classifier can't drift into disagreeing about this writer's name.
 from scripts.download_research import LOG_BACKFILL_RUN_MODE
@@ -37,20 +42,6 @@ APP_LOG_LINE = re.compile(
 
 GHA_PREFIX = re.compile(r"^forecast_job\t[^\t]*\t\d{4}-\d{2}-\d{2}T[\d:.]+Z\s*")
 
-# --- Provider header mapping ---
-
-PROVIDER_HEADERS = {
-    "## News Articles (AskNews)": "asknews",
-    "## Web Research (Native Search)": "native_search",
-    "## Web Research (Google Search via Gemini)": "gemini_search",
-    "## Financial & Economic Data": "financial_data",
-    "## Prediction Market Snapshot": "prediction_market",
-    "## Web Research (Exa)": "exa",
-    "## Web Research (Perplexity)": "perplexity",
-    "## Web Research (OpenRouter)": "openrouter",
-    "## Research (Custom)": "custom",
-}
-
 # --- QID extraction from Metaculus URLs ---
 
 QID_PATTERN = re.compile(r"metaculus\.com/(?:questions|c/[^/]+)/(\d+)")
@@ -72,9 +63,15 @@ def normalize_timestamp(gha_timestamp: str) -> str:
 
 
 def detect_providers(research_text: str) -> list[str]:
-    """Detect which research providers contributed based on ## headers in the text."""
+    """Detect which research providers contributed based on ## headers in the text.
+
+    Walks the live pipeline's own provider -> header map backwards. Nothing is
+    inverted into a second dict: a copy is what let ``resolution_source`` and
+    ``timeseries_anchor`` go unrecognized here for months while the pipeline had been
+    emitting both, so every future provider now self-propagates.
+    """
     providers = []
-    for header, provider_name in PROVIDER_HEADERS.items():
+    for provider_name, header in PROVIDER_SECTION_HEADERS.items():
         if header in research_text:
             providers.append(provider_name)
     return providers
@@ -143,7 +140,7 @@ def parse_research_blocks(log_text: str, run_id: str) -> list[dict]:
     return records
 
 
-def list_qualifying_runs(workflow: str, limit: int, status: str, since: str, repo: str) -> list[dict]:
+def list_qualifying_runs(workflow: str, *, limit: int, status: str, since: str, repo: str) -> list[dict]:
     """List qualifying GHA runs via the gh CLI."""
     cmd = [
         "gh",
@@ -160,7 +157,9 @@ def list_qualifying_runs(workflow: str, limit: int, status: str, since: str, rep
         "--json",
         "databaseId,createdAt,conclusion,status",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # S603: fixed `gh run list` argv, no shell. Every interpolation is an operator-supplied
+    # CLI flag value occupying its own argv slot, so nothing can inject a flag or a command.
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
     if result.returncode != 0:
         logger.error(f"gh run list failed: {result.stderr}")
         sys.exit(1)
@@ -176,7 +175,9 @@ def list_qualifying_runs(workflow: str, limit: int, status: str, since: str, rep
 def download_run_log(run_id: int, repo: str) -> str | None:
     """Download the full log for a GHA run. Returns None on failure."""
     cmd = ["gh", "run", "view", str(run_id), "--repo", repo, "--log"]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    # S603: fixed `gh run view` argv, no shell; run_id comes from GitHub's own run listing
+    # and repo from the operator's --repo, each in its own argv slot.
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)  # noqa: S603
     if result.returncode != 0:
         logger.warning(f"Failed to download log for run {run_id}: {result.stderr.strip()}")
         return None
@@ -190,8 +191,8 @@ def existing_records(output_dir: Path) -> set[tuple[int, str]]:
         return seen
     for jsonl_file in output_dir.glob("*.jsonl"):
         with open(jsonl_file) as f:
-            for line in f:
-                line = line.strip()
+            for raw_line in f:
+                line = raw_line.strip()
                 if not line:
                     continue
                 record = json.loads(line)
@@ -218,9 +219,10 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
-    # Verify gh CLI is available
+    # Verify gh CLI is available. `gh` is resolved off PATH on purpose: FileNotFoundError
+    # IS the "not installed" branch below, which a shutil.which() preflight would restate.
     try:
-        subprocess.run(["gh", "--version"], capture_output=True, check=True)
+        subprocess.run(["gh", "--version"], capture_output=True, check=True)  # noqa: S607
     except FileNotFoundError:
         logger.error("gh CLI not found. Install from https://cli.github.com/")
         sys.exit(1)
@@ -228,7 +230,7 @@ def main():
         logger.error("gh CLI is installed but returned an error. Check authentication with 'gh auth status'.")
         sys.exit(1)
 
-    runs = list_qualifying_runs(args.workflow, args.limit, args.status, args.since, args.repo)
+    runs = list_qualifying_runs(args.workflow, limit=args.limit, status=args.status, since=args.since, repo=args.repo)
     logger.info(f"Found {len(runs)} qualifying runs (status={args.status}, since={args.since})")
 
     if args.dry_run:

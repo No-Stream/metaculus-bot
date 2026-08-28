@@ -4,6 +4,7 @@ import os
 import sys
 from typing import Any
 
+import litellm.exceptions
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.constants import (
@@ -156,7 +157,7 @@ def get_donated_404_fallback_count() -> int:
 
 def reset_donated_404_fallback_count() -> None:
     """Reset the counter to zero. Used by tests; not for production code."""
-    global _donated_404_fallback_count
+    global _donated_404_fallback_count  # noqa: PLW0603  # module-global run counter is the design (AGENTS.md)
     _donated_404_fallback_count = 0
 
 
@@ -177,7 +178,7 @@ def get_generic_key_fallback_count() -> int:
 
 def reset_generic_key_fallback_count() -> None:
     """Reset the counter to zero. Used by tests; not for production code."""
-    global _generic_key_fallback_count
+    global _generic_key_fallback_count  # noqa: PLW0603  # module-global run counter is the design (AGENTS.md)
     _generic_key_fallback_count = 0
 
 
@@ -199,7 +200,7 @@ def get_credit_key_fallback_count() -> int:
 
 def reset_credit_key_fallback_count() -> None:
     """Reset the counter to zero. Used by tests; not for production code."""
-    global _credit_key_fallback_count
+    global _credit_key_fallback_count  # noqa: PLW0603  # module-global run counter is the design (AGENTS.md)
     _credit_key_fallback_count = 0
 
 
@@ -502,8 +503,6 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     # 429 rate-limit: BYOK quotas are per-key, so primary being throttled does
     # NOT imply secondary is also throttled. Fall back immediately — litellm
     # already exhausted its internal retry budget before raising.
-    import litellm.exceptions  # noqa: PLC0415  # function-scoped: avoids formatter stripping unused top-level import
-
     if isinstance(exc, litellm.exceptions.RateLimitError):
         return True
 
@@ -538,15 +537,13 @@ def should_retry_with_general_key(exc: Exception) -> bool:
         return True
     if _is_credit_failure(status, msg):
         return True
-    if any(cue in provider_text for cue in _ROUTE_SCOPED_TEXT_CUES):
-        return True
-
-    # Default: keep the key. What reaches here is everything a swap cannot help —
-    # moderation and permission refusals (both keys refuse the same prompt), 502/503
-    # upstream outages, and a plain missing-model 404. The explicit negative blocks this
+    # Route-scoped wording is the last positive signal. Everything it does not match
+    # keeps the key: what reaches here is everything a swap cannot help — moderation
+    # and permission refusals (both keys refuse the same prompt), 502/503 upstream
+    # outages, and a plain missing-model 404. The explicit negative blocks this
     # replaced were unreachable in the reported-status regime, because the 403 return
     # above and the positive branches had already claimed every status they named.
-    return False
+    return any(cue in provider_text for cue in _ROUTE_SCOPED_TEXT_CUES)
 
 
 def _is_donated_404(exc: Exception) -> bool:
@@ -655,13 +652,13 @@ async def record_donated_key_fallback(model: str, exc: Exception) -> None:
     # forecasters failing on one dry key — the exact 2026-07-26 shape — race the
     # increment, undercount the generic total, and take a degraded run GREEN. That is the
     # failure this whole change exists to prevent.
-    global _generic_key_fallback_count
+    global _generic_key_fallback_count  # noqa: PLW0603  # bytecode-atomic increment is load-bearing, see block comment
     _generic_key_fallback_count += 1
     if suppressible:
-        global _credit_key_fallback_count
+        global _credit_key_fallback_count  # noqa: PLW0603  # bytecode-atomic increment is load-bearing, see block comment
         _credit_key_fallback_count += 1
     if _is_donated_404(exc):
-        global _donated_404_fallback_count
+        global _donated_404_fallback_count  # noqa: PLW0603  # bytecode-atomic increment is load-bearing, see block comment
         _donated_404_fallback_count += 1
         logger.warning(
             "Donated OpenRouter key returned 404 'no allowed providers' for model=%s; "
@@ -722,8 +719,8 @@ class FallbackOpenRouterLlm(GeneralLlm):
                 # output; on cancellation the secondary is cancelled too. The
                 # primary's exception is intentionally discarded because the
                 # caller asked for a fallback, not a re-raise.
-                await record_donated_key_fallback(self.model, e)  # noqa: ASYNC120
-                return await self._invoke_once_using_secondary(prompt, system_prompt)  # noqa: ASYNC120
+                await record_donated_key_fallback(self.model, e)
+                return await self._invoke_once_using_secondary(prompt, system_prompt)
             raise
 
     async def _invoke_once_using_primary(self, prompt: Any, system_prompt: str | None = None) -> str:

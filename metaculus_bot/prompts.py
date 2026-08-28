@@ -1,6 +1,7 @@
+# HARNESS-SCAN-EXEMPT-monolithic-file-loc  # prompt-template registry; text length, not control flow — splitting fragments prompt review
 import json
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Literal
 
 from forecasting_tools import (
@@ -126,7 +127,7 @@ def _forecasting_window_str(
     # value raises TypeError. ``datetime.now(timezone.utc)`` also fixes 0.2.54's
     # latent naive-local-vs-naive-UTC skew (harmless only when the host runs UTC,
     # e.g. CI). The rendered dates are unchanged for current naive UTC inputs.
-    today = datetime.now(timezone.utc)
+    today = datetime.now(UTC)
     open_time = _as_utc(question.open_time)
     scheduled_resolution_time = _as_utc(question.scheduled_resolution_time)
     elapsed_days = (today - open_time).days
@@ -151,7 +152,7 @@ def _today_str() -> str:
     UTC so it agrees with ``_forecasting_window_str`` (which normalizes to UTC)
     within the same prompt bundle, regardless of host timezone.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
 def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:
@@ -186,7 +187,7 @@ def _option_probs_example(options: list[str]) -> str:
     if not options:
         return ""
     example_probs = _build_example_probs(len(options))
-    body = json.dumps(dict(zip(options, example_probs)))
+    body = json.dumps(dict(zip(options, example_probs, strict=True)))
     # ``body`` is ``{"opt1": p1, "opt2": p2, ...}`` — strip the outer braces
     # because the template supplies them (``"option_probs": {{{example}}}``).
     return body[1:-1]
@@ -545,8 +546,8 @@ def _strong_evidence_market_clause(
     )
 
 
-# Header the timeseries_anchor research provider emits (research/orchestrator.py
-# _provider_header). The numeric prompt gates its anchor clause on this substring
+# Header the timeseries_anchor research provider emits (research/section_format.py
+# PROVIDER_SECTION_HEADERS). The numeric prompt gates its anchor clause on this substring
 # so the guidance only appears when an anchor section is actually present.
 TS_ANCHOR_SECTION_HEADER = "## Time Series Anchor"
 
@@ -821,7 +822,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         • Options (in resolution order): {question.options}
 
-        
+
 
         ── Context ───────────────────────────────────────────────────────────
         {question.background_info}
@@ -984,7 +985,7 @@ def numeric_prompt(
         • If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes or scientific notation, just numbers.
 
         ── Scoring Rule ──
-        Metaculus continuous questions use a log density score: score = ln f(x*), where f is your forecasted PDF evaluated at the realized value x*. A uniform 0.01 floor is added to every PDF to avoid −∞; excluding the truth yields ln(0.01) ≈ -4.605, while sharp accuracy is rewarded (e.g., f(x*) = 10 → +2.303). Probability mass below/above the bounds is scored as a binary event;  PDF sharpness is capped (about 0.01 ≤ f ≤ ~35), so spiky tricks don't pay. This is a proper scoring rule—to maximize expected score, report your true uncertainty and resist overconfident, narrow shapes.
+        Metaculus continuous questions use a log density score: score = ln f(x*), where f is your forecasted PDF evaluated at the realized value x*. A uniform 0.01 floor is added to every PDF to avoid -∞; excluding the truth yields ln(0.01) ≈ -4.605, while sharp accuracy is rewarded (e.g., f(x*) = 10 → +2.303). Probability mass below/above the bounds is scored as a binary event;  PDF sharpness is capped (about 0.01 ≤ f ≤ ~35), so spiky tricks don't pay. This is a proper scoring rule—to maximize expected score, report your true uncertainty and resist overconfident, narrow shapes.
 
         ── Intelligence Briefing (assistant research) ────────────────────────
         {research}
@@ -1117,7 +1118,7 @@ def numeric_prompt(
           "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
 
         The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
-        """
+        """  # noqa: S608  # not SQL: the prompt prose "INSIDE VIEW UPDATE (update from your base rate)" trips the heuristic
     )
 
 
@@ -1319,6 +1320,7 @@ def stacking_numeric_prompt(
     question: NumericQuestion,
     research: str,
     base_predictions: list[str],
+    *,
     lower_bound_message: str,
     upper_bound_message: str,
     aggregated_tool_output: str | None = None,
@@ -1339,15 +1341,15 @@ def stacking_numeric_prompt(
         {aggregation_section}
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
-        
+
         ── Context ───────────────────────────────────────────────────────────
         {question.background_info}
-        
+
         {question.resolution_criteria}
         {question.fine_print}
-        
+
         Units: {question.unit_of_measure or "Not stated: infer if possible"}
-        
+
         ── Units & Bounds ─────────────────────────────────────
         • Base unit for output values: {question.unit_of_measure or "base unit"}
         • Displayed range (base units): [{nom_lower}, {nom_upper}]
@@ -1357,8 +1359,8 @@ def stacking_numeric_prompt(
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 
         ── Scoring Rule ──
-        Metaculus continuous questions use a log density score: score = ln f(x*), where f is your forecasted PDF evaluated at the realized value x*. A uniform 0.01 floor is added to every PDF to avoid −∞; excluding the truth yields ln(0.01) ≈ -4.605, while sharp accuracy is rewarded (e.g., f(x*) = 10 → +2.303). Probability mass below/above the bounds is scored as a binary event;  PDF sharpness is capped (about 0.01 ≤ f ≤ ~35), so spiky tricks don't pay. This is a proper scoring rule—to maximize expected score, report your true uncertainty and resist overconfident, narrow shapes.
-        
+        Metaculus continuous questions use a log density score: score = ln f(x*), where f is your forecasted PDF evaluated at the realized value x*. A uniform 0.01 floor is added to every PDF to avoid -∞; excluding the truth yields ln(0.01) ≈ -4.605, while sharp accuracy is rewarded (e.g., f(x*) = 10 → +2.303). Probability mass below/above the bounds is scored as a binary event;  PDF sharpness is capped (about 0.01 ≤ f ≤ ~35), so spiky tricks don't pay. This is a proper scoring rule—to maximize expected score, report your true uncertainty and resist overconfident, narrow shapes.
+
         ── Intelligence Briefing ────────────────────────────────
         {research}
 
@@ -1537,7 +1539,7 @@ def gap_fill_analyzer_prompt(
         7. Missing expert opinion — first pass asserts a claim that should have a
            named expert or institution behind it but does not cite one.
         8. Stale first-pass info — first pass appears drawn from training data rather
-           than current search (e.g., no {datetime.now().year} data on a near-term question).
+           than current search (e.g., no {datetime.now(UTC).year} data on a near-term question).
         9. Missing counter-evidence — first pass is one-sided; a "consider the
            opposite" search would strengthen the forecast.
 

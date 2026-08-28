@@ -75,7 +75,7 @@ def predictit_contract_names(market: dict[str, Any]) -> str:
         return ""
     names = [
         str(contract.get("name") or "")
-        for contract in contracts[:PREDICTIT_CONTRACTS_RENDERED]  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        for contract in contracts[:PREDICTIT_CONTRACTS_RENDERED]  # HARNESS-SCAN-EXEMPT-subsampling
         if isinstance(contract, dict)
     ]
     return ", ".join(name for name in names if name)

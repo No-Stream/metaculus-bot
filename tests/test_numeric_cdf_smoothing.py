@@ -5,6 +5,7 @@ Tests for numeric CDF smoothing:
 """
 
 from datetime import datetime, timedelta
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -91,7 +92,7 @@ class TestNumericCDFSmoothing:
 
         vals = [p.value for p in adjusted]
         # Strictly increasing
-        assert all(b > a for a, b in zip(vals, vals[1:])), vals
+        assert all(b > a for a, b in pairwise(vals)), vals
         # Warn about cluster spread
         assert any("Cluster spread applied" in rec.message for rec in caplog.records)
 
@@ -117,9 +118,9 @@ class TestNumericCDFSmoothing:
 
         vals = [p.value for p in adjusted]
         # Strictly increasing after adjustment
-        assert all(b > a for a, b in zip(vals, vals[1:])), vals
+        assert all(b > a for a, b in pairwise(vals)), vals
         # Differences within clusters should be at least ~1.0 in count-like case (allow some tolerance)
-        diffs = [b - a for a, b in zip(vals, vals[1:])]
+        diffs = [b - a for a, b in pairwise(vals)]
         assert any(d >= 0.5 for d in diffs), diffs
         assert any("Cluster spread applied" in rec.message for rec in caplog.records)
 
@@ -143,7 +144,7 @@ class TestNumericCDFSmoothing:
         adjusted = apply_jitter_and_clamp(raw, cast(NumericQuestion, q))
         vals = [p.value for p in adjusted]
         assert all(q.lower_bound <= v <= q.upper_bound for v in vals)
-        assert all(b > a for a, b in zip(vals, vals[1:])), vals
+        assert all(b > a for a, b in pairwise(vals)), vals
         # Should log both correction and cluster spread
         msgs = [rec.message for rec in caplog.records]
         assert any("Corrected numeric distribution" in m for m in msgs)

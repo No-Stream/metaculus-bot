@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 from playwright.async_api import Error as _PlaywrightError
 
@@ -21,7 +22,7 @@ class _FakeResponse:
         self.status = status
         self.headers = headers or {}
 
-    async def __aenter__(self) -> "_FakeResponse":
+    async def __aenter__(self) -> _FakeResponse:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -39,7 +40,7 @@ class _FakeSession:
         self._responses = list(responses)
         self.calls: list[tuple[str, bool]] = []
 
-    async def __aenter__(self) -> "_FakeSession":
+    async def __aenter__(self) -> _FakeSession:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -152,7 +153,7 @@ async def test_search_web_retries_then_success(monkeypatch: pytest.MonkeyPatch) 
     )
     sleeps: list[float] = []
 
-    monkeypatch.setattr("asyncio.sleep", AsyncMock(side_effect=lambda delay: sleeps.append(delay)))
+    monkeypatch.setattr("asyncio.sleep", AsyncMock(side_effect=sleeps.append))
     _patch_async_exa(monkeypatch, searcher)
 
     outcome = await agentic_tools.search_web("query")
@@ -237,7 +238,7 @@ async def test_search_news_happy_path_uses_gate_and_semaphore(monkeypatch: pytes
             return None
 
     class FakeSdk:
-        async def __aenter__(self) -> "FakeSdk":
+        async def __aenter__(self) -> FakeSdk:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -278,7 +279,7 @@ class _FakeAskNewsSdk:
     def __init__(self, search_news_mock: AsyncMock) -> None:
         self.news = SimpleNamespace(search_news=search_news_mock)
 
-    async def __aenter__(self) -> "_FakeAskNewsSdk":
+    async def __aenter__(self) -> _FakeAskNewsSdk:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -579,7 +580,8 @@ async def test_fetch_plain_textual_branch_strips_allowlisted_markup(monkeypatch:
 
     assert result.status == "ok"
     assert "Emerson College" in result.text
-    assert "<a " not in result.text and "style=" not in result.text
+    assert "<a " not in result.text
+    assert "style=" not in result.text
     assert "a < 5 and b > 3" in result.text
 
 
@@ -735,7 +737,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def content(self) -> str:
@@ -768,7 +770,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             # Runs strictly after _try_rendered_fetch acquires the host gate.
             events.append("rendered_started")
             return self
@@ -779,7 +781,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     plain_task = asyncio.create_task(agentic_tools._fetch_plain("https://example.com/plain-page"))
@@ -797,7 +799,8 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     rendered_result = await rendered_task
 
     assert plain_result.status == "ok"
-    assert rendered_result is not None and rendered_result.method == "rendered"
+    assert rendered_result is not None
+    assert rendered_result.method == "rendered"
     assert events.index("plain_read_finished") < events.index("rendered_started")
 
 
@@ -850,7 +853,7 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
             self.aborted = code
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def content(self) -> str:
@@ -883,7 +886,7 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -892,11 +895,12 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     result = await agentic_tools._try_rendered_fetch("https://example.com/page")
-    assert result is not None and result.method == "rendered"
+    assert result is not None
+    assert result.method == "rendered"
 
     # Teardown drained the handlers before close (Playwright's remedy for the storm).
     assert captured["unroute_behavior"] == "ignoreErrors"
@@ -1047,6 +1051,108 @@ async def test_fetch_plain_refuses_an_undecodable_textual_body(monkeypatch: pyte
     assert result.status == "empty"
     assert result.escalate_rendered is True
     assert "could not decode" in result.text
+
+
+class TestFetchPlainTerminalStatuses:
+    """Behavior pins for the non-content exit paths of the plain rung.
+
+    Each branch here decides whether the ladder escalates, retries, or hands the
+    driver a refusal, and each was previously only covered transitively through
+    ``fetch``. They are pinned directly so the status/method/text triple a
+    caller keys on cannot drift.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", sorted(agentic_tools._RETRYABLE_FETCH_BLOCK_STATUSES))
+    async def test_anti_bot_status_is_blocked(self, status: int, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=status, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/gated")
+
+        assert result.status == "blocked"
+        assert result.method == "plain"
+        assert result.text == f"Fetch blocked with HTTP {status}."
+        assert result.url == "https://example.com/gated"
+
+    @pytest.mark.asyncio
+    async def test_server_error_status_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=503, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/down")
+
+        assert result.status == "error"
+        assert result.text == "Fetch failed with HTTP 503."
+
+    @pytest.mark.asyncio
+    async def test_pdf_content_type_asks_for_read_document(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/report.pdf")
+
+        assert result.status == "ok"
+        assert result.method == "document_needed"
+        assert "read_document" in result.text
+
+    @pytest.mark.asyncio
+    async def test_pdf_magic_bytes_behind_html_content_type_ask_for_read_document(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A mislabeled body is classified off its bytes, not its Content-Type."""
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"%PDF-1.7\nbinary"))
+
+        result = await agentic_tools._fetch_plain("https://example.com/mislabeled")
+
+        assert result.method == "document_needed"
+
+    @pytest.mark.asyncio
+    async def test_oversized_body_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=None))
+
+        result = await agentic_tools._fetch_plain("https://example.com/huge")
+
+        assert result.status == "error"
+        assert result.text == "Fetch body exceeded the size limit."
+
+    @pytest.mark.asyncio
+    async def test_unsupported_content_type_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/zip"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"PK\x03\x04payload"))
+
+        result = await agentic_tools._fetch_plain("https://example.com/bundle.zip")
+
+        assert result.status == "error"
+        assert result.text == "Unsupported content type: application/zip"
+        assert result.content_type == "application/zip"
+
+    @pytest.mark.asyncio
+    async def test_transport_error_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _RaisingSession(_FakeSession):
+            def get(self, url: str, *, allow_redirects: bool = False):  # type: ignore[override]
+                self.calls.append((url, allow_redirects))
+                raise aiohttp.ClientConnectorError(MagicMock(), OSError("refused"))
+
+        session = _RaisingSession(_FakeResponse(status=200))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/unreachable")
+
+        assert result.status == "error"
+        assert result.text.startswith("Fetch error: ClientConnectorError")
 
 
 @pytest.mark.asyncio
@@ -1261,7 +1367,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
             return None
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             assert url == "https://example.com/page"
             assert wait_until == "networkidle"
             assert timeout == 35_000
@@ -1302,7 +1408,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1321,7 +1427,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
@@ -1352,7 +1458,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     at_cap = asyncio.Event()
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def content(self) -> str:
@@ -1394,7 +1500,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1412,7 +1518,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     tasks = [
@@ -1459,7 +1565,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     guard_holder: list = []
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             # Drive the guard the way Chromium would: the public main-frame
             # request continues; the page's client-side redirect to the
             # private host is aborted.
@@ -1500,7 +1606,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1522,7 +1628,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
@@ -1648,7 +1754,7 @@ async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: p
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1659,7 +1765,7 @@ async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: p
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://rebind.example.com/page")
@@ -1675,7 +1781,7 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     launch_args: list[list[str] | None] = []
 
     class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def content(self) -> str:
@@ -1709,7 +1815,7 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     class FakePlaywrightManager:
         chromium = FakeChromium()
 
-        async def __aenter__(self) -> "FakePlaywrightManager":
+        async def __aenter__(self) -> FakePlaywrightManager:
             return self
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1724,12 +1830,13 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     monkeypatch.setitem(
         sys.modules,
         "playwright.async_api",
-        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
-    assert outcome is not None and outcome.method == "rendered"
+    assert outcome is not None
+    assert outcome.method == "rendered"
     assert len(launch_args) == 1
     assert launch_args[0] == ["--host-resolver-rules=MAP example.com 93.184.216.34"]
 

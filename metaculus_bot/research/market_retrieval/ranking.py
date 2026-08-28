@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Sequence
+from typing import Any
 
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _liquidity_label
 from metaculus_bot.structured_output_schema import extract_json_block
@@ -53,7 +54,7 @@ TIER_UNSPECIFIED = "unspecified"
 # and 4 are things a forecaster reasons FROM, not the quantity itself. Sliced out of TIERS
 # instead of respelled so the vocabulary cannot drift between the two; the legend's "only the
 # first two measure the quantity asked about" states the same fact to the forecaster.
-STRONG_TIERS: frozenset[str] = frozenset(TIERS[:2])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+STRONG_TIERS: frozenset[str] = frozenset(TIERS[:2])  # HARNESS-SCAN-EXEMPT-subsampling
 
 # Per-row phrase cap. The label is one glanceable phrase a forecaster prompt can weight, not
 # a second rationale.
@@ -227,7 +228,7 @@ class RankingShapeRegression(RankingUnusable):
 def _settlement_sources_text(match: MarketMatch) -> str:
     names = [
         (source.name or source.url).strip()
-        for source in match.settlement_sources[:SETTLEMENT_SOURCES_RENDERED]  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        for source in match.settlement_sources[:SETTLEMENT_SOURCES_RENDERED]  # HARNESS-SCAN-EXEMPT-subsampling
     ]
     return "; ".join(name[:SETTLEMENT_SOURCE_CHARS] for name in names if name)
 
@@ -403,8 +404,12 @@ def _first_usable_array(text: str) -> list[Any]:
     if saw_empty_array:
         return []
     if saw_array:
-        raise RankingUnusable(f"no array of ranking objects in {text[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
-    raise RankingUnusable(f"no JSON array found in {text[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
+        raise RankingUnusable(
+            f"no array of ranking objects in {text[:160]!r}"
+        )  # HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
+    raise RankingUnusable(
+        f"no JSON array found in {text[:160]!r}"
+    )  # HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
 
 
 def parse_ranking(text: str, pool_size: int) -> list[Pick]:
@@ -473,7 +478,7 @@ def parse_ranking(text: str, pool_size: int) -> list[Pick]:
         # output. The message carries the diagnosis because only this frame sees `parsed`.
         raise RankingShapeRegression(
             f"{len(parsed)} entries yielded no usable pick (renamed index key, or every index "
-            f"outside a pool of {pool_size}); first={repr(parsed[0])[:160]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
+            f"outside a pool of {pool_size}); first={repr(parsed[0])[:160]}"  # HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
         )
     return picks[:RENDER_BUDGET]
 

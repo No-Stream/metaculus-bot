@@ -17,6 +17,22 @@ argparse-driven entry point. The behavioral spec lives in
 
 Module-level imports are deliberate: tests monkeypatch the wave-1/2/3 entry
 points at ``metaculus_bot.ablation.cli.<name>``. Keep the imports below stable.
+
+That patch surface is what fixes this module's boundary. A monkeypatch of
+``metaculus_bot.ablation.cli.screen_batch`` only reaches a call site in *this*
+module, so every stage that invokes one of those entry points stays here, alongside
+``run_ablation``, the per-stage narration, and the argparse entry point. The stages
+that call nothing patchable, and every supporting layer, live next door:
+
+* ``ablation.cli_args`` — argparse, the stage token list + force cascade, the
+  rate-limit dial, and the ``_StagePlan`` / ``_ArmStage`` plan types.
+* ``ablation.manifest_serde`` — qids-manifest serde and question rehydration.
+* ``ablation.run_state`` — ``WorkingSet`` / ``SpendReport``, their cache hydration,
+  the cached-vs-fresh partition helpers, and the ``--qids`` filters.
+* ``ablation.reporting`` — the end-of-run spend block and the ``--qa-research`` dump.
+* ``ablation.deterministic_arms`` — the mean / median / PDF arms (no LLM calls).
+* ``ablation.score_stage`` — arm label sets, report shims, paired scoring, artifacts.
+* ``ablation.stacker_selection`` — which stacker model and cache slug a run uses.
 """
 
 from __future__ import annotations
@@ -26,41 +42,39 @@ import asyncio
 import json
 import logging
 import sys
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
-
-from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
-from forecasting_tools.data_models.binary_report import BinaryReport
-from forecasting_tools.data_models.multiple_choice_report import MultipleChoiceReport
-from forecasting_tools.data_models.numeric_report import NumericReport
-from forecasting_tools.data_models.questions import OutOfBoundsResolution
 
 from metaculus_bot.ablation.cache import AblationCache, atomic_write_text, model_slug_to_filename
-from metaculus_bot.ablation.forecaster_lineup import FREE_FORECASTER_MODELS, FREE_PARSER_MODEL
-from metaculus_bot.ablation.forecasters import (
-    deserialize_prediction_value,
-    run_forecasters_batch,
+from metaculus_bot.ablation.cli_args import (
+    _ARM_STAGES,
+    DEFAULT_CACHE_DIR,
+    DEFAULT_TOURNAMENTS,
+    STAGES,  # noqa: F401  # re-export: tests read the stage vocabulary off this module
+    _build_parser,
+    _expand_forced_stages,
+    _rate_limit_mode_kwargs,
+    _StagePlan,
 )
-from metaculus_bot.ablation.leakage_screen import (
-    _EMPTY_BLOB_RESPONSE,
-    DEFAULT_DETECTOR_MODEL,
-    _research_blob_sha,
-    screen_batch,
+from metaculus_bot.ablation.deterministic_arms import _stage_pdf, _stage_simple_agg
+
+# ``get_lineup`` was function-scoped in ``_stage_forecast`` so a partial edit couldn't leave
+# the formatter stripping it as unused. Top-level is safe: this module already imports
+# ``forecaster_lineup``, and nothing patches ``get_lineup`` at its own module, so the
+# binding cannot go stale under a monkeypatch.
+from metaculus_bot.ablation.forecaster_lineup import FREE_FORECASTER_MODELS, get_lineup
+from metaculus_bot.ablation.forecasters import run_forecasters_batch
+from metaculus_bot.ablation.leakage_screen import _EMPTY_BLOB_RESPONSE, screen_batch
+from metaculus_bot.ablation.manifest_serde import (
+    _build_manifest_entry,
+    _build_question_shim_from_manifest_entry,
+    _deserialize_ground_truth,
+    _serialize_ground_truth,  # noqa: F401  # re-export: manifest-schema tests import it from here
+    _serialize_question_metadata,  # noqa: F401  # re-export: manifest-schema tests import it from here
 )
 from metaculus_bot.ablation.prune import DEFAULT_BATCH_SIZE as PRUNE_DEFAULT_BATCH_SIZE
 from metaculus_bot.ablation.prune import run_prune_for_qids
-from metaculus_bot.ablation.qa_iterate import (
-    DEFAULT_FORECASTABILITY_THRESHOLD as QA_ITERATE_DEFAULT_FORECASTABILITY_THRESHOLD,
-)
-from metaculus_bot.ablation.qa_iterate import (
-    DEFAULT_LEAKAGE_THRESHOLD as QA_ITERATE_DEFAULT_LEAKAGE_THRESHOLD,
-)
-from metaculus_bot.ablation.qa_iterate import (
-    DEFAULT_MAX_ITERATIONS as QA_ITERATE_DEFAULT_MAX_ITERATIONS,
-)
 from metaculus_bot.ablation.qa_iterate import (
     IterateOutcome,
     read_manual_rejects,
@@ -69,33 +83,31 @@ from metaculus_bot.ablation.qa_iterate import (
     serialize_outcome,
     write_manual_rejects,
 )
+from metaculus_bot.ablation.reporting import _print_spend_report, _stage_qa_research_dump
 from metaculus_bot.ablation.research import run_gemini_research_for_qids
-from metaculus_bot.ablation.run_pdf import (  # noqa: E402
-    ARM_PDF_MIN1,
-    ARM_PDF_MIN2,
-    run_pdf_for_qid,
-)
-
-# Symbols used in _stage_stack for the mean arm and pdf mean variant.
-# Function-scoped imports would survive formatter stripping, but these are
-# used in multiple places across the orchestrator so top-level is cleaner.
-from metaculus_bot.ablation.run_simple_agg import run_mean_for_qid, run_median_for_qid
 from metaculus_bot.ablation.run_stacker import (
     ABLATION_MIN_FORECASTERS,
     ARM_MEAN,
     ARM_MEDIAN,
     ARM_PDF,
-    ARM_STACK,
-    ARM_STACK_AUG,
     run_stacker_batch,
 )
-from metaculus_bot.ablation.scoring import (
-    PairedScore,
-    aggregate_paired,
-    score_arm_for_qid,
+from metaculus_bot.ablation.run_state import (
+    SpendReport,
+    WorkingSet,
+    _apply_qids_filter,
+    _hydrate_working_set_from_cache,
+    _partition_screen_cache,
+    _partition_stacker_cache,
+    _qids_with_any_arm_payload,
+    _record_stacker_spend,
 )
-from metaculus_bot.ablation.scoring_report import render_summary_markdown
-from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose  # noqa: F401
+from metaculus_bot.ablation.score_stage import (
+    _build_report_shim,  # noqa: F401  # re-export: report-shim tests import it from here
+    _stage_score,
+)
+from metaculus_bot.ablation.stacker_selection import _active_stacker_slug, _stacker_batch_kwargs
+from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.backtest.question_prep import (
     BacktestQuestionSet,
@@ -104,626 +116,6 @@ from metaculus_bot.backtest.question_prep import (
 from metaculus_bot.backtest.scoring import GroundTruth
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-STAGES: list[str] = [
-    "fetch",
-    "research",
-    "prune",
-    "screen",
-    "qa_iterate",
-    "forecast",
-    "stack",
-    "stack_aug",
-    "pdf",
-    "median",
-    "mean",
-    "score",
-]
-DEFAULT_TOURNAMENTS: list[str] = ["spring-aib-2026"]
-DEFAULT_RESOLVED_AFTER: str = "2026-01-01"
-DEFAULT_CACHE_DIR: str = "backtests/ablation"
-
-# Static cascade map: forcing a stage on the left invalidates the caches of
-# every stage on the right (transitive closure already pre-computed). Without
-# this, --force-stages forecast leaves stale stacker payloads on disk derived
-# from the OLD forecaster outputs, and the next score run quietly compares
-# fresh-vs-stale arms. See cli_audit_20260515.md (C1) for the operator footgun.
-_FORCE_CASCADES: dict[str, set[str]] = {
-    "fetch": set(),
-    "research": {"prune", "screen", "qa_iterate", "forecast", "stack", "stack_aug", "pdf", "median", "mean"},
-    "prune": {"screen", "qa_iterate", "forecast", "stack", "stack_aug", "pdf", "median", "mean"},
-    "screen": {"qa_iterate"},
-    "qa_iterate": set(),
-    "forecast": {"stack", "stack_aug", "pdf", "median", "mean"},
-    "stack": set(),
-    "stack_aug": set(),
-    "pdf": set(),
-    "median": set(),
-    "mean": set(),
-    "score": set(),
-}
-
-
-def _expand_forced_stages(forced: set[str]) -> set[str]:
-    """Apply the static cascade map to ``forced`` and return the expansion."""
-    expanded = set(forced)
-    for stage in forced:
-        expanded.update(_FORCE_CASCADES.get(stage, set()))
-    return expanded
-
-
-# ---------------------------------------------------------------------------
-# Spend tracking
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class SpendReport:
-    """Tracks API-call counts and cache hits across a single CLI run.
-
-    Counters are populated by each stage by snapshotting cache state before the
-    stage runs and diffing against post-stage cache state. The orchestrator
-    (``run_ablation``) constructs one ``SpendReport`` per CLI run and threads
-    it through every stage; ``_print_spend_report`` renders it at the end.
-    """
-
-    gemini_research_calls: int = 0
-    gemini_gap_fill_calls: int = 0
-    leakage_detector_calls: int = 0
-    forecaster_llm_calls: int = 0
-    stacker_llm_calls_stack: int = 0
-    stacker_llm_calls_stack_aug: int = 0
-    parser_llm_calls: int = 0
-    redactor_invocations: int = 0
-    cached_research_hits: int = 0
-    cached_prune_hits: int = 0
-    cached_screen_hits: int = 0
-    cached_forecaster_hits: int = 0
-    cached_stacker_hits: dict[str, int] = field(default_factory=dict)
-    fallback_stacker_stack: int = 0
-    fallback_stacker_stack_aug: int = 0
-    prune_validation_failures: int = 0
-
-
-# ---------------------------------------------------------------------------
-# Argparse
-# ---------------------------------------------------------------------------
-
-
-# Rate-limit dial mapping. Each preset trades off wall-clock speed vs. tolerance
-# for upstream-provider 429s. ``fast`` is the historical behavior; ``gentle`` is
-# the new default and pairs lower per-forecaster parallelism with a longer retry
-# budget so a single 429 wave doesn't shed forecasters from the lineup. ``slow``
-# serializes per-forecaster runs entirely — useful on medium runs where wall-
-# clock matters less than completing every cell. ``patient`` keeps ``slow``'s
-# concurrency=1 but bumps the retry budget to 8 — "slow but persistent" for
-# free-tier providers (qwen, minimax, gemma-4-26b) that frequently shed
-# forecasters under tight retry budgets even though successive attempts often
-# succeed.
-_RATE_LIMIT_MODES: tuple[str, ...] = ("fast", "gentle", "slow", "patient")
-_RATE_LIMIT_MODE_TO_KWARGS: dict[str, dict[str, int]] = {
-    "fast": {"per_forecaster_concurrency": 4, "max_retries": 1},
-    "gentle": {"per_forecaster_concurrency": 2, "max_retries": 3},
-    "slow": {"per_forecaster_concurrency": 1, "max_retries": 5},
-    "patient": {"per_forecaster_concurrency": 1, "max_retries": 8},
-}
-
-
-def _rate_limit_mode_kwargs(mode: str) -> dict[str, int]:
-    """Return the (per_forecaster_concurrency, max_retries) kwargs for a mode."""
-    return dict(_RATE_LIMIT_MODE_TO_KWARGS[mode])
-
-
-def _parse_csv_ints(raw: str) -> list[int]:
-    return [int(x.strip()) for x in raw.split(",") if x.strip()]
-
-
-def _parse_csv_strings(raw: str) -> list[str]:
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-def _parse_stages_arg(raw: str) -> list[str]:
-    parsed = _parse_csv_strings(raw)
-    invalid = [s for s in parsed if s not in STAGES]
-    if invalid:
-        raise argparse.ArgumentTypeError(f"invalid stage(s): {invalid}; valid stages: {STAGES}")
-    return parsed
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="ablation",
-        description="Probabilistic-tools ablation benchmark — A/B test of PROBABILISTIC_TOOLS_ENABLED.",
-    )
-    parser.add_argument("--num-binary", type=int, default=0, help="Target binary question count.")
-    parser.add_argument("--num-multiple-choice", type=int, default=0, help="Target MC question count.")
-    parser.add_argument("--num-numeric", type=int, default=0, help="Target numeric question count.")
-    parser.add_argument(
-        "--qids",
-        type=_parse_csv_ints,
-        default=None,
-        help=(
-            "Comma-separated explicit qid list; bypasses fetching. When combined with "
-            "--stages subsets that omit fetch, the working set is filtered to these qids "
-            "after manifest hydration so downstream stages run only over the requested qids."
-        ),
-    )
-    parser.add_argument(
-        "--tournaments",
-        type=_parse_csv_strings,
-        default=DEFAULT_TOURNAMENTS,
-        help="Comma-separated tournament slugs; default: spring-aib-2026.",
-    )
-    parser.add_argument(
-        "--resolved-after",
-        type=str,
-        default=DEFAULT_RESOLVED_AFTER,
-        help="ISO date YYYY-MM-DD; lower bound on actual_resolution_time.",
-    )
-    parser.add_argument(
-        "--resolved-before",
-        type=str,
-        default=None,
-        help="ISO date YYYY-MM-DD; optional upper bound on actual_resolution_time.",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        type=str,
-        default=DEFAULT_CACHE_DIR,
-        help=f"Disk cache root; default: {DEFAULT_CACHE_DIR}.",
-    )
-    parser.add_argument(
-        "--stages",
-        type=_parse_stages_arg,
-        default=list(STAGES),
-        help=f"Comma-separated subset of {STAGES}; default: all stages.",
-    )
-    parser.add_argument(
-        "--qa-research",
-        action="store_true",
-        help="Halt after the screen stage; dump first 5 qids' research+verdict to a QA markdown file.",
-    )
-    parser.add_argument(
-        "--force-stages",
-        type=_parse_stages_arg,
-        default=[],
-        help=(
-            "Comma-separated stages to re-run (bypass cache reads). Other stages still read cache. "
-            "Forcing a stage AUTO-CASCADES to every downstream stage whose inputs change: "
-            "research → prune,screen,qa_iterate,forecast,stack,stack_aug,pdf,median; "
-            "prune → screen,qa_iterate,forecast,stack,stack_aug,pdf,median; "
-            "screen → qa_iterate; forecast → stack,pdf. "
-            "Without the cascade, downstream caches would silently serve stale outputs "
-            "derived from the prior upstream artifact."
-        ),
-    )
-    parser.add_argument(
-        "--per-question-sleep",
-        type=int,
-        default=30,
-        help=(
-            "Seconds to sleep BETWEEN STAGES, AFTER each API-firing stage "
-            "(research, prune, screen, qa_iterate, forecast, stack, pdf). "
-            "Total pause for a full pipeline = 7 × value. Despite the name this is "
-            "per-stage, not per-question: a 30-question run with --per-question-sleep=30 "
-            "pauses ~210s total (7 stages × 30s), not 900s. Set to 0 to disable. "
-            "Increase to back off OpenRouter rate limits. "
-            "TODO: real per-question pacing would require restructuring run_forecasters_batch's "
-            "asyncio.gather into a serial loop (or a per-question post-release sleep); "
-            "documented but deliberately not shipped here."
-        ),
-    )
-    parser.add_argument(
-        "--gap-fill-max-gaps",
-        type=int,
-        default=3,
-        help="Maximum number of gap-fill searches per question; default: 3 (no-op when --no-gap-fill is set).",
-    )
-    parser.add_argument(
-        "--gemini-model",
-        type=str,
-        default="gemini-2.5-flash",
-        help=(
-            "Gemini model for research grounded search. Default: gemini-2.5-flash "
-            "(fully free at our scale per Google AI Studio rate limits). "
-            "Production tournament uses gemini-3-flash-preview which requires Tier 1 billing. "
-            "Canonical: this flag overrides any GEMINI_SEARCH_MODEL shell env var for the run."
-        ),
-    )
-    gap_fill_group = parser.add_mutually_exclusive_group()
-    gap_fill_group.add_argument(
-        "--gap-fill",
-        dest="gap_fill",
-        action="store_true",
-        help=(
-            "Enable second-pass gap-fill grounded search. Off by default for the ablation; "
-            "gap-fill amplifies leakage on resolved questions because the analyzer hunts for "
-            "'factual gaps' which reliably surface resolution-revealing sentences."
-        ),
-    )
-    gap_fill_group.add_argument(
-        "--no-gap-fill",
-        dest="gap_fill",
-        action="store_false",
-        help="Disable second-pass gap-fill (default). The benchmark deliberately uses single-pass Gemini.",
-    )
-    parser.set_defaults(gap_fill=False)
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=4,
-        help="Global ceiling for OpenRouter parallelism; default: 4.",
-    )
-    # Default is ``patient`` (concurrency=1, max_retries=8) as of 2026-05-14
-    # (Phase A.3 Package 3a). At 50q × 5 forecasters = 250 calls per arm,
-    # ``gentle`` (concurrency=2, max_retries=3) was thrashing free-tier
-    # per-minute throttles (qwen / minimax / gemma-4-26b) and bleeding
-    # forecasters off the lineup — `patient`'s extra retry budget rides out
-    # the 429 storms at the cost of wall-clock. Operators with a smoke
-    # workload (≤4q) can opt back into ``gentle`` or ``fast``.
-    parser.add_argument(
-        "--rate-limit-mode",
-        type=str,
-        choices=list(_RATE_LIMIT_MODES),
-        default="patient",
-        help=(
-            "Rate-limit dial. Maps to (per_forecaster_concurrency, max_retries) tuples: "
-            "'fast' (4, 1) — historical behavior, lowest wall-clock; "
-            "'gentle' (2, 3) — tolerates a single 429 wave per forecaster; "
-            "'slow' (1, 5) — full serialization, for medium runs where wall-clock is secondary; "
-            "'patient' (1, 8) — current default: slow but persistent, more retry "
-            "budget to ride out free-tier 429 storms (qwen / minimax / gemma-4-26b) "
-            "at 50q+ scale."
-        ),
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Seed for reproducible bootstrap CIs in scoring; default: 0.",
-    )
-    parser.add_argument(
-        "--qa-iterate-mode",
-        type=str,
-        choices=["halt", "advisory", "skip"],
-        default="halt",
-        help=(
-            "Mode for the qa_iterate stage. 'halt' (default) writes the QA summary then raises "
-            "RuntimeError so the operator can review manual_rejects.json before forecast spend. "
-            "'advisory' writes the summary but proceeds to forecast. 'skip' bypasses the stage entirely."
-        ),
-    )
-    parser.add_argument(
-        "--qa-iterate-max-iterations",
-        type=int,
-        default=QA_ITERATE_DEFAULT_MAX_ITERATIONS,
-        help=f"Max iterations per qid in qa_iterate; default: {QA_ITERATE_DEFAULT_MAX_ITERATIONS}.",
-    )
-    parser.add_argument(
-        "--qa-iterate-leakage-threshold",
-        type=float,
-        default=QA_ITERATE_DEFAULT_LEAKAGE_THRESHOLD,
-        help=(f"Verifier leakage_risk threshold for accepting a qid; default: {QA_ITERATE_DEFAULT_LEAKAGE_THRESHOLD}."),
-    )
-    parser.add_argument(
-        "--qa-iterate-forecastability-threshold",
-        type=float,
-        default=QA_ITERATE_DEFAULT_FORECASTABILITY_THRESHOLD,
-        help=(
-            "Verifier forecastability threshold below which a clean blob is rejected as "
-            f"too thin to forecast from; default: {QA_ITERATE_DEFAULT_FORECASTABILITY_THRESHOLD}. "
-            "At 50q+ the modal smoke-run forecastability sits near 0.18 — operators can "
-            "tighten to 0.25 or relax to 0.15 after seeing the iteration distribution."
-        ),
-    )
-    parser.add_argument(
-        "--prune-batch-size",
-        type=int,
-        default=PRUNE_DEFAULT_BATCH_SIZE,
-        help=(
-            f"Redactor batch size; default: {PRUNE_DEFAULT_BATCH_SIZE}. Lower = smaller "
-            "blast radius on flaky runs (each subprocess failure drops at most batch_size "
-            "qids before per-qid recovery kicks in)."
-        ),
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help=(
-            "Logging level for stage transitions and per-qid verdicts. Default INFO. "
-            "Set DEBUG for subprocess invocations and raw API responses. "
-            "Logs are tee'd to stderr and to <cache-dir>/logs/run_<timestamp>.log."
-        ),
-    )
-    parser.add_argument(
-        "--lineup",
-        type=str,
-        choices=["free", "prod"],
-        default="free",
-        help=(
-            "Forecaster ensemble: 'free' for the 4-model free-tier ablation (default), "
-            "'prod' for the 3-model paid ensemble (claude-opus-4.6, claude-opus-4.8, "
-            "gpt-5.6-sol, all at medium reasoning effort). The 'prod' lineup also selects "
-            "the opus-4.8 prod stacker under --plain-llm."
-        ),
-    )
-    parser.add_argument(
-        "--plain-llm",
-        action="store_true",
-        default=False,
-        help=(
-            "Construct stacker LLMs via plain GeneralLlm (no donated-key wrapper, no "
-            "fallback wrapping). Intended for paid benchmark-mode runs where fail-fast "
-            "is preferred over cost absorption."
-        ),
-    )
-    parser.add_argument(
-        "--no-stacker-fallback",
-        action="store_true",
-        default=False,
-        help=(
-            "Disable the stacker fallback chain: on primary stacker failure, propagate "
-            "the error immediately instead of trying the fallback LLM or median fallback. "
-            "Intended for paid benchmark-mode runs where we want to see failures rather "
-            "than silently degrade."
-        ),
-    )
-    return parser
-
-
-# ---------------------------------------------------------------------------
-# Manifest serialization
-# ---------------------------------------------------------------------------
-
-
-def _question_type_str(question: Any) -> str:
-    if isinstance(question, BinaryQuestion):
-        return "binary"
-    if isinstance(question, MultipleChoiceQuestion):
-        return "multiple_choice"
-    if isinstance(question, NumericQuestion):
-        return "numeric"
-    raise ValueError(f"Unsupported question type: {type(question).__name__}")
-
-
-def _serialize_resolution(resolution: Any) -> Any:
-    """Convert a ``GroundTruth.resolution`` to a JSON-safe value.
-
-    ``OutOfBoundsResolution`` is an Enum; the cache writer's ``default=str``
-    fallback would emit ``"OutOfBoundsResolution.ABOVE_UPPER_BOUND"`` which the
-    ``float(...)`` call in :func:`_deserialize_ground_truth` cannot reverse.
-    Tag the enum explicitly with a ``_type`` discriminator so the deserializer
-    can reconstruct it via ``OutOfBoundsResolution[...]``.
-    """
-    if isinstance(resolution, OutOfBoundsResolution):
-        return {"_type": "OutOfBoundsResolution", "value": resolution.name}
-    if isinstance(resolution, datetime):
-        return resolution.isoformat()
-    return resolution
-
-
-def _deserialize_resolution(raw: Any, question_type: str) -> Any:
-    """Inverse of :func:`_serialize_resolution`, dispatched by question type."""
-    if isinstance(raw, dict) and raw.get("_type") == "OutOfBoundsResolution":
-        return OutOfBoundsResolution[raw["value"]]
-    if question_type == "binary":
-        return bool(raw)
-    if question_type == "numeric":
-        assert not isinstance(raw, dict)
-        return float(raw)
-    return str(raw)
-
-
-def _serialize_ground_truth(gt: GroundTruth) -> dict:
-    return {
-        "question_id": gt.question_id,
-        "question_type": gt.question_type,
-        "resolution": _serialize_resolution(gt.resolution),
-        "resolution_string": gt.resolution_string,
-        "actual_resolution_time": (
-            gt.actual_resolution_time.isoformat() if gt.actual_resolution_time is not None else None
-        ),
-        "question_text": gt.question_text,
-        "page_url": gt.page_url,
-    }
-
-
-def _deserialize_ground_truth(payload: dict) -> GroundTruth:
-    resolution = _deserialize_resolution(payload["resolution"], payload["question_type"])
-    actual_time_raw = payload.get("actual_resolution_time")
-    actual_time = datetime.fromisoformat(actual_time_raw) if actual_time_raw else None
-    return GroundTruth(
-        question_id=int(payload["question_id"]),
-        question_type=payload["question_type"],
-        resolution=resolution,
-        resolution_string=payload["resolution_string"],
-        community_prediction=None,
-        actual_resolution_time=actual_time,
-        question_text=payload["question_text"],
-        page_url=payload.get("page_url"),
-    )
-
-
-def _serialize_question_metadata(question: Any) -> dict:
-    # ``open_time`` / ``scheduled_resolution_time`` round-trip as ISO strings so
-    # the manifest-hydration path gets real datetimes back; ``compute_mid_window_today``
-    # subtracts them.
-    metadata: dict[str, Any] = {
-        "open_time": question.open_time.isoformat() if question.open_time is not None else None,
-        "scheduled_resolution_time": (
-            question.scheduled_resolution_time.isoformat() if question.scheduled_resolution_time is not None else None
-        ),
-    }
-    if isinstance(question, NumericQuestion):
-        metadata["lower_bound"] = float(question.lower_bound)
-        metadata["upper_bound"] = float(question.upper_bound)
-        metadata["open_lower_bound"] = bool(question.open_lower_bound)
-        metadata["open_upper_bound"] = bool(question.open_upper_bound)
-        # ``zero_point`` is legitimately Optional on NumericQuestion (None for
-        # linear-scale, float for log-scale). Direct attribute access will fail
-        # loudly if forecasting-tools renames the field; the None branch handles
-        # the legitimate optional case.
-        metadata["zero_point"] = float(question.zero_point) if question.zero_point is not None else None
-        # ``unit_of_measure`` is read by ``stacking_numeric_prompt`` and ``numeric_prompt``;
-        # legitimately Optional (None when the question doesn't specify a unit).
-        metadata["unit_of_measure"] = question.unit_of_measure
-        # ``cdf_size`` (``inbound_outcome_count + 1``) is 201 for continuous questions and
-        # smaller for discrete ones (e.g. 17 for an integer-count 0..15 question). Persist it so
-        # the rehydrated shim carries the real grid length instead of NumericQuestion's 201
-        # default — the ARM_PDF structured-math arm builds its CDF on this grid, and a wrong
-        # length silently mis-scores discrete questions. Older manifests (schema_version 1)
-        # predate this field; the shim reader treats it as optional and the ablation arms
-        # recover it from the cached per-forecaster CDF for those entries.
-        metadata["cdf_size"] = int(question.cdf_size) if question.cdf_size is not None else None
-    if isinstance(question, MultipleChoiceQuestion):
-        metadata["options"] = list(question.options)
-    return metadata
-
-
-def _build_manifest_entry(question: Any, ground_truth: GroundTruth, tournament: str) -> dict:
-    # ``resolution_criteria`` / ``fine_print`` / ``background_info`` are required
-    # by every downstream consumer that rehydrates from the manifest:
-    # * ``backtest.leakage._check_single_question_leakage`` reads ``resolution_criteria``.
-    # * Stacker prompts (binary/MC/numeric) read all three.
-    # All three are legitimately Optional on the Pydantic model (default ``None``),
-    # so we serialize with that fallback. Direct attribute access surfaces drift
-    # if forecasting-tools renames any of the fields.
-    return {
-        "type": _question_type_str(question),
-        "tournament": tournament,
-        "question_text": question.question_text,
-        "page_url": question.page_url,
-        "id_of_post": question.id_of_post,
-        "resolution_criteria": question.resolution_criteria,
-        "fine_print": question.fine_print,
-        "background_info": question.background_info,
-        "ground_truth": _serialize_ground_truth(ground_truth),
-        "question_metadata": _serialize_question_metadata(question),
-    }
-
-
-def _id_of_post_from_entry(entry: dict) -> int | None:
-    """Recover ``id_of_post`` from a manifest entry.
-
-    Newer entries store it directly; older entries (written before the field
-    was added) fall back to parsing the trailing integer from
-    ``page_url=https://www.metaculus.com/questions/<post_id>``. Returns None
-    when neither source yields an int.
-    """
-    explicit = entry.get("id_of_post")
-    if isinstance(explicit, int):
-        return explicit
-    page_url = entry.get("page_url") or ""
-    tail = page_url.rstrip("/").rsplit("/", 1)[-1]
-    return int(tail) if tail.isdigit() else None
-
-
-def _build_question_shim_from_manifest_entry(qid: int, entry: dict) -> Any:
-    """Rehydrate a real Pydantic question instance from a manifest entry.
-
-    Function name is preserved for callers + tests; "shim" here means
-    "rebuild without an API call," not "MagicMock." Real ``BinaryQuestion`` /
-    ``NumericQuestion`` / ``MultipleChoiceQuestion`` instances flow through
-    every downstream stage:
-
-    * The forecaster path calls ``framework._initialize_notepad(question)``,
-      which constructs ``Notepad(question=question)`` — a Pydantic model with
-      ``question: MetaculusQuestion``. A MagicMock fails that validation.
-    * The framework's ``_get_notepad`` builds an error message via
-      ``question.id_of_post``; MagicMock(spec=...) raises AttributeError on
-      any field not explicitly set.
-
-    The manifest is written by ``_build_manifest_entry`` in this same module —
-    every key dereferenced here is required by that writer's schema. Missing
-    required keys mean schema drift, not optional fields, so direct subscript
-    surfaces drift via ``KeyError``. ``zero_point`` and ``unit_of_measure``
-    use ``.get`` because they are legitimately optional.
-    """
-    qtype = entry["type"]
-    # Pre-validate required keys so ``KeyError`` surfaces schema drift before
-    # we try to construct the Pydantic model (whose ``ValidationError`` would
-    # be a less precise signal).
-    required_top_level = ("page_url", "resolution_criteria", "fine_print", "background_info", "question_metadata")
-    for key in required_top_level:
-        if key not in entry:
-            raise KeyError(key)
-    metadata = entry["question_metadata"]
-    required_metadata = ("open_time", "scheduled_resolution_time")
-    for key in required_metadata:
-        if key not in metadata:
-            raise KeyError(key)
-
-    open_time_raw = metadata["open_time"]
-    scheduled_resolution_raw = metadata["scheduled_resolution_time"]
-    open_time = datetime.fromisoformat(open_time_raw) if open_time_raw is not None else None
-    scheduled_resolution_time = (
-        datetime.fromisoformat(scheduled_resolution_raw) if scheduled_resolution_raw is not None else None
-    )
-
-    common_kwargs: dict[str, Any] = {
-        "question_text": entry["question_text"],
-        "page_url": entry["page_url"],
-        "id_of_post": _id_of_post_from_entry(entry),
-        "id_of_question": qid,
-        "resolution_criteria": entry["resolution_criteria"],
-        "fine_print": entry["fine_print"],
-        "background_info": entry["background_info"],
-        "open_time": open_time,
-        "scheduled_resolution_time": scheduled_resolution_time,
-    }
-
-    if qtype == "binary":
-        return BinaryQuestion(**common_kwargs)
-    if qtype == "multiple_choice":
-        # ``options`` is required on MC manifest entries; missing → drift.
-        return MultipleChoiceQuestion(options=metadata["options"], **common_kwargs)
-    if qtype == "numeric":
-        # ``lower_bound`` / ``upper_bound`` / ``open_*_bound`` always written by
-        # ``_serialize_question_metadata`` for numerics; missing → drift.
-        numeric_kwargs: dict[str, Any] = {
-            "lower_bound": metadata["lower_bound"],
-            "upper_bound": metadata["upper_bound"],
-            "open_lower_bound": metadata["open_lower_bound"],
-            "open_upper_bound": metadata["open_upper_bound"],
-            # ``zero_point`` is None for linear-scale numerics; legitimately optional.
-            "zero_point": metadata.get("zero_point"),
-            # ``unit_of_measure`` is None when the question doesn't specify a unit.
-            "unit_of_measure": metadata.get("unit_of_measure"),
-        }
-        # ``cdf_size`` distinguishes a discrete grid (e.g. 17) from the 201-point continuous
-        # default. Older manifests (schema_version 1) omit it — pass it only when present so
-        # NumericQuestion keeps its 201 default for those entries (it rejects ``cdf_size=None``).
-        cdf_size = metadata.get("cdf_size")
-        if cdf_size is not None:
-            numeric_kwargs["cdf_size"] = int(cdf_size)
-        return NumericQuestion(**numeric_kwargs, **common_kwargs)
-    raise ValueError(f"Unknown question type {qtype} in manifest entry for qid {qid}")
-
-
-# ---------------------------------------------------------------------------
-# Working set
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class WorkingSet:
-    """In-memory state shared across stages.
-
-    ``research_blobs`` holds RAW blobs after the research stage and SANITIZED
-    blobs after the prune stage. Raw blobs always remain on disk under
-    ``research/<qid>.md``; sanitized blobs land in ``research_pruned/<qid>.md``.
-    Downstream stages (screen, forecast, stack) always see sanitized blobs.
-    ``prune_metas`` carries per-qid redactor metadata for the QA dump.
-    """
-
-    questions: dict[int, Any] = field(default_factory=dict)
-    ground_truths: dict[int, GroundTruth] = field(default_factory=dict)
-    research_blobs: dict[int, str] = field(default_factory=dict)
-    prune_metas: dict[int, dict] = field(default_factory=dict)
-    leakage_verdicts: dict[int, dict] = field(default_factory=dict)
-    forecaster_payloads: dict[int, dict[str, dict]] = field(default_factory=dict)
-    stacker_payloads: dict[str, dict[int, dict]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +138,7 @@ async def load_questions_by_qids(qids: list[int]) -> tuple[list[Any], dict[int, 
 
 
 # ---------------------------------------------------------------------------
-# Stage: fetch
+# Fetch stage
 # ---------------------------------------------------------------------------
 
 
@@ -760,30 +152,43 @@ async def _stage_fetch(args: argparse.Namespace, cache: AblationCache, working: 
     """
     await asyncio.sleep(0)
     if args.qids:
-        existing = cache.read_qids_manifest()
-        # If every qid already in manifest, no fetch needed — load shims from manifest.
-        if all(qid in existing for qid in args.qids):
-            for qid in args.qids:
-                entry = existing[qid]
-                question = _build_question_shim_from_manifest_entry(qid, entry)
-                working.questions[qid] = question
-                working.ground_truths[qid] = _deserialize_ground_truth(entry["ground_truth"])
-            return
+        await _fetch_explicit_qids(args, cache, working)
+    else:
+        await _fetch_tournament_delta(args, cache, working)
 
-        # Some qids missing from manifest: fetch them via the per-qid loader.
-        questions, ground_truths = await load_questions_by_qids(args.qids)
-        new_entries: dict[int, dict] = {}
-        tournament = args.tournaments[0] if args.tournaments else DEFAULT_TOURNAMENTS[0]
-        for question in questions:
-            qid = question.id_of_question
-            gt = ground_truths[qid]
+
+async def _fetch_explicit_qids(args: argparse.Namespace, cache: AblationCache, working: WorkingSet) -> None:
+    """Hydrate ``args.qids`` from the manifest, fetching only the ones missing from it."""
+    existing = cache.read_qids_manifest()
+    # If every qid already in manifest, no fetch needed — load shims from manifest.
+    if all(qid in existing for qid in args.qids):
+        for qid in args.qids:
+            entry = existing[qid]
+            question = _build_question_shim_from_manifest_entry(qid, entry)
             working.questions[qid] = question
-            working.ground_truths[qid] = gt
-            new_entries[qid] = _build_manifest_entry(question, gt, tournament)
-        cache.append_qids_manifest(new_entries)
+            working.ground_truths[qid] = _deserialize_ground_truth(entry["ground_truth"])
         return
 
-    # No --qids: tournament fetch with append-extend semantics.
+    # Some qids missing from manifest: fetch them via the per-qid loader.
+    questions, ground_truths = await load_questions_by_qids(args.qids)
+    new_entries: dict[int, dict] = {}
+    tournament = args.tournaments[0] if args.tournaments else DEFAULT_TOURNAMENTS[0]
+    for question in questions:
+        qid = question.id_of_question
+        gt = ground_truths[qid]
+        working.questions[qid] = question
+        working.ground_truths[qid] = gt
+        new_entries[qid] = _build_manifest_entry(question, gt, tournament)
+    cache.append_qids_manifest(new_entries)
+
+
+async def _fetch_tournament_delta(args: argparse.Namespace, cache: AblationCache, working: WorkingSet) -> None:
+    """Tournament fetch with append-extend semantics.
+
+    Hydrates every already-known qid from the manifest, then fetches only the per-type
+    shortfall against the requested counts, dropping anything the manifest already has.
+    """
+    await asyncio.sleep(0)
     existing = cache.read_qids_manifest()
     existing_per_type = {"binary": 0, "multiple_choice": 0, "numeric": 0}
     for entry in existing.values():
@@ -848,7 +253,7 @@ async def _stage_fetch(args: argparse.Namespace, cache: AblationCache, working: 
 
 
 # ---------------------------------------------------------------------------
-# Stage: research
+# Research stage
 # ---------------------------------------------------------------------------
 
 
@@ -856,6 +261,7 @@ async def _stage_research(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -906,7 +312,7 @@ async def _stage_research(
 
 
 # ---------------------------------------------------------------------------
-# Stage: prune
+# Prune stage
 # ---------------------------------------------------------------------------
 
 
@@ -914,6 +320,7 @@ async def _stage_prune(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -967,7 +374,7 @@ async def _stage_prune(
 
 
 # ---------------------------------------------------------------------------
-# Stage: screen
+# Screen stage
 # ---------------------------------------------------------------------------
 
 
@@ -975,6 +382,7 @@ async def _stage_screen(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -990,21 +398,7 @@ async def _stage_screen(
     ground_truths = {qid: working.ground_truths[qid] for qid in working.research_blobs if qid in working.ground_truths}
     research_blobs = dict(working.research_blobs)
 
-    cached_verdicts: dict[int, dict] = {}
-    qids_needing_screen: list[int] = []
-    if not force:
-        for qid in research_blobs:
-            cached = cache.read_leakage_screen(qid)
-            if cached is not None and cached.get("research_blob_sha") == _research_blob_sha(research_blobs[qid]):
-                cached_verdicts[qid] = cached
-                spend.cached_screen_hits += 1
-            else:
-                # Cache miss, missing sha (pre-C3 entry), or stale sha — re-screen.
-                if cached is not None:
-                    logger.info("screen | qid=%d cache stale (blob changed); re-screening", qid)
-                qids_needing_screen.append(qid)
-    else:
-        qids_needing_screen = list(research_blobs.keys())
+    cached_verdicts, qids_needing_screen = _partition_screen_cache(cache, research_blobs, force=force, spend=spend)
 
     fresh_verdicts: dict[int, dict] = {}
     if qids_needing_screen:
@@ -1039,7 +433,7 @@ async def _stage_screen(
 
 
 # ---------------------------------------------------------------------------
-# Stage: qa_iterate
+# QA-iterate stage
 # ---------------------------------------------------------------------------
 
 
@@ -1073,7 +467,7 @@ async def _stage_qa_iterate(
         logger.info("stage=qa_iterate SKIPPED (mode=skip)")
         return {}, None
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     summary_path, manual_rejects_path = _qa_iterate_paths(cache, timestamp=timestamp)
 
     if force and manual_rejects_path.exists():
@@ -1146,7 +540,7 @@ async def _stage_qa_iterate(
 
 
 # ---------------------------------------------------------------------------
-# Stage: forecast
+# Forecast stage
 # ---------------------------------------------------------------------------
 
 
@@ -1154,6 +548,7 @@ async def _stage_forecast(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -1167,12 +562,10 @@ async def _stage_forecast(
     drift if the orchestrator's coarse all-or-nothing cache check changes
     shape later.
     """
-    from metaculus_bot.ablation.forecaster_lineup import get_lineup  # noqa: PLC0415
-
     await asyncio.sleep(0)
     qids = sorted(working.research_blobs.keys())
 
-    lineup_name: str = getattr(args, "lineup", "free")
+    lineup_name: str = args.lineup
     forecaster_llms, lineup_models = get_lineup(lineup_name)
 
     cached_per_qid: dict[int, dict[str, dict]] = {}
@@ -1232,131 +625,8 @@ async def _stage_forecast(
 
 
 # ---------------------------------------------------------------------------
-# Stage: stacker
+# Stacker stage
 # ---------------------------------------------------------------------------
-
-
-def _active_stacker_slug(args: argparse.Namespace) -> str:
-    """Filesystem slug for the stacker this run uses, for per-stacker cache keying.
-
-    Only the LLM-stacker arms (stack / stack_aug) are slugged so a stacker swap
-    (e.g. opus-4.5 free-tier vs opus-4.8 prod) never overwrites another stacker's
-    results, while deterministic arms (median / mean / pdf_*) stay shared. The
-    selection mirrors the stacker construction in ``_stage_llm_stacker``:
-
-    * ``--plain-llm --lineup prod`` → opus-4.8 (``PROD_STACKER_MODEL``).
-    * ``--plain-llm`` other lineups → opus-4.5 (``DEFAULT_STACKER_MODEL``).
-    * No ``--plain-llm`` → the default donated-key wrapper, whose primary is also
-      ``DEFAULT_STACKER_MODEL`` (opus-4.5).
-
-    All three callers (``_stage_llm_stacker`` write/read, ``_stage_score`` read,
-    ``_hydrate_working_set_from_cache`` read) route through here so they agree.
-    """
-    from metaculus_bot.ablation.run_stacker import DEFAULT_STACKER_MODEL, PROD_STACKER_MODEL  # noqa: PLC0415
-
-    use_prod_stacker = getattr(args, "plain_llm", False) and getattr(args, "lineup", "free") == "prod"
-    model = PROD_STACKER_MODEL if use_prod_stacker else DEFAULT_STACKER_MODEL
-    return model_slug_to_filename(model)
-
-
-async def _stage_simple_agg(
-    arm: str,
-    working: WorkingSet,
-    cache: AblationCache,
-    force: bool,
-    spend: SpendReport,
-) -> None:
-    """Sequential deterministic aggregation (mean/median). No LLM calls."""
-    await asyncio.sleep(0)
-    qids = sorted(working.forecaster_payloads.keys())
-
-    cached_payloads: dict[int, dict] = {}
-    needs_run: list[int] = []
-    for qid in qids:
-        if not force:
-            cached = cache.read_stacker_output(qid=qid, arm=arm)
-            if cached is not None:
-                cached_payloads[qid] = cached
-                spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
-                continue
-        needs_run.append(qid)
-
-    fresh_results: dict[int, dict] = {}
-    if needs_run:
-        run_fn = run_median_for_qid if arm == ARM_MEDIAN else run_mean_for_qid
-        for qid in needs_run:
-            fresh_results[qid] = await run_fn(
-                qid=qid,
-                question=working.questions[qid],
-                forecaster_payloads=working.forecaster_payloads[qid],
-                cache=cache,
-                force=force,
-            )
-
-    working.stacker_payloads[arm] = {**cached_payloads, **fresh_results}
-
-
-async def _stage_pdf(
-    working: WorkingSet,
-    cache: AblationCache,
-    force: bool,
-    spend: SpendReport,
-) -> None:
-    """Deterministic structured-math aggregation for all PDF sub-arms."""
-    from metaculus_bot.ablation.run_pdf import ARM_PDF_MIN1_MEAN  # noqa: PLC0415
-
-    await asyncio.sleep(0)
-    qids = sorted(working.forecaster_payloads.keys())
-
-    # PDF sub-arms share a single cache-read loop for the parent ARM_PDF key.
-    cached_payloads: dict[int, dict] = {}
-    needs_run: list[int] = []
-    for qid in qids:
-        if not force:
-            cached = cache.read_stacker_output(qid=qid, arm=ARM_PDF)
-            if cached is not None:
-                cached_payloads[qid] = cached
-                spend.cached_stacker_hits[ARM_PDF] = spend.cached_stacker_hits.get(ARM_PDF, 0) + 1
-                continue
-        needs_run.append(qid)
-
-    results_min1: dict[int, dict] = {}
-    results_min2: dict[int, dict] = {}
-    for qid in needs_run:
-        result_min1 = await run_pdf_for_qid(
-            qid=qid,
-            question=working.questions[qid],
-            forecaster_payloads=working.forecaster_payloads[qid],
-            cache=cache,
-            force=force,
-            min_forecasters=1,
-            arm_label=ARM_PDF_MIN1,
-        )
-        result_min2 = await run_pdf_for_qid(
-            qid=qid,
-            question=working.questions[qid],
-            forecaster_payloads=working.forecaster_payloads[qid],
-            cache=cache,
-            force=force,
-            min_forecasters=2,
-            arm_label=ARM_PDF_MIN2,
-        )
-        # pdf_min1_mean is computed for diagnostic completeness but not scored.
-        await run_pdf_for_qid(
-            qid=qid,
-            question=working.questions[qid],
-            forecaster_payloads=working.forecaster_payloads[qid],
-            cache=cache,
-            force=force,
-            min_forecasters=1,
-            arm_label=ARM_PDF_MIN1_MEAN,
-            aggregation="mean",
-        )
-        results_min1[qid] = result_min1
-        results_min2[qid] = result_min2
-
-    working.stacker_payloads[ARM_PDF_MIN1] = {**cached_payloads, **results_min1}
-    working.stacker_payloads[ARM_PDF_MIN2] = {**cached_payloads, **results_min2}
 
 
 async def _stage_llm_stacker(
@@ -1364,6 +634,7 @@ async def _stage_llm_stacker(
     args: argparse.Namespace,
     working: WorkingSet,
     cache: AblationCache,
+    *,
     force: bool,
     spend: SpendReport,
 ) -> None:
@@ -1375,16 +646,9 @@ async def _stage_llm_stacker(
     # stacker so a swap never clobbers another stacker's results.
     stacker_slug = _active_stacker_slug(args)
 
-    cached_payloads: dict[int, dict] = {}
-    needs_run: list[int] = []
-    for qid in qids:
-        if not force:
-            cached = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=stacker_slug)
-            if cached is not None:
-                cached_payloads[qid] = cached
-                spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
-                continue
-        needs_run.append(qid)
+    cached_payloads, needs_run = _partition_stacker_cache(
+        cache, qids, arm, stacker_slug=stacker_slug, force=force, spend=spend
+    )
 
     fresh_results: dict[int, dict] = {}
     if needs_run:
@@ -1396,66 +660,14 @@ async def _stage_llm_stacker(
             }
             for qid in needs_run
         }
-        # Wire --plain-llm and --no-stacker-fallback into stacker construction.
-        # --lineup prod uses the opus-4.8 prod stacker (mirrors the prod-ish
-        # forecaster posture); other lineups keep the opus-4.5 default.
-        stacker_llm_kwarg: GeneralLlm | None = None
-        fallback_llm_kwarg: GeneralLlm | None = None
-        if getattr(args, "plain_llm", False):
-            from metaculus_bot.ablation.run_stacker import (  # noqa: PLC0415
-                _OPENAI_STACKER_KWARGS,
-                _OPUS_STACKER_KWARGS,
-                _PROD_STACKER_KWARGS,
-                DEFAULT_STACKER_FALLBACK_MODEL,
-                DEFAULT_STACKER_MODEL,
-                PROD_STACKER_MODEL,
-            )
-
-            if getattr(args, "lineup", "free") == "prod":
-                stacker_llm_kwarg = GeneralLlm(model=PROD_STACKER_MODEL, **_PROD_STACKER_KWARGS)
-            else:
-                stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
-            if not getattr(args, "no_stacker_fallback", False):
-                fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_OPENAI_STACKER_KWARGS)
-        elif getattr(args, "no_stacker_fallback", False):
-            # No fallback but still use the donated-key wrapper for primary.
-            fallback_llm_kwarg = None
-
-        batch_kwargs: dict[str, Any] = {
-            "stacker_slug": stacker_slug,
-            "force": force,
-            "concurrency": args.concurrency,
-        }
-        if stacker_llm_kwarg is not None:
-            batch_kwargs["stacker_llm"] = stacker_llm_kwarg
-        if getattr(args, "no_stacker_fallback", False):
-            batch_kwargs["fallback_stacker_llm"] = None
-        elif fallback_llm_kwarg is not None:
-            batch_kwargs["fallback_stacker_llm"] = fallback_llm_kwarg
-
         fresh_results = await run_stacker_batch(
             qid_to_data,
             arm,
             cache,
-            **batch_kwargs,
+            **_stacker_batch_kwargs(args, stacker_slug=stacker_slug, force=force),
         )
 
-    # Count LLM calls and fallback usage from fresh results.
-    is_arm_a = arm == ARM_STACK
-    for payload in fresh_results.values():
-        used = payload["stacker_model_used"]
-        if used in ("primary", "fallback"):
-            if is_arm_a:
-                spend.stacker_llm_calls_stack += 1
-            else:
-                spend.stacker_llm_calls_stack_aug += 1
-            spend.parser_llm_calls += 1
-        if used == "fallback":
-            if is_arm_a:
-                spend.fallback_stacker_stack += 1
-            else:
-                spend.fallback_stacker_stack_aug += 1
-
+    _record_stacker_spend(fresh_results, arm, spend)
     working.stacker_payloads[arm] = {**cached_payloads, **fresh_results}
 
 
@@ -1463,310 +675,18 @@ async def _stage_stack(
     args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
+    *,
     arm: str,
     force: bool,
     spend: SpendReport,
 ) -> None:
     """Dispatcher for stacker arms. Routes to per-type implementation."""
     if arm in (ARM_MEDIAN, ARM_MEAN):
-        await _stage_simple_agg(arm, working, cache, force, spend)
+        await _stage_simple_agg(arm, working, cache, force=force, spend=spend)
     elif arm == ARM_PDF:
         await _stage_pdf(working, cache, force, spend)
     else:
-        await _stage_llm_stacker(arm, args, working, cache, force, spend)
-
-
-# ---------------------------------------------------------------------------
-# Stage: QA dump
-# ---------------------------------------------------------------------------
-
-
-def _stage_qa_research_dump(
-    args: argparse.Namespace,
-    cache: AblationCache,
-    working: WorkingSet,
-) -> Path:
-    """Dump first N qids' question, ground truth, research blob, leakage verdict."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    target_path = cache.root / f"qa_research_{timestamp}.md"
-
-    qids_in_order = sorted(working.questions.keys())
-    selected = qids_in_order[: max(5, args.num_binary + args.num_multiple_choice + args.num_numeric)]
-
-    lines: list[str] = ["# Ablation QA Research Dump", "", f"Generated: {timestamp}", ""]
-    for qid in selected:
-        gt = working.ground_truths[qid]
-        # Read from disk rather than ``working.research_blobs``: the screen
-        # stage pops leaked qids from in-memory state to keep them out of
-        # downstream forecast/stack stages, but the QA dump exists to let the
-        # operator review what the screener flagged. The blob still lives on
-        # disk via ``cache.write_research``, so go back to that source.
-        cached_research = cache.read_research(qid)
-        if cached_research is None:
-            # Research stage skipped or never ran for this qid — record it
-            # explicitly rather than emit a sentinel string under a
-            # normal-looking section.
-            lines.append(f"## Q{qid} (skipped — no research blob)")
-            lines.append(f"- URL: {gt.page_url}")
-            lines.append(f"- Question text: {gt.question_text}")
-            lines.append("")
-            continue
-        research = cached_research[0]
-        # The QA dump runs even on partial-pipeline failures so the operator
-        # can review whatever artifacts DO exist. A qid may have research
-        # cached but no verdict (e.g., prune stage failed for everyone, screen
-        # never ran). Surface that as a "no verdict" section rather than
-        # crashing — the goal is operator-readable diagnostic output.
-        verdict = working.leakage_verdicts.get(qid)
-
-        lines.append(f"## Q{qid}")
-        lines.append(f"- URL: {gt.page_url}")
-        lines.append(f"- Question text: {gt.question_text}")
-        lines.append(f"- Ground truth: {gt.resolution_string}")
-        if verdict is None:
-            lines.append("- Leaked: (no verdict — screen stage did not run for this qid)")
-            lines.append("")
-        else:
-            lines.append(f"- Leaked: {verdict['is_leaked']}")
-            lines.append("")
-            lines.append("### Detector verdict")
-            lines.append(str(verdict["detector_response"]))
-            lines.append("")
-        lines.append("### Raw research blob (truncated to 4000 chars)")
-        lines.append("```")
-        lines.append(research[:4000])
-        lines.append("```")
-        lines.append("")
-
-        # Surface the redactor's output and metadata so the operator can review
-        # what was pruned and verify the redactor's judgment. The pruned blob
-        # lives at research_pruned/<qid>.md when the prune stage ran; a missing
-        # entry simply means the prune stage didn't process this qid.
-        cached_pruned = cache.read_pruned_research(qid)
-        if cached_pruned is not None:
-            sanitized_blob, prune_meta = cached_pruned
-            n_redactions = len(prune_meta.get("redactions", []))
-            lines.append(
-                f"### Sanitized blob ({prune_meta.get('original_chars', 0)} -> "
-                f"{prune_meta.get('sanitized_chars', 0)} chars, {n_redactions} redactions)"
-            )
-            lines.append("```")
-            lines.append(sanitized_blob[:4000])
-            lines.append("```")
-            lines.append("")
-            if prune_meta.get("redactions"):
-                lines.append("### Redactions")
-                for redaction in prune_meta["redactions"]:
-                    excerpt = redaction.get("original_excerpt", "")
-                    reason = redaction.get("reason", "")
-                    lines.append(f"- `{excerpt}` — {reason}")
-                lines.append("")
-
-    atomic_write_text(target_path, "\n".join(lines))
-    return target_path
-
-
-# ---------------------------------------------------------------------------
-# Stage: score
-# ---------------------------------------------------------------------------
-
-
-def _build_report_shim(qid: int, question: Any, payload: dict) -> Any:
-    """Build a MagicMock report whose isinstance() check matches the question type.
-
-    The score function in ``metaculus_bot.ablation.scoring`` uses ``isinstance``
-    to dispatch to the right metric set; ``MagicMock(spec=BinaryReport)`` etc.
-    pass that check.
-    """
-    stacker_pred = payload["stacker_prediction"]
-    pred_type = stacker_pred["type"]
-
-    if pred_type == "binary":
-        report = MagicMock(spec=BinaryReport)
-        report.prediction = float(stacker_pred["prob"])
-        return report
-
-    if pred_type == "multiple_choice":
-        report = MagicMock(spec=MultipleChoiceReport)
-        prediction = MagicMock()
-        predicted_options: list[Any] = []
-        for opt in stacker_pred["options"]:
-            po = MagicMock()
-            po.option_name = opt["option_name"]
-            po.probability = float(opt["probability"])
-            predicted_options.append(po)
-        prediction.predicted_options = predicted_options
-        report.prediction = prediction
-        report.question = question
-        return report
-
-    if pred_type == "numeric":
-        # Post-Bucket-1: ``deserialize_prediction_value`` returns a
-        # ``PchipNumericDistribution`` whose ``.cdf`` already provides the
-        # constraint-enforced 201-point CDF as a list of Percentile objects
-        # (monotonic by construction — PCHIP enforces strict monotonicity in
-        # the value axis). No defensive sort or duplicate-check needed; that
-        # was a workaround for the old ``list[Percentile]`` return type when
-        # free-model stackers emitted out-of-order declared percentiles.
-        report = MagicMock(spec=NumericReport)
-        deserialized = deserialize_prediction_value(stacker_pred, question)
-        cdf_points: list[Any] = []
-        for percentile in deserialized.cdf:
-            point = MagicMock()
-            point.value = float(percentile.value)
-            point.percentile = float(percentile.percentile)
-            cdf_points.append(point)
-        prediction = MagicMock()
-        prediction.cdf = cdf_points
-        report.prediction = prediction
-        report.question = question
-        return report
-
-    raise ValueError(f"Unknown prediction type {pred_type} for qid {qid}")
-
-
-def _stage_score(
-    args: argparse.Namespace,
-    cache: AblationCache,
-    working: WorkingSet,
-) -> Path:
-    """Build paired scores, aggregate, render summary, write run + summary files.
-
-    Uses per-comparison N: each pairwise comparison only requires the two arms in
-    that comparison to have succeeded for a qid. A qid is included if at least 2
-    arms succeeded (enabling at least one comparison). This avoids collapsing N to
-    the 5-way intersection of all arms.
-    """
-    paired_scores: list[PairedScore] = []
-    # Union of all qids that have ANY arm payload.
-    all_arm_keys = [ARM_STACK, ARM_STACK_AUG, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN, ARM_MEAN]
-    qid_set: set[int] = set()
-    for arm_key in all_arm_keys:
-        qid_set.update(working.stacker_payloads.get(arm_key, {}).keys())
-    qids = sorted(qid_set)
-    # Determine scoring mode. 5-arm is active when pdf payloads are present;
-    # 6-arm adds the deterministic mean arm on top, used only when BOTH pdf AND
-    # mean payloads are present. Old free-tier cache dirs (pdf, no mean) stay on
-    # the 5-arm path; pre-pdf data stays on the 3-arm path.
-    has_pdf_arms = bool(working.stacker_payloads.get(ARM_PDF_MIN1)) or bool(working.stacker_payloads.get(ARM_PDF_MIN2))
-    has_mean_arm = bool(working.stacker_payloads.get(ARM_MEAN))
-
-    n_scored = 0
-    for qid in qids:
-        question = working.questions.get(qid)
-        gt = working.ground_truths.get(qid)
-        if question is None or gt is None:
-            continue
-
-        # Build report for each arm: None if the arm is missing or failed.
-        def _report_or_none(payload: dict | None) -> Any:
-            if payload is None or not payload.get("success"):
-                return None
-            return _build_report_shim(qid, question, payload)
-
-        payload_stack = working.stacker_payloads.get(ARM_STACK, {}).get(qid)
-        payload_stack_aug = working.stacker_payloads.get(ARM_STACK_AUG, {}).get(qid)
-        payload_pdf_min1 = working.stacker_payloads.get(ARM_PDF_MIN1, {}).get(qid)
-        payload_pdf_min2 = working.stacker_payloads.get(ARM_PDF_MIN2, {}).get(qid)
-        payload_median = working.stacker_payloads.get(ARM_MEDIAN, {}).get(qid)
-        payload_mean = working.stacker_payloads.get(ARM_MEAN, {}).get(qid)
-
-        report_stack = _report_or_none(payload_stack)
-        report_stack_aug = _report_or_none(payload_stack_aug)
-        report_pdf_min1 = _report_or_none(payload_pdf_min1)
-        report_pdf_min2 = _report_or_none(payload_pdf_min2)
-        report_median = _report_or_none(payload_median)
-        report_mean = _report_or_none(payload_mean)
-
-        # Count present arms — need at least 2 for any comparison.
-        n_present = sum(
-            1
-            for r in [report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median, report_mean]
-            if r is not None
-        )
-        if n_present < 2:
-            continue
-
-        if has_pdf_arms and has_mean_arm:
-            scores = score_arm_for_qid(
-                [
-                    ("stack", report_stack, payload_stack),
-                    ("stack_aug", report_stack_aug, payload_stack_aug),
-                    ("pdf_min1", report_pdf_min1, payload_pdf_min1),
-                    ("pdf_min2", report_pdf_min2, payload_pdf_min2),
-                    ("median", report_median, payload_median),
-                    ("mean", report_mean, payload_mean),
-                ],
-                gt,
-            )
-        elif has_pdf_arms:
-            scores = score_arm_for_qid(
-                [
-                    ("stack", report_stack, payload_stack),
-                    ("stack_aug", report_stack_aug, payload_stack_aug),
-                    ("pdf_min1", report_pdf_min1, payload_pdf_min1),
-                    ("pdf_min2", report_pdf_min2, payload_pdf_min2),
-                    ("median", report_median, payload_median),
-                ],
-                gt,
-            )
-        else:
-            scores = score_arm_for_qid(
-                [
-                    ("stack", report_stack, payload_stack),
-                    ("stack_aug", report_stack_aug, payload_stack_aug),
-                    ("median", report_median, payload_median),
-                ],
-                gt,
-            )
-        if scores:
-            n_scored += 1
-        paired_scores.extend(scores)
-
-    stats = aggregate_paired(paired_scores, n_bootstrap=5000, seed=args.seed)
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    metadata = {
-        "timestamp": timestamp,
-        "n_questions": n_scored,
-        "tournaments": ", ".join(args.tournaments),
-        "resolved_after": args.resolved_after,
-    }
-    summary_md = render_summary_markdown(stats, paired_scores, metadata)
-
-    run_payload = {
-        "metadata": metadata,
-        "stats": [
-            {
-                "metric": s.metric,
-                "question_type": s.question_type,
-                "n": s.n,
-                "mean_delta": s.mean_delta,
-                "bootstrap_ci_low": s.bootstrap_ci_low,
-                "bootstrap_ci_high": s.bootstrap_ci_high,
-                "sign_test_p": s.sign_test_p,
-                "wilcoxon_p": s.wilcoxon_p,
-                "higher_is_better": s.higher_is_better,
-            }
-            for s in stats
-        ],
-        "paired_scores": [
-            {
-                "qid": s.qid,
-                "question_type": s.question_type,
-                "metric": s.metric,
-                "comparison": s.comparison,
-                "score_stack": s.score_stack,
-                "score_stack_aug": s.score_stack_aug,
-                "score_median": s.score_median,
-                "delta": s.delta,
-                "higher_is_better": s.higher_is_better,
-            }
-            for s in paired_scores
-        ],
-    }
-    cache.write_score_run(timestamp, run_payload)
-    return cache.write_score_summary(timestamp, summary_md)
+        await _stage_llm_stacker(arm, args, working, cache, force=force, spend=spend)
 
 
 # ---------------------------------------------------------------------------
@@ -1774,173 +694,169 @@ def _stage_score(
 # ---------------------------------------------------------------------------
 
 
-async def _hydrate_working_set_from_cache(
+async def _run_score_only(
+    args: argparse.Namespace, cache: AblationCache, working: WorkingSet, spend: SpendReport
+) -> int:
+    """``--stages score``: hydrate every artifact from disk and score, without spending.
+
+    Returns the process exit code — 2 when no qid has any arm payload at all, since
+    there is nothing to score and the operator asked for exactly that.
+    """
+    await _hydrate_working_set_from_cache(cache, working, spend=spend, stacker_slug=_active_stacker_slug(args))
+    _apply_qids_filter(working, args.qids)
+    if not _qids_with_any_arm_payload(working):
+        arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
+        logger.error(
+            "Cannot run 'score': zero qids have any stacker outputs %s.",
+            arm_counts,
+        )
+        print("ERROR: --stages score: zero qids have any arm payloads.")
+        return 2
+    summary_path = _stage_score(args, cache, working)
+    _print_spend_report(spend, working, summary_path)
+    return 0
+
+
+async def _run_research_stages(
+    args: argparse.Namespace,
     cache: AblationCache,
     working: WorkingSet,
-    spend: SpendReport | None = None,
-    stacker_slug: str | None = None,
+    *,
+    spend: SpendReport,
+    plan: _StagePlan,
 ) -> None:
-    """For score-only paths: load every artifact from disk.
+    """Run the requested research / prune / screen stages in order."""
+    if plan.wants("research"):
+        n = len(working.questions)
+        # Gemini grounded search ~30s/qid, parallelism = args.concurrency.
+        est_seconds = max(30, n * 30 // max(1, args.concurrency))
+        logger.info("stage=research START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
+        await _stage_research(args, cache, working, force=plan.is_forced("research"), spend=spend)
+        logger.info("stage=research DONE | qids_with_blob=%d", len(working.research_blobs))
+        await asyncio.sleep(plan.sleep_seconds)
 
-    When ``spend`` is supplied (score-only path), bumps the relevant
-    ``cached_*_hits`` fields so the spend report reflects what was loaded
-    rather than reading as a hard zero across the board.
+    if plan.wants("prune"):
+        n = len(working.research_blobs)
+        # Redactor: ~30s/batch × ceil(n/batch_size).
+        n_batches = (n + PRUNE_DEFAULT_BATCH_SIZE - 1) // max(1, PRUNE_DEFAULT_BATCH_SIZE) if n else 0
+        est_seconds = max(30, n_batches * 30)
+        logger.info(
+            "stage=prune START | est wall-clock ~%d min (n=%d, batches=%d)", est_seconds // 60 + 1, n, n_batches
+        )
+        await _stage_prune(args, cache, working, force=plan.is_forced("prune"), spend=spend)
+        logger.info(
+            "stage=prune DONE | qids_with_sanitized_blob=%d | validation_failures=%d",
+            len(working.research_blobs),
+            spend.prune_validation_failures,
+        )
+        await asyncio.sleep(plan.sleep_seconds)
 
-    ``stacker_slug`` is applied ONLY to the LLM-stacker arms (stack / stack_aug)
-    so the score-only path reads the active run's stacker outputs; deterministic
-    arms (pdf / median / mean) read with ``stacker_slug=None`` (shared, unslugged).
-    The in-memory ``working.stacker_payloads`` keys stay the plain arm name —
-    only the on-disk filename carries the slug — so scoring/summary code is
-    untouched.
+    if plan.wants("screen"):
+        n = len(working.research_blobs)
+        est_seconds = max(15, n * 10 // max(1, args.concurrency))
+        logger.info("stage=screen START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
+        await _stage_screen(args, cache, working, force=plan.is_forced("screen"), spend=spend)
+        # Verdict dicts have a fixed schema; ``is_leaked`` always present.
+        n_leaked = sum(1 for v in working.leakage_verdicts.values() if v["is_leaked"])
+        logger.info("stage=screen DONE | leaked=%d clean=%d", n_leaked, len(working.research_blobs))
+        await asyncio.sleep(plan.sleep_seconds)
+
+
+async def _run_qa_iterate_stage(
+    args: argparse.Namespace,
+    cache: AblationCache,
+    working: WorkingSet,
+    *,
+    plan: _StagePlan,
+) -> None:
+    """Run the QA-iterate stage, raising in halt mode so the operator reviews first.
+
+    The inter-stage sleep happens BEFORE the halt-mode raise so the pause symmetry
+    matches advisory mode and the operator's preferred backoff is honored even when
+    halting right after the verifier batch. Halt is strict — it always blocks, even on
+    a fully-clean batch, so the QA summary is read before any forecast spend.
     """
-    await asyncio.sleep(0)
-    manifest = cache.read_qids_manifest()
-    for qid_raw, entry in manifest.items():
-        qid = int(qid_raw)
-        question = _build_question_shim_from_manifest_entry(qid, entry)
-        gt = _deserialize_ground_truth(entry["ground_truth"])
-        working.questions[qid] = question
-        working.ground_truths[qid] = gt
-        cached_research = cache.read_research(qid)
-        if cached_research is not None and spend is not None:
-            spend.cached_research_hits += 1
-        cached_pruned = cache.read_pruned_research(qid)
-        if cached_pruned is not None:
-            # Only the sanitized blob flows downstream — the raw blob is kept
-            # on disk for QA-dump inspection only. If pruning failed for a qid
-            # (no cached pruned blob), it must NOT be eligible for forecast or
-            # later stages even when those stages are requested without
-            # ``--stages prune``. The original prune stage drops such qids
-            # from ``research_blobs``; we mirror that here so re-running
-            # downstream stages from cache produces the same working set.
-            working.research_blobs[qid] = cached_pruned[0]
-            working.prune_metas[qid] = cached_pruned[1]
-            if spend is not None:
-                spend.cached_prune_hits += 1
-        verdict = cache.read_leakage_screen(qid)
-        if verdict is not None:
-            working.leakage_verdicts[qid] = verdict
-            if spend is not None:
-                spend.cached_screen_hits += 1
-        forecaster_payloads = cache.list_forecaster_outputs(qid)
-        if forecaster_payloads:
-            working.forecaster_payloads[qid] = forecaster_payloads
-            if spend is not None:
-                spend.cached_forecaster_hits += len(forecaster_payloads)
-        for arm in (ARM_STACK, ARM_STACK_AUG, ARM_PDF, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN, ARM_MEAN):
-            # Only the LLM-stacker arms are slugged; deterministic arms stay shared.
-            arm_slug = stacker_slug if arm in (ARM_STACK, ARM_STACK_AUG) else None
-            payload = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=arm_slug)
-            if payload is not None:
-                working.stacker_payloads.setdefault(arm, {})[qid] = payload
-                if spend is not None:
-                    spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
+    logger.info("stage=qa_iterate START mode=%s", args.qa_iterate_mode)
+    outcomes, qa_summary_path = await _stage_qa_iterate(args, cache, working, force=plan.is_forced("qa_iterate"))
+    n_clean = sum(1 for o in outcomes.values() if o.final_status == "clean")
+    n_rejected = len(outcomes) - n_clean
+    await asyncio.sleep(plan.sleep_seconds)
+    if args.qa_iterate_mode == "halt" and qa_summary_path is not None:
+        raise RuntimeError(
+            f"QA iteration halted: {n_rejected} rejects + {n_clean} clean qids. "
+            f"Review {qa_summary_path}. To resume after review:\n"
+            f"  1. (Optional) edit {cache.root}/manual_rejects.json to override rejects.\n"
+            f"  2. Run: --stages forecast,stack,stack_aug,pdf,median,score (note: this skips qa_iterate; "
+            f"manual_rejects is only consulted when qa_iterate is in --stages)."
+        )
 
 
-def _filter_working_set_to_qids(working: WorkingSet, qids: list[int]) -> set[int]:
-    """Restrict every per-qid attribute of ``working`` to entries in ``qids``.
-
-    Returns the set of requested qids that were NOT found in the manifest
-    (so the caller can log them). Without this filter, --qids X --stages
-    stack would silently fan out the stacker over the full manifest.
-    """
-    requested = set(qids)
-    for attr in (
-        "questions",
-        "ground_truths",
-        "research_blobs",
-        "prune_metas",
-        "leakage_verdicts",
-        "forecaster_payloads",
-    ):
-        existing = getattr(working, attr)
-        filtered = {qid: v for qid, v in existing.items() if qid in requested}
-        setattr(working, attr, filtered)
-    # Filter each arm's payload dict within stacker_payloads.
-    for arm_key in list(working.stacker_payloads.keys()):
-        working.stacker_payloads[arm_key] = {
-            qid: v for qid, v in working.stacker_payloads[arm_key].items() if qid in requested
-        }
-    return requested - set(working.questions.keys())
-
-
-def _print_spend_report(spend: SpendReport, working: WorkingSet, summary_path: Path | None) -> None:
-    n_total = len(working.questions)
-    # Verdict dicts have a fixed schema (leakage_screen._build_verdict);
-    # ``is_leaked`` is always present. Direct subscript surfaces drift.
-    n_leaked = sum(1 for v in working.leakage_verdicts.values() if v["is_leaked"])
-    # n_clean = qids that reached forecasters (all upstream gates passed: prune,
-    # screen, qa_iterate). Filter by leakage verdict because hydration on resume
-    # loads all on-disk pruned blobs regardless of whether the screen later
-    # marked them leaked. Without this filter, resume invocations report
-    # n_dropped_other as a negative count.
-    clean_qids = {
-        qid for qid in working.research_blobs if not working.leakage_verdicts.get(qid, {}).get("is_leaked", False)
-    }
-    n_clean = len(clean_qids)
-    n_dropped_other = n_total - n_clean - n_leaked
-
-    by_type = {"binary": 0, "multiple_choice": 0, "numeric": 0}
-    # ``research_blobs`` and ``questions`` are kept in lockstep by the
-    # orchestrator — every qid in research_blobs is in questions. Direct
-    # subscript surfaces invariant violations as KeyError.
-    for qid in clean_qids:
-        question = working.questions[qid]
-        if isinstance(question, BinaryQuestion):
-            by_type["binary"] += 1
-        elif isinstance(question, MultipleChoiceQuestion):
-            by_type["multiple_choice"] += 1
-        elif isinstance(question, NumericQuestion):
-            by_type["numeric"] += 1
-
-    detector_short = DEFAULT_DETECTOR_MODEL.rsplit("/", maxsplit=1)[-1].replace(":free", "")
-    parser_short = FREE_PARSER_MODEL.rsplit("/", maxsplit=1)[-1].replace(":free", "")
+async def _run_forecast_stage(
+    args: argparse.Namespace,
+    cache: AblationCache,
+    working: WorkingSet,
+    *,
+    spend: SpendReport,
+    plan: _StagePlan,
+) -> None:
+    """Run the forecaster fan-out stage."""
+    n = len(working.research_blobs)
     n_forecasters = len(FREE_FORECASTER_MODELS)
+    rl_kwargs = _rate_limit_mode_kwargs(args.rate_limit_mode)
+    per_forecaster_concurrency = max(1, rl_kwargs["per_forecaster_concurrency"])
+    # Forecaster: ~30s/call serially per question, parallelism =
+    # (per_question_concurrency × per_forecaster_concurrency).
+    per_question_seconds = (n_forecasters * 30) // per_forecaster_concurrency
+    global_parallel = max(1, args.concurrency)
+    est_seconds = max(60, n * per_question_seconds // global_parallel)
+    logger.info(
+        "stage=forecast START | est wall-clock ~%d min (n=%d × n_forecasters=%d / "
+        "per_forecaster_concurrency=%d / question_concurrency=%d)",
+        est_seconds // 60 + 1,
+        n,
+        n_forecasters,
+        per_forecaster_concurrency,
+        global_parallel,
+    )
+    await _stage_forecast(args, cache, working, force=plan.is_forced("forecast"), spend=spend)
+    logger.info("stage=forecast DONE | qids=%d", len(working.forecaster_payloads))
+    await asyncio.sleep(plan.sleep_seconds)
 
-    border = "=" * 60
-    print(border)
-    print("ABLATION RUN COMPLETE")
-    print(border)
-    print("Spend report:")
-    print(
-        f"  Gemini search        primary: {spend.gemini_research_calls} calls    "
-        f"gap-fill: {spend.gemini_gap_fill_calls} calls"
-    )
-    print(
-        f"  Redactor             {spend.redactor_invocations} claude -p invocations "
-        f"({spend.prune_validation_failures} validation failures)"
-    )
-    print(f"  Leakage detector     {spend.leakage_detector_calls} LLM calls (free model: {detector_short})")
-    print(f"  Forecasters          {spend.forecaster_llm_calls} LLM calls (free models, {n_forecasters} per question)")
-    print(f"  Stacker (stack)      {spend.stacker_llm_calls_stack} calls ({spend.fallback_stacker_stack} fallback)")
-    print(
-        f"  Stacker (stack_aug)        {spend.stacker_llm_calls_stack_aug} calls ({spend.fallback_stacker_stack_aug} fallback)"
-    )
-    print(f"  Parser               {spend.parser_llm_calls} calls (free model: {parser_short})")
-    print(
-        f"  Cache hits           research={spend.cached_research_hits}  "
-        f"prune={spend.cached_prune_hits}  "
-        f"screen={spend.cached_screen_hits}  forecast={spend.cached_forecaster_hits}  "
-        f"stack={spend.cached_stacker_hits.get(ARM_STACK, 0)}  "
-        f"stack_aug={spend.cached_stacker_hits.get(ARM_STACK_AUG, 0)}  "
-        f"pdf={spend.cached_stacker_hits.get(ARM_PDF, 0)}  "
-        f"median={spend.cached_stacker_hits.get(ARM_MEDIAN, 0)}"
-    )
-    print()
-    print(
-        f"Results: {n_clean} questions in working set "
-        f"({n_leaked} leaked, {n_dropped_other} other drops "
-        "(prune/qa_iterate))"
-    )
-    print(f"  Binary:  {by_type['binary']} questions")
-    print(f"  MC:      {by_type['multiple_choice']} questions")
-    print(f"  Numeric: {by_type['numeric']} questions")
-    if summary_path is not None:
-        print()
-        print(f"Summary written to: {summary_path}")
-        print()
-        print(f"Ready for sign-off — please review summary at {summary_path} before expanding the run.")
-    print(border)
+
+async def _run_arm_stages(
+    args: argparse.Namespace,
+    cache: AblationCache,
+    working: WorkingSet,
+    *,
+    spend: SpendReport,
+    plan: _StagePlan,
+) -> None:
+    """Run each requested aggregation arm, in ``_ARM_STAGES`` order."""
+    for stage in _ARM_STAGES:
+        if not plan.wants(stage.name):
+            continue
+        n = len(working.forecaster_payloads)
+        if stage.deterministic_note is None:
+            est_seconds = max(30, n * 30 // max(1, args.concurrency))
+            logger.info("stage=%s START | est wall-clock ~%d min (n=%d)", stage.name, est_seconds // 60 + 1, n)
+        else:
+            logger.info("stage=%s START | est wall-clock ~1 min (n=%d, %s)", stage.name, n, stage.deterministic_note)
+        await _stage_stack(args, cache, working, arm=stage.arm, force=plan.is_forced(stage.name), spend=spend)
+        logger.info("stage=%s DONE | qids=%d", stage.name, len(working.stacker_payloads.get(stage.report_arm, {})))
+        if stage.deterministic_note is None:
+            await asyncio.sleep(plan.sleep_seconds)
+
+
+def _run_score_stage(args: argparse.Namespace, cache: AblationCache, working: WorkingSet) -> Path | None:
+    """Score the run, or return None (after a WARN) when no arm produced any payload."""
+    logger.info("stage=score START")
+    if not _qids_with_any_arm_payload(working):
+        arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
+        logger.warning("score | no qids have any arm payloads %s; skipping", arm_counts)
+        return None
+    summary_path = _stage_score(args, cache, working)
+    logger.info("stage=score DONE | summary=%s", summary_path)
+    return summary_path
 
 
 async def run_ablation(args: argparse.Namespace) -> int:
@@ -1961,86 +877,25 @@ async def run_ablation(args: argparse.Namespace) -> int:
     working = WorkingSet()
     spend = SpendReport()
 
-    requested = set(args.stages)
     forced_explicit = set(args.force_stages)
     forced = _expand_forced_stages(forced_explicit)
     if forced != forced_explicit:
         logger.info("forced stages (after cascade): %s", sorted(forced))
+    plan = _StagePlan(requested=set(args.stages), forced=forced, sleep_seconds=args.per_question_sleep)
 
-    sleep_seconds = args.per_question_sleep
-    score_only = requested == {"score"}
-
-    if score_only:
-        await _hydrate_working_set_from_cache(cache, working, spend=spend, stacker_slug=_active_stacker_slug(args))
-        if args.qids:
-            missing = _filter_working_set_to_qids(working, args.qids)
-            if missing:
-                logger.error("--qids filter: %d qids not in working set: %s", len(missing), sorted(missing))
-        # Per-comparison N: only need at least some qids with >= 2 arm payloads.
-        all_arm_qids: set[int] = set()
-        for arm_payloads in working.stacker_payloads.values():
-            all_arm_qids.update(arm_payloads.keys())
-        if not all_arm_qids:
-            arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
-            logger.error(
-                "Cannot run 'score': zero qids have any stacker outputs %s.",
-                arm_counts,
-            )
-            print("ERROR: --stages score: zero qids have any arm payloads.")
-            return 2
-        summary_path = _stage_score(args, cache, working)
-        _print_spend_report(spend, working, summary_path)
-        return 0
+    if plan.requested == {"score"}:
+        return await _run_score_only(args, cache, working, spend)
 
     # Full pipeline (or any subset that includes upstream stages).
-    if "fetch" in requested:
+    if plan.wants("fetch"):
         logger.info("stage=fetch START")
         await _stage_fetch(args, cache, working)
         logger.info("stage=fetch DONE | qids=%d", len(working.questions))
     else:
         await _hydrate_working_set_from_cache(cache, working, stacker_slug=_active_stacker_slug(args))
-        if args.qids:
-            missing = _filter_working_set_to_qids(working, args.qids)
-            if missing:
-                logger.error("--qids filter: %d qids not in working set: %s", len(missing), sorted(missing))
+        _apply_qids_filter(working, args.qids)
 
-    if "research" in requested:
-        n = len(working.questions)
-        # Gemini grounded search ~30s/qid, parallelism = args.concurrency.
-        est_seconds = max(30, n * 30 // max(1, args.concurrency))
-        logger.info("stage=research START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
-        force = "research" in forced
-        await _stage_research(args, cache, working, force=force, spend=spend)
-        logger.info("stage=research DONE | qids_with_blob=%d", len(working.research_blobs))
-        await asyncio.sleep(sleep_seconds)
-
-    if "prune" in requested:
-        n = len(working.research_blobs)
-        # Redactor: ~30s/batch × ceil(n/batch_size).
-        n_batches = (n + PRUNE_DEFAULT_BATCH_SIZE - 1) // max(1, PRUNE_DEFAULT_BATCH_SIZE) if n else 0
-        est_seconds = max(30, n_batches * 30)
-        logger.info(
-            "stage=prune START | est wall-clock ~%d min (n=%d, batches=%d)", est_seconds // 60 + 1, n, n_batches
-        )
-        force = "prune" in forced
-        await _stage_prune(args, cache, working, force=force, spend=spend)
-        logger.info(
-            "stage=prune DONE | qids_with_sanitized_blob=%d | validation_failures=%d",
-            len(working.research_blobs),
-            spend.prune_validation_failures,
-        )
-        await asyncio.sleep(sleep_seconds)
-
-    if "screen" in requested:
-        n = len(working.research_blobs)
-        est_seconds = max(15, n * 10 // max(1, args.concurrency))
-        logger.info("stage=screen START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
-        force = "screen" in forced
-        await _stage_screen(args, cache, working, force=force, spend=spend)
-        # Verdict dicts have a fixed schema; ``is_leaked`` always present.
-        n_leaked = sum(1 for v in working.leakage_verdicts.values() if v["is_leaked"])
-        logger.info("stage=screen DONE | leaked=%d clean=%d", n_leaked, len(working.research_blobs))
-        await asyncio.sleep(sleep_seconds)
+    await _run_research_stages(args, cache, working, spend=spend, plan=plan)
 
     if args.qa_research:
         qa_path = _stage_qa_research_dump(args, cache, working)
@@ -2048,106 +903,15 @@ async def run_ablation(args: argparse.Namespace) -> int:
         _print_spend_report(spend, working, summary_path=None)
         return 0
 
-    if "qa_iterate" in requested:
-        logger.info("stage=qa_iterate START mode=%s", args.qa_iterate_mode)
-        outcomes, qa_summary_path = await _stage_qa_iterate(args, cache, working, force="qa_iterate" in forced)
-        n_clean = sum(1 for o in outcomes.values() if o.final_status == "clean")
-        n_rejected = len(outcomes) - n_clean
-        # Sleep BEFORE the halt-mode raise so the inter-stage pause symmetry
-        # matches advisory mode and so the operator's preferred backoff time
-        # is honored even when halting after the verifier batch.
-        await asyncio.sleep(sleep_seconds)
-        # Strict halt: always block in halt mode so the operator reviews the QA
-        # summary before forecast spend, even on a fully-clean batch. Resume with
-        # --stages forecast,stack,stack_aug,pdf,median,score after review.
-        if args.qa_iterate_mode == "halt" and qa_summary_path is not None:
-            raise RuntimeError(
-                f"QA iteration halted: {n_rejected} rejects + {n_clean} clean qids. "
-                f"Review {qa_summary_path}. To resume after review:\n"
-                f"  1. (Optional) edit {cache.root}/manual_rejects.json to override rejects.\n"
-                f"  2. Run: --stages forecast,stack,stack_aug,pdf,median,score (note: this skips qa_iterate; "
-                f"manual_rejects is only consulted when qa_iterate is in --stages)."
-            )
+    if plan.wants("qa_iterate"):
+        await _run_qa_iterate_stage(args, cache, working, plan=plan)
 
-    if "forecast" in requested:
-        n = len(working.research_blobs)
-        n_forecasters = len(FREE_FORECASTER_MODELS)
-        rl_kwargs = _rate_limit_mode_kwargs(args.rate_limit_mode)
-        per_forecaster_concurrency = max(1, rl_kwargs["per_forecaster_concurrency"])
-        # Forecaster: ~30s/call serially per question, parallelism =
-        # (per_question_concurrency × per_forecaster_concurrency).
-        per_question_seconds = (n_forecasters * 30) // per_forecaster_concurrency
-        global_parallel = max(1, args.concurrency)
-        est_seconds = max(60, n * per_question_seconds // global_parallel)
-        logger.info(
-            "stage=forecast START | est wall-clock ~%d min (n=%d × n_forecasters=%d / "
-            "per_forecaster_concurrency=%d / question_concurrency=%d)",
-            est_seconds // 60 + 1,
-            n,
-            n_forecasters,
-            per_forecaster_concurrency,
-            global_parallel,
-        )
-        force = "forecast" in forced
-        await _stage_forecast(args, cache, working, force=force, spend=spend)
-        logger.info("stage=forecast DONE | qids=%d", len(working.forecaster_payloads))
-        await asyncio.sleep(sleep_seconds)
+    if plan.wants("forecast"):
+        await _run_forecast_stage(args, cache, working, spend=spend, plan=plan)
 
-    if "stack" in requested:
-        n = len(working.forecaster_payloads)
-        est_seconds = max(30, n * 30 // max(1, args.concurrency))
-        logger.info("stage=stack START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
-        force = "stack" in forced
-        await _stage_stack(args, cache, working, arm=ARM_STACK, force=force, spend=spend)
-        logger.info("stage=stack DONE | qids=%d", len(working.stacker_payloads.get(ARM_STACK, {})))
-        await asyncio.sleep(sleep_seconds)
+    await _run_arm_stages(args, cache, working, spend=spend, plan=plan)
 
-    if "stack_aug" in requested:
-        n = len(working.forecaster_payloads)
-        est_seconds = max(30, n * 30 // max(1, args.concurrency))
-        logger.info("stage=stack_aug START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
-        force = "stack_aug" in forced
-        await _stage_stack(args, cache, working, arm=ARM_STACK_AUG, force=force, spend=spend)
-        logger.info("stage=stack_aug DONE | qids=%d", len(working.stacker_payloads.get(ARM_STACK_AUG, {})))
-        await asyncio.sleep(sleep_seconds)
-
-    if "pdf" in requested:
-        n = len(working.forecaster_payloads)
-        logger.info("stage=pdf START | est wall-clock ~1 min (n=%d, deterministic structured-math)", n)
-        force = "pdf" in forced
-        await _stage_stack(args, cache, working, arm=ARM_PDF, force=force, spend=spend)
-        logger.info("stage=pdf DONE | qids=%d", len(working.stacker_payloads.get(ARM_PDF_MIN2, {})))
-        # No inter-stage sleep — ARM_PDF does zero API work.
-
-    if "median" in requested:
-        n = len(working.forecaster_payloads)
-        logger.info("stage=median START | est wall-clock ~1 min (n=%d, deterministic aggregation)", n)
-        force = "median" in forced
-        await _stage_stack(args, cache, working, arm=ARM_MEDIAN, force=force, spend=spend)
-        logger.info("stage=median DONE | qids=%d", len(working.stacker_payloads.get(ARM_MEDIAN, {})))
-        # No inter-stage sleep — ARM_MEDIAN does zero API work.
-
-    if "mean" in requested:
-        n = len(working.forecaster_payloads)
-        logger.info("stage=mean START | est wall-clock ~1 min (n=%d, deterministic aggregation)", n)
-        force = "mean" in forced
-        await _stage_stack(args, cache, working, arm=ARM_MEAN, force=force, spend=spend)
-        logger.info("stage=mean DONE | qids=%d", len(working.stacker_payloads.get(ARM_MEAN, {})))
-        # No inter-stage sleep — ARM_MEAN does zero API work.
-
-    summary_path: Path | None = None
-    if "score" in requested:
-        logger.info("stage=score START")
-        all_arm_qids = set()
-        for arm_payloads in working.stacker_payloads.values():
-            all_arm_qids.update(arm_payloads.keys())
-        if not all_arm_qids:
-            arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
-            logger.warning("score | no qids have any arm payloads %s; skipping", arm_counts)
-        else:
-            summary_path = _stage_score(args, cache, working)
-            logger.info("stage=score DONE | summary=%s", summary_path)
-
+    summary_path = _run_score_stage(args, cache, working) if plan.wants("score") else None
     _print_spend_report(spend, working, summary_path)
     return 0
 
@@ -2172,7 +936,9 @@ def _configure_logging(args: argparse.Namespace, cache_dir: Path) -> Path:
     """
     logs_dir = cache_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # astimezone() attaches the local zone without shifting the wall clock, so the
+    # run-log filename stays local-time (what the operator greps) and tz-aware.
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     log_path = logs_dir / f"run_{timestamp}.log"
 
     level = getattr(logging, args.log_level.upper())

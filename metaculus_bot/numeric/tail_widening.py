@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import NamedTuple
 
 import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
@@ -91,6 +92,177 @@ def _tail_weight(p: float, tail_start: float) -> float:
     return min(1.0, (t - no_widen_zone) / tail_start)
 
 
+class _TailIndices(NamedTuple):
+    """Positions of the six percentiles the span-floor and outer-span rules key on.
+
+    ``None`` where the declaration does not carry that percentile — both rules are
+    skipped rather than approximated when a member of their triple is missing.
+    """
+
+    p025: int | None
+    p05: int | None
+    p10: int | None
+    p90: int | None
+    p95: int | None
+    p975: int | None
+
+
+def _validate_widening_knobs(k_tail: float, span_floor_gamma: float) -> None:
+    if k_tail < 1.0:
+        raise ValueError(
+            f"k_tail={k_tail} is invalid: narrowing is not implemented (k_tail < 1.0). "
+            "Only widening (k_tail >= 1.0) is supported; k_tail=1.0 is the identity "
+            "pass. See scratch_docs_and_planning/tail_widening_empirical_calibration.md."
+        )
+    if span_floor_gamma < 0.0:
+        raise ValueError(
+            f"span_floor_gamma={span_floor_gamma} is invalid: must be >= 0.0. "
+            "Use 0.0 to disable the floor check; any positive value enables it."
+        )
+
+
+def _stretch_tails(
+    p_vals: np.ndarray,
+    x_vals: np.ndarray,
+    question: NumericQuestion,
+    *,
+    k_tail: float,
+    tail_start: float,
+) -> np.ndarray:
+    """Scale each percentile's distance from the median in a bound-aware transform space.
+
+    Returns the widened values clamped back into ``[lower_bound, upper_bound]``. With
+    ``k_tail == 1.0`` the transform round-trip is skipped entirely and the declared
+    values pass through, so the identity case cannot drift on floating point.
+    """
+    lower = float(question.lower_bound)
+    upper = float(question.upper_bound)
+    eps = max(1e-12, max(upper - lower, 1e-12) * 1e-12)
+    fwd, inv = _choose_transform(question, eps)
+
+    y_vals = np.array([fwd(x) for x in x_vals], dtype=float)
+
+    # Locate the median in transformed space; interpolate in p-space when p=0.5 is absent.
+    if any(abs(p - 0.5) < 1e-12 for p in p_vals):
+        y_m = float(y_vals[np.argmin(np.abs(p_vals - 0.5))])
+    else:
+        y_m = float(np.interp(0.5, p_vals, y_vals))
+
+    k_delta = max(0.0, k_tail - 1.0)
+    widened_y = []
+    for p, y in zip(p_vals, y_vals, strict=True):
+        k_eff = 1.0 + k_delta * _tail_weight(p, tail_start)
+        widened_y.append(y_m + k_eff * (y - y_m))
+
+    widened_x = np.array([inv(y) for y in widened_y], dtype=float) if k_tail > 1.0 else x_vals.copy()
+    return np.clip(widened_x, lower, upper)
+
+
+def _locate_tail_indices(p_vals: np.ndarray) -> _TailIndices:
+    def _find_index(target: float) -> int | None:
+        idxs = np.where(np.isclose(p_vals, target, atol=5e-6))[0]
+        return int(idxs[0]) if len(idxs) else None
+
+    return _TailIndices(
+        p025=_find_index(0.025),
+        p05=_find_index(0.05),
+        p10=_find_index(0.10),
+        p90=_find_index(0.90),
+        p95=_find_index(0.95),
+        p975=_find_index(0.975),
+    )
+
+
+def _apply_span_floors(
+    widened_x: np.ndarray,
+    tail_idx: _TailIndices,
+    span_floor_gamma: float,
+    question: NumericQuestion,
+) -> None:
+    """Enforce ``(p05 - p025) >= gamma * (p10 - p05)`` and its upper mirror, in place."""
+    if span_floor_gamma <= 0:
+        return
+
+    if None not in (tail_idx.p025, tail_idx.p05, tail_idx.p10):
+        inner = max(0.0, widened_x[tail_idx.p10] - widened_x[tail_idx.p05])
+        target_span = span_floor_gamma * inner
+        current = widened_x[tail_idx.p05] - widened_x[tail_idx.p025]
+        if target_span > current + 1e-15:
+            widened_x[tail_idx.p025] = max(float(question.lower_bound), widened_x[tail_idx.p05] - target_span)
+
+    if None not in (tail_idx.p90, tail_idx.p95, tail_idx.p975):
+        inner = max(0.0, widened_x[tail_idx.p95] - widened_x[tail_idx.p90])
+        target_span = span_floor_gamma * inner
+        current = widened_x[tail_idx.p975] - widened_x[tail_idx.p95]
+        if target_span > current + 1e-15:
+            widened_x[tail_idx.p975] = min(float(question.upper_bound), widened_x[tail_idx.p95] + target_span)
+
+
+def _preserve_outer_spans(
+    widened_x: np.ndarray,
+    x_vals: np.ndarray,
+    tail_idx: _TailIndices,
+    question: NumericQuestion,
+) -> None:
+    """Keep the outer tail spans from SHRINKING relative to the declaration, in place.
+
+    Widening is monotone in the transform space but not necessarily in value space once
+    the bound clamp and span floors have run, so this guards the case where the caller
+    asked for wider tails and a pass above narrowed one.
+    """
+    if None not in (tail_idx.p025, tail_idx.p05):
+        base_low_outer = x_vals[tail_idx.p05] - x_vals[tail_idx.p025]
+        new_low_outer = widened_x[tail_idx.p05] - widened_x[tail_idx.p025]
+        if new_low_outer + 1e-15 < base_low_outer:
+            widened_x[tail_idx.p025] = max(float(question.lower_bound), widened_x[tail_idx.p05] - base_low_outer)
+
+    if None not in (tail_idx.p95, tail_idx.p975):
+        base_up_outer = x_vals[tail_idx.p975] - x_vals[tail_idx.p95]
+        new_up_outer = widened_x[tail_idx.p975] - widened_x[tail_idx.p95]
+        if new_up_outer + 1e-15 < base_up_outer:
+            widened_x[tail_idx.p975] = min(float(question.upper_bound), widened_x[tail_idx.p95] + base_up_outer)
+
+
+def _nudge_off_open_bounds(updated: list[float], question: NumericQuestion, value_floor: float) -> None:
+    """Pull the extreme tails off an OPEN bound so they aren't near-duplicates of the edge."""
+    if question.open_lower_bound:
+        updated[0] = max(updated[0], float(question.lower_bound) + value_floor)
+        if len(updated) >= 2:
+            updated[1] = max(updated[1], updated[0] + value_floor)
+    if question.open_upper_bound:
+        updated[-1] = min(updated[-1], float(question.upper_bound) - value_floor)
+        if len(updated) >= 2:
+            updated[-2] = min(updated[-2], updated[-1] - value_floor)
+
+
+def _apply_spacing_schedule(updated: list[float], question: NumericQuestion, value_floor: float) -> None:
+    """Keep ``value_floor`` between neighbours while reserving room for the points above.
+
+    The forward pass leaves each point at least ``value_floor`` above its predecessor; on
+    an open upper bound its ceiling shrinks by one floor per remaining point so the sweep
+    can never run the tail into ``U``. The backward pass mirrors it.
+    """
+    if len(updated) < 2:
+        return
+
+    lower = float(question.lower_bound)
+    upper = float(question.upper_bound)
+    open_low = bool(question.open_lower_bound)
+    open_up = bool(question.open_upper_bound)
+
+    for i in range(1, len(updated)):
+        min_allowed = updated[i - 1] + value_floor
+        max_allowed = upper - value_floor * (len(updated) - 1 - i) if open_up else upper
+        if updated[i] < min_allowed:
+            updated[i] = min(max_allowed, min_allowed)
+
+    for i in range(len(updated) - 2, -1, -1):
+        max_allowed = updated[i + 1] - value_floor
+        min_allowed = lower + value_floor * i if open_low else lower
+        if updated[i] > max_allowed:
+            updated[i] = max(min_allowed, max_allowed)
+
+
 def widen_declared_percentiles(
     percentile_list: list[Percentile],
     question: NumericQuestion,
@@ -123,153 +295,46 @@ def widen_declared_percentiles(
         declare unusually sharp tails.
     """
 
-    if k_tail < 1.0:
-        raise ValueError(
-            f"k_tail={k_tail} is invalid: narrowing is not implemented (k_tail < 1.0). "
-            "Only widening (k_tail >= 1.0) is supported; k_tail=1.0 is the identity "
-            "pass. See scratch_docs_and_planning/tail_widening_empirical_calibration.md."
-        )
-    if span_floor_gamma < 0.0:
-        raise ValueError(
-            f"span_floor_gamma={span_floor_gamma} is invalid: must be >= 0.0. "
-            "Use 0.0 to disable the floor check; any positive value enables it."
-        )
+    _validate_widening_knobs(k_tail, span_floor_gamma)
 
     # If no percentiles, or both widening and span-floor disabled, bail out
     if not percentile_list or (k_tail <= 1.0 and span_floor_gamma <= 0.0):
         return percentile_list
 
-    L = float(question.lower_bound)
-    U = float(question.upper_bound)
-    rng = max(U - L, 1e-12)
-
-    eps = max(1e-12, rng * 1e-12)
-    fwd, inv = _choose_transform(question, eps)
+    range_size = max(float(question.upper_bound) - float(question.lower_bound), 1e-12)
 
     # Build arrays in percentile order
     p_vals = np.array([float(p.percentile) for p in percentile_list], dtype=float)
     x_vals = np.array([float(p.value) for p in percentile_list], dtype=float)
 
-    # Transform and find median in transformed space
-    y_vals = np.array([fwd(x) for x in x_vals], dtype=float)
+    widened_x = _stretch_tails(p_vals, x_vals, question, k_tail=k_tail, tail_start=tail_start)
 
-    # Locate median index by p=0.5; if not present, interpolate y_median between neighbors
-    if any(abs(p - 0.5) < 1e-12 for p in p_vals):
-        y_m = float(y_vals[np.argmin(np.abs(p_vals - 0.5))])
-    else:
-        # Simple linear interpolation in p-space for y
-        y_m = float(np.interp(0.5, p_vals, y_vals))
-
-    # Apply tail ramp widening
-    k_delta = max(0.0, k_tail - 1.0)
-    widened_y = []
-    for p, y in zip(p_vals, y_vals):
-        w = _tail_weight(p, tail_start)
-        k_eff = 1.0 + k_delta * w
-        widened_y.append(y_m + k_eff * (y - y_m))
-    widened_y_arr = np.array(widened_y, dtype=float)
-
-    # Inverse transform back to x-space (or keep original if k_tail<=1)
+    tail_idx = _locate_tail_indices(p_vals)
+    _apply_span_floors(widened_x, tail_idx, span_floor_gamma, question)
     if k_tail > 1.0:
-        widened_x = np.array([inv(y) for y in widened_y_arr], dtype=float)
-    else:
-        widened_x = x_vals.copy()
-
-    # Clamp to numeric bounds
-    widened_x = np.clip(widened_x, L, U)
-
-    # Enforce span floors at extremes if available
-    # Require presence of 2.5, 5, 10 and 90, 95, 97.5
-    def _find_index(target: float) -> int | None:
-        idxs = np.where(np.isclose(p_vals, target, atol=5e-6))[0]
-        return int(idxs[0]) if len(idxs) else None
-
-    i025 = _find_index(0.025)
-    i05 = _find_index(0.05)
-    i10 = _find_index(0.10)
-    i90 = _find_index(0.90)
-    i95 = _find_index(0.95)
-    i975 = _find_index(0.975)
-
-    if span_floor_gamma > 0 and None not in (i025, i05, i10):
-        inner = max(0.0, widened_x[i10] - widened_x[i05])
-        target_span = span_floor_gamma * inner
-        current = widened_x[i05] - widened_x[i025]
-        if target_span > current + 1e-15:
-            widened_x[i025] = max(L, widened_x[i05] - target_span)
-
-    if span_floor_gamma > 0 and None not in (i90, i95, i975):
-        inner = max(0.0, widened_x[i95] - widened_x[i90])
-        target_span = span_floor_gamma * inner
-        current = widened_x[i975] - widened_x[i95]
-        if target_span > current + 1e-15:
-            widened_x[i975] = min(U, widened_x[i95] + target_span)
-
-    # Ensure outer spans do not shrink relative to baseline when widening is requested
-    if k_tail > 1.0:
-        if None not in (i025, i05):
-            base_low_outer = x_vals[i05] - x_vals[i025]
-            new_low_outer = widened_x[i05] - widened_x[i025]
-            if new_low_outer + 1e-15 < base_low_outer:
-                widened_x[i025] = max(L, widened_x[i05] - base_low_outer)
-        if None not in (i95, i975):
-            base_up_outer = x_vals[i975] - x_vals[i95]
-            new_up_outer = widened_x[i975] - widened_x[i95]
-            if new_up_outer + 1e-15 < base_up_outer:
-                widened_x[i975] = min(U, widened_x[i95] + base_up_outer)
-
-    # Ensure strictly increasing and within bounds
-    updated = widened_x.tolist()
+        _preserve_outer_spans(widened_x, x_vals, tail_idx, question)
 
     # A final gentle pass to guarantee strict monotonicity and bound proximity
-    range_size = rng
-    updated = ensure_strictly_increasing_bounded(updated, question, range_size)
+    updated = ensure_strictly_increasing_bounded(widened_x.tolist(), question, range_size)
 
-    # For open bounds, nudge tails away from exact bounds to avoid near-duplicates against range
-    open_low = bool(question.open_lower_bound)
-    open_up = bool(question.open_upper_bound)
-    # Use a modest floor to avoid unit-mismatch detector (relative to range)
+    # Modest floor relative to the range, so the unit-mismatch detector isn't tripped.
     value_floor = max(range_size * 1e-6, 1e-8)
-    if open_low:
-        updated[0] = max(updated[0], L + value_floor)
-        if len(updated) >= 2:
-            updated[1] = max(updated[1], updated[0] + value_floor)
-    if open_up:
-        updated[-1] = min(updated[-1], U - value_floor)
-        if len(updated) >= 2:
-            updated[-2] = min(updated[-2], updated[-1] - value_floor)
-    # Re-ensure monotonic after nudging
+    _nudge_off_open_bounds(updated, question, value_floor)
     updated = ensure_strictly_increasing_bounded(updated, question, range_size)
 
-    # Final safety: clamp and enforce monotonicity within [L, U] for semi-bounded cases
-    updated = np.clip(updated, L, U).tolist()
-    # Build a small spacing schedule so we never exceed U while preserving order
-    if len(updated) >= 2:
-        # Forward pass: ensure each is at least value_floor above previous
-        for i in range(1, len(updated)):
-            min_allowed = updated[i - 1] + value_floor
-            max_allowed = U - value_floor * (len(updated) - 1 - i) if open_up else U
-            if updated[i] < min_allowed:
-                updated[i] = min(max_allowed, min_allowed)
-        # Backward pass: ensure each is at most value_floor below next
-        for i in range(len(updated) - 2, -1, -1):
-            max_allowed = updated[i + 1] - value_floor
-            min_allowed = L + value_floor * i if open_low else L
-            if updated[i] > max_allowed:
-                updated[i] = max(min_allowed, max_allowed)
+    # Final safety: clamp into [L, U], then re-space so ordering survives the clamp.
+    updated = np.clip(updated, float(question.lower_bound), float(question.upper_bound)).tolist()
+    _apply_spacing_schedule(updated, question, value_floor)
 
     # Rebuild Percentile objects preserving original percentiles
-    result: list[Percentile] = [Percentile(value=float(v), percentile=float(p)) for v, p in zip(updated, p_vals)]
+    result: list[Percentile] = [
+        Percentile(value=float(v), percentile=float(p)) for v, p in zip(updated, p_vals, strict=True)
+    ]
 
-    try:
-        # Quick sanity: monotone increasing
-        deltas = np.diff([pp.value for pp in result])
-        if not np.all(deltas > -1e-12):
-            logger.warning(
-                "Tail widening produced non-monotone sequence; enforced correction applied | Q=%s",
-                getattr(question, "id_of_question", None),
-            )
-    except Exception as e:
-        logger.warning(f"Monotonicity check failed: {e}")
+    if not np.all(np.diff([pp.value for pp in result]) > -1e-12):
+        logger.warning(
+            "Tail widening produced non-monotone sequence; enforced correction applied | Q=%s",
+            getattr(question, "id_of_question", None),
+        )
 
     return result

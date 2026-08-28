@@ -178,7 +178,7 @@ class TestApplyMCPlatt:
         total = sum(clamped)
         expected = [q / total for q in clamped]
 
-        for option, exp in zip(result.predicted_options, expected):
+        for option, exp in zip(result.predicted_options, expected, strict=True):
             assert option.probability == pytest.approx(exp, abs=1e-9)
         # Sum to 1 invariant.
         assert sum(o.probability for o in result.predicted_options) == pytest.approx(1.0, abs=1e-9)
@@ -223,7 +223,7 @@ class TestApplyMCPlatt:
         raw = small + large
         assert sum(raw) == pytest.approx(1.0, abs=1e-12)
         names = [f"opt_{i}" for i in range(len(raw))]
-        opts = self._make_options(list(zip(names, raw)))
+        opts = self._make_options(list(zip(names, raw, strict=True)))
 
         result = apply_mc_platt(opts, params)
 
@@ -233,7 +233,7 @@ class TestApplyMCPlatt:
         total = sum(clamped)
         expected = [q / total for q in clamped]
 
-        for option, exp in zip(result.predicted_options, expected):
+        for option, exp in zip(result.predicted_options, expected, strict=True):
             assert option.probability == pytest.approx(exp, abs=1e-9)
 
         # Sum-to-one invariant.
@@ -310,7 +310,7 @@ class TestFitPlatt:
         n = 200
         raw_probs = rng.uniform(0.05, 0.95, size=n)
         outcomes = (raw_probs < 0.5).tolist()
-        with pytest.raises(ValueError, match="non-positive slope|anti-correlated"):
+        with pytest.raises(ValueError, match=r"non-positive slope|anti-correlated"):
             fit_platt(raw_probs.tolist(), outcomes)
 
     def test_uninformative_forecaster_raises_below_slope_threshold(self):

@@ -248,7 +248,7 @@ class NumericStructured(BaseModel):
                 f"NumericStructured.declared_percentiles must include at least "
                 f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}, missing {sorted(missing)}"
             )
-        for pct in v.keys():
+        for pct in v:
             if not (0.0 <= pct <= 1.0):
                 raise ValueError(f"Percentile keys must be in [0, 1], got {pct}")
         sorted_keys = sorted(v.keys())
@@ -456,36 +456,42 @@ def iter_balanced_braces(s: str) -> Iterator[str]:
         start_idx = s.find("{", idx)
         if start_idx == -1:
             return
-        depth = 0
-        in_string = False
-        escape_next = False
-        closed = False
-        i = start_idx
-        while i < length:
-            c = s[i]
-            if escape_next:
-                escape_next = False
-            elif in_string:
-                if c == "\\":
-                    escape_next = True
-                elif c == '"':
-                    in_string = False
-            elif c == '"':
-                in_string = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    yield s[start_idx : i + 1]
-                    closed = True
-                    break
-            i += 1
-        if not closed:
+        end_idx = _scan_to_matching_brace(s, start_idx)
+        if end_idx is None:
             # Unbalanced from start_idx to end — no further balanced block can
             # begin inside this run, so stop.
             return
-        idx = i + 1
+        yield s[start_idx : end_idx + 1]
+        idx = end_idx + 1
+
+
+def _scan_to_matching_brace(s: str, start_idx: int) -> int | None:
+    """Index of the ``}`` that closes the ``{`` at ``start_idx``, or None if unbalanced.
+
+    String-literal-aware: braces inside JSON string literals are not counted, and
+    backslash escapes are respected so ``"\\""`` does not terminate a string.
+    """
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i in range(start_idx, len(s)):
+        c = s[i]
+        if escape_next:
+            escape_next = False
+        elif in_string:
+            if c == "\\":
+                escape_next = True
+            elif c == '"':
+                in_string = False
+        elif c == '"':
+            in_string = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
 
 
 def extract_first_balanced_braces(s: str) -> str | None:
@@ -524,6 +530,38 @@ def parse_structured_payload(
 
     ``"discrete_count"`` is intentionally unsupported at runtime — see the
     module docstring.
+    """
+    payload = _decode_structured_payload(raw_json, question_type, log_failures=log_failures)
+    if payload is None:
+        return None
+
+    model_cls = _QUESTION_TYPE_TO_MODEL[question_type]
+    try:
+        return model_cls.model_validate(payload)  # type: ignore[return-value]
+    except ValidationError as exc:
+        retry = _retry_without_binary_telemetry(model_cls, payload, question_type, exc)
+        if retry is not None:
+            return retry
+        if log_failures:
+            logger.warning(
+                "Structured block failed validation for question_type=%s: %s",
+                question_type,
+                exc,
+            )
+        return None
+
+
+def _decode_structured_payload(
+    raw_json: str,
+    question_type: Literal["binary", "numeric", "multiple_choice"],
+    *,
+    log_failures: bool,
+) -> dict | None:
+    """Size-cap, decode, and shape-check a raw structured block into a dict.
+
+    Returns None on any failure (over the byte cap, malformed JSON, a non-object payload, or
+    a ``question_type`` that contradicts the caller's). On success the expected
+    ``question_type`` is injected when absent, so the Pydantic discriminator resolves.
     """
     if len(raw_json) > _MAX_STRUCTURED_BLOCK_BYTES:
         if log_failures:
@@ -566,52 +604,48 @@ def parse_structured_payload(
 
     # Inject the expected question_type if missing so the discriminator picks the right model.
     if payload_qtype is None:
-        payload = {**payload, "question_type": question_type}
+        return {**payload, "question_type": question_type}
+    return payload
 
-    model_cls = _QUESTION_TYPE_TO_MODEL[question_type]
-    try:
-        return model_cls.model_validate(payload)  # type: ignore[return-value]
-    except ValidationError as exc:
-        # Strip-and-retry for malformed BINARY telemetry (2026-07-08). The
-        # ``base_rate_anchor`` and ``criteria_clauses`` fields are TELEMETRY
-        # ONLY — nothing in the pipeline reads them to clamp or mutate a
-        # forecast. But without this branch, a malformed anchor / clauses
-        # payload (canonical failure modes: ``criteria_clauses: null`` even
-        # though the prompt says "omit"; a reversed ``{low > high}`` anchor)
-        # would make us drop the ENTIRE block — including a perfectly good
-        # posterior_prob — silently disappearing the forecaster's base-rate
-        # blend and prior/posterior contributions from the cross-model
-        # aggregation. That would let a pure formatting bug in a telemetry
-        # field shift stacker input, violating the telemetry rollout's
-        # zero-behavior-change invariant.
-        #
-        # NOT a schema-wide before-validator: those silently coerce bad
-        # clause probs and miss the reversed-anchor case. Retry with only
-        # the telemetry fields dropped, so any error in a core field
-        # (posterior_prob, prior, base_rate, hazard, evidence, scenarios)
-        # still surfaces via the None return.
-        _TELEMETRY_FIELDS = {"base_rate_anchor", "criteria_clauses"}
-        if question_type == "binary" and _TELEMETRY_FIELDS & payload.keys():
-            stripped_keys = sorted(_TELEMETRY_FIELDS & payload.keys())
-            stripped_payload = {k: v for k, v in payload.items() if k not in _TELEMETRY_FIELDS}
-            try:
-                retry = model_cls.model_validate(stripped_payload)  # type: ignore[assignment]
-            except ValidationError:
-                pass
-            else:
-                logger.warning(
-                    "Dropping malformed telemetry fields %s and keeping core binary block (original error: %s)",
-                    stripped_keys,
-                    exc,
-                )
-                return retry  # type: ignore[return-value]
-        if log_failures:
-            logger.warning(
-                "Structured block failed validation for question_type=%s: %s",
-                question_type,
-                exc,
-            )
+
+def _retry_without_binary_telemetry(
+    model_cls: type[BaseModel],
+    payload: dict,
+    question_type: str,
+    exc: ValidationError,
+) -> StructuredBlock | None:
+    """Re-validate a failed BINARY block with only the telemetry fields dropped.
+
+    Strip-and-retry for malformed BINARY telemetry (2026-07-08). The ``base_rate_anchor``
+    and ``criteria_clauses`` fields are TELEMETRY ONLY — nothing in the pipeline reads them
+    to clamp or mutate a forecast. But without this, a malformed anchor / clauses payload
+    (canonical failure modes: ``criteria_clauses: null`` even though the prompt says "omit";
+    a reversed ``{low > high}`` anchor) would make us drop the ENTIRE block — including a
+    perfectly good posterior_prob — silently disappearing the forecaster's base-rate blend
+    and prior/posterior contributions from the cross-model aggregation. That would let a pure
+    formatting bug in a telemetry field shift stacker input, violating the telemetry
+    rollout's zero-behavior-change invariant.
+
+    NOT a schema-wide before-validator: those silently coerce bad clause probs and miss the
+    reversed-anchor case. Only the telemetry fields are dropped, so any error in a core field
+    (posterior_prob, prior, base_rate, hazard, evidence, scenarios) still surfaces as None.
+    """
+    telemetry_fields = {"base_rate_anchor", "criteria_clauses"}
+    if question_type != "binary" or not telemetry_fields & payload.keys():
         return None
+
+    stripped_keys = sorted(telemetry_fields & payload.keys())
+    stripped_payload = {k: v for k, v in payload.items() if k not in telemetry_fields}
+    try:
+        retry = model_cls.model_validate(stripped_payload)
+    except ValidationError:
+        return None
+    logger.warning(
+        "Dropping malformed telemetry fields %s and keeping core binary block (original error: %s)",
+        stripped_keys,
+        exc,
+    )
+    return retry  # type: ignore[return-value]
 
 
 def parse_structured_block(

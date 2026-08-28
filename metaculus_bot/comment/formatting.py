@@ -8,9 +8,9 @@ orchestration.
 from __future__ import annotations
 
 import logging
-from typing import Literal, Sequence
+from collections.abc import Sequence
 
-from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.comment.markers import (
@@ -32,6 +32,7 @@ from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,
 )
+from metaculus_bot.question_types import question_type_of
 from metaculus_bot.tool_runner import _feature_enabled as _tool_runner_feature_enabled
 
 logger = logging.getLogger(__name__)
@@ -77,9 +78,32 @@ def _forecasters_used_suffix(n_used: int | None, n_configured: int | None) -> st
     return f"\n{format_forecasters_used_marker(n_used, n_configured)}"
 
 
+def _stacker_outcome_markers(stacker_outcome: str) -> tuple[str, str]:
+    """The (STACKER_OUTCOME, legacy STACKED) marker pair for one outcome.
+
+    Raises on an unknown outcome rather than defaulting: a new outcome that silently
+    published as ``STACKED: false`` would misreport whether the stacker ran.
+    """
+    match stacker_outcome:
+        case "primary":
+            return STACKER_OUTCOME_PRIMARY, STACKED_MARKER_TRUE
+        case "fallback_llm":
+            return STACKER_OUTCOME_FALLBACK_LLM, STACKED_MARKER_TRUE
+        case "fallback_median":
+            return STACKER_OUTCOME_FALLBACK_MEDIAN, STACKED_MARKER_FALSE
+        case "fallback_mean":
+            return STACKER_OUTCOME_FALLBACK_MEAN, STACKED_MARKER_FALSE
+        case "skipped":
+            return STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
+        case "skipped_config_off":
+            return STACKER_OUTCOME_SKIPPED_CONFIG_OFF, STACKED_MARKER_FALSE
+        case other:
+            raise ValueError(f"Unknown stacker outcome {other!r}")
+
+
 def build_unified_explanation(
     base_text: str,
-    question: object,
+    question: MetaculusQuestion,
     aggregation_strategy: AggregationStrategy,
     stacker_outcome: str | None,
     *,
@@ -110,30 +134,8 @@ def build_unified_explanation(
         "every reachable code path in _aggregate_predictions sets it. Missing entry = real bug."
     )
 
-    match stacker_outcome:
-        case "primary":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_PRIMARY, STACKED_MARKER_TRUE
-        case "fallback_llm":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_LLM, STACKED_MARKER_TRUE
-        case "fallback_median":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEDIAN, STACKED_MARKER_FALSE
-        case "fallback_mean":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEAN, STACKED_MARKER_FALSE
-        case "skipped":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
-        case "skipped_config_off":
-            outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED_CONFIG_OFF, STACKED_MARKER_FALSE
-        case other:
-            raise ValueError(f"Unknown stacker outcome {other!r}")
-
-    if isinstance(question, BinaryQuestion):
-        qtype: Literal["binary", "numeric", "multiple_choice"] | None = "binary"
-    elif isinstance(question, NumericQuestion):
-        qtype = "numeric"
-    elif isinstance(question, MultipleChoiceQuestion):
-        qtype = "multiple_choice"
-    else:
-        qtype = None
+    outcome_marker, legacy_marker = _stacker_outcome_markers(stacker_outcome)
+    qtype = question_type_of(question)
 
     skip_reason_suffix = "" if skip_reason is None else f"\n{format_stacker_skip_reason_marker(skip_reason)}"
     tools_marker = TOOLS_USED_MARKER_TRUE if _tool_runner_feature_enabled(qtype) else TOOLS_USED_MARKER_FALSE

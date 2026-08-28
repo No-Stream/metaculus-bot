@@ -21,7 +21,7 @@ Four of these guard things that break quietly rather than loudly:
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -161,7 +161,7 @@ def _table_rows(text: str) -> list[dict[str, str]]:
         cells = [cell.strip() for cell in line.strip("| ").split(" | ")]
         if set("".join(cells)) <= {"-"}:
             continue  # the |---|---| separator
-        out.append(dict(zip(header, cells)))
+        out.append(dict(zip(header, cells, strict=False)))
     return out
 
 
@@ -205,7 +205,7 @@ class TestColumns:
         """`conf` and `relevance` are gone; `status`, `relation` and `why` replace them."""
         rendered = render_snapshot(MarketSnapshot(matches=[_row()]))
 
-        header = [line for line in rendered.split("\n") if line.startswith("| platform")][0]
+        header = next(line for line in rendered.split("\n") if line.startswith("| platform"))
         assert header == "| platform | title | prob | total_vol | OI | signal | close | status | relation | why |"
         assert TABLE_COLUMNS == (
             "platform",
@@ -227,7 +227,7 @@ class TestColumns:
             title="US unemployment rate",
             tier="same_quantity_other_cut",
             why="same BLS series, different month",
-            close=datetime(2026, 6, 30, tzinfo=timezone.utc),
+            close=datetime(2026, 6, 30, tzinfo=UTC),
         )
 
         cells = _table_rows(render_snapshot(MarketSnapshot(matches=[row])))[0]
@@ -447,7 +447,7 @@ class TestScalarPriceCell:
                 prob=None,
                 scalar=widest,
                 rules="R" * RAW_BULLET_BODY_MAX_CHARS,
-                close=datetime(2026, 12, 31, tzinfo=timezone.utc),
+                close=datetime(2026, 12, 31, tzinfo=UTC),
                 bettors=250,
             )
             for _ in range(RENDER_BUDGET)
@@ -580,7 +580,7 @@ class TestRenderBudget:
             total_volume=123456789.0,
             open_interest=98765432.0,
             is_resolved=True,
-            close_time=datetime(2026, 12, 31, tzinfo=timezone.utc),
+            close_time=datetime(2026, 12, 31, tzinfo=UTC),
         )
         return [
             _row(
@@ -592,7 +592,7 @@ class TestRenderBudget:
                 prob=None,
                 volume=123456789.0,
                 oi=98765432.0,
-                close=datetime(2026, 12, 31, tzinfo=timezone.utc),
+                close=datetime(2026, 12, 31, tzinfo=UTC),
                 resolved=index % 2 == 0,
                 children=tuple(maxed_child for _ in range(MAX_CHILD_ROWS_PER_MARKET)),
             )
@@ -609,7 +609,7 @@ class TestRenderBudget:
                 implied_prob_yes=prob,
                 total_volume=volume,
                 open_interest=volume / 2,
-                close_time=datetime(2026, 6, 30, tzinfo=timezone.utc),
+                close_time=datetime(2026, 6, 30, tzinfo=UTC),
             )
             for title, prob, volume in (
                 ("Before Nov 1, 2026", 0.175, 45_000.0),
@@ -626,7 +626,7 @@ class TestRenderBudget:
                 rules=_REAL_RULES,
                 url=_REAL_URL,
                 prob=None,
-                close=datetime(2026, 6, 30, tzinfo=timezone.utc),
+                close=datetime(2026, 6, 30, tzinfo=UTC),
                 children=outcomes,
             )
             for _ in range(RENDER_BUDGET)
@@ -653,14 +653,14 @@ class TestRenderBudget:
                 prob=None,
                 volume=123456789.0,
                 oi=98765432.0,
-                close=datetime(2026, 12, 31, tzinfo=timezone.utc),
+                close=datetime(2026, 12, 31, tzinfo=UTC),
                 children=tuple(
                     MarketChild(
                         title=f"{'C' * (CHILD_TITLE_MAX_CHARS - 2)}{index:02d}",
                         implied_prob_yes=0.91 - 0.03 * index,
                         total_volume=123456789.0,
                         open_interest=98765432.0,
-                        close_time=datetime(2026, 12, 31, tzinfo=timezone.utc),
+                        close_time=datetime(2026, 12, 31, tzinfo=UTC),
                     )
                     for index in range(MAX_CHILD_ROWS_PER_MARKET)
                 ),

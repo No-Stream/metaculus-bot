@@ -55,6 +55,9 @@ dev = [
     "h5netcdf>=1.8.1",
     "h5py>=3.16.0",
     "pyyaml>=6.0.3",
+    "deptry>=0.25.1",
+    "import-linter>=2.13",
+    "pytest-timeout>=2.4.0",
 ]
 
 [tool.uv]
@@ -88,10 +91,127 @@ module-root = ""
 
 [tool.ruff]
 line-length = 120
+target-version = "py312"
+extend-exclude = [
+    "REFERENCE_COPY_OF_*",
+    "scratch",
+    "scratch_docs_and_planning",
+    "benchmarks",
+    "backtests",
+    "report",
+]
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
-ignore = ["E501"]
+# Preview is scoped: explicit-preview-rules means prefix selectors (S, B, PL*)
+# activate only stable rules; preview rules activate only when named in select.
+preview = true
+explicit-preview-rules = true
+select = [
+    # fundamentals
+    "E",
+    "F",
+    "W",
+    "I",
+    "UP",
+    # correctness / Python footguns
+    "B",
+    "RUF",
+    "PLE",
+    "PLW",
+    "BLE",
+    "RET",
+    "A",
+    # concurrency / IO / time
+    "ASYNC",
+    "DTZ",
+    # security
+    "S",
+    # maintainability / structure
+    "C90",
+    "SIM",
+    "C4",
+    "ERA",
+    "PIE",
+    # logging
+    "LOG",
+    "G",
+    # tests
+    "PT",
+    # suppression hygiene (blanket noqa / type: ignore)
+    "PGH",
+    # debugger / print residue
+    "T10",
+    "T20",
+    # API readability at call sites
+    "FBT003",
+    # imports at module scope (deliberate exceptions carry noqa, see AGENTS.md)
+    "PLC0415",
+    # structural limits (stable)
+    "PLR0912",
+    "PLR0915",
+    # structural limits (preview, explicitly opted in)
+    "PLR0914",
+    "PLR0916",
+    "PLR0917",
+    "PLR1702",
+]
+ignore = [
+    "E501", # formatter owns line length
+    "S101", # asserts are legitimate internal invariants (and ubiquitous in tests)
+    "G004", # repo logging convention is f-strings with {var=}
+]
+# MULTIPLICATION SIGN is deliberate math typography in prompts/docstrings ("5× cost").
+allowed-confusables = ["×"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-branches = 10
+max-statements = 50
+max-positional-args = 4
+max-bool-expr = 5
+max-locals = 15
+max-nested-blocks = 4
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    # Test functions are linear scenario scripts; structural limits fit production code.
+    "C901",
+    "PLR0912",
+    "PLR0914",
+    "PLR0915",
+    "PLR0916",
+    "PLR0917",
+    "PLR1702",
+    "FBT003",   # bool positionals into local test helpers read fine
+    "S105",     # fake credentials in fixtures
+    "S106",
+    "DTZ",      # fixture datetimes follow whatever prod semantics require
+    "ASYNC230", # blocking IO inside async tests is harmless
+    "ASYNC240",
+    "PLC0415",  # function-scoped imports scope monkeypatches
+    "S603",     # subprocess in tests runs the repo's own scripts/git with fixed args
+    "S607",
+]
+# CLI entry points print by design.
+"scripts/**" = ["T201"]
+"analyze_correlations.py" = ["T201"]
+"backtest.py" = ["T201"]
+"community_benchmark.py" = ["T201"]
+"main.py" = ["T201"]
+"metaculus_bot/ablation/cli.py" = ["T201"]
+# The ablation CLI's end-of-run spend/results block, split out of cli.py.
+"metaculus_bot/ablation/reporting.py" = ["T201"]
+"metaculus_bot/check_openrouter_credits.py" = ["T201"]
+"metaculus_bot/performance_analysis/cli.py" = ["T201"]
+# Monkey-patch modules: module-global state IS the design (patch flags, counters
+# whose bytecode-atomic increments are documented load-bearing in AGENTS.md).
+# scoring_patches.py is deliberately absent: its counters moved into the
+# scoring_diagnostics dataclass singleton, so it has no `global` statement left.
+"metaculus_bot/publish_hardening.py" = ["PLW0603"]
+"metaculus_bot/publish_gate.py" = ["PLW0603"]
+"metaculus_bot/ablation/window_patch.py" = ["PLW0603"]
 
 [tool.pytest.ini_options]
 # pythonpath=["."] replaces the legacy PYTHONPATH=. env hack so tests can import
@@ -111,6 +231,11 @@ asyncio_mode = "auto"
 [tool.coverage.run]
 source = ["metaculus_bot"]
 omit = ["*/__pycache__/*", "metaculus_bot/check_openrouter_credits.py"]
+# Branch coverage: a line-covered `if` whose False arm never runs reads as 100% under
+# line coverage alone, which is exactly the shape of this codebase's risk — flag gates,
+# fail-shut guards and soft-fail fallbacks are all one-armed branches whose untaken side
+# is the interesting one. No fail_under floor: this is a measurement, not a gate.
+branch = true
 
 [tool.coverage.report]
 show_missing = true
@@ -148,3 +273,187 @@ exclude = [
 # third-party (forecasting-tools) boundary for little bug yield. Promoting the
 # core pipeline to strict is a tracked follow-on (see FUTURE.md) — best done
 # on an already-clean base rather than fighting ~900 errors at once.
+
+# Dependency hygiene: catches an import of a package nothing declares (which works
+# locally off a transitive install and dies on the next `uv lock`), and a dev-only
+# package imported by the shipped code (which works in CI's `uv sync --dev` and dies in
+# the bot workflows' `uv sync --no-dev`). Run via `make deps`.
+[tool.deptry]
+# deptry's defaults already exclude venv/.venv/.direnv/tests/.git/setup.py, and `tests`
+# must STAY excluded: deptry has no notion of a dev-only source file, so every
+# `import pytest` there would be reported as a misplaced dev dependency. The additions
+# below are the local-only trees ruff's extend-exclude already lists. All of them are
+# gitignored and deptry honors gitignore, so naming them is belt-and-suspenders — a
+# .gitignore edit must not silently pull scratch/'s ~1500 analysis scripts into the scan.
+extend_exclude = [
+    "REFERENCE_COPY_OF_.*",
+    "scratch.*",
+    "benchmarks",
+    "backtests",
+    "report",
+    "\\.claude",
+]
+
+[tool.deptry.per_rule_ignores]
+# DEP003 — imported but only a transitive dependency. Both are guaranteed present by a
+# declared direct dependency, and both are imported for exception types that surface
+# through that dependency's own API rather than for their own client:
+#   urllib3 <- requests. `from urllib3 import exceptions` in metaculus_bot/http_status.py
+#     (the one importer, since the shared is_transient_question_fetch_error absorbed the
+#     per-file copies) exists to catch ul3_exc.ProtocolError next to requests' own
+#     exceptions, because requests re-raises urllib3's type unwrapped.
+#   httpx <- openai (and asknews, exa-py, google-genai, litellm — five declared deps
+#     require it). Used directly in credit_telemetry.py, check_openrouter_credits.py and
+#     research/agentic/tools.py.
+# Declaring either directly would add a second version constraint on a package those
+# dependencies already resolve, for no gain in availability.
+DEP003 = ["urllib3", "httpx"]
+# DEP004 — dev dependency imported by the shipped package. matplotlib plotting is
+# optional at both call sites and neither is reachable on a live bot run:
+#   calibration/fit_platt_cli.py imports it inside try/except ImportError and returns a
+#     skip note that lands in the report, so the CLI works without it.
+#   research/ts_chart.py imports it at module scope, but ts_chart itself is imported
+#     lazily inside an ImportError guard in _maybe_stash_single_chart, only after the
+#     TS_ANCHOR_CHART_ENABLED gate ('false' in all five bot workflows). Under
+#     `uv sync --no-dev` that guard logs one ERROR naming matplotlib and degrades to
+#     the text-only anchor (pinned by tests/test_ts_chart.py::TestProviderChartHook::
+#     test_missing_matplotlib_degrades_to_text_only_anchor). So matplotlib must move to
+#     [project].dependencies when the flag is flipped on in a workflow — not to keep the
+#     run alive, but because otherwise the flag renders no chart at all.
+DEP004 = ["matplotlib"]
+
+# Import-direction contracts. Every contract below was derived from the real graph (grimp).
+# The first five passed as written, with no code change; the scoring one is the exception —
+# it was added together with the fix that made it pass. Run via `make lint_imports`.
+[tool.importlinter]
+root_packages = ["metaculus_bot", "scripts"]
+
+# Operator tooling depends on the library, never the reverse. scripts/ is not packaged by
+# uv_build, so a metaculus_bot -> scripts edge would import a file no prod install ships.
+# `tests` cannot be named here: it has no __init__.py, so it is not in the graph at all.
+[[tool.importlinter.contracts]]
+name = "metaculus_bot does not import operator tooling (scripts/)"
+type = "forbidden"
+source_modules = ["metaculus_bot"]
+forbidden_modules = ["scripts"]
+
+# research/ gathers the evidence the forecast stages consume; reaching back into those
+# stages would make a provider untestable without standing up the whole ensemble, and
+# routes a cycle through llm_configs (which both sides import).
+[[tool.importlinter.contracts]]
+name = "research does not import the forecast/aggregation/stacking stages"
+type = "forbidden"
+source_modules = ["metaculus_bot.research"]
+forbidden_modules = [
+    "metaculus_bot.forecaster",
+    "metaculus_bot.forecaster_runners",
+    "metaculus_bot.aggregation_pipeline",
+    "metaculus_bot.aggregation_strategies",
+    "metaculus_bot.stacking",
+    "metaculus_bot.stacking_route",
+    "metaculus_bot.post_processing",
+    "metaculus_bot.spread_metrics",
+]
+
+# numeric/ (percentiles -> PCHIP CDF) and probabilistic_tools/ are pure math over values
+# already extracted, which is what lets the CDF pipeline be tested from a plain list of
+# Percentiles. probabilistic_tools -> numeric is allowed and used (mixtures, pdf_pooling
+# and distributions all read numeric.config + numeric.pchip_cdf); only the two upward
+# directions are forbidden.
+[[tool.importlinter.contracts]]
+name = "numeric + probabilistic_tools stay independent of research and the forecaster"
+type = "forbidden"
+source_modules = ["metaculus_bot.numeric", "metaculus_bot.probabilistic_tools"]
+forbidden_modules = [
+    "metaculus_bot.research",
+    "metaculus_bot.forecaster",
+    "metaculus_bot.forecaster_runners",
+    "metaculus_bot.aggregation_pipeline",
+    "metaculus_bot.stacking",
+    "metaculus_bot.stacking_route",
+    "metaculus_bot.post_processing",
+]
+
+# The offline side — the correlation/residual analysis package and the backtest, ablation
+# and benchmark harnesses — imports the live pipeline; an edge back would put their
+# statsmodels/matplotlib-adjacent import cost inside a bot run and invite cycles.
+# Deliberately NOT extended to performance_analysis: forecaster.py and
+# comment/formatting.py both import performance_analysis.parsing today (the comment-marker
+# parsers are genuinely shared), so only ensemble_analysis is contractible on that side.
+[[tool.importlinter.contracts]]
+name = "the live pipeline does not import offline analysis or the benchmark harnesses"
+type = "forbidden"
+source_modules = [
+    "metaculus_bot.forecaster",
+    "metaculus_bot.forecaster_runners",
+    "metaculus_bot.aggregation_pipeline",
+    "metaculus_bot.stacking",
+    "metaculus_bot.stacking_route",
+    "metaculus_bot.post_processing",
+    "metaculus_bot.research",
+    "metaculus_bot.numeric",
+    "metaculus_bot.comment",
+    "metaculus_bot.value_extraction",
+    "metaculus_bot.publish_gate",
+    "metaculus_bot.cli",
+]
+forbidden_modules = [
+    "metaculus_bot.ensemble_analysis",
+    "metaculus_bot.backtest",
+    "metaculus_bot.ablation",
+    "metaculus_bot.benchmark",
+]
+
+# constants.py is imported by nearly every module in the package, so an upward import
+# there is a circular import waiting for the next module that lands. Same for the other
+# foundation leaves. prompts.py is deliberately absent from the source list: it reads
+# STANDARD_PERCENTILES_CSV out of numeric.config by design.
+[[tool.importlinter.contracts]]
+name = "foundation modules (constants, config, types, utils) do not import upward"
+type = "forbidden"
+source_modules = [
+    "metaculus_bot.constants",
+    "metaculus_bot.config",
+    "metaculus_bot.simple_types",
+    "metaculus_bot.exceptions",
+    "metaculus_bot.time_utils",
+    "metaculus_bot.http_status",
+    "metaculus_bot.question_types",
+    "metaculus_bot.utils",
+]
+forbidden_modules = [
+    "metaculus_bot.research",
+    "metaculus_bot.numeric",
+    "metaculus_bot.probabilistic_tools",
+    "metaculus_bot.comment",
+    "metaculus_bot.forecaster",
+    "metaculus_bot.forecaster_runners",
+    "metaculus_bot.aggregation_pipeline",
+    "metaculus_bot.stacking",
+    "metaculus_bot.stacking_route",
+    "metaculus_bot.post_processing",
+    "metaculus_bot.cli",
+    "metaculus_bot.prompts",
+    "metaculus_bot.llm_configs",
+    "metaculus_bot.llm_setup",
+    "metaculus_bot.value_extraction",
+    "metaculus_bot.calibration",
+    "metaculus_bot.performance_analysis",
+    "metaculus_bot.ensemble_analysis",
+    "metaculus_bot.backtest",
+    "metaculus_bot.ablation",
+    "metaculus_bot.benchmark",
+]
+
+# The scoring split cut through shared mutable state: scoring_patches imports the parsers in
+# scoring_extraction, and the parsers used to reach back into scoring_patches from inside four
+# function bodies to bump the diagnostic counters, which is a real cycle (hoisting any of those
+# imports raises ImportError on a partially initialized module). The counters now live in the
+# scoring_diagnostics leaf, which imports nothing from the package, so the back-edge is gone;
+# this contract is what stops it coming back. grimp resolves function-scoped imports, so a
+# relapse fails here whether the import sits at module scope or inside a function.
+[[tool.importlinter.contracts]]
+name = "the scoring parsers do not import the scoring patches back"
+type = "forbidden"
+source_modules = ["metaculus_bot.scoring_extraction"]
+forbidden_modules = ["metaculus_bot.scoring_patches"]

@@ -7,7 +7,7 @@ actually SURVIVES the research bundle and reaches the forecaster. Three links si
 and each is a live regression risk:
 
 - the orchestrator has to select the provider off `TS_ANCHOR_ENABLED` and stamp the section
-  with `_provider_header("timeseries_anchor")`;
+  with `provider_header("timeseries_anchor")`;
 - that header string is `prompts.TS_ANCHOR_SECTION_HEADER`, and the numeric prompt gates its
   anchor-evidence clause on finding that exact substring in the research — so a header reword
   on either side silently drops the guidance while every unit test stays green;

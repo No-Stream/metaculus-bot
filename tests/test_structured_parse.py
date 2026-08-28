@@ -92,8 +92,10 @@ class TestListWrapperUnwrap:
         assert isinstance(result, list)
         assert len(result) == 3
         assert all(isinstance(p, Percentile) for p in result)
-        assert result[0].percentile == 0.1 and result[0].value == 10.0
-        assert result[2].percentile == 0.9 and result[2].value == 90.0
+        assert result[0].percentile == 0.1
+        assert result[0].value == 10.0
+        assert result[2].percentile == 0.9
+        assert result[2].value == 90.0
 
     @pytest.mark.asyncio
     async def test_option_probability_list_wrapper_unwrap(self, parser_llm):
@@ -105,8 +107,10 @@ class TestListWrapperUnwrap:
         assert isinstance(result, list)
         assert len(result) == 2
         assert all(isinstance(o, OptionProbability) for o in result)
-        assert result[0].option_name == "A" and result[0].probability == 0.6
-        assert result[1].option_name == "B" and result[1].probability == 0.4
+        assert result[0].option_name == "A"
+        assert result[0].probability == 0.6
+        assert result[1].option_name == "B"
+        assert result[1].probability == 0.4
 
 
 class TestConstrainedLlmReceivesParserModel:

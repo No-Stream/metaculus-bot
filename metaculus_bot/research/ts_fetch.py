@@ -45,6 +45,8 @@ from typing import Literal
 
 import pandas as pd
 import requests
+import yfinance
+from yfinance.exceptions import YFException
 
 from metaculus_bot.constants import TS_ANCHOR_HTTP_TIMEOUT
 from metaculus_bot.research.http_fetch import BROWSER_HEADERS
@@ -67,7 +69,7 @@ _POLITENESS_LAST_CALL_TS: float = 0.0
 
 def _reset_politeness_clock() -> None:
     """Clear the pacing clock so a test's first fetch doesn't wait on a previous test's."""
-    global _POLITENESS_LAST_CALL_TS
+    global _POLITENESS_LAST_CALL_TS  # noqa: PLW0603  # process-wide pacing clock shared by two providers' to_thread calls
     with _POLITENESS_LOCK:
         _POLITENESS_LAST_CALL_TS = 0.0
 
@@ -99,7 +101,7 @@ def _politeness_gate() -> None:
     itself is sync and shared by two providers' ``to_thread`` calls; a thread lock is
     what both can hold correctly.
     """
-    global _POLITENESS_LAST_CALL_TS
+    global _POLITENESS_LAST_CALL_TS  # noqa: PLW0603  # process-wide pacing clock shared by two providers' to_thread calls
     if POLITENESS_SLEEP_S <= 0:
         return
     with _POLITENESS_LOCK:
@@ -255,9 +257,6 @@ def _fetch_fred_csv(spec: SeriesSpec, start: date, ceiling: date, vintage: date 
 
 
 def _fetch_yfinance_csv(spec: SeriesSpec, start: date, ceiling: date) -> bytes:
-    import yfinance  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # optional-dep pattern, matches financial_data.py
-    from yfinance.exceptions import YFException  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-
     try:
         # end is EXCLUSIVE in yfinance 1.x → ceiling + 1 day makes the ceiling inclusive.
         frame = yfinance.Ticker(spec.series_id).history(

@@ -142,10 +142,7 @@ def _parse_gap_list(raw: str, *, max_gaps: int | None = None) -> list[dict[str, 
     # payloads with trailing commentary. Both helpers live in one module so
     # the brace-scanner is fixed in one place.
     fenced = extract_json_block(raw)
-    if fenced is not None:
-        stripped = fenced
-    else:
-        stripped = extract_first_balanced_braces(raw) or raw.strip()
+    stripped = fenced if fenced is not None else extract_first_balanced_braces(raw) or raw.strip()
 
     try:
         data: Any = json.loads(stripped)
@@ -195,7 +192,9 @@ async def _run_analyzer(
     for ```json fenced output and _parse_gap_list handles fence stripping +
     balanced-brace fallback for trailing commentary.
     """
-    from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+    from metaculus_bot.fallback_openrouter import (  # noqa: PLC0415  # late import: tests patch this at its source module
+        build_llm_with_openrouter_fallback,
+    )
 
     llm = build_llm_with_openrouter_fallback(
         model=GAP_FILL_ANALYZER_MODEL,
@@ -324,7 +323,7 @@ async def run_gap_fill_pass(
     )
 
     sections: list[str] = []
-    for idx, (gap, res) in enumerate(zip(gaps, results), start=1):
+    for idx, (gap, res) in enumerate(zip(gaps, results, strict=True), start=1):
         if isinstance(res, BaseException):
             logger.warning(f"GapFill: gap #{idx} search failed ({type(res).__name__}): {res}")
             continue

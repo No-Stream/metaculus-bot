@@ -1,7 +1,7 @@
 """Tests for the research persistence write path."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from metaculus_bot.research.persistence import RESEARCH_SCHEMA_VERSION, ResearchPersistenceWriter
@@ -164,7 +164,7 @@ class TestResearchPersistenceWriter:
         record = json.loads(result.read_text().strip())
 
         ts = datetime.fromisoformat(record["timestamp"])
-        assert ts.tzinfo == timezone.utc
+        assert ts.tzinfo == UTC
 
     def test_provider_results_persisted_at_schema_v2(self, tmp_path: Path) -> None:
         writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")

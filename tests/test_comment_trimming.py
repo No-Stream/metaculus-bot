@@ -10,6 +10,7 @@ parser-compatibility check that runs the live parsing.py regexes.
 
 import json
 import math
+from typing import ClassVar
 
 import pytest
 from forecasting_tools import ReasonedPrediction
@@ -556,7 +557,8 @@ class TestParserCompatibility:
         # rationales. Whatever it retains must have valid model names.
         trimmed_map = parse_forecaster_model_map(trimmed)
         for idx, name in trimmed_map.items():
-            assert name and not name.startswith("Forecaster"), f"Forecaster {idx} attribution degraded to '{name}'"
+            assert name, f"Forecaster {idx} attribution degraded to '{name}'"
+            assert not name.startswith("Forecaster"), f"Forecaster {idx} attribution degraded to '{name}'"
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +747,7 @@ class TestAgainstCheckedInMiniComments:
 
     def _load_mini_comments(self) -> list[str]:
         from pathlib import (
-            Path,  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # matches this file's local style
+            Path,  # HARNESS-SCAN-EXEMPT-function-level-import  # matches this file's local style
         )
 
         path = Path(__file__).parent / "data" / "performance_comments_mini.jsonl"
@@ -912,7 +914,7 @@ class TestStackerCombinedBlockTrim:
     _STACKER_META_BASE = 300.0
     # Well-separated bases so a misattributed block is unmistakable in the
     # recovered percentiles (a neighbor's values would be off by hundreds).
-    _BASE_MODELS: list[tuple[str, float]] = [
+    _BASE_MODELS: ClassVar[list[tuple[str, float]]] = [
         ("openrouter/openai/gpt-5.6-sol", 100.0),
         ("openrouter/anthropic/claude-opus-4.8", 500.0),
         ("openrouter/google/gemini-3.1-pro-preview", 900.0),

@@ -11,6 +11,11 @@ This module is used by ``community_benchmark.py`` AND the active
 ``backtest.py`` / ``analyze_correlations.py`` scoring paths.
 Prefer ``backtest.py`` + ``metaculus_bot/backtest/scoring.py`` which score against
 actual question resolutions.
+
+Scope: the monkey-patch installers and the baseline-score math. The parsing layer that
+reads community forecasts off a question's ``api_json`` lives in
+``metaculus_bot/scoring_extraction.py``; the run-wide diagnostic counters both halves bump
+live in the ``metaculus_bot/scoring_diagnostics.py`` leaf. Both are re-exported below.
 """
 
 import logging
@@ -19,381 +24,118 @@ from typing import Any
 
 import numpy as np
 
+from metaculus_bot import scoring_diagnostics
+from metaculus_bot.scoring_diagnostics import (
+    get_scoring_path_stats,
+    log_scoring_path_stats,
+    reset_scoring_path_stats,
+)
+from metaculus_bot.scoring_extraction import (
+    _extract_mc_community_probs,
+    _extract_numeric_community_cdf,
+    extract_multiple_choice_probabilities,
+    extract_numeric_percentiles,
+    log_mc_vector_mismatch,
+)
+
+# Re-exported for callers that have always imported them from this module path
+# (``community_benchmark``, ``analyze_correlations``, ``ensemble_simulator``, the test
+# suite). The parsing itself now lives in ``scoring_extraction`` and the three
+# ``*_scoring_path_stats`` accessors in ``scoring_diagnostics``.
+__all__ = [
+    "apply_scoring_patches",
+    "calculate_multiple_choice_baseline_score",
+    "calculate_numeric_baseline_score",
+    "extract_multiple_choice_probabilities",
+    "extract_numeric_percentiles",
+    "get_scoring_path_stats",
+    "log_mc_vector_mismatch",
+    "log_score_scale_validation",
+    "log_scoring_path_stats",
+    "patch_error_handling",
+    "patch_multiple_choice_scoring",
+    "patch_numeric_scoring",
+    "reset_scoring_path_stats",
+]
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Scoring path counters for diagnostics across a run
-_NUMERIC_PMF_ATTEMPTS = 0
-_NUMERIC_PMF_SUCCESSES = 0
-_NUMERIC_FALLBACK_ATTEMPTS = 0
-_NUMERIC_FALLBACK_SUCCESSES = 0
-_MC_ATTEMPTS = 0
-_MC_MISSING_COMMUNITY = 0
-_MC_SUCCESSES = 0
-# MC diagnostics breakdown
-_MC_MISSING_API_JSON = 0
-_MC_MISSING_QUESTION_NODE = 0
-_MC_MISSING_AGGREGATIONS = 0
-_MC_MISSING_PROB_YES_PER_CATEGORY = 0
+_CACHE_MISS = object()
 
 
-def reset_scoring_path_stats() -> None:
-    global _NUMERIC_PMF_ATTEMPTS, _NUMERIC_PMF_SUCCESSES
-    global _NUMERIC_FALLBACK_ATTEMPTS, _NUMERIC_FALLBACK_SUCCESSES
-    global _MC_ATTEMPTS, _MC_MISSING_COMMUNITY, _MC_SUCCESSES
-    global _MC_MISSING_API_JSON, _MC_MISSING_QUESTION_NODE, _MC_MISSING_AGGREGATIONS, _MC_MISSING_PROB_YES_PER_CATEGORY
-    _NUMERIC_PMF_ATTEMPTS = 0
-    _NUMERIC_PMF_SUCCESSES = 0
-    _NUMERIC_FALLBACK_ATTEMPTS = 0
-    _NUMERIC_FALLBACK_SUCCESSES = 0
-    _MC_ATTEMPTS = 0
-    _MC_MISSING_COMMUNITY = 0
-    _MC_SUCCESSES = 0
-    _MC_MISSING_API_JSON = 0
-    _MC_MISSING_QUESTION_NODE = 0
-    _MC_MISSING_AGGREGATIONS = 0
-    _MC_MISSING_PROB_YES_PER_CATEGORY = 0
+def _cached_baseline_score(cache: dict | None, q_id: Any, q_type: str, log_label: str) -> Any:
+    """The cached score for this question, or ``_CACHE_MISS`` when nothing is cached.
 
-
-def get_scoring_path_stats() -> dict[str, float | int]:
-    total_numeric = _NUMERIC_PMF_ATTEMPTS + _NUMERIC_FALLBACK_ATTEMPTS
-    total_mc = _MC_ATTEMPTS
-    return {
-        "numeric_pmf_attempts": _NUMERIC_PMF_ATTEMPTS,
-        "numeric_pmf_successes": _NUMERIC_PMF_SUCCESSES,
-        "numeric_fallback_attempts": _NUMERIC_FALLBACK_ATTEMPTS,
-        "numeric_fallback_successes": _NUMERIC_FALLBACK_SUCCESSES,
-        "numeric_total": total_numeric,
-        "numeric_fallback_rate": ((_NUMERIC_FALLBACK_ATTEMPTS / total_numeric) if total_numeric > 0 else 0.0),
-        "mc_attempts": total_mc,
-        "mc_successes": _MC_SUCCESSES,
-        "mc_missing_community": _MC_MISSING_COMMUNITY,
-        "mc_missing_rate": ((_MC_MISSING_COMMUNITY / total_mc) if total_mc > 0 else 0.0),
-        # MC breakdown
-        "mc_missing_api_json": _MC_MISSING_API_JSON,
-        "mc_missing_question_node": _MC_MISSING_QUESTION_NODE,
-        "mc_missing_aggregations": _MC_MISSING_AGGREGATIONS,
-        "mc_missing_prob_yes_per_category": _MC_MISSING_PROB_YES_PER_CATEGORY,
-    }
-
-
-def log_scoring_path_stats() -> None:
-    stats = get_scoring_path_stats()
-    logger.info("=== SCORING PATH SUMMARY ===")
-    logger.info(
-        "Numeric: pmf_attempts=%d pmf_successes=%d fallback_attempts=%d fallback_successes=%d total=%d fallback_rate=%.2f",
-        stats["numeric_pmf_attempts"],
-        stats["numeric_pmf_successes"],
-        stats["numeric_fallback_attempts"],
-        stats["numeric_fallback_successes"],
-        stats["numeric_total"],
-        stats["numeric_fallback_rate"],
-    )
-    logger.info(
-        "MC: attempts=%d successes=%d missing_community=%d missing_rate=%.2f",
-        stats["mc_attempts"],
-        stats["mc_successes"],
-        stats["mc_missing_community"],
-        stats["mc_missing_rate"],
-    )
-    logger.info(
-        "MC missing breakdown: api_json=%d question_node=%d aggregations=%d prob_yes_per_category=%d",
-        stats["mc_missing_api_json"],
-        stats["mc_missing_question_node"],
-        stats["mc_missing_aggregations"],
-        stats["mc_missing_prob_yes_per_category"],
-    )
-
-    # Bright warnings when fallbacks dominate
-    if stats["numeric_total"] and stats["numeric_fallback_rate"] >= 0.8:
-        logger.warning(
-            "⚠️  ALERT: Numeric scoring fallback used for %.0f%% of items. Check that model predictions expose CDFs.",
-            100 * stats["numeric_fallback_rate"],
-        )
-    logger.info("=== END SCORING SUMMARY ===")
-
-
-def validate_community_prediction_count(question: Any) -> bool:
+    A cached None means "previously failed"; the caller returns it without re-logging.
+    ``log_label`` is passed rather than derived from ``q_type`` so each caller keeps its
+    own long-standing log prefix ("MC" vs "Numeric") verbatim.
     """
-    Validate that a question has sufficient community predictions (minimum 10).
-
-    Args:
-        question: MetaculusQuestion object
-
-    Returns:
-        True if question has adequate community predictions, False otherwise
-    """
-    num_predictions = getattr(question, "num_predictions", None)
-    if num_predictions is not None:
-        logger.debug(f"Question {question.id_of_question}: {num_predictions} community predictions")
-        return num_predictions >= 10
-
-    prediction_count = getattr(question, "prediction_count", None)
-    if prediction_count is not None:
-        logger.debug(f"Question {question.id_of_question}: {prediction_count} community predictions")
-        return prediction_count >= 10
-
-    community_pred = getattr(question, "community_prediction_at_access_time", None)
-    if community_pred is not None:
-        logger.debug(f"Question {question.id_of_question}: has community prediction (assuming sufficient count)")
-        return True
-
-    logger.warning(f"Question {question.id_of_question}: cannot determine community prediction count")
-    return False
+    if cache is None or q_id is None:
+        return _CACHE_MISS
+    entry = cache.get((q_id, q_type))
+    if entry is None:
+        return _CACHE_MISS
+    cached_score, _diagnostics_logged = entry
+    if cached_score is not None:
+        logger.debug(f"{log_label} Question {q_id}: using cached baseline score {cached_score:.2f}")
+    return cached_score
 
 
-def extract_multiple_choice_probabilities(
-    prediction: Any,
-) -> tuple[list[float], list[str]]:
-    """
-    Safely extracts probabilities from a PredictedOptionList, sorting by option name.
-
-    Note: forecasting_tools PredictedOption uses the field `option_name`.
-
-    Returns:
-        Tuple of (probabilities, option_names) both in sorted order
-    """
-    if not prediction or not hasattr(prediction, "predicted_options") or prediction.predicted_options is None:
-        return [], []
-    # Sort by option name to ensure consistent order
-    try:
-        sorted_options = sorted(prediction.predicted_options, key=lambda o: o.option_name)
-        option_names = [opt.option_name for opt in sorted_options]
-    except AttributeError:
-        # Fallback if mocks used a different attribute during tests
-        sorted_options = sorted(prediction.predicted_options, key=lambda o: getattr(o, "option", ""))
-        option_names = [getattr(opt, "option", f"option_{i}") for i, opt in enumerate(sorted_options)]
-    return [opt.probability for opt in sorted_options], option_names
-
-
-def extract_numeric_percentiles(prediction: Any) -> list[tuple[float, float]]:
-    """
-    Extract (percentile, value) pairs from a numeric prediction.
-
-    Args:
-        prediction: NumericDistribution or similar object
-
-    Returns:
-        List of (percentile, value) tuples
-    """
-    try:
-        if hasattr(prediction, "declared_percentiles") and prediction.declared_percentiles:
-            return [(float(p.percentile), float(p.value)) for p in prediction.declared_percentiles]
-    except (TypeError, AttributeError, ValueError) as e:
-        logger.warning(f"Failed to extract numeric percentiles: {e}")
-
-    return []
-
-
-def log_mc_vector_mismatch(
-    question: Any,
+def _report_mc_vector_mismatch(
+    report: Any,
+    *,
     bot_probs: list[float],
     community_probs: list[float],
     community_source: str,
     bot_option_names: list[str],
+    q_id: Any,
+    cache: dict | None,
 ) -> None:
-    """
-    Log detailed diagnostics for MC vector length mismatches.
+    """Log the vector-length mismatch diagnostics once per question, then cache the failure."""
+    diagnostics_logged = False
+    if cache is not None and q_id is not None:
+        entry = cache.get((q_id, "multiple_choice"))
+        if entry is not None:
+            _, diagnostics_logged = entry
 
-    Args:
-        question: MetaculusQuestion object
-        bot_probs: Bot prediction probabilities
-        community_probs: Community prediction probabilities
-        community_source: Source of community data (e.g., "forecast_values", "probability_yes_per_category")
-        bot_option_names: Option names from bot prediction (sorted)
-    """
-    qid = getattr(question, "id_of_question", "unknown")
-    question_options = getattr(question, "options", None)
+    if diagnostics_logged:
+        logger.debug(f"MC Question {q_id}: vector mismatch (diagnostics already logged)")
+        return
 
-    logger.warning(f"MC Question {qid} VECTOR MISMATCH:")
-    logger.warning(f"  Bot prediction: {len(bot_probs)} options {bot_option_names}")
-    logger.warning(f"  Community data: {len(community_probs)} options (source: {community_source})")
-
-    if question_options and isinstance(question_options, list):
-        logger.warning(f"  Question options: {len(question_options)} options {question_options}")
-
-        # Analyze potential causes
-        if len(bot_probs) == len(question_options) and len(community_probs) != len(question_options):
-            logger.warning(
-                f"  → Likely cause: Community data missing {len(question_options) - len(community_probs)} options"
-            )
-        elif len(community_probs) == len(question_options) and len(bot_probs) != len(question_options):
-            logger.warning(f"  → Likely cause: Bot prediction missing {len(question_options) - len(bot_probs)} options")
-        else:
-            logger.warning("  → Complex mismatch: bot≠question≠community")
-    else:
-        logger.warning(f"  Question options: unavailable (type={type(question_options)})")
-        logger.warning("  → Cannot determine root cause without question.options")
+    log_mc_vector_mismatch(
+        report.question,
+        bot_probs,
+        community_probs,
+        community_source=community_source,
+        bot_option_names=bot_option_names,
+    )
+    # Cache the failed result with diagnostics logged
+    if cache is not None and q_id is not None:
+        cache[(q_id, "multiple_choice")] = (None, True)
 
 
-def _extract_mc_community_probs(question: Any) -> tuple[list[float] | None, str]:
-    """Extract community option probabilities for an MC question from api_json.
+def _clamp_and_renormalize(probs: list[float]) -> list[float]:
+    """Clamp into [0.001, 0.999] then renormalize, falling back to uniform on a zero sum."""
+    clamped = [max(min(float(p), 0.999), 0.001) for p in probs]
+    total = sum(clamped)
+    if total > 0:
+        return [p / total for p in clamped]
+    return [1.0 / len(clamped)] * len(clamped)
 
-    According to the Metaculus API, community MC aggregations expose
-    `probability_yes_per_category` under `aggregations.recency_weighted.latest`.
-    We align the resulting vector to `question.options` order.
-    """
-    global \
-        _MC_MISSING_API_JSON, \
-        _MC_MISSING_QUESTION_NODE, \
-        _MC_MISSING_AGGREGATIONS, \
-        _MC_MISSING_PROB_YES_PER_CATEGORY, \
-        _MC_MISSING_COMMUNITY
-    try:
-        # Basic fingerprint
-        post_id = getattr(question, "id_of_post", None)
-        qid = getattr(question, "id_of_question", None)
-        api_json = getattr(question, "api_json", None)
-        if not isinstance(api_json, dict):
-            logger.warning(
-                "MC q=%s post=%s: api_json missing or not dict (type=%s)",
-                qid,
-                post_id,
-                type(api_json).__name__,
-            )
-            _MC_MISSING_API_JSON += 1
-            _MC_MISSING_COMMUNITY += 1
-            return None, "missing_api_json"
 
-        # Detect the question node
-        api_has_question = isinstance(api_json.get("question"), dict)
-        question_obj = api_json.get("question") if api_has_question else api_json
-        if not isinstance(question_obj, dict):
-            logger.warning(
-                "MC q=%s post=%s: missing question object (api_has_question=%s, type=%s)",
-                qid,
-                post_id,
-                api_has_question,
-                type(question_obj).__name__,
-            )
-            _MC_MISSING_QUESTION_NODE += 1
-            _MC_MISSING_COMMUNITY += 1
-            return None, "missing_question_node"
+def _mc_expected_baseline_score(bot_probs: list[float], community_probs: list[float]) -> float:
+    """100 * (E_c[ln p] / ln K + 1) over clamp-and-renormalized vectors."""
+    eps = 1e-9
+    bot_probs = _clamp_and_renormalize(bot_probs)
+    community_probs = _clamp_and_renormalize(community_probs)
 
-        qtype = question_obj.get("type")
-        options = getattr(question, "options", None)
-        if options is None and isinstance(question_obj.get("options"), list):
-            options = question_obj.get("options")
-
-        aggregations = question_obj.get("aggregations")
-        if not isinstance(aggregations, dict):
-            logger.info(
-                "MC q=%s: aggregations missing (question.type=%s). keys=%s",
-                qid,
-                qtype,
-                list(question_obj.keys()),
-            )
-            _MC_MISSING_AGGREGATIONS += 1
-            _MC_MISSING_COMMUNITY += 1
-            return None, "missing_aggregations"
-
-        rw = aggregations.get("recency_weighted")
-        rw_latest = rw.get("latest") if isinstance(rw, dict) else None
-        rw_keys = list(rw_latest.keys()) if isinstance(rw_latest, dict) else None
-        logger.debug(
-            "MC q=%s: rw.latest keys=%s (agg.keys=%s)",
-            qid,
-            rw_keys,
-            list(aggregations.keys()),
-        )
-
-        if not isinstance(rw_latest, dict):
-            logger.info("MC q=%s: recency_weighted.latest missing", qid)
-            _MC_MISSING_PROB_YES_PER_CATEGORY += 1
-            _MC_MISSING_COMMUNITY += 1
-            return None, "missing_rw_latest"
-
-        # First, prefer forecast_values aligned by index with options
-        fv = rw_latest.get("forecast_values")
-        if isinstance(fv, list):
-            if not options or not isinstance(options, list):
-                logger.info("MC q=%s: options unavailable; cannot align forecast_values", qid)
-                _MC_MISSING_COMMUNITY += 1
-                return None, "forecast_values_no_options"
-            if len(fv) != len(options):
-                logger.warning(
-                    "MC q=%s: forecast_values length %d != options length %d",
-                    qid,
-                    len(fv),
-                    len(options),
-                )
-                _MC_MISSING_PROB_YES_PER_CATEGORY += 1
-                _MC_MISSING_COMMUNITY += 1
-                return None, "forecast_values_length_mismatch"
-            try:
-                probs = [float(x) for x in fv]
-            except Exception as e:
-                logger.warning("MC q=%s: forecast_values cast error: %s", qid, e)
-                _MC_MISSING_PROB_YES_PER_CATEGORY += 1
-                _MC_MISSING_COMMUNITY += 1
-                return None, "forecast_values_cast_error"
-            within = all(0.0 <= p <= 1.0 for p in probs)
-            total = sum(probs)
-            if not within:
-                logger.warning("MC q=%s: forecast_values contain out-of-range probabilities", qid)
-                _MC_MISSING_PROB_YES_PER_CATEGORY += 1
-                _MC_MISSING_COMMUNITY += 1
-                return None, "forecast_values_out_of_range"
-            if abs(total - 1.0) > 1e-3:
-                logger.warning("MC q=%s: forecast_values sum %.6f far from 1.0", qid, total)
-                _MC_MISSING_PROB_YES_PER_CATEGORY += 1
-                _MC_MISSING_COMMUNITY += 1
-                return None, "forecast_values_bad_sum"
-            if abs(total - 1.0) > 1e-6:
-                logger.info("MC q=%s: normalizing forecast_values (sum=%.6f)", qid, total)
-                probs = [p / total for p in probs]
-            logger.debug("MC q=%s: using rw.latest.forecast_values aligned to options", qid)
-            return probs, "forecast_values"
-
-        # If forecast_values missing, try probability_yes_per_category dict
-        pyc = rw_latest.get("probability_yes_per_category")
-        if isinstance(pyc, dict):
-            if options and isinstance(options, list):
-                keys = sorted(pyc.keys())
-                missing = [opt for opt in options if opt not in pyc]
-                extra = [k for k in keys if k not in options]
-                if missing or extra:
-                    logger.warning(
-                        "MC q=%s: option mismatch vs pyc. missing=%s extra=%s",
-                        qid,
-                        missing,
-                        extra,
-                    )
-                # `.get(opt, 0.0)` is deliberate HERE, unlike the backtest scorer's version:
-                # the mismatch is already warned about above, and the sum gate below rejects
-                # the record outright when a materially-missing option pulls the total off
-                # 1.0 — so a fabricated zero never reaches a score. A rounding-level gap
-                # (< 1e-3) is renormalized away.
-                probs = [float(pyc.get(opt, 0.0)) for opt in options]
-                total = sum(probs)
-                if abs(total - 1.0) > 1e-6 and abs(total - 1.0) <= 1e-3:
-                    logger.info("MC q=%s: normalizing pyc (sum=%.6f)", qid, total)
-                    probs = [p / total for p in probs]
-                elif abs(total - 1.0) > 1e-3:
-                    logger.warning("MC q=%s: pyc sum %.6f far from 1.0", qid, total)
-                    _MC_MISSING_PROB_YES_PER_CATEGORY += 1
-                    _MC_MISSING_COMMUNITY += 1
-                    return None, "pyc_bad_sum"
-                logger.debug("MC q=%s: using rw.latest.probability_yes_per_category", qid)
-                return probs, "probability_yes_per_category"
-            else:
-                logger.info("MC q=%s: options unavailable; cannot align pyc", qid)
-                _MC_MISSING_COMMUNITY += 1
-                return None, "pyc_no_options"
-
-        logger.info(
-            "MC q=%s: neither forecast_values nor pyc available in rw.latest (keys=%s)",
-            qid,
-            rw_keys,
-        )
-        _MC_MISSING_PROB_YES_PER_CATEGORY += 1
-        _MC_MISSING_COMMUNITY += 1
-        return None, "no_forecast_data"
-
-    except Exception as e:
-        logger.warning(f"Failed to extract MC community probabilities: {e}")
-        _MC_MISSING_COMMUNITY += 1
-    return None, "exception"
+    K = max(1, len(bot_probs))
+    lnK = math.log(K) if K > 1 else 1.0
+    sum_ln = 0.0
+    for c_i, p_i in zip(community_probs, bot_probs, strict=True):
+        sum_ln += c_i * math.log(max(p_i, eps))
+    return 100.0 * (sum_ln / lnK + 1.0)
 
 
 def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = None) -> float | None:
@@ -411,23 +153,14 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
     Returns:
         Baseline score or None if cannot be calculated
     """
-    global _MC_ATTEMPTS, _MC_MISSING_COMMUNITY, _MC_SUCCESSES
-
     # Check cache first to avoid duplicate calculations
     q_id = getattr(report.question, "id_of_question", None)
-    if cache is not None and q_id is not None:
-        cache_key = (q_id, "multiple_choice")
-        if cache_key in cache:
-            cached_score, diagnostics_logged = cache[cache_key]
-            if cached_score is not None:
-                logger.debug(f"MC Question {q_id}: using cached baseline score {cached_score:.2f}")
-                return cached_score
-            else:
-                # Cached None result (calculation previously failed), but don't re-log vector mismatch
-                return None
+    cached = _cached_baseline_score(cache, q_id, "multiple_choice", "MC")
+    if cached is not _CACHE_MISS:
+        return cached
 
     try:
-        _MC_ATTEMPTS += 1
+        scoring_diagnostics.COUNTERS.mc_attempts += 1
         # Extract bot prediction probabilities
         bot_probs, bot_option_names = extract_multiple_choice_probabilities(report.prediction)
         if not bot_probs:
@@ -444,51 +177,19 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
             )
             return None
         if len(community_probs) != len(bot_probs):
-            # Check if we've already logged diagnostics for this question
-            should_log_diagnostics = True
-            if cache is not None and q_id is not None:
-                cache_key = (q_id, "multiple_choice")
-                if cache_key in cache:
-                    _, diagnostics_logged = cache[cache_key]
-                    should_log_diagnostics = not diagnostics_logged
-
-            if should_log_diagnostics:
-                log_mc_vector_mismatch(
-                    report.question,
-                    bot_probs,
-                    community_probs,
-                    community_source,
-                    bot_option_names,
-                )
-                # Cache the failed result with diagnostics logged
-                if cache is not None and q_id is not None:
-                    cache[(q_id, "multiple_choice")] = (None, True)
-            else:
-                logger.debug(f"MC Question {q_id}: vector mismatch (diagnostics already logged)")
-
+            _report_mc_vector_mismatch(
+                report,
+                bot_probs=bot_probs,
+                community_probs=community_probs,
+                community_source=community_source,
+                bot_option_names=bot_option_names,
+                q_id=q_id,
+                cache=cache,
+            )
             return None
 
-        # Clamp and normalize both
-        eps = 1e-9
-        bot_probs = [max(min(p, 0.999), 0.001) for p in bot_probs]
-        s = sum(bot_probs)
-        bot_probs = [p / s for p in bot_probs] if s > 0 else [1.0 / len(bot_probs)] * len(bot_probs)
-
-        community_probs = [max(min(float(c), 0.999), 0.001) for c in community_probs]
-        s2 = sum(community_probs)
-        community_probs = (
-            [c / s2 for c in community_probs] if s2 > 0 else [1.0 / len(community_probs)] * len(community_probs)
-        )
-
-        # Expected baseline-style score vs community:
-        # 100 * (E_c[ ln p ] / ln K + 1)
-        K = max(1, len(bot_probs))
-        lnK = math.log(K) if K > 1 else 1.0
-        sum_ln = 0.0
-        for c_i, p_i in zip(community_probs, bot_probs):
-            sum_ln += c_i * math.log(max(p_i, eps))
-        final_score = 100.0 * (sum_ln / lnK + 1.0)
-        _MC_SUCCESSES += 1
+        final_score = _mc_expected_baseline_score(bot_probs, community_probs)
+        scoring_diagnostics.COUNTERS.mc_successes += 1
 
         # Cache the result and log appropriately
         if cache is not None and q_id is not None:
@@ -509,88 +210,6 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = N
             f"Error calculating MC baseline score for question {getattr(report.question, 'id_of_question', 'unknown')}"
         )
         return None
-
-
-def _extract_numeric_community_cdf(question: Any) -> list[float] | None:
-    """Extract community CDF (forecast_values) from api_json with structured logging; no fallback."""
-    try:
-        post_id = getattr(question, "id_of_post", None)
-        qid = getattr(question, "id_of_question", None)
-        api_json = getattr(question, "api_json", None)
-        if not isinstance(api_json, dict):
-            logger.warning(
-                "Numeric q=%s post=%s: api_json missing or not dict (type=%s)",
-                qid,
-                post_id,
-                type(api_json).__name__,
-            )
-            return None
-
-        api_has_question = isinstance(api_json.get("question"), dict)
-        question_obj = api_json.get("question") if api_has_question else api_json
-        if not isinstance(question_obj, dict):
-            logger.warning(
-                "Numeric q=%s post=%s: missing question object (api_has_question=%s, type=%s)",
-                qid,
-                post_id,
-                api_has_question,
-                type(question_obj).__name__,
-            )
-            return None
-
-        expected_len = None
-        try:
-            scaling = question_obj.get("scaling", {})
-            inbound = scaling.get("inbound_outcome_count")
-            if inbound is not None:
-                expected_len = int(inbound) + 1
-        except (ValueError, TypeError):
-            expected_len = None
-
-        aggregations = question_obj.get("aggregations")
-        if not isinstance(aggregations, dict):
-            logger.info(
-                "Numeric q=%s: aggregations missing. keys=%s",
-                qid,
-                list(question_obj.keys()),
-            )
-            return None
-
-        rw = aggregations.get("recency_weighted")
-        rw_latest = rw.get("latest") if isinstance(rw, dict) else None
-        rw_keys = list(rw_latest.keys()) if isinstance(rw_latest, dict) else None
-        logger.debug(
-            "Numeric q=%s: rw.latest keys=%s (agg.keys=%s)",
-            qid,
-            rw_keys,
-            list(aggregations.keys()),
-        )
-        if not isinstance(rw_latest, dict):
-            logger.info("Numeric q=%s: recency_weighted.latest missing", qid)
-            return None
-
-        fv = rw_latest.get("forecast_values")
-        if isinstance(fv, list) and len(fv) >= 2:
-            if expected_len and len(fv) != expected_len:
-                logger.warning(
-                    "Numeric q=%s: forecast_values length %d != expected %d",
-                    qid,
-                    len(fv),
-                    expected_len,
-                )
-            logger.debug(
-                "Numeric q=%s: using rw.latest.forecast_values len=%d first=%.5f last=%.5f",
-                qid,
-                len(fv),
-                float(fv[0]),
-                float(fv[-1]),
-            )
-            return [float(x) for x in fv]
-
-        logger.info("Numeric q=%s: forecast_values missing in rw.latest (keys=%s)", qid, rw_keys)
-    except Exception as e:
-        logger.warning(f"Failed to extract numeric community CDF: {e}")
-    return None
 
 
 def calculate_numeric_baseline_score(report: Any, cache: dict | None = None) -> float | None:
@@ -614,38 +233,14 @@ def calculate_numeric_baseline_score(report: Any, cache: dict | None = None) -> 
     Returns:
         Baseline score or None if cannot be calculated (expected range: ~[-100, +20])
     """
-    global _NUMERIC_PMF_ATTEMPTS, _NUMERIC_PMF_SUCCESSES
-    global _NUMERIC_FALLBACK_ATTEMPTS, _NUMERIC_FALLBACK_SUCCESSES
-
     # Check cache first to avoid duplicate calculations
     q_id = getattr(report.question, "id_of_question", None)
-    if cache is not None and q_id is not None:
-        cache_key = (q_id, "numeric")
-        if cache_key in cache:
-            cached_score, diagnostics_logged = cache[cache_key]
-            if cached_score is not None:
-                logger.debug(f"Numeric Question {q_id}: using cached baseline score {cached_score:.2f}")
-                return cached_score
-            else:
-                # Cached None result (calculation previously failed)
-                return None
+    cached = _cached_baseline_score(cache, q_id, "numeric", "Numeric")
+    if cached is not _CACHE_MISS:
+        return cached
 
     try:
-        # Try to obtain model CDF percentiles (list of objects with .percentile in [0,1])
-        model_cdf_percentiles = None
-        try:
-            candidate_cdf = getattr(report.prediction, "cdf", None)
-            # Validate the CDF looks like a sequence of percentile-like objects
-            if isinstance(candidate_cdf, (list, tuple)) and len(candidate_cdf) >= 2:
-                model_cdf_percentiles = candidate_cdf
-            else:
-                model_cdf_percentiles = None
-        except Exception as e:
-            logger.warning(
-                f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: cannot compute model CDF: {e}"
-            )
-
-        # Extract community CDF from API JSON
+        model_cdf_percentiles = _model_cdf_percentiles(report)
         community_cdf = _extract_numeric_community_cdf(report.question)
 
         # If either CDF is missing or too short, fall back to percentile-based approximation
@@ -653,94 +248,9 @@ def calculate_numeric_baseline_score(report: Any, cache: dict | None = None) -> 
             logger.info(
                 f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: missing community/model CDF; using percentile fallback"
             )
-            try:
-                _NUMERIC_FALLBACK_ATTEMPTS += 1
-                # Get question bounds for proper bin calculation
-                lower_bound = getattr(report.question, "lower_bound", None)
-                upper_bound = getattr(report.question, "upper_bound", None)
+            return _score_numeric_from_declared_percentiles(report, model_cdf_percentiles, q_id=q_id, cache=cache)
 
-                if lower_bound is None or upper_bound is None:
-                    logger.warning(
-                        f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: missing bounds, cannot calculate bins"
-                    )
-                    return None
-
-                # Use declared percentiles to approximate PMF
-                declared = getattr(report.prediction, "declared_percentiles", None)
-                if not declared and model_cdf_percentiles:
-                    declared = model_cdf_percentiles[::20]  # Take every 20th for approximation
-
-                if not declared or len(declared) < 3:
-                    return None
-
-                # Convert percentiles to CDF approximation
-                percs = [
-                    float(getattr(p, "percentile", 0)) / (100.0 if getattr(p, "percentile", 1) > 1 else 1.0)
-                    for p in declared
-                ]
-
-                # Create approximate PMF from percentile differences
-                bot_pmf = np.diff(percs)
-                bot_pmf = np.maximum(bot_pmf, 0.0)
-                if bot_pmf.sum() <= 0:
-                    return None
-                bot_pmf = bot_pmf / bot_pmf.sum()
-
-                # Create uniform community PMF (fallback when no community CDF)
-                community_pmf = np.ones(len(bot_pmf)) / len(bot_pmf)
-
-                # Apply relative scoring
-                return _calculate_relative_numeric_score(bot_pmf, community_pmf, upper_bound - lower_bound, q_id, cache)
-
-            except Exception as e:
-                logger.warning(f"Numeric Question {q_id}: percentile fallback scoring failed: {e}")
-                return None
-
-        # PMF-based relative scoring against community distribution
-        _NUMERIC_PMF_ATTEMPTS += 1
-
-        # Get question bounds for bin width calculation
-        lower_bound = getattr(report.question, "lower_bound", None)
-        upper_bound = getattr(report.question, "upper_bound", None)
-
-        if lower_bound is None or upper_bound is None:
-            logger.warning(
-                f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: missing bounds for PMF scoring"
-            )
-            return None
-
-        # Convert CDFs to PMFs
-        model_cdf_values = np.clip(
-            np.array([float(p.percentile) for p in model_cdf_percentiles], dtype=float),
-            0.0,
-            1.0,
-        )
-        bot_pmf = np.diff(model_cdf_values)
-        bot_pmf = np.maximum(bot_pmf, 0.0)
-        if bot_pmf.sum() <= 0:
-            logger.warning(
-                f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: model PMF degenerate"
-            )
-            return None
-        bot_pmf = bot_pmf / bot_pmf.sum()
-
-        community_cdf_arr = np.clip(np.array(community_cdf, dtype=float), 0.0, 1.0)
-        community_pmf = np.diff(community_cdf_arr)
-        community_pmf = np.maximum(community_pmf, 0.0)
-        if community_pmf.sum() <= 0:
-            logger.warning(
-                f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: community PMF degenerate"
-            )
-            return None
-        community_pmf = community_pmf / community_pmf.sum()
-
-        # Align lengths (guard, though both should be same length)
-        m = min(len(bot_pmf), len(community_pmf))
-        bot_pmf = bot_pmf[:m]
-        community_pmf = community_pmf[:m]
-
-        # Apply relative scoring
-        return _calculate_relative_numeric_score(bot_pmf, community_pmf, upper_bound - lower_bound, q_id, cache)
+        return _score_numeric_from_cdfs(report, model_cdf_percentiles, community_cdf, q_id=q_id, cache=cache)
 
     except Exception:
         logger.exception(
@@ -749,8 +259,124 @@ def calculate_numeric_baseline_score(report: Any, cache: dict | None = None) -> 
         return None
 
 
+def _model_cdf_percentiles(report: Any) -> Any:
+    """The model's CDF if it looks like a sequence of >= 2 percentile-like objects, else None."""
+    try:
+        candidate_cdf = getattr(report.prediction, "cdf", None)
+        # Validate the CDF looks like a sequence of percentile-like objects
+        if isinstance(candidate_cdf, (list, tuple)) and len(candidate_cdf) >= 2:
+            return candidate_cdf
+    # Boundary: ``cdf`` is a computed property on the prediction, so ANY failure to build it
+    # degrades to the declared-percentile fallback below rather than losing the score.
+    except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
+        logger.warning(
+            f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: cannot compute model CDF: {e}"
+        )
+    return None
+
+
+def _numeric_bounds(report: Any, missing_note: str) -> tuple[float, float] | None:
+    """Read the question's bounds, warning with ``missing_note`` when either is absent."""
+    lower_bound = getattr(report.question, "lower_bound", None)
+    upper_bound = getattr(report.question, "upper_bound", None)
+    if lower_bound is None or upper_bound is None:
+        logger.warning(f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: {missing_note}")
+        return None
+    return lower_bound, upper_bound
+
+
+def _score_numeric_from_declared_percentiles(
+    report: Any, model_cdf_percentiles: Any, *, q_id: Any, cache: dict | None
+) -> float | None:
+    """Fallback path: approximate the bot PMF from declared percentiles, score vs uniform."""
+    try:
+        scoring_diagnostics.COUNTERS.numeric_fallback_attempts += 1
+        bounds = _numeric_bounds(report, "missing bounds, cannot calculate bins")
+        if bounds is None:
+            return None
+        lower_bound, upper_bound = bounds
+
+        # Use declared percentiles to approximate PMF
+        declared = getattr(report.prediction, "declared_percentiles", None)
+        if not declared and model_cdf_percentiles:
+            declared = model_cdf_percentiles[::20]  # Take every 20th for approximation
+
+        if not declared or len(declared) < 3:
+            return None
+
+        # Convert percentiles to CDF approximation
+        percs = [
+            float(getattr(p, "percentile", 0)) / (100.0 if getattr(p, "percentile", 1) > 1 else 1.0) for p in declared
+        ]
+
+        # Create approximate PMF from percentile differences
+        bot_pmf = np.diff(percs)
+        bot_pmf = np.maximum(bot_pmf, 0.0)
+        if bot_pmf.sum() <= 0:
+            return None
+        bot_pmf = bot_pmf / bot_pmf.sum()
+
+        # Create uniform community PMF (fallback when no community CDF)
+        community_pmf = np.ones(len(bot_pmf)) / len(bot_pmf)
+
+        score = _calculate_relative_numeric_score(
+            bot_pmf, community_pmf, total_range=upper_bound - lower_bound, q_id=q_id, cache=cache
+        )
+        if score is not None:
+            scoring_diagnostics.COUNTERS.numeric_fallback_successes += 1
+        return score
+
+    # Boundary: the fallback is already the degraded rung, so its own failure means
+    # "no score for this question", never a failed benchmark run.
+    except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
+        logger.warning(f"Numeric Question {q_id}: percentile fallback scoring failed: {e}")
+        return None
+
+
+def _pmf_from_cdf(cdf_values: Any, degenerate_note: str, report: Any) -> np.ndarray | None:
+    """Clip a CDF into [0, 1], difference it into a PMF, and renormalize. None if degenerate."""
+    clipped = np.clip(np.array(cdf_values, dtype=float), 0.0, 1.0)
+    pmf = np.maximum(np.diff(clipped), 0.0)
+    if pmf.sum() <= 0:
+        logger.warning(f"Numeric Question {getattr(report.question, 'id_of_question', 'unknown')}: {degenerate_note}")
+        return None
+    return pmf / pmf.sum()
+
+
+def _score_numeric_from_cdfs(
+    report: Any, model_cdf_percentiles: Any, community_cdf: list[float], *, q_id: Any, cache: dict | None
+) -> float | None:
+    """Primary path: PMF-based relative scoring against the community distribution."""
+    scoring_diagnostics.COUNTERS.numeric_pmf_attempts += 1
+
+    bounds = _numeric_bounds(report, "missing bounds for PMF scoring")
+    if bounds is None:
+        return None
+    lower_bound, upper_bound = bounds
+
+    bot_pmf = _pmf_from_cdf([float(p.percentile) for p in model_cdf_percentiles], "model PMF degenerate", report)
+    if bot_pmf is None:
+        return None
+
+    community_pmf = _pmf_from_cdf(community_cdf, "community PMF degenerate", report)
+    if community_pmf is None:
+        return None
+
+    # Align lengths (guard, though both should be same length)
+    m = min(len(bot_pmf), len(community_pmf))
+
+    score = _calculate_relative_numeric_score(
+        bot_pmf[:m], community_pmf[:m], total_range=upper_bound - lower_bound, q_id=q_id, cache=cache
+    )
+    # Each path owns its own success counter: ``_calculate_relative_numeric_score`` is shared,
+    # so a bump inside it lands on whichever counter it names and mis-attributes the other path.
+    if score is not None:
+        scoring_diagnostics.COUNTERS.numeric_pmf_successes += 1
+    return score
+
+
 def _calculate_relative_numeric_score(
-    bot_pmf: np.ndarray, community_pmf: np.ndarray, total_range: float, q_id: int | None, cache: dict | None
+    bot_pmf: np.ndarray, community_pmf: np.ndarray, *, total_range: float, q_id: int | None, cache: dict | None
 ) -> float | None:
     """
     Calculate relative numeric score using community PMF as expectation weights.
@@ -785,12 +411,9 @@ def _calculate_relative_numeric_score(
 
         # Bin-aware normalization so uniform vs uniform anchors near -50 for any bin count:
         # Solve 100 * (-ln(n)/norm + 1) = -50  =>  norm = ln(n)/1.5
-        num_bins = max(2, int(len(bot_pmf)))
+        num_bins = max(2, len(bot_pmf))
         normalization = math.log(num_bins) / 1.5
         final_score = 100.0 * (expected_log_score / normalization + 1.0)
-
-        global _NUMERIC_PMF_SUCCESSES
-        _NUMERIC_PMF_SUCCESSES += 1
 
         # Cache the result and log appropriately
         if cache is not None and q_id is not None:
@@ -812,7 +435,7 @@ def _calculate_relative_numeric_score(
 def patch_multiple_choice_scoring():
     """Monkey patch MultipleChoiceReport.expected_baseline_score"""
     try:
-        from forecasting_tools.data_models.multiple_choice_report import (
+        from forecasting_tools.data_models.multiple_choice_report import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
             MultipleChoiceReport,
         )
 
@@ -825,14 +448,18 @@ def patch_multiple_choice_scoring():
 
     except ImportError as e:
         logger.error(f"Could not import MultipleChoiceReport for patching: {e}")
-    except Exception as e:
+    # Boundary: patching a third-party class is best-effort. A failure here leaves ft's own
+    # NotImplementedError property in place; it must not abort the importing benchmark.
+    except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         logger.error(f"Error patching MultipleChoiceReport: {e}")
 
 
 def patch_numeric_scoring():
     """Monkey patch NumericReport.expected_baseline_score"""
     try:
-        from forecasting_tools.data_models.numeric_report import NumericReport
+        from forecasting_tools.data_models.numeric_report import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
+            NumericReport,
+        )
 
         def expected_baseline_score_numeric(self) -> float | None:
             return calculate_numeric_baseline_score(self)
@@ -843,17 +470,22 @@ def patch_numeric_scoring():
 
     except ImportError as e:
         logger.error(f"Could not import NumericReport for patching: {e}")
-    except Exception as e:
+    # Boundary: same as the MC patch above — best-effort monkey-patch, never a hard failure.
+    except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         logger.error(f"Error patching NumericReport: {e}")
 
 
 def patch_error_handling():
     """Monkey patch ForecastReport.calculate_average_expected_baseline_score to fix UnboundLocalError"""
     try:
-        from typing import Sequence
+        from collections.abc import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
+            Sequence,
+        )
 
-        import typeguard
-        from forecasting_tools.data_models.forecast_report import ForecastReport
+        import typeguard  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
+        from forecasting_tools.data_models.forecast_report import (  # noqa: PLC0415  # late import: ImportError is handled to degrade the monkey-patch
+            ForecastReport,
+        )
 
         @staticmethod
         def calculate_average_expected_baseline_score_fixed(
@@ -893,7 +525,8 @@ def patch_error_handling():
 
     except ImportError as e:
         logger.error(f"Could not import ForecastReport for patching: {e}")
-    except Exception as e:
+    # Boundary: same as the two patches above — best-effort monkey-patch, never a hard failure.
+    except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         logger.error(f"Error patching ForecastReport: {e}")
 
 
@@ -905,54 +538,52 @@ def log_score_scale_validation(benchmarks: list[Any]) -> None:
         benchmarks: List of BenchmarkForBot objects
     """
     try:
-        from forecasting_tools.data_models.questions import (
-            BinaryQuestion,
-            MultipleChoiceQuestion,
-            NumericQuestion,
-        )
-
-        binary_scores = []
-        numeric_scores = []
-        mc_scores = []
-
-        for benchmark in benchmarks:
-            for report in benchmark.forecast_reports:
-                score = report.expected_baseline_score
-                if score is not None:
-                    if isinstance(report.question, BinaryQuestion):
-                        binary_scores.append(score)
-                    elif isinstance(report.question, NumericQuestion):
-                        numeric_scores.append(score)
-                    elif isinstance(report.question, MultipleChoiceQuestion):
-                        mc_scores.append(score)
+        scores_by_label = _scores_by_question_type(benchmarks)
 
         logger.info("=== SCORE SCALE VALIDATION ===")
-
-        if binary_scores:
-            logger.info(
-                f"Binary scores: count={len(binary_scores)}, range=[{min(binary_scores):.1f}, {max(binary_scores):.1f}], mean={np.mean(binary_scores):.1f}, mean_abs={np.mean([abs(s) for s in binary_scores]):.1f}"
-            )
-        else:
-            logger.info("Binary scores: no data")
-
-        if numeric_scores:
-            logger.info(
-                f"Numeric scores: count={len(numeric_scores)}, range=[{min(numeric_scores):.1f}, {max(numeric_scores):.1f}], mean={np.mean(numeric_scores):.1f}, mean_abs={np.mean([abs(s) for s in numeric_scores]):.1f}"
-            )
-        else:
-            logger.info("Numeric scores: no data")
-
-        if mc_scores:
-            logger.info(
-                f"MC scores: count={len(mc_scores)}, range=[{min(mc_scores):.1f}, {max(mc_scores):.1f}], mean={np.mean(mc_scores):.1f}, mean_abs={np.mean([abs(s) for s in mc_scores]):.1f}"
-            )
-        else:
-            logger.info("MC scores: no data")
-
+        for label, scores in scores_by_label.items():
+            _log_score_distribution(label, scores)
         logger.info("=== END SCORE VALIDATION ===")
 
-    except Exception as e:
+    # Boundary: this is diagnostics-only, so a report that cannot score must not take down
+    # the benchmark run that called it.
+    except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         logger.error(f"Error in score scale validation: {e}")
+
+
+def _scores_by_question_type(benchmarks: list[Any]) -> dict[str, list[float]]:
+    """Bucket every non-None ``expected_baseline_score`` by question type, in report order."""
+    from forecasting_tools.data_models.questions import (  # noqa: PLC0415  # late import: ImportError is handled by the caller to degrade the diagnostics
+        BinaryQuestion,
+        MultipleChoiceQuestion,
+        NumericQuestion,
+    )
+
+    label_by_type = {BinaryQuestion: "Binary", NumericQuestion: "Numeric", MultipleChoiceQuestion: "MC"}
+    scores: dict[str, list[float]] = {label: [] for label in label_by_type.values()}
+
+    for benchmark in benchmarks:
+        for report in benchmark.forecast_reports:
+            score = report.expected_baseline_score
+            if score is None:
+                continue
+            for question_type, label in label_by_type.items():
+                if isinstance(report.question, question_type):
+                    scores[label].append(score)
+                    break
+
+    return scores
+
+
+def _log_score_distribution(label: str, scores: list[float]) -> None:
+    """One count/range/mean/mean_abs line per question type, or a "no data" line."""
+    if not scores:
+        logger.info(f"{label} scores: no data")
+        return
+    logger.info(
+        f"{label} scores: count={len(scores)}, range=[{min(scores):.1f}, {max(scores):.1f}], "
+        f"mean={np.mean(scores):.1f}, mean_abs={np.mean([abs(s) for s in scores]):.1f}"
+    )
 
 
 def apply_scoring_patches() -> None:

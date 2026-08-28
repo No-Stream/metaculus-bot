@@ -474,7 +474,7 @@ MARKER_SPECS: list[MarkerSpec] = [
         # `decision` is routed|skipped; `step` names the deciding branch on a route
         # (url_single / url_spread / kw_single) or the reject reason on a skip
         # (url_ambiguous, url_quantity_gate, url_change_vs_level_guard,
-        # url_no_relative_return_wording, kw_no_keyword_hit, kw_derivation_gate,
+        # url_no_relative_return_wording, kw_no_keyword_hit, kw_derivation_gate,  # noqa: ERA001  # prose list of route/skip tokens, not code
         # kw_ambiguous, kw_change_vs_level_guard). `series` is the series involved where one
         # is known — comma-joined on ambiguity, slash-joined on a spread, the "none" sentinel
         # (-> None) on a plain keyword miss. All values are spaceless, so `\S+` takes each.
@@ -593,8 +593,8 @@ MARKER_SPECS: list[MarkerSpec] = [
         "publish_hardening",
         # Per-attempt publish failure WARN (metaculus_bot/publish_hardening.py
         # _wrap_with_timeout_retry). Two emitted shapes share the prefix:
-        #   "PUBLISH_HARDENING: <method> attempt N/M timed out after Ts"
-        #   "PUBLISH_HARDENING: <method> attempt N/M failed (<ExcType>: <msg>)"
+        #   "PUBLISH_HARDENING: <method> attempt N/M timed out after Ts"  # noqa: ERA001  # documented marker format, not commented-out code
+        #   "PUBLISH_HARDENING: <method> attempt N/M failed (<ExcType>: <msg>)"  # noqa: ERA001  # documented marker format, not commented-out code
         # The ``attempt N/M`` clause is what keeps this spec off the OTHER
         # PUBLISH_HARDENING-prefixed strings in that module (the applied-INFO line,
         # the seam-moved AttributeErrors, the loop-exited RuntimeError). Exactly one
@@ -663,8 +663,8 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "research_phase_deadline",
-        # Research-phase deadline WARN (research/orchestrator.py
-        # _await_providers_within_deadline): the outer budget bound cancelled
+        # Research-phase deadline WARN (research/provider_fanout.py
+        # await_providers_within_deadline): the outer budget bound cancelled
         # straggler providers. Carries no question ref — the line names counts and
         # provider names only — so qid_kind stays None; the cancelled providers also
         # survive as status="deadline" rows in the archive's provider_results, which
@@ -676,7 +676,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "gap_fill_skipped_for_budget",
-        # Per-QUESTION gap-fill skip (research/orchestrator.py): both passes dropped
+        # Per-QUESTION gap-fill skip (research/gap_fill_stages.py): both passes dropped
         # up front, either on the fast path or because the research phase had no
         # budget left. ``research_phase_remaining`` is "n/a" (fast path — never
         # computed) or "NNNs".
@@ -688,7 +688,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "gap_fill_cut_for_budget",
-        # Per-QUESTION mid-phase gap-fill cut (research/orchestrator.py): the pass
+        # Per-QUESTION mid-phase gap-fill cut (research/gap_fill_stages.py): the pass
         # STARTED and was then cancelled at the research-phase deadline — the one
         # budget event recoverable from nothing else once GHA logs expire (the
         # up-front skip above and the fast path both have their own records).
@@ -847,6 +847,7 @@ MARKER_SPECS: list[MarkerSpec] = [
 def _build_record(
     spec: MarkerSpec,
     match: re.Match[str],
+    *,
     line: str,
     seq: int,
     meta: dict[str, str],
@@ -910,7 +911,7 @@ def parse_log_text(
         for spec in MARKER_SPECS:
             match = spec.regex.search(line)
             if match:
-                harvested[spec.name].append(_build_record(spec, match, line, counters[spec.name], meta))
+                harvested[spec.name].append(_build_record(spec, match, line=line, seq=counters[spec.name], meta=meta))
                 counters[spec.name] += 1
                 break  # marker tokens are mutually exclusive — one marker per line
     return harvested

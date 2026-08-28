@@ -53,7 +53,7 @@ def numeric_block(scale: float, *, trailing_comma: bool = False) -> str:
 
 
 def mc_block(probs: list[float], *, trailing_comma: bool = False) -> str:
-    body = ", ".join(f'"{name}": {prob}' for name, prob in zip(OPTIONS, probs))
+    body = ", ".join(f'"{name}": {prob}' for name, prob in zip(OPTIONS, probs, strict=False))
     tail = "," if trailing_comma else ""
     return f'{{"question_type": "multiple_choice", "option_probs": {{{body}}}{tail}}}'
 
@@ -64,7 +64,7 @@ def full_percentile_list() -> list[Percentile]:
 
 def make_pol(probs: list[float]) -> PredictedOptionList:
     return PredictedOptionList(
-        predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in zip(OPTIONS, probs)]
+        predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in zip(OPTIONS, probs, strict=False)]
     )
 
 
@@ -393,7 +393,7 @@ class TestRungLlm:
     @pytest.mark.asyncio
     async def test_mc_llm_tolerant_two_stage_fallback(self) -> None:
         """llm rung mirrors the old strict→tolerant two-stage parse."""
-        raw = [OptionProbability(option_name=n, probability=p) for n, p in zip(OPTIONS, [0.4, 0.35, 0.25])]
+        raw = [OptionProbability(option_name=n, probability=p) for n, p in zip(OPTIONS, [0.4, 0.35, 0.25], strict=True)]
 
         calls: list[type] = []
 
@@ -419,9 +419,11 @@ class TestRungLlm:
         """
         partial = [Percentile(percentile=p, value=float(i)) for i, p in enumerate([0.1, 0.5, 0.9])]
         llm_mock = AsyncMock(return_value=partial)
-        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
-            with pytest.raises(ValueExtractionError):
-                await extract_numeric("prose only", PARSER_LLM)
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock),
+            pytest.raises(ValueExtractionError),
+        ):
+            await extract_numeric("prose only", PARSER_LLM)
 
     @pytest.mark.asyncio
     async def test_prompt_notes_forwarded(self) -> None:
@@ -442,9 +444,11 @@ class TestRungFailure:
     @pytest.mark.asyncio
     async def test_all_rungs_fail_raises_typed_error(self) -> None:
         llm_mock = AsyncMock(side_effect=ValueError("parser exploded"))
-        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
-            with pytest.raises(ValueExtractionError) as excinfo:
-                await extract_binary("no json anywhere", PARSER_LLM, question_id=7, model_name="m")
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock),
+            pytest.raises(ValueExtractionError) as excinfo,
+        ):
+            await extract_binary("no json anywhere", PARSER_LLM, question_id=7, model_name="m")
         msg = str(excinfo.value)
         assert "block:" in msg
         assert "llm:" in msg
@@ -455,9 +459,11 @@ class TestRungFailure:
         """>200KB block: no parse, no repair; only the llm rung may salvage."""
         huge = '{"question_type": "binary", "posterior_prob": 0.5, "pad": "' + "x" * 210_000 + '"}'
         llm_mock = AsyncMock(side_effect=ValueError("nope"))
-        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
-            with pytest.raises(ValueExtractionError) as excinfo:
-                await extract_binary(rationale_with(huge), PARSER_LLM)
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock),
+            pytest.raises(ValueExtractionError) as excinfo,
+        ):
+            await extract_binary(rationale_with(huge), PARSER_LLM)
         assert "size cap" in str(excinfo.value)
 
 
@@ -482,9 +488,11 @@ class TestSalvageFidelity:
         disordered = full_percentile_list()
         disordered[1] = Percentile(percentile=disordered[1].percentile, value=999.0)
         llm_mock = AsyncMock(return_value=disordered)
-        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
-            with pytest.raises(ValueExtractionError) as excinfo:
-                await extract_numeric("prose with no block at all", PARSER_LLM)
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock),
+            pytest.raises(ValueExtractionError) as excinfo,
+        ):
+            await extract_numeric("prose with no block at all", PARSER_LLM)
 
         assert "value-disordered" in str(excinfo.value)
 
@@ -505,9 +513,11 @@ class TestSalvageFidelity:
     async def test_a_non_finite_salvaged_value_fails_the_rung(self) -> None:
         with_nan = full_percentile_list()
         with_nan[6] = Percentile(percentile=with_nan[6].percentile, value=float("nan"))
-        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(return_value=with_nan)):
-            with pytest.raises(ValueExtractionError) as excinfo:
-                await extract_numeric("prose with no block at all", PARSER_LLM)
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(return_value=with_nan)),
+            pytest.raises(ValueExtractionError) as excinfo,
+        ):
+            await extract_numeric("prose with no block at all", PARSER_LLM)
 
         assert "non-finite" in str(excinfo.value)
 

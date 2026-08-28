@@ -24,7 +24,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -185,6 +185,30 @@ class TestKalshiEventProjection:
         assert projected["settlement_sources"] == [
             {"name": source["name"], "url": source["url"]} for source in raw["settlement_sources"]
         ]
+
+    @pytest.mark.asyncio
+    async def test_a_ticketless_event_is_dropped_as_the_page_streams(self) -> None:
+        """The projection's one ROW-level drop, and the only branch in it nothing else guards.
+
+        The event ticker is the pool's dedup key and the settlement index's key, so a ticketless
+        event is unreferenceable downstream: it would take a Kalshi width slot and a dedup slot
+        while nothing could point at it, and `kalshi_event_match` would build it a URL-less row.
+        The sibling event is what makes this a per-row drop rather than a lost page — a projection
+        that bailed on the whole body would satisfy an assertion about the bad event alone.
+        """
+        page = {
+            "events": [
+                {"event_ticker": "", "title": "no ticker at all", "markets": [{"status": "active"}]},
+                {"event_ticker": "KEEPER", "title": "has a ticker", "markets": [{"status": "active"}]},
+            ],
+            "cursor": "",
+        }
+        session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=page)})
+
+        pull = await venues.kalshi_prefetch_events(session)
+
+        assert [event["event_ticker"] for event in pull.events] == ["KEEPER"]
+        assert (pull.token, pull.complete) == ("", True), "one unusable row is not a degraded pull"
 
     @pytest.mark.asyncio
     async def test_a_200_carrying_a_null_events_array_is_a_lost_catalogue(self) -> None:
@@ -479,10 +503,12 @@ class TestKalshiEventDerivations:
         match = venues.kalshi_event_match(event, match_confidence=0.5, channel="universe_fuzzy")
 
         assert match is not None
-        assert match.total_volume is not None and match.open_interest is not None
+        assert match.total_volume is not None
+        assert match.open_interest is not None
         assert match.total_volume == pytest.approx(expected_volume)
         assert match.open_interest == pytest.approx(expected_oi)
-        assert first_volume is not None and first_oi is not None
+        assert first_volume is not None
+        assert first_oi is not None
         assert match.total_volume > first_volume, "the sum must exceed its own first strike"
         assert match.open_interest > first_oi
 
@@ -503,13 +529,15 @@ class TestKalshiEventDerivations:
         assert settled["status"] == "finalized"
         assert (settled["yes_bid_dollars"], settled["yes_ask_dollars"]) == ("0.0000", "1.0000")
         settled_volume, settled_oi = venues.kalshi_usd_liquidity(settled)
-        assert settled_volume is not None and settled_oi is not None
+        assert settled_volume is not None
+        assert settled_oi is not None
 
         all_strikes = venues.kalshi_event_usd_liquidity(event["markets"])
         live_only = venues.kalshi_event_usd_liquidity(event["markets"][1:])
 
         assert venues.kalshi_event_usd_liquidity(event["markets"]) == live_only
-        assert all_strikes[0] is not None and live_only[0] is not None
+        assert all_strikes[0] is not None
+        assert live_only[0] is not None
         assert all_strikes[0] == pytest.approx(live_only[0]), (
             "a settled strike's $0.50 phantom midpoint reached the family sum"
         )
@@ -531,7 +559,8 @@ class TestKalshiEventDerivations:
         assert match is not None
         assert match.is_resolved is True
         assert match.total_volume == pytest.approx(venues.kalshi_event_usd_liquidity(event["markets"])[0])
-        assert match.total_volume is not None and match.total_volume > 0.0
+        assert match.total_volume is not None
+        assert match.total_volume > 0.0
         assert _liquidity_label(match) != "no-liquidity-data"
 
     def test_a_multi_strike_family_quotes_no_family_price_and_shows_every_strikes_own(
@@ -843,7 +872,8 @@ class TestKalshiEventDerivations:
         match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
 
         bid, ask = safe_float(only["yes_bid_dollars"]), safe_float(only["yes_ask_dollars"])
-        assert bid is not None and ask is not None, "fixture must quote a two-sided book"
+        assert bid is not None, "fixture must quote a two-sided book"
+        assert ask is not None, "fixture must quote a two-sided book"
 
         assert match is not None
         assert (match.bid, match.ask) == (bid, ask)
@@ -904,9 +934,11 @@ class TestKalshiEventDerivations:
         volume_fp = safe_float(market["volume_fp"])
         oi_fp = safe_float(market["open_interest_fp"])
         notional = safe_float(market["notional_value_dollars"]) or 1.0
-        assert volume_fp is not None and oi_fp is not None
+        assert volume_fp is not None
+        assert oi_fp is not None
         assert oi_usd == pytest.approx(oi_fp * notional)
-        assert volume_usd is not None and volume_usd <= volume_fp, "volume converts at a sub-dollar price"
+        assert volume_usd is not None, "volume converts at a sub-dollar price"
+        assert volume_usd <= volume_fp, "volume converts at a sub-dollar price"
 
     def test_absent_counts_read_as_no_data_rather_than_zero(self) -> None:
         assert venues.kalshi_usd_liquidity({}) == (None, None)
@@ -985,7 +1017,8 @@ class TestPolymarket:
         assert rows[0].total_volume == pytest.approx(safe_float(event["volume"]))
         assert rows[0].open_interest == pytest.approx(safe_float(event["openInterest"]))
         assert rows[0].volume_24h == pytest.approx(safe_float(event["volume24hr"]))
-        assert rows[0].total_volume is not None and rows[0].total_volume > 4 * child_volume_sum
+        assert rows[0].total_volume is not None
+        assert rows[0].total_volume > 4 * child_volume_sum
 
     def test_an_absent_24h_volume_stays_none_rather_than_carrying_lifetime_volume(
         self, captured_payloads: dict[str, Any]
@@ -1218,7 +1251,8 @@ class TestPolymarket:
 
         rows = venues.parse_polymarket_matches(payload, width=3)
 
-        assert rows is not None and len(rows) == 3
+        assert rows is not None
+        assert len(rows) == 3
 
     def test_a_wrong_top_level_shape_reads_as_a_lost_fetch_not_an_empty_search(
         self, caplog: pytest.LogCaptureFixture
@@ -1258,7 +1292,7 @@ class TestManifold:
         rows = venues.parse_manifold_matches(payload, width=60)
 
         assert rows, "fixture must carry Manifold search rows"
-        for row, raw in zip(rows, payload):
+        for row, raw in zip(rows, payload, strict=False):
             assert row.num_bettors == raw.get("uniqueBettorCount")
             assert row.total_volume == safe_float(raw.get("volume"))
             if isinstance(raw.get("closeTime"), (int, float)):
@@ -1279,8 +1313,10 @@ class TestManifold:
         wide = venues.parse_manifold_matches(payload, width=25)
         narrow = venues.parse_manifold_matches(payload, width=4)
 
-        assert wide is not None and len(wide) == 25
-        assert narrow is not None and len(narrow) == 4
+        assert wide is not None
+        assert len(wide) == 25
+        assert narrow is not None
+        assert len(narrow) == 4
 
     def test_a_wrong_top_level_shape_reads_as_a_lost_fetch_not_an_empty_search(
         self, caplog: pytest.LogCaptureFixture
@@ -1363,10 +1399,11 @@ class TestManifoldMultiOutcome:
         rows = venues.parse_manifold_matches(payload, width=60)
 
         assert rows is not None
-        multi = [(row, raw) for row, raw in zip(rows, payload) if raw["outcomeType"] != "BINARY"]
+        multi = [(row, raw) for row, raw in zip(rows, payload, strict=False) if raw["outcomeType"] != "BINARY"]
         assert len(multi) == 2, "fixture must carry multi-outcome rows, or this proves nothing"
         for row, raw in multi:
-            assert raw.get("probability") is None and "answers" not in raw
+            assert raw.get("probability") is None
+            assert "answers" not in raw
             assert row.implied_prob_yes is None
             assert row.num_bettors == raw["uniqueBettorCount"]
             assert row.close_time is not None
@@ -1424,7 +1461,8 @@ class TestManifoldMultiOutcome:
         array is enough to tell the shapes apart and nothing needs to consult ``outcomeType``."""
         detail = manifold_multi_outcome["detail_binary"]
 
-        assert "answers" not in detail and detail["probability"] is not None
+        assert "answers" not in detail
+        assert detail["probability"] is not None
         assert venues.manifold_top_answers(detail) == ()
 
     @pytest.mark.parametrize(
@@ -1678,7 +1716,7 @@ class TestManifoldMultiOutcome:
         # (that Manifold ships them a real probability, without which the venue would go priceless).
         search = manifold_multi_outcome["search_all"]
         assert {market["outcomeType"] for market in search} == {"BINARY", "MULTIPLE_CHOICE"}
-        for row, market in zip(venues.parse_manifold_matches(search, width=60) or [], search):
+        for row, market in zip(venues.parse_manifold_matches(search, width=60) or [], search, strict=False):
             assert (row.implied_prob_yes is None) is (market["outcomeType"] != "BINARY"), row.market_title
 
     def test_an_answer_child_carries_the_markets_bettor_count(self, manifold_multi_outcome: dict[str, Any]) -> None:
@@ -1753,7 +1791,8 @@ class TestManifoldScalarValueMarkets:
         payload = manifold_pseudo_numeric["search_pseudo_numeric"]
         rows = venues.parse_manifold_matches(payload, width=60)
 
-        assert rows is not None and len(rows) == 1
+        assert rows is not None
+        assert len(rows) == 1
         row = rows[0]
         assert row.implied_prob_yes is None
         assert row.scalar_estimate == ScalarEstimate(
@@ -1779,8 +1818,9 @@ class TestManifoldScalarValueMarkets:
         payload = manifold_pseudo_numeric["search_log_scale"]
         rows = venues.parse_manifold_matches(payload, width=60)
 
-        assert rows is not None and len(rows) == 2
-        for row, market in zip(rows, payload):
+        assert rows is not None
+        assert len(rows) == 2
+        for row, market in zip(rows, payload, strict=False):
             assert market["isLogScale"] is True
             assert row.implied_prob_yes is None
             estimate = row.scalar_estimate
@@ -1833,7 +1873,7 @@ class TestManifoldScalarValueMarkets:
         rows = venues.parse_manifold_matches(payload, width=60)
 
         assert rows is not None
-        for row, market in zip(rows, payload):
+        for row, market in zip(rows, payload, strict=False):
             estimate = row.scalar_estimate
             assert estimate is not None
             assert estimate.value == market["value"], "the venue's own figure, verbatim"
@@ -1880,11 +1920,13 @@ class TestManifoldScalarValueMarkets:
         — but it is the standing reason the price read is an allow-list rather than a
         ``PSEUDO_NUMERIC`` deny-list, since a deny-list would price it the day that changes."""
         payload = manifold_pseudo_numeric["search_stonk"]
-        assert payload[0]["outcomeType"] == "STONK" and "answers" not in payload[0]
+        assert payload[0]["outcomeType"] == "STONK"
+        assert "answers" not in payload[0]
 
         rows = venues.parse_manifold_matches(payload, width=60)
 
-        assert rows is not None and len(rows) == 1
+        assert rows is not None
+        assert len(rows) == 1
         assert rows[0].implied_prob_yes is None
         assert rows[0].scalar_estimate is None
 
@@ -1896,7 +1938,9 @@ class TestManifoldScalarValueMarkets:
 
         assert rows is not None
         binary = [
-            (row, raw) for row, raw in zip(rows, payload) if raw["outcomeType"] == venues.MANIFOLD_PRICED_OUTCOME_TYPE
+            (row, raw)
+            for row, raw in zip(rows, payload, strict=False)
+            if raw["outcomeType"] == venues.MANIFOLD_PRICED_OUTCOME_TYPE
         ]
         assert len(binary) == 2, "fixture must carry BINARY rows, or this proves nothing"
         for row, raw in binary:
@@ -1918,8 +1962,10 @@ class TestManifoldScalarValueMarkets:
             rows = venues.parse_manifold_matches(payload, width=60)
 
         assert rows is not None
-        assert rows[0].implied_prob_yes is None and rows[0].scalar_estimate is None
-        assert "market-level probability" in caplog.text and "SOMETHING_NEW" in caplog.text
+        assert rows[0].implied_prob_yes is None
+        assert rows[0].scalar_estimate is None
+        assert "market-level probability" in caplog.text
+        assert "SOMETHING_NEW" in caplog.text
 
     def test_the_live_payloads_reach_that_warning_on_no_row(
         self,
@@ -1988,7 +2034,8 @@ class TestScalarCoercions:
         aware = parse_iso("2026-11-01T00:00:00Z")
         naive_input = parse_iso("2026-11-01T00:00:00")
 
-        assert aware is not None and naive_input is not None
+        assert aware is not None
+        assert naive_input is not None
         assert aware.tzinfo is not None
         assert naive_input.tzinfo is not None
         assert naive_input == aware, "a naive value is TREATED as UTC, not shifted"
@@ -2007,7 +2054,8 @@ class TestScalarCoercions:
         pool naive today."""
         parsed = parse_iso("2026-11-01")
 
-        assert parsed is not None and parsed.tzinfo is not None
+        assert parsed is not None
+        assert parsed.tzinfo is not None
 
     @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
     def test_safe_float_rejects_non_finite_values(self, literal: str) -> None:
@@ -2064,7 +2112,7 @@ class TestPredictIt:
         """
         parsed = parse_iso_guarded("2026-11-03T23:59:59.1234567")
 
-        assert parsed == datetime(2026, 11, 3, 23, 59, 59, 123456, tzinfo=timezone.utc)
+        assert parsed == datetime(2026, 11, 3, 23, 59, 59, 123456, tzinfo=UTC)
 
     @pytest.mark.parametrize(
         "unparseable_tail",
@@ -2082,10 +2130,10 @@ class TestPredictIt:
         and losing the guard would raise inside `to_thread` and zero all four venues."""
         parsed = parse_iso_guarded(unparseable_tail)
 
-        assert parsed == datetime(2026, 11, 3, tzinfo=timezone.utc)
+        assert parsed == datetime(2026, 11, 3, tzinfo=UTC)
 
     def test_a_plain_timestamp_keeps_its_time_of_day(self) -> None:
-        assert parse_iso_guarded("2026-11-03T23:59:59") == datetime(2026, 11, 3, 23, 59, 59, tzinfo=timezone.utc)
+        assert parse_iso_guarded("2026-11-03T23:59:59") == datetime(2026, 11, 3, 23, 59, 59, tzinfo=UTC)
 
     def test_the_row_carries_the_parsed_close_time(self, captured_payloads: dict[str, Any]) -> None:
         market = copy.deepcopy(captured_payloads["predictit_all"]["markets"][0])
@@ -2161,7 +2209,7 @@ class TestPredictIt:
 
         children = venues.predictit_contract_children(contracts)
 
-        assert children[0].close_time == datetime(2026, 11, 3, 23, 59, 59, tzinfo=timezone.utc)
+        assert children[0].close_time == datetime(2026, 11, 3, 23, 59, 59, tzinfo=UTC)
         assert children[1].close_time is None
 
     def test_contract_names_become_the_rules_text(self, captured_payloads: dict[str, Any]) -> None:
@@ -2196,7 +2244,8 @@ class TestPredictIt:
 
         match = venues.predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy")
 
-        assert match is not None and match.is_resolved is True
+        assert match is not None
+        assert match.is_resolved is True
 
     @pytest.mark.parametrize("order", [("Closed", "Open"), ("Open", "Closed")])
     def test_one_open_contract_keeps_the_market_live_in_either_order(self, order: tuple[str, str]) -> None:
@@ -2237,7 +2286,8 @@ class TestPredictIt:
 
         match = venues.predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy")
 
-        assert match is not None and match.is_resolved is False
+        assert match is not None
+        assert match.is_resolved is False
 
     @pytest.mark.asyncio
     async def test_prefetch_keeps_the_none_versus_empty_contract(self) -> None:

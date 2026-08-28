@@ -140,7 +140,8 @@ import concurrent.futures
 import functools
 import logging
 import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import requests
 from forecasting_tools.data_models.binary_report import BinaryReport

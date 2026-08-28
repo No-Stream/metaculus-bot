@@ -7,7 +7,7 @@ telemetry parser reads them, so the text is a contract, not a convenience.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -197,7 +197,7 @@ async def test_close_time_skip_is_alertable_and_reset_per_run(mock_general_llm, 
         BinaryQuestion(
             question_text="Will this have closed by publish time?",
             id_of_question=45085,
-            close_time=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            close_time=datetime(2020, 1, 1, tzinfo=UTC),
         )
     )
     try:

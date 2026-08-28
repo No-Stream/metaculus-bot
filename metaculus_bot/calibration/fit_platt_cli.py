@@ -145,7 +145,7 @@ def _extract_mc_pairs(records: list[dict[str, Any]]) -> tuple[list[float], list[
                 "Skipping MC record qid=%s: resolved option %r not in options list", r.get("question_id"), resolution
             )
             continue
-        for option_name, prob in zip(options, forecasts):
+        for option_name, prob in zip(options, forecasts, strict=True):
             if not isinstance(prob, (int, float)):
                 logger.warning(
                     "Skipping MC option qid=%s option=%r: prob=%r is not a number",
@@ -173,7 +173,9 @@ def _bucket_calibration(probs: list[float], outcomes: list[bool]) -> dict[str, d
         label = f"{low:.1f}-{high:.1f}"
         # Match analysis.binary_summary: lower-inclusive, upper-exclusive,
         # with the final bucket also including the upper edge (1.0).
-        in_bucket = [(p, o) for p, o in zip(probs, outcomes) if low <= p < high or (high == 1.0 and p == 1.0)]
+        in_bucket = [
+            (p, o) for p, o in zip(probs, outcomes, strict=False) if low <= p < high or (high == 1.0 and p == 1.0)
+        ]
         if not in_bucket:
             continue
         bucket_probs = [p for p, _ in in_bucket]
@@ -246,9 +248,9 @@ def _run_fit(
 
     # In-sample Brier — apply the curve with NO cap so the user sees what the
     # unconstrained fit wants. The cap is a separate user-tuned safety rail.
-    baseline_briers = [brier_score(p, o) for p, o in zip(raw_probs, outcomes)]
+    baseline_briers = [brier_score(p, o) for p, o in zip(raw_probs, outcomes, strict=False)]
     adjusted_probs = [apply_binary_platt(p, params, max_abs_deviation=None) for p in raw_probs]
-    post_briers = [brier_score(p, o) for p, o in zip(adjusted_probs, outcomes)]
+    post_briers = [brier_score(p, o) for p, o in zip(adjusted_probs, outcomes, strict=False)]
     baseline_mean = sum(baseline_briers) / len(baseline_briers)
     post_mean = sum(post_briers) / len(post_briers)
     delta = baseline_mean - post_mean
@@ -319,10 +321,10 @@ def _try_plot(
         return "No fits ran; skipping calibration plot."
 
     try:
-        import matplotlib  # pyright: ignore[reportMissingImports]  # matplotlib genuinely optional for CLI plotting; CLI works without it
+        import matplotlib  # pyright: ignore[reportMissingImports]  # matplotlib genuinely optional for CLI plotting; CLI works without it  # noqa: PLC0415
 
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt  # pyright: ignore[reportMissingImports]  # optional CLI dep, guarded by ImportError
+        import matplotlib.pyplot as plt  # pyright: ignore[reportMissingImports]  # optional CLI dep, guarded by ImportError  # noqa: PLC0415
     except ImportError as exc:
         logger.warning("matplotlib unavailable: %s; skipping plot.", exc)
         return f"matplotlib unavailable ({exc}); calibration plot skipped."
@@ -427,7 +429,7 @@ def _format_buckets_table(buckets: dict[str, dict[str, float | int]] | None) -> 
 def _format_section(outcome: FitOutcome | None, title: str) -> str:
     lines: list[str] = [f"## {title} fit"]
     if outcome is None:
-        lines.append("\n_Not run (no `--{0}-from` argument)._".format(title.lower()))
+        lines.append(f"\n_Not run (no `--{title.lower()}-from` argument)._")
         return "\n".join(lines)
 
     lines.append(f"\n- n_train: **{outcome.n_train}**")
@@ -459,6 +461,7 @@ def _format_section(outcome: FitOutcome | None, title: str) -> str:
 def _write_report(
     binary_outcome: FitOutcome | None,
     mc_outcome: FitOutcome | None,
+    *,
     plot_skip_note: str | None,
     path: Path,
     version: str,
@@ -562,7 +565,13 @@ def run(args: argparse.Namespace) -> int:
         _write_json(mc_outcome, output_dir / "mc_fit.json", version)
 
     plot_skip_note = _try_plot(binary_outcome, mc_outcome, output_dir / "calibration_curves_pre_post.png")
-    _write_report(binary_outcome, mc_outcome, plot_skip_note, output_dir / "report.md", version)
+    _write_report(
+        binary_outcome,
+        mc_outcome,
+        plot_skip_note=plot_skip_note,
+        path=output_dir / "report.md",
+        version=version,
+    )
     return 0
 
 

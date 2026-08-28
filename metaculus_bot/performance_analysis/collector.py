@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
@@ -161,42 +162,39 @@ def _build_comment_lookup(comments: list[dict]) -> dict[int, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict]:
-    """Process a single post into one or more question records."""
-    post_id = post_data["id"]
-    title = post_data.get("title", "")
+@dataclass(frozen=True, slots=True)
+class _CommentSignals:
+    """Everything the bot's own comment tells us about one post's forecast.
 
-    if title.startswith("[PRACTICE]"):
-        title_preview = title[:60]  # HARNESS-SCAN-EXEMPT-subsampling  # log display truncation
-        logger.info(f"  Skipping PRACTICE post {post_id}: {title_preview}")
-        return []
+    Bundled so the post-level and question-level processors pass one value rather than
+    a dozen parallel parameters; every field is None/empty when the post has no comment.
+    """
 
-    group = post_data.get("group_of_questions")
-    if group is not None:
-        questions = group.get("questions", [])
-    else:
-        q = post_data.get("question")
-        questions = [q] if q is not None else []
+    text: str | None
+    comment_id: int | None
+    created_at: str | None
+    per_model: dict[str, str] | dict[str, dict[str, float]]
+    per_model_numeric_percentiles: dict[str, list[tuple[float, float]]]
+    was_stacked: bool | None
+    stacker_outcome: str | None
+    stacker_outcome_source: str
+    stacker_skip_reason: str | None
+    forecasters_used: tuple[int, int] | None
 
-    if not questions:
-        logger.warning(f"  Post {post_id} has no question data")
-        return []
 
-    comment = comment_lookup.get(post_id)
+def _comment_signals(comment: dict | None, post_id: int) -> _CommentSignals:
+    """Parse every per-comment marker and per-model recovery off one bot comment."""
     comment_text = comment.get("text") or comment.get("comment_text") if comment else None
-    comment_id = comment["id"] if comment else None
-    comment_created_at = comment.get("created_at") if comment else None
+
     # MC questions need full per-option probability vectors (not just the top
     # option line which the legacy single-string parser returned). Detect MC by
     # checking whether the parser found any option lines; if so, use the dict
     # values from parse_per_model_mc_option_probs as per_model_forecasts.
     per_model_numeric_percentiles = parse_per_model_numeric_percentiles(comment_text) if comment_text else {}
     per_model_mc_option_probs = parse_per_model_mc_option_probs(comment_text) if comment_text else {}
-    if per_model_mc_option_probs:
-        # MC question: use the full option-probability dicts.
-        per_model = per_model_mc_option_probs
-    else:
-        per_model = parse_per_model_forecasts(comment_text) if comment_text else {}
+    # An MC question yields full option-probability dicts; anything else falls back to the
+    # legacy single-value bullet parser.
+    per_model = per_model_mc_option_probs or (parse_per_model_forecasts(comment_text) if comment_text else {})
     was_stacked = parse_stacked_marker(comment_text) if comment_text else None
     # Tri-state outcome: prefers the new STACKER_OUTCOME= marker, falls back to
     # the legacy STACKED= marker, then to historical body-shape detection for
@@ -205,15 +203,6 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
         stacker_outcome, stacker_outcome_source = parse_inferred_stacker_outcome(comment_text)
     else:
         stacker_outcome, stacker_outcome_source = None, "none"
-    # Additive skip-reason disclosure: a plain "skipped" outcome alone can't tell a
-    # below-threshold skip from the single-forecaster short-circuit (q44870). None
-    # on comments predating the marker.
-    stacker_skip_reason = parse_stacker_skip_reason_marker(comment_text) if comment_text else None
-    # Ensemble-size disclosure: (n_used, n_configured) when the FORECASTERS_USED
-    # marker is present, else None (older comments predate it). Lets era-bucketing
-    # tell a degraded publish (a model dropped) from a genuine roster change —
-    # CLAUDE.md's "fewer than N bullets" ambiguity.
-    forecasters_used = parse_forecasters_used_marker(comment_text) if comment_text else None
 
     # Cross-signal sanity: a stacked comment should expose at least one
     # per-model entry via the rationale parsers. If the marker says stacked
@@ -227,6 +216,53 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
             f"comment_len={len(comment_text) if comment_text else 0}"
         )
 
+    return _CommentSignals(
+        text=comment_text,
+        comment_id=comment["id"] if comment else None,
+        created_at=comment.get("created_at") if comment else None,
+        per_model=per_model,
+        per_model_numeric_percentiles=per_model_numeric_percentiles,
+        was_stacked=was_stacked,
+        stacker_outcome=stacker_outcome,
+        stacker_outcome_source=stacker_outcome_source,
+        # Additive skip-reason disclosure: a plain "skipped" outcome alone can't tell a
+        # below-threshold skip from the single-forecaster short-circuit (q44870). None
+        # on comments predating the marker.
+        stacker_skip_reason=parse_stacker_skip_reason_marker(comment_text) if comment_text else None,
+        # Ensemble-size disclosure: (n_used, n_configured) when the FORECASTERS_USED
+        # marker is present, else None (older comments predate it). Lets era-bucketing
+        # tell a degraded publish (a model dropped) from a genuine roster change —
+        # CLAUDE.md's "fewer than N bullets" ambiguity.
+        forecasters_used=parse_forecasters_used_marker(comment_text) if comment_text else None,
+    )
+
+
+def _questions_on_post(post_data: dict) -> list[dict]:
+    """The post's question dicts — a group's members, or its single question."""
+    group = post_data.get("group_of_questions")
+    if group is not None:
+        return group.get("questions", [])
+    q = post_data.get("question")
+    return [q] if q is not None else []
+
+
+def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict]:
+    """Process a single post into one or more question records."""
+    post_id = post_data["id"]
+    title = post_data.get("title", "")
+
+    if title.startswith("[PRACTICE]"):
+        title_preview = title[:60]  # HARNESS-SCAN-EXEMPT-subsampling  # log display truncation
+        logger.info(f"  Skipping PRACTICE post {post_id}: {title_preview}")
+        return []
+
+    questions = _questions_on_post(post_data)
+    if not questions:
+        logger.warning(f"  Post {post_id} has no question data")
+        return []
+
+    signals = _comment_signals(comment_lookup.get(post_id), post_id)
+
     records: list[dict] = []
     for q in questions:
         # Recover per-base-model forecasts from the stacker-combined R1 body.
@@ -234,40 +270,80 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
         # returns {model: {option: prob}}, numeric returns {} (use
         # per_model_numeric_percentiles instead — it already handles stacking).
         q_type_for_base = q.get("type", "") if q else ""
-        per_base_model_forecasts = parse_per_base_model_forecasts(comment_text, q_type_for_base) if comment_text else {}
+        per_base_model_forecasts = parse_per_base_model_forecasts(signals.text, q_type_for_base) if signals.text else {}
         record = _process_single_question(
             post_id,
             title,
             q,
-            comment_text,
-            comment_id,
-            per_model,
-            per_model_numeric_percentiles,
-            was_stacked,
-            post_data,
-            comment_created_at=comment_created_at,
-            stacker_outcome=stacker_outcome,
-            stacker_outcome_source=stacker_outcome_source,
-            stacker_skip_reason=stacker_skip_reason,
+            comment_text=signals.text,
+            comment_id=signals.comment_id,
+            per_model=signals.per_model,
+            per_model_numeric_percentiles=signals.per_model_numeric_percentiles,
+            was_stacked=signals.was_stacked,
+            post_data=post_data,
+            comment_created_at=signals.created_at,
+            stacker_outcome=signals.stacker_outcome,
+            stacker_outcome_source=signals.stacker_outcome_source,
+            stacker_skip_reason=signals.stacker_skip_reason,
             per_base_model_forecasts=per_base_model_forecasts,
-            forecasters_used=forecasters_used,
+            forecasters_used=signals.forecasters_used,
         )
         if record is not None:
             records.append(record)
     return records
 
 
+def _our_forecast(q: dict, q_type: str) -> tuple[list[float] | None, float | None, dict | None]:
+    """``(forecast_values, prob_yes, metaculus_scores)`` from the question's own record.
+
+    ``forecast_values is None`` means the bot never forecast this question, which is the
+    caller's signal to drop the record.
+    """
+    my_forecasts = q.get("my_forecasts")
+    if not (my_forecasts and my_forecasts.get("latest")):
+        return None, None, None
+
+    forecast_values = my_forecasts["latest"].get("forecast_values")
+    prob_yes = None
+    if q_type == "binary" and forecast_values and len(forecast_values) >= 2:
+        prob_yes = forecast_values[1]
+
+    raw_sd = my_forecasts.get("score_data")
+    metaculus_scores = (
+        {
+            "peer_score": raw_sd.get("peer_score"),
+            "spot_peer_score": raw_sd.get("spot_peer_score"),
+            "baseline_score": raw_sd.get("baseline_score"),
+            "spot_baseline_score": raw_sd.get("spot_baseline_score"),
+            "coverage": raw_sd.get("coverage"),
+            "weighted_coverage": raw_sd.get("weighted_coverage"),
+            "relative_legacy_score": raw_sd.get("relative_legacy_score"),
+        }
+        if raw_sd
+        else None
+    )
+    return forecast_values, prob_yes, metaculus_scores
+
+
+def _post_category(post_data: dict) -> str | None:
+    """The post's first project category name, if it carries one."""
+    category_list = post_data.get("projects", {}).get("category", [])
+    if category_list and isinstance(category_list, list) and len(category_list) > 0:
+        return category_list[0].get("name")
+    return None
+
+
 def _process_single_question(
     post_id: int,
     title: str,
     q: dict,
+    *,
     comment_text: str | None,
     comment_id: int | None,
     per_model: dict[str, str] | dict[str, dict[str, float]],
     per_model_numeric_percentiles: dict[str, list[tuple[float, float]]],
     was_stacked: bool | None,
     post_data: dict,
-    *,
     comment_created_at: str | None = None,
     stacker_outcome: str | None = None,
     stacker_outcome_source: str = "none",
@@ -289,26 +365,7 @@ def _process_single_question(
         logger.info(f"  Skipping Q{question_id}: resolution={resolution_raw}")
         return None
 
-    my_forecasts = q.get("my_forecasts")
-    forecast_values = None
-    prob_yes = None
-    metaculus_scores: dict | None = None
-    if my_forecasts and my_forecasts.get("latest"):
-        forecast_values = my_forecasts["latest"].get("forecast_values")
-        if q_type == "binary" and forecast_values and len(forecast_values) >= 2:
-            prob_yes = forecast_values[1]
-        raw_sd = my_forecasts.get("score_data")
-        if raw_sd:
-            metaculus_scores = {
-                "peer_score": raw_sd.get("peer_score"),
-                "spot_peer_score": raw_sd.get("spot_peer_score"),
-                "baseline_score": raw_sd.get("baseline_score"),
-                "spot_baseline_score": raw_sd.get("spot_baseline_score"),
-                "coverage": raw_sd.get("coverage"),
-                "weighted_coverage": raw_sd.get("weighted_coverage"),
-                "relative_legacy_score": raw_sd.get("relative_legacy_score"),
-            }
-
+    forecast_values, prob_yes, metaculus_scores = _our_forecast(q, q_type)
     if forecast_values is None:
         logger.info(f"  Skipping Q{question_id}: no forecast from us")
         return None
@@ -317,13 +374,7 @@ def _process_single_question(
     open_lower = q.get("open_lower_bound", False)
     open_upper = q.get("open_upper_bound", False)
     options = q.get("options")
-
-    category = None
-    projects = post_data.get("projects", {})
-    category_list = projects.get("category", [])
-    if category_list and isinstance(category_list, list) and len(category_list) > 0:
-        category = category_list[0].get("name")
-
+    category = _post_category(post_data)
     q_title = q.get("title") or title
 
     record = {
@@ -489,9 +540,9 @@ def _compute_scores(record: dict) -> None:
                 res_float,
                 lower_bound,
                 upper_bound,
-                record["open_lower_bound"],
-                record["open_upper_bound"],
-                zero_point,
+                open_lower_bound=record["open_lower_bound"],
+                open_upper_bound=record["open_upper_bound"],
+                zero_point=zero_point,
             )
         except (ValueError, ZeroDivisionError) as e:
             logger.warning(f"Failed numeric scoring for post {record.get('post_id')}: {e}")
@@ -584,9 +635,7 @@ def _rescorable(record: object) -> bool:
     q_type = record.get("type")
     if q_type == "binary" and "our_prob_yes" not in record:
         return False
-    if q_type in ("numeric", "discrete") and not all(k in record for k in ("open_lower_bound", "open_upper_bound")):
-        return False
-    return True
+    return q_type not in ("numeric", "discrete") or all(k in record for k in ("open_lower_bound", "open_upper_bound"))
 
 
 # Recomputation float wiggle vs a genuinely different stored value. The scorer
@@ -614,7 +663,7 @@ def rescore_records(records: list[dict]) -> int:
     for record in records:
         if not _rescorable(record):
             continue
-        fresh = {**record, **{field: None for field in _SCORE_FIELDS}}
+        fresh = {**record, **dict.fromkeys(_SCORE_FIELDS)}
         _compute_scores(fresh)
         record_changed = False
         for field in _SCORE_FIELDS:

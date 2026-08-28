@@ -10,9 +10,11 @@ Tests the full flow across all components:
 import json
 import subprocess
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
+
+import pytest
 
 from backtest import _load_research_from_archive
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
@@ -462,7 +464,7 @@ class TestBackfillE2E:
                 loaded.append(json.loads(line.strip()))
 
         assert len(loaded) == len(records)
-        for original, roundtripped in zip(records, loaded):
+        for original, roundtripped in zip(records, loaded, strict=False):
             assert original == roundtripped
 
 
@@ -561,7 +563,7 @@ class TestDownloadMergeE2E:
 
 def _iso(dt: datetime) -> str:
     """Render a datetime as a GH-style 'YYYY-MM-DDTHH:MM:SSZ' createdAt string."""
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _artifact(name: str, run_id: int, created: datetime, expired: bool = False) -> dict:
@@ -590,7 +592,7 @@ class TestArtifactsEndpointSweep:
 
     def test_list_research_artifacts_parses_paginated_stream(self) -> None:
         """`gh api --paginate ... --jq` emits one object per line; parse them all."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=1)),
             _artifact("research-200", 200, now - timedelta(days=2)),
@@ -612,15 +614,14 @@ class TestArtifactsEndpointSweep:
     def test_list_research_artifacts_exits_on_gh_failure(self) -> None:
         """A gh error is fail-fast (sys.exit), never silently swallowed."""
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
-        with mock.patch("scripts.gha_artifacts.subprocess.run", return_value=failed):
-            try:
-                list_research_artifacts("repo")
-            except SystemExit as exc:
-                assert exc.code == 1
-            else:
-                raise AssertionError("expected SystemExit on gh failure")
+        with (
+            mock.patch("scripts.gha_artifacts.subprocess.run", return_value=failed),
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            list_research_artifacts("repo")
+        assert excinfo.value.code == 1
 
-    def test_only_live_research_artifacts_downloaded_expired_logged(self, caplog) -> None:  # noqa: ANN001
+    def test_only_live_research_artifacts_downloaded_expired_logged(self, caplog) -> None:
         """Live research-* downloaded; expired logged (not downloaded); non-research ignored.
 
         Enumeration + download live in the shared core (scripts.gha_artifacts), so the
@@ -628,7 +629,7 @@ class TestArtifactsEndpointSweep:
         ``gha._download_artifact_to``. ``_download_artifact_to`` writes a real run dir so
         ``research_jsonl_files`` + ``load_jsonl_records`` run for real.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=1)),
             _artifact("research-200", 200, now - timedelta(days=2)),
@@ -636,7 +637,7 @@ class TestArtifactsEndpointSweep:
             _artifact("benchmark-results", 300, now - timedelta(days=1)),  # not research-*
         ]
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             # qid mirrors the run id (100 -> 1, 200 -> 2) so the aggregated qids are checkable.
             run_dir = Path(dest_dir) / str(run_id)
             out = run_dir / "research_outputs"
@@ -667,14 +668,14 @@ class TestArtifactsEndpointSweep:
 
     def test_dedup_by_run_id_downloads_once(self) -> None:
         """Two artifact rows sharing a workflow_run id are downloaded at most once."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=1)),
             _artifact("research-100-retry", 100, now - timedelta(hours=1)),  # same run_id
             _artifact("research-200", 200, now - timedelta(days=2)),
         ]
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             run_dir = Path(dest_dir) / str(run_id)
             out = run_dir / "research_outputs"
             out.mkdir(parents=True, exist_ok=True)
@@ -695,13 +696,13 @@ class TestArtifactsEndpointSweep:
 
     def test_since_days_post_filter_excludes_old_artifacts(self) -> None:
         """--since-days windows out live artifacts created before the cutoff."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=1)),  # inside 7-day window
             _artifact("research-200", 200, now - timedelta(days=30)),  # outside 7-day window
         ]
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             run_dir = Path(dest_dir) / str(run_id)
             out = run_dir / "research_outputs"
             out.mkdir(parents=True, exist_ok=True)
@@ -722,7 +723,7 @@ class TestArtifactsEndpointSweep:
 
     def test_full_flow_rebuilds_manifest(self, tmp_path: Path) -> None:
         """The downloaded records feed build_archive and produce a manifest (rebuild intact)."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [_artifact("research-100", 100, now - timedelta(days=1))]
 
         record = {
@@ -733,7 +734,7 @@ class TestArtifactsEndpointSweep:
             "providers_used": ["asknews"],
         }
 
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             run_dir = Path(dest_dir) / str(run_id)
             out = run_dir / "research_outputs"
             out.mkdir(parents=True, exist_ok=True)
@@ -808,7 +809,7 @@ class TestSyncResearchNoClobber:
         output_dir = tmp_path / "archive"
         self._write_backfill(backfill_dir)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         artifacts = [_artifact("research-28256121132", 28256121132, now - timedelta(days=1))]
         artifact_record = {
             "qid": 43613,
@@ -822,7 +823,7 @@ class TestSyncResearchNoClobber:
         # + load_jsonl_records run for real so the build parses BOTH the downloaded
         # artifact file and the on-disk comment backfill (mocking load_jsonl_records
         # globally would hijack backfill loading).
-        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+        def fake_download(run_id, repo, artifact_name, dest_dir):
             run_dir = Path(dest_dir) / str(run_id)
             out = run_dir / "research_outputs"
             out.mkdir(parents=True, exist_ok=True)

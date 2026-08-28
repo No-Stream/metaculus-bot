@@ -120,7 +120,7 @@ class TestPoolMcValidation:
             pool_mc([{"A": 0.5, "B": 0.5}, {"A": 0.3, "C": 0.7}])
 
     def test_rejects_out_of_range_probability(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"not in \[0,1\]"):
             pool_mc([{"A": 1.5, "B": -0.5}])
 
     def test_rejects_non_normalized_vector(self):
@@ -128,5 +128,5 @@ class TestPoolMcValidation:
             pool_mc([{"A": 0.2, "B": 0.2}])
 
     def test_rejects_non_positive_concentration(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="concentration must be > 0"):
             pool_mc([{"A": 0.5, "B": 0.5}], concentration=0.0)

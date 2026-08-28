@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from itertools import pairwise
 
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
@@ -97,7 +98,7 @@ def log_corrections_summary(
     corrections_made: bool,
 ) -> None:
     """Log summary of corrections made to the distribution."""
-    if corrections_made or any(v != orig for v, orig in zip(modified_values, original_values)):
+    if corrections_made or any(v != orig for v, orig in zip(modified_values, original_values, strict=False)):
         logger.warning(f"Corrected numeric distribution for question {getattr(question, 'id_of_question', 'N/A')}")
 
 
@@ -105,6 +106,7 @@ def log_cluster_spreading_summary(
     modified_values: list[float],
     original_values: list[float],
     question: NumericQuestion,
+    *,
     clusters_applied: int,
     spread_delta: float,
     count_like: bool,
@@ -112,8 +114,8 @@ def log_cluster_spreading_summary(
     """Log summary of cluster spreading operations."""
     if clusters_applied > 0:
         # Compute pre- and post-spread min deltas for logging
-        pre_deltas = [b - a for a, b in zip(original_values, original_values[1:])]
-        post_deltas = [b - a for a, b in zip(modified_values, modified_values[1:])]
+        pre_deltas = [b - a for a, b in pairwise(original_values)]
+        post_deltas = [b - a for a, b in pairwise(modified_values)]
 
         min_value_delta_before = min(pre_deltas) if pre_deltas else float("inf")
         min_value_delta_after = min(post_deltas) if post_deltas else float("inf")

@@ -5,7 +5,8 @@ user-friendly bound messages so that the core forecaster class stays small.
 """
 
 import logging
-from typing import Literal, Sequence
+from collections.abc import Sequence
+from typing import Literal
 
 import numpy as np
 from forecasting_tools import PredictedOptionList
@@ -22,11 +23,11 @@ from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 __all__ = [
-    "aggregate_numeric",
     "aggregate_binary_mean",
+    "aggregate_numeric",
     "bound_messages",
-    "nominal_bounds",
     "clamp_and_renormalize_mc",
+    "nominal_bounds",
 ]
 
 
@@ -111,7 +112,9 @@ def _postprocess_ensemble_cdf(
             max_step=max_step_required,
         )
 
-        declared_percentiles = [Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_vals, p_vals)]
+        declared_percentiles = [
+            Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_vals, p_vals, strict=False)
+        ]
         return create_pchip_numeric_distribution(
             pchip_cdf=list(map(float, p_vals)),
             percentile_list=declared_percentiles,
@@ -129,7 +132,7 @@ def _postprocess_ensemble_cdf(
         min_step_required,
     )
 
-    percentile_values = {float(prob * 100.0): float(val) for val, prob in zip(x_vals, p_vals)}
+    percentile_values = {float(prob * 100.0): float(val) for val, prob in zip(x_vals, p_vals, strict=False)}
     pchip_cdf_values, _ = generate_pchip_cdf(
         percentile_values=percentile_values,
         open_upper_bound=question.open_upper_bound,
@@ -145,7 +148,9 @@ def _postprocess_ensemble_cdf(
     )
 
     x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)
-    declared_percentiles = [Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, pchip_cdf_values)]
+    declared_percentiles = [
+        Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, pchip_cdf_values, strict=False)
+    ]
     return create_pchip_numeric_distribution(
         pchip_cdf=list(map(float, pchip_cdf_values)),
         percentile_list=declared_percentiles,
@@ -231,7 +236,7 @@ def aggregate_numeric(
     predictions
         List of `NumericDistribution` objects as produced by individual LLMs.
     question
-        The original `NumericQuestion` – needed for bounds metadata.
+        The original `NumericQuestion` - needed for bounds metadata.
     method
         "mean" (default) or "median" to pick aggregation strategy.
     """
@@ -336,7 +341,7 @@ def clamp_and_renormalize_mc(
     consequences. Returns the same `PredictedOptionList` for convenience.
     """
     clamped = clamp_and_renormalize_probs([option.probability for option in predicted_option_list.predicted_options])
-    for option, probability in zip(predicted_option_list.predicted_options, clamped):
+    for option, probability in zip(predicted_option_list.predicted_options, clamped, strict=True):
         option.probability = probability
 
     return predicted_option_list

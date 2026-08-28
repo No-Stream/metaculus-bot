@@ -8,6 +8,8 @@ Tests cover:
   - Round-trip validation against Metaculus constraints
 """
 
+from typing import ClassVar
+
 import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
@@ -78,7 +80,7 @@ class TestSnapCdfToIntegers:
     def test_basic_step_shape(self):
         """Snapped CDF concentrates more mass at integer grid points than smooth CDF."""
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         assert len(result) == 201
 
@@ -94,7 +96,7 @@ class TestSnapCdfToIntegers:
     def test_pmf_conservation(self):
         """Total probability mass should be conserved after snapping."""
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         # Total mass = CDF[-1] - CDF[0]
         original_mass = cdf[-1] - cdf[0]
@@ -104,7 +106,7 @@ class TestSnapCdfToIntegers:
     def test_strictly_increasing(self):
         """Every adjacent pair must differ by at least min_step."""
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         diffs = np.diff(result)
         assert np.all(diffs >= NUM_MIN_PROB_STEP - 1e-10)
@@ -112,7 +114,7 @@ class TestSnapCdfToIntegers:
     def test_min_step_compliance(self):
         """Min step must be >= 5e-5 (Metaculus API requirement)."""
         cdf = _make_smooth_cdf(0.0, 20.0, center=10.0, spread=3.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 20.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 20.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         min_diff = float(np.min(np.diff(result)))
         assert min_diff >= NUM_MIN_PROB_STEP - 1e-10
@@ -120,7 +122,7 @@ class TestSnapCdfToIntegers:
     def test_max_step_compliance(self):
         """Max step must be <= 0.2 (Metaculus API requirement)."""
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         max_diff = float(np.max(np.diff(result)))
         assert max_diff <= NUM_MAX_STEP + 1e-10
@@ -128,14 +130,14 @@ class TestSnapCdfToIntegers:
     def test_values_in_unit_interval(self):
         """All CDF values must be in [0, 1]."""
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         assert all(0.0 <= v <= 1.0 for v in result)
 
     def test_wider_range(self):
         """Snapping works for a wider range like [0, 150] with 151 integers."""
         cdf = _make_smooth_cdf(0.0, 150.0, center=50.0, spread=20.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 150.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 150.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         assert len(result) == 201
         diffs = np.diff(result)
@@ -221,7 +223,7 @@ class TestEdgeCases:
         cdf = np.clip(cdf, 0.0, 1.0)
         cdf[-1] = 1.0
 
-        result = snap_cdf_to_integers(cdf.tolist(), 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf.tolist(), 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         max_diff = float(np.max(np.diff(result)))
         assert max_diff <= NUM_MAX_STEP + 1e-10
@@ -230,7 +232,7 @@ class TestEdgeCases:
         """More than DISCRETE_SNAP_MAX_INTEGERS → skip snapping."""
         n_ints = DISCRETE_SNAP_MAX_INTEGERS + 50
         cdf = _make_smooth_cdf(0.0, float(n_ints), center=float(n_ints / 2), spread=float(n_ints / 5))
-        result = snap_cdf_to_integers(cdf, 0.0, float(n_ints), False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, float(n_ints), open_lower_bound=False, open_upper_bound=False)
         assert result is None
 
     def test_already_discrete_question_skipped(self):
@@ -277,7 +279,7 @@ class TestEdgeCases:
     def test_single_integer_in_range(self):
         """Edge case: only one integer in range."""
         cdf = _make_smooth_cdf(0.5, 1.5, center=1.0, spread=0.2)
-        result = snap_cdf_to_integers(cdf, 0.5, 1.5, False, False)
+        result = snap_cdf_to_integers(cdf, 0.5, 1.5, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         assert len(result) == 201
         diffs = np.diff(result)
@@ -286,7 +288,7 @@ class TestEdgeCases:
     def test_no_integers_in_range(self):
         """Edge case: no integers in range (e.g., [0.1, 0.9])."""
         cdf = _make_smooth_cdf(0.1, 0.9, center=0.5, spread=0.1)
-        result = snap_cdf_to_integers(cdf, 0.1, 0.9, False, False)
+        result = snap_cdf_to_integers(cdf, 0.1, 0.9, open_lower_bound=False, open_upper_bound=False)
         assert result is None
 
 
@@ -365,7 +367,7 @@ class TestRoundTripValidation:
 
     def test_roundtrip_closed_bounds(self):
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         self._assert_metaculus_constraints(result, False, False)
 
@@ -373,7 +375,7 @@ class TestRoundTripValidation:
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
         cdf[0] = 0.005
         cdf[-1] = 0.995
-        result = snap_cdf_to_integers(cdf, 0.0, 10.0, True, True)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=True, open_upper_bound=True)
         assert result is not None
         self._assert_metaculus_constraints(result, True, True)
 
@@ -389,14 +391,14 @@ class TestRoundTripValidation:
         cdf = np.clip(cdf, 0.0, 1.0)
         cdf[-1] = 1.0
 
-        result = snap_cdf_to_integers(cdf.tolist(), 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf.tolist(), 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         self._assert_metaculus_constraints(result, False, False)
 
     def test_roundtrip_wide_range(self):
         """Range [0, 150] with 151 integers passes constraints."""
         cdf = _make_smooth_cdf(0.0, 150.0, center=75.0, spread=25.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 150.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 150.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         self._assert_metaculus_constraints(result, False, False)
 
@@ -406,7 +408,7 @@ class TestRoundTripValidation:
 
         question = _make_question(lower_bound=0.0, upper_bound=10.0)
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
-        result = snap_cdf_to_integers(cdf, 0.0, 10.0, False, False)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert result is not None
         _validate_pchip_cdf(result, question)
 
@@ -435,7 +437,7 @@ class TestDiscreteSnapScoring:
     def test_snapped_beats_smooth_for_integer_resolution(self, resolution: int):
         """Snapping improves log score for integer resolutions (step alignment at k)."""
         cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=float(resolution), spread=2.0)
-        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, False, False)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert cdf_snapped is not None
         score_smooth = _log_score(cdf_smooth, float(resolution), 0.0, 10.0)
         score_snapped = _log_score(cdf_snapped, float(resolution), 0.0, 10.0)
@@ -446,7 +448,7 @@ class TestDiscreteSnapScoring:
         """For non-integer resolution, snapping produces a finite (but worse) score."""
         resolution = 5.3
         cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=resolution, spread=2.0)
-        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, False, False)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert cdf_snapped is not None
         score_smooth = _log_score(cdf_smooth, resolution, 0.0, 10.0)
         score_snapped = _log_score(cdf_snapped, resolution, 0.0, 10.0)
@@ -456,7 +458,7 @@ class TestDiscreteSnapScoring:
     def test_concentrated_distribution_snapped_is_finite(self):
         """Narrow spread with max-step redistribution still produces finite scores."""
         cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=0.5)
-        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, False, False)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert cdf_snapped is not None
         score_snapped = _log_score(cdf_snapped, 5.0, 0.0, 10.0)
         assert np.isfinite(score_snapped)
@@ -464,7 +466,7 @@ class TestDiscreteSnapScoring:
     def test_lower_bound_integer_closed_bound(self):
         """Resolution at lower bound (0 on [0,10], closed) improves with snapping."""
         cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=0.0, spread=2.0)
-        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, False, False)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
         assert cdf_snapped is not None
         assert abs(cdf_snapped[0] - 0.0) < 1e-10
         score_snapped = _log_score(cdf_snapped, 0.0, 0.0, 10.0)
@@ -564,3 +566,108 @@ class TestMaybeSnapIntegration:
         result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 
         assert result is distribution
+
+
+class TestSnapCdfGoldenOutputs:
+    """Exact-output pins on a small grid.
+
+    The snapper chains half-integer PMF extraction, a ``searchsorted`` step-CDF
+    reconstruction, the closed-lower pin, the uniform mixture, and
+    ``safe_cdf_bounds``. The property tests above cover each constraint the output must
+    satisfy; these goldens pin the composition, so the stages can be split into helpers
+    without silently changing a submitted CDF. Captured from the implementation as of
+    2026-08-26.
+    """
+
+    GOLDEN: ClassVar[dict[str, list[float]]] = {
+        "linear21_closed": [
+            0.0,
+            0.05,
+            0.14994225,
+            0.15,
+            0.24994225,
+            0.25,
+            0.34994225,
+            0.35,
+            0.44994225,
+            0.45,
+            0.54994225,
+            0.55,
+            0.64994225,
+            0.65,
+            0.74994225,
+            0.75,
+            0.84994225,
+            0.85,
+            0.94994225,
+            0.95,
+            1.0,
+        ],
+        "linear21_open": [
+            0.04994225,
+            0.05,
+            0.14994225,
+            0.15,
+            0.24994225,
+            0.25,
+            0.34994225,
+            0.35,
+            0.44994225,
+            0.45,
+            0.54994225,
+            0.55,
+            0.64994225,
+            0.65,
+            0.74994225,
+            0.75,
+            0.84994225,
+            0.85,
+            0.94994225,
+            0.95,
+            0.999,
+        ],
+        "conc21_closed": [
+            0.0,
+            0.023529411764706,
+            0.047058823529412,
+            0.070588235294118,
+            0.094117647058824,
+            0.117647058823529,
+            0.141176470588235,
+            0.164705882352941,
+            0.364705882352941,
+            0.388235294117647,
+            0.588235294117647,
+            0.611764705882353,
+            0.811764705882353,
+            0.835294117647059,
+            0.858823529411765,
+            0.882352941176471,
+            0.905882352941177,
+            0.929411764705882,
+            0.952941176470588,
+            0.976470588235294,
+            1.0,
+        ],
+    }
+
+    @staticmethod
+    def _input_cdf(name: str) -> list[float]:
+        if name == "conc21_closed":
+            return list(np.clip((np.linspace(0.0, 10.0, 21) - 4.0) / 2.0, 0.0, 1.0))
+        return list(np.linspace(0.0, 1.0, 21))
+
+    @pytest.mark.parametrize("name", list(GOLDEN))
+    def test_golden_output(self, name: str):
+        open_bounds = name.endswith("_open")
+
+        result = snap_cdf_to_integers(
+            self._input_cdf(name),
+            0.0,
+            10.0,
+            open_lower_bound=open_bounds,
+            open_upper_bound=open_bounds,
+        )
+
+        assert result is not None
+        np.testing.assert_allclose(result, self.GOLDEN[name], rtol=0, atol=1e-12)

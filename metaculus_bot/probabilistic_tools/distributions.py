@@ -70,6 +70,7 @@ _P10_P90_Z_GAP: float = 2.5631
 def _fit_cdf_lsq(
     cdf_fn: CdfFn,
     items: list[tuple[float, float]],
+    *,
     initial_loc: float,
     initial_scale: float,
     label: str,
@@ -115,9 +116,9 @@ def _fit_normal_lsq(items: list[tuple[float, float]], initial_mu: float, initial
     return _fit_cdf_lsq(
         lambda v, mu, s: stats.norm.cdf(v, loc=mu, scale=s),
         items,
-        initial_mu,
-        initial_sigma,
-        "normal",
+        initial_loc=initial_mu,
+        initial_scale=initial_sigma,
+        label="normal",
     )
 
 
@@ -132,7 +133,7 @@ def _initial_normal_guess(items: list[tuple[float, float]]) -> tuple[float, floa
         p90 = next(v for p, v in items if p == 0.9)
         sigma_guess = max((p90 - p10) / _P10_P90_Z_GAP, 1e-6)
         return mu_guess, sigma_guess
-    # Fallback: interpolate at ±1σ under the normal (0.1587 / 0.8413).
+    # Fallback: interpolate at +/-1 sigma under the normal (0.1587 / 0.8413).
     lo = float(np.interp(0.1587, probs, vals))
     hi = float(np.interp(0.8413, probs, vals))
     sigma_guess = max((hi - lo) / 2.0, 1e-6)
@@ -170,9 +171,9 @@ def fit_student_t_from_percentiles(percentile_values: dict[float, float], df: fl
     loc, scale = _fit_cdf_lsq(
         lambda v, loc, s: stats.t.cdf(v, df=df, loc=loc, scale=s),
         items,
-        loc0,
-        scale0,
-        f"student_t(df={df:.3g})",
+        initial_loc=loc0,
+        initial_scale=scale0,
+        label=f"student_t(df={df:.3g})",
     )
     return StudentTFit(loc=loc, scale=scale, df=float(df), method="least_squares_cdf")
 
@@ -207,15 +208,8 @@ def out_of_bounds_mass(
     if lower_bound is not None and upper_bound is not None and not (lower_bound < upper_bound):
         raise ValueError(f"lower_bound {lower_bound} must be < upper_bound {upper_bound}")
 
-    if lower_bound is None:
-        prob_below = 0.0
-    else:
-        prob_below = eval_cdf(fit, lower_bound)
-
-    if upper_bound is None:
-        prob_above = 0.0
-    else:
-        prob_above = 1.0 - eval_cdf(fit, upper_bound)
+    prob_below = 0.0 if lower_bound is None else eval_cdf(fit, lower_bound)
+    prob_above = 0.0 if upper_bound is None else 1.0 - eval_cdf(fit, upper_bound)
 
     interior = max(0.0, 1.0 - prob_below - prob_above)
     return TailMassResult(
@@ -237,6 +231,7 @@ def percentiles_to_metaculus_cdf(
     percentile_values: dict[float, float],
     lower_bound: float,
     upper_bound: float,
+    *,
     open_lower: bool,
     open_upper: bool,
     zero_point: float | None = None,

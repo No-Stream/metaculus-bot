@@ -125,12 +125,12 @@ async def test_percentiles_only_path_logs_format_and_returns_distribution(caplog
     question = _make_numeric_question()
     rationale = _percentiles_only_rationale()
 
-    with patch("metaculus_bot.forecaster_runners.parse_structured", new=_structure_output_mock(_percentile_objs())):
-        with patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)):
-            with caplog.at_level(logging.INFO, logger="metaculus_bot.forecaster_runners"):
-                pred = await bot._run_forecast_on_numeric(
-                    question, research="r", llm_to_use=GeneralLlm(model="test-model")
-                )
+    with (
+        patch("metaculus_bot.forecaster_runners.parse_structured", new=_structure_output_mock(_percentile_objs())),
+        patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)),
+        caplog.at_level(logging.INFO, logger="metaculus_bot.forecaster_runners"),
+    ):
+        pred = await bot._run_forecast_on_numeric(question, research="r", llm_to_use=GeneralLlm(model="test-model"))
 
     assert isinstance(pred.prediction_value, NumericDistribution)
     cdf = pred.prediction_value.cdf
@@ -148,9 +148,11 @@ async def test_percentile_path_default_k_tail_is_identity_no_op() -> None:
     question = _make_numeric_question()
     rationale = _percentiles_only_rationale()
 
-    with patch("metaculus_bot.forecaster_runners.parse_structured", new=_structure_output_mock(_percentile_objs())):
-        with patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)):
-            pred = await bot._run_forecast_on_numeric(question, research="r", llm_to_use=GeneralLlm(model="test-model"))
+    with (
+        patch("metaculus_bot.forecaster_runners.parse_structured", new=_structure_output_mock(_percentile_objs())),
+        patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)),
+    ):
+        pred = await bot._run_forecast_on_numeric(question, research="r", llm_to_use=GeneralLlm(model="test-model"))
 
     declared = pred.prediction_value.declared_percentiles
     declared_by_pct: dict[float, float] = {round(float(p.percentile), 4): float(p.value) for p in declared}
@@ -177,9 +179,11 @@ async def test_percentile_path_with_old_k_tail_visibly_widens_tails(monkeypatch:
     question = _make_numeric_question()
     rationale = _percentiles_only_rationale()
 
-    with patch("metaculus_bot.forecaster_runners.parse_structured", new=_structure_output_mock(_percentile_objs())):
-        with patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)):
-            pred = await bot._run_forecast_on_numeric(question, research="r", llm_to_use=GeneralLlm(model="test-model"))
+    with (
+        patch("metaculus_bot.forecaster_runners.parse_structured", new=_structure_output_mock(_percentile_objs())),
+        patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)),
+    ):
+        pred = await bot._run_forecast_on_numeric(question, research="r", llm_to_use=GeneralLlm(model="test-model"))
 
     declared = pred.prediction_value.declared_percentiles
     declared_by_pct: dict[float, float] = {round(float(p.percentile), 4): float(p.value) for p in declared}

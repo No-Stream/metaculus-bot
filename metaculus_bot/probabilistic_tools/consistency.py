@@ -56,27 +56,15 @@ def _sse_for_fit(fit: FitType, declared: dict[float, float]) -> float:
     return sse
 
 
-def percentile_family_consistency(
+def _fit_all_families(
     declared_percentiles: dict[float, float],
-    claimed_family: FamilyLiteral | None,
-    student_t_df: float | None = None,
-) -> ConsistencyResult:
-    """Compare declared percentiles against normal/lognormal/Student-t fits.
+    df: float,
+) -> tuple[dict[str, float], dict[str, FitType]]:
+    """Fit normal / lognormal / Student-t, scoring an unfittable family as ``inf`` SSE.
 
-    ``student_t_df`` defaults to ``_DEFAULT_STUDENT_T_DF`` (5.0). Callers that
-    thread through a forecaster's declared df (``NumericStructured.student_t_df``)
-    get an apples-to-apples comparison with their chosen heavy-tailed shape.
+    A family that fails to fit is recorded in ``sse_by_family`` but absent from
+    ``fits_by_family``, so a downstream reader can tell "fit badly" from "could not fit".
     """
-    if not declared_percentiles or len(declared_percentiles) < 2:
-        raise ValueError("declared_percentiles must have at least 2 entries")
-    for p in declared_percentiles.keys():
-        if not (0.0 < float(p) < 1.0):
-            raise ValueError(f"percentile keys must be in (0, 1) (got {p})")
-
-    df = _DEFAULT_STUDENT_T_DF if student_t_df is None else float(student_t_df)
-    if df <= 0:
-        raise ValueError(f"student_t_df must be > 0 (got {df})")
-
     sse_by_family: dict[str, float] = {}
     fits_by_family: dict[str, FitType] = {}
 
@@ -87,8 +75,7 @@ def percentile_family_consistency(
     except ValueError:
         sse_by_family["normal"] = math.inf
 
-    all_positive = all(v > 0 for v in declared_percentiles.values())
-    if all_positive:
+    if all(v > 0 for v in declared_percentiles.values()):
         try:
             lognorm_fit = fit_lognormal_from_percentiles(declared_percentiles)
             fits_by_family["lognormal"] = lognorm_fit
@@ -105,6 +92,31 @@ def percentile_family_consistency(
     except ValueError:
         sse_by_family["student_t"] = math.inf
 
+    return sse_by_family, fits_by_family
+
+
+def percentile_family_consistency(
+    declared_percentiles: dict[float, float],
+    claimed_family: FamilyLiteral | None,
+    student_t_df: float | None = None,
+) -> ConsistencyResult:
+    """Compare declared percentiles against normal/lognormal/Student-t fits.
+
+    ``student_t_df`` defaults to ``_DEFAULT_STUDENT_T_DF`` (5.0). Callers that
+    thread through a forecaster's declared df (``NumericStructured.student_t_df``)
+    get an apples-to-apples comparison with their chosen heavy-tailed shape.
+    """
+    if not declared_percentiles or len(declared_percentiles) < 2:
+        raise ValueError("declared_percentiles must have at least 2 entries")
+    for p in declared_percentiles:
+        if not (0.0 < float(p) < 1.0):
+            raise ValueError(f"percentile keys must be in (0, 1) (got {p})")
+
+    df = _DEFAULT_STUDENT_T_DF if student_t_df is None else float(student_t_df)
+    if df <= 0:
+        raise ValueError(f"student_t_df must be > 0 (got {df})")
+
+    sse_by_family, fits_by_family = _fit_all_families(declared_percentiles, df)
     best_family = min(sse_by_family.items(), key=lambda kv: kv[1])[0]
 
     details = {
@@ -194,10 +206,9 @@ def stated_base_rate_consistency(
         if abs(log_lr) > _WEAK_EVIDENCE_LR_BOUND:
             flag = True
             reason = f"evidence=weak but implied LR={lr:.3f} exceeds |log(3)| bound"
-    elif evidence_strength_max == "moderate":
-        if abs(log_lr) > _MODERATE_EVIDENCE_LR_BOUND:
-            flag = True
-            reason = f"evidence=moderate but implied LR={lr:.3f} exceeds |log(10)| bound"
+    elif evidence_strength_max == "moderate" and abs(log_lr) > _MODERATE_EVIDENCE_LR_BOUND:
+        flag = True
+        reason = f"evidence=moderate but implied LR={lr:.3f} exceeds |log(10)| bound"
     # evidence=strong: never flag.
 
     return ConsistencyResult(flag=flag, flag_reason=reason, details=details)

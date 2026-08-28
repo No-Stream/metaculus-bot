@@ -76,7 +76,8 @@ Free / safe — run freely:
 
 - Gates and formatting: `make test`, `make test_fast`, `make test_e2e`,
   `make lint`, `make format`, `make typecheck`, `make typecheck_ty`, `make cov`,
-  `make audit`, `make precommit*`. The whole suite is self-contained: the `e2e`
+  `make audit`, `make deps` (deptry), `make lint_imports` (import-linter),
+  `make precommit*`. The whole suite is self-contained: the `e2e`
   marker means full-pipeline with MOCKED LLMs, and the autouse
   `_block_network_egress` fixture (`tests/conftest.py`) raises on any non-loopback
   connect, so no selected test can reach a paid API. `addopts` deselects only the
@@ -355,7 +356,8 @@ The bot's published Metaculus comments are the durable per-model record: on non-
 - **Format**: `make format` (Ruff format + autofix).
 - **Pre-commit**: `make precommit_install` then `make precommit` or `make precommit_all`.
 - **Typecheck**: `make typecheck` (basedpyright; `make typecheck_ty` for the secondary ty checker).
-- **Coverage**: `make cov`. **Audit**: `make audit` (osv-scanner over `uv.lock`; requires `brew install osv-scanner` locally — CI runs it via `google/osv-scanner-action`).
+- **Coverage**: `make cov` (branch coverage is on). **Audit**: `make audit` (osv-scanner over `uv.lock`; requires `brew install osv-scanner` locally — CI runs it via `google/osv-scanner-action`).
+- **Dependency hygiene**: `make deps` (deptry: undeclared/unused/transitive deps). **Import contracts**: `make lint_imports` (import-linter; the 6 contracts live in `pyproject.toml` `[tool.importlinter]`). Both free, both in CI's lint job and `make all`.
 - **Test single file**: `uv run pytest tests/test_specific.py`.
 
 **The full suite must pass before anything is pushed, and CI green is the real gate — not a local green run.** `make precommit_install` installs both hook types: the ruff hooks on commit, plus a `pytest-full-suite` pre-push hook running the same `uv run --frozen pytest --cov=metaculus_bot` that `.github/workflows/ci.yaml` runs. Per-push rather than per-commit — the suite takes ~105s, too much friction on every commit but the right price on the thing reviewers see.
@@ -376,14 +378,21 @@ The donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) is shared and r
 
 - Never paste the full key into chat or commit it. `.env` is gitignored.
 
-### Function-scoped imports in `forecaster.py`
+### Function-scoped imports (`# noqa: PLC0415`)
 
-`forecaster.py` keeps a handful of `from x import y` statements inside functions instead of at module scope, each tagged `# noqa: PLC0415  # function-scoped: see AGENTS.md`. Two reasons drive this:
+Imports go at module top. **`forecaster.py` now has none inside functions** — the four it used to carry (both `tool_runner` entry points, `comment.formatting.build_unified_explanation`, and `timeseries_anchor._session_charts`) were hoisted 2026-08-27 after each reason this section used to give was checked and found not to hold:
 
-1. **Optional dependency loading.** `prediction_market_provider` pulls in `rapidfuzz`; `tool_runner` only matters when `PROBABILISTIC_TOOLS_ENABLED` is on. Importing them at function scope keeps the cold-start path lean and avoids surprising errors when an optional dep isn't installed.
-2. **Ruff auto-formatter behavior.** When a usage edit is staged separately from the import edit (common during refactors and subagent dispatches), Ruff's auto-formatter strips the now-unused top-level import between cycles. Function-scoped imports survive this because the symbol is referenced in the same statement block.
+- **Cold start.** `import metaculus_bot.forecaster` costs ~4.2 s, nearly all of it `forecasting_tools`/`litellm`. Per `python -X importtime`, the hoists add ~124 ms to that (2.7 %): `comment.formatting` 14 ms including `tool_runner`'s 6 ms, and `research.timeseries_anchor` 110 ms — of which **105 ms is yfinance**, which now rides in via `timeseries_anchor` → `ts_fetch` (also hoisted, matching `research/financial_data.py`, which has always imported yfinance at module top). matplotlib does NOT come along: `timeseries_anchor` imports `ts_chart` inside its own render guard. Re-measure with `-X importtime` if you add a top-level import that pulls scipy-, matplotlib- or browser-weight machinery in; the bar for a lazy import on this path is a couple hundred milliseconds, not ten.
+- **"Optional dependency."** `rapidfuzz`, `yfinance` and `asknews` are all declared runtime dependencies in `pyproject.toml`, so a function-scoped import never protected against their absence. The one genuinely optional package is **matplotlib** (dev group, and prod installs `uv sync --no-dev`) — see `DEP004` in `pyproject.toml`.
+- **"Formatter would strip it."** Ruff only strips an import with no usage. Add the import and its usage in the SAME edit and it survives; that is a rule about how to sequence edits, not a reason to move an import into a function body.
 
-Don't hoist these to the top of `forecaster.py` without first checking that both reasons no longer apply.
+A function-scoped import needs one of three REAL justifications, and the noqa comment must name which:
+
+1. **Genuinely optional dependency** — matplotlib behind an `ImportError` guard (`research/timeseries_anchor.py`, `calibration/fit_platt_cli.py`).
+2. **Late binding for a patch surface** — a test patches the name on its SOURCE module and the consumer must resolve it at call time. Hoisting a `from x import y` here binds the unpatched object at import time and silently defeats the test (this repo has shipped that bug). Live cases: `numeric.pipeline.sanitize_percentiles` from `ablation/run_stacker.py`, `numeric.pchip_cdf.*` from `numeric/pchip_processing.py` and `scripts/score_ghosts.py`, `asknews_sdk.AsyncAskNewsSDK` and `constants.NATIVE_SEARCH_WALL_TIMEOUT` from `research/providers.py`, `constants.FETCH_GET_RETRIES` from `fetch_hardening.py`, `fallback_openrouter.build_llm_with_openrouter_fallback` from `research/targeted.py`, and `ablation/forecasters.py`'s deliberate self-import (tests rebind `run_forecasters_for_question` on the module).
+3. **A real circular import** — verify it by hoisting and importing, don't assume. Prefer fixing the module layout over keeping the lazy import.
+
+Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and never delete a `HARNESS-SCAN-EXEMPT-function-level-import` marker.
 
 ### Important commands
 

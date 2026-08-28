@@ -72,7 +72,7 @@ _MC_MATCH_SCORE = 0.0
 #   score = 100·(-0.9107219 / 0.4620981 + 1) = 100·(-1.9708476 + 1) = -97.0847554
 _NUMERIC_DIVERGENT_SCORE = -97.08475536113947
 #   Negative control — model CDF = community CDF = [0.0, 0.5, 1.0]:
-#   bot_pmf = community_pmf = [0.5, 0.5]; bot_scored = [0.5, 0.5];
+#   bot_pmf and community_pmf are both [0.5, 0.5], so bot_scored is [0.5, 0.5] as well;
 #   E_c[ln(bot_scored)] = ln(0.5) = -ln(2); normalization = ln(2)/1.5;
 #   score = 100·(-ln(2) / (ln(2)/1.5) + 1) = 100·(-1.5 + 1) = -50.0 (the anchor).
 _NUMERIC_MATCH_SCORE = -50.0
@@ -101,7 +101,8 @@ def _patched_scoring() -> Iterator[None]:
     """
 
     originals = {
-        (cls, name): cls.__dict__.get(name, _MISSING)  # noqa: HARNESS-SCAN-EXEMPT-mapping-get-in-loop  # bounded: 3 patch targets
+        # HARNESS-SCAN-EXEMPT-mapping-get-in-loop  # bounded: 3 patch targets
+        (cls, name): cls.__dict__.get(name, _MISSING)
         for cls, name in _PATCHED_TARGETS
     }
     scoring_patches.apply_scoring_patches()

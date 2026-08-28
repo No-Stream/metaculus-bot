@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from itertools import pairwise
 from typing import Any
 
 import numpy as np
@@ -56,8 +57,8 @@ from tests.conftest import make_mock_numeric_question
 
 class TestBetaBinomialUpdate:
     def test_default_weakly_informative_prior_posterior_mean(self):
-        # Default prior_mean=0.5, prior_strength=1.0 → α=β=0.5.
-        # Posterior: α=0.5+3=3.5, β=0.5+9=9.5, mean=3.5/13.
+        # Default prior_mean=0.5, prior_strength=1.0 → alpha=beta=0.5.
+        # Posterior: alpha=0.5+3=3.5, beta=0.5+9=9.5, mean=3.5/13.
         r = beta_binomial_update(k=3, n=12)
         assert isinstance(r, BetaBinomialResult)
         assert r.posterior_alpha == pytest.approx(3.5)
@@ -65,8 +66,8 @@ class TestBetaBinomialUpdate:
         assert r.posterior_mean == pytest.approx(3.5 / 13.0, rel=1e-9)
 
     def test_informative_prior_pulls_toward_prior_mean(self):
-        # Stated outside view 0.15 with strength 5 → α=0.75, β=4.25.
-        # k/n = 3/12, posterior α=3.75, β=13.25, mean ≈ 0.2206.
+        # Stated outside view 0.15 with strength 5 → alpha=0.75, beta=4.25.
+        # k/n = 3/12, posterior alpha=3.75, beta=13.25, mean ≈ 0.2206.
         r = beta_binomial_update(k=3, n=12, prior_mean=0.15, prior_strength=DEFAULT_INFORMATIVE_PRIOR_STRENGTH)
         assert r.posterior_alpha == pytest.approx(0.75 + 3.0)
         assert r.posterior_beta == pytest.approx(4.25 + 9.0)
@@ -127,11 +128,11 @@ class TestLaplaceRuleOfSuccession:
         assert laplace_rule_of_succession(0, 0) == pytest.approx(0.5)
 
     def test_invalid_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="k must satisfy"):
             laplace_rule_of_succession(5, 3)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="k must satisfy"):
             laplace_rule_of_succession(-1, 10)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="n must be"):
             laplace_rule_of_succession(0, -1)
 
 
@@ -192,11 +193,11 @@ class TestBaseRateBlend:
             base_rate_blend([0.2, 0.3], weights=[-1.0, 2.0])
 
     def test_empty_rates_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="rates must be non-empty"):
             base_rate_blend([])
 
     def test_unknown_method_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="unknown method"):
             base_rate_blend([0.2, 0.3], method="nope")  # ty: ignore[invalid-argument-type]  # type: ignore[arg-type]
 
 
@@ -228,9 +229,9 @@ class TestImpliedLikelihoodRatio:
             implied_likelihood_ratio(0.5, 1.0)
 
     def test_invalid_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="prior_prob"):
             implied_likelihood_ratio(-0.1, 0.5)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="posterior_prob"):
             implied_likelihood_ratio(0.1, 1.1)
 
 
@@ -244,7 +245,7 @@ class TestBayesFromLikelihoods:
         assert bayes_from_likelihoods(0.3, 0.5, 0.5) == pytest.approx(0.3)
 
     def test_both_likelihoods_zero_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="cannot both be zero"):
             bayes_from_likelihoods(0.3, 0.0, 0.0)
 
     def test_prior_at_zero_boundary_raises(self):
@@ -259,11 +260,11 @@ class TestBayesFromLikelihoods:
             bayes_from_likelihoods(1.0, 0.1, 0.1)
 
     def test_invalid_probs_raise(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="prior_prob"):
             bayes_from_likelihoods(-0.1, 0.5, 0.5)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="p_e_given_h"):
             bayes_from_likelihoods(0.5, 1.1, 0.5)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="p_e_given_not_h"):
             bayes_from_likelihoods(0.5, 0.5, -0.2)
 
 
@@ -321,17 +322,17 @@ class TestProbEventBefore:
         assert r.conditional_prob_given_no_event_yet == 0.0
 
     def test_invalid_hazard_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="hazard_rate"):
             prob_event_before(-1.0, 0.5, 0.5)
 
     def test_invalid_fraction_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="elapsed_fraction"):
             prob_event_before(0.5, 1.5, 0.5)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="remaining_fraction"):
             prob_event_before(0.5, 0.5, -0.1)
 
     def test_invalid_unit_duration(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="window_length"):
             prob_event_before(0.5, 0.5, 0.5, window_length=0)
 
 
@@ -350,11 +351,11 @@ class TestWeibullProbEventBefore:
         assert weibull_prob_event_before(scale=2.0, shape=1.5, t=0.0) == 0.0
 
     def test_invalid_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="scale"):
             weibull_prob_event_before(scale=0, shape=1.0, t=1.0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="shape"):
             weibull_prob_event_before(scale=1.0, shape=-1.0, t=1.0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="t must be"):
             weibull_prob_event_before(scale=1.0, shape=1.0, t=-1.0)
 
 
@@ -373,15 +374,15 @@ class TestFitGammaFromGaps:
         assert fit.shape * fit.scale**2 == pytest.approx(fit.variance, abs=1e-9)
 
     def test_single_observation_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="at least 2 entries"):
             fit_gamma_from_gaps([10])
 
     def test_zero_variance_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="variance of observed_gaps"):
             fit_gamma_from_gaps([5, 5, 5, 5])
 
     def test_empty_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="observed_gaps"):
             fit_gamma_from_gaps([])
 
 
@@ -407,11 +408,11 @@ class TestGammaProbEventBefore:
 
     def test_invalid_args_raise(self):
         fit = fit_gamma_from_gaps([75, 111, 73])
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="elapsed must be"):
             gamma_prob_event_before(fit, elapsed=-1.0, remaining=10.0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="remaining must be"):
             gamma_prob_event_before(fit, elapsed=5.0, remaining=0.0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="remaining must be"):
             gamma_prob_event_before(fit, elapsed=5.0, remaining=-1.0)
 
     def test_deep_tail_conditional_stays_in_unit_interval(self):
@@ -434,7 +435,7 @@ class TestGammaProbEventBefore:
 
         class _FakeGamma:
             @staticmethod
-            def cdf(x, a, scale):  # noqa: ARG004 — args mirror scipy
+            def cdf(x, a, scale):
                 # Pretend F(elapsed=10) = 0.9999999, F(total=11) = 1.00000005
                 # → diff = 1.0000000600000005e-7, survival = 1e-7, ratio > 1.
                 if x == 11.0:
@@ -472,13 +473,13 @@ class TestWeibullProbEventBeforeConditional:
         assert result.conditional_prob_given_no_event_yet == pytest.approx(1.0 - math.exp(-0.5), rel=1e-10)
 
     def test_invalid_args_raise(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="scale"):
             weibull_prob_event_before_conditional(scale=0.0, shape=1.0, elapsed=1.0, remaining=1.0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="shape"):
             weibull_prob_event_before_conditional(scale=1.0, shape=0.0, elapsed=1.0, remaining=1.0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="elapsed must be"):
             weibull_prob_event_before_conditional(scale=1.0, shape=1.0, elapsed=-1.0, remaining=1.0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="remaining must be"):
             weibull_prob_event_before_conditional(scale=1.0, shape=1.0, elapsed=1.0, remaining=0.0)
 
     def test_deep_tail_conditional_stays_in_unit_interval(self):
@@ -526,7 +527,7 @@ class TestPoissonAtLeastOne:
         assert poisson_at_least_one(20.0) == pytest.approx(1.0 - math.exp(-20.0))
 
     def test_invalid_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="lambda_t"):
             poisson_at_least_one(-0.1)
 
 
@@ -543,7 +544,7 @@ class TestBaseRateToHazard:
         assert base_rate_to_hazard(k=0, n=10) == pytest.approx(0.05)
 
     def test_informative_prior_pulls_toward_prior_rate(self):
-        # Prior rate 0.5/yr with strength 10 → α=5.0, β=10.
+        # Prior rate 0.5/yr with strength 10 → alpha=5.0, beta=10.
         # Data 3/12 years → posterior mean = (5 + 3) / (10 + 12) = 8/22.
         got = base_rate_to_hazard(k=3, n=12, prior_rate=0.5, prior_strength=10.0)
         assert got == pytest.approx(8.0 / 22.0)
@@ -554,15 +555,15 @@ class TestBaseRateToHazard:
         assert got == pytest.approx(0.3, rel=1e-2)
 
     def test_invalid_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="k must be"):
             base_rate_to_hazard(k=-1, n=10)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="n must be"):
             base_rate_to_hazard(k=0, n=0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="years_per_ref_period"):
             base_rate_to_hazard(k=1, n=5, years_per_ref_period=0.0)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="prior_rate"):
             base_rate_to_hazard(k=1, n=5, prior_rate=-0.1)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="prior_strength"):
             base_rate_to_hazard(k=1, n=5, prior_strength=0.0)
 
 
@@ -576,15 +577,15 @@ class TestLinearPool:
         assert got == pytest.approx((0.2 + 3 * 0.8) / 4)
 
     def test_invalid_prob_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="all probs must be in"):
             linear_pool([0.2, 1.5])
 
     def test_invalid_weight_length(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="weights length"):
             linear_pool([0.2, 0.3], weights=[1.0])
 
     def test_empty_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="probs must be non-empty"):
             linear_pool([])
 
 
@@ -611,7 +612,7 @@ class TestLogPool:
         assert 0.0 < got < 1.0
 
     def test_invalid_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="all probs must be in"):
             log_pool([0.2, -0.1])
 
 
@@ -635,7 +636,7 @@ class TestSatopaaExtremize:
         assert got < min(probs)
 
     def test_alpha_below_one_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="alpha must be"):
             satopaa_extremize([0.3, 0.5], alpha=0.5)
 
 
@@ -660,11 +661,11 @@ class TestInverseVariancePool:
         assert v3 < v2
 
     def test_invalid_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="all variances must be"):
             inverse_variance_pool([1.0, 2.0], [0.0, 1.0])
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="means length"):
             inverse_variance_pool([1.0], [1.0, 1.0])
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="means must be"):
             inverse_variance_pool([], [])
 
 
@@ -692,7 +693,7 @@ class TestLinearPoolOptions:
             linear_pool_options([{"A": 0.3, "B": 0.3}])
 
     def test_empty_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="option vectors must be"):
             linear_pool_options([])
 
 
@@ -718,15 +719,15 @@ class TestNoisyOr:
         assert noisy_or([1.0, 0.3]) == 1.0
 
     def test_empty_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="probs must be non-empty"):
             noisy_or([])
 
     def test_prob_above_one_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="all probs must be in"):
             noisy_or([1.5])
 
     def test_negative_prob_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="all probs must be in"):
             noisy_or([-0.1])
 
     def test_rejects_unknown_kwargs(self):
@@ -758,17 +759,17 @@ class TestFitNormalFromPercentiles:
         assert fit.sigma == pytest.approx(1.0, rel=0.05)
 
     def test_empty_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="percentile_values must be"):
             fit_normal_from_percentiles({})
 
     def test_single_point_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="need at least 2"):
             fit_normal_from_percentiles({0.5: 1.0})
 
     def test_invalid_percentile_key_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="percentile keys must be"):
             fit_normal_from_percentiles({0.0: 1.0, 0.5: 2.0})
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="percentile keys must be"):
             fit_normal_from_percentiles({0.5: 1.0, 1.0: 2.0})
 
 
@@ -799,7 +800,7 @@ class TestFitStudentTFromPercentiles:
         assert fit.df == pytest.approx(df)
 
     def test_invalid_df_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="df must be"):
             fit_student_t_from_percentiles({0.25: -1.0, 0.75: 1.0}, df=0)
 
 
@@ -836,7 +837,7 @@ class TestOutOfBoundsMass:
 
     def test_bounds_ordering_validation(self):
         fit = NormalFit(mu=0.0, sigma=1.0, method="m")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="lower_bound"):
             out_of_bounds_mass(fit, lower_bound=5.0, upper_bound=1.0)
 
     def test_only_upper_bound(self):
@@ -887,7 +888,7 @@ class TestFitToStandardPercentiles:
         fit = LognormalFit(mu=1.0, sigma=0.5, method="m")
         out = fit_to_standard_percentiles(fit)
         values = [out[q] for q in sorted(out.keys())]
-        assert all(a < b for a, b in zip(values, values[1:]))
+        assert all(a < b for a, b in pairwise(values))
 
 
 class TestPercentilesToMetaculusCdf:
@@ -918,7 +919,7 @@ class TestPercentilesToMetaculusCdf:
         assert cdf[-1] <= 0.999
 
     def test_invalid_bound_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="upper_bound"):
             percentiles_to_metaculus_cdf(
                 percentile_values={0.5: 5.0},
                 lower_bound=10.0,
@@ -928,7 +929,7 @@ class TestPercentilesToMetaculusCdf:
             )
 
     def test_invalid_percentile_key_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="percentile keys must be"):
             percentiles_to_metaculus_cdf(
                 percentile_values={1.5: 5.0, 0.5: 10.0},
                 lower_bound=0.0,
@@ -967,11 +968,11 @@ class TestDirichletWithOther:
             dirichlet_with_other({"A": 0.2, "B": 0.2}, other_mass=0.2)
 
     def test_empty_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="option_probs must be"):
             dirichlet_with_other({}, other_mass=None)
 
     def test_invalid_concentration(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="concentration must be"):
             dirichlet_with_other({"A": 1.0}, other_mass=None, concentration=0.0)
 
 
@@ -995,14 +996,14 @@ class TestNegativeBinomialPercentiles:
     def test_monotone(self):
         out = negative_binomial_percentiles(mean=8.0, overdispersion_factor=3.0)
         vs = [out[q] for q in sorted(out.keys())]
-        assert all(a <= b for a, b in zip(vs, vs[1:]))
+        assert all(a <= b for a, b in pairwise(vs))
 
     def test_phi_one_raises(self):
         with pytest.raises(ValueError, match="overdispersion"):
             negative_binomial_percentiles(mean=5.0, overdispersion_factor=1.0)
 
     def test_negative_mean_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="mean must be"):
             negative_binomial_percentiles(mean=-1.0, overdispersion_factor=2.0)
 
 
@@ -1016,7 +1017,7 @@ class TestPoissonPercentiles:
         assert abs(out[0.5] - 20.0) <= 2
 
     def test_negative_mean_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="mean must be"):
             poisson_percentiles(mean=-0.5)
 
 
@@ -1031,15 +1032,15 @@ class TestBetaBinomialCeilingPercentiles:
             assert v <= 10
 
     def test_invalid_mean_range(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="mean must be in"):
             beta_binomial_ceiling_percentiles(mean=11.0, ceiling=10)
 
     def test_invalid_ceiling(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="ceiling must be"):
             beta_binomial_ceiling_percentiles(mean=0.0, ceiling=0)
 
     def test_invalid_concentration(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="concentration must be"):
             beta_binomial_ceiling_percentiles(mean=5.0, ceiling=10, concentration=0.0)
 
 
@@ -1092,11 +1093,11 @@ class TestPercentileFamilyConsistency:
             percentile_family_consistency(declared, claimed_family=None, student_t_df=0.0)
 
     def test_invalid_input_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="declared_percentiles must have"):
             percentile_family_consistency({}, claimed_family="normal")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="declared_percentiles must have"):
             percentile_family_consistency({0.5: 1.0}, claimed_family="normal")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="percentile keys must be"):
             percentile_family_consistency({1.5: 1.0, 0.5: 2.0}, claimed_family="normal")
 
 
@@ -1143,7 +1144,7 @@ class TestStatedBaseRateConsistency:
         assert res.flag is True
 
     def test_invalid_strength_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="unknown evidence_strength_max"):
             stated_base_rate_consistency(0.5, 0.5, "super")  # ty: ignore[invalid-argument-type]  # type: ignore[arg-type]
 
 
@@ -1167,7 +1168,7 @@ class TestPercentileMonotonicity:
         assert res.flag is True
 
     def test_empty_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="declared_percentiles must be non-empty"):
             percentile_monotonicity_check({})
 
 
@@ -1226,13 +1227,13 @@ class TestConsistencyBranchEdges:
 
 class TestDirichletDegenerateBetaBranches:
     def test_alpha_k_zero_raises(self):
-        # option_probs with mass 0 for a key → α=0 → fail-fast ValueError.
-        # Configuration: {"A": 0.0} + other_mass=1.0 sums to 1.0. α_A = 0.
+        # option_probs with mass 0 for a key → alpha=0 → fail-fast ValueError.
+        # Configuration: {"A": 0.0} + other_mass=1.0 sums to 1.0. alpha_A = 0.
         with pytest.raises(ValueError, match="alpha_k"):
             dirichlet_with_other({"A": 0.0}, other_mass=1.0, concentration=10.0)
 
     def test_other_mass_zero_raises(self):
-        # {"A": 1.0} + other_mass=0.0 → α for __OTHER__ is 0 → ValueError.
+        # {"A": 1.0} + other_mass=0.0 → alpha for __OTHER__ is 0 → ValueError.
         with pytest.raises(ValueError, match="alpha_k"):
             dirichlet_with_other({"A": 1.0}, other_mass=0.0, concentration=10.0)
 
@@ -1257,7 +1258,7 @@ class TestNelderMeadNonConvergenceRaises:
         from metaculus_bot.probabilistic_tools import distributions as dist_mod
 
         def _forced_fail(_objective, x0, **_kwargs):
-            fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            fields: dict[str, Any] = {"success": False, "message": "forced", "x": x0, "fun": float("inf"), "nit": 0}
             return OptimizeResult(**fields)
 
         monkeypatch.setattr(dist_mod.optimize, "minimize", _forced_fail)
@@ -1318,7 +1319,7 @@ class TestDistributionRoundtrip:
 
 
 # ===========================================================================
-# Pooling identities — Satopaa α=1 equals log pool; weight rescaling
+# Pooling identities — Satopaa alpha=1 equals log pool; weight rescaling
 # ===========================================================================
 
 
@@ -1349,7 +1350,7 @@ class TestPoolingIdentities:
 
 class TestBetaBinomialClosedForm:
     @pytest.mark.parametrize(
-        "k,n,prior_mean,prior_strength",
+        ("k", "n", "prior_mean", "prior_strength"),
         [
             (0, 10, 0.1, 1.0),
             (5, 20, 0.3, 2.0),
@@ -1435,25 +1436,25 @@ class TestMixtureConstruction:
     def test_negative_weight_raises(self):
         from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="negative weight"):
             MixtureOfNormals((MixtureComponent(weight=-0.5, mean=10.0, sd=5.0),))
 
     def test_zero_sd_raises(self):
         from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="non-positive sd"):
             MixtureOfNormals((MixtureComponent(weight=1.0, mean=10.0, sd=0.0),))
 
     def test_no_components_raises(self):
         from metaculus_bot.probabilistic_tools import MixtureOfNormals
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="requires at least one"):
             MixtureOfNormals(())
 
     def test_zero_total_weight_raises(self):
         from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="total weight must be"):
             MixtureOfNormals((MixtureComponent(weight=0.0, mean=10.0, sd=5.0),))
 
 
@@ -1485,14 +1486,14 @@ class TestMixtureCDF:
         from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
 
         mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=1.0),))
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="grid must contain only finite"):
             mixture_cdf(mix, np.array([0.0, float("nan"), 1.0]))
 
     def test_empty_grid_raises(self):
         from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
 
         mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=1.0),))
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="grid must be non-empty"):
             mixture_cdf(mix, np.array([]))
 
 
@@ -1567,13 +1568,13 @@ class TestFitMixtureFromPercentiles:
     def test_n_components_one_raises(self):
         from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="n_components must be"):
             fit_mixture_from_percentiles({0.1: 1.0, 0.5: 2.0, 0.9: 3.0}, n_components=1, seed=0)
 
     def test_n_components_five_raises(self):
         from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="n_components must be"):
             fit_mixture_from_percentiles({0.1: 1.0, 0.5: 2.0, 0.9: 3.0}, n_components=5, seed=0)
 
     def test_multi_start_recovers_bimodal_independent_of_seed(self):
@@ -1630,8 +1631,8 @@ class TestFitMixtureFromPercentiles:
         )
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
-        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
-            fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+        def _always_fail(objective, x0, **kwargs):
+            fields: dict[str, Any] = {"success": False, "message": "forced", "x": x0, "fun": float("inf"), "nit": 0}
             return OptimizeResult(**fields)
 
         monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
@@ -1658,8 +1659,8 @@ class TestFitMixtureFromPercentiles:
         )
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
-        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
-            fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+        def _always_fail(objective, x0, **kwargs):
+            fields: dict[str, Any] = {"success": False, "message": "forced", "x": x0, "fun": float("inf"), "nit": 0}
             return OptimizeResult(**fields)
 
         monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
@@ -1685,8 +1686,8 @@ class TestFitMixtureFromPercentiles:
         from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
-        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001
-            fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+        def _always_fail(objective, x0, **kwargs):
+            fields: dict[str, Any] = {"success": False, "message": "forced", "x": x0, "fun": float("inf"), "nit": 0}
             return OptimizeResult(**fields)
 
         monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
@@ -1714,8 +1715,8 @@ class TestFitMixtureFromPercentiles:
         bad_log_sd = -50.0
         x_bad = np.concatenate([np.zeros(n), np.array([10.0, 20.0, 30.0]), np.full(n, bad_log_sd)])
 
-        def _success_with_tiny_sd(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
-            fields: dict[str, Any] = dict(success=True, message="ok", x=x_bad, fun=0.0, nit=1)
+        def _success_with_tiny_sd(objective, x0, **kwargs):
+            fields: dict[str, Any] = {"success": True, "message": "ok", "x": x_bad, "fun": 0.0, "nit": 1}
             return OptimizeResult(**fields)
 
         monkeypatch.setattr(mixtures_mod.optimize, "minimize", _success_with_tiny_sd)

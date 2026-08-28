@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -139,6 +140,7 @@ def _middle_band(records: list[dict]) -> list[dict]:
 def select_cohort(
     records: list[dict],
     mode: Literal["worst", "best", "middle"],
+    *,
     n_binary: int = 10,
     n_numeric: int = 5,
     n_mc: int = 2,
@@ -189,7 +191,7 @@ def select_cohort(
         sel_numeric = sorted(numeric_pool, key=lambda r: _rank_key_best_logscore(r, "numeric_log_score"))[:n_numeric]
         sel_mc = sorted(mc_pool, key=lambda r: _rank_key_best_logscore(r, "mc_log_score"))[:n_mc]
     elif mode == "middle":
-        rng = random.Random(seed)
+        rng = random.Random(seed)  # noqa: S311  # deterministic audit sampling, not cryptographic
         middle = _middle_band(records)
         binary_pool = [r for r in middle if r.get("type") == "binary"]
         numeric_pool = [r for r in middle if r.get("type") in ("numeric", "discrete")]
@@ -226,6 +228,7 @@ def select_cohort(
 
 def select_worst_misses(
     records: list[dict],
+    *,
     n_binary: int = 10,
     n_numeric: int = 5,
     n_mc: int = 2,
@@ -337,71 +340,117 @@ def _record_cdf_size(record: dict) -> int:
     return len(published) if len(published) >= 3 else PCHIP_CDF_POINTS
 
 
-def _rank_numeric(record: dict) -> list[dict]:
+@dataclass(frozen=True, slots=True)
+class _NumericScoringInputs:
+    """Everything a member curve needs to be rebuilt and log-scored on one record."""
+
+    resolution: float
+    lower_bound: float
+    upper_bound: float
+    zero_point: float | None
+    open_lower: bool
+    open_upper: bool
+    cdf_size: int
+    min_step: float
+    max_step: float
+
+
+def _numeric_scoring_inputs(record: dict) -> _NumericScoringInputs | None:
+    """Bundle the record's bounds, grid size and per-bin step constraints, or None."""
     score_inputs = resolve_numeric_record_to_score_inputs(record)
     if score_inputs is None:
-        return []
+        return None
     res_float, lower_bound, upper_bound, zero_point = score_inputs
-
-    open_lower = bool(record.get("open_lower_bound", False))
-    open_upper = bool(record.get("open_upper_bound", False))
     cdf_size = _record_cdf_size(record)
     min_step, max_step = grid_step_constraints(cdf_size)
+    return _NumericScoringInputs(
+        resolution=res_float,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        zero_point=zero_point,
+        open_lower=bool(record.get("open_lower_bound", False)),
+        open_upper=bool(record.get("open_upper_bound", False)),
+        cdf_size=cdf_size,
+        min_step=min_step,
+        max_step=max_step,
+    )
+
+
+def _score_member_curve(
+    model: str,
+    percentile_pairs: list,
+    inputs: _NumericScoringInputs,
+    *,
+    post_id: object,
+) -> dict | None:
+    """Rebuild one member's CDF on the record's own grid and log-score it.
+
+    None means the member could not be scored (PCHIP or scoring failure), which the
+    caller counts toward the degraded-ranking warning.
+    """
+    percentile_dict, conflicts = declared_anchors(percentile_pairs)
+    if conflicts:
+        logger.warning(
+            f"Conflicting percentile restatement post={post_id} model={model}: "
+            f"{conflicts} label(s) declared twice with different values; the last value is scored"
+        )
+    try:
+        cdf, _ = generate_pchip_cdf(
+            percentile_dict,
+            open_upper_bound=inputs.open_upper,
+            open_lower_bound=inputs.open_lower,
+            upper_bound=inputs.upper_bound,
+            lower_bound=inputs.lower_bound,
+            zero_point=inputs.zero_point,
+            min_step=inputs.min_step,
+            max_step=inputs.max_step,
+            num_points=inputs.cdf_size,
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.warning(f"Per-model PCHIP failure post={post_id} model={model}: {exc}")
+        return None
+
+    try:
+        score = numeric_log_score(
+            cdf,
+            inputs.resolution,
+            inputs.lower_bound,
+            inputs.upper_bound,
+            open_lower_bound=inputs.open_lower,
+            open_upper_bound=inputs.open_upper,
+            zero_point=inputs.zero_point,
+        )
+    except (ValueError, ZeroDivisionError) as exc:
+        logger.warning(f"Per-model scoring failure post={post_id} model={model}: {exc}")
+        return None
+
+    return {
+        "model": model,
+        "percentiles": percentile_pairs,
+        "score": score,
+        "raw": _summarize_percentiles(percentile_dict),
+        "n_anchors": len(percentile_dict),
+    }
+
+
+def _rank_numeric(record: dict) -> list[dict]:
+    inputs = _numeric_scoring_inputs(record)
+    if inputs is None:
+        return []
 
     cohort = per_model_ranking_cohort(record)
     log_ranking_cohort(record, cohort, cut="audit_rank_numeric")
     per_model = cohort.entries
-    skipped_count = 0
-    ranked: list[dict] = []
     post_id = record.get("post_id")
+
+    ranked: list[dict] = []
+    skipped_count = 0
     for model, percentile_pairs in per_model.items():
-        percentile_dict, conflicts = declared_anchors(percentile_pairs)
-        if conflicts:
-            logger.warning(
-                f"Conflicting percentile restatement post={post_id} model={model}: "
-                f"{conflicts} label(s) declared twice with different values; the last value is scored"
-            )
-        try:
-            cdf, _ = generate_pchip_cdf(
-                percentile_dict,
-                open_upper_bound=open_upper,
-                open_lower_bound=open_lower,
-                upper_bound=upper_bound,
-                lower_bound=lower_bound,
-                zero_point=zero_point,
-                min_step=min_step,
-                max_step=max_step,
-                num_points=cdf_size,
-            )
-        except (ValueError, RuntimeError) as exc:
-            logger.warning(f"Per-model PCHIP failure post={post_id} model={model}: {exc}")
+        entry = _score_member_curve(model, percentile_pairs, inputs, post_id=post_id)
+        if entry is None:
             skipped_count += 1
-            continue
-
-        try:
-            score = numeric_log_score(
-                cdf,
-                res_float,
-                lower_bound,
-                upper_bound,
-                open_lower,
-                open_upper,
-                zero_point,
-            )
-        except (ValueError, ZeroDivisionError) as exc:
-            logger.warning(f"Per-model scoring failure post={post_id} model={model}: {exc}")
-            skipped_count += 1
-            continue
-
-        ranked.append(
-            {
-                "model": model,
-                "percentiles": percentile_pairs,
-                "score": score,
-                "raw": _summarize_percentiles(percentile_dict),
-                "n_anchors": len(percentile_dict),
-            }
-        )
+        else:
+            ranked.append(entry)
 
     # If the majority of models failed, the audit output for this question
     # would be misleading (empty or near-empty ranking) — surface loudly
@@ -580,49 +629,106 @@ def _load_external_comments(post_id: int, audit_dir: Path) -> str | None:
     return text
 
 
+def _crowd_size_text(meta: dict) -> str:
+    """Render ``metadata.nr_forecasters`` as three states, not two.
+
+    Absent or None means the collector never read a crowd size (the post carried no
+    field). A literal 0 is the pre-2026-08-25 sentinel: every record pulled before the
+    writer fix carries 0 because the collector read the field off the question dict,
+    which never carries it. A genuine zero crowd cannot occur on a question this bot
+    forecast on — the bot's own forecast counts — so a bare "0" would state an empty
+    crowd nobody measured. The sentinel renders as unknown, with the reason, so it stays
+    distinguishable from both n/a and a real count.
+    """
+    crowd = meta.get("nr_forecasters")
+    if crowd == 0:
+        return "unknown (0 = pre-2026-08-25 record; the field was never read)"
+    if crowd is None:
+        return "n/a"
+    return str(crowd)
+
+
+def _miss_header_lines(record: dict) -> list[str]:
+    """The question's identity, resolution, our forecast and its score."""
+    post_id = record["post_id"]
+    meta = record.get("metadata") or {}
+    was_stacked = record.get("was_stacked")
+
+    lines = [
+        f"# {record.get('title', '(no title)')}\n",
+        f"- **Metaculus**: https://www.metaculus.com/questions/{post_id}/",
+        f"- **post_id**: {post_id}  |  **cohort**: {record.get('_cohort', '?')}  |  **type**: {record['type']}",
+        f"- **Resolved**: {_format_resolution(record)}",
+        f"- **Our prediction**: {_format_our_prediction(record)}",
+        f"- **Score**: {_format_score_header(record)}",
+        f"- **nr_forecasters**: {_crowd_size_text(meta)}",
+        f"- **was_stacked**: {'unknown' if was_stacked is None else was_stacked}",
+    ]
+    if meta.get("category"):
+        lines.append(f"- **category**: {meta['category']}")
+    lines.append("")
+    return lines
+
+
+def _reasoning_order(ranked_models: list[dict], per_model_reasoning: dict[str, str]) -> list[str]:
+    """Models best-first by rank, then any reasoning-only member appended.
+
+    A reasoning-only member is MC (no per-member ranker), an unparseable value, or a
+    member the ranking cohort excluded (anonymous key, too-sparse curve). Their prose
+    is still worth reading — only their SCORE was untrustworthy.
+    """
+    if not ranked_models:
+        return list(per_model_reasoning.keys())
+    ordered = [r["model"] for r in ranked_models if r["model"] in per_model_reasoning]
+    ordered.extend(m for m in per_model_reasoning if m not in ordered)
+    return ordered
+
+
+def _per_model_reasoning_lines(
+    record: dict,
+    ranked_models: list[dict],
+    per_model_reasoning: dict[str, str],
+) -> list[str]:
+    """Each member's rationale, headed by its forecast and score when it was ranked.
+
+    Opens with a truncation warning when a summary bullet lost its rationale. That read
+    deliberately stays OUTSIDE the ranking cohort: it asks "did every bullet keep its
+    rationale", which needs every bullet — filtering it would hide a trimmed rationale
+    behind an exclusion.
+    """
+    lines: list[str] = []
+    summary_models = set(parse_per_model_forecasts(record.get("comment_text") or "").keys())
+    missing = summary_models - set(per_model_reasoning.keys())
+    if missing:
+        lines.append(f"> ⚠️ Reasoning missing for {sorted(missing)} — comment likely trimmed to COMMENT_CHAR_LIMIT.")
+        lines.append("")
+
+    lines.append("## Per-model reasoning")
+    lines.append("")
+
+    score_label = "log score" if record["type"] in ("numeric", "discrete") else "Brier"
+    scored_by_model = {r["model"]: r for r in ranked_models}
+    for model in _reasoning_order(ranked_models, per_model_reasoning):
+        scored = scored_by_model.get(model)
+        forecast_str = (
+            f" — forecast **{scored['raw']}** ({score_label} {scored['score']:.3f})" if scored is not None else ""
+        )
+        lines.append(f"### {model}{forecast_str}\n")
+        lines.append(per_model_reasoning.get(model, ""))
+        lines.append("")
+    return lines
+
+
 def emit_miss_markdown(
     record: dict,
     ranked_models: list[dict],
     per_model_reasoning: dict[str, str],
+    *,
     audit_dir: Path,
     out_path: Path,
 ) -> None:
     """Write a per-question audit markdown file."""
-    post_id = record["post_id"]
-    title = record.get("title", "(no title)")
-    q_type = record["type"]
-    cohort = record.get("_cohort", "?")
-    url = f"https://www.metaculus.com/questions/{post_id}/"
-    meta = record.get("metadata") or {}
-
-    lines: list[str] = []
-    lines.append(f"# {title}\n")
-    lines.append(f"- **Metaculus**: {url}")
-    lines.append(f"- **post_id**: {post_id}  |  **cohort**: {cohort}  |  **type**: {q_type}")
-    lines.append(f"- **Resolved**: {_format_resolution(record)}")
-    lines.append(f"- **Our prediction**: {_format_our_prediction(record)}")
-    lines.append(f"- **Score**: {_format_score_header(record)}")
-    # Three states, not two. Absent or None means the collector never read a crowd size
-    # (the post carried no field). A literal 0 is the pre-2026-08-25 sentinel: every
-    # record pulled before the writer fix carries 0 because the collector read the field
-    # off the question dict, which never carries it. A genuine zero crowd cannot occur on
-    # a question this bot forecast on — the bot's own forecast counts — so a bare "0"
-    # would state an empty crowd nobody measured. Render the sentinel as unknown, with
-    # the reason, so it stays distinguishable from both n/a and a real count.
-    crowd = meta.get("nr_forecasters")
-    if crowd == 0:
-        crowd_text = "unknown (0 = pre-2026-08-25 record; the field was never read)"
-    elif crowd is None:
-        crowd_text = "n/a"
-    else:
-        crowd_text = str(crowd)
-    lines.append(f"- **nr_forecasters**: {crowd_text}")
-    was_stacked = record.get("was_stacked")
-    lines.append(f"- **was_stacked**: {'unknown' if was_stacked is None else was_stacked}")
-    category = meta.get("category")
-    if category:
-        lines.append(f"- **category**: {category}")
-    lines.append("")
+    lines = _miss_header_lines(record)
 
     # Binary (Brier) and numeric/discrete (log score off each member's rebuilt
     # CDF) are ranked; MC has no per-member ranker yet.
@@ -630,47 +736,11 @@ def emit_miss_markdown(
     lines.append("")
     lines.append(_format_model_ranking(ranked_models, record))
 
-    # Flag truncation so the reader knows per-model reasoning may be partial. This
-    # is the one per-model read here that deliberately stays OUTSIDE the ranking
-    # cohort: it asks "did every bullet keep its rationale", which needs every
-    # bullet — filtering it would hide a trimmed rationale behind an exclusion.
-    summary_models = set(parse_per_model_forecasts(record.get("comment_text") or "").keys())
-    reasoning_models = set(per_model_reasoning.keys())
-    missing = summary_models - reasoning_models
-    if missing:
-        lines.append(f"> ⚠️ Reasoning missing for {sorted(missing)} — comment likely trimmed to COMMENT_CHAR_LIMIT.")
-        lines.append("")
-
-    # Per-model reasoning, ordered by rank when available so best-first.
-    lines.append("## Per-model reasoning")
-    lines.append("")
-    ordered_models: list[str]
-    if ranked_models:
-        ordered_models = [r["model"] for r in ranked_models if r["model"] in per_model_reasoning]
-        # Append any reasoning-only models: MC, an unparseable value, or a member
-        # the ranking cohort excluded (anonymous key, too-sparse curve). Their
-        # prose is still worth reading — only their SCORE was untrustworthy.
-        for m in per_model_reasoning:
-            if m not in ordered_models:
-                ordered_models.append(m)
-    else:
-        ordered_models = list(per_model_reasoning.keys())
-
-    score_label = "log score" if q_type in ("numeric", "discrete") else "Brier"
-    for model in ordered_models:
-        prose = per_model_reasoning.get(model, "")
-        forecast_str = ""
-        for r in ranked_models:
-            if r["model"] == model:
-                forecast_str = f" — forecast **{r['raw']}** ({score_label} {r['score']:.3f})"
-                break
-        lines.append(f"### {model}{forecast_str}\n")
-        lines.append(prose)
-        lines.append("")
+    lines.extend(_per_model_reasoning_lines(record, ranked_models, per_model_reasoning))
 
     # Optional external-forecaster-comment inclusion (other bots + humans,
     # curated manually since the comments API is restricted).
-    external = _load_external_comments(post_id, audit_dir)
+    external = _load_external_comments(record["post_id"], audit_dir)
     if external is not None:
         lines.append("## External forecaster comments (other bots + humans, manually curated)")
         lines.append("")
@@ -722,6 +792,140 @@ _DEFAULT_SYNTHESIS_FRAMING: dict[str, str] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _BinaryRankingTallies:
+    """Cross-question counts and deltas read off the binary per-model rankings."""
+
+    binary_count: int
+    best_model_tally: dict[str, int]
+    avoided_model_tally: dict[str, int]
+    # (post_id, best model, ensemble Brier, best-model Brier, ensemble - best)
+    ensemble_vs_best_deltas: list[tuple[int, str, float, float, float]]
+    missing_ensemble_brier: list[int]
+
+
+def _binary_ranking_tallies(records_with_rankings: list[dict]) -> _BinaryRankingTallies:
+    """Who finished best/worst per question, and how much the aggregate gave up.
+
+    A record with no ensemble Brier is NAMED as omitted rather than given a delta. The
+    old fallback rendered the missing score as 0.000 — a PERFECT ensemble — with delta
+    +0.000, which reads as "aggregating cost nothing" on a record that was never scored.
+    """
+    best_model_tally: dict[str, int] = {}
+    avoided_model_tally: dict[str, int] = {}
+    binary_count = 0
+    ensemble_vs_best_deltas: list[tuple[int, str, float, float, float]] = []
+    missing_ensemble_brier: list[int] = []
+
+    for entry in records_with_rankings:
+        rec = entry["record"]
+        ranked = entry["ranked"]
+        if rec.get("type") != "binary" or not ranked:
+            continue
+        binary_count += 1
+        best = ranked[0]
+        worst = ranked[-1]
+        best_model_tally[best["model"]] = best_model_tally.get(best["model"], 0) + 1
+        avoided_model_tally[worst["model"]] = avoided_model_tally.get(worst["model"], 0) + 1
+        if rec.get("our_prob_yes") is None:
+            continue
+        ensemble_brier = rec.get("brier_score")
+        if ensemble_brier is None:
+            missing_ensemble_brier.append(rec["post_id"])
+            continue
+        ensemble_vs_best_deltas.append(
+            (rec["post_id"], best["model"], ensemble_brier, best["score"], ensemble_brier - best["score"])
+        )
+
+    return _BinaryRankingTallies(
+        binary_count=binary_count,
+        best_model_tally=best_model_tally,
+        avoided_model_tally=avoided_model_tally,
+        ensemble_vs_best_deltas=ensemble_vs_best_deltas,
+        missing_ensemble_brier=missing_ensemble_brier,
+    )
+
+
+def _closest_to_truth_lines(tallies: _BinaryRankingTallies, framing: dict[str, str]) -> list[str]:
+    """Per-model best/worst finish counts, most-often-best first."""
+    if not tallies.best_model_tally:
+        return []
+
+    lines = [
+        f"## Closest-to-truth tally ({framing['cohort_name']})\n",
+        f"| model | {framing['tally_best_label']} | {framing['tally_worst_label']} |",
+        "|---|---|---|",
+    ]
+    all_models = sorted(set(tallies.best_model_tally) | set(tallies.avoided_model_tally))
+    lines.extend(
+        f"| {m} | {tallies.best_model_tally.get(m, 0)} | {tallies.avoided_model_tally.get(m, 0)} |"
+        for m in sorted(all_models, key=lambda k: -tallies.best_model_tally.get(k, 0))
+    )
+    lines.append("")
+    return lines
+
+
+def _ensemble_vs_best_lines(tallies: _BinaryRankingTallies, framing: dict[str, str]) -> list[str]:
+    """What aggregating cost against the best member, worst regret first."""
+    lines: list[str] = []
+    if tallies.ensemble_vs_best_deltas:
+        lines.append(f"## {framing['delta_section_label']}\n")
+        lines.append("| post | best model | ensemble Brier | best-model Brier | Δ (lost by aggregating) |")
+        lines.append("|---|---|---|---|---|")
+        lines.extend(
+            f"| {pid} | {best_m} | {ens:.3f} | {best:.3f} | {delta:+.3f} |"
+            for pid, best_m, ens, best, delta in sorted(tallies.ensemble_vs_best_deltas, key=lambda t: -t[4])
+        )
+        lines.append("")
+    if tallies.missing_ensemble_brier:
+        lines.append(
+            f"_Omitted from the delta table — no ensemble Brier on the record, so there is no delta: "
+            f"{sorted(tallies.missing_ensemble_brier)}._\n"
+        )
+    return lines
+
+
+def _high_spread_lines(records_with_rankings: list[dict], framing: dict[str, str]) -> list[str]:
+    """The ten widest per-model disagreements — the stacking candidates.
+
+    Binary only: "spread" here is max - min over the per-model probabilities (a number
+    in [0, 1]). Numeric/discrete entries produced by ``_rank_numeric`` carry
+    ``percentiles`` rather than ``prob``, and a percentile-based spread isn't directly
+    comparable, so they are skipped rather than given a number the reader would misread.
+    """
+    high_spread_miss = []
+    for entry in records_with_rankings:
+        rec = entry["record"]
+        ranked = entry["ranked"]
+        if rec.get("type") != "binary" or len(ranked) < 2:
+            continue
+        probs = [r["prob"] for r in ranked]
+        high_spread_miss.append(
+            (
+                rec["post_id"],
+                rec.get("title", "")[:60],
+                max(probs) - min(probs),
+                rec.get("brier_score"),
+                rec.get("was_stacked"),
+            )
+        )
+
+    if not high_spread_miss:
+        return []
+
+    lines = [
+        f"## {framing['spread_section_label']}\n",
+        "| post | title | best-vs-worst spread | Brier | was_stacked |",
+        "|---|---|---|---|---|",
+    ]
+    for pid, t, spread, brier, stacked in sorted(high_spread_miss, key=lambda x: -x[2])[:10]:
+        stacked_text = "unknown" if stacked is None else str(stacked)
+        brier_text = f"{brier:.3f}" if brier is not None else "n/a"
+        lines.append(f"| {pid} | {t} | {spread * 100:.1f}pp | {brier_text} | {stacked_text} |")
+    lines.append("")
+    return lines
+
+
 def emit_synthesis(
     records_with_rankings: list[dict],
     out_path: Path,
@@ -741,100 +945,13 @@ def emit_synthesis(
     positional key can no longer win "times best".
     """
     f = {**_DEFAULT_SYNTHESIS_FRAMING, **(framing or {})}
+    tallies = _binary_ranking_tallies(records_with_rankings)
 
-    lines: list[str] = []
-    lines.append(f"# {f['title']}\n")
-    lines.append(f"{f['intro_paragraph']}\n")
-
-    # Per-model "best finisher" tally — how often was each model the closest?
-    best_model_tally: dict[str, int] = {}
-    avoided_model_tally: dict[str, int] = {}
-    binary_count = 0
-    ensemble_vs_best_deltas: list[tuple[int, str, float, float, float]] = []
-    missing_ensemble_brier: list[int] = []
-    for entry in records_with_rankings:
-        rec = entry["record"]
-        ranked = entry["ranked"]
-        if rec.get("type") != "binary" or not ranked:
-            continue
-        binary_count += 1
-        best = ranked[0]
-        worst = ranked[-1]
-        best_model_tally[best["model"]] = best_model_tally.get(best["model"], 0) + 1
-        avoided_model_tally[worst["model"]] = avoided_model_tally.get(worst["model"], 0) + 1
-        if rec.get("our_prob_yes") is None:
-            continue
-        ensemble_brier = rec.get("brier_score")
-        if ensemble_brier is None:
-            # No ensemble Brier means no delta. The old fallback rendered the
-            # missing score as 0.000 — a PERFECT ensemble — with delta +0.000,
-            # which reads as "aggregating cost nothing" on a record that was
-            # never scored. Name the omission instead.
-            missing_ensemble_brier.append(rec["post_id"])
-            continue
-        best_brier = best["score"]
-        ensemble_vs_best_deltas.append(
-            (rec["post_id"], best["model"], ensemble_brier, best_brier, ensemble_brier - best_brier)
-        )
-
-    lines.append(f"## Scope\n\n- {binary_count} binary records ranked.\n")
-
-    if best_model_tally:
-        lines.append(f"## Closest-to-truth tally ({f['cohort_name']})\n")
-        lines.append(f"| model | {f['tally_best_label']} | {f['tally_worst_label']} |")
-        lines.append("|---|---|---|")
-        all_models = sorted(set(best_model_tally) | set(avoided_model_tally))
-        for m in sorted(all_models, key=lambda k: -best_model_tally.get(k, 0)):
-            lines.append(f"| {m} | {best_model_tally.get(m, 0)} | {avoided_model_tally.get(m, 0)} |")
-        lines.append("")
-
-    if ensemble_vs_best_deltas:
-        lines.append(f"## {f['delta_section_label']}\n")
-        lines.append("| post | best model | ensemble Brier | best-model Brier | Δ (lost by aggregating) |")
-        lines.append("|---|---|---|---|---|")
-        for pid, best_m, ens, best, delta in sorted(ensemble_vs_best_deltas, key=lambda t: -t[4]):
-            lines.append(f"| {pid} | {best_m} | {ens:.3f} | {best:.3f} | {delta:+.3f} |")
-        lines.append("")
-    if missing_ensemble_brier:
-        lines.append(
-            f"_Omitted from the delta table — no ensemble Brier on the record, so there is no delta: "
-            f"{sorted(missing_ensemble_brier)}._\n"
-        )
-
-    # Spread buckets — large per-model spread + wrong ensemble = stacking case.
-    # Only meaningful for binary records: "spread" here is max - min over the
-    # per-model probabilities (a number in [0, 1]). Numeric/discrete entries
-    # produced by ``_rank_numeric`` carry ``percentiles`` rather than ``prob``,
-    # and a percentile-based spread isn't directly comparable, so we skip them
-    # here rather than synthesize a number that the reader would misread.
-    high_spread_miss = []
-    for entry in records_with_rankings:
-        ranked = entry["ranked"]
-        rec = entry["record"]
-        if rec.get("type") != "binary":
-            continue
-        if len(ranked) < 2:
-            continue
-        probs = [r["prob"] for r in ranked]
-        spread = max(probs) - min(probs)
-        high_spread_miss.append(
-            (
-                rec["post_id"],
-                rec.get("title", "")[:60],
-                spread,
-                rec.get("brier_score"),
-                rec.get("was_stacked"),
-            )
-        )
-    if high_spread_miss:
-        lines.append(f"## {f['spread_section_label']}\n")
-        lines.append("| post | title | best-vs-worst spread | Brier | was_stacked |")
-        lines.append("|---|---|---|---|---|")
-        for pid, t, s, b, st in sorted(high_spread_miss, key=lambda x: -x[2])[:10]:
-            st_s = "unknown" if st is None else str(st)
-            b_s = f"{b:.3f}" if b is not None else "n/a"
-            lines.append(f"| {pid} | {t} | {s * 100:.1f}pp | {b_s} | {st_s} |")
-        lines.append("")
+    lines: list[str] = [f"# {f['title']}\n", f"{f['intro_paragraph']}\n"]
+    lines.append(f"## Scope\n\n- {tallies.binary_count} binary records ranked.\n")
+    lines.extend(_closest_to_truth_lines(tallies, f))
+    lines.extend(_ensemble_vs_best_lines(tallies, f))
+    lines.extend(_high_spread_lines(records_with_rankings, f))
 
     lines.append("## Manual synthesis\n")
     lines.append("<!-- Populate by hand after reading per-question miss_*.md files. -->\n")
@@ -852,7 +969,7 @@ def emit_combined_report(
     lines: list[str] = []
     lines.append("# Audit: bot misses (combined report)\n")
     lines.append("## Table of contents\n")
-    for entry, path in zip(records_with_rankings, miss_paths, strict=False):
+    for entry, _path in zip(records_with_rankings, miss_paths, strict=False):
         rec = entry["record"]
         anchor = f"miss-{rec['post_id']}"
         lines.append(f"- [{rec['post_id']} — {rec.get('title', '')[:70]}](#{anchor})")

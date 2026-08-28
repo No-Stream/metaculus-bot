@@ -113,7 +113,8 @@ class TestRunSyncWaitsForTheNetwork:
         assert "curl -sf -m 5 https://api.github.com/" in script
         tries = re.search(r"NETWORK_WAIT_TRIES=(\d+)", script)
         sleep_s = re.search(r"NETWORK_WAIT_SLEEP_S=(\d+)", script)
-        assert tries is not None and sleep_s is not None, "the wait must be bounded by explicit constants"
+        assert tries is not None, "the wait must be bounded by explicit constants"
+        assert sleep_s is not None, "the wait must be bounded by explicit constants"
         assert 0 < int(tries.group(1)) * int(sleep_s.group(1)) <= 900, "bounded wait should cap out within ~15 min"
 
 
@@ -123,7 +124,10 @@ class TestSyncFailureIsVisible:
     def test_failure_writes_a_sentinel_and_notifies(self) -> None:
         script = _RUN_SYNC.read_text()
         assert "LAST_SYNC_FAILED" in script, "a failed run must leave a greppable sentinel file"
-        assert "osascript" in script and "display notification" in script, (
+        assert "osascript" in script, (
+            "a failed run must fire a macOS notification — the dated logfile alone is what nobody read for six weeks"
+        )
+        assert "display notification" in script, (
             "a failed run must fire a macOS notification — the dated logfile alone is what nobody read for six weeks"
         )
 

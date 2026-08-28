@@ -35,6 +35,7 @@ from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
     GeneralLlm,
+    MetaculusQuestion,
     MultipleChoiceQuestion,
     ReasonedPrediction,
 )
@@ -327,9 +328,11 @@ class TestStackedMarkerInjection:
         q = _make_binary_question()
         assert q.id_of_question not in bot._stacker_outcome
 
-        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
-            with pytest.raises(AssertionError, match="stacker_outcome must be provided"):
-                bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+        with (
+            patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION),
+            pytest.raises(AssertionError, match="stacker_outcome must be provided"),
+        ):
+            bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
     def test_qid_none_under_stacking_raises(self):
         # Defensive branch in _create_unified_explanation: if id_of_question is
@@ -342,9 +345,11 @@ class TestStackedMarkerInjection:
         # would also work but this keeps the test minimal).
         object.__setattr__(q, "id_of_question", None)
 
-        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
-            with pytest.raises(AssertionError, match="stacker_outcome must be provided"):
-                bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+        with (
+            patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION),
+            pytest.raises(AssertionError, match="stacker_outcome must be provided"),
+        ):
+            bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
     def test_marker_survives_trim_comment(self):
         # trim_comment preserves the tail when truncating; the marker is
@@ -448,10 +453,7 @@ def _make_prediction_with_model(
     model_tag: str | None,
     body: str = "analysis...",
 ) -> ReasonedPrediction:
-    if model_tag is None:
-        reasoning = body
-    else:
-        reasoning = f"Model: {model_tag}\n\n{body}"
+    reasoning = body if model_tag is None else f"Model: {model_tag}\n\n{body}"
     return ReasonedPrediction(prediction_value=prob, reasoning=reasoning)
 
 
@@ -718,7 +720,8 @@ class TestForecastersUsedDisclosure:
         assert bot._conditional_stacking_triggered_count == 1, "precondition: stacking must have fired"
         assert len(collection.predictions) == 1, "precondition: stacking collapses the ensemble to one aggregate"
         match = FORECASTERS_USED_MARKER_RE.search(comment)
-        assert match is not None and match.groups() == ("3", "3")
+        assert match is not None
+        assert match.groups() == ("3", "3")
 
     @pytest.mark.asyncio
     async def test_base_combine_publish_discloses_survivors_of_configured(self):
@@ -733,7 +736,8 @@ class TestForecastersUsedDisclosure:
         assert bot._conditional_stacking_skipped_count == 1, "precondition: stacking must have been skipped"
         assert len(collection.predictions) == 2
         match = FORECASTERS_USED_MARKER_RE.search(comment)
-        assert match is not None and match.groups() == ("2", "3")
+        assert match is not None
+        assert match.groups() == ("2", "3")
 
     @pytest.mark.asyncio
     async def test_single_forecaster_short_circuit_discloses_one_of_configured(self):
@@ -746,7 +750,8 @@ class TestForecastersUsedDisclosure:
 
         assert len(collection.predictions) == 1
         match = FORECASTERS_USED_MARKER_RE.search(comment)
-        assert match is not None and match.groups() == ("1", "3")
+        assert match is not None
+        assert match.groups() == ("1", "3")
 
     def _collection(self, n_predictions: int) -> ResearchWithPredictions:
         return ResearchWithPredictions(
@@ -766,7 +771,8 @@ class TestForecastersUsedDisclosure:
             out = bot._create_unified_explanation(q, [self._collection(1)], 0.6, 0.01, 1.0)
         # 1 of 2 configured contributed — a dropped model, disclosed.
         match = FORECASTERS_USED_MARKER_RE.search(out)
-        assert match is not None and match.groups() == ("1", "2")
+        assert match is not None
+        assert match.groups() == ("1", "2")
 
     def test_full_ensemble_discloses_all_used(self):
         bot = self._bot()
@@ -774,7 +780,8 @@ class TestForecastersUsedDisclosure:
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [self._collection(2)], 0.6, 0.01, 1.0)
         match = FORECASTERS_USED_MARKER_RE.search(out)
-        assert match is not None and match.groups() == ("2", "2")
+        assert match is not None
+        assert match.groups() == ("2", "2")
 
     def test_delegated_run_discloses_parent_fanout_width_not_zero(self):
         """With no "forecasters" roster the bot delegates to the parent, whose
@@ -796,7 +803,8 @@ class TestForecastersUsedDisclosure:
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [self._collection(3)], 0.6, 0.01, 1.0)
         match = FORECASTERS_USED_MARKER_RE.search(out)
-        assert match is not None and match.groups() == ("3", "3")
+        assert match is not None
+        assert match.groups() == ("3", "3")
 
     def test_record_carries_parsed_ensemble_size(self):
         post = _make_post_data()
@@ -1533,7 +1541,7 @@ class TestOversizedCommentReportConstruction:
     prove no ValidationError fires — the exact 2026-06-05 crash on Q578/Q20683.
     """
 
-    def _oversized_explanation(self, question: object) -> str:
+    def _oversized_explanation(self, question: MetaculusQuestion) -> str:
         summary = "\n".join(f"*Forecaster {i}*: {60 + i}.0%" for i in range(1, 7))
         rationales = "\n".join(
             f"## R1: Forecaster {i} Reasoning\nModel: openrouter/provider/m{i}\nrationale body {i}" for i in range(1, 7)
