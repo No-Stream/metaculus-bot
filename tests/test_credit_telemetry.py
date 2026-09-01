@@ -61,7 +61,6 @@ from metaculus_bot.credit_telemetry import (
     _fetch_snapshot,
     classify_donated_key_state,
     drain_litellm_callbacks,
-    forecaster_role,
     get_probed_donated_key_state,
     install_role_spend_tracker,
     llm_call_metadata,
@@ -82,6 +81,7 @@ from metaculus_bot.llm_configs import (
     STACKER_FALLBACK_LLM,
     STACKER_LLM,
     SUMMARIZER_LLM,
+    forecaster_role,
 )
 
 DONATED_KEY = "sk-or-v1-DONATEDsecretAB12"

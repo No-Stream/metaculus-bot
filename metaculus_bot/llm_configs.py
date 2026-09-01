@@ -8,7 +8,6 @@ from typing import Any
 
 from forecasting_tools import GeneralLlm
 
-from metaculus_bot.credit_telemetry import forecaster_role
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 
 __all__ = [
@@ -59,6 +58,20 @@ ACCEPTABLE_QUANTS = [
 # that forecasting-tools' un-gated tenacity cannot. Spread per-instance (NOT by mutating
 # REASONING_MODEL_CONFIG) so PARSER_LLM / STACKER configs are untouched.
 _FORECASTER_CONFIG = {**REASONING_MODEL_CONFIG, "allowed_tries": 1}
+
+
+def forecaster_role(model: str) -> str:
+    """``forecaster:<vendor>`` for an ``openrouter/<vendor>/<model>`` roster slug.
+
+    The CREDIT_ROLE_SPEND spend line every roster slot books under. The roster is
+    latest-per-vendor, one slot each, so the VENDOR is the stable identity of a slot
+    across model rotations — a per-model role would start a new time series at every swap
+    and defeat the era-over-era cost comparison this exists for.
+    """
+    parts = model.split("/")
+    if len(parts) < 3 or parts[0] != "openrouter":
+        raise ValueError(f"forecaster_role expects an openrouter/<vendor>/<model> slug, got {model!r}")
+    return f"forecaster:{parts[1]}"
 
 
 def _forecaster_slot(model: str, **kwargs: Any) -> GeneralLlm:

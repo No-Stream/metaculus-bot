@@ -537,7 +537,8 @@ def llm_call_metadata(role: str | None, key_alias: str) -> dict[str, str]:
     """The litellm ``metadata=`` payload that tags every completion for the role ledger.
 
     Roles in use (descriptive, one per spend line; ``forecaster:<vendor>`` for the
-    roster slots): ``forecaster:openai`` / ``forecaster:anthropic`` / ``forecaster:google``,
+    roster slots, derived from the slug by ``llm_configs.forecaster_role`` so a roster
+    swap cannot mislabel a slot): ``forecaster:openai`` / ``forecaster:anthropic`` / ``forecaster:google``,
     ``stacker``, ``stacker_fallback``, ``parser``, ``summarizer``, ``crux_analyzer``,
     ``native_search``, ``targeted_search``, ``gap_fill_analyzer``, ``gap_fill_resolver``,
     ``gap_fill_v2_driver``, ``market_query_author``, ``market_ranker``,
@@ -550,19 +551,6 @@ def llm_call_metadata(role: str | None, key_alias: str) -> dict[str, str]:
     AskNews (subscription), Exa (``search_web``).
     """
     return {ROLE_METADATA_KEY: role or UNTAGGED_ROLE, KEY_ALIAS_METADATA_KEY: key_alias}
-
-
-def forecaster_role(model: str) -> str:
-    """``forecaster:<vendor>`` for an ``openrouter/<vendor>/<model>`` roster slug.
-
-    The roster is latest-per-vendor, one slot each, so the VENDOR is the stable identity
-    of a slot across model rotations — a per-model role would start a new time series at
-    every swap and defeat the era-over-era cost comparison this exists for.
-    """
-    parts = model.split("/")
-    if len(parts) < 3 or parts[0] != "openrouter":
-        raise ValueError(f"forecaster_role expects an openrouter/<vendor>/<model> slug, got {model!r}")
-    return f"forecaster:{parts[1]}"
 
 
 def plain_llm_key_alias(model: str) -> str:
