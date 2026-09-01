@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch backtest_with_cache
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -298,6 +298,15 @@ score_ghosts:
 # ARGS="--red-line 0.5" for a tighter line, ARGS="--output <path>" to dump the summary JSON.
 close_margin_watch:
 	uv run python scripts/close_margin_watch.py $(ARGS)
+
+# Question-supply census per tournament slug, counting post status `closed` (closed to
+# forecasting, NOT yet resolved) alongside open/resolved, plus the backlog of unresolved
+# questions past their own scheduled_resolve_time. Read-only + free (Metaculus posts list
+# only; no LLM, no research, no publish). Omitting `closed` is what made two consecutive
+# residual rounds' supply projections miss. ARGS="--slugs <a> <b>" to scope,
+# ARGS="--statuses open closed" to narrow, ARGS="--output <path>" to dump JSON.
+supply_probe:
+	uv run python scripts/supply_probe.py $(ARGS)
 
 # Download run-log artifacts + harvest telemetry only (no research sync). Same script
 # as sync_telemetry; kept as a named target for parity with download_research.
