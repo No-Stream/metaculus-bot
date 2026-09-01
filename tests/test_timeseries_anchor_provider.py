@@ -67,6 +67,7 @@ from metaculus_bot.research.ts_estimators import (
     annualized_realized_vol_pct,
     clock_matches_cadence,
     horizon_steps,
+    multi_period_annualized_vol_pct,
     observed_periods_per_year,
     series_clock,
     variance_ratio,
@@ -680,9 +681,9 @@ class TestSeriesClockAndCalendarBases:
         expected = float(returns.std() * np.sqrt(CALENDAR_DAYS_PER_YEAR) * 100.0)
         shipped_252 = float(returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
 
-        line = tsrender._realized_vol_line(continuous, clock)
+        lines = tsrender._realized_vol_lines(continuous, clock)
 
-        assert line == f"- 30-calendar-day annualized realized volatility: {expected:.1f}%"
+        assert lines == [f"- 30-calendar-day annualized realized volatility: {expected:.1f}%"]
         # The defect was worth a factor of sqrt(365/252) = 1.2035; make sure the old number is
         # genuinely different at the rendered precision rather than a rounding coincidence.
         assert f"{shipped_252:.1f}" != f"{expected:.1f}"
@@ -696,9 +697,9 @@ class TestSeriesClockAndCalendarBases:
         returns = business.pct_change().dropna().tail(tsrender.REALIZED_VOL_WINDOW)
         expected = float(returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
 
-        assert tsrender._realized_vol_line(business, clock) == (
+        assert tsrender._realized_vol_lines(business, clock) == [
             f"- 30-trading-day annualized realized volatility: {expected:.1f}%"
-        )
+        ]
 
     def test_rendered_band_on_a_24_7_series_uses_calendar_steps_and_says_so(self):
         continuous = _twenty_four_seven_series("BTC-USD")
@@ -904,6 +905,51 @@ class TestCoarseCadenceClocks:
         ):
             index = pd.DatetimeIndex(series.index)
             assert clock_matches_cadence(series_clock(index), index) is True, series.name
+
+
+class TestAnchorRealizedVolNoiseFlag:
+    """The anchor's own one-day-return volatility line carries the same noise screen.
+
+    This is the second place the bot annualizes ONE-step returns for a forecaster, and the
+    anchor routes to any URL-cited Yahoo ticker — so q44797's pegged cross would render an
+    equally inflated figure here. The change BAND is a different story: it is built from
+    h-step changes at h of tens of observations, where independent quote noise contributes
+    ~2/h of the variance, so the flag must say the band is unaffected rather than casting
+    doubt on the whole section.
+    """
+
+    @staticmethod
+    def _clock() -> SeriesClock:
+        return SeriesClock(freq="daily", periods_per_year=TRADING_DAYS_PER_YEAR)
+
+    def test_a_clean_series_renders_one_unqualified_line(self):
+        lines = tsrender._realized_vol_lines(random_walk_close_series(seed=3), self._clock())
+
+        assert len(lines) == 1
+        assert lines[0].startswith("- 30-trading-day annualized realized volatility:")
+        assert "noise-suspect" not in lines[0]
+
+    def test_a_noise_dominated_series_flags_and_offers_the_robust_figure(self):
+        noisy = noise_dominated_close_series(seed=3)
+        robust = multi_period_annualized_vol_pct(
+            noisy,
+            lag=FINANCIAL_VARIANCE_RATIO_LAG,
+            periods_per_year=TRADING_DAYS_PER_YEAR,
+            min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+        )
+        assert robust is not None
+
+        lines = tsrender._realized_vol_lines(noisy, self._clock())
+
+        assert len(lines) == 2
+        assert lines[0].endswith("— noise-suspect")
+        assert "Vendor-noise flag" in lines[1]
+        assert f"the volatility is {robust:.1f}%" in lines[1]
+        assert "The change band above is unaffected" in lines[1]
+
+    def test_a_short_series_renders_nothing(self):
+        short = random_walk_close_series(seed=3, n=20)
+        assert tsrender._realized_vol_lines(short, self._clock()) == []
 
 
 class TestSharedVolEstimator:
