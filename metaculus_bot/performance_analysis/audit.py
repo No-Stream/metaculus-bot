@@ -89,44 +89,38 @@ def _filter_by_type(records: list[dict], q_types: tuple[str, ...], fallback_fiel
     return [r for r in records if r.get("type") in q_types and _has_rankable_score(r, fallback_field)]
 
 
-def _rank_key_worst_binary(r: dict) -> tuple[int, float]:
-    ranked = ranking_score(r)
-    if ranked is not None:
-        return (ranked.tier, ranked.value)  # primary: platform score ascending (most negative = worst)
-    brier = r.get("brier_score")
-    if brier is None:
-        return (NO_SCORE_TIER, 0.0)
-    return (FALLBACK_TIER, -brier)  # fallback: higher Brier = worse
+# Brier is a LOSS (higher = worse); both log scores are GAINS (higher = better).
+# A field absent here raises rather than silently defaulting to a direction.
+_FALLBACK_HIGHER_IS_BETTER: dict[str, bool] = {
+    "brier_score": False,
+    "numeric_log_score": True,
+    "mc_log_score": True,
+}
 
 
-def _rank_key_worst_logscore(r: dict, field: str) -> tuple[int, float]:
+def _ranking_goodness(r: dict, fallback_field: str) -> tuple[int, float]:
+    """``(tier, goodness)`` where higher goodness is always BETTER within its tier."""
     ranked = ranking_score(r)
     if ranked is not None:
         return (ranked.tier, ranked.value)
-    log = r.get(field)
-    if log is None:
+    value = r.get(fallback_field)
+    if value is None:
         return (NO_SCORE_TIER, 0.0)
-    return (FALLBACK_TIER, log)  # fallback: lower log = worse
+    return (FALLBACK_TIER, value if _FALLBACK_HIGHER_IS_BETTER[fallback_field] else -value)
 
 
-def _rank_key_best_binary(r: dict) -> tuple[int, float]:
-    ranked = ranking_score(r)
-    if ranked is not None:
-        return (ranked.tier, -ranked.value)  # primary: platform score descending (most positive = best)
-    brier = r.get("brier_score")
-    if brier is None:
-        return (NO_SCORE_TIER, 0.0)
-    return (FALLBACK_TIER, brier)  # fallback: lower Brier = better
+def _rank_key(r: dict, fallback_field: str, *, best: bool) -> tuple[int, float]:
+    """Sort key: ascending sort yields worst-first, or best-first with ``best=True``."""
+    tier, goodness = _ranking_goodness(r, fallback_field)
+    return (tier, -goodness if best else goodness)
 
 
-def _rank_key_best_logscore(r: dict, field: str) -> tuple[int, float]:
-    ranked = ranking_score(r)
-    if ranked is not None:
-        return (ranked.tier, -ranked.value)
-    log = r.get(field)
-    if log is None:
-        return (NO_SCORE_TIER, 0.0)
-    return (FALLBACK_TIER, -log)  # fallback: higher log = better
+def _banding_field(records: list[dict]) -> str | None:
+    """Which platform score the whole cohort bands on: spot whenever any record carries it."""
+    for field in RANKING_FIELDS:
+        if any(score_field(r, field) is not None for r in records):
+            return field
+    return None
 
 
 def _middle_band(records: list[dict]) -> list[dict]:
@@ -140,21 +134,30 @@ def _middle_band(records: list[dict]) -> list[dict]:
     That is intentional: the cohort is meant to surface "ordinary questions" relative to
     the crowd, which requires peer comparability.
     """
-    for field in RANKING_FIELDS:
-        with_score = [r for r in records if score_field(r, field) is not None]
-        if not with_score:
-            continue
-        if field != SPOT_PEER_FIELD:
-            logger.warning(
-                f"_middle_band: no record carries {SPOT_PEER_FIELD}; banding on coverage-scaled "
-                f"{field} instead, so the band's edges reflect submission timing as well as skill"
-            )
-        sorted_records = sorted(with_score, key=lambda r: score_field(r, field) or 0.0)
-        n = len(sorted_records)
-        lower_idx = int(0.2 * n)
-        upper_idx = max(lower_idx, int(0.8 * n))
-        return sorted_records[lower_idx:upper_idx]
-    return []
+    field = _banding_field(records)
+    if field is None:
+        return []
+    if field != SPOT_PEER_FIELD:
+        logger.warning(
+            f"MIDDLE_BAND_PEER_FALLBACK: banding on {field}; the band's own 20/80 edges are set "
+            "by coverage-scaled values, not just the records' sort tier "
+            "(see PLATFORM_RANKING_SOURCE above)"
+        )
+    ranked = sorted(
+        (r for r in records if score_field(r, field) is not None),
+        key=lambda r: score_field(r, field) or 0.0,
+    )
+    n = len(ranked)
+    dropped = len(records) - n
+    if dropped:
+        logger.warning(
+            f"MIDDLE_BAND_DROPPED_UNSCORED: {dropped} record(s) carry no {field}; middle mode is "
+            "peer-anchored, so a record with no banding score has no 'middle' and is excluded "
+            "from the cohort rather than tiered behind it"
+        )
+    lower_idx = int(0.2 * n)
+    upper_idx = max(lower_idx, int(0.8 * n))
+    return ranked[lower_idx:upper_idx]
 
 
 def select_cohort(
@@ -199,20 +202,14 @@ def select_cohort(
     Returns concatenated list in (binary, numeric, mc, extras) order.
     """
     log_ranking_score_sources(records, cut=f"select_cohort:{mode}")
-    if mode == "worst":
+    if mode in ("worst", "best"):
+        best = mode == "best"
         binary_pool = _filter_by_type(records, ("binary",), "brier_score")
         numeric_pool = _filter_by_type(records, ("numeric", "discrete"), "numeric_log_score")
         mc_pool = _filter_by_type(records, ("multiple_choice",), "mc_log_score")
-        sel_binary = sorted(binary_pool, key=_rank_key_worst_binary)[:n_binary]
-        sel_numeric = sorted(numeric_pool, key=lambda r: _rank_key_worst_logscore(r, "numeric_log_score"))[:n_numeric]
-        sel_mc = sorted(mc_pool, key=lambda r: _rank_key_worst_logscore(r, "mc_log_score"))[:n_mc]
-    elif mode == "best":
-        binary_pool = _filter_by_type(records, ("binary",), "brier_score")
-        numeric_pool = _filter_by_type(records, ("numeric", "discrete"), "numeric_log_score")
-        mc_pool = _filter_by_type(records, ("multiple_choice",), "mc_log_score")
-        sel_binary = sorted(binary_pool, key=_rank_key_best_binary)[:n_binary]
-        sel_numeric = sorted(numeric_pool, key=lambda r: _rank_key_best_logscore(r, "numeric_log_score"))[:n_numeric]
-        sel_mc = sorted(mc_pool, key=lambda r: _rank_key_best_logscore(r, "mc_log_score"))[:n_mc]
+        sel_binary = sorted(binary_pool, key=lambda r: _rank_key(r, "brier_score", best=best))[:n_binary]
+        sel_numeric = sorted(numeric_pool, key=lambda r: _rank_key(r, "numeric_log_score", best=best))[:n_numeric]
+        sel_mc = sorted(mc_pool, key=lambda r: _rank_key(r, "mc_log_score", best=best))[:n_mc]
     elif mode == "middle":
         rng = random.Random(seed)  # noqa: S311  # deterministic audit sampling, not cryptographic
         middle = _middle_band(records)

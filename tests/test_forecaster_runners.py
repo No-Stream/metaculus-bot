@@ -304,7 +304,9 @@ class TestForecasterChartVision:
                 ),
             ),
             patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(_STANDARD_PERCENTILES, None)),
-            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+            patch(
+                "metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()
+            ) as mock_build,
             patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
             patch("metaculus_bot.forecaster_runners.log_final_prediction"),
             patch("metaculus_bot.forecaster_runners.log_open_bound_piling_diagnostics"),
@@ -314,6 +316,8 @@ class TestForecasterChartVision:
         called_arg = _last_invoke_arg(invoke)
         assert isinstance(called_arg, VisionMessageData)
         assert called_arg.b64_image == "ZmFrZQ=="
+        # A lost model_name kwarg attributes CDF_MAXSTEP_CLIP to model=unknown silently.
+        assert mock_build.call_args.kwargs["model_name"] == forecaster_llm.model
 
 
 class TestRunMcForecast:
@@ -393,7 +397,9 @@ class TestRunNumericForecast:
                 "metaculus_bot.forecaster_runners.sanitize_percentiles",
                 return_value=(_STANDARD_PERCENTILES, None),
             ),
-            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=mock_prediction),
+            patch(
+                "metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=mock_prediction
+            ) as mock_build,
             patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
             patch("metaculus_bot.forecaster_runners.log_final_prediction"),
         ):
@@ -403,6 +409,8 @@ class TestRunNumericForecast:
 
         assert prediction.prediction_value == mock_prediction
         assert discrete_vote is True
+        # A lost model_name kwarg attributes CDF_MAXSTEP_CLIP to model=unknown silently.
+        assert mock_build.call_args.kwargs["model_name"] == forecaster_llm.model
 
     @pytest.mark.asyncio
     async def test_sanitize_percentiles_receives_the_forecaster_model_name(

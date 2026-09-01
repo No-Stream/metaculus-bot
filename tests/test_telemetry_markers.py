@@ -694,12 +694,13 @@ class TestNumericAggregateGridMismatch:
         assert rec["qid_kind"] == "question_id"
 
 
-class TestCdfMaxstepSmear:
+class TestCdfMaxstepClip:
     """The repair that reshaped 47% of q45065's published mass while logging at DEBUG.
 
     Not alertable — the per-bin cap is the platform's — but the two displacement fields
     are what make the repair's own POLICY auditable after the fact, which is exactly
-    what was missing when the smear was diagnosed a month after the forecast resolved.
+    what was missing when the retired slack-proportional redistribution was diagnosed
+    a month after the forecast resolved.
     """
 
     def test_fields(self):

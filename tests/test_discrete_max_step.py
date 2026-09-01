@@ -29,9 +29,14 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
 from metaculus_bot.numeric.config import grid_step_constraints
+from metaculus_bot.numeric.discrete_snap import snap_distribution_to_integers
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
-from metaculus_bot.numeric.pchip_processing import generate_pchip_cdf_with_smoothing
+from metaculus_bot.numeric.pchip_processing import (
+    create_fallback_numeric_distribution,
+    generate_pchip_cdf_with_smoothing,
+)
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric.utils import aggregate_numeric
 
 _PCHIP_LOGGER = "metaculus_bot.numeric.pchip_cdf"
 
@@ -50,6 +55,27 @@ _CONCENTRATED_LOW_COUNT: list[tuple[float, float]] = [
     (0.90, 3.20),
     (0.95, 4.20),
     (0.975, 5.20),
+    (0.99, 6.60),
+]
+
+
+# Same question shape, but with a tight spike at 3 (P40-P60 within +-0.01). On the
+# STANDARD 201-point grid this declaration breaches the 0.2 cap (one ~0.04-wide bin
+# holds >20% of mass), while the published 9-point CDF has a 1.0 cap and never clips —
+# so any clip marker from building it on the cdf_size=9 question is a phantom.
+_SPIKED_LOW_COUNT: list[tuple[float, float]] = [
+    (0.01, 0.30),
+    (0.025, 0.80),
+    (0.05, 1.30),
+    (0.10, 1.90),
+    (0.20, 2.50),
+    (0.40, 2.99),
+    (0.50, 3.00),
+    (0.60, 3.01),
+    (0.80, 3.60),
+    (0.90, 4.30),
+    (0.95, 5.00),
+    (0.975, 5.70),
     (0.99, 6.60),
 ]
 
@@ -183,9 +209,11 @@ class TestBuildNumericDistributionDiscrete:
 
         This is the guard that keeps the two regimes from crossing: nothing about
         nearest-first packing may reintroduce clipping on a grid whose server cap is 1.0.
+        The declaration is deliberately tight enough to clip on the standard 201-point
+        grid, so a provisional fine-grid build leaking a phantom marker fails here too.
         """
         question = _discrete_count_question()
-        percentiles = [Percentile(percentile=p, value=v) for p, v in _CONCENTRATED_LOW_COUNT]
+        percentiles = [Percentile(percentile=p, value=v) for p, v in _SPIKED_LOW_COUNT]
         sanitized, zero_point = sanitize_percentiles(percentiles, question)
 
         with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
@@ -285,6 +313,32 @@ class TestQ45065NearestFirstPacking:
         assert float(steps.min()) >= NUM_MIN_PROB_STEP - 1e-12
         assert np.all(steps >= 0.0)
 
+    def test_published_composition_keeps_the_mass_where_it_was_declared(self):
+        """The ensemble and snap stages must not undo the nearest-first packing.
+
+        The 47%-above-35-deaths figure was measured on the PUBLISHED forecast —
+        per-model build -> aggregate_numeric(median) -> snap_distribution_to_integers
+        — and both later stages re-enter safe_cdf_bounds. Median of one is that
+        forecast; the point is the two extra safe_cdf_bounds passes, not the combine.
+        """
+        question = _q45065_question()
+        declared = [Percentile(percentile=p, value=v) for p, v in _Q45065_OPUS_PERCENTILES]
+        sanitized, zero_point = sanitize_percentiles(declared, question, model_name=self._MODEL)
+        per_model = build_numeric_distribution(sanitized, question, zero_point, model_name=self._MODEL)
+
+        aggregated = aggregate_numeric([per_model], question, "median")
+        snapped = snap_distribution_to_integers(aggregated, question)
+        assert snapped is not None
+        probs = np.asarray([p.percentile for p in snapped.get_cdf()], dtype=float)
+        steps = np.diff(probs)
+
+        near = float(steps[_Q45065_RESOLUTION_BIN - 2 : _Q45065_RESOLUTION_BIN + 3].sum())
+        far = float(steps[_Q45065_RESOLUTION_BIN + 21 :].sum())
+        assert near >= 0.60, f"only {near:.4f} of published mass within +-2 bins of the resolution"
+        assert far <= 0.05, f"{far:.4f} of published mass landed 21+ bins above the resolution"
+        assert float(steps.max()) <= NUM_MAX_STEP + 1e-12
+        assert float(steps.min()) >= NUM_MIN_PROB_STEP - 1e-12
+
     def test_marker_names_the_forecaster_and_where_the_mass_went(self, caplog):
         question = _q45065_question()
         declared = [Percentile(percentile=p, value=v) for p, v in _Q45065_OPUS_PERCENTILES]
@@ -318,17 +372,41 @@ class TestQ45065NearestFirstPacking:
         assert float(steps.max()) < NUM_MAX_STEP
         assert not _clip_markers(caplog)
 
-    def test_coarse_grid_never_reaches_the_max_step_repair(self, caplog):
-        """The relaxed coarse-grid cap means the repair does not fire at all there.
 
-        This is the guard that keeps the two regimes from crossing: nothing about
-        nearest-first packing may reintroduce clipping on a grid whose server cap is 1.0.
+class TestFallbackDistributionMemoization:
+    """BoundSafeNumericDistribution (the ft-fallback wrapper) memoizes get_cdf()."""
+
+    def test_fallback_path_emits_one_marker_per_build_not_per_read(self, caplog):
+        """One clip emits ONE marker, however many times the CDF is read.
+
+        Un-memoized, every accessor read (validate + diagnostics + aggregate +
+        publish) re-ran safe_cdf_bounds and re-emitted the marker, so fallback-path
+        clips counted 3-4x against the PCHIP path's once in the telemetry archive.
+        The declaration spans the range (upstream's builder rejects flat tails) but
+        piles 60% of its mass inside one 0.5-wide bin, forcing an over-cap step.
         """
-        question = _discrete_count_question()
-        percentiles = [Percentile(percentile=p, value=v) for p, v in _CONCENTRATED_LOW_COUNT]
-        sanitized, zero_point = sanitize_percentiles(percentiles, question)
+        question = _q45065_question(lower_bound=0.0, upper_bound=100.0, open_lower_bound=False, open_upper_bound=True)
+        spiked = [
+            (0.01, 1.0),
+            (0.025, 3.0),
+            (0.05, 6.0),
+            (0.10, 12.0),
+            (0.20, 50.02),
+            (0.40, 50.06),
+            (0.50, 50.10),
+            (0.60, 50.14),
+            (0.80, 50.20),
+            (0.90, 75.0),
+            (0.95, 88.0),
+            (0.975, 94.0),
+            (0.99, 99.0),
+        ]
+        declared = [Percentile(percentile=p, value=v) for p, v in spiked]
+        fallback = create_fallback_numeric_distribution(declared, question, None, model_name="some/forecaster")
 
         with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
-            build_numeric_distribution(sanitized, question, zero_point, model_name="some/forecaster")
+            first = fallback.get_cdf()
+            second = fallback.get_cdf()
 
-        assert not _clip_markers(caplog)
+        assert second is first
+        assert len(_clip_markers(caplog)) == 1

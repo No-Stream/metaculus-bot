@@ -8,6 +8,7 @@ Tests cover:
   - Round-trip validation against Metaculus constraints
 """
 
+import logging
 from typing import ClassVar
 
 import numpy as np
@@ -227,6 +228,26 @@ class TestEdgeCases:
         assert result is not None
         max_diff = float(np.max(np.diff(result)))
         assert max_diff <= NUM_MAX_STEP + 1e-10
+
+    def test_snap_clip_marker_names_the_stage_and_the_question(self, caplog):
+        """The snap-stage CDF_MAXSTEP_CLIP must carry the QUESTION id and its own label.
+
+        The question id is the telemetry archive's join key (markers.py pins the
+        marker to QID_KIND_QUESTION_ID); a snap clip logging question=None silently
+        orphans every clip on a published discrete forecast.
+        """
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=0.3)
+        dist = create_pchip_distribution_from_cdf(cdf, question)
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pchip_cdf"):
+            result = snap_distribution_to_integers(dist, question)
+
+        assert result is not None
+        markers = [r.getMessage() for r in caplog.records if "CDF_MAXSTEP_CLIP:" in r.getMessage()]
+        assert len(markers) == 1
+        assert f"question={question.id_of_question}" in markers[0]
+        assert "model=ensemble_discrete_snap" in markers[0]
 
     def test_too_many_integers_returns_none(self):
         """More than DISCRETE_SNAP_MAX_INTEGERS → skip snapping."""

@@ -10,12 +10,18 @@ from scipy.stats import spearmanr
 
 from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
-from metaculus_bot.performance_analysis import platform_scores
 from metaculus_bot.performance_analysis.parsing import (
     MIN_SCOREABLE_ANCHORS,
     _parse_probability,
     declared_anchors,
     is_anonymous_model_key,
+)
+from metaculus_bot.performance_analysis.platform_scores import (
+    baseline_score,
+    coverage,
+    peer_score,
+    spot_baseline_score,
+    spot_peer_score,
 )
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
@@ -56,6 +62,19 @@ def _score_stats(values: list[float]) -> dict:
     }
 
 
+# The one registry for the four platform-score metrics: summary key, accessor, report
+# label, in report order. platform_score_summary, the section's emptiness gate and its
+# render loop all iterate this, so adding a metric in one place reaches all three
+# (previously a `fields` dict here and a `_PLATFORM_SCORE_ROWS` 730 lines apart could
+# drift, silently dropping a metric from the report). ``coverage`` is handled separately.
+_PLATFORM_SCORE_METRICS: tuple[tuple[str, Callable[[dict], float | None], str], ...] = (
+    ("spot_peer", spot_peer_score, "spot peer (PRIMARY, the leaderboard metric)"),
+    ("peer", peer_score, "peer (coverage-scaled, secondary)"),
+    ("spot_baseline", spot_baseline_score, "spot baseline (primary)"),
+    ("baseline", baseline_score, "baseline (coverage-scaled, secondary)"),
+)
+
+
 def platform_score_summary(data: list[dict]) -> dict:
     """Metaculus's own scores on the published forecasts, SPOT peer first.
 
@@ -68,16 +87,10 @@ def platform_score_summary(data: list[dict]) -> dict:
     Every field is counted over the records that actually carry it, so the per-metric
     ``count`` differs from ``count`` (all records) whenever a pull predates score capture.
     """
-    fields = {
-        "spot_peer": platform_scores.spot_peer_score,
-        "peer": platform_scores.peer_score,
-        "spot_baseline": platform_scores.spot_baseline_score,
-        "baseline": platform_scores.baseline_score,
-    }
     summary: dict = {"count": len(data)}
-    for name, reader in fields.items():
+    for name, reader, _label in _PLATFORM_SCORE_METRICS:
         summary[name] = _score_stats([v for v in (reader(r) for r in data) if v is not None])
-    summary["mean_coverage"] = _mean([v for v in (platform_scores.coverage(r) for r in data) if v is not None])
+    summary["mean_coverage"] = _mean([v for v in (coverage(r) for r in data) if v is not None])
     return summary
 
 
@@ -389,6 +402,10 @@ GRID_SCALED_MAX_STEP_MERGED_AT = B4E9DF0_MERGED_AT
 # must want at least this much MORE mass there for the record to be clamp-suspected.
 _CLAMP_CAP_ATOL = 1e-6
 _CLAMP_MEMBER_MARGIN = 0.10
+# The min-step / ramp / discrete-snap machinery shaves the top step ~1% below the cap
+# (q45065: 0.1977991526 against 0.2, 98.9%), so exact equality structurally misses every
+# post-snap instance; a bin at >= this fraction of the cap is treated as cap-bound too.
+_CLAMP_CAP_NEAR_FRAC = 0.90
 
 
 def _resolution_bin(grid: list[float], cdf: list[float], resolution: float) -> tuple[float, float, float]:
@@ -445,11 +462,18 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
     A missing/unparseable timestamp is treated as pre-fix — the undated records in
     the archive all predate the fix.
 
-    Suspected requires ALL of: the realized bin within ``_CLAMP_CAP_ATOL`` of the
-    era-correct cap, at least two attributed member curves, and the LEAST
-    concentrated member wanting at least ``member_margin`` more mass on that bin —
-    "every member" is the point; a clamp overrides the whole ensemble, unlike a
-    median.
+    Suspected requires ALL of: the realized bin CAP-BOUND — within ``_CLAMP_CAP_ATOL``
+    of the era-correct cap, or at least ``_CLAMP_CAP_NEAR_FRAC`` of it, since the
+    min-step / ramp / snap machinery shaves a saturated bin ~1% under the cap — at
+    least two attributed member curves, and the LEAST concentrated member wanting at
+    least ``member_margin`` more mass on that bin — "every member" is the point; a
+    clamp overrides the whole ensemble, unlike a median.
+
+    The cap is the PLATFORM's per-bin rule (``0.2 * 200 / N``), so a cap-bound
+    realized bin is not automatically our defect. Pre-``d4ee57f`` records additionally
+    carry the slack-proportional smear; post-``d4ee57f`` the excess is packed into the
+    adjacent bins, and a cap-bound bin means only that the platform constraint set the
+    published mass at the truth.
     """
     out: dict = {"applicable": record.get("type") in ("numeric", "discrete"), "suspected": False}
     if not out["applicable"]:
@@ -474,6 +498,8 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
     min_member = min(member_bin_masses.values()) if member_bin_masses else None
 
     at_cap = abs(published_bin_mass - cap) <= _CLAMP_CAP_ATOL
+    cap_fraction = published_bin_mass / cap
+    cap_bound = at_cap or cap_fraction >= _CLAMP_CAP_NEAR_FRAC
     out |= {
         "n_grid_points": len(grid),
         "max_step_cap": cap,
@@ -481,10 +507,12 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
         "resolution_bin": [bin_low, bin_high],
         "published_bin_mass": published_bin_mass,
         "resolution_bin_at_cap": at_cap,
+        "resolution_bin_cap_fraction": cap_fraction,
+        "resolution_bin_cap_bound": cap_bound,
         "member_bin_masses": member_bin_masses,
         "min_member_bin_mass": min_member,
         "suspected": bool(
-            at_cap
+            cap_bound
             and min_member is not None
             and min_member > published_bin_mass + member_margin
             and len(member_bin_masses) >= 2
@@ -797,25 +825,16 @@ def _question_count_lines(data: list[dict]) -> list[str]:
     return lines
 
 
-_PLATFORM_SCORE_ROWS: tuple[tuple[str, str], ...] = (
-    ("spot_peer", "spot peer (PRIMARY, the leaderboard metric)"),
-    ("peer", "peer (coverage-scaled, secondary)"),
-    ("spot_baseline", "spot baseline (primary)"),
-    ("baseline", "baseline (coverage-scaled, secondary)"),
-)
-
-
 def _platform_score_section_lines(data: list[dict]) -> list[str]:
     """Metaculus's own scores, spot peer first. Empty when no record carries any.
 
     Every other section of this report is a BOT-side score (Brier, log score) computed
-    here from the resolution. This one is the platform's own arithmetic, and it is the
-    only thing in the report that corresponds to tournament standing — which is why the
-    spot/coverage-scaled split is labelled in the row names rather than left to the
-    reader.
+    here from the resolution. This one is the only section computed by the platform
+    rather than by us; it is still a pooled mean over whatever records the caller
+    passed, so it is not the leaderboard standing.
     """
     ps = platform_score_summary(data)
-    if not any(ps[key]["count"] for key, _label in _PLATFORM_SCORE_ROWS):
+    if not any(ps[key]["count"] for key, _reader, _label in _PLATFORM_SCORE_METRICS):
         return []
 
     lines = [
@@ -826,10 +845,16 @@ def _platform_score_section_lines(data: list[dict]) -> list[str]:
         "its coverage is mostly a function of how early it submitted. Rank on spot, read peer as "
         "a diagnostic only.",
         "",
+        "These figures are pooled over every record handed in — no config-era split, and no "
+        "exclusion of the known-bug (`KNOWN_BUG_QIDS`) or degraded-run (`DEGRADED_RUN_QIDS` / "
+        "`PARTIAL_DEGRADED_QIDS`) cohorts. Read them as this pull's mean, not as tournament "
+        "standing; pass a pre-filtered `data` or use `width_monitor --exclude-qids` for a "
+        "cohort-controlled read.",
+        "",
         "| metric | n | mean | median |",
         "|--------|---|------|--------|",
     ]
-    for key, label in _PLATFORM_SCORE_ROWS:
+    for key, _reader, label in _PLATFORM_SCORE_METRICS:
         stats = ps[key]
         if not stats["count"]:
             continue

@@ -98,11 +98,6 @@ class RankingScore:
     field: str
 
     @property
-    def is_spot(self) -> bool:
-        """True when this is the leaderboard-true spot peer score."""
-        return self.field == SPOT_PEER_FIELD
-
-    @property
     def tier(self) -> int:
         """Sort tier: 0 for spot peer, 1 for coverage-scaled peer."""
         return RANKING_FIELDS.index(self.field)
@@ -135,9 +130,9 @@ def log_ranking_score_sources(records: Iterable[dict], *, cut: str) -> dict[str,
     if counts[PEER_FIELD]:
         logger.warning(
             f"PLATFORM_RANKING_SOURCE: cut={cut} {counts[PEER_FIELD]} record(s) carry no "
-            f"{SPOT_PEER_FIELD} and were ranked on coverage-scaled {PEER_FIELD}; that order is "
-            "partly submission timing, not skill. They sort in their own tier, behind every "
-            "spot-scored record."
+            f"{SPOT_PEER_FIELD}, so ranking or banding them can only use coverage-scaled "
+            f"{PEER_FIELD}, whose order is partly submission timing rather than skill. "
+            "Each cut states what it did with them."
         )
     return counts
 

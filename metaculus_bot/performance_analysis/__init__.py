@@ -30,6 +30,13 @@ from metaculus_bot.performance_analysis.audit import (
     select_cohort,
     select_worst_misses,
 )
+from metaculus_bot.performance_analysis.cohorts import (
+    DEGRADED_RUN_QIDS,
+    EXCLUSION_COHORTS,
+    KNOWN_BUG_QIDS,
+    PARTIAL_DEGRADED_QIDS,
+    parse_exclude_qids,
+)
 from metaculus_bot.performance_analysis.collector import (
     build_performance_dataset,
     fetch_bot_comments,
@@ -89,17 +96,6 @@ from metaculus_bot.performance_analysis.stacker_detection import (
     get_stacker_outcome_field,
     has_stacker_body_marker,
     has_was_stacked_flag,
-)
-
-# The standing scoring-exclusion cohorts, re-exported so a round script can reach them
-# without knowing they live in the width monitor — retyping the ids is what the constants
-# exist to stop.
-from metaculus_bot.performance_analysis.width_monitor import (
-    DEGRADED_RUN_QIDS,
-    EXCLUSION_COHORTS,
-    KNOWN_BUG_QIDS,
-    PARTIAL_DEGRADED_QIDS,
-    parse_exclude_qids,
 )
 
 __all__ = [

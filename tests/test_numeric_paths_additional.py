@@ -256,15 +256,17 @@ async def test_numeric_percentile_set_validation():
 
 
 @pytest.mark.asyncio
-@patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
-@patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format", return_value={})
+@patch("metaculus_bot.numeric.pipeline.generate_pchip_cdf")
+@patch("metaculus_bot.numeric.pipeline.percentiles_to_pchip_format", return_value={})
 async def test_discrete_zero_point_override(mock_format, mock_generate):
     f = _make_forecaster()
-    # Discrete (non-201) and zero_point provided → should pass zero_point=None into pchip
+    # Discrete (non-201) and zero_point provided → should pass zero_point=None into pchip.
+    # Patch pipeline's OWN bindings: the discrete question builds directly on its coarse
+    # grid via build_numeric_distribution, which resolves both names at module top here.
     q = _make_question(cdf_size=101, zero_point=0.0)
 
-    # Return a valid CDF to avoid fallback
-    mock_generate.return_value = (np.linspace(0.0, 1.0, 201).tolist(), False)
+    # Return a valid coarse-grid CDF to avoid fallback.
+    mock_generate.return_value = (np.linspace(0.0, 1.0, 101).tolist(), False)
 
     plist = [
         Percentile(percentile=p, value=v)

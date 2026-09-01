@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
@@ -254,3 +256,47 @@ def test_ensemble_aligned_discrete_grid_preserves_shape():
         agg = aggregate_numeric(dists, question, method)
         probs = np.array([p.percentile for p in agg.cdf], dtype=float)
         assert probs[1] - probs[0] > 0.25, f"{method}: P(0) unexpectedly clipped"
+
+
+def _fine_grid_question() -> NumericQuestion:
+    return NumericQuestion(
+        id_of_question=45065,
+        id_of_post=44916,
+        page_url="https://example.com/q/44916",
+        question_text="Continuous question on the standard grid",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=0.0,
+        upper_bound=100.0,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        unit_of_measure="",
+        zero_point=None,
+        cdf_size=201,
+    )
+
+
+def test_ensemble_clip_marker_names_the_stage_and_the_question(caplog):
+    """The continuous-branch CDF_MAXSTEP_CLIP must carry ensemble_median and the question id.
+
+    The question id is the telemetry archive's join key, so an unlabeled ensemble
+    clip is unjoinable. The clip is NOT reachable through public aggregate_numeric —
+    a pointwise median of already-capped member CDFs is itself capped — so the
+    private helper is the honest producer to pin.
+    """
+    question = _fine_grid_question()
+    x = np.linspace(question.lower_bound, question.upper_bound, 201)
+    p = 1.0 / (1.0 + np.exp(-(x - 50.0) / 0.2))
+    p[0], p[-1] = 0.0, 1.0
+    p = np.maximum.accumulate(p)
+
+    with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pchip_cdf"):
+        _postprocess_ensemble_cdf(x, p, question, "median")
+
+    markers = [r.getMessage() for r in caplog.records if "CDF_MAXSTEP_CLIP:" in r.getMessage()]
+    assert len(markers) == 1
+    assert f"question={question.id_of_question}" in markers[0]
+    assert "model=ensemble_median" in markers[0]

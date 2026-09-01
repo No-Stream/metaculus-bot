@@ -32,8 +32,9 @@ from metaculus_bot.performance_analysis.platform_scores import (
     spot_peer_score,
 )
 
-# The exact shape collector._our_forecast writes onto a record, so these tests break if
-# the collector's key names drift away from the accessors.
+# Mirrors collector._our_forecast's metaculus_scores shape BY HAND — a collector key
+# rename does not redden this file; test_metaculus_scores_populated_from_my_forecasts_
+# score_data (tests/test_main_comment_output.py) is what pins the collector's key set.
 _COLLECTOR_SHAPED_SCORES: dict[str, float] = {
     "peer_score": -15.0,
     "spot_peer_score": -38.8,
@@ -94,14 +95,12 @@ class TestRankingScore:
         assert ranked is not None
         assert ranked.field == SPOT_PEER_FIELD
         assert ranked.value == pytest.approx(-38.8)
-        assert ranked.is_spot
         assert ranked.tier == 0
 
     def test_falls_back_to_coverage_scaled_peer_only_when_spot_is_absent(self):
         ranked = ranking_score(_record(peer_score=-15.0))
         assert ranked is not None
         assert ranked.field == PEER_FIELD
-        assert not ranked.is_spot
         assert ranked.tier == 1
 
     def test_none_when_the_record_carries_neither(self):
@@ -196,6 +195,19 @@ class TestReportSection:
     def test_section_is_absent_when_no_record_carries_a_platform_score(self):
         assert analysis._platform_score_section_lines([_record()]) == []
 
+    def test_section_states_it_is_pooled_and_unfiltered(self):
+        """The figure pools every era and every standing exclusion cohort; without the
+        caveat the PRIMARY label reads as the leaderboard standing."""
+        section = "\n".join(analysis._platform_score_section_lines(TestPlatformScoreSummary._data()))
+        assert "pooled over every record handed in" in section
+        assert "not as tournament standing" in section
+
     def test_generate_report_leads_with_the_platform_scores(self):
-        report = analysis.generate_report(TestPlatformScoreSummary._data())
-        assert "## Metaculus Platform Scores" in report
+        record = _record(spot_peer_score=-38.8, peer_score=-15.0)
+        record |= {"brier_score": 0.25, "log_score": -1.0, "our_prob_yes": 0.5, "resolution_parsed": True}
+        report = analysis.generate_report([record])
+        headings = [line for line in report.splitlines() if line.startswith("## ")]
+        # First, not merely present: moving the section below the binary one is the
+        # regression this pins.
+        assert headings[0] == "## Metaculus Platform Scores"
+        assert "## Binary Questions" in headings

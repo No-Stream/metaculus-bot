@@ -1492,7 +1492,8 @@ Notes on the story:
 **Ongoing monitor: `metaculus_bot/performance_analysis/width_monitor.py`** (read-only, free — not cost-gated).
 Run: `uv run python -m metaculus_bot.performance_analysis.width_monitor --cached scratch/coherence_2026-07-15/perf_all_tagged.json`
 (or `--tournament <slug>` for a live read-only pull; `--output-json <path>` to persist;
-`--exclude-qids known_bug` drops the 43746/43747 open-bound bug pair that every other residual dimension already
+`--exclude-qids known_bug` drops the known-pipeline-bug cohort — 43746/43747 (open-bound arithmetic bug) plus
+43913 (pre-`9f1175c` discrete max-step cap) — that every other residual dimension already
 excludes, and renders the dropped count so the exclusion is never silent). Per config era it reports
 central-80% / central-50% coverage with Jeffreys CIs, cov@10/50/90, PIT std (uniform ideal 0.289 — below ⇒ too
 wide, above ⇒ too narrow), median relative band width `(P90−P10)/|P50|` as the raw sharpness metric, and

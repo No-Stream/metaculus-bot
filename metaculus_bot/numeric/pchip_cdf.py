@@ -96,9 +96,10 @@ def _redistribute_excess_probability(cdf: np.ndarray, max_step: float) -> _MaxSt
     """Clip every over-cap step and pack the displaced mass into the nearest bins with headroom.
 
     Total mass and monotonicity survive by construction: packing only ADDS to bins that
-    had headroom, so the min-step cannot be tightened either. A negative step (possible
-    when a caller hands in a non-monotone CDF) is floored at zero first; the endpoint
-    re-pin in :func:`safe_cdf_bounds` absorbs the resulting overshoot.
+    had headroom, so the min-step cannot be tightened either. Callers must hand in a
+    MONOTONE CDF (every production caller pre-monotonizes); the ``np.maximum(raw_steps,
+    0.0)`` floor below is a defensive last resort, not a supported path — it inflates
+    total mass, and the endpoint is restored only for monotone input.
     """
     raw_steps = np.diff(cdf)
     was_monotone = not bool(np.any(raw_steps < 0.0))

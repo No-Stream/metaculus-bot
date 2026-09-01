@@ -4,6 +4,8 @@ The coverage math is verified against hand-computed values on synthetic
 records with linear CDFs (so PIT = (resolution - lower) / (upper - lower)).
 """
 
+import json
+import logging
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -11,12 +13,15 @@ import pytest
 
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, GRID_SCALED_MAX_STEP_MERGED_AT
-from metaculus_bot.performance_analysis.width_monitor import (
+from metaculus_bot.performance_analysis.cohorts import (
     DEGRADED_RUN_QIDS,
     EXCLUSION_COHORTS,
     KNOWN_BUG_QIDS,
-    MIN_N_FOR_POINT_METRICS,
     PARTIAL_DEGRADED_QIDS,
+    parse_exclude_qids,
+)
+from metaculus_bot.performance_analysis.width_monitor import (
+    MIN_N_FOR_POINT_METRICS,
     TS_ANCHOR_ENABLE,
     WIDENING_FLIP,
     _cdf_and_grid,
@@ -29,7 +34,6 @@ from metaculus_bot.performance_analysis.width_monitor import (
     default_eras,
     jeffreys_ci,
     main,
-    parse_exclude_qids,
     relative_band_width,
     render_markdown,
 )
@@ -787,6 +791,54 @@ class TestDegradedRunCohorts:
         }
         assert by_label["all"].n_pit == 1
         assert by_label["all"].n_excluded == 2
+
+
+class TestExcludeQidsCliReporting:
+    """``main`` reports requested-vs-matched and warns only on the id-space confusion.
+
+    A bare numeric id matching no record used to be a silent no-op — pasting the
+    degraded cohort's POST ids rendered byte-identically to ``--exclude-qids ''``. The
+    numeric half of the failure the shorthand raise closed stays reportable here without
+    alarming on a cohort id that simply isn't in the pull.
+    """
+
+    def _write(self, tmp_path, records: list[dict]) -> str:
+        path = tmp_path / "data.json"
+        path.write_text(json.dumps(records))
+        return str(path)
+
+    def test_reports_requested_and_matched_counts(self, tmp_path, caplog):
+        records = [
+            _record_with_pit(0.5, created_at="2026-08-01T00:00:00Z", question_id=99999),
+            _record_with_pit(0.5, created_at="2026-08-01T00:00:00Z", question_id=44872),
+        ]
+        path = self._write(tmp_path, records)
+        with caplog.at_level(logging.INFO):
+            main(["--cached", path, "--exclude-qids", "degraded_run"])
+        # 8 requested (the whole degraded_run cohort), 1 present in this pull.
+        assert any("8 requested id(s), 1 matched" in r.message for r in caplog.records)
+
+    def test_warns_when_an_explicit_id_is_a_post_id_not_a_question_id(self, tmp_path, caplog):
+        # 44721 is the POST id of question 44870 (a degraded_run member). Pasting post ids
+        # is the collision the cohort comment warns about.
+        record = _record_with_pit(0.5, created_at="2026-08-01T00:00:00Z", question_id=44870)
+        record["post_id"] = 44721
+        path = self._write(tmp_path, [record])
+        with caplog.at_level(logging.WARNING):
+            main(["--cached", path, "--exclude-qids", "44721"])
+        assert any(
+            "matched no question_id but IS a post_id" in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    def test_no_post_id_warning_on_a_correct_cohort_pass(self, tmp_path, caplog):
+        record = _record_with_pit(0.5, created_at="2026-08-01T00:00:00Z", question_id=44870)
+        record["post_id"] = 44721
+        path = self._write(tmp_path, [record])
+        with caplog.at_level(logging.WARNING):
+            main(["--cached", path, "--exclude-qids", "degraded_run"])
+        assert not any("IS a post_id" in r.message for r in caplog.records if r.levelno == logging.WARNING)
 
 
 class TestBandMissSplit:

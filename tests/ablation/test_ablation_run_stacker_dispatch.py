@@ -19,7 +19,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.run_stacker import ARM_STACK, run_stacker_for_arm
-from metaculus_bot.numeric.pipeline import sanitize_percentiles
+from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from tests.ablation_stacker_fakes import (
     _make_binary_q,
     _make_mc_q,
@@ -210,6 +210,10 @@ class TestQuestionTypeDispatch:
                 "metaculus_bot.numeric.pipeline.sanitize_percentiles",
                 wraps=sanitize_percentiles,
             ) as sanitize_spy,
+            patch(
+                "metaculus_bot.numeric.pipeline.build_numeric_distribution",
+                wraps=build_numeric_distribution,
+            ) as build_spy,
         ):
             payload = _run(
                 run_stacker_for_arm(
@@ -238,6 +242,8 @@ class TestQuestionTypeDispatch:
         # model=unknown as "a caller forgot to pass it" — the ablation stacker path must
         # wire its own model through, like the prod stacker and forecaster paths do.
         assert sanitize_spy.call_args.kwargs["model_name"] is stacker_llm.model
+        # A lost model_name kwarg attributes CDF_MAXSTEP_CLIP to model=unknown silently.
+        assert build_spy.call_args.kwargs["model_name"] is stacker_llm.model
 
     def test_dispatch_stacker_wraps_numeric_with_sanitize_and_build(
         self,

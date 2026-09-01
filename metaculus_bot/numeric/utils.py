@@ -110,7 +110,7 @@ def _postprocess_ensemble_cdf(
             open_upper=question.open_upper_bound,
             min_step=min_step_required,
             max_step=max_step_required,
-            question_id=getattr(question, "id_of_question", None),
+            question_id=question.id_of_question,
             model_name=f"ensemble_{method_label}",
         )
 

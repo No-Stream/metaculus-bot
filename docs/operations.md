@@ -660,10 +660,12 @@ is absent from the table rather than present-and-empty.
 uv run python -m metaculus_bot.performance_analysis.width_monitor --tournament <slug>
 # or against a cached dataset:
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path>
-# drop the known-pipeline-bug cohort (43746/43747, the open-bound arithmetic bug;
-# 43913, the pre-9f1175c discrete max-step cap) from every row; the excluded count
-# is rendered in the table, so the exclusion is never silent:
-uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path> --exclude-qids known_bug
+# drop a standing exclusion cohort from every row; the excluded count is rendered
+# in the table, so the exclusion is never silent. Three shorthands — known_bug
+# (since-fixed pipeline defects), degraded_run (dry-key 1-of-3 publishes) and
+# partial_degraded (2-of-3) — compose with each other and with explicit ids; the
+# id sets live in performance_analysis/cohorts.py (EXCLUSION_COHORTS):
+uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path> --exclude-qids known_bug,degraded_run
 ```
 
 Before either analysis, run `make sync_all` (also read-only and free) so the

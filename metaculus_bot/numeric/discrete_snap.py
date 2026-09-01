@@ -230,7 +230,7 @@ def snap_distribution_to_integers(
         upper_bound=question.upper_bound,
         open_lower_bound=question.open_lower_bound,
         open_upper_bound=question.open_upper_bound,
-        question_id=getattr(question, "id_of_question", None),
+        question_id=question.id_of_question,
     )
 
     if snapped_cdf is None:

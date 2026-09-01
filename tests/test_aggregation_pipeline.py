@@ -27,7 +27,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from metaculus_bot.aggregation_pipeline import AggregationCounters, AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
-from metaculus_bot.numeric.pipeline import sanitize_percentiles
+from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from tests.conftest import make_mock_numeric_question
 
 
@@ -473,7 +473,13 @@ class TestStackerNumericAttribution:
                 "metaculus_bot.aggregation_pipeline.sanitize_percentiles",
                 wraps=sanitize_percentiles,
             ) as spy,
+            patch(
+                "metaculus_bot.aggregation_pipeline.build_numeric_distribution",
+                wraps=build_numeric_distribution,
+            ) as build_spy,
         ):
             await pipeline.run_stacking(question, "research", reasoned)
 
         assert spy.call_args.kwargs["model_name"] == "test-model"
+        # A lost model_name kwarg attributes CDF_MAXSTEP_CLIP to model=unknown silently.
+        assert build_spy.call_args.kwargs["model_name"] == "test-model"

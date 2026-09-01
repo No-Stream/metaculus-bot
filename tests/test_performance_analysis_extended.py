@@ -1031,6 +1031,44 @@ class TestMaxStepClampScreen:
         assert screen["max_step_cap"] == pytest.approx(0.2)
         assert screen["suspected"] is True
 
+    def _fine_grid_members(self) -> dict[str, list[list[float]]]:
+        """Three 11-anchor curves each putting ~0.65-0.77 on the [100, 101] bin."""
+        value_rows = [
+            [99.90, 100.00, 100.15, 100.30, 100.45, 100.55, 100.70, 100.85, 101.00, 101.30, 101.60],
+            [99.95, 100.05, 100.18, 100.32, 100.46, 100.56, 100.72, 100.90, 101.05, 101.35, 101.65],
+            [99.85, 99.98, 100.12, 100.28, 100.43, 100.53, 100.68, 100.83, 100.98, 101.28, 101.55],
+        ]
+        return {
+            f"model-{name}": [[label, value] for label, value in zip(self._LABELS, values, strict=True)]
+            for name, values in zip("abc", value_rows, strict=True)
+        }
+
+    def _fine_grid_record(self, realized_bin_mass: float) -> dict:
+        steps = np.full(200, (1.0 - realized_bin_mass) / 199)
+        steps[100] = realized_bin_mass
+        cdf = np.concatenate([[0.0], np.cumsum(steps)]).tolist()
+        grid = np.linspace(0.0, 200.0, 201).tolist()
+        return self._record(
+            submitted=self._POST_FIX_TS, members=self._fine_grid_members(), cdf=cdf, grid=grid, resolution=100.5
+        )
+
+    def test_post_snap_near_cap_bin_is_suspected(self):
+        """The q45065 shape: the snap alpha shaves the realized bin ~1.1% under the 0.2
+        cap (0.1977991526), so the exact-equality screen read it as clear while all
+        three members declared 0.65-0.77 there. The near-cap ratio must catch it."""
+        screen = max_step_clamp_screen(self._fine_grid_record(0.1977991526))
+        assert screen["suspected"] is True
+        assert screen["resolution_bin_at_cap"] is False
+        assert screen["resolution_bin_cap_bound"] is True
+        assert screen["resolution_bin_cap_fraction"] == pytest.approx(0.989, abs=1e-3)
+
+    def test_bin_well_below_the_cap_is_not_cap_bound(self):
+        # 0.15 against a 0.2 cap is 75% — below _CLAMP_CAP_NEAR_FRAC, so not cap-bound
+        # even though every member wanted materially more mass there.
+        screen = max_step_clamp_screen(self._fine_grid_record(0.15))
+        assert screen["resolution_bin_cap_bound"] is False
+        assert screen["suspected"] is False
+
     def test_missing_timestamp_treated_as_pre_fix(self):
         screen = max_step_clamp_screen(self._record(submitted=None))
         assert screen["submitted_before_grid_scaled_cap"] is True

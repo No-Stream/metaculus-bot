@@ -818,7 +818,7 @@ class TestSelectCohortBest:
 
     def test_best_mode_numeric_falls_back_to_highest_log_score_when_peer_missing(self):
         # _numeric_record's default has no metaculus_scores → no peer_score, so
-        # _rank_key_best_logscore's fallback path (sort descending by
+        # _rank_key's best-mode fallback path (sort descending by
         # numeric_log_score) is what's exercised here. Locks the fallback.
         rs = [
             _numeric_record(10, resolution=50.0, numeric_log_score=-30.0),
@@ -1049,7 +1049,46 @@ class TestSpotPeerIsThePrimaryRankingKey:
         with caplog.at_level(logging.WARNING):
             result = select_cohort(records, mode="middle", n_binary=10, n_numeric=0, n_mc=0, seed=42)
         assert len(result) == 6
-        assert any("coverage-scaled" in r.message for r in caplog.records if r.levelno == logging.WARNING)
+        # Keyed on _middle_band's own marker + producing logger: log_ranking_score_sources
+        # emits a sibling "coverage-scaled" WARN first, which used to satisfy this test
+        # even with the _middle_band WARN deleted.
+        assert any(
+            r.name == "metaculus_bot.performance_analysis.audit" and "MIDDLE_BAND_PEER_FALLBACK" in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    def test_middle_mode_warns_with_the_count_it_dropped(self, caplog):
+        """The drop itself must be logged by _middle_band — it is the only place that
+        knows the count, and nothing else records that a peer-only record entered no
+        tier at all."""
+        records = []
+        for i in range(10):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"spot_peer_score": float(i)}
+            records.append(r)
+        peer_only = _binary_record(99, 0.5, True)
+        peer_only["metaculus_scores"] = {"peer_score": 4.0}
+        with caplog.at_level(logging.WARNING):
+            select_cohort([*records, peer_only], mode="middle", n_binary=20, n_numeric=0, n_mc=0, seed=42)
+        assert any(
+            r.name == "metaculus_bot.performance_analysis.audit"
+            and "MIDDLE_BAND_DROPPED_UNSCORED" in r.message
+            and "1 record(s)" in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    def test_middle_mode_all_spot_cohort_emits_no_drop_warning(self, caplog):
+        records = []
+        for i in range(10):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"spot_peer_score": float(i)}
+            records.append(r)
+        with caplog.at_level(logging.WARNING):
+            select_cohort(records, mode="middle", n_binary=10, n_numeric=0, n_mc=0, seed=42)
+        audit_warnings = [r for r in caplog.records if r.levelno == logging.WARNING and r.name.endswith(".audit")]
+        assert audit_warnings == []
 
     def test_score_header_leads_with_spot_and_labels_peer(self):
         record = _binary_record(1, 0.40, True)
