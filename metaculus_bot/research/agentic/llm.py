@@ -7,6 +7,7 @@ from typing import Any
 from litellm import acompletion
 
 from metaculus_bot.constants import OAI_ANTH_OPENROUTER_KEY_ENV, OPENROUTER_API_KEY_ENV
+from metaculus_bot.credit_telemetry import DONATED_KEY_ALIAS, PERSONAL_KEY_ALIAS, llm_call_metadata
 from metaculus_bot.fallback_openrouter import (
     record_donated_key_fallback,
     should_retry_with_general_key,
@@ -16,6 +17,9 @@ from metaculus_bot.research.agentic.types import LoopConfig
 
 LlmCall = Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], Awaitable[Any]]
 
+# The CREDIT_ROLE_SPEND line for the v2 driver's tool-loop completions.
+GAP_FILL_V2_DRIVER_ROLE = "gap_fill_v2_driver"
+
 
 def build_default_llm_call(config: LoopConfig) -> LlmCall:
     model = config.model if config.model.startswith("openrouter/") else f"openrouter/{config.model}"
@@ -24,7 +28,10 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
     use_fallback = should_route_via_donated_key(model) and donated_key and personal_key and donated_key != personal_key
 
     async def _call_once(
-        messages: list[dict[str, Any]], tools_json: list[dict[str, Any]] | None, api_key: str | None
+        messages: list[dict[str, Any]],
+        tools_json: list[dict[str, Any]] | None,
+        api_key: str | None,
+        key_alias: str,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -32,6 +39,10 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
             # code paths; copying the container preserves the loop's append-only
             # prefix (dict identity is kept — providers cache on it).
             "messages": list(messages),
+            # CREDIT_ROLE_SPEND tag. The GeneralLlm builders stamp this once at
+            # construction; this raw-acompletion path stamps it per call, with the key
+            # alias of the key this attempt actually bills.
+            "metadata": llm_call_metadata(GAP_FILL_V2_DRIVER_ROLE, key_alias),
             "parallel_tool_calls": True,
             "reasoning_effort": config.reasoning_effort,
             # litellm's OpenrouterConfig doesn't map reasoning_effort; without this
@@ -61,7 +72,7 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
             assert donated_key is not None
             assert personal_key is not None
             try:
-                return await _call_once(messages, tools_json, donated_key)
+                return await _call_once(messages, tools_json, donated_key, DONATED_KEY_ALIAS)
             except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # classifier re-raises non-key-scoped errors
                 if not should_retry_with_general_key(exc):
                     raise
@@ -71,13 +82,14 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
                 # path in the bot — v2 runs on every question in all four prod
                 # workflows — failed over to the paid key completely silently.
                 await record_donated_key_fallback(model, exc)
-                return await _call_once(messages, tools_json, personal_key)
+                return await _call_once(messages, tools_json, personal_key, PERSONAL_KEY_ALIAS)
 
-        api_key = donated_key if should_route_via_donated_key(model) and donated_key else personal_key
+        use_donated = bool(should_route_via_donated_key(model) and donated_key)
+        api_key = donated_key if use_donated else personal_key
         # The counted/logged fallback DECISION is now shared with fallback_openrouter
         # (record_donated_key_fallback). Only the transport differs: this path calls
         # raw litellm.acompletion for tool-loop support, where the wrapper goes
         # through GeneralLlm. Share the transport too if this grows a retry ladder.
-        return await _call_once(messages, tools_json, api_key)
+        return await _call_once(messages, tools_json, api_key, DONATED_KEY_ALIAS if use_donated else PERSONAL_KEY_ALIAS)
 
     return _call

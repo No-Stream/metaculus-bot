@@ -47,6 +47,7 @@ from metaculus_bot.constants import (
     TS_ANCHOR_ENABLED_ENV,
     env_flag_enabled,
 )
+from metaculus_bot.credit_telemetry import llm_call_metadata, plain_llm_key_alias
 from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research import degradation_views
@@ -610,6 +611,9 @@ class ResearchOrchestrator:
             # (GeneralLlm ctor default is already None). No top_p.
             temperature=None,
             api_key=get_openrouter_api_key(model_name) if model_name.startswith("openrouter/") else None,
+            # CREDIT_ROLE_SPEND tag. Perplexity is not donated-key-eligible, so the
+            # openrouter/ route bills the personal key; the direct route bills Perplexity.
+            metadata=llm_call_metadata("perplexity_research", plain_llm_key_alias(model_name)),
             # allowed_tries=1 hands the retry budget to the gated wrapper below; left
             # unpinned it inherited forecasting-tools' default of 2 with an un-gated
             # random.uniform(5, 10) tenacity sleep.

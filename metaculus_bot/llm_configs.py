@@ -8,6 +8,7 @@ from typing import Any
 
 from forecasting_tools import GeneralLlm
 
+from metaculus_bot.credit_telemetry import forecaster_role
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 
 __all__ = [
@@ -59,6 +60,16 @@ ACCEPTABLE_QUANTS = [
 # REASONING_MODEL_CONFIG) so PARSER_LLM / STACKER configs are untouched.
 _FORECASTER_CONFIG = {**REASONING_MODEL_CONFIG, "allowed_tries": 1}
 
+
+def _forecaster_slot(model: str, **kwargs: Any) -> GeneralLlm:
+    """One roster member, booked in the CREDIT_ROLE_SPEND ledger under ``forecaster:<vendor>``.
+
+    The role is derived from the slug rather than written beside it so a roster swap cannot
+    leave a slot mislabeled.
+    """
+    return build_llm_with_openrouter_fallback(model=model, role=forecaster_role(model), **_FORECASTER_CONFIG, **kwargs)
+
+
 FORECASTER_LLMS: list[GeneralLlm] = [
     # 2026-07-20: forecaster roster dropped from 6 to a 3-member latest-per-vendor
     # triple (1 OpenAI / 1 Anthropic / 1 Google). This is the SECOND roster change
@@ -85,21 +96,19 @@ FORECASTER_LLMS: list[GeneralLlm] = [
     # max|xhigh|high|medium|low|minimal|none and this model accepts high (bogus
     # values 400). NOTE: "max" is Anthropic-only — OpenAI's ceiling is xhigh and
     # OpenAI rejects max upstream even though OpenRouter's enum validation admits it.
-    build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5.6-sol",
+    _forecaster_slot(
+        "openrouter/openai/gpt-5.6-sol",
         reasoning={"effort": "high"},
-        **_FORECASTER_CONFIG,
     ),
     # Anthropic slot. 2026-07-15: enabled:True (provider-default adaptive thinking)
     # -> explicit effort=xhigh. Anthropic also exposes "max" one tier above xhigh —
     # held back deliberately for latency: unbounded adaptive thinking caused silent
     # FORECASTER_SOFT_DEADLINE stalls on the retired opus-4.6 slot, e.g. Q14333 on
     # 2026-05-07.
-    build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-opus-4.8",
+    _forecaster_slot(
+        "openrouter/anthropic/claude-opus-4.8",
         reasoning={"effort": "xhigh"},
         extra_body={"verbosity": "high"},
-        **_FORECASTER_CONFIG,
     ),
     # Google slot. No explicit reasoning-effort kwarg — gemini-3.1-pro-preview has
     # no xhigh tier and uses provider defaults. PINNED to the personal
@@ -107,10 +116,7 @@ FORECASTER_LLMS: list[GeneralLlm] = [
     # fallback_openrouter (the donated key routes it through a free-tier Google
     # AI Studio BYOK integration with quota 0, so it would 429 there); see the
     # TODO(gemini-3.1-pro-donated) tag pending the Metaculus-side BYOK fix.
-    build_llm_with_openrouter_fallback(
-        model="openrouter/google/gemini-3.1-pro-preview",
-        **_FORECASTER_CONFIG,
-    ),
+    _forecaster_slot("openrouter/google/gemini-3.1-pro-preview"),
 ]
 
 
@@ -141,6 +147,7 @@ FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FO
 # also uses UTILITY_MODEL_CONFIG) keeps its allowed_tries=3.
 SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-terra",
+    role="summarizer",
     reasoning={"effort": "low"},
     **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )
@@ -155,6 +162,7 @@ SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # Effort unchanged at low.
 PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-luna",
+    role="parser",
     reasoning={"effort": "low"},
     **UTILITY_MODEL_CONFIG,
 )
@@ -185,6 +193,7 @@ STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     # forecaster slot; "max" (one tier above xhigh) is deliberately held back for
     # latency — the stacker runs under STACKER_SOFT_DEADLINE.
     "openrouter/anthropic/claude-opus-4.8",
+    role="stacker",
     reasoning={"effort": "xhigh"},
     extra_body={"verbosity": "high"},
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},
@@ -199,6 +208,7 @@ STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # covers the primary stacker and forecaster slots, not this tighter-budget path.
 STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-sol",
+    role="stacker_fallback",
     reasoning={"effort": "high"},
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1, "timeout": 300},
 )
@@ -243,6 +253,7 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # fail-open — the whole ranking is lost, not just its tail — and luna's output tokens are cheap.
 MARKET_RANKER_LLM_CONFIG: dict = {
     "model": "openrouter/openai/gpt-5.6-luna",
+    "role": "market_ranker",
     "temperature": None,
     "max_tokens": 3000,
     "reasoning_effort": "low",
@@ -256,6 +267,7 @@ MARKET_RANKER_LLM_CONFIG: dict = {
 # tokens including reasoning; max_tokens sits ~2.5x above that.
 MARKET_QUERY_AUTHOR_LLM_CONFIG: dict = {
     "model": "openrouter/openai/gpt-5.6-luna",
+    "role": "market_query_author",
     "temperature": None,
     "max_tokens": 1500,
     "reasoning_effort": "low",
@@ -277,6 +289,7 @@ MARKET_QUERY_AUTHOR_LLM_CONFIG: dict = {
 # Per-instance override so PARSER_LLM keeps its allowed_tries=3.
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-terra",
+    role="crux_analyzer",
     reasoning={"effort": "low"},
     **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )

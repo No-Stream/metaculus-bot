@@ -303,6 +303,11 @@ tee'd from `run_logs/` during the run, alongside the run's
     telemetry archive). It differences each run's start usage against the next
     run's, which is the only place the lagged spend is observable. The most
     recent run has no successor yet, so it shows as unsettled until another runs.
+- `CREDIT_ROLE_SPEND:` (`credit_telemetry.py`) — one line per (role, key): which
+  pipeline stage spent what, off OpenRouter's own per-call accounting. On a
+  one-question smoke run expect three `forecaster:<vendor>` rows plus the
+  research roles; `usd=n/a` means no cost data, `role=untagged` means a builder
+  call site is missing its `role=`. Described under "Credit telemetry" below.
 - `FORECASTERS_SURVIVED:` (`forecaster.py`) — the answer to "did every forecaster
   survive?", as `survived=n/N models=...`. Check it rather than inferring: the
   minimum to publish is low enough that a thinned ensemble still exits zero, and
@@ -420,9 +425,57 @@ stderr), so per-run spend is durably grep-able:
 - `CREDIT_SPEND_UNSETTLED: key=... run_delta_usd=... is a LOWER BOUND ...` beside
   every `usage_delta_unsettled` figure, so a `0.00` is never mistaken for
   no-spend. `scripts/reconcile_credit_spend.py` recovers the settled number.
+- `CREDIT_ROLE_SPEND: role=... key=... usd=... calls=... costed_calls=...
+  byok_usd=...` — one line per (role, key) at end of run, saying WHERE the
+  OpenRouter dollars went. See "Per-role spend" below.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
   key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD`
   (`constants.py`).
+
+### Per-role spend (`CREDIT_ROLE_SPEND`)
+
+The per-key deltas above say what a run cost; the role lines say which part of
+the pipeline spent it: `forecaster:openai` / `forecaster:anthropic` /
+`forecaster:google` (the vendor slot, so the series survives a model swap),
+`stacker`, `stacker_fallback`, `parser`, `summarizer`, `crux_analyzer`,
+`native_search`, `targeted_search`, `gap_fill_analyzer`, `gap_fill_resolver`,
+`gap_fill_v2_driver`, `market_query_author`, `market_ranker`,
+`financial_classifier`, `perplexity_research`. The list lives in
+`credit_telemetry.llm_call_metadata`.
+
+How the number is produced, because it decides how to read it:
+
+- Every LLM built through `build_llm_with_openrouter_fallback(..., role=...)`
+  (and the raw-`acompletion` gap-fill v2 driver) stamps a litellm `metadata=`
+  tag with its role and the key it bills (`donated` for the wrapper's primary,
+  `personal` for its fallback or a personal-key-pinned model, `direct` for a
+  non-OpenRouter slug). A litellm success callback (`RoleSpendTracker`) reads
+  the tag back together with **OpenRouter's own per-call usage accounting** off
+  the response: `usage.cost` (credits drawn from the key) plus
+  `usage.cost_details.upstream_inference_cost` (the provider's charge on a BYOK
+  route). `usd` is their sum; `byok_usd` is the upstream part on its own. The
+  donated key routes through Metaculus's BYOK integrations, so on that key nearly
+  everything is `byok_usd` — the same money `/auth/key` books as `byok_usage` and
+  subtracts from `limit_remaining`; the personal key is not BYOK, so its rows read
+  `byok_usd=0.0000`. This is the provider's figure, not litellm's price table.
+- `usd=n/a` means none of that row's calls carried cost data. It is never a
+  fabricated zero; `costed_calls` says how many of `calls` the sum covers.
+- `role=untagged` means a completion nobody stamped — forecasting-tools' own
+  helpers, or a builder call site that forgot its `role=`. `key=unknown` is the
+  same for the key.
+- Not on OpenRouter, so never in this ledger: Gemini grounded search and gap-fill
+  v2's `read_document` (google-genai on the personal Google AI Studio key), the
+  AskNews subscription, Exa. The ledger is therefore an OpenRouter-only figure,
+  like the `$0.38–0.41/question` in `FUTURE.md`.
+- The lines are logged from the same `finally` as `CREDIT_SPEND`, after the
+  forecast loop has drained litellm's callback queue (`cli.py`
+  `_forecast_with_callback_drain`), so a crashed run still reports what it booked.
+
+Harvested as `credit_role_spend.jsonl` in the telemetry archive.
+`uv run python scripts/reconcile_credit_spend.py --roles` (free, offline) prints
+each run's role-ledger total beside its settled per-key spend — the two measure
+the same money from opposite ends, so their ratio is the ledger's own coverage
+check — plus a per-role table over the selected runs.
 
 A floor breach does not abort the run. Forecasting and publishing complete
 normally, and outside the suppression window below `cli.py` then exits non-zero
@@ -746,10 +799,13 @@ the telemetry markers:
   `GHOST_PRE_JSON` and `GHOST_FORECAST` / `GHOST_FORECAST_JSON` lines log the
   loop's pre- and post-research private forecasts for telemetry only; neither is
   ever published. `docs/agentic_gap_fill.md` reads the fields in full.
-- `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_FLOOR_BREACH` — credit telemetry,
-  described above. `CREDIT_FLOOR_BREACH` keeps firing during the credit-alert
-  suppression window, so seeing one on a green run is expected until 2026-09-10;
-  the adjacent INFO line names the resume date.
+- `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH`
+  — credit telemetry, described above. `CREDIT_FLOOR_BREACH` keeps firing during
+  the credit-alert suppression window, so seeing one on a green run is expected
+  until 2026-09-10; the adjacent INFO line names the resume date.
+  `CREDIT_ROLE_SPEND` is the per-(role, key) decomposition of the run's
+  OpenRouter spend; a run with no completions logs a single no-completions line
+  under the same token instead of rows.
 - `TIME_BUDGET: question=... budget_s=... close_time=... close_limited=...
   fast_path=...` — one line per question, emitted by `time_budget.py` before any
   research runs. Emitted even on roomy questions on purpose: `CLOSE_MARGIN` fires

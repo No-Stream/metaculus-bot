@@ -908,6 +908,61 @@ class TestCredit:
         assert rec["floor"] == 50.00
 
 
+# Verbatim from credit_telemetry.log_role_spend — the source of truth, so a
+# producer-side shape change breaks these loudly.
+CREDIT_ROLE_SPEND_LINE = (
+    PFX + "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000"
+)
+CREDIT_ROLE_SPEND_NA_LINE = (
+    PFX + "CREDIT_ROLE_SPEND: role=perplexity_research key=direct usd=n/a calls=2 costed_calls=0 byok_usd=n/a"
+)
+CREDIT_ROLE_SPEND_EMPTY_LEDGER_LINE = (
+    PFX + "CREDIT_ROLE_SPEND: no successful LLM completions reached the litellm success callback this run"
+)
+
+
+class TestCreditRoleSpend:
+    def test_row_fields(self):
+        rec = _parse_one(CREDIT_ROLE_SPEND_LINE)
+        assert rec["marker"] == "credit_role_spend"
+        # The vendor-slot role carries a colon; it must survive as the string it is.
+        assert rec["role"] == "forecaster:openai"
+        assert rec["key"] == "donated"
+        assert rec["usd"] == 0.2030
+        assert rec["calls"] == 2
+        assert rec["costed_calls"] == 2
+        assert rec["byok_usd"] == 0.2000
+
+    def test_uncosted_row_reads_none_not_zero(self):
+        # ``n/a`` is the whole point of ``costed_calls``: the calls happened, the dollars are
+        # unknown, and a 0.0 here would read as "this role is free".
+        rec = _parse_one(CREDIT_ROLE_SPEND_NA_LINE)
+        assert rec["role"] == "perplexity_research"
+        assert rec["key"] == "direct"
+        assert rec["usd"] is None
+        assert rec["byok_usd"] is None
+        assert (rec["calls"], rec["costed_calls"]) == (2, 0)
+
+    def test_empty_ledger_line_is_not_a_row(self):
+        # The no-completions line shares the token so it is greppable, but it must not
+        # harvest as a (role, key) record.
+        harvested = parse_log_text(CREDIT_ROLE_SPEND_EMPTY_LEDGER_LINE + "\n", **_META)
+        assert harvested["credit_role_spend"] == []
+
+    def test_no_question_ref(self):
+        # Per-run, per-role — same qid-less shape as the other credit markers.
+        rec = _parse_one(CREDIT_ROLE_SPEND_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_shadow_the_per_key_spend_marker(self):
+        # ``CREDIT_SPEND`` and ``CREDIT_ROLE_SPEND`` share a prefix; each line must land in
+        # exactly its own file.
+        harvested = parse_log_text("\n".join([CREDIT_SPEND_LINE, CREDIT_ROLE_SPEND_LINE]) + "\n", **_META)
+        assert len(harvested["credit_spend"]) == 1
+        assert len(harvested["credit_role_spend"]) == 1
+
+
 class TestHtmlCommentMarkers:
     def test_stacker_outcome(self):
         rec = _parse_one("<!-- STACKER_OUTCOME=primary -->")

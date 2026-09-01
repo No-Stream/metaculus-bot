@@ -72,6 +72,9 @@ def _build_constrained_llm(response_format_model: type[BaseModel], parser_model:
     """
     return build_llm_with_openrouter_fallback(
         parser_model,
+        # Same CREDIT_ROLE_SPEND line as PARSER_LLM: the constrained primary and the
+        # structure_output fallback are one parsing job on the same tier.
+        role="parser",
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
         # kept to pin provider-default sampling against a future default flip. reasoning
