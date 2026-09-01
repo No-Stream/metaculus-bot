@@ -263,8 +263,8 @@ The flow for a `js_wall` (or `no_resolving_content`) result:
    JSON, fetched <timestamp>. The cited page itself rendered no readable text."
 
 Raw JSON passthrough is deliberate. The Tier-1 JSON branch already renders API bodies verbatim
-(the CISA KEV feed is the sizing example in `constants.py`), so forecasters are used to reading
-a JSON body in this section. A deterministic body under a provenance lead beats a summary the
+(the CISA KEV feed is the sizing example in `constants.py`), so forecasters already meet JSON
+bodies among the resolution snapshots. A deterministic body under a provenance lead beats a summary the
 fetcher invented, and an eight-entry categories array with names and counts needs no
 translation. The Mapotic categories body is 2.4 KB, well inside the cap.
 
