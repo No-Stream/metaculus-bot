@@ -57,13 +57,21 @@ from forecasting_tools.helpers.metaculus_client import MetaculusClient
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import FALL_CUP_SLUG, METACULUS_CUP_ID, TOURNAMENT_ID
+
+# The scoring pull's own post-unwrapping, shared rather than re-derived: both read the same
+# posts list, and a probe that counted questions differently from the pull it exists to
+# project would be answering a subtly different question.
+from metaculus_bot.performance_analysis.collector import questions_on_post
 from metaculus_bot.time_utils import _as_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
 # Read off the client rather than hardcoded, so the host this probe sends the token to is
-# the same host `verify_metaculus_api_identity` vetted (it derives its preflight URL the
-# same way, and both honor a METACULUS_API_BASE_URL override).
+# the same host `verify_metaculus_api_identity` vetted (it derives its preflight URL the same
+# way). Both honor a METACULUS_API_BASE_URL override, including one set in a .env file: this
+# assignment runs after the imports above, and importing `metaculus_bot.constants` is what
+# loads .env / .env.local, while the preflight resolves its own URL per call for the same
+# reason (see `api_preflight.preflight_url`).
 POSTS_URL = f"{MetaculusClient().base_url}/posts/"
 
 # The three statuses the receipts exercised. `closed` is the whole point of the utility;
@@ -137,18 +145,6 @@ class SlugSupply:
     def worst_overdue_days(self) -> float:
         """Overdue margin of the worst backlog question; 0.0 when nothing is overdue."""
         return self.backlog[0].overdue_days if self.backlog else 0.0
-
-
-def questions_on_post(post: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Every forecastable question on a post: the single question, or a group's members.
-
-    Empty for a post that carries neither (tournaments hold notebook posts too).
-    """
-    question = post.get("question")
-    if isinstance(question, dict):
-        return [question]
-    group = post.get("group_of_questions") or {}
-    return list(group.get("questions") or [])
 
 
 def _question_is_resolved(question: Mapping[str, Any], post_status: str) -> bool:

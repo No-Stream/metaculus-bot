@@ -59,7 +59,6 @@ prod startup.
 from __future__ import annotations
 
 import asyncio
-import importlib
 import logging
 from typing import Any
 from unittest.mock import MagicMock
@@ -693,20 +692,17 @@ class TestApiPreflightBaseUrlSeam:
     def test_preflight_url_targets_the_clients_api_root(self) -> None:
         # Same root the real question fetch hits, plus the posts-list path whose
         # unauthenticated response IS the identity fingerprint.
-        assert api_preflight.PREFLIGHT_URL.startswith(MetaculusClient().base_url)
-        assert "/posts/" in api_preflight.PREFLIGHT_URL
+        assert api_preflight.preflight_url().startswith(MetaculusClient().base_url)
+        assert "/posts/" in api_preflight.preflight_url()
 
     def test_preflight_url_follows_the_base_url_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # MetaculusClient reads METACULUS_API_BASE_URL, so an override must move the
         # preflight target too — otherwise we would vet the default host and then send
-        # the token somewhere else entirely.
+        # the token somewhere else entirely. No module reload: the URL is resolved per call,
+        # which is what lets an override reaching the process AFTER import (the .env.local
+        # case — nothing loads that file at import time) still move the vetted host.
         monkeypatch.setenv("METACULUS_API_BASE_URL", "https://staging.example.invalid/api")
-        reloaded = importlib.reload(api_preflight)
-        try:
-            assert reloaded.PREFLIGHT_URL.startswith("https://staging.example.invalid/api")
-        finally:
-            monkeypatch.undo()
-            importlib.reload(api_preflight)
+        assert api_preflight.preflight_url().startswith("https://staging.example.invalid/api")
 
     def test_deprecated_shim_attribute_is_really_gone(self) -> None:
         # Documents WHY the module was repointed, so nobody "restores" the old read.

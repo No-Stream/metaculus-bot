@@ -24,15 +24,16 @@ from datetime import UTC, datetime
 
 import pytest
 import requests
+from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot import api_preflight
 from metaculus_bot.constants import FALL_CUP_SLUG, METACULUS_CUP_ID, TOURNAMENT_ID
+from metaculus_bot.performance_analysis.collector import questions_on_post
 from scripts import supply_probe
 from scripts.supply_probe import (
     SlugSupply,
     fetch_posts_by_status,
     probe_slugs,
-    questions_on_post,
     render_report,
     summarize_slug_supply,
 )
@@ -66,6 +67,11 @@ def _group_post(post_id: int, questions: list[dict], *, title: str = "A group?")
 
 
 class TestQuestionsOnPost:
+    """The shared unwrapping, which lives in ``performance_analysis.collector`` — the probe
+    reads the same posts list the scoring pull does, so both count questions one way. These
+    cases were written against the probe's own former copy and are the only coverage the
+    helper has, so they stay here rather than moving with it."""
+
     def test_single_question_post(self):
         post = _post(101, _question(1))
         assert [q["id"] for q in questions_on_post(post)] == [1]
@@ -407,4 +413,19 @@ class TestDefaults:
     def test_probe_url_shares_the_host_the_preflight_vets(self):
         # The identity guard's promise is that the vetted host is the host the token goes
         # to, so a hardcoded probe URL would quietly break it under a base-URL override.
-        assert api_preflight.PREFLIGHT_URL.startswith(supply_probe.POSTS_URL)
+        assert api_preflight.preflight_url().startswith(supply_probe.POSTS_URL)
+
+    def test_an_override_loaded_from_a_dotenv_file_moves_both_urls_together(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure this pair is built to exclude: vetting one host and sending the token
+        to another. It was live until 2026-09 — `api_preflight` bound its URL as a module
+        constant, so an override arriving with the .env files (nothing loads `.env.local` at
+        import time) moved POSTS_URL and left the vetted host at www.metaculus.com. Simulated
+        here by setting the variable AFTER both modules are imported, which is exactly what a
+        late dotenv load looks like from the modules' point of view."""
+        monkeypatch.setenv("METACULUS_API_BASE_URL", "https://staging.example.invalid/api")
+        posts_url = f"{MetaculusClient().base_url}/posts/"
+
+        assert posts_url.startswith("https://staging.example.invalid/api")
+        assert api_preflight.preflight_url().startswith(posts_url)

@@ -55,7 +55,7 @@ def _mock_transport(
         response.status_code = status
         response._content = body.encode()
         response.encoding = "utf-8"
-        response.url = request.url or api_preflight.PREFLIGHT_URL
+        response.url = request.url or api_preflight.preflight_url()
         response.request = request
         return response
 
@@ -164,7 +164,7 @@ class TestNeverSendsCredentials:
         request = captured["request"]
         assert "Authorization" not in request.headers
         assert request.method == "GET"
-        assert request.url == api_preflight.PREFLIGHT_URL
+        assert request.url == api_preflight.preflight_url()
 
     def test_passes_timeout_to_transport(self) -> None:
         with _mock_transport(status=403) as captured:

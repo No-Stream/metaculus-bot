@@ -73,9 +73,21 @@ def _api_base_url() -> str:
     return MetaculusClient().base_url
 
 
-# The posts list is the exact endpoint the question fetch hits, so its unauthenticated
-# behavior is the identity signature we want to check.
-PREFLIGHT_URL = f"{_api_base_url()}/posts/?limit=1"
+def preflight_url() -> str:
+    """The URL the identity probe hits: the posts list, whose unauthenticated behavior IS
+    the fingerprint (it is the exact endpoint the question fetch uses).
+
+    Resolved at CALL time rather than bound as a module constant, because the base URL comes
+    out of the environment and this module is imported BEFORE the bot loads its ``.env``
+    files. A constant here read whatever ``METACULUS_API_BASE_URL`` was set at import, while
+    every real fetch resolves it after ``load_environment()`` — measured divergence: with the
+    override in ``.env.local`` (which ``load_environment`` applies with ``override=True``, and
+    which nothing loads at import), the constant vetted ``www.metaculus.com`` and the token
+    then went to the override host. That is precisely the "credentials to an unvetted host"
+    failure this module exists to prevent, so the two reads have to happen at the same time.
+    """
+    return f"{_api_base_url()}/posts/?limit=1"
+
 
 # The real Metaculus API gates unauthenticated access behind these statuses —
 # this is its fingerprint when we send no token.
@@ -114,19 +126,20 @@ def _parse_json_object(body: str) -> dict[str, Any] | None:
 def verify_metaculus_api_identity(timeout: float = 20.0) -> None:
     """Confirm www.metaculus.com is answered by the real Metaculus API before any authed call.
 
-    Sends ONE unauthenticated GET (no token, no headers) to ``PREFLIGHT_URL``
+    Sends ONE unauthenticated GET (no token, no headers) to ``preflight_url()``
     through an isolated ``trust_env=False`` session (so no netrc/env credential
     is attached). Passes silently on the real API's fingerprint; raises
     ``MetaculusApiIdentityError`` with a diagnostic on anything else. Never
     retries — see module docstring.
     """
+    url = preflight_url()
     try:
         with requests.Session() as session:
             session.trust_env = False  # do not let ~/.netrc or proxy env inject credentials
-            response = session.get(PREFLIGHT_URL, timeout=timeout, allow_redirects=False)
+            response = session.get(url, timeout=timeout, allow_redirects=False)
     except requests.RequestException as e:
         raise MetaculusApiIdentityError(
-            f"Metaculus API identity preflight could not reach {PREFLIGHT_URL!r} "
+            f"Metaculus API identity preflight could not reach {url!r} "
             f"({type(e).__name__}: {e}); DNS/TLS/connect failure before any response. "
             "Do NOT retry with credentials; check `dig www.metaculus.com` and Metaculus status channels."
         ) from e
@@ -144,13 +157,13 @@ def verify_metaculus_api_identity(timeout: float = 20.0) -> None:
             logger.info(f"Metaculus API identity preflight passed ({status=} JSON results payload)")
             return
         raise MetaculusApiIdentityError(
-            f"Metaculus API identity preflight got {status=} from {PREFLIGHT_URL!r} but the body is not the "
+            f"Metaculus API identity preflight got {status=} from {url!r} but the body is not the "
             f"expected JSON results payload (first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_DIAGNOSTIC_HINT}."
         )
 
     if status in _TRANSIENT_STATUSES:
         raise MetaculusApiIdentityError(
-            f"Metaculus API identity preflight got {status=} from {PREFLIGHT_URL!r} "
+            f"Metaculus API identity preflight got {status=} from {url!r} "
             f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); transient edge throttle/server condition — "
             "not necessarily a hijack; a later retry of the whole run is appropriate; "
             "do NOT retry with credentials now."
@@ -158,7 +171,7 @@ def verify_metaculus_api_identity(timeout: float = 20.0) -> None:
 
     if 500 <= status < 600:
         raise MetaculusApiIdentityError(
-            f"Metaculus API identity preflight got {status=} from {PREFLIGHT_URL!r} "
+            f"Metaculus API identity preflight got {status=} from {url!r} "
             f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); cannot verify API identity. "
             "This may be a genuine Metaculus server error rather than a hijack, but the run is useless either way. "
             "Do NOT retry with credentials; check Metaculus status channels."
@@ -167,6 +180,6 @@ def verify_metaculus_api_identity(timeout: float = 20.0) -> None:
     # Any other status — 404, a 3xx redirect (allow_redirects=False keeps it a
     # status, not a followed hop), an unexpected 2xx, or a stray 4xx.
     raise MetaculusApiIdentityError(
-        f"Metaculus API identity preflight got unexpected {status=} from {PREFLIGHT_URL!r} "
+        f"Metaculus API identity preflight got unexpected {status=} from {url!r} "
         f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_DIAGNOSTIC_HINT}."
     )
