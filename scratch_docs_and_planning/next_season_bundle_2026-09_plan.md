@@ -682,7 +682,7 @@ outlet and rewrites the unsupported one; generic tier words untouched; prose sen
 modified; diagnostics count emitted; interaction test with item 3 (dotted indices stripped
 first, attribution check still sees the tier tag).
 
-#### Item 5 — market-odds bullet narrowing (`prompts.py:266`) — WORDING PENDING OPERATOR CONFIRMATION
+#### Item 5 — market-odds bullet narrowing (`prompts.py:266`) — wording CONFIRMED by operator 2026-09-01
 
 **What/why.** In 42 ranked-era bundles, the bullet's covered-venue half produced exactly one
 content-redundant retrieval and THREE stale covered-venue prices that contradicted correct live
@@ -699,9 +699,8 @@ why it beats both keep-as-is and full removal).
 - Prediction market odds and forecasts (if available)
 ```
 
-with the RECOMMENDED text below — **this exact wording is pending operator confirmation; do
-not commit the prompt edit until confirmed** (ask in the PR/review thread; the rest of the item
-— test scaffolding — can be staged):
+with the text below — **wording confirmed verbatim by the operator on 2026-09-01; commit as
+written**:
 
 ```
 - Market-implied or crowd odds from sources OTHER than Polymarket, Kalshi, Manifold, or
