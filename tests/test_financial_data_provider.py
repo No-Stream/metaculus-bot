@@ -720,8 +720,9 @@ class TestPeggedCrossAnchor:
 
         assert "### USDSZL=X" in result, "the pegged pair's own block must survive"
         assert "### ZAR=X" in result, "the liquid anchor must be rendered beside it"
-        assert "⚠ Pegged pair: USD/SZL is fixed at par with the South African rand since 1974" in result
+        assert "⚠ Pegged pair: USD/SZL — SZL is fixed at par with the South African rand since 1974" in result
         assert "Peg anchor: `ZAR=X`" in result
+        assert "quotes ZAR per US dollar" in result
         assert "_Peg anchor for USDSZL=X" in result
         # The pegged block keeps its own latest price: disclosure, not substitution.
         assert result.index("### USDSZL=X") < result.index("- Latest price:") < result.index("### ZAR=X")
@@ -796,11 +797,48 @@ class TestPeggedCrossAnchor:
             assert kwargs["end"] == "2026-03-16"  # open_time.date() + 1d, end EXCLUSIVE
             assert kwargs["start"] == expected_start
 
+    def test_a_euro_pegged_row_reads_the_per_usd_euro_cross_and_names_the_currency(self) -> None:
+        """The euro pegs must anchor on `EUR=X`, not the inverted `EURUSD=X`.
+
+        Yahoo's `EURUSD=X` quotes US DOLLARS PER EURO, the opposite way round to USD/DKK
+        (DKK per USD = 7.46038 / EURUSD), so its signed percent moves are the NEGATIVE of the
+        pegged pair's while both rendered sentences claim they transfer unchanged. `EUR=X` is
+        the per-USD spelling (euros per USD, like the existing `ZAR=X`/`SGD=X` rows), which
+        makes the claim true instead of needing a sign-flip caveat. The regime string also
+        states a rate against the EURO, so the disclosure's subject must be the currency: the
+        old "USD/DKK is held near ... 7.46038 per euro" printed a ~16% level error directly
+        above that block's own "Latest price: 6.44".
+        """
+        for pegged, currency in (("USDDKK=X", "DKK"), ("USDXOF=X", "XOF"), ("USDXAF=X", "XAF")):
+            closes = {pegged: _noisy_close(seed=12), "EUR=X": _clean_close(seed=12)}
+            with patch("metaculus_bot.research.financial_data.yfinance", _yfinance_by_symbol(closes)):
+                result = _fetch_yfinance_data(pegged)
+
+            assert "### EUR=X" in result, f"{pegged} must anchor on the per-USD euro cross"
+            assert "EURUSD=X" not in result, f"{pegged} must not anchor on the inverted cross"
+            assert "Peg anchor: `EUR=X`" in result
+            assert "quotes EUR per US dollar" in result
+            assert f"⚠ Pegged pair: USD/{currency} — {currency} is " in result
+            # The peg rate is quoted per EURO; attaching it to the USD cross is the level error.
+            assert f"USD/{currency} is held near" not in result
+            assert f"USD/{currency} is fixed at 655.957" not in result
+
     def test_no_anchor_is_itself_pegged_so_the_render_cannot_recurse(self) -> None:
         """The one-level recursion bound `_fetch_yfinance_data` documents."""
         anchors = {peg.anchor_ticker for peg in HARD_PEG_ANCHORS.values() if peg.anchor_ticker}
         assert anchors
         assert not (anchors & set(HARD_PEG_ANCHORS)), "an anchor that is itself pegged would recurse"
+
+    def test_every_anchor_is_the_per_usd_form(self) -> None:
+        """`XXX=X` is Yahoo's units-per-US-dollar spelling, the same orientation as the
+        `USD<currency>=X` pair a question resolves on. An inverted `EURUSD=X`-shaped anchor
+        would hand the forecaster percent moves with the wrong SIGN under a sentence saying
+        they transfer unchanged, so the shape is forbidden here rather than caveated in prose.
+        """
+        anchors = {peg.anchor_ticker for peg in HARD_PEG_ANCHORS.values() if peg.anchor_ticker}
+        assert anchors
+        for anchor in anchors:
+            assert re.fullmatch(r"[A-Z]{3}=X", anchor), f"{anchor} is not Yahoo's per-USD form"
 
     def test_every_peg_entry_carries_both_spellings_and_a_dated_regime(self) -> None:
         for ticker, peg in HARD_PEG_ANCHORS.items():
@@ -1165,6 +1203,31 @@ class TestFredFirstReleaseTable:
         assert kwargs["realtime_end"] == "9999-12-31"
         # Bounded to the prints the table renders, read off the dates already in hand.
         assert kwargs["observation_start"] == pd.Timestamp("2026-03-01")
+
+    def test_an_out_of_order_fred_response_still_renders_ascending(self) -> None:
+        """`_render_fred_series` documents "sorted ascending by date" as a precondition and
+        nothing used to establish it: the live path only dropna'd. Two things break on an
+        out-of-order response, and neither is cosmetic. The year-over-year lookup slices
+        `data.loc[:year_ago]`, which RAISES on a non-monotonic DatetimeIndex with a
+        non-existing key, so the outer soft-fail swallows the whole series block; and
+        `pd.concat(join="inner")` takes the LEFT operand's order, so the table's `tail(4)`
+        would pick four arbitrary prints under a "recent prints" label. Sorting the first
+        releases (which the fetch already did) fixes neither, since they are the right operand.
+        """
+        shuffled = _monthly_fred(self._CURRENT).iloc[np.array([0, 4, 1, 3, 2])]
+        assert not shuffled.index.is_monotonic_increasing, "the fixture must actually be out of order"
+        instance = self._fred_mock(shuffled, _monthly_fred(self._FIRST))
+        with patch("metaculus_bot.research.financial_data.Fred", return_value=instance) as fred_class:
+            fred_class.earliest_realtime_start = "1776-07-04"
+            fred_class.latest_realtime_end = "9999-12-31"
+            markdown = _fetch_fred_data("CSUSHPISA", "fake_key", is_resolving_source=True)
+
+        assert markdown != "", "an out-of-order response must not soft-fail the whole block"
+        # The same four rows, in the same order, as the already-sorted fixture renders.
+        assert "- Latest value: 331.893 (2026-06-01)" in markdown
+        row_dates = re.findall(r"^ {2}- (\d{4}-\d{2}-\d{2}): first release", markdown, flags=re.MULTILINE)
+        assert row_dates == sorted(row_dates), f"table rows are not date-ascending: {row_dates}"
+        assert row_dates == ["2026-03-01", "2026-04-01", "2026-05-01", "2026-06-01"]
 
     def test_a_classifier_only_series_makes_no_vintage_request(self) -> None:
         """The revision channel matters for the series a question GRADES against; every

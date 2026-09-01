@@ -138,6 +138,14 @@ class CurrencyPeg:
     pegged to the USD leg itself (HKD, AED, SAR, QAR), where no substitute cross exists and
     the only honest statement is that the pair has no independent market dynamics.
     ``regime`` names the peg rate and its start date and is rendered verbatim.
+
+    Every ``anchor_ticker`` is Yahoo's per-USD ``XXX=X`` form — units of the anchor currency
+    per US dollar, the same way round as the ``USD<currency>=X`` pair the question resolves
+    on. That orientation is the whole reason the block can hand the anchor's SIGNED percent
+    moves and its volatility to a forecaster as the pegged pair's own; only the price LEVELS
+    are a different quantity (and only when the peg is not at par). An inverted anchor such
+    as ``EURUSD=X`` (US dollars per euro) would move the opposite way and is forbidden by
+    test — see ``test_every_anchor_is_the_per_usd_form``.
     """
 
     currency: str
@@ -182,28 +190,32 @@ HARD_PEG_ANCHORS: dict[str, CurrencyPeg] = {
         )
     ),
     # Pegged to the euro, so the euro's own USD cross carries the dynamics. The anchor is
-    # EURUSD=X (USD per EUR), the INVERSE direction of USD/<currency>: percent moves and
-    # volatility transfer, levels do not.
+    # `EUR=X` — Yahoo's per-USD spelling, euros per US dollar (~0.86) — NOT `EURUSD=X`, which
+    # quotes US dollars per euro (~1.16) and therefore moves the OPPOSITE way to USD/DKK:
+    # USD/DKK = 7.46038 * (EUR per USD), so a 2% rise in `EUR=X` is a ~2% rise in the pegged
+    # pair, while a 2% rise in `EURUSD=X` is a ~2% FALL in it. With the per-USD form the
+    # anchor's signed percent moves and its volatility are the pegged pair's own; only the
+    # levels differ.
     **_peg_entries(
         CurrencyPeg(
             "DKK",
             "held near the ERM II central rate of 7.46038 per euro (band 7.29252-7.62824) under Denmark's "
             "fixed-exchange-rate policy, in force since the 1980s",
-            "EURUSD=X",
+            "EUR=X",
         )
     ),
     **_peg_entries(
         CurrencyPeg(
             "XOF",
             "fixed at 655.957 per euro since 1 January 1999, guaranteed by the French Treasury",
-            "EURUSD=X",
+            "EUR=X",
         )
     ),
     **_peg_entries(
         CurrencyPeg(
             "XAF",
             "fixed at 655.957 per euro since 1 January 1999, guaranteed by the French Treasury",
-            "EURUSD=X",
+            "EUR=X",
         )
     ),
     # Interchangeable at par with the Singapore dollar, which is the traded cross.
@@ -237,12 +249,18 @@ def _peg_for_ticker(ticker: str) -> CurrencyPeg | None:
 
 
 def _peg_disclosure_lines(ticker: str, peg: CurrencyPeg) -> list[str]:
-    """The forecaster-facing peg warning: what is fixed, and what to read instead."""
+    """The forecaster-facing peg warning: what is fixed, and what to read instead.
+
+    The regime's subject is the CURRENCY, not the USD cross: every ``regime`` string states a
+    rate against the peg's own reference (7.46038 DKK per euro, 655.957 XOF per euro), which
+    is not the USD cross's level — rendering it as "USD/XOF is fixed at 655.957 per euro" put
+    a ~16% level error directly above that block's own "Latest price: 565.31".
+    """
     pair = f"USD/{peg.currency}"
     lines = [
-        f"- ⚠ Pegged pair: {pair} is {peg.regime}. The volatility, 52-week range and daily "
-        f"closes in this block are a thin vendor quote on a fixed cross, so most of their "
-        f"day-to-day movement is quote noise rather than exchange-rate risk."
+        f"- ⚠ Pegged pair: {pair} — {peg.currency} is {peg.regime}. The volatility, 52-week "
+        f"range and daily closes in this block are a thin vendor quote on a fixed cross, so "
+        f"most of their day-to-day movement is quote noise rather than exchange-rate risk."
     ]
     if peg.anchor_ticker is None:
         lines.append(
@@ -251,9 +269,11 @@ def _peg_disclosure_lines(ticker: str, peg: CurrencyPeg) -> list[str]:
             "from any volatility figure below."
         )
     else:
+        anchor_currency = peg.anchor_ticker.split("=")[0]
         lines.append(
             f"- Peg anchor: `{peg.anchor_ticker}` is the liquid cross the peg is fixed to, and its block is "
-            f"appended directly below. Read ITS volatility and percent moves as {pair}'s own."
+            f"appended directly below. It quotes {anchor_currency} per US dollar — the same way round as "
+            f"{pair}, so read ITS volatility and signed percent moves as {pair}'s own."
         )
     return lines
 
@@ -1053,7 +1073,12 @@ def _fetch_fred_data(series_id: str, api_key: str, *, is_resolving_source: bool 
             logger.warning(f"FRED returned empty data for {series_id=}")
             return ""
 
-        data = data.dropna()
+        # Sorted here, not just dropna'd, because everything downstream reads position as
+        # date order: `iloc[-1]`/`iloc[-2]` as latest/previous, the YoY label slice (which
+        # RAISES on a non-monotonic DatetimeIndex and would soft-fail the whole block), and
+        # the first-release table's `tail()` — `pd.concat(join="inner")` takes the LEFT
+        # operand's order, so sorting the vintage series alone establishes nothing.
+        data = data.dropna().sort_index()
         if data.empty:
             return ""
 
