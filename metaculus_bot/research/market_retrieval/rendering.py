@@ -1,6 +1,6 @@
 """The rendered snapshot: a markdown table in the ranker's order, plus the rules bullets.
 
-Five things here are contracts rather than formatting choices:
+Seven things here are contracts rather than formatting choices:
 
 - **Zero rendered rows returns ``""`` before any preamble is emitted.** That early return is
   what produces ``status="empty"`` downstream and the attempted-vs-succeeded distinction
@@ -34,6 +34,15 @@ Five things here are contracts rather than formatting choices:
   at parse time, so a fabricated 0.50 never reaches the sort, the render, or a group's summed price.
   A blanked cell renders the venue's own book as a RANGE (``0.00-1.00``) where there is one, which
   cannot be read as a point probability.
+- **A ``close`` date that has already passed says so, in the cell.** The column is the venue's
+  TRADING close, and on Kalshi it trails settlement by a median +317 days on the markets this bot
+  has rendered, so a forecaster told to "verify the resolution date" is checking against a date that
+  means something else. Worse, a market can be long dead and still read ``status=open``: Manifold's
+  close dates are soft, so ``is_resolved`` stays false past them, and q45163's best-ranked row closed
+  five months before the forecast with nothing in the table saying so. ``_close_cell`` appends
+  ``(Nd ago)`` against the snapshot's own ``forecast_time``, and the legend carries the
+  close-is-not-settlement caveat. The date itself never leaves the cell — it is what the
+  date-verification instruction is checked against, and an age cannot answer that.
 - **Every number in the ``prob`` column is a probability, unless it is labelled as something
   else.** The one exception is a scalar market's own value, and it renders as ``value N (scale LOW
   to HIGH)`` for exactly that reason — the forecaster prompts tell a model to anchor on this cell,
@@ -74,6 +83,7 @@ from metaculus_bot.research.market_retrieval.types import (
     format_scalar_number,
 )
 from metaculus_bot.research.market_retrieval.venues._shared import child_render_order_key
+from metaculus_bot.time_utils import _as_utc
 
 # Significant digits for a scalar market's VALUE, which is deliberately shorter than the bounds
 # beside it (`types.SCALAR_BOUND_SIG_DIGITS`, which lives there because the ranker's candidate line
@@ -235,6 +245,9 @@ MARKET_SIGNAL_LEGEND = (
     "`same_quantity_same_date`, then `same_quantity_other_cut`, then `driver_or_consequence`, then `weak` "
     "(`unspecified` if ungraded); only the first two measure the quantity asked about, and `why` is the "
     "one-phrase reason. `status` is `open` or `RESOLVED`; a RESOLVED price is a realized outcome, not a forecast. "
+    "`close` is the venue's TRADING close, not its settlement date (on Kalshi the two are months apart), so never "
+    "read it as this market's resolution date. `(Nd ago)` means the close date had already passed when this forecast "
+    "was made: treat that price as stale even where `status` still reads open. "
     "A `↳` row is one OUTCOME of the market above it (strike, bracket, ballot line) with its own price; the parent "
     "row has none, so anchor on the outcome that matches this question. "
     "A `↳ [remaining N]` row names every one of that market's remaining outcomes with its own price, so no outcome "
@@ -338,6 +351,40 @@ def _price_cell(
     return "-"
 
 
+def _close_cell(close_time: datetime | None, forecast_time: datetime | None) -> str:
+    """The ``close`` cell: the date, plus how long ago it passed when it is in the past.
+
+    A bare date makes a forecaster do the subtraction, and on the case this fixes there was nothing
+    to prompt them to try: q45163's rank-0 row closed 2026-02-27 against an 08-09 snapshot and
+    rendered ``status=open`` beside it, because Manifold's soft close dates leave ``is_resolved``
+    false — so the table's only cue that its best-ranked market was five months dead was a date in a
+    column full of dates. ``(162d ago)`` is the cue.
+
+    It says the DATE has passed and not that trading stopped, which is the only thing we know: the
+    same soft-close behaviour that hid this defect means a Manifold market can still be tradeable
+    past its close date, so ``closed 162d ago`` would be an overclaim on exactly the venue that
+    produced the case. The legend carries the reading ("treat that price as stale even where
+    ``status`` still reads open") and the shorter suffix saves 7 chars a row, which matters on a
+    slate that can carry 22 dated rows.
+
+    The date STAYS. It is what the preamble's "verify each market's resolution date against THIS
+    question" instruction is checked against, and a relative age cannot answer that.
+
+    ``timedelta.days`` floors, so a close a few hours old reads as 0 and discloses nothing (a market
+    that stopped trading this morning is not stale) and a future close goes negative and discloses
+    nothing. Both sides normalize through ``_as_utc``: venue close times are UTC-aware by
+    construction (``http.parse_iso``), and a naive ``forecast_time`` from a caller would otherwise
+    raise on the subtraction and take the whole render down.
+    """
+    if close_time is None:
+        return "-"
+    rendered = close_time.strftime("%Y-%m-%d")
+    if forecast_time is None:
+        return rendered
+    days_since_close = (_as_utc(forecast_time) - _as_utc(close_time)).days
+    return f"{rendered} ({days_since_close}d ago)" if days_since_close >= 1 else rendered
+
+
 def _priced_cells(
     *,
     implied_prob_yes: float | None,
@@ -346,6 +393,7 @@ def _priced_cells(
     close_time: datetime | None,
     is_resolved: bool,
     signal: str,
+    forecast_time: datetime | None,
     scalar_estimate: ScalarEstimate | None = None,
     quote_low: float | None = None,
     quote_high: float | None = None,
@@ -361,18 +409,36 @@ def _priced_cells(
     at the parent's call site so there stays exactly one place that decides what the ``prob`` column
     may contain. The quote bounds ride through for the same reason: a single-strike Kalshi FAMILY and
     a strike sub-row can both have their midpoint refused, and the two must render that identically.
+
+    ``forecast_time`` is required rather than defaulted so no call site can silently render dates
+    with no staleness read: the value may legitimately be ``None`` (an archived snapshot written
+    before the field existed), and that has to be a decision the caller states.
     """
     return {
         "prob": _price_cell(implied_prob_yes, scalar_estimate, quote_low, quote_high),
         "total_vol": f"{total_volume:.0f}" if total_volume is not None else "-",
         "OI": f"{open_interest:.0f}" if open_interest is not None else "-",
         "signal": signal,
-        "close": close_time.strftime("%Y-%m-%d") if close_time else "-",
+        "close": _close_cell(close_time, forecast_time),
         "status": "RESOLVED" if is_resolved else "open",
     }
 
 
-def _row_cells(match: MarketMatch) -> dict[str, str]:
+def _why_cell(match: MarketMatch) -> str:
+    """The ``why`` cell: the ranker's phrase, behind the tier-cap note when there is one.
+
+    The note leads, and it is NOT subject to ``WHY_CHARS`` — the cap is a disagreement between our
+    arithmetic and the model's grade, and truncating it away would leave a demoted tier with no
+    stated reason. The ranker's own phrase keeps its cap behind it.
+    """
+    label = _cell(match.relevance_label, limit=WHY_CHARS)
+    note = _cell(match.tier_cap_note)
+    if not note:
+        return label or "-"
+    return f"{note}. {label}" if label else note
+
+
+def _row_cells(match: MarketMatch, forecast_time: datetime | None) -> dict[str, str]:
     return {
         "platform": match.platform,
         "title": _cell(match.market_title, limit=TITLE_MAX_CHARS),
@@ -383,6 +449,7 @@ def _row_cells(match: MarketMatch) -> dict[str, str]:
             close_time=match.close_time,
             is_resolved=match.is_resolved,
             signal=_liquidity_label(match),
+            forecast_time=forecast_time,
             scalar_estimate=match.scalar_estimate,
             # The parent's book. Populated only where a venue publishes one, and consulted only when
             # the row carries no price — which is how a single-strike Kalshi family whose midpoint was
@@ -391,11 +458,11 @@ def _row_cells(match: MarketMatch) -> dict[str, str]:
             quote_high=match.ask,
         ),
         "relation": _cell(match.relation_tier) or TIER_UNSPECIFIED,
-        "why": _cell(match.relevance_label, limit=WHY_CHARS) or "-",
+        "why": _why_cell(match),
     }
 
 
-def _child_cells(platform: str, child: MarketChild) -> dict[str, str]:
+def _child_cells(platform: str, child: MarketChild, forecast_time: datetime | None) -> dict[str, str]:
     """One outcome's sub-row: its own price and liquidity, its parent's venue and relation.
 
     ``relation`` and ``why`` are the RANKER's grades and the ranker never saw this outcome — it
@@ -413,6 +480,7 @@ def _child_cells(platform: str, child: MarketChild) -> dict[str, str]:
             close_time=child.close_time,
             is_resolved=child.is_resolved,
             signal=_child_liquidity_label(platform, child),
+            forecast_time=forecast_time,
             quote_low=child.quote_low,
             quote_high=child.quote_high,
         ),
@@ -883,9 +951,10 @@ def render_snapshot_with_stats(
     lines.append("| " + " | ".join(TABLE_COLUMNS) + " |")
     lines.append("|" + "---|" * len(TABLE_COLUMNS))
     for index, match in enumerate(matches):
-        lines.append(_table_row(_row_cells(match)))
+        lines.append(_table_row(_row_cells(match, snapshot.forecast_time)))
         lines.extend(
-            _table_row(_child_cells(match.platform, match.children[position])) for position in full_positions[index]
+            _table_row(_child_cells(match.platform, match.children[position], snapshot.forecast_time))
+            for position in full_positions[index]
         )
         ladder = ladder_rows.get(index)
         if ladder is not None:

@@ -66,27 +66,42 @@ _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 # in the commit log, not here). `MAX_CHILD_ROWS_PER_SNAPSHOT` bounds the sub-row half, which is
 # most of the total; the per-market cap never binds on a full 8-row slate.
 #
+# Every budget figure below is measured with the STALENESS disclosure on (see
+# `_BUDGET_FORECAST_TIME`), because `_close_cell` pays per dated row and the bound has to cover a
+# slate whose closes have all passed.
+#
 # MAXED: 8 rows with every field simultaneously at its cap, EVERY row multi-outcome, every one of
-# its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too. Measured at 10,341 chars against the shipped
+# its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too. Measured at 10,878 chars against the shipped
 # constants (`MAX_CHILD_ROWS_PER_SNAPSHOT` = 14 full sub-rows plus the 1,400-char ladder section
-# allowance — rendering.py's own comment explains why 14 beat the design's gridded 16), so the
-# slack is 259 and this budget has genuinely stopped being a formality. Naming every outcome
-# instead of cutting the tail is what spent it; the legend's added sentences are the rest.
-MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 10_600
+# allowance — rendering.py's own comment explains why 14 beat the design's gridded 16), and the
+# all-open ladder fixture at 10,914, so the slack is 136 and this budget has genuinely stopped
+# being a formality. Naming every outcome instead of cutting the tail is what spent it; the
+# legend's added sentences are the rest.
+#
+# Re-derived 10,600 -> 11,050 for the staleness disclosure, and that purchase is worth
+# stating in full because it is the tightest this section has ever been. It bought two things: +295
+# fixed legend chars for the close-is-not-settlement caveat and the new cell shape, and +242 on this
+# fixture for `(Nd ago)` on all 22 dated rows. The ceiling above it is
+# `RESEARCH_SECTION_CHAR_LIMIT / 4` = 11,249, asserted below, so the remaining structural headroom
+# is 199 characters — the next thing that widens this section cannot be paid for out of slack and
+# has to either cut prose or re-derive the quarter-limit relationship itself.
+MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 11_050
 
 # REALISTIC: 8 rows of content shaped like live payloads rather than chosen — what a real question
-# renders. Measured at 7,499 chars, ~450 BELOW the pre-completeness-change figure: a four-outcome
-# family names all four either way, and the lower full-row cap moves two of them from a full
-# sub-row into the ladder.
-MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_050
+# renders. Measured at 8,036 chars (7,794 before the staleness suffix), ~450 BELOW the
+# pre-completeness-change figure: a four-outcome family names all four either way, and the lower
+# full-row cap moves two of them from a full sub-row into the ladder. 8,050 -> 8,150 for the
+# staleness disclosure: the measured figure still fit the old budget with 14 chars to spare, which is
+# a coincidence rather than headroom.
+MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_150
 
 # Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
-# 2,329 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
+# 2,624 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
 # the only part with no data to justify it — the whole-snapshot budget has slack that would
-# otherwise absorb an added paragraph unnoticed. At 2,329 of 2,400 this is still the tightest
+# otherwise absorb an added paragraph unnoticed. At 2,624 of 2,700 this is still the tightest
 # budget in the file, which is the point: the next legend sentence has to earn a re-derivation.
 #
-# Re-derived twice, and both purchases are on the record. From 1,700 to 1,850: a `prob` cell may hold
+# Re-derived three times, and every purchase is on the record. From 1,700 to 1,850: a `prob` cell may hold
 # a scalar market's value, and a forecaster told to anchor on that column needs the legend to say so.
 # From 1,850 to 2,400: the ladder row and the `LO-HI` quote-range cell are two new cell shapes, and
 # the legend's contract is that it names every shape a cell can hold — an unexplained `+8 settled at
@@ -94,8 +109,17 @@ MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_050
 # range replaces was "the market says 50/50". Each is one sentence, cut to its contract. The third
 # purchase is the `+N off certainty by under X` group: a cumulative threshold ladder collapses BOTH of
 # its tails, so a forecaster reading that label against a rung it knows trades at 0.99 needs to be told
-# the figure is a distance from certainty rather than a price.
-MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 2_400
+# the figure is a distance from certainty rather than a price. The fourth is the `close` column, at
+# 2,400 -> 2,700 (measured 2,624): the column was never explained at all, its date is the venue's
+# TRADING close rather than its settlement date (a median +317 days apart on the Kalshi rows this bot
+# has rendered), and it can now carry a `(Nd ago)` suffix. A forecaster instructed to verify each
+# market's resolution date was checking against a date that means something else.
+MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 2_700
+
+# The instant the budget fixtures date their rows against: past every close date any of them carries,
+# so every dated row renders its `(Nd ago)` suffix and the char budgets bound the worst case rather
+# than a slate that happens to be all-future.
+_BUDGET_FORECAST_TIME = datetime(2027, 12, 31, tzinfo=UTC)
 
 _REAL_TITLE = "Will the US unemployment rate be above 4.5% in June 2026?"
 _REAL_RULES = (
@@ -123,6 +147,7 @@ def _row(
     answers: tuple[tuple[str, float], ...] = (),
     children: tuple[MarketChild, ...] = (),
     scalar: ScalarEstimate | None = None,
+    cap_note: str = "",
 ) -> MarketMatch:
     return MarketMatch(
         platform=platform,
@@ -145,6 +170,7 @@ def _row(
         top_answers=answers,
         children=children,
         scalar_estimate=scalar,
+        tier_cap_note=cap_note,
     )
 
 
@@ -481,6 +507,121 @@ class TestRankedOrder:
         assert len(_table_rows(render_snapshot(MarketSnapshot(matches=matches)))) == 8
 
 
+class TestCloseStaleness:
+    """The `close` cell's staleness disclosure, dated against the snapshot's own `forecast_time`.
+
+    Dates from the measured case, q45163: the snapshot was taken 2026-08-09 and its best-ranked
+    market's close date was 2026-02-27, roughly five months earlier, while the row rendered
+    `status=open` because Manifold's soft close dates leave `is_resolved` false. The table's only
+    cue that the row was months dead was a date in a column full of dates. (The archived row's own
+    close is 23:59 that day and prod would have recorded 162; these fixture instants give 163.)
+    """
+
+    FORECAST_TIME = datetime(2026, 8, 9, 9, 11, tzinfo=UTC)
+    STALE_CLOSE = datetime(2026, 2, 27, tzinfo=UTC)
+
+    def _close_cells(self, *, close: datetime | None, forecast_time: datetime | None) -> list[str]:
+        rows = [_row(close=close, children=(MarketChild(title="A rung", implied_prob_yes=0.3, close_time=close),))]
+        return [
+            cells["close"] for cells in _table_rows(render_snapshot(MarketSnapshot(rows, forecast_time=forecast_time)))
+        ]
+
+    def test_a_close_date_already_past_names_how_long_ago_it_was(self) -> None:
+        parent, child = self._close_cells(close=self.STALE_CLOSE, forecast_time=self.FORECAST_TIME)
+
+        assert parent == "2026-02-27 (163d ago)"
+        assert child == "2026-02-27 (163d ago)", "an outcome's own close date is as capable of being stale"
+
+    def test_the_date_itself_never_leaves_the_cell(self) -> None:
+        """The preamble tells the forecaster to verify each market's resolution DATE against the
+        question, and an age cannot answer that."""
+        assert self._close_cells(close=self.STALE_CLOSE, forecast_time=self.FORECAST_TIME)[0].startswith("2026-02-27")
+
+    def test_a_future_close_says_nothing_about_staleness(self) -> None:
+        cells = self._close_cells(close=datetime(2026, 12, 31, tzinfo=UTC), forecast_time=self.FORECAST_TIME)
+
+        assert cells == ["2026-12-31", "2026-12-31"]
+
+    def test_a_close_a_few_hours_old_is_not_called_stale(self) -> None:
+        """`timedelta.days` floors, so same-day reads 0 — a market that stopped trading this
+        morning is not what this disclosure is for."""
+        cells = self._close_cells(close=datetime(2026, 8, 9, 3, 0, tzinfo=UTC), forecast_time=self.FORECAST_TIME)
+
+        assert cells == ["2026-08-09", "2026-08-09"]
+
+    def test_a_snapshot_with_no_forecast_time_renders_the_bare_date(self) -> None:
+        """The archive-replay case: snapshots written before `forecast_time` existed carry None, and
+        a replay must reproduce what the forecaster saw rather than re-age every row against the
+        replay's own clock."""
+        cells = self._close_cells(close=self.STALE_CLOSE, forecast_time=None)
+
+        assert cells == ["2026-02-27", "2026-02-27"]
+
+    def test_a_naive_forecast_time_does_not_break_the_render(self) -> None:
+        """Venue close times are UTC-aware by construction (`http.parse_iso`); a naive value from a
+        caller would otherwise raise on the subtraction and take the whole section down."""
+        cells = self._close_cells(close=self.STALE_CLOSE, forecast_time=datetime(2026, 8, 9, 9, 11))
+
+        assert cells[0] == "2026-02-27 (163d ago)"
+
+    def test_a_row_with_no_close_date_still_renders_a_dash(self) -> None:
+        assert self._close_cells(close=None, forecast_time=self.FORECAST_TIME)[0] == "-"
+
+    def test_a_resolved_row_discloses_its_age_too(self) -> None:
+        """q45173's snapshot carried markets settled in 2022 and 2023. `status=RESOLVED` says the
+        price is a realized outcome; it does not say how old the market is."""
+        rendered = render_snapshot(
+            MarketSnapshot(
+                [_row(resolved=True, close=datetime(2023, 5, 1, tzinfo=UTC))], forecast_time=self.FORECAST_TIME
+            )
+        )
+        cells = _table_rows(rendered)[0]
+
+        assert cells["status"] == "RESOLVED"
+        assert cells["close"].endswith("d ago)")
+
+    def test_the_disclosure_claims_the_date_passed_and_not_that_trading_stopped(self) -> None:
+        """The venue that produced this case is the one whose close dates are SOFT: a Manifold
+        market can still be tradeable past its close date, so `closed Nd ago` would be an
+        overclaim. The legend carries the reading instead."""
+        cell = self._close_cells(close=self.STALE_CLOSE, forecast_time=self.FORECAST_TIME)[0]
+
+        assert "closed" not in cell
+
+
+class TestTierCapNote:
+    def test_a_capped_row_shows_the_note_ahead_of_the_rankers_own_phrase(self) -> None:
+        """Both halves are load-bearing: the note is the disagreement between our arithmetic and the
+        model's grade, and the phrase is what the model said about the row we overruled."""
+        row = _row(tier="same_quantity_other_cut", why="conditional country market", cap_note="stale: closed 163d")
+
+        cells = _table_rows(render_snapshot(MarketSnapshot([row])))[0]
+
+        assert cells["why"] == "stale: closed 163d. conditional country market"
+        assert cells["relation"] == "same_quantity_other_cut", "the tier cell stays a vocabulary word"
+
+    def test_the_note_is_not_truncated_away_by_a_maxed_out_why_phrase(self) -> None:
+        """`WHY_CHARS` caps the ranker's phrase, not the note: a demoted tier with its reason
+        truncated off reads as an ordinary grade."""
+        note = "stale: closed 163d before the question opened (ranker said same_quantity_same_date)"
+        row = _row(tier="same_quantity_other_cut", why="W" * (WHY_CHARS * 2), cap_note=note)
+
+        cells = _table_rows(render_snapshot(MarketSnapshot([row])))[0]
+
+        assert cells["why"].startswith(note)
+        assert cells["why"].count("W") == WHY_CHARS
+
+    def test_a_note_with_no_ranker_phrase_still_renders(self) -> None:
+        row = _row(tier="same_quantity_other_cut", why="", cap_note="stale: closed 163d")
+
+        assert _table_rows(render_snapshot(MarketSnapshot([row])))[0]["why"] == "stale: closed 163d"
+
+    def test_an_uncapped_row_is_unchanged(self) -> None:
+        cells = _table_rows(render_snapshot(MarketSnapshot([_row(tier="weak", why="loose correlate")])))[0]
+
+        assert cells["why"] == "loose correlate"
+
+
 class TestPreambleSelector:
     @pytest.mark.parametrize("tier", ["same_quantity_same_date", "same_quantity_other_cut"])
     def test_a_same_quantity_row_earns_the_strong_preamble(self, tier: str) -> None:
@@ -539,6 +680,23 @@ class TestLegend:
         assert CHILD_ROW_MARKER in MARKET_SIGNAL_LEGEND
         assert "one OUTCOME of the market above it" in MARKET_SIGNAL_LEGEND
         assert "the parent row has none" in MARKET_SIGNAL_LEGEND
+
+    def test_the_legend_says_a_close_date_is_not_a_settlement_date(self) -> None:
+        """Item 4 of the staleness work, and the forecaster's half of a fact only the venue module
+        documents: Kalshi's `close_time` is a max over an event's strikes and trails actual
+        settlement by a median +317 days on the markets this bot has rendered. The preamble tells
+        the forecaster to verify each market's resolution DATE, so an unqualified close date is an
+        instruction to check against the wrong number."""
+        assert "`close` is the venue's TRADING close, not its settlement date" in MARKET_SIGNAL_LEGEND
+        assert "on Kalshi the two are months apart" in MARKET_SIGNAL_LEGEND
+        assert "never read it as this market's resolution date" in MARKET_SIGNAL_LEGEND
+
+    def test_the_legend_explains_the_staleness_suffix(self) -> None:
+        """The legend's standing contract is that every shape a cell can hold is named, and this one
+        also has to carry the reading the cell deliberately does not claim — a soft-closed Manifold
+        market can still be tradeable past its close date."""
+        assert "`(Nd ago)`" in MARKET_SIGNAL_LEGEND
+        assert "treat that price as stale even where `status` still reads open" in MARKET_SIGNAL_LEGEND
 
     def test_the_legend_ships_inside_the_section(self) -> None:
         rendered = render_snapshot(MarketSnapshot(matches=[_row(tier="weak")]))
@@ -670,7 +828,9 @@ class TestRenderBudget:
 
     def test_an_open_priced_slate_fits_the_maxed_budget(self) -> None:
         """The ladder's worst committed shape, against the same ceiling as `_maxed_rows`."""
-        rendered = render_snapshot(MarketSnapshot(matches=self._maxed_open_priced_rows()))
+        rendered = render_snapshot(
+            MarketSnapshot(matches=self._maxed_open_priced_rows(), forecast_time=_BUDGET_FORECAST_TIME)
+        )
 
         assert len(rendered) < MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET, (
             f"an all-open distinctly-priced slate rendered {len(rendered)} chars, over the "
@@ -692,7 +852,7 @@ class TestRenderBudget:
         assert stats.ladder_chars <= LADDER_SECTION_MAX_CHARS
 
     def test_a_maxed_eight_row_snapshot_fits_the_char_budget(self) -> None:
-        rendered = render_snapshot(MarketSnapshot(matches=self._maxed_rows()))
+        rendered = render_snapshot(MarketSnapshot(matches=self._maxed_rows(), forecast_time=_BUDGET_FORECAST_TIME))
 
         assert len(rendered) < MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET, (
             f"maxed render grew to {len(rendered)} chars, over the "
@@ -702,7 +862,7 @@ class TestRenderBudget:
 
     def test_a_realistic_eight_row_snapshot_fits_the_operators_budget(self) -> None:
         """The operator's ~6,000 figure, against content shaped like the real thing."""
-        rendered = render_snapshot(MarketSnapshot(matches=self._realistic_rows()))
+        rendered = render_snapshot(MarketSnapshot(matches=self._realistic_rows(), forecast_time=_BUDGET_FORECAST_TIME))
 
         assert len(rendered) < MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET
 
@@ -721,12 +881,14 @@ class TestRenderBudget:
         its siblings rather than itself.
 
         The margin is no longer comfortable, and that is worth knowing rather than smoothing over:
-        the sub-row expansion took the maxed render from 56% of the quarter-limit to 90%, so this
-        assertion has stopped being a formality. The next thing that widens the section has to
-        re-derive its relationship to RESEARCH_SECTION_CHAR_LIMIT rather than assume the room is
-        there. The realistic figure (7,465 of 11,249, or 66%) is where the real headroom lives.
+        the sub-row expansion took the maxed render from 56% of the quarter-limit to 90%, and the
+        staleness disclosure took it to 97% (10,878 of 11,249), so this assertion has stopped being
+        a formality. The next thing that widens the section cannot be paid for out of slack: it has
+        to cut prose or re-derive this relationship, and 199 characters is what the BUDGET has left
+        against the quarter-limit. The realistic figure (8,036 of 11,249, or 71%) is where the real
+        headroom lives.
         """
-        rendered = render_snapshot(MarketSnapshot(matches=self._maxed_rows()))
+        rendered = render_snapshot(MarketSnapshot(matches=self._maxed_rows(), forecast_time=_BUDGET_FORECAST_TIME))
 
         assert len(rendered) < RESEARCH_SECTION_CHAR_LIMIT / 4
         assert MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET < RESEARCH_SECTION_CHAR_LIMIT / 4

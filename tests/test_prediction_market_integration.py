@@ -90,6 +90,9 @@ def _build_integration_question() -> MagicMock:
     q.fine_print = ""
     q.unit_of_measure = None
     q.page_url = "https://metaculus.com/q/99999"
+    # Same trap one stage later: `ranking.cap_stale_top_tier` subtracts this from each row's close
+    # time, and a MagicMock auto-attr raises TypeError there.
+    q.open_time = None
     return q
 
 

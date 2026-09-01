@@ -72,6 +72,8 @@ class TestMarketMatchShape:
         assert match.top_answers == ()
         assert match.children == ()
         assert match.scalar_estimate is None
+        assert match.price_withheld is False
+        assert match.tier_cap_note == ""
 
 
 class TestArchiveRoundTrip:
@@ -212,6 +214,33 @@ class TestArchiveRoundTrip:
         encoded = json.loads(json.dumps(as_dict, default=str))
         assert encoded["matches"][0]["scalar_estimate"]["value"] == 120.96691732988944
         assert encoded["matches"][0]["implied_prob_yes"] is None
+
+    def test_a_capped_tier_archives_both_the_capped_grade_and_what_the_ranker_said(self):
+        """The staleness cap's whole record. `relation_tier` has to stay one of the four vocabulary
+        words (`STRONG_TIERS` membership picks the rendered preamble and every tier-conditioned
+        residual cut tests the cell by equality), so the demotion's reason lives in its own field —
+        which also keeps `relevance_label` the model's verbatim phrase, and therefore keeps "what the
+        ranker said about a row our arithmetic overruled" recoverable from the archive."""
+        match = _positional_row()
+        match.relation_tier = "same_quantity_other_cut"
+        match.relevance_label = "conditional country market"
+        match.tier_cap_note = "stale: closed 163d before the question opened (ranker said same_quantity_same_date)"
+
+        row = json.loads(json.dumps(dataclasses.asdict(MarketSnapshot(matches=[match])), default=str))["matches"][0]
+        assert row["relation_tier"] == "same_quantity_other_cut"
+        assert row["relevance_label"] == "conditional country market"
+        assert "ranker said same_quantity_same_date" in row["tier_cap_note"]
+
+    def test_the_snapshots_forecast_time_survives_the_archive(self):
+        """It is what the render dates its staleness disclosures against, so a replay that could not
+        read it back would either lose the disclosures or re-age every row against its own clock."""
+        encoded = json.loads(
+            json.dumps(
+                dataclasses.asdict(MarketSnapshot(matches=[_positional_row()], forecast_time=_CLOSE)), default=str
+            )
+        )
+        assert encoded["forecast_time"].startswith("2026-08-31")
+        assert dataclasses.asdict(MarketSnapshot())["forecast_time"] is None
 
     def test_a_row_never_archives_both_a_probability_and_a_scalar_value(self):
         """The invariant the venue parser enforces, asserted where the archive would expose a break.

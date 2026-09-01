@@ -222,6 +222,11 @@ def mock_question():
     q.unit_of_measure = ""
     q.page_url = "https://metaculus.com/q/12345"
     q.scheduled_resolution_time = None
+    # Same auto-attribute reason, one stage later: `cap_stale_top_tier` subtracts this from a
+    # market's close time, and a `MagicMock` there raises `TypeError` inside the ranking stage,
+    # which the snapshot-level net swallows into an empty snapshot. Real questions carry
+    # `datetime | None`. Tests that want the staleness cap to fire set a real datetime.
+    q.open_time = None
     return q
 
 
@@ -280,7 +285,7 @@ def manifold_payload():
             "volume": 8200.0,
             "totalLiquidity": 1500.0,
             "uniqueBettorCount": 42,
-            "closeTime": 1782086400000,  # ms: 2026-06-20
+            "closeTime": 1782086400000,  # ms: 2026-06-22T00:00:00Z
             "textDescription": "YES if SpaceX Starship reaches orbit before July 1 2026.",
             "isResolved": False,
         }
