@@ -62,7 +62,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 import aiohttp
@@ -306,7 +307,29 @@ async def _rank_pool(question: Any, pool: generation.PoolResult) -> tuple[list[M
             f"detail=falling back to retrieval order; {exc}"
         )
         return ranking.fail_open_slate(pool.candidates), f"error({type(exc).__name__})", "failopen", len(prompt)
-    return ranking.apply_picks(pool.candidates, picks), f"ok({len(picks)})", "ranked", len(prompt)
+    ranked_rows = ranking.cap_stale_top_tier(
+        ranking.apply_picks(pool.candidates, picks),
+        question_open_time=getattr(question, "open_time", None),
+    )
+    _log_tier_caps(getattr(question, "id_of_question", None), ranked_rows)
+    return ranked_rows, f"ok({len(picks)})", "ranked", len(prompt)
+
+
+def _log_tier_caps(qid: int | None, ranked_rows: Sequence[MarketMatch]) -> None:
+    """One INFO line per question whose top-tier grade the staleness cap refused, and none otherwise.
+
+    Silent on the overwhelmingly common no-cap case, so a line in the run log means the ranker
+    graded a long-closed market as same-date. The note itself also rides the rendered table and the
+    archived snapshot (`MarketMatch.tier_cap_note`), which is what makes the incidence answerable
+    offline after the 90-day GHA log expiry; this line is the prod-log half.
+    """
+    capped = [row for row in ranked_rows if row.tier_cap_note]
+    if not capped:
+        return
+    logger.info(
+        f"MARKET_TIER_CAPPED: question={qid} rows={len(capped)} "
+        f"capped={','.join(f'{row.platform}@{row.rank}' for row in capped)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +489,17 @@ async def _fetch_market_snapshot_impl(
     venue_search_results = await _run_venue_search_stage(ctx, all_queries)
     pool, pool_by_venue = await _assemble_pool_stage(ctx, all_queries, prefetch, venue_search_results)
     ranked_rows = await _rank_stage(ctx, pool, pool_by_venue)
-    return MarketSnapshot(matches=ranked_rows, sources=ctx.ledger.tokens, pool_size=len(pool.candidates))
+    return MarketSnapshot(
+        matches=ranked_rows,
+        sources=ctx.ledger.tokens,
+        pool_size=len(pool.candidates),
+        # The instant the render dates its staleness disclosures against. `as_of` when a caller
+        # supplied one (a backtest's simulated present, where pool assembly has already dropped
+        # everything closing at or before it), otherwise now. Stamped on the snapshot rather than
+        # read from the clock in the renderer so a replay of the archived payload reproduces what
+        # the forecaster saw instead of re-aging every row against the replay's own clock.
+        forecast_time=as_of or datetime.now(UTC),
+    )
 
 
 def _log_ranking_telemetry(

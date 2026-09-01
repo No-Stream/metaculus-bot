@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import patch
@@ -53,6 +54,33 @@ kalshi_events_payload = _fakes.kalshi_events_payload
 predictit_payload = _fakes.predictit_payload
 
 RETRIEVAL_WIDTH_KALSHI = generation.RETRIEVAL_WIDTH["kalshi"]
+
+
+def _rank_first_as(*, tier: str, why: str) -> Callable[[str], str]:
+    """`rank_one_per_venue` with the tier and phrase chosen by the caller.
+
+    Indices are read back out of the prompt for the reason the shared helper documents: a
+    hard-coded array would silently render fewer rows than the test means, and a test that then
+    asserts on rows passes for the wrong reason.
+    """
+
+    def _rank(prompt: str) -> str:
+        picks = json.loads(_rank_one_per_venue(prompt))
+        return json.dumps([{**pick, "tier": tier, "why": why} for pick in picks])
+
+    return _rank
+
+
+def _table_row_by_platform(rendered: str, platform: str) -> dict[str, str]:
+    """One rendered parent row as a header-keyed dict.
+
+    By header NAME rather than by position, matching the rendering suite: a column addition would
+    otherwise shift every assertion onto its neighbour.
+    """
+    lines = [line for line in rendered.split("\n") if line.startswith("| ")]
+    header = [cell.strip() for cell in lines[0].strip("| ").split(" | ")]
+    rows = [dict(zip(header, [cell.strip() for cell in line.strip("| ").split(" | ")], strict=False)) for line in lines]
+    return next(row for row in rows if row["platform"] == platform)
 
 
 class TestFetchMarketSnapshot:
@@ -124,6 +152,69 @@ class TestFetchMarketSnapshot:
         assert [(child.title, child.implied_prob_yes) for child in predictit_rows[0].children] == [("Yes", 0.58)]
         assert "| ↳ | Yes | 0.58 |" in rendered
         assert _RANKER_CUE not in rendered
+
+    @pytest.mark.asyncio
+    async def test_a_market_closed_long_before_the_question_opened_is_capped_and_disclosed(
+        self, mock_question, manifold_payload, caplog: pytest.LogCaptureFixture
+    ):
+        """The staleness pair end to end: the deterministic tier cap and the row-level disclosure.
+
+        The Manifold fixture is the measured shape — it closes 2026-06-22 and carries
+        `isResolved: false`, exactly like q45163's rank-0 row, which closed five months before the
+        forecast and still rendered `status=open` because Manifold's close dates are soft. Worth a
+        pipeline test rather than only unit coverage because the two halves are computed in different
+        stages off different clocks: the cap reads the QUESTION's open time in the ranking stage, and
+        the disclosure reads the SNAPSHOT's own `forecast_time` in the renderer. A wiring that read
+        one of them off the wrong object would leave both unit suites green.
+
+        The `(Nd ago)` figure is matched as a pattern, not a number: `forecast_time` is the fetch
+        instant on the provider path, so the age grows by one every day this fixture ages.
+        """
+        mock_question.open_time = datetime(2026, 12, 1, tzinfo=UTC)
+        handlers = _handlers(**{_MANIFOLD_SEARCH_URL: FakeResponse(200, manifold_payload)})
+
+        with caplog.at_level(logging.INFO):
+            snapshot = await _fetch(
+                mock_question, handlers, ranking=_rank_first_as(tier="same_quantity_same_date", why="same window")
+            )
+
+        row = next(match for match in snapshot.matches if match.platform == "manifold")
+        assert row.relation_tier == "same_quantity_other_cut", "the top tier is refused, one rung only"
+        assert row.tier_cap_note == (
+            "stale: closed 162d before the question opened (ranker said same_quantity_same_date)"
+        )
+        assert row.relevance_label == "same window", "the ranker's own phrase is left verbatim"
+
+        cells = _table_row_by_platform(format_snapshot_for_research(snapshot), "manifold")
+        assert cells["relation"] == "same_quantity_other_cut"
+        assert cells["why"].startswith("stale: closed 162d before the question opened")
+        assert re.fullmatch(r"2026-06-22 \(\d+d ago\)", cells["close"]), cells["close"]
+        assert cells["status"] == "open", "the soft-close row still reads open — the cue is the close cell"
+
+        capped = [message for message in caplog.messages if message.startswith("MARKET_TIER_CAPPED:")]
+        assert len(capped) == 1
+        assert "rows=1" in capped[0]
+        assert f"question={mock_question.id_of_question}" in capped[0]
+
+    @pytest.mark.asyncio
+    async def test_a_market_closing_after_the_question_opened_keeps_its_grade_and_logs_nothing(
+        self, mock_question, manifold_payload, caplog: pytest.LogCaptureFixture
+    ):
+        """The other side of the cap, and the reason its log line is conditional: the overwhelmingly
+        common case must leave the ranker's grade alone and say nothing at all, so a
+        `MARKET_TIER_CAPPED` line in a run log means something happened."""
+        mock_question.open_time = datetime(2026, 5, 1, tzinfo=UTC)
+        handlers = _handlers(**{_MANIFOLD_SEARCH_URL: FakeResponse(200, manifold_payload)})
+
+        with caplog.at_level(logging.INFO):
+            snapshot = await _fetch(
+                mock_question, handlers, ranking=_rank_first_as(tier="same_quantity_same_date", why="same window")
+            )
+
+        row = next(match for match in snapshot.matches if match.platform == "manifold")
+        assert row.relation_tier == "same_quantity_same_date"
+        assert row.tier_cap_note == ""
+        assert not [message for message in caplog.messages if message.startswith("MARKET_TIER_CAPPED:")]
 
     @pytest.mark.asyncio
     async def test_an_empty_ranking_is_a_valid_answer_and_not_a_degradation(self, mock_question, kalshi_events_payload):

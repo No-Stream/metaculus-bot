@@ -326,7 +326,19 @@ Four stages per question:
    candidate pool, returning up to 8 rows in ranked order with a relation tier and a
    one-phrase reason. Width is the model's choice in 0..8 — an empty array is a
    VALID answer, not a failure — and nothing downstream re-orders, re-scores or
-   caps per venue. Everything else falls open to the pool-order top rows, marked as
+   caps per venue. Exactly one deterministic pass runs after it, and it changes no row's
+   POSITION: `cap_stale_top_tier` refuses `same_quantity_same_date` on a row whose close
+   date precedes the question's own `open_time` by more than
+   `MARKET_STALENESS_TIER_CAP_DAYS`, capping the grade one rung to
+   `same_quantity_other_cut` and writing a `tier_cap_note` that names the gap and the
+   tier the ranker asked for. It is disclosure rather than a drop (the row keeps its
+   rank, its price and its rules bullet), because a wrongly excluded market is evidence
+   the forecaster never sees. It fires on nothing in the archived corpus, so read it as a
+   guard on a claim a long-closed market cannot make rather than as a measured fix: only 9
+   archived rows are graded `same_quantity_same_date` at all, and q45163's own offender was
+   graded one tier below that. Ordering WITHIN a tier is the ranker prompt's job for the
+   same reason (its `closes` recency signal), since the render is its order verbatim.
+   Everything else falls open to the pool-order top rows, marked as
    such: unreadable output, and equally a transient LLM error on the call itself
    (the retry wrapper catches the `openai.APIError` family, which is what every
    litellm transport exception subclasses, and returns an empty completion the
@@ -340,6 +352,19 @@ the legend says which, since the two are not comparable), a liquidity/participat
 bettor count for Manifold, `no-liquidity-data` for PredictIt), close date,
 `open`/`RESOLVED` status, and the ranker's `relation` + `why`, followed by each
 market's resolution rules.
+
+A close date already in the past when the forecast was made carries a `(Nd ago)` suffix,
+dated against the snapshot's own `forecast_time` so a later replay of the archived payload
+reproduces what the forecaster saw rather than re-aging every row against the replay's clock.
+The suffix claims only that the DATE has passed, not that trading stopped, because Manifold's
+close dates are soft and its rows can read `status=open` past them. That is exactly how a
+five-month-dead market reached rank 0 on q45163 with nothing in the table saying so, and the
+disclosure fires on 62 of the 711 archived rendered rows (7 of them still labelled
+`status=open`) at a measured cost of 1,017 characters across 102 archived snapshots. The
+legend carries the reading, plus one caveat: the column is the venue's TRADING close rather
+than its settlement date, and on the Kalshi rows this bot has rendered the two sit a median
++317 days apart, so a forecaster told to verify each market's resolution date was checking
+against a different number.
 
 Two row shapes have **no single probability** and render `-` rather than a number:
 a Kalshi event that is a threshold FAMILY (86.5% of that catalogue), where one

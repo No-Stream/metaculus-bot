@@ -275,6 +275,14 @@ class MarketMatch:
     # cannot distinguish a refusal from a venue that quotes nothing, and the `MARKET_CHILD_RENDER`
     # marker has to count refusals to say how often the Kalshi spread threshold fires in prod.
     price_withheld: bool = False
+    # Why this row's `relation_tier` is one rung BELOW what the ranker asked for, written by
+    # `ranking.cap_stale_top_tier` and empty on every row it did not touch. Separate from
+    # `relevance_label` on purpose: that field is the ranker's own phrase, verbatim, and
+    # overwriting it would make "what the model actually said" unrecoverable from the archive.
+    # Separate from `relation_tier` for the mirror reason — the tier cell has to stay one of the
+    # four vocabulary words, since `STRONG_TIERS` membership (which picks the preamble) and every
+    # tier-conditioned residual cut test it by equality.
+    tier_cap_note: str = ""
 
 
 @dataclass
@@ -301,6 +309,21 @@ class MarketSnapshot:
     # only when a non-empty pool was reviewed, and this is the N that notice quotes. 0 on
     # every whole-provider failure path (timeout, outer-except), matching their empty sources.
     pool_size: int = 0
+    # The instant the forecast is being made — `as_of` where a caller supplied one (a backtest's
+    # simulated present), otherwise the instant the snapshot was fetched. ADDITIVE, same
+    # `asdict`-archived reason as `pool_size`.
+    #
+    # It lives on the SNAPSHOT rather than being read from the clock inside the renderer because
+    # the render has to be reproducible from an archived snapshot alone (the same contract that
+    # keeps the degraded-ranking marker derived from `sources`): a replay months later would
+    # otherwise stamp every row `(N days ago)` against ITS clock and report staleness the
+    # forecaster was never shown. `as_of` first for the mirror case — with a cutoff supplied, pool
+    # assembly has already dropped everything closing at or before it, so no row can be stale
+    # relative to that instant and no disclosure fires, which is correct.
+    #
+    # None means "unknown", and the renderer then prints the bare close date with no staleness
+    # claim: archived snapshots written before this field existed replay exactly as they rendered.
+    forecast_time: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
