@@ -102,6 +102,63 @@ def check_tournament_dates(logger: logging.Logger | None = None) -> None:
         )
 
 
+# --- Fall Metaculus Cup reminder (deliberate, dated time bomb) ---
+# The summer season closes on TOURNAMENT_END_DATE (2026-09-06) and the fall cup is the
+# one identified next-season lever. The platform object already exists — slug
+# `metaculus-cup-fall-2026`, project id 33108, start_date 2026-08-28T12:00:00Z,
+# forecasting_end_date 2027-01-01T00:00:00Z (API probe 2026-09-01) — but it held 0 posts,
+# the 'Forecast on Metaculus Cup' workflow is disabled_manually, and the bare
+# `metaculus-cup` slug now 404s, so METACULUS_CUP_ID above no longer auto-resolves and
+# must be pointed at the dated slug (or id 33108) when configuring. The operator expects
+# questions ~2026-09-20 and asked for runs to START ERRORING from FALL_CUP_REMINDER_DATE
+# as the reminder to configure/enable the cup. Flipping FALL_CUP_CONFIGURED to True is
+# the acknowledgment that retires the whole check (and its companion CI time-bomb test
+# in tests/test_tournament_dates.py).
+#
+# Live window on tournament crons is narrow by design: check_tournament_dates raises
+# TournamentExpiredError from 2026-09-20 (end date + hard stop) anyway, so there this
+# reminder only adds 09-15..09-20 — but it also reddens the cup/minibench crons and any
+# manual or test run after, and the CI test keeps failing regardless of run mode.
+FALL_CUP_SLUG: str = "metaculus-cup-fall-2026"
+FALL_CUP_REMINDER_DATE: str = "2026-09-15"
+FALL_CUP_CONFIGURED: bool = False  # flip to True once the fall cup constants + workflow are set up
+
+
+def fall_cup_reminder_due(today: date | None = None) -> bool:
+    """Whether the fall-cup configuration reminder should redden runs.
+
+    False before ``FALL_CUP_REMINDER_DATE`` and always False once the operator flips
+    ``FALL_CUP_CONFIGURED``. ``today`` defaults to the system clock read at CALL time,
+    same contract as ``credit_alerts_active`` below: tests inject a fixed date, and a
+    long-lived process crosses the date without a redeploy.
+    """
+    if FALL_CUP_CONFIGURED:
+        return False
+    # Local calendar day is deliberate on an operator-facing dated lever, and prod
+    # (UTC runners) sees no difference — same rationale as credit_alerts_active.
+    return (today or date.today()) >= date.fromisoformat(FALL_CUP_REMINDER_DATE)  # noqa: DTZ011  # see comment above
+
+
+def check_fall_cup_reminder(logger: logging.Logger | None = None, today: date | None = None) -> bool:
+    """Log the loud FALL_CUP_REMINDER line when due; return whether it fired.
+
+    The caller (cli.main) holds the returned bool and exits non-zero at end of run,
+    the same shape as the credit-floor path: forecasting and publishing complete
+    normally, and the red exit is purely the reminder signal.
+    """
+    if not fall_cup_reminder_due(today):
+        return False
+    log = logger or logging.getLogger(__name__)
+    log.error(
+        f"FALL_CUP_REMINDER: {FALL_CUP_SLUG} expected to open ~2026-09-20 — enable the "
+        f"'Forecast on Metaculus Cup' workflow and set the season constants "
+        f"(METACULUS_CUP_ID no longer auto-resolves: the bare 'metaculus-cup' slug 404s, "
+        f"point it at {FALL_CUP_SLUG}). Flip FALL_CUP_CONFIGURED=True in constants.py to "
+        f"retire this reminder. This run will exit non-zero as the reminder signal."
+    )
+    return True
+
+
 # Load .env early so ASKNEWS_* values are read correctly at import time in local runs
 load_environment()
 

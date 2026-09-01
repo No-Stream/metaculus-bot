@@ -599,8 +599,13 @@ class TestExcludeQids:
         the published CDF carried 20.00% on that bin — pinned at exactly 0.200000, the
         201-grid ceiling misapplied to an 11-point grid. Receipts in
         `scratch/residual_2026-08-24/dossiers/43913_dossier.md`.
+
+        43147 and 41798 joined 2026-09-01: the same defect on pre_flip discrete
+        records (34- and 12-point grids, true caps 1.0), flagged by the shipped
+        `max_step_clamp_screen`. Receipts in
+        `scratch/residual_2026-08-31/dim_numeric-width.md`.
         """
-        assert frozenset({"43746", "43747", "43913"}) == KNOWN_BUG_QIDS
+        assert frozenset({"43746", "43747", "43913", "43147", "41798"}) == KNOWN_BUG_QIDS
 
     def test_43913_drops_from_the_rows_it_was_added_for(self):
         # The reclassification is only worth anything if the id actually matches: the

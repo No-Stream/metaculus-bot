@@ -15,6 +15,7 @@ from metaculus_bot.constants import (
     PERSIST_RESEARCH_ENABLED_ENV,
     TEST_QUESTIONS_OVERRIDE_ENV,
     TOURNAMENT_ID,
+    check_fall_cup_reminder,
     check_tournament_dates,
     credit_alerts_active,
     env_flag_enabled,
@@ -163,6 +164,15 @@ def main() -> None:
     _configure_process()
     run_mode = _parse_run_mode()
 
+    # Fall-cup configuration reminder (constants.py): logs its ERROR here, at startup,
+    # so the operator sees it before the run's noise; the non-zero exit it demands
+    # happens in _report_degradation_and_exit AFTER forecasting/publishing complete,
+    # same shape as the credit-floor path. Checked in every run mode on purpose — the
+    # tournament crons stop reaching this from 2026-09-20 (check_tournament_dates
+    # raises), but the cup/minibench crons and manual runs keep reddening until the
+    # operator flips FALL_CUP_CONFIGURED.
+    fall_cup_reminder = check_fall_cup_reminder(logger)
+
     # Wire research persistence if enabled (production GHA runs set this env var)
     research_writer = None
     research_sink = None
@@ -240,6 +250,7 @@ def main() -> None:
         template_bot,
         report_summary_error=report_summary_error,
         donated_below_floor=donated_below_floor,
+        fall_cup_reminder=fall_cup_reminder,
     )
 
 
@@ -248,6 +259,7 @@ def _report_degradation_and_exit(
     *,
     report_summary_error: Exception | None,
     donated_below_floor: bool,
+    fall_cup_reminder: bool,
 ) -> None:
     """Emit the one-line degradation breakdown and decide the process exit status.
 
@@ -336,6 +348,7 @@ def _report_degradation_and_exit(
         and alertable <= 0
         and generic_fallback <= 0
         and not (donated_below_floor and alerts_active)
+        and not fall_cup_reminder
         and not has_deprecation_alerts()
     )
     completion_phrase = "Run completed clean with" if run_clean else "Run completed with"
@@ -382,6 +395,13 @@ def _report_degradation_and_exit(
             "(operator is self-funding the rest of the season), so this run exits zero.",
             CREDIT_ALERT_RESUME_DATE.isoformat(),
         )
+
+    # Fall-cup configuration reminder: the FALL_CUP_REMINDER error was already logged at
+    # startup (check_fall_cup_reminder, constants.py). Same shape as the credit-floor
+    # path above — the run completed and published normally, and this non-zero exit is
+    # purely the reminder-to-configure signal, retired by flipping FALL_CUP_CONFIGURED.
+    if fall_cup_reminder:
+        sys.exit(1)
 
     # Post-submission deprecation tripwire. Runs LAST so submission has fully
     # completed (and so other alertable conditions exit first with their own

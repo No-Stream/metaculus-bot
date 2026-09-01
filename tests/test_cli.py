@@ -125,6 +125,7 @@ def _cli_main_test_mode(
     alertable_count: int,
     *,
     donated_below_floor: bool = False,
+    fall_cup_reminder: bool = False,
     today: date | None = None,
     stub_bot: MagicMock | None = None,
 ) -> Iterator[MagicMock]:
@@ -184,6 +185,11 @@ def _cli_main_test_mode(
             patch("metaculus_bot.cli.apply_publish_hardening"),
             patch("metaculus_bot.cli.apply_fetch_hardening"),
             patch("metaculus_bot.cli.check_tournament_dates"),
+            # Pin the fall-cup reminder the same way as credit_alerts_active: it reads
+            # the real clock in prod, and left unpinned it would flip this whole suite
+            # red from FALL_CUP_REMINDER_DATE. The one test allowed to read the real
+            # clock is the deliberate time bomb in test_tournament_dates.py.
+            patch("metaculus_bot.cli.check_fall_cup_reminder", return_value=fall_cup_reminder),
             # The API identity preflight makes a real unauthenticated GET to
             # metaculus.com; stub it so these exit-status/telemetry tests stay
             # hermetic (its own behavior is covered in test_api_preflight.py).
@@ -342,6 +348,35 @@ class TestCliCreditFloor:
                 cli_main()
             telemetry.log_start.assert_called_once()
             telemetry.log_end_and_check_floor.assert_called_once()
+
+
+class TestCliFallCupReminderExit:
+    """The fall-cup reminder reddens the run the same way the credit floor does.
+
+    The check itself (date gate, FALL_CUP_CONFIGURED flip, log content) is covered in
+    test_tournament_dates.py; here the harness pins its verdict and these tests pin
+    the exit wiring: run completes and publishes first, exits non-zero after, and the
+    run is never stamped clean.
+    """
+
+    def test_reminder_fires_run_completes_then_sys_exit_1(self, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+            _cli_main_test_mode(alertable_count=0, fall_cup_reminder=True) as telemetry,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
+            # Forecasting/telemetry completed before the exit — reminder, not abort.
+            telemetry.log_start.assert_called_once()
+            telemetry.log_end_and_check_floor.assert_called_once()
+        # run_clean must be the exact complement of every non-zero exit path, so a
+        # reminder run must not stamp the archive's summary with the clean token.
+        assert "Run completed clean" not in caplog.text
+
+    def test_no_reminder_returns_normally(self) -> None:
+        with _cli_main_test_mode(alertable_count=0, fall_cup_reminder=False):
+            cli_main()
 
 
 class TestCliResearchFlush:

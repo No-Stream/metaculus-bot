@@ -31,7 +31,16 @@ logger: logging.Logger = logging.getLogger(__name__)
 #   Receipts: scratch/residual_2026-08-24/dossiers/43913_dossier.md and
 #   dim_discrete-maxstep-counterfactual.md. The fix reached prod inside `b4e9df0`
 #   (2026-07-21T17:07:37Z), so no post-triple-era question can carry this shape.
-KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747", "43913"})
+# - 43147 and 41798, added 2026-09-01: the same pre-`9f1175c` defect as 43913, on
+#   pre_flip discrete records. Both published exactly 0.200000 of mass on the
+#   resolving bin — the 201-grid ceiling misapplied to 34- and 12-point grids whose
+#   real server caps are 1.0 — while even the LEAST concentrated attributed member
+#   wanted 0.525 / 0.635 there, so the cap, not the ensemble, set the published
+#   mass (peers -34.75 / -35.50). Identified by the era-correct
+#   `analysis.max_step_clamp_screen`, which narrowed the raw 0.200-pinned sweep
+#   (11 of 67 discretes) to these two plus the already-member 43913. Receipts:
+#   scratch/residual_2026-08-31/dim_numeric-width.md, "Discrete max-step artifact".
+KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747", "43913", "43147", "41798"})
 
 # The CANONICAL degraded-ensemble cohort: the dry-donated-key incident window
 # (2026-07-26 .. 07-28), when OpenRouter reported the drained donated key's breached spend

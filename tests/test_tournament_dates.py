@@ -4,17 +4,23 @@ Includes a test that will FAIL if run after the tournament end date + grace peri
 forcing developers to update TOURNAMENT_ID and related constants for the new season.
 """
 
-from datetime import datetime, timedelta
+import logging
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 
+from metaculus_bot import constants
 from metaculus_bot.constants import (
+    FALL_CUP_REMINDER_DATE,
+    FALL_CUP_SLUG,
     TOURNAMENT_END_DATE,
     TOURNAMENT_HARD_STOP_WEEKS,
     TOURNAMENT_ID,
     TournamentExpiredError,
+    check_fall_cup_reminder,
     check_tournament_dates,
+    fall_cup_reminder_due,
 )
 
 
@@ -129,4 +135,84 @@ class TestTournamentConfigFreshness:
         assert is_slug or is_numeric, (
             f"TOURNAMENT_ID '{TOURNAMENT_ID}' doesn't look like a valid tournament ID. "
             f"Expected slug (e.g., 'spring-aib-2026') or numeric ID."
+        )
+
+
+class TestFallCupReminderGate:
+    """The date gate and the FALL_CUP_CONFIGURED flag-off path, on injected dates.
+
+    These stay green forever (no wall clock); the real-clock time bomb lives in
+    TestFallCupReminderTimeBomb below.
+    """
+
+    REMINDER_DATE = date.fromisoformat(FALL_CUP_REMINDER_DATE)
+
+    def test_not_due_before_the_reminder_date(self) -> None:
+        assert not fall_cup_reminder_due(today=self.REMINDER_DATE - timedelta(days=1))
+
+    def test_due_on_and_after_the_reminder_date(self) -> None:
+        assert fall_cup_reminder_due(today=self.REMINDER_DATE)
+        assert fall_cup_reminder_due(today=self.REMINDER_DATE + timedelta(days=90))
+
+    def test_configured_flip_silences_it_even_after_the_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Flipping FALL_CUP_CONFIGURED is the operator's acknowledgment: it retires the
+        reminder on any date, which is what makes the whole check easy to decommission."""
+        monkeypatch.setattr(constants, "FALL_CUP_CONFIGURED", True)
+        assert not fall_cup_reminder_due(today=self.REMINDER_DATE)
+        assert not fall_cup_reminder_due(today=self.REMINDER_DATE + timedelta(days=365))
+
+    def test_check_logs_the_loud_error_and_reports_fired(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.ERROR):
+            assert check_fall_cup_reminder(today=self.REMINDER_DATE) is True
+        assert "FALL_CUP_REMINDER" in caplog.text
+        assert FALL_CUP_SLUG in caplog.text
+        assert "FALL_CUP_CONFIGURED" in caplog.text  # the message must name its own off-switch
+
+    def test_check_is_silent_before_the_date(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.ERROR):
+            assert check_fall_cup_reminder(today=self.REMINDER_DATE - timedelta(days=1)) is False
+        assert "FALL_CUP_REMINDER" not in caplog.text
+
+    def test_check_is_silent_once_configured(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(constants, "FALL_CUP_CONFIGURED", True)
+        with caplog.at_level(logging.ERROR):
+            assert check_fall_cup_reminder(today=self.REMINDER_DATE) is False
+        assert "FALL_CUP_REMINDER" not in caplog.text
+
+    def test_reminder_date_is_valid_iso_format(self) -> None:
+        assert date.fromisoformat(FALL_CUP_REMINDER_DATE).year == 2026
+
+
+class TestFallCupReminderTimeBomb:
+    """DELIBERATE TIME BOMB — this test is SUPPOSED to start failing on 2026-09-15.
+
+    Operator-requested reminder (2026-08-31): the fall Metaculus Cup
+    (`metaculus-cup-fall-2026`, project id 33108) is expected to open ~2026-09-20, the
+    'Forecast on Metaculus Cup' workflow is disabled_manually, and the bare
+    `metaculus-cup` slug that METACULUS_CUP_ID relies on now 404s. This test reads the
+    REAL clock on purpose, exactly like test_tournament_not_expired above — do NOT
+    "fix" it as flaky by mocking the date. Silence it by doing the configuration it
+    is reminding you about, then flipping FALL_CUP_CONFIGURED = True in
+    metaculus_bot/constants.py.
+    """
+
+    def test_fall_cup_is_configured_before_the_fall_season(self) -> None:
+        assert not fall_cup_reminder_due(), (
+            f"\n\n"
+            f"{'=' * 70}\n"
+            f"FALL METACULUS CUP IS NOT CONFIGURED - ACTION REQUIRED\n"
+            f"{'=' * 70}\n"
+            f"It is on/after {FALL_CUP_REMINDER_DATE} and FALL_CUP_CONFIGURED is False.\n"
+            f"The fall cup ('{FALL_CUP_SLUG}', project id 33108) is expected to open\n"
+            f"~2026-09-20. To silence this DELIBERATE reminder (it is not flaky):\n"
+            f"  1. Point METACULUS_CUP_ID in metaculus_bot/constants.py at\n"
+            f"     '{FALL_CUP_SLUG}' (the bare 'metaculus-cup' slug 404s now).\n"
+            f"  2. Re-enable the 'Forecast on Metaculus Cup' workflow\n"
+            f"     (.github/workflows/run_bot_on_metaculus_cup.yaml, disabled_manually).\n"
+            f"  3. Update the season constants (TOURNAMENT_ID / TOURNAMENT_END_DATE)\n"
+            f"     if the fall AIB season is also known by then.\n"
+            f"  4. Flip FALL_CUP_CONFIGURED = True in metaculus_bot/constants.py.\n"
+            f"{'=' * 70}\n"
         )
