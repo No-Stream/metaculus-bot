@@ -433,6 +433,11 @@ so. A page can also draw both verdicts at once and should: Tier-1
 dataset is the correct reading of a tracker whose prose we cannot use and whose series
 we can.
 
+Every fetched URL emits one harvested `RESOLUTION_SOURCE_FETCH` line (status, HTTP
+code, and any routeless embed providers), so per-domain fetch health is a query
+against the telemetry archive instead of a re-scrape of run logs that expire from GHA
+at 90 days. See "Reading run logs" in `docs/operations.md` for the field meanings.
+
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window).
 

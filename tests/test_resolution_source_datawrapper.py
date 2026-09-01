@@ -919,6 +919,28 @@ class TestEmbedShellPageStillHops:
         assert [r.status for r in results] == ["js_wall", "success"]
         assert results[0].unreadable_embeds == []
 
+    async def test_the_hop_emits_its_own_fetch_marker(self, monkeypatch, caplog):
+        """Item 19d: dataset hops ride the same per-URL marker, told apart by their url —
+        `static.dwcdn.net/data/<chart_id>.csv` is reachable no other way, so a query can
+        partition hop artifacts from cited pages on it."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(5), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} status=ok http=200 embeds=none",
+        ]
+
 
 class TestProviderEndToEnd:
     async def test_dataset_section_rendered_through_provider(self, monkeypatch):

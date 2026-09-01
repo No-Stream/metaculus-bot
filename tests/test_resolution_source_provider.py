@@ -1110,6 +1110,88 @@ class TestEmbedShapedPages:
         )
 
 
+class TestResolutionSourceFetchMarker:
+    """Item 19d: per-URL outcomes as ONE harvested marker line (`resolution_source_fetch`).
+
+    The outcomes used to live only in free-text logs and the comment's diagnostics block,
+    so "cdc.gov is 0 successes in 1,069 fetch records" meant re-scraping GHA logs that
+    expire at 90 days.
+    """
+
+    async def test_one_line_per_fetched_url_with_status_and_http_code(self, article_html, monkeypatch, caplog):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                "https://www.bls.gov/cpi/": FakeResponse(200, body=article_html, content_type="text/html"),
+                "https://cbp.gov/data": FakeResponse(403, body=b"", content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ and https://cbp.gov/data")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        lines = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")]
+        assert lines == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.bls.gov/cpi/ status=ok http=200 embeds=none",
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data status=blocked http=403 embeds=none",
+        ]
+
+    async def test_the_marker_names_the_unreadable_embed_providers(
+        self, tracker_with_infogram_html, monkeypatch, caplog
+    ):
+        # The whole point on the 44554 shape: the fetch is a legitimate `success`, so the
+        # only thing that makes the missing numbers queryable is this field.
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {"https://www.racetothewh.com/senate/26": FakeResponse(200, body=tracker_with_infogram_html)}
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="See https://www.racetothewh.com/senate/26")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.racetothewh.com/senate/26 "
+            "status=ok http=200 embeds=infogram"
+        ]
+
+    async def test_a_fetch_that_never_got_a_response_reports_http_n_a(self, monkeypatch, caplog):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession({"https://slow.example.com/x": TimeoutError()})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="See https://slow.example.com/x")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://slow.example.com/x status=error http=n/a embeds=none"
+        ]
+
+    async def test_no_fetch_is_logged_twice(self, article_html, monkeypatch, caplog):
+        """One outcome line per fetch, in one format. The free-text
+        `resolution_source fetched <netloc> (<status>)` lines the marker supersedes were
+        deleted rather than left beside it; what remains are REASON lines (a decode score,
+        an unread content-type, an SSRF rejection) that carry what the marker cannot."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                "https://www.bls.gov/cpi/": FakeResponse(200, body=article_html, content_type="text/html"),
+                "https://cbp.gov/data": FakeResponse(403, body=b"", content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ and https://cbp.gov/data")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert not [m for m in caplog.messages if "resolution_source fetched" in m]
+
+
 class TestFetchResolutionSources:
     async def test_per_host_serialization(self, article_html, monkeypatch):
         """Two URLs on the same host must never fetch concurrently, while

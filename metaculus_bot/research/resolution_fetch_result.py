@@ -157,6 +157,17 @@ def vacuous_body_status(text: str, undecodable_ratio: float, *, require_csv_rows
     return None
 
 
+def fetch_outcome_token(result: FetchResult) -> str:
+    """The telemetry token for one fetch: ``"ok"`` for a success, else the verbatim status.
+
+    Shared by the provider-diagnostics source map below and the per-URL
+    ``RESOLUTION_SOURCE_FETCH`` run-log marker, so the two can never disagree about
+    what a fetch outcome is called. ``"ok"`` (not ``"success"``) because the
+    diagnostics formatter recognizes that prefix as "this source contributed".
+    """
+    return "ok" if result.status == "success" else result.status
+
+
 def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     """Per-URL outcome map for provider diagnostics: ``{domain: "ok" | <FetchStatus>}``.
 
@@ -194,12 +205,10 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
             while f"{key}#{n}" in sources:
                 n += 1
             key = f"{key}#{n}"
-        if r.status == "success":
-            sources[key] = "ok"
-        elif r.chart_id is not None and r.status == "stale_data":
+        if r.chart_id is not None and r.status == "stale_data":
             sources[key] = "none"
         else:
-            sources[key] = r.status
+            sources[key] = fetch_outcome_token(r)
     return sources
 
 
