@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.genai import types as genai_types
 
+from metaculus_bot.research.gemini_search import _strip_model_citation_indices
 from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
 
 
@@ -616,6 +617,215 @@ async def test_malformed_supports_fall_back_to_unspliced_text(
     assert out.startswith("body text")
     assert "[1] Example One — example.com" in out
     assert "could not splice inline citations" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Model-authored hierarchical citation indices (_strip_model_citation_indices)
+# ---------------------------------------------------------------------------
+
+
+class TestStripModelCitationIndices:
+    """Gemini writes its OWN hierarchical ``[2.4.1]`` indices alongside the ``[N]`` markers
+    our formatter splices from real grounding metadata: 173 of 323 archived sections carry
+    them and they resolve to nothing we hold, so a forecaster cannot tell which
+    brackets are checkable (scratch/residual_2026-08-31/gemini_search_audit/cutB_pattern.md
+    §3.1). Every example below is a shape the archived corpus actually contains, except the
+    preserved-numeric cases, which pin the false-positive boundary.
+    """
+
+    def test_removes_a_lone_index_and_the_space_it_leaves(self) -> None:
+        assert _strip_model_citation_indices("tag more sharks [2.4.1]. The count") == "tag more sharks. The count"
+
+    def test_removes_a_multi_token_group(self) -> None:
+        assert _strip_model_citation_indices("office [1.1.1, 1.1.2]. He") == "office. He"
+
+    def test_keeps_a_tier_tag_and_drops_the_index_beside_it(self) -> None:
+        assert _strip_model_citation_indices("path of totality [A: NASA, 1.1.2].") == "path of totality [A: NASA]."
+
+    def test_keeps_a_tier_tag_whose_index_is_space_separated(self) -> None:
+        # q45081's shape: the index sits inside the tier item with no comma before it.
+        assert _strip_model_citation_indices("[A: official 2.4.1, 3.2.5].") == "[A: official]."
+        assert _strip_model_citation_indices("[B: Access Newswire 1.1.4, 3.3.4].") == "[B: Access Newswire]."
+
+    def test_keeps_a_trailing_tier_grade_when_the_index_comes_first(self) -> None:
+        # q44944's shape: ``index: tier`` rather than ``tier: outlet, index``.
+        assert _strip_model_citation_indices("HPI rose [1.1.8, 2.1.4: A].") == "HPI rose [A]."
+
+    def test_preserves_semicolon_separated_tier_groups(self) -> None:
+        # q44841's shape: two tier tags in one bracket, semicolon-delimited.
+        stripped = _strip_model_citation_indices("[B: Forbes, 1.6.4; C: Newsweek, 3.2.2].")
+        assert stripped == "[B: Forbes; C: Newsweek]."
+
+    def test_preserves_our_spliced_markers(self) -> None:
+        text = "Alpha.[1] Beta.[12] Gamma.[1, 3] Delta.[11, 12]"
+        assert _strip_model_citation_indices(text) == text
+
+    def test_preserves_bracketed_quantities_and_version_like_tokens(self) -> None:
+        """The false-positive boundary. Zero of the 2,609 archived dotted-in-bracket groups
+        is a quantity, but a dotted token that carries a unit, a currency prefix, a trailing
+        word, a 4-digit component (a year) or a 3-digit component (an IP octet) is content,
+        not a citation index, so the rule must leave every one of these alone.
+        """
+        for text in (
+            "gasoline [3.8%] higher",
+            "priced at [$1.5] a share",
+            "reached [1.5 million] viewers",
+            "shipped in [v2.1.3] of the tool",
+            "dated [2026.08] in the filing",
+            "resolved [192.168.1.1] internally",
+            "the [1.5-2.0] range",
+        ):
+            assert _strip_model_citation_indices(text) == text, text
+
+    def test_is_idempotent(self) -> None:
+        text = "office [1.1.1, 1.1.2]. NASA [A: NASA, 1.1.2] said.[1]"
+        once = _strip_model_citation_indices(text)
+        assert _strip_model_citation_indices(once) == once
+
+    def test_empties_a_table_cell_without_eating_the_pipes(self) -> None:
+        assert _strip_model_citation_indices("| **2024** | 2.2% | [1.4, 1.23] |") == "| **2024** | 2.2% | |"
+
+
+@pytest.mark.asyncio
+async def test_splice_runs_before_the_strip_and_sources_survive_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end ordering guard. ``_splice_inline_citations`` indexes the ORIGINAL response
+    text by grounding-support BYTE offsets, so the strip must run AFTER it — stripping first
+    would shift every offset and land the markers mid-word. The ``### Sources`` block's own
+    ``[N]`` lines must come through untouched.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+
+    text = "OCEARCH plans a 2026 expedition [2.4.1]. It targets Nova Scotia [A: OCEARCH, 2.4.4]."
+    end_first = text.index("[2.4.1].") + len("[2.4.1].")
+    blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/zzz"
+    chunks = [CannedWebChunk(uri=blob, title="OCEARCH", domain="ocearch.org")]
+    supports = [CannedSupport(seg=CannedSegment(end_index=end_first, text=""), indices=[0])]
+    response = _make_response(text, chunks=chunks, supports=supports)
+    fake_client = _make_client_with_response(response)
+
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=44872)
+
+    assert "OCEARCH plans a 2026 expedition.[1] It targets Nova Scotia [A: OCEARCH]." in out
+    assert "2.4.1" not in out
+    assert "2.4.4" not in out
+    assert "[1] OCEARCH — ocearch.org" in out
+
+
+@pytest.mark.asyncio
+async def test_url_context_only_path_is_also_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The url_context escape branch renders model text to forecasters too, and nothing is
+    spliced there (no chunks), so the strip is safe and the defect is identical.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response(
+        "Read straight off the resolving page [1.2.3].",
+        chunks=None,
+        supports=None,
+        url_metadata=[CannedUrlMeta("https://gov.example/report", CannedStatus("URL_RETRIEVAL_STATUS_SUCCESS"))],
+    )
+    fake_client = _make_client_with_response(response)
+
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=1)
+
+    assert "Read straight off the resolving page." in out
+    assert "1.2.3" not in out
+
+
+# ---------------------------------------------------------------------------
+# GEMINI_GROUNDING_DENSITY telemetry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_grounding_density_marker_emitted_on_the_grounded_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Post-floor, 41% of passing responses carry <=3 grounding supports and the median
+    response has one support per ~872 chars — the floor-immune surface where the embellishment
+    rate lives. The marker makes "did that move" a query instead of a hand audit; it is
+    deliberately NOT a gate (q44944's decisive, true ICE figure came out of a 1-support
+    response). ``chars`` is the RAW model text, the denominator the audit measured.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+
+    text = "Alpha fact. Beta fact."
+    blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/zzz"
+    chunks = [
+        CannedWebChunk(uri=blob, title="A", domain="a.example.com"),
+        CannedWebChunk(uri=blob, title="B", domain="b.example.com"),
+    ]
+    supports = [CannedSupport(seg=CannedSegment(end_index=len(text), text=""), indices=[1])]
+    response = _make_response(text, chunks=chunks, supports=supports)
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        await invoke_gemini_grounded("prompt", qid=44944)
+
+    assert f"GEMINI_GROUNDING_DENSITY: question=44944 chunks=2 supports=1 chars={len(text)}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_grounding_density_marker_absent_when_the_floor_suppresses(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A suppressed response renders nothing, so it has no density to report — and counting it
+    would put ungrounded parametric text in the same cohort as grounded sections.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response("Ungrounded prose.", chunks=None, supports=None, web_search_queries=["q"])
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        await invoke_gemini_grounded("prompt", qid=38195)
+
+    assert "GEMINI_GROUNDING_DENSITY" not in caplog.text
+    assert "GEMINI_UNGROUNDED_SUPPRESSED" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_grounding_density_marker_absent_on_the_url_context_only_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The marker measures google_search grounding density, so it is scoped to responses that
+    carry grounding chunks. A url_context-only response has neither chunks nor supports: its
+    density is undefined rather than zero, and a ``chunks=0 supports=0`` row would pool a
+    structurally different response shape into the same cohort.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response(
+        "Read straight off the resolving page.",
+        chunks=None,
+        supports=None,
+        url_metadata=[CannedUrlMeta("https://gov.example/report", CannedStatus("URL_RETRIEVAL_STATUS_SUCCESS"))],
+    )
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=1)
+
+    assert out.startswith("Read straight off the resolving page.")
+    assert "GEMINI_GROUNDING_DENSITY" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -848,8 +848,24 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
     ),
     MarkerSpec(
+        "gemini_grounding_density",
+        # The floor's complement (research/gemini_search.py _format_grounded_response): one row
+        # per response that PASSED the grounded-chunk floor, carrying how thinly the passing text
+        # is attributed. Post-floor the median response has one grounding support per ~872 chars
+        # and 41% of passers carry <=3 supports, which is the surface the floor cannot see and
+        # where the embellishment rate lives. Deliberately telemetry and never a gate — a decisive
+        # true figure once came out of a 1-support response — so nothing keys on these values;
+        # they exist so "did embellishment move" is a query over the archive. ``chars`` is the raw
+        # model text, so supports/chars reproduces the audit's density denominator.
+        re.compile(
+            r"GEMINI_GROUNDING_DENSITY:\s*question=(?P<question>\S+)\s+chunks=(?P<chunks>\S+)"
+            r"\s+supports=(?P<supports>\S+)\s+chars=(?P<chars>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
+    ),
+    MarkerSpec(
         "agentic_document_ungrounded_suppressed",
-        # The read_document twin of the marker above (research/agentic/tools.py
+        # The read_document twin of GEMINI_UNGROUNDED_SUPPRESSED (research/agentic/tools.py
         # read_document): Gemini's url_context tool retrieved nothing, so the answer would
         # be unsourced recall and the "fetched" verification tier is withheld. Worth
         # measuring separately because a "fetched" document discrepancy is the only kind

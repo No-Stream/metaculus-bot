@@ -1908,7 +1908,41 @@ class TestGeminiUngroundedSuppressed:
         assert rec["queries"] == 0
 
 
-# read_document's twin of the WARN above (metaculus_bot/research/agentic/tools.py): Gemini's
+# The floor's complement (metaculus_bot/research/gemini_search.py _format_grounded_response):
+# one INFO row per response that PASSED the grounded-chunk floor, recording how thinly the
+# passing text is attributed. ``chars`` is the raw model text, so supports/chars reproduces the
+# audit's density denominator (median ~872 chars per attributed span post-floor).
+GEMINI_GROUNDING_DENSITY_LINE = PFX + "GEMINI_GROUNDING_DENSITY: question=44944 chunks=4 supports=1 chars=3535"
+
+
+class TestGeminiGroundingDensity:
+    def test_fields(self):
+        rec = _parse_one(GEMINI_GROUNDING_DENSITY_LINE)
+        assert rec["marker"] == "gemini_grounding_density"
+        assert rec["chunks"] == 4
+        assert rec["supports"] == 1
+        assert rec["chars"] == 3535
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GEMINI_GROUNDING_DENSITY_LINE)
+        # gemini_search.py passes question.id_of_question, same as its suppression twin.
+        assert rec["qid"] == 44944
+        assert rec["qid_kind"] == "question_id"
+
+    def test_absent_qid_coerces_to_none(self):
+        # qid is Optional at the call site; "None" renders into the line verbatim.
+        rec = _parse_one(PFX + "GEMINI_GROUNDING_DENSITY: question=None chunks=1 supports=0 chars=812")
+        assert rec["qid"] is None
+        assert rec["supports"] == 0
+
+    def test_does_not_collide_with_the_suppression_marker(self):
+        # Both markers start GEMINI_ and are emitted from the same function; each spec must
+        # claim only its own line or one of them would be double-counted in the archive.
+        assert _parse_one(GEMINI_GROUNDING_DENSITY_LINE)["marker"] == "gemini_grounding_density"
+        assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
+
+
+# read_document's twin of GEMINI_UNGROUNDED_SUPPRESSED (metaculus_bot/research/agentic/tools.py): Gemini's
 # url_context tool retrieved nothing, so the "fetched" tier is withheld rather than granting a
 # parametric-recall answer the authority to supersede the briefing for every forecaster.
 AGENTIC_DOCUMENT_UNGROUNDED_LINE = (
