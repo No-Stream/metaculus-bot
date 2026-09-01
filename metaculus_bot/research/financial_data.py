@@ -26,7 +26,6 @@ from metaculus_bot.constants import (
     FINANCIAL_FRED_VINTAGE_PRINTS,
     FINANCIAL_VARIANCE_RATIO_FLOOR,
     FINANCIAL_VARIANCE_RATIO_LAG,
-    FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
     FINANCIAL_YFINANCE_LOOKBACK_DAYS,
     FINANCIAL_YFINANCE_RECENT_DAYS,
     FRED_API_KEY_ENV,
@@ -34,6 +33,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
+from metaculus_bot.research.noise_flag import noise_flag_line, screen_for_quote_noise
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.ts_estimators import (
@@ -41,10 +41,8 @@ from metaculus_bot.research.ts_estimators import (
     TRADING_DAYS_PER_YEAR,
     annualized_realized_vol_pct,
     daily_step_unit,
-    multi_period_annualized_vol_pct,
     observed_periods_per_year,
     stale_latest_age_days,
-    variance_ratio,
 )
 from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
 
@@ -594,20 +592,13 @@ def _volatility_lines(close: pd.Series, periods_per_year: int, *, symbol: str) -
     )
     long_line = None if long_vol is None else f"- {long_window}-{unit} annualized volatility: {long_vol:.1f}%"
 
-    noise_ratio = variance_ratio(
-        close, lag=FINANCIAL_VARIANCE_RATIO_LAG, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS
-    )
-    if noise_ratio is None or noise_ratio >= FINANCIAL_VARIANCE_RATIO_FLOOR:
+    screen = screen_for_quote_noise(close, periods_per_year=periods_per_year)
+    if screen is None:
         return [short_line] if long_line is None else [short_line, long_line]
 
-    robust_vol = multi_period_annualized_vol_pct(
-        close,
-        lag=FINANCIAL_VARIANCE_RATIO_LAG,
-        periods_per_year=periods_per_year,
-        min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
-    )
+    robust_vol = screen.robust_vol_pct
     flagged = [
-        f"- ⚠ Vendor-noise flag: variance ratio VR({FINANCIAL_VARIANCE_RATIO_LAG}) = {noise_ratio:.2f} over "
+        f"- ⚠ Vendor-noise flag: variance ratio VR({FINANCIAL_VARIANCE_RATIO_LAG}) = {screen.ratio:.2f} over "
         f"{len(close) - 1} {unit} returns. A random walk reads ~1.0; below "
         f"{FINANCIAL_VARIANCE_RATIO_FLOOR:.2f} most of each day's move is reversed the next, which is quote "
         "noise on an illiquid or fixed cross rather than genuine price movement, and it inflates every "
@@ -623,10 +614,7 @@ def _volatility_lines(close: pd.Series, periods_per_year: int, *, symbol: str) -
         flagged.append(f"{long_line} (from one-day returns, noise included)")
     flagged.append(f"{short_line} (from one-day returns, noise included; noise-suspect)")
     logger.info(
-        f"FINANCIAL_NOISE_FLAG: surface=financial_data symbol={symbol} vr_lag={FINANCIAL_VARIANCE_RATIO_LAG} "
-        f"vr={noise_ratio:.3f} floor={FINANCIAL_VARIANCE_RATIO_FLOOR} short_vol={short_vol:.1f} "
-        f"long_vol={long_vol if long_vol is None else round(long_vol, 1)} "
-        f"robust_vol={robust_vol if robust_vol is None else round(robust_vol, 1)}"
+        noise_flag_line(screen, surface="financial_data", symbol=symbol, short_vol=short_vol, long_vol=long_vol)
     )
     return flagged
 

@@ -14,7 +14,12 @@ import pytest
 from forecasting_tools import GeneralLlm
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
-from metaculus_bot.constants import FINANCIAL_YFINANCE_LOOKBACK_DAYS, MAX_FINANCIAL_IDENTIFIERS
+from metaculus_bot.constants import (
+    FINANCIAL_VARIANCE_RATIO_FLOOR,
+    FINANCIAL_VARIANCE_RATIO_LAG,
+    FINANCIAL_YFINANCE_LOOKBACK_DAYS,
+    MAX_FINANCIAL_IDENTIFIERS,
+)
 from metaculus_bot.research.financial_data import (
     _PERIOD_SLIP_GRACE_DAYS,
     _PERIOD_TARGET_DAYS,
@@ -35,6 +40,7 @@ from metaculus_bot.research.financial_data import (
     extract_financial_identifiers_from_criteria,
     financial_data_provider,
 )
+from metaculus_bot.research.noise_flag import NoiseScreen, noise_flag_line, screen_for_quote_noise
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
 from metaculus_bot.research.ts_estimators import (
@@ -47,6 +53,7 @@ from metaculus_bot.research.ts_estimators import (
     variance_ratio,
 )
 from metaculus_bot.research.ts_fetch import FetchError
+from scripts.telemetry.markers import MARKER_SPECS
 from tests.ts_anchor_fakes import noise_dominated_close_series, random_walk_close_series
 
 
@@ -913,6 +920,82 @@ class TestVolatilityHorizonsAndNoiseFlag:
         log_returns = np.diff(np.log(noisy.to_numpy(dtype="float64")))
         one_day = float(log_returns.std(ddof=1) * np.sqrt(252) * 100.0)
         assert robust == pytest.approx(one_day * math.sqrt(ratio), rel=1e-9)
+
+
+class TestSharedNoiseScreen:
+    """One owner for the screen and the telemetry line, so the two surfaces cannot drift.
+
+    The screen and the FINANCIAL_NOISE_FLAG format string were duplicated across
+    `financial_data._volatility_lines` and `ts_render._realized_vol_lines`, which is how the
+    two copies of the vol estimator drifted before (the q44882 sqrt(252)-on-a-24/7-series
+    defect was fixed in one copy weeks before the other). Only the forecaster-facing prose is
+    local to each renderer now.
+    """
+
+    @staticmethod
+    def _spec_regex() -> re.Pattern[str]:
+        return next(s for s in MARKER_SPECS if s.name == "financial_noise_flag").regex
+
+    def test_the_screen_fires_only_below_the_floor(self) -> None:
+        assert screen_for_quote_noise(_clean_close(seed=3), periods_per_year=252) is None
+        fired = screen_for_quote_noise(_noisy_close(seed=3), periods_per_year=252)
+        assert fired is not None
+        assert fired.ratio < FINANCIAL_VARIANCE_RATIO_FLOOR
+        # Same refusal policy for both estimators, so a fired screen always carries a remedy.
+        assert fired.robust_vol_pct is not None
+
+    def test_a_sample_the_estimator_refuses_is_not_a_flag(self) -> None:
+        """An administratively fixed quote has no measurable return variance, so the ratio
+        would be float noise over float noise — and "no measurement" must not read as a flag."""
+        flat = pd.Series([7.4604] * 300, index=pd.date_range(end="2026-03-02", periods=300, freq="B"))
+        assert screen_for_quote_noise(flat, periods_per_year=252) is None
+
+    def test_both_surfaces_emit_the_same_field_set_under_the_spec_regex(self) -> None:
+        """The anti-drift property R12 exists for: one shape, every field required, so a
+        reorder harvests as a clean zero rather than recording None for an emitted value."""
+        screen = NoiseScreen(ratio=0.412, robust_vol_pct=9.44)
+        yfinance_line = noise_flag_line(
+            screen, surface="financial_data", symbol="USDSZL=X", short_vol=17.85, long_vol=15.24
+        )
+        anchor_line = noise_flag_line(screen, surface="ts_anchor", symbol="CSUSHPISA", short_vol=14.6, long_vol=None)
+
+        regex = self._spec_regex()
+        yfinance_match = regex.search(yfinance_line)
+        anchor_match = regex.search(anchor_line)
+        assert yfinance_match is not None
+        assert anchor_match is not None
+        assert yfinance_match.groupdict() == {
+            "surface": "financial_data",
+            "symbol": "USDSZL=X",
+            "vr_lag": str(FINANCIAL_VARIANCE_RATIO_LAG),
+            "vr": "0.412",
+            "floor": str(FINANCIAL_VARIANCE_RATIO_FLOOR),
+            "short_vol": "17.9",
+            "long_vol": "15.2",
+            "robust_vol": "9.4",
+        }
+        # The anchor computes no long window; `surface` is what tells that apart from a
+        # yfinance series too short to hold one, so the field itself stays present.
+        assert anchor_match.groupdict() | {"surface": "financial_data"} == yfinance_match.groupdict() | {
+            "symbol": "CSUSHPISA",
+            "short_vol": "14.6",
+            "long_vol": "None",
+        }
+
+    def test_a_refused_remedy_renders_the_none_sentinel(self) -> None:
+        line = noise_flag_line(
+            NoiseScreen(ratio=0.369, robust_vol_pct=None),
+            surface="financial_data",
+            symbol="USDSZL=X",
+            short_vol=17.85,
+            long_vol=None,
+        )
+        match = self._spec_regex().search(line)
+        assert match is not None
+        # "None", not 0.0: the archive coerces the sentinel to null rather than a fabricated
+        # zero volatility.
+        assert match.group("robust_vol") == "None"
+        assert match.group("long_vol") == "None"
 
 
 class TestFetchFredData:

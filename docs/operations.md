@@ -944,15 +944,17 @@ the telemetry markers:
   decode score, an unread content-type, an SSRF rejection) carrying what the marker
   cannot.
 - `FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor symbol=... vr_lag=... vr=...
-  floor=... short_vol=... [long_vol=...] robust_vol=...` — the series behind a rendered
+  floor=... short_vol=... long_vol=... robust_vol=...` — the series behind a rendered
   volatility is noise-dominated: its variance ratio sits below
   `FINANCIAL_VARIANCE_RATIO_FLOOR`, meaning most of each day's move is reversed the
   next, which inflates any volatility computed from one-day returns. The flagged
   block leads with `robust_vol`, measured on overlapping `vr_lag`-step returns, and
-  labels the short-window figure noise-suspect. Two surfaces emit it, sharing the
-  estimator: `financial_data.py`'s `_volatility_lines` and `ts_render.py`'s
-  `_realized_vol_lines`. Only the financial-data surface prints `long_vol`, so a
-  `ts_anchor` record reads that field as null rather than zero. Per-identifier, so
+  labels the short-window figure noise-suspect. Two surfaces log it, sharing the
+  screen and the line itself (`research/noise_flag.py`): `financial_data.py`'s
+  `_volatility_lines` and `ts_render.py`'s `_realized_vol_lines`. Only the
+  financial-data surface computes a long-horizon window, so a `ts_anchor` record
+  reads `long_vol` as null rather than zero — `surface` is what tells that apart
+  from a yfinance series too short to hold one. Per-identifier, so
   one question can fire several and the line carries no question id — `symbol` (the
   ticker or FRED series id, same field position as `FINANCIAL_STALE_LATEST`) is what
   tells two flagged identifiers in one run apart and joins a noise-flag record to the
