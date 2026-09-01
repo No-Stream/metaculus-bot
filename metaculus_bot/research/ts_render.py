@@ -24,6 +24,9 @@ import numpy as np
 import pandas as pd
 
 from metaculus_bot.constants import (
+    FINANCIAL_VARIANCE_RATIO_FLOOR,
+    FINANCIAL_VARIANCE_RATIO_LAG,
+    FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
     TS_ANCHOR_LOOKBACK_YEARS,
     TS_ANCHOR_MONTHLY_TABLE_ROWS,
     TS_ANCHOR_NATIVE_TABLE_ROWS,
@@ -43,8 +46,10 @@ from metaculus_bot.research.ts_estimators import (
     annualized_realized_vol_pct,
     clock_matches_cadence,
     horizon_steps,
+    multi_period_annualized_vol_pct,
     series_clock,
     stale_latest_age_days,
+    variance_ratio,
 )
 from metaculus_bot.research.ts_routing import Derivation, _Route
 
@@ -223,8 +228,9 @@ def _fifty_two_week_line(series: pd.Series, ceiling: date, last: float) -> str:
     return f"- {label}: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"  # noqa: RUF001  # en dash is deliberate range typography in rendered research
 
 
-def _realized_vol_line(series: pd.Series, clock: SeriesClock) -> str | None:
-    """Annualized realized volatility over the last ``REALIZED_VOL_WINDOW`` observations.
+def _realized_vol_lines(series: pd.Series, clock: SeriesClock) -> list[str]:
+    """Annualized realized volatility over the last ``REALIZED_VOL_WINDOW`` observations,
+    plus the vendor-noise flag when the series' variance ratio trips the screen.
 
     Annualizes on the series' OBSERVED density, not a fixed sqrt(252): a 24/7 series prints
     ~365 bars a year, so the trading-day factor understated its volatility by
@@ -234,13 +240,53 @@ def _realized_vol_line(series: pd.Series, clock: SeriesClock) -> str | None:
     separately again; only the sentence wording is local. The label names the step unit for
     the same reason: 30 rows is six calendar weeks on an exchange-traded series, so calling it
     "30-day" was a row count masquerading as a calendar window.
+
+    The noise screen is the same estimator and the same ``FINANCIAL_VARIANCE_RATIO_*``
+    thresholds ``financial_data`` uses, because this is the other place the bot annualizes
+    ONE-day returns for a forecaster: q44797's pegged cross would render an equally inflated
+    figure here, and the anchor can route to any URL-cited Yahoo ticker. The BANDS above it
+    are structurally immune — they are empirical h-step change quantiles at h of tens of
+    observations, where independent quote noise contributes ~2/h of the variance — so the
+    flag says so rather than casting doubt on the whole section.
     """
     annualized = annualized_realized_vol_pct(
         series, window=REALIZED_VOL_WINDOW, periods_per_year=clock.periods_per_year
     )
     if annualized is None:
-        return None
-    return f"- {REALIZED_VOL_WINDOW}-{clock.step_unit} annualized realized volatility: {annualized:.1f}%"
+        return []
+    vol_line = f"- {REALIZED_VOL_WINDOW}-{clock.step_unit} annualized realized volatility: {annualized:.1f}%"
+    noise_ratio = variance_ratio(
+        series, lag=FINANCIAL_VARIANCE_RATIO_LAG, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS
+    )
+    if noise_ratio is None or noise_ratio >= FINANCIAL_VARIANCE_RATIO_FLOOR:
+        return [vol_line]
+    robust_vol = multi_period_annualized_vol_pct(
+        series,
+        lag=FINANCIAL_VARIANCE_RATIO_LAG,
+        periods_per_year=clock.periods_per_year,
+        min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+    )
+    robust_clause = (
+        ""
+        if robust_vol is None
+        else (
+            f" Measured on overlapping {FINANCIAL_VARIANCE_RATIO_LAG}-{clock.step_unit} returns, over which that "
+            f"reversing component cancels, the volatility is {robust_vol:.1f}%."
+        )
+    )
+    logger.info(
+        f"FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag={FINANCIAL_VARIANCE_RATIO_LAG} "
+        f"vr={noise_ratio:.3f} floor={FINANCIAL_VARIANCE_RATIO_FLOOR} short_vol={annualized:.1f} "
+        f"robust_vol={robust_vol if robust_vol is None else round(robust_vol, 1)}"
+    )
+    return [
+        f"{vol_line} — noise-suspect",
+        f"- ⚠ Vendor-noise flag: variance ratio VR({FINANCIAL_VARIANCE_RATIO_LAG}) = {noise_ratio:.2f} over this "
+        f"series' history. A random walk reads ~1.0; below {FINANCIAL_VARIANCE_RATIO_FLOOR:.2f} most of each "
+        "step's move is reversed the next, which inflates any volatility computed from one-step returns."
+        f"{robust_clause} The change band above is unaffected — it is built from multi-observation changes, over "
+        "which that noise cancels.",
+    ]
 
 
 def _band_line(
@@ -426,9 +472,7 @@ def _render_single(
     parts.extend(band_lines)
 
     if clock.freq == "daily" and use_log:
-        vol_line = _realized_vol_line(derived, clock)
-        if vol_line:
-            parts.append(vol_line)
+        parts.extend(_realized_vol_lines(derived, clock))
 
     parts.append(f"\n_{PROVENANCE_FOOTER}_")
     return "\n".join(parts), band

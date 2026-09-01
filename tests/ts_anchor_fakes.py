@@ -1,6 +1,6 @@
-"""Shared fakes + question factories for the time-series-anchor test files.
+"""Shared fakes + question factories for the time-series test files.
 
-Split out because three test modules key on the same two shapes and duplicating either
+Split out because several test modules key on the same shapes and duplicating any of them
 would let them drift apart:
 
 - ``FakeHttp`` / ``_csv`` — the ``ts_fetch._http_get`` seam (raw CSV bytes by URL prefix).
@@ -9,6 +9,11 @@ would let them drift apart:
 - ``_make_numeric_q`` / ``_make_discrete_q`` / ``_DGS10_RC`` — the question mock every
   routing, render, provider and guard test builds on. Used by ``test_ts_routing.py`` and
   ``test_timeseries_anchor_provider.py``.
+- ``random_walk_close_series`` / ``noise_dominated_close_series`` — the clean-versus-noisy
+  price pair the variance-ratio screen is calibrated on. Used by
+  ``test_timeseries_anchor_provider.py`` (the estimator itself) and
+  ``test_financial_data_provider.py`` (the rendered noise flag), which is exactly the pair
+  of consumers a private copy in either file would let disagree.
 """
 
 from __future__ import annotations
@@ -16,11 +21,64 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import numpy as np
+import pandas as pd
 from forecasting_tools import NumericQuestion
 from forecasting_tools.data_models.questions import DiscreteQuestion
 
 # A resolution-criteria string that routes deterministically to a non-revising FRED series.
 _DGS10_RC = "Resolves per https://fred.stlouisfed.org/series/DGS10 on the resolution date."
+
+# Rows in the synthetic price pair below: ~265 business days is what the provider's own
+# FINANCIAL_YFINANCE_LOOKBACK_DAYS window returns for an exchange-traded series, so the
+# variance-ratio screen is calibrated at the sample size it will actually see in prod.
+_SYNTHETIC_CLOSE_ROWS = 265
+# Daily log-return sd of the underlying walk. 0.6%/day annualizes to ~9.5% on the
+# trading-day basis — the order of magnitude USD/ZAR ran at in the q44797 window.
+_SYNTHETIC_DAILY_SIGMA = 0.006
+
+
+def random_walk_close_series(
+    name: str = "CLEAN=X",
+    *,
+    seed: int = 0,
+    n: int = _SYNTHETIC_CLOSE_ROWS,
+    daily_sigma: float = _SYNTHETIC_DAILY_SIGMA,
+    start: float = 16.4,
+    end: str = "2026-07-17",
+) -> pd.Series:
+    """A clean geometric random walk on business days — the liquid-cross shape.
+
+    Deterministic per ``seed``. Its variance ratio has no reason to sit away from 1 beyond
+    sampling noise, which is what makes it the false-positive control for the screen."""
+    idx = pd.bdate_range(end=pd.Timestamp(end), periods=n)
+    rng = np.random.default_rng(seed)
+    return pd.Series(start * np.exp(np.cumsum(rng.normal(0.0, daily_sigma, n))), index=idx, name=name)
+
+
+def noise_dominated_close_series(
+    name: str = "NOISY=X",
+    *,
+    seed: int = 0,
+    n: int = _SYNTHETIC_CLOSE_ROWS,
+    daily_sigma: float = _SYNTHETIC_DAILY_SIGMA,
+    quote_noise_sigma: float = _SYNTHETIC_DAILY_SIGMA,
+    start: float = 16.4,
+    end: str = "2026-07-17",
+) -> pd.Series:
+    """The pegged-cross shape: the same walk seen through independent quote noise.
+
+    ``log p_t = log s_t + e_t`` with ``e`` iid, so every daily return carries
+    ``e_t - e_{t-1}`` — a negatively autocorrelated component that inflates a one-day
+    volatility estimate and then cancels over multi-day windows. At
+    ``quote_noise_sigma == daily_sigma`` the noise is ~2/3 of return variance, which is the
+    regime the q44797 verification measured on ``USDSZL=X`` (79% of variance vendor noise)
+    and which puts VR(5) near 0.47 against ~1 for the walk above."""
+    idx = pd.bdate_range(end=pd.Timestamp(end), periods=n)
+    rng = np.random.default_rng(seed)
+    walk = np.cumsum(rng.normal(0.0, daily_sigma, n))
+    quote_noise = rng.normal(0.0, quote_noise_sigma, n)
+    return pd.Series(start * np.exp(walk + quote_noise), index=idx, name=name)
 
 
 class FakeHttp:
