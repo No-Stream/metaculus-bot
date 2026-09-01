@@ -331,7 +331,7 @@ class TestDriverSystemPromptLiveDataSource:
         collapsed = " ".join(build_system_prompt("2026-07-21").split())
         assert "resolves off a live data source" in collapsed
         assert "tracker, index, average, counter, or dashboard" in collapsed
-        assert "its CURRENT reading and the date it was last updated" in collapsed
+        assert "its CURRENT reading, together with the date it was last updated, is a verify target" in collapsed
 
     def test_system_prompt_bans_future_dated_targets(self) -> None:
         collapsed = " ".join(build_system_prompt("2026-07-21").split())
