@@ -61,6 +61,50 @@ Two things can block or stale the install on a checkout that predates the uv mig
   disk and so fails confusingly rather than obviously. `make precommit_install` regenerates
   the file against the current interpreter.
 
+## Season-start checklist
+
+Before a new tournament or Cup season opens its first question. These are
+operator steps: the reads below are free metadata pulls with no inference spend,
+but they are network calls and they feed a roster decision, so an implementing
+session does not run them — it proposes, the operator runs and decides.
+
+- **Resolve "latest per vendor" from a LIVE model-list read, never from memory.**
+  The roster design (`FORECASTER_LLMS` in `metaculus_bot/llm_configs.py`) is the
+  newest frontier reasoning model from each vendor, one slot each, and nothing in
+  the repo can say what that currently resolves to — the 2026-08-31 gemini-slot
+  review found that a roster decision needs this one read before anything else.
+  OpenRouter's public models endpoint lists every slug with `created`, its
+  listing time as a Unix timestamp (per the endpoint's OpenAPI schema):
+
+  ```bash
+  curl -s https://openrouter.ai/api/v1/models \
+    | jq -r '.data[] | [.id, .created] | @tsv' | sort
+  ```
+
+  Filter per vendor prefix — `openai/`, `anthropic/`, `google/`, `x-ai/` — and
+  read the newest `created` per vendor:
+
+  ```bash
+  curl -s https://openrouter.ai/api/v1/models \
+    | jq -r '.data[] | [.id, (.created | todate)] | @tsv' \
+    | grep -E '^(openai|anthropic|google|x-ai)/' | sort -t$'\t' -k2
+  ```
+
+  Then check, before touching the roster: the slug is a reasoning model, not a
+  mini/flash/fast tier or a `:free` route; its provider is on the donated key's
+  allowed list (`DONATED_KEY_PROVIDERS` in `fallback_openrouter.py`), or the slot
+  knowingly bills the personal key like the pinned Google Pro slot
+  (`DONATED_KEY_BLOCKED_GOOGLE_MODELS`); and its reasoning-effort enum accepts
+  the tier the slot is configured for (the OpenAI ceiling is `xhigh`; `max` is
+  Anthropic-only).
+- **A roster change is a config-era boundary.** Residual analysis buckets by the
+  merge-to-main timestamp, so make any swap once, in the same merge as everything
+  else that shifts the forecast distribution, before the first question — never
+  mid-window (`FUTURE.md`, "FREEZE the triple").
+- **Refresh the tournament constants** (`TOURNAMENT_ID`, the date checks in
+  `constants.py`) and flip the fall-cup reminder off once configured
+  (`FALL_CUP_CONFIGURED`), or every scheduled run reddens on the reminder.
+
 ## API keys and the shared-vs-personal key model
 
 The bot needs several credentials. `.env.template` lists them with inline

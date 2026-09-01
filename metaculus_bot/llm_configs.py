@@ -70,6 +70,14 @@ def _forecaster_slot(model: str, **kwargs: Any) -> GeneralLlm:
     return build_llm_with_openrouter_fallback(model=model, role=forecaster_role(model), **_FORECASTER_CONFIG, **kwargs)
 
 
+# SEASON-START RITUAL (operator, not an implementing session): resolve "latest per vendor"
+# with a LIVE OpenRouter model-list read, never from memory — nothing in this repo can say
+# what the newest OpenAI/Anthropic/Google model currently is, and the 2026-08-31 gemini-slot
+# review found that a roster decision needs that one read before anything else:
+#   curl -s https://openrouter.ai/api/v1/models | jq -r '.data[] | [.id, .created] | @tsv' | sort
+# filtered per vendor prefix (openai/, anthropic/, google/, x-ai/); what to check on the
+# result is in docs/operations.md "Season-start checklist". Any change here is a config-era
+# boundary for residual analysis, so make it once, before the first question.
 FORECASTER_LLMS: list[GeneralLlm] = [
     # 2026-07-20: forecaster roster dropped from 6 to a 3-member latest-per-vendor
     # triple (1 OpenAI / 1 Anthropic / 1 Google). This is the SECOND roster change
