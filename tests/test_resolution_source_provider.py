@@ -40,6 +40,7 @@ from metaculus_bot.research.resolution_source import (
     is_metaculus_self_ref,
     is_yahoo_ticker_url,
     looks_like_csv_rows,
+    looks_like_embed_shell,
     looks_like_js_wall,
     resolution_source_provider,
     select_fetchable_urls,
@@ -235,6 +236,61 @@ def article_html() -> bytes:
         b"its next meeting.</p></article>"
         b"<footer>&copy; 2026 Example News</footer></body></html>"
     )
+
+
+# Infogram's own published embed code (container div + async loader + credit
+# block), the shape racetothewh.com/senate/26 used on qids 44554/44556.
+_INFOGRAM_EMBED_MARKUP = (
+    '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive" '
+    'data-title="NE - Osborn v. Ricketts"></div>'
+    '<script>!function(e,i,n,s){var t="InfogramEmbeds";}(document,0,"infogram-async",'
+    '"https://e.infogram.com/js/dist/embed-loader-min.js");</script>'
+    '<div style="padding:8px 0;text-align:center">'
+    '<a href="https://infogram.com/vs9b6iAeARko8cuwH51x">NE - Osborn v. Ricketts</a><br>'
+    '<a href="https://infogram.com" rel="nofollow">Infogram</a></div>'
+)
+
+
+def _embed_shell_page(embed_markup: str) -> bytes:
+    """A page that is nothing but chrome around one embed.
+
+    Trafilatura extracts 167 chars from this (heading + the one caption sentence):
+    ABOVE the 100-char JS-wall floor, so before `no_resolving_content` existed it
+    published as an unqualified `success` with no numbers in it.
+    """
+    return (
+        "<!doctype html><html><head><title>NE Senate polling average</title></head><body>"
+        "<nav>Home | Senate | House | Governors</nav>"
+        "<article><h1>Nebraska Senate polling average</h1>"
+        f"{embed_markup}"
+        "<p>The chart above updates whenever a new qualifying poll is released.</p>"
+        "</article><footer>&copy; 2026</footer></body></html>"
+    ).encode()
+
+
+@pytest.fixture
+def infogram_shell_html() -> bytes:
+    return _embed_shell_page(_INFOGRAM_EMBED_MARKUP)
+
+
+@pytest.fixture
+def tracker_with_infogram_html() -> bytes:
+    """The 44554 shape: real forecast prose (581 extracted chars) around the embed
+    that holds the resolving polling average. The prose is worth keeping; what it
+    does NOT contain is any polling number."""
+    return (
+        "<!doctype html><html><head><title>The 2026 Senate Forecast</title></head><body>"
+        "<article><h1>The 2026 Senate Forecast</h1>"
+        "<p>The forecast predicts the outcome of every Senate race in 2026 using a data-driven "
+        "model that factors in the latest polling, historic trends, candidate quality, and "
+        "fundraising. Every day, we simulate the election 50,000 times to get the best projection "
+        "we can on how likely each party is to win the majority.</p>"
+        f"{_INFOGRAM_EMBED_MARKUP}"
+        "<p>Background: after a successful 2024 cycle, Republicans hold a 53-47 advantage, and "
+        "Democrats need to flip four seats to take a 51-49 majority. Their best offensive "
+        "opportunities are Maine and North Carolina, with Ohio and Alaska also competitive.</p>"
+        "</article></body></html>"
+    ).encode()
 
 
 def _mock_question(*, resolution_criteria: str = "", fine_print: str = "") -> MagicMock:
@@ -928,6 +984,130 @@ class TestFetchOne:
         assert result.status == "unsupported_type"
         assert result.content_type is None
         assert result.text == ""
+
+
+class TestEmbedShapedPages:
+    """qids 44554/44556: a tracker page returned HTTP 200, extracted forecast background,
+    and reported `success` while the resolving Nebraska polling average sat in two Infogram
+    iframes trafilatura drops. The section published under "primary grading evidence" with
+    zero polling numbers in it, byte-identical across three questions, and nothing anywhere
+    said so. Two outcomes now, split by how much page text came back."""
+
+    async def test_an_embed_shell_200_is_no_resolving_content(self, infogram_shell_html):
+        session = FakeSession({"https://tracker.example.com/senate": FakeResponse(200, body=infogram_shell_html)})
+
+        result = await _fetch_one(session, "https://tracker.example.com/senate", {})
+
+        assert result.status == "no_resolving_content"
+        assert result.http_status == 200  # the fetch itself succeeded; the CONTENT did not arrive
+        assert result.text == ""
+        assert result.unreadable_embeds == ["infogram"]
+
+    async def test_the_same_thin_page_without_the_embed_stays_a_success(self):
+        """The embed is the discriminator, not the length. Identical chrome with the embed
+        markup swapped for an inert div extracts the same 167 chars and still publishes —
+        so `no_resolving_content` is not a raised JS-wall floor in disguise."""
+        session = FakeSession(
+            {"https://plain.example.com/p": FakeResponse(200, body=_embed_shell_page("<div>chart goes here</div>"))}
+        )
+
+        result = await _fetch_one(session, "https://plain.example.com/p", {})
+
+        assert result.status == "success"
+        assert result.unreadable_embeds == []
+
+    async def test_prose_plus_an_unreadable_embed_keeps_the_prose_and_discloses_the_gap(
+        self, tracker_with_infogram_html
+    ):
+        """The 44554 page itself: 2.9k chars of real background around the embed. Withholding
+        it would throw away readable evidence, so the text stays and the section says plainly
+        that the embedded figures are not in it — the caveat above it claims primary grading
+        evidence, so an unqualified success overstated what was retrieved."""
+        session = FakeSession(
+            {"https://tracker.example.com/senate/26": FakeResponse(200, body=tracker_with_infogram_html)}
+        )
+
+        result = await _fetch_one(session, "https://tracker.example.com/senate/26", {})
+
+        assert result.status == "success"
+        assert "simulate the election 50,000 times" in result.text
+        assert result.unreadable_embeds == ["infogram"]
+        assert "infogram embed(s) that this fetch cannot read" in result.text
+        assert "NOT in the text above" in result.text
+
+    async def test_the_disclosure_is_budgeted_inside_the_per_url_cap(self, tracker_with_infogram_html, monkeypatch):
+        # The note is budgeted out of the cap (like the Tier-2 dataset lead), never added
+        # on top of it, so the per-URL bound the section budget relies on still holds.
+        cap = 500
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        session = FakeSession({"https://t.example.com/p": FakeResponse(200, body=tracker_with_infogram_html)})
+
+        result = await _fetch_one(session, "https://t.example.com/p", {})
+
+        assert result.status == "success"
+        assert len(result.text) <= cap
+        assert "NOT in the text above" in result.text
+
+    async def test_an_ordinary_article_carries_no_disclosure(self, article_html):
+        session = FakeSession({"https://news.example.com/report": FakeResponse(200, body=article_html)})
+
+        result = await _fetch_one(session, "https://news.example.com/report", {})
+
+        assert result.status == "success"
+        assert result.unreadable_embeds == []
+        assert "cannot read" not in result.text
+
+    def test_the_shell_floor_sits_above_the_js_wall_floor(self):
+        # Both floors read module globals so tests can retune them; the ordering is what
+        # makes the embed verdict strictly more specific than the JS-wall one.
+        assert looks_like_embed_shell("x" * 300) is True
+        assert looks_like_js_wall("x" * 300) is False
+        assert looks_like_embed_shell("x" * 500) is False
+
+    def test_a_no_resolving_content_result_is_a_loss_token_not_ok(self):
+        """The diagnostics half: as `success` this reported `ok`, so the provider block read
+        fully healthy on a question whose only cited source handed back no numbers."""
+        results = [
+            FetchResult(
+                url="https://tracker.example.com/senate",
+                status="no_resolving_content",
+                text="",
+                http_status=200,
+                content_type="text/html",
+                unreadable_embeds=["infogram"],
+            )
+        ]
+
+        assert _fetch_result_sources(results) == {"tracker.example.com": "no_resolving_content"}
+
+    def test_a_no_resolving_content_page_is_not_rendered_as_grading_evidence(self):
+        results = [
+            FetchResult(
+                url="https://tracker.example.com/senate",
+                status="no_resolving_content",
+                text="",
+                http_status=200,
+                content_type="text/html",
+                unreadable_embeds=["infogram"],
+            )
+        ]
+
+        out = format_resolution_sections(results, datetime(2026, 9, 1, tzinfo=UTC))
+
+        assert "### https://tracker.example.com/senate" not in out
+        assert "tracker.example.com: no_resolving_content" in out
+        assert "weight other evidence accordingly" in out
+
+    def test_a_blank_no_resolving_content_result_constructs(self):
+        # The success-implies-content guard must not fire on the new status: it is a
+        # FAILURE status and its text is empty by construction.
+        assert FetchResult(
+            url="https://t.example.com/p",
+            status="no_resolving_content",
+            text="",
+            http_status=200,
+            content_type="text/html",
+        )
 
 
 class TestFetchResolutionSources:

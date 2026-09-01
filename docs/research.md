@@ -404,15 +404,34 @@ complete), and the formatter appends `[N additional source(s) omitted — sectio
 budget]` when later sections are dropped for length.
 
 The per-URL `FetchStatus` distinguishes two kinds of non-success, and only one is a
-seam. `blocked` / `js_wall` are pages we could not READ, and they remain the target
-of a future Tier-2 LLM-driven fetch pass. `empty_body` (a 200 whose body is empty or
-whitespace-only) and `unsupported_type` (including a body whose declared charset
-decodes to mojibake) are bodies that carried no information — refusals rather than
-seams, because there is nothing on the other side to fetch harder. Both exist
-because `status="success"` has to mean CONTENT: as `success`, an empty body rendered
-an empty section under the "primary grading evidence" caveat, suppressed the
+seam. `blocked` / `js_wall` / `no_resolving_content` are pages we could not READ, and
+they remain the target of a future Tier-2 LLM-driven fetch pass. `empty_body` (a 200
+whose body is empty or whitespace-only) and `unsupported_type` (including a body whose
+declared charset decodes to mojibake) are bodies that carried no information — refusals
+rather than seams, because there is nothing on the other side to fetch harder. Both
+exist because `status="success"` has to mean CONTENT: as `success`, an empty body
+rendered an empty section under the "primary grading evidence" caveat, suppressed the
 "resolving page was unreachable" notice for every sibling URL, and reported `ok` to
 provider diagnostics.
+
+`no_resolving_content` is the newest of those seams and covers the page whose numbers
+are real but locked inside a third-party data embed — Infogram, Flourish or Tableau,
+detected in the RAW HTML by `unreadable_data_embed_providers` because trafilatura emits
+no iframe or embed-script URLs at any setting. Datawrapper is deliberately excluded from
+that scan since the Tier-2 hop reaches it. What happens next depends on how much page
+text came back, and the split is the point. Below
+`RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS` of extracted text the page is an embed SHELL
+and is withheld under this status, which costs nothing because everything archived below
+that floor is site chrome. Above the floor the page kept real prose, so the prose is
+rendered and one bracketed line says plainly that the figures inside the embeds are not
+in it. Both halves come from qids 44554/44556, where a Senate-forecast tracker returned
+HTTP 200, extracted 2.9k chars of background, and published under the primary-grading-
+evidence caveat with zero polling numbers in it — byte-identical across three questions,
+with the resolving average sitting in two Infogram iframes and nothing anywhere saying
+so. A page can also draw both verdicts at once and should: Tier-1
+`no_resolving_content` on the page next to a Tier-2 `success` on its Datawrapper
+dataset is the correct reading of a tracker whose prose we cannot use and whose series
+we can.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window).

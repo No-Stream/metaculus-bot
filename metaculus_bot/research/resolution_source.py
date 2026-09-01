@@ -17,7 +17,17 @@ the question will be graded against.
 
 Tier 1 is plain HTTP with browser-like headers, no LLM calls, no retries.
 Sites behind JS walls / heavy anti-bot remain deferred (see `FetchStatus` —
-`blocked` / `js_wall` results are retained in the returned list as that seam).
+`blocked` / `js_wall` / `no_resolving_content` results are retained in the
+returned list as that seam).
+
+A page whose numbers live in a third-party data embed we have no route to
+(Infogram / Flourish / Tableau) is handled two ways, by how much page text
+came back: an embed SHELL — extraction below
+`RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS`, i.e. chrome around the embed — is
+withheld as `no_resolving_content`, while a page that also carried real prose
+keeps it and gets a one-line disclosure that the embedded figures are not in
+that text (qids 44554/44556, whose tracker rendered 2.9k chars of forecast
+background as "primary grading evidence" with zero polling numbers in it).
 
 Tier 2 (2026-08, qids 44858/44841): when a fetched page's RAW HTML embeds a
 Datawrapper chart, fetch that chart's live "Get the data" CSV — poll trackers
@@ -72,6 +82,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
     RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S,
     RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS,
+    RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS,
     RESOLUTION_SOURCE_ENABLED_ENV,
     RESOLUTION_SOURCE_GLOBAL_CONCURRENCY,
     RESOLUTION_SOURCE_HTTP_TIMEOUT,
@@ -95,6 +106,7 @@ from metaculus_bot.research.http_fetch import (
     extract_datawrapper_charts,
     parse_http_last_modified,
     read_body_capped,
+    unreadable_data_embed_providers,
 )
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -299,6 +311,48 @@ def looks_like_js_wall(text: str) -> bool:
     """A 200 OK whose extracted text is shorter than the JS-wall threshold is a
     strong signal the page needs JS to render — Tier-2 candidate."""
     return len(text.strip()) < RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
+
+
+def looks_like_embed_shell(text: str) -> bool:
+    """True when an extraction is too thin to be anything but scaffolding around an embed.
+
+    Only consulted for pages that DO reference a routeless data embed, because the
+    threshold sits well above the JS-wall floor and would otherwise withhold terse
+    real pages. See the constant for the archive calibration; trafilatura's own
+    precision filter drops most embed credit blocks ("Created with Infogram" and
+    friends), so the char floor carries this on its own and no boilerplate-pattern
+    list is needed.
+    """
+    return len(text.strip()) < RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
+
+
+def _unreadable_embed_disclosure(providers: list[str]) -> str:
+    """The one-line note a rendered page carries when it hides figures in an embed.
+
+    Forecaster-facing and deliberately plain: the section it sits in is captioned
+    "primary grading evidence", so a page whose resolving numbers are NOT in the
+    text has to say so or the caveat overstates what was retrieved. No count of
+    embeds — one embed can be referenced by both a container div and a loader
+    script, and an overstated count in evidence prose is its own small fabrication.
+    """
+    return (
+        f"[This page displays data through {', '.join(providers)} embed(s) that this fetch cannot read — "
+        f"any figures shown inside them are NOT in the text above.]"
+    )
+
+
+def _page_text_with_embed_disclosure(extracted: str, url: str, providers: list[str]) -> str:
+    """Per-URL-capped page text, with the unreadable-embed disclosure appended.
+
+    The disclosure is budgeted out of the cap rather than added on top (same shape
+    as the Tier-2 dataset lead) so the per-URL bound still holds, and it is appended
+    AFTER truncation so the truncation marker cannot swallow it.
+    """
+    if not providers:
+        return _truncate_with_marker(extracted, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
+    disclosure = _unreadable_embed_disclosure(providers)
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(disclosure) - 2
+    return f"{_truncate_with_marker(extracted, body_cap, url)}\n\n{disclosure}"
 
 
 def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -> tuple[list[str], int]:
@@ -549,7 +603,7 @@ def _resolution_status_outcome(status: int, current_url: str, content_type: str)
 
 
 async def _resolution_html_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult:
-    """Trafilatura extraction plus the JS-wall check, carrying any Datawrapper embeds along."""
+    """Trafilatura extraction plus the embed-shell and JS-wall checks, carrying embeds along."""
     status = resp.status
     netloc = urlparse(current_url).netloc
     body = await read_body_capped(
@@ -573,8 +627,26 @@ async def _resolution_html_outcome(resp: Any, current_url: str, content_type: st
     # embeds are still findable; the page's main text is
     # trafilatura's to decode, which is why no vacuity check
     # runs on this branch (an empty extraction is `js_wall`).
-    charts = extract_datawrapper_charts(decode_text_body(body, content_type)[0])
+    html_text = decode_text_body(body, content_type)[0]
+    charts = extract_datawrapper_charts(html_text)
+    unreadable_embeds = unreadable_data_embed_providers(html_text)
     extracted = await asyncio.to_thread(_extract_main_text, body, current_url)
+    # Embed-shell verdict FIRST, and it is the more specific one: a page whose
+    # numbers sit in a routeless embed and whose extraction is chrome tells us
+    # where the content is, which `js_wall` ("needs JS for anything") does not.
+    # Datawrapper is exempt from the embed scan (it has the Tier-2 hop), so a
+    # walled tracker still comes back `js_wall` and still hops.
+    if unreadable_embeds and looks_like_embed_shell(extracted or ""):
+        logger.info(f"resolution_source fetched {netloc} (no_resolving_content: {unreadable_embeds})")
+        return FetchResult(
+            url=current_url,
+            status="no_resolving_content",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+            datawrapper_charts=charts,
+            unreadable_embeds=unreadable_embeds,
+        )
     # An empty extraction on a 200 OK is a JS-wall (SPA that
     # rendered client-side, cookie/consent gate, etc.) —
     # exactly the Tier-2 candidate signal. Treat identically
@@ -589,15 +661,17 @@ async def _resolution_html_outcome(resp: Any, current_url: str, content_type: st
             http_status=status,
             content_type=content_type or None,
             datawrapper_charts=charts,
+            unreadable_embeds=unreadable_embeds,
         )
     logger.info(f"resolution_source fetched {netloc} (success)")
     return FetchResult(
         url=current_url,
         status="success",
-        text=_truncate_with_marker(extracted, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, current_url),
+        text=_page_text_with_embed_disclosure(extracted, current_url, unreadable_embeds),
         http_status=status,
         content_type=content_type or None,
         datawrapper_charts=charts,
+        unreadable_embeds=unreadable_embeds,
     )
 
 

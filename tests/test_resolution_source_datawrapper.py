@@ -95,6 +95,25 @@ def _tracker_page_html(*chart_ids: str) -> bytes:
     ).encode()
 
 
+def _embed_shell_page_with_datawrapper(chart_id: str) -> bytes:
+    """Chrome around BOTH an Infogram embed (no route) and a Datawrapper one (the hop).
+
+    The Tier-1 verdict on the page and the Tier-2 verdict on the dataset are
+    independent: the page carries numbers we cannot read, AND the chart's live CSV
+    is served. Withholding the page must not withhold the dataset.
+    """
+    return (
+        "<!doctype html><html><head><title>Tracker</title></head><body>"
+        "<article><h1>Poll tracker</h1>"
+        '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive"></div>'
+        f'<div id="datawrapper-iframe" data-attrs="{{&quot;url&quot;:&quot;'
+        f"https://datawrapper.dwcdn.net/{chart_id}/11/&quot;,"
+        f'&quot;title&quot;:&quot;Tracker chart {chart_id}&quot;}}"></div>'
+        "<p>Charts update whenever new qualifying polls are released.</p>"
+        "</article></body></html>"
+    ).encode()
+
+
 def _csv_body(n_rows: int) -> str:
     lines = ["modeldate,approve,disapprove"]
     lines.extend(f"day-{i:04d},38.5,57.9" for i in range(n_rows))
@@ -849,6 +868,56 @@ def _mock_question(criteria: str) -> MagicMock:
     q.question_text = "tracker question"
     q.page_url = "https://metaculus.com/q/998"
     return q
+
+
+class TestEmbedShellPageStillHops:
+    """The two tiers are independent verdicts. A page whose own text is embed chrome is
+    withheld (`no_resolving_content`), and that must not touch the Datawrapper hop the
+    page also exposes — the dataset is the resolving series those pages exist to serve."""
+
+    async def test_a_withheld_shell_page_still_serves_its_dataset(self, monkeypatch):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(
+                    200, body=_embed_shell_page_with_datawrapper(CHART_ID), content_type="text/html"
+                ),
+                DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL])
+
+        assert [r.status for r in results] == ["no_resolving_content", "success"]
+        assert results[0].unreadable_embeds == ["infogram"]
+        out = format_resolution_sections(results, datetime.now(UTC))
+        assert "day-0019,38.5,57.9" in out  # the dataset renders
+        assert f"### {PAGE_URL}" not in out  # the shell page does not
+        assert "no_resolving_content" in out  # and the loss is named
+
+    async def test_a_datawrapper_only_shell_is_still_js_wall(self, monkeypatch):
+        """Datawrapper is exempt from the routeless-embed scan because the hop reaches it,
+        so a JS-walled tracker keeps reporting `js_wall` — the status that names a page we
+        could not read at all rather than one hiding data behind a provider with no route."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        shell = (
+            '<!doctype html><html><body><div id="root"></div>'
+            '<div data-attrs="{&quot;url&quot;:&quot;'
+            f'https://datawrapper.dwcdn.net/{CHART_ID}/11/&quot;}}"></div></body></html>'
+        ).encode()
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=shell, content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL])
+
+        assert [r.status for r in results] == ["js_wall", "success"]
+        assert results[0].unreadable_embeds == []
 
 
 class TestProviderEndToEnd:
