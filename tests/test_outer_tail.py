@@ -167,6 +167,18 @@ class TestStarvedOuterTail:
         assert reading.starved is False
         assert reading.tail_mass is None
 
+    def test_an_anchor_inside_the_last_bin_leaves_no_band_to_measure(self):
+        # The declared anchor (median 630.0) sits below the displayed ceiling of 630.5, so this
+        # is not the declared-beyond-bound shape — but no bin lies FULLY beyond it. A partially
+        # covered bin would inflate the band's mass without inflating its bin count, and the
+        # ratio between those two is the whole measurement, so the side reports EMPTY_BAND
+        # rather than a floor multiple read off half a bin.
+        reading = _high_side(_rig_count_record(band_bin_multiple=1.12, declared_top=(629.9, 630.0, 630.1)))
+        assert reading.verdict is OuterTailVerdict.EMPTY_BAND
+        assert reading.starved is False
+        assert reading.band_bins is None
+        assert reading.floor_multiple is None
+
     def test_the_low_side_mirror_fires_on_a_starved_floor(self):
         # The same geometry read from below: the bins under the declared p1 (568) at 1.2x the
         # min step, with the canonical 1% below the displayed floor.
@@ -202,14 +214,31 @@ class TestStarvedOuterTail:
         assert _high_side(record).verdict is OuterTailVerdict.NO_MEMBER_CURVE
 
     def test_a_curve_whose_shared_anchor_is_not_extreme_is_unmeasurable(self):
-        # A trimmed recovery can leave the members sharing only their p50. Reading the band as
-        # "everything above the median" would call almost every record starved.
+        # A trimmed recovery can leave the members sharing only their p50. A band read as
+        # "everything above the median" spans about half the grid, so its mean per-bin mass
+        # lands tens of times above the platform minimum and the side would read HEALTHY
+        # however starved its terminal bins are — the false clean bill of health this
+        # requirement exists to refuse.
         record = _rig_count_record(band_bin_multiple=1.12)
         record["per_model_numeric_percentiles"] = {
             "model-0": [[10.0, 575.0], [50.0, 586.0]],
             "model-1": [[50.0, 586.0], [99.0, 603.0]],
         }
         assert _high_side(record).verdict is OuterTailVerdict.ANCHOR_NOT_EXTREME
+
+    def test_members_sharing_no_percentile_label_are_unmeasurable(self):
+        # Recovered curves need not agree on their labels: the canonical set changed mid-season
+        # (11-point p2.5..p97.5 -> 13-point p1..p99), so an intersection can come back EMPTY.
+        # Medianing p99 against p97.5 would average two different quantities, so the side
+        # reports NO_SHARED_ANCHOR instead of picking one member's label.
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "model-0": [[1.0, 566.0], [50.0, 586.0], [99.0, 603.0]],
+            "model-1": [[2.5, 567.0], [40.0, 584.0], [97.5, 602.0]],
+        }
+        reading = _high_side(record)
+        assert reading.verdict is OuterTailVerdict.NO_SHARED_ANCHOR
+        assert reading.declared_percentile is None
 
     def test_anonymous_forecaster_keys_are_excluded_from_the_anchor(self):
         # On a stacker-fired record the positional `Forecaster N` bucket holds the stacker's

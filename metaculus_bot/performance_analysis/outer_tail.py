@@ -71,11 +71,16 @@ from metaculus_bot.performance_analysis.scoring import numeric_log_score
 # Receipts: scratch/next_season_bundle_2026-09/item19/.
 STARVED_OUTER_TAIL_FLOOR_MULTIPLE: float = 2.0
 
-# The band is measured from the most extreme percentile EVERY member declared, and that
-# anchor has to actually be a tail anchor. A trimmed comment can leave the members sharing
-# only their p50, and reading the band as "everything above the median" would call almost
-# every record starved. Applied symmetrically: the low side needs an anchor at or below
-# ``100 - this``. The canonical sets both clear it (p99 today, p97.5 in the 11-point era).
+# The band is measured from the most extreme percentile EVERY member declared, and that anchor
+# has to actually be a tail anchor. A trimmed comment can leave the members sharing only their
+# p50, and a band read as "everything above the median" spans about half the grid, so its mean
+# per-bin mass sits tens of times above the platform minimum and the side reads HEALTHY however
+# starved its terminal bins are: measured 61.5x on the q45218 geometry, whose top 27 bins do sit
+# at the floor, and 98.0x on a plain ramp, against a trigger of 2.0x. So lowering this constant
+# does not over-flag — it turns a disclosed ``ANCHOR_NOT_EXTREME`` into an affirmative clean
+# bill of health, which is the one thing the verdict enum exists to prevent. Applied
+# symmetrically: the low side needs an anchor at or below ``100 - this``. The canonical sets
+# both clear it (p99 today, p97.5 in the 11-point era).
 STARVED_OUTER_TAIL_MIN_ANCHOR_PERCENTILE: float = 90.0
 
 # The platform's per-bin minimum step is ``round(0.01 / N, 9)`` where N = cdf_size - 1 (see
@@ -188,8 +193,14 @@ class OuterTailScan:
 
 
 def _flat_zone_sort_key(reading: OuterTailReading) -> float:
-    """Worst-first key. Only measured readings are ranked, so the fallback never applies."""
-    return reading.flat_zone_log_score if reading.flat_zone_log_score is not None else 0.0
+    """Worst-first key over STARVED readings, every one of which carries a measurement.
+
+    Asserted rather than defaulted: 0.0 is the most FAVOURABLE key this table can hold, so a
+    broken invariant would sort an unmeasured side to the top of a worst-first list instead of
+    saying anything. The assert also narrows the type for the checker.
+    """
+    assert reading.flat_zone_log_score is not None, f"unmeasured reading ranked: {reading!r}"
+    return reading.flat_zone_log_score
 
 
 def _member_declared_anchors(record: dict) -> dict[str, dict[float, float]]:
@@ -330,7 +341,9 @@ def _measure_one_outer_tail(
     *,
     floor_multiple: float,
 ) -> OuterTailReading:
-    scaling = record.get("scaling") or {}
+    # Reached only when cdf_and_grid succeeded, which required both bounds, so the sub-dict is
+    # there — the sibling _flat_zone_log_score reads it the same way.
+    scaling = record["scaling"]
     if float(scaling["range_max"]) <= float(scaling["range_min"]):
         # A degenerate range has no bins to score; the same guard numeric_pit_analysis applies.
         return _unmeasurable(record, side, OuterTailVerdict.NO_USABLE_CDF)
