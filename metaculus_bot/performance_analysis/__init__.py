@@ -92,8 +92,8 @@ from metaculus_bot.performance_analysis.stacker_detection import (
 )
 
 # The standing scoring-exclusion cohorts, re-exported so a round script can reach them
-# without knowing they live in the width monitor. Every private copy of these ids has
-# drifted from the canonical set at least once.
+# without knowing they live in the width monitor — retyping the ids is what the constants
+# exist to stop.
 from metaculus_bot.performance_analysis.width_monitor import (
     DEGRADED_RUN_QIDS,
     EXCLUSION_COHORTS,

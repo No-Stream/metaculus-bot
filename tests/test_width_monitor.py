@@ -768,6 +768,11 @@ class TestDegradedRunCohorts:
             parse_exclude_qids("degraded")
         with pytest.raises(ValueError, match="known_bug"):
             parse_exclude_qids("43800,knownbug")
+        # str.isdigit() alone accepts a fullwidth digit, which would pass the guard and then
+        # match no question id: exactly the silent no-op the guard exists to prevent.
+        fullwidth_43800 = "".join(chr(0xFF10 + int(digit)) for digit in "43800")
+        with pytest.raises(ValueError, match="neither a question id"):
+            parse_exclude_qids(fullwidth_43800)
 
     def test_a_degraded_run_question_actually_leaves_the_rows(self):
         """End-to-end through the metrics: the constant is only worth anything if the id

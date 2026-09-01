@@ -37,8 +37,9 @@ stale archive silently drops recent questions and receipts. Non-negotiable first
   `KNOWN_BUG_QIDS`, `DEGRADED_RUN_QIDS` (dry-key 1-of-3), `PARTIAL_DEGRADED_QIDS` (2-of-3)
   from `metaculus_bot.performance_analysis` — the same sets the `known_bug` /
   `degraded_run` / `partial_degraded` `--exclude-qids` shorthands expand to. Three rounds
-  hardcoded private copies before the constants existed and at least one drifted. Excluded
-  from headline aggregates, reported separately — never silently dropped.
+  hardcoded private copies of the degraded ids before the constants existed, and the
+  known-bug copies have drifted from the canonical set at least once. Excluded from
+  headline aggregates, reported separately — never silently dropped.
 - Diff vs prior round (`new_since_prior.json`): the new cohort is what the round is about.
 - Spot-check re-pull stability (a handful of prior spot-peer scores must reproduce).
 

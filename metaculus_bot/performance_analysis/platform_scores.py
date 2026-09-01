@@ -5,12 +5,13 @@ project carries ``score_type=spot_peer_tournament``, every question's
 ``default_score_type`` is ``spot_peer``, and ``spot_scoring_time`` equals
 ``actual_close_time`` on all 158 posts pulled.
 
-``peer_score`` on the same record is the COVERAGE-SCALED quantity — approximately
-``spot_peer_score x coverage``. The bot submits exactly once per question and never
-revises (forecast history length 1 on 157/158 posts), so its coverage is just whatever
-fraction of the open window that single submission happened to span, and the residual
-between the two scores is crowd movement between our submit and the close rather than
-anything the bot decided. Coverage scaling therefore FLATTERS misses and dulls hits
+``peer_score`` on the same record is the COVERAGE-SCALED quantity: ``spot_peer_score x
+coverage`` reproduces the platform's own ``peer_score`` to a median residual of 0.69
+points over the 30 records checked, and that residual is crowd movement in the 1.5-3h
+window between our submit and the close rather than anything the bot decided. The bot
+submits exactly once per question and never revises (forecast history length 1 on 157/158
+posts), so its coverage is just whatever fraction of the open window that single
+submission happened to span. Coverage scaling therefore FLATTERS misses and dulls hits
 (q44872: peer -15.0 against spot peer -38.8), which makes peer unusable as a ranking
 key — two records ordered by it are ordered partly by how early each was submitted.
 

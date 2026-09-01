@@ -196,7 +196,10 @@ def parse_exclude_qids(raw: str) -> frozenset[str]:
     """
     tokens = {token.strip() for token in raw.split(",") if token.strip()}
     cohort_names = tokens & EXCLUSION_COHORTS.keys()
-    unknown = sorted(t for t in tokens - cohort_names if not t.isdigit())
+    # ASCII-only digits: str.isdigit() also accepts fullwidth and superscript digits, which
+    # would pass this guard and then match no question id, i.e. the silent no-op it exists
+    # to prevent.
+    unknown = sorted(t for t in tokens - cohort_names if not (t.isascii() and t.isdigit()))
     if unknown:
         raise ValueError(
             f"--exclude-qids: {unknown} is neither a question id nor a cohort shorthand "
@@ -545,7 +548,8 @@ def compute_all_eras(
     table), so an exclusion is never silent. Pass one of the documented cohorts in
     ``EXCLUSION_COHORTS`` — ``KNOWN_BUG_QIDS`` (known pipeline bugs),
     ``DEGRADED_RUN_QIDS`` (dry-key 1-of-3 publishes) or ``PARTIAL_DEGRADED_QIDS``
-    (2-of-3) — rather than re-hardcoding ids; every private copy has drifted.
+    (2-of-3) — rather than re-hardcoding ids: the known-bug set's private copies have
+    already drifted, and three rounds retyped the degraded ids before they had a home.
     """
     if eras is None:
         eras = default_eras()

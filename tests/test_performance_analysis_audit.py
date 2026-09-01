@@ -1025,6 +1025,21 @@ class TestSpotPeerIsThePrimaryRankingKey:
         # complement mirrored, i.e. it would admit 8 and 9.
         assert {r["post_id"] for r in result} == {2, 3, 4, 5, 6, 7}
 
+    def test_middle_mode_drops_peer_only_records_rather_than_banding_two_quantities(self):
+        """A mixed cohort bands on spot alone. The peer-only records have no spot value to
+        place in the percentile band, and inserting them by their peer value would move the
+        band's own 20/80 edges using numbers from a different scale."""
+        records = []
+        for i in range(10):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"spot_peer_score": float(i)}
+            records.append(r)
+        peer_only = _binary_record(99, 0.5, True)
+        peer_only["metaculus_scores"] = {"peer_score": 4.0}  # would land mid-band on value
+        result = select_cohort([*records, peer_only], mode="middle", n_binary=20, n_numeric=0, n_mc=0, seed=42)
+        assert 99 not in {r["post_id"] for r in result}
+        assert {r["post_id"] for r in result} == {2, 3, 4, 5, 6, 7}
+
     def test_middle_mode_warns_when_it_has_to_band_on_coverage_scaled_peer(self, caplog):
         records = []
         for i in range(10):
