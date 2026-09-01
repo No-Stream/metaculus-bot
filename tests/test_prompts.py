@@ -672,6 +672,64 @@ class TestSourceProvenanceLadder:
         assert "centered near this value" in lowered
 
 
+class TestNullResultReadingClause:
+    """A search that found nothing licenses "could not find evidence of X", never
+    "X did not happen". On qid 44799 four of six forecasters read the gap-fill
+    resolver's "I found no authoritative public record" as "the permit is absent",
+    and the two members that discounted it scored best in the ensemble. Every base
+    forecaster prompt must carry the reading rule; the gap-fill analyzer carries the
+    auditor's version of it."""
+
+    def _assert_forecaster_clause_present(self, prompt: str) -> None:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        lowered = " ".join(prompt.lower().split())
+        assert "read a null search result as a null search result" in lowered
+        assert "could not find evidence of x" in lowered
+        # Coverage-conditioned strength, and the demonstrated-capability discount.
+        assert "weight the absence by how well the topic is covered" in lowered
+        assert "already demonstrated the capability" in lowered
+
+    def test_binary_prompt_carries_null_result_clause(self) -> None:
+        self._assert_forecaster_clause_present(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_carries_null_result_clause(self) -> None:
+        self._assert_forecaster_clause_present(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_carries_null_result_clause(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_forecaster_clause_present(result)
+
+    def test_clause_sits_with_the_evidence_weighting_rubric(self) -> None:
+        """The clause is an evidence-weighting rule, so it must land after the
+        Strong/Moderate/Weak rubric rather than displacing it."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        rubric_at = prompt.index("Weak: anecdotes")
+        clause_at = prompt.index("Read a null search result")
+        assert rubric_at < clause_at
+
+    def test_stacking_prompts_do_not_carry_the_clause(self) -> None:
+        """Scope guard: the clause ships to the base prompts only (stacking is
+        prod-disabled, so the diff stays minimal)."""
+        stacked = stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"])
+        assert "Read a null search result" not in stacked
+
+    def test_gap_fill_analyzer_carries_the_auditor_version(self) -> None:
+        """Auditor phrasing, not forecaster phrasing: the analyzer must not bank a
+        first-pass "found nothing" as an established negative, and must point the
+        gap at the authoritative place that would hold the record."""
+        prompt = gap_fill_analyzer_prompt(
+            "Will the permit be granted?",
+            "Resolves YES if the regulator lists the permit.",
+            "See the regulator's public register.",
+            "First pass: no authoritative public record found.",
+            is_benchmarking=False,
+        )
+        lowered = " ".join(prompt.lower().split())
+        assert "null results are search outcomes" in lowered
+        assert "not as an established negative fact" in lowered
+        assert "name that source in the search query" in lowered
+
+
 class TestStatusQuoDerivation:
     """Every forecaster prompt must open PHASE 0 with a mandatory status-quo
     DERIVATION — a question the model answers itself before reviewing any

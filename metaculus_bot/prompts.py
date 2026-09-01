@@ -452,6 +452,28 @@ _SOURCE_PROVENANCE_LADDER = """
                  corroborating sources is likely a transcription or translation error — flag it, don't anchor on it."""
 
 
+# How to read a searched-and-found-nothing result, shared verbatim across the three
+# forecaster prompts. On qid 44799 the gap-fill resolver reported "I found no
+# authoritative public record" and four of six forecasters converted that into
+# "the authorization is absent"; the two that discounted it scored best in the
+# ensemble. Same pre-indent contract as _SOURCE_PROVENANCE_LADDER above: every line
+# is at >= 15 spaces so clean_indents preserves the nesting in all three prompts
+# despite their differing baselines (binary 12, MC/numeric 8).
+_NULL_RESULT_READING = """
+               • Read a null search result as a null search result. "No record found", "no authoritative
+                 source located", or "could not confirm" licenses only "we could not find evidence of X" —
+                 it does NOT establish that X does not exist or did not happen. Never convert an absence of
+                 retrieved evidence into a positive finding of absence.
+               • Weight the absence by how well the topic is covered. Silence from a comprehensive,
+                 well-indexed source that this domain reliably reports through (a regulator's filing
+                 database, an official statistics release, an official registry) is real evidence, but only
+                 weak-to-moderate. Silence from general web search on a poorly-covered, local, or
+                 fast-moving topic is nearly no evidence at all.
+               • Absence is weaker still where the actor has already demonstrated the capability or behavior
+                 in question (same firm, same jurisdiction, same process) — there, a missing public record is
+                 more often a gap in reporting than a missing event."""
+
+
 # The liquidity/participation weighting sentence, appended to the shared strong-evidence
 # clause so every forecaster prompt tells the model to weight a crowd signal by how
 # informative it is (the prediction-market provider emits a per-market `signal` label
@@ -739,6 +761,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                  - Strong: multiple independent sources; clear causal mechanisms; strong precedent
                  - Moderate: one good source; indirect links; weak precedent
                  - Weak: anecdotes; speculative logic; volatile indicators
+{_NULL_RESULT_READING}
 
             5) Competing cases and red-teaming
                • Strongest Bear Case (No): most compelling, evidence-based argument for No.
@@ -868,6 +891,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
               - Strong: multiple independent sources; clear causality; strong precedent
               - Moderate: one good source; indirect links; weak precedent
               - Weak: anecdotes; speculative logic; volatile indicators
+{_NULL_RESULT_READING}
 
         (5) Strongest pro case for the currently most-likely option
             • Use weighted evidence and explicit causal chains.
@@ -1038,6 +1062,7 @@ def numeric_prompt(
             - Strong: multiple independent sources, clear causal links, strong precedent
             - Moderate: one good source, indirect links, weak precedent
             - Weak: anecdotes, speculative logic, volatile indicators
+{_NULL_RESULT_READING}
 
         (6) Tail scenarios
             - Coherent pathway for unusually low results.
@@ -1542,6 +1567,13 @@ def gap_fill_analyzer_prompt(
            than current search (e.g., no {datetime.now(UTC).year} data on a near-term question).
         9. Missing counter-evidence — first pass is one-sided; a "consider the
            opposite" search would strengthen the forecast.
+
+        NULL RESULTS ARE SEARCH OUTCOMES. Where the first pass says it searched and
+        found nothing ("no record found", "no authoritative source located"), treat that
+        as an open question, not as an established negative fact. If the missing record
+        is load-bearing, the gap is to look for it in the specific authoritative place
+        that would hold it — name that source in the search query — and to establish what
+        its silence there would and would not show.
 
         ORDER THE GAPS BY DECISION-RELEVANCE, most forecast-moving first. Before you
         finalize the list, compare the candidate gaps against each other and rank
