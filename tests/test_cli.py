@@ -42,7 +42,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from metaculus_bot.cli import _forecast_with_callback_drain
+from metaculus_bot.cli import RunMode, _forecast_with_callback_drain, _run_forecasts
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
@@ -401,6 +401,38 @@ class TestCliRoleSpendWiring:
         with patch("metaculus_bot.cli.drain_litellm_callbacks", drained), pytest.raises(RuntimeError):
             await _forecast_with_callback_drain(_boom)
         drained.assert_awaited_once_with()
+
+    @pytest.mark.parametrize(
+        "run_mode",
+        ["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"],
+    )
+    def test_every_run_mode_forecasts_through_the_callback_drain(self, run_mode: RunMode) -> None:
+        """Every mode goes through the one ``asyncio.run`` + drain in ``_run_forecasts``.
+
+        The drain used to be applied per mode, four times over, so a mode added without it
+        would still forecast and publish normally while silently reporting no per-role
+        spend. ``_question_source`` now hands back a factory and cannot run a loop of its
+        own, which is what this pins: the drain is awaited exactly once per mode.
+        """
+        bot = MagicMock()
+        bot.forecast_questions = AsyncMock(return_value=["report"])
+        bot.forecast_on_tournament = AsyncMock(return_value=["report"])
+        drained = AsyncMock()
+
+        with (
+            patch("metaculus_bot.cli.MetaculusApi", MagicMock()),
+            patch("metaculus_bot.cli.check_tournament_dates"),
+            patch("metaculus_bot.cli.drain_litellm_callbacks", drained),
+        ):
+            assert _run_forecasts(bot, run_mode) == ["report"]
+
+        drained.assert_awaited_once_with()
+
+    def test_an_unknown_run_mode_raises_before_any_spend(self) -> None:
+        """The invalid-mode guard has to fire while resolving the source, i.e. before the
+        loop starts and before any question is fetched."""
+        with pytest.raises(ValueError, match="Invalid run mode"):
+            _run_forecasts(MagicMock(), "not_a_mode")  # type: ignore[arg-type]
 
 
 class TestCliFallCupReminderExit:
