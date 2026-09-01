@@ -5,6 +5,8 @@ import re
 from datetime import UTC, date, datetime, timedelta
 from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from urllib.error import URLError
+from xml.etree.ElementTree import ParseError
 
 import numpy as np
 import pandas as pd
@@ -1088,7 +1090,9 @@ class TestFredFirstReleaseTable:
     """
 
     @staticmethod
-    def _fred_mock(current: pd.Series, first_releases: pd.Series | None) -> MagicMock:
+    def _fred_mock(
+        current: pd.Series, first_releases: pd.Series | None, vintage_error: Exception | None = None
+    ) -> MagicMock:
         """A fredapi mock whose get_series answers the plain and initial-release calls.
 
         The initial-release call is the one carrying ``output_type``; recorded on
@@ -1100,7 +1104,7 @@ class TestFredFirstReleaseTable:
             if "output_type" in kwargs:
                 first_release_calls.append(kwargs)
                 if first_releases is None:
-                    raise ValueError("Bad Request. Invalid output_type.")
+                    raise vintage_error or ValueError("Bad Request. Invalid output_type.")
                 return first_releases
             return current
 
@@ -1121,14 +1125,14 @@ class TestFredFirstReleaseTable:
         *,
         is_resolving_source: bool,
         first_releases: pd.Series | None = None,
-        vintage_call_fails: bool = False,
+        vintage_error: Exception | None = None,
     ) -> tuple[str, MagicMock]:
         current = _monthly_fred(self._CURRENT)
-        if vintage_call_fails:
+        if vintage_error is not None:
             releases = None
         else:
             releases = _monthly_fred(self._FIRST) if first_releases is None else first_releases
-        instance = self._fred_mock(current, releases)
+        instance = self._fred_mock(current, releases, vintage_error)
         with patch("metaculus_bot.research.financial_data.Fred", return_value=instance) as fred_class:
             fred_class.earliest_realtime_start = "1776-07-04"
             fred_class.latest_realtime_end = "9999-12-31"
@@ -1182,9 +1186,23 @@ class TestFredFirstReleaseTable:
         assert "### DGS10" in markdown
         assert instance.first_release_calls == []
 
-    def test_a_failed_vintage_fetch_leaves_the_primary_block_standing(self) -> None:
-        """The table is enrichment; the series itself is the source."""
-        markdown, instance = self._fetch(is_resolving_source=True, vintage_call_fails=True)
+    @pytest.mark.parametrize(
+        "vintage_error",
+        [
+            # fredapi re-raises the API's own error message as ValueError...
+            ValueError("Bad Request. Invalid output_type."),
+            # ...a transport failure arrives as URLError, an OSError...
+            URLError("connection reset"),
+            # ...and a non-XML body (a proxy or status page answering instead) reaches
+            # ET.fromstring, whose ParseError is a SyntaxError and matches neither above.
+            ParseError("syntax error: line 1, column 0"),
+        ],
+        ids=["api_error", "transport", "unparseable_body"],
+    )
+    def test_a_failed_vintage_fetch_leaves_the_primary_block_standing(self, vintage_error: Exception) -> None:
+        """The table is enrichment; the series itself is the source, and no failure mode of
+        the extra call may take it down."""
+        markdown, instance = self._fetch(is_resolving_source=True, vintage_error=vintage_error)
 
         assert "- Latest value: 331.893 (2026-06-01)" in markdown
         assert "First release vs current vintage" not in markdown

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 from urllib.parse import unquote
+from xml.etree.ElementTree import ParseError
 
 import pandas as pd
 import yfinance
@@ -1007,9 +1008,12 @@ def _fetch_fred_first_releases(fred: Fred, series_id: str, observation_start: pd
     that the latest rendered observation is present, so if that reading of the parameter
     interaction is ever wrong the table is dropped rather than rendered stale.
 
-    ``None`` on any FRED error (``fredapi`` raises ``ValueError`` carrying the API's own
-    message; transport failures arrive as ``OSError``/``URLError``) so the series' primary
-    block still renders — this table is enrichment, not the source itself.
+    ``None`` on any FRED error, so the series' primary block still renders — this table is
+    enrichment and must never be able to take the source itself down. The three ways this
+    call can fail are ``ValueError`` (``fredapi`` re-raises the API's own error message that
+    way), ``OSError`` (``URLError``/``HTTPError`` transport failures), and ``ParseError``
+    (``fredapi`` runs ``ET.fromstring`` over the response body, including an error body,
+    which is not XML if a proxy or status page answers instead).
     """
     try:
         first_releases = fred.get_series(
@@ -1019,7 +1023,7 @@ def _fetch_fred_first_releases(fred: Fred, series_id: str, observation_start: pd
             realtime_start=Fred.earliest_realtime_start,
             realtime_end=Fred.latest_realtime_end,
         )
-    except (ValueError, OSError):
+    except (ValueError, OSError, ParseError):
         logger.warning(f"FRED first-release (ALFRED vintage) fetch failed for {series_id=}", exc_info=True)
         return None
     cleaned = first_releases.dropna()
