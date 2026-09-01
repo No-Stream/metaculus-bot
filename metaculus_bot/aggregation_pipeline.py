@@ -207,7 +207,7 @@ class AggregationPipeline:
                 f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
             )
 
-        prediction = build_numeric_distribution(percentile_list, question, zero_point)
+        prediction = build_numeric_distribution(percentile_list, question, zero_point, model_name=stacker_llm.model)
         log_open_bound_piling_diagnostics(prediction, question, stacker_llm.model, percentile_list)
         log_final_prediction(prediction, question)
         logger.info(f"Stacked numeric prediction for {page_url}")

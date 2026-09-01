@@ -379,7 +379,7 @@ async def _dispatch_stacker(
             raise UnitMismatchError(
                 f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
             )
-        prediction = build_numeric_distribution(percentile_list, question, zero_point)
+        prediction = build_numeric_distribution(percentile_list, question, zero_point, model_name=stacker_llm.model)
         return prediction, meta_text
     raise ValueError(f"Unsupported question type for stacking: {type(question).__name__}")
 

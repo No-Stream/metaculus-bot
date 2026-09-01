@@ -301,7 +301,9 @@ def _build_guarded_numeric_distribution(
         declared_percentiles, question, model_name=forecaster_llm.model
     )
 
-    prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
+    prediction = build_numeric_distribution(
+        sanitized_percentiles, question, zero_point, model_name=forecaster_llm.model
+    )
 
     mismatch, reason = detect_unit_mismatch(sanitized_percentiles, question)
     if mismatch:

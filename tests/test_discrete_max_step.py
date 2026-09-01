@@ -1,32 +1,39 @@
-"""Regression tests for the discrete-grid max-step bug.
+"""Regression tests for the two discrete-grid max-step bugs.
 
-`generate_pchip_cdf` used to hard-code the 201-point-grid max-step constant
-(`NUM_MAX_STEP = 0.2`) inside `safe_cdf_bounds`, even when resampling a
-per-model CDF onto a coarse discrete grid (`cdf_size < 201`). On a 9-point grid
-the server's own max-step is `0.2 * 200 / (cdf_size - 1) = 5.0` (effectively
-unconstrained), so the 0.2 cap wrongly clipped every integer's probability to
-20% and shoved the excess mass onto higher integers — a systematic upward shift
-on small-count questions (e.g. Q38880).
+**Wrong cap (2026-06).** `generate_pchip_cdf` used to hard-code the 201-point-grid
+max-step constant (`NUM_MAX_STEP = 0.2`) inside `safe_cdf_bounds`, even when resampling a
+per-model CDF onto a coarse discrete grid (`cdf_size < 201`). On a 9-point grid the
+server's own max-step is `0.2 * 200 / (cdf_size - 1) = 5.0` (effectively unconstrained),
+so the 0.2 cap wrongly clipped every integer's probability to 20% and shoved the excess
+mass onto higher integers — a systematic upward shift on small-count questions (e.g.
+Q38880). `grid_step_constraints` now scales the cap with the grid.
 
-These tests pin the corrected behaviour: the max-step passed to the CDF builder
-scales with the grid, so a concentrated low-count distribution keeps its mass on
-the low integers.
+**Wrong destination for the excess (2026-08).** On a FINE grid the 0.2 cap is the
+platform's own and correctly binds, but `_redistribute_excess_probability` handed the
+clipped excess out in proportion to each bin's SLACK — near-uniform on a grid whose other
+bins are near-empty. q45065 published 47% of its mass above 35 deaths where all three
+forecasters had declared ~2%. Packing is nearest-first now
+(`_pack_excess_nearest_first`), and the two regimes are pinned against each other here:
+a coarse grid must not redistribute at all, a fine grid must keep the excess adjacent.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.constants import NUM_MAX_STEP
+from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
 from metaculus_bot.numeric.config import grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from metaculus_bot.numeric.pchip_processing import generate_pchip_cdf_with_smoothing
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+
+_PCHIP_LOGGER = "metaculus_bot.numeric.pchip_cdf"
 
 # grok's actual concentrated declared percentiles for Q38880 (count 0-7,
 # open upper), padded to the 13 canonical percentiles. P(0) faithful ~0.3.
@@ -45,6 +52,10 @@ _CONCENTRATED_LOW_COUNT: list[tuple[float, float]] = [
     (0.975, 5.20),
     (0.99, 6.60),
 ]
+
+
+def _smear_markers(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "CDF_MAXSTEP_SMEAR:" in r.getMessage()]
 
 
 def _discrete_count_question(**overrides) -> NumericQuestion:
@@ -166,3 +177,158 @@ class TestBuildNumericDistributionDiscrete:
 
         ref_at_grid = np.interp(grid_x, ref_x, ref_cdf)
         assert np.allclose(probs, ref_at_grid, atol=0.03)
+
+    def test_coarse_grid_never_reaches_the_max_step_repair(self, caplog):
+        """The relaxed coarse-grid cap means the repair does not fire at all there.
+
+        This is the guard that keeps the two regimes from crossing: nothing about
+        nearest-first packing may reintroduce clipping on a grid whose server cap is 1.0.
+        """
+        question = _discrete_count_question()
+        percentiles = [Percentile(percentile=p, value=v) for p, v in _CONCENTRATED_LOW_COUNT]
+        sanitized, zero_point = sanitize_percentiles(percentiles, question)
+
+        with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
+            build_numeric_distribution(sanitized, question, zero_point, model_name="some/forecaster")
+
+        assert not _smear_markers(caplog)
+
+
+# claude-opus-4.8's actual declared percentiles for q45065 (post 44916, "how many deaths
+# will the U.S. government officially report", resolved 14.0). All three triple-era
+# forecasters declared a near point-mass on 14; opus put 0.718 in the (13.5, 14.5] bin,
+# which the platform's 0.2 cap cannot hold. Receipts: residual round q45065_capbug.md.
+_Q45065_OPUS_PERCENTILES: list[tuple[float, float]] = [
+    (0.01, 12.4),
+    (0.025, 12.9),
+    (0.05, 13.2),
+    (0.10, 13.5),
+    (0.20, 13.8),
+    (0.40, 13.96),
+    (0.50, 14.0),
+    (0.60, 14.08),
+    (0.80, 14.4),
+    (0.90, 15.0),
+    (0.95, 16.2),
+    (0.975, 18.0),
+    (0.99, 20.5),
+]
+
+# (13.5, 14.5] on linspace(9.5, 209.5, 201), i.e. the integer count 14 that resolved.
+_Q45065_RESOLUTION_BIN = 4
+
+
+def _q45065_question(**overrides) -> NumericQuestion:
+    """201-point grid over [9.5, 209.5] — one bin per integer count 10..209, both bounds open."""
+    base: dict[str, Any] = {
+        "id_of_question": 45065,
+        "id_of_post": 44916,
+        "page_url": "https://www.metaculus.com/questions/44916/",
+        "question_text": "How many deaths will the U.S. government officially report?",
+        "background_info": "",
+        "resolution_criteria": "",
+        "fine_print": "",
+        "published_time": None,
+        "close_time": None,
+        "lower_bound": 9.5,
+        "upper_bound": 209.5,
+        "open_lower_bound": True,
+        "open_upper_bound": True,
+        "unit_of_measure": "deaths",
+        "zero_point": None,
+        "cdf_size": 201,
+    }
+    base.update(overrides)
+    return NumericQuestion(**base)
+
+
+class TestQ45065NearestFirstPacking:
+    """The fine-grid half of the family: the cap is right, its old destination was not.
+
+    Under slack-proportional redistribution opus's clipped 0.518 spread near-uniformly over
+    ~198 bins, so the published ensemble asserted a 47% chance of 35+ deaths against the
+    forecasters' own ~2%. The realized score barely noticed (the answer landed in the
+    declared bin) but a one-bin miss priced at +100 to +400 peer points, which is what these
+    pins protect.
+    """
+
+    _MODEL: ClassVar[str] = "openrouter/anthropic/claude-opus-4.8"
+
+    def _build(self) -> np.ndarray:
+        question = _q45065_question()
+        declared = [Percentile(percentile=p, value=v) for p, v in _Q45065_OPUS_PERCENTILES]
+        sanitized, zero_point = sanitize_percentiles(declared, question, model_name=self._MODEL)
+        prediction = build_numeric_distribution(sanitized, question, zero_point, model_name=self._MODEL)
+        probs = np.asarray([p.percentile for p in prediction.get_cdf()], dtype=float)
+        assert len(probs) == 201
+        return np.diff(probs)
+
+    def test_resolving_bin_sits_exactly_at_the_platform_cap(self):
+        steps = self._build()
+        assert float(steps[_Q45065_RESOLUTION_BIN]) == pytest.approx(NUM_MAX_STEP, abs=1e-9)
+
+    def test_declared_spike_stays_within_two_bins_of_the_resolution(self):
+        lo, hi = _Q45065_RESOLUTION_BIN - 2, _Q45065_RESOLUTION_BIN + 3
+        near = float(self._build()[lo:hi].sum())
+        # Declared ~0.74 in this window; slack-proportional redistribution left ~0.43.
+        assert near >= 0.60, f"only {near:.4f} of mass within +-2 bins of the resolution"
+
+    def test_far_tail_no_longer_carries_the_displaced_mass(self):
+        steps = self._build()
+        far = float(steps[_Q45065_RESOLUTION_BIN + 21 :].sum())
+        # 0.458 of opus's clipped mass used to land here (>= 35 deaths); declared ~0.02.
+        assert far <= 0.05, f"{far:.4f} of mass landed 21+ bins above the resolution"
+
+    def test_submission_constraints_hold(self):
+        steps = self._build()
+        assert float(steps.max()) <= NUM_MAX_STEP + 1e-12
+        assert float(steps.min()) >= NUM_MIN_PROB_STEP - 1e-12
+        assert np.all(steps >= 0.0)
+
+    def test_marker_names_the_forecaster_and_where_the_mass_went(self, caplog):
+        question = _q45065_question()
+        declared = [Percentile(percentile=p, value=v) for p, v in _Q45065_OPUS_PERCENTILES]
+        sanitized, zero_point = sanitize_percentiles(declared, question, model_name=self._MODEL)
+
+        with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
+            build_numeric_distribution(sanitized, question, zero_point, model_name=self._MODEL)
+
+        markers = _smear_markers(caplog)
+        assert len(markers) == 1
+        assert f"question={question.id_of_question}" in markers[0]
+        assert f"model={self._MODEL}" in markers[0]
+        assert "over_cap_bins=1" in markers[0]
+        # The displacement fields are what make the packing policy auditable from the log.
+        assert "max_offset_bins=2" in markers[0]
+
+    def test_ordinary_declaration_emits_no_marker(self, caplog):
+        """A declaration wide enough to clear the cap must leave the log clean.
+
+        Without this the WARN would read as routine and stop being a signal.
+        """
+        question = _q45065_question()
+        wide = [(p, 20.0 + 150.0 * p) for p, _v in _Q45065_OPUS_PERCENTILES]
+        declared = [Percentile(percentile=p, value=v) for p, v in wide]
+        sanitized, zero_point = sanitize_percentiles(declared, question, model_name=self._MODEL)
+
+        with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
+            prediction = build_numeric_distribution(sanitized, question, zero_point, model_name=self._MODEL)
+
+        steps = np.diff(np.asarray([p.percentile for p in prediction.get_cdf()], dtype=float))
+        assert float(steps.max()) < NUM_MAX_STEP
+        assert not _smear_markers(caplog)
+
+    def test_coarse_grid_never_reaches_the_max_step_repair(self, caplog):
+        """The relaxed coarse-grid cap means the repair does not fire at all there.
+
+        This is the guard that keeps the two regimes from crossing: nothing about
+        nearest-first packing may reintroduce clipping on a grid whose server cap is 1.0.
+        """
+        question = _discrete_count_question()
+        percentiles = [Percentile(percentile=p, value=v) for p, v in _CONCENTRATED_LOW_COUNT]
+        sanitized, zero_point = sanitize_percentiles(percentiles, question)
+
+        with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
+            build_numeric_distribution(sanitized, question, zero_point, model_name="some/forecaster")
+
+        assert not _smear_markers(caplog)

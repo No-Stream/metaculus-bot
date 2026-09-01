@@ -110,6 +110,8 @@ def _postprocess_ensemble_cdf(
             open_upper=question.open_upper_bound,
             min_step=min_step_required,
             max_step=max_step_required,
+            question_id=getattr(question, "id_of_question", None),
+            model_name=f"ensemble_{method_label}",
         )
 
         declared_percentiles = [
@@ -145,6 +147,7 @@ def _postprocess_ensemble_cdf(
         num_points=target_cdf_size,
         question_id=getattr(question, "id_of_question", None),
         question_url=getattr(question, "page_url", None),
+        model_name=f"ensemble_{method_label}",
     )
 
     x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)

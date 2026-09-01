@@ -82,14 +82,22 @@ def build_numeric_distribution(
     percentile_list: list[Percentile],
     question: NumericQuestion,
     zero_point: float | None,
+    *,
+    model_name: str = "",
 ) -> NumericDistribution:
-    """Create a numeric distribution, falling back to a heuristic on failure."""
+    """Create a numeric distribution, falling back to a heuristic on failure.
+
+    ``model_name`` only labels the ``CDF_MAXSTEP_SMEAR`` marker (whose declaration the
+    platform's per-bin cap had to clip), the same way ``sanitize_percentiles`` labels
+    ``NUMERIC_DEGENERATE_DECLARATION``.
+    """
 
     try:
         pchip_cdf, _smoothing_applied, _aggressive = generate_pchip_cdf_with_smoothing(
             percentile_list,
             question,
             zero_point,
+            model_name=model_name,
         )
         prediction = create_pchip_numeric_distribution(pchip_cdf, percentile_list, question, zero_point)
     # Documented soft-fail boundary: ANY PCHIP build failure delegates the CDF to
@@ -97,7 +105,7 @@ def build_numeric_distribution(
     # recoverable build failure into a dropped forecast.
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         log_pchip_fallback(question, exc)
-        prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point)
+        prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point, model_name=model_name)
 
     validate_cdf_construction(prediction, question)
 
@@ -117,6 +125,7 @@ def build_numeric_distribution(
             num_points=target_cdf_size,
             question_id=getattr(question, "id_of_question", None),
             question_url=getattr(question, "page_url", None),
+            model_name=model_name,
         )
         x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)
         declared_percentiles = [

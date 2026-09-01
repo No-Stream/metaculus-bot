@@ -611,6 +611,21 @@ SPREAD_UNDEFINED_LINE = (
     "SPREAD_UNDEFINED: question=45363 qtype=numeric denominator=-0 models=3 — key-percentile spread "
     "is unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement"
 )
+# Verbatim bytes from replaying q45065's opus-4.8 declaration through
+# build_numeric_distribution (numeric/pchip_cdf.py safe_cdf_bounds), and from the
+# conc21_closed snap golden in tests/test_discrete_snap.py.
+CDF_MAXSTEP_SMEAR_LINE = (
+    "2026-08-31 23:02:02,257 - metaculus_bot.numeric.pchip_cdf - WARNING - "
+    "CDF_MAXSTEP_SMEAR: question=45065 model=openrouter/anthropic/claude-opus-4.8 "
+    "clipped_mass=0.517852 over_cap_bins=1 bins_displaced=4 max_offset_bins=2 "
+    "pre_max_step=0.717852 max_step=0.200000"
+)
+CDF_MAXSTEP_SMEAR_ENSEMBLE_LINE = (
+    "2026-08-31 23:02:02,258 - metaculus_bot.numeric.pchip_cdf - WARNING - "
+    "CDF_MAXSTEP_SMEAR: question=None model=ensemble_discrete_snap "
+    "clipped_mass=0.399018 over_cap_bins=3 bins_displaced=4 max_offset_bins=1 "
+    "pre_max_step=0.499480 max_step=0.200000"
+)
 NUMERIC_PCHIP_FALLBACK_LINE = (
     "2026-06-11 21:14:03,512 - metaculus_bot.numeric.diagnostics - WARNING - "
     "Question 43913: PCHIP CDF construction failed (Percentile values must be strictly increasing), "
@@ -677,6 +692,40 @@ class TestNumericAggregateGridMismatch:
         rec = _parse_one(NUMERIC_AGGREGATE_GRID_MISMATCH_LINE)
         assert rec["qid"] == 44620
         assert rec["qid_kind"] == "question_id"
+
+
+class TestCdfMaxstepSmear:
+    """The repair that reshaped 47% of q45065's published mass while logging at DEBUG.
+
+    Not alertable — the per-bin cap is the platform's — but the two displacement fields
+    are what make the repair's own POLICY auditable after the fact, which is exactly
+    what was missing when the smear was diagnosed a month after the forecast resolved.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(CDF_MAXSTEP_SMEAR_LINE)
+        assert rec["marker"] == "cdf_maxstep_smear"
+        assert rec["model"] == "openrouter/anthropic/claude-opus-4.8"
+        assert rec["clipped_mass"] == pytest.approx(0.517852)
+        assert rec["over_cap_bins"] == 1
+        assert rec["bins_displaced"] == 4
+        assert rec["max_offset_bins"] == 2
+        assert rec["pre_max_step"] == pytest.approx(0.717852)
+        assert rec["max_step"] == pytest.approx(0.2)
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(CDF_MAXSTEP_SMEAR_LINE)
+        assert rec["qid"] == 45065
+        assert rec["qid_kind"] == "question_id"
+
+    def test_ensemble_stage_label_and_absent_question(self):
+        # The aggregation stages have no forecaster to name, so they label the stage; a
+        # caller with no question in scope renders "None", which must coerce to a real
+        # absent field rather than the string.
+        rec = _parse_one(CDF_MAXSTEP_SMEAR_ENSEMBLE_LINE)
+        assert rec["model"] == "ensemble_discrete_snap"
+        assert rec["qid"] is None
+        assert rec["over_cap_bins"] == 3
 
 
 class TestNumericPchipFallback:

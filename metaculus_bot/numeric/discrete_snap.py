@@ -141,11 +141,13 @@ def snap_cdf_to_integers(
     *,
     open_lower_bound: bool,
     open_upper_bound: bool,
+    question_id: int | str | None = None,
 ) -> list[float] | None:
     """Convert a smooth 201-point CDF to a step function at integer boundaries.
 
     Returns snapped CDF values (list of 201 floats), or None if snapping
-    should be skipped (too many integers, etc.).
+    should be skipped (too many integers, etc.). ``question_id`` only labels the
+    ``CDF_MAXSTEP_SMEAR`` marker ``safe_cdf_bounds`` may emit below.
     """
     n_points = len(cdf_values)
     x_grid = np.linspace(lower_bound, upper_bound, n_points)
@@ -169,7 +171,13 @@ def snap_cdf_to_integers(
     # --- Step 4: Max-step redistribution + boundary pinning ---
     # safe_cdf_bounds handles max-step, boundary constraints, and a final min-step re-enforcement;
     # the uniform mixture above remains the primary min-step mechanism
-    enforced_cdf = safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound)
+    enforced_cdf = safe_cdf_bounds(
+        mixed_cdf,
+        open_lower_bound,
+        open_upper_bound,
+        question_id=question_id,
+        model_name="ensemble_discrete_snap",
+    )
 
     # Guard: uniform mixture may not satisfy min-step for very concentrated distributions
     diffs = np.diff(enforced_cdf)
@@ -222,6 +230,7 @@ def snap_distribution_to_integers(
         upper_bound=question.upper_bound,
         open_lower_bound=question.open_lower_bound,
         open_upper_bound=question.open_upper_bound,
+        question_id=getattr(question, "id_of_question", None),
     )
 
     if snapped_cdf is None:

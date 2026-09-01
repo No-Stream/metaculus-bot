@@ -169,6 +169,45 @@ class TestSafeCdfBounds:
         assert all(step <= NUM_MAX_STEP + 1e-6 for step in steps), f"Steps: {steps}"
         assert result[-1] - result[0] == pytest.approx(1.0, rel=1e-9)
 
+    def test_over_cap_excess_lands_next_to_the_spike(self):
+        """The clipped excess is packed nearest-first, not spread across the whole grid.
+
+        Regression for q45065: a spike the platform cap cannot hold used to be handed out
+        in proportion to every bin's SLACK, and on a 201-point grid where every other bin
+        is near-empty that is a near-uniform spread — 88% of the displaced mass landed 21+
+        bins away. The cap is the platform's; where the excess goes is ours.
+        """
+        n_bins = 200
+        background = 0.3 / (n_bins - 1)
+        steps = np.full(n_bins, background)
+        steps[100] = 0.7
+        cdf = np.concatenate([[0.0], np.cumsum(steps)])
+
+        result = safe_cdf_bounds(cdf, open_lower=False, open_upper=False)
+        out = np.diff(result)
+
+        assert float(out.max()) <= NUM_MAX_STEP + 1e-12
+        assert result[-1] - result[0] == pytest.approx(1.0, rel=1e-9)
+        # Rings 1 and 2 absorb everything: 3 bins at the cap plus a split remainder.
+        assert float(out[99:102].sum()) == pytest.approx(3 * NUM_MAX_STEP)
+        assert float(out[98:103].sum()) == pytest.approx(0.7 + 4 * background, abs=1e-9)
+        # Symmetric declaration, symmetric remainder — no one-sided tail at the last ring.
+        assert float(out[98]) == pytest.approx(float(out[102]))
+        # Untouched far bins are the anti-smear assertion: the retired policy lifted every
+        # one of them by roughly excess/n_bins.
+        for far in (0, 50, 150, n_bins - 1):
+            assert float(out[far]) == pytest.approx(background)
+
+    def test_grid_too_short_to_hold_the_mass_raises(self):
+        """Four bins at a 0.2 cap hold 0.8; a full unit of mass has nowhere to go.
+
+        Unreachable on a real submission (the server's own cap scales so capacity is always
+        >= 1.0), but the repair must fail loudly rather than silently drop the remainder.
+        """
+        cdf = np.array([0.0, 0.9, 0.95, 0.98, 1.0])
+        with pytest.raises(RuntimeError, match="Failed to redistribute CDF probability mass"):
+            safe_cdf_bounds(cdf, open_lower=False, open_upper=False, min_step=1e-4, max_step=0.2)
+
     def test_open_lower_flat_prefix_min_step_reenforced(self):
         """Regression: pinning cdf[0] to 0.001 + cummax flattens any sub-0.001
         prefix into 0-step bins, violating the 5e-5 server min-step. The

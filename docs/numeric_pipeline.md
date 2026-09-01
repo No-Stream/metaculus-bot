@@ -174,6 +174,26 @@ forward-then-backward sweep to guarantee every adjacent pair is at least one min
 apart. `_apply_ramp_smoothing` (`pchip_processing.py`) is a final tilt that adds a
 tiny linear ramp when the raw CDF still has a sub-min-step bin.
 
+**Where the clipped excess goes is our choice, and it is nearest-first.**
+`_pack_excess_nearest_first` clips each over-cap bin and pours its excess into the
+adjacent bins with headroom, walking outward one ring at a time and splitting the
+remainder across a ring in proportion to each side's room. The retired policy handed the
+excess out in proportion to every bin's *slack*, which on a fine grid where the other
+bins are near-empty is a near-uniform spread: q45065 had all three forecasters declare
+~0.72 on the count that resolved, and published 47% of its mass above 35 deaths against
+their own ~2%. The cap itself is the platform's and is untouched — a 0.72 single-bin mass
+is simply not expressible on a 201-point grid — so the honest repair is the legal shape
+closest to the declaration. Every clip emits a `CDF_MAXSTEP_SMEAR` WARN naming the
+forecaster, the mass displaced, and how far it travelled (`scripts/telemetry/markers.py`
+harvests it); it is deliberately **not** alertable, since a spike above a platform cap is
+a forecaster's declaration rather than a bot defect.
+
+`safe_cdf_bounds` is the single choke point for this: the per-model build
+(`generate_pchip_cdf`), the per-model ramp pass, the ensemble CDF
+(`_postprocess_ensemble_cdf`, both branches), the discrete integer snap, the
+forecasting-tools fallback builder, and the offline pooling paths all reach the max-step
+rule through it, so the packing policy has exactly one implementation.
+
 ### Open vs. closed bounds: a one-sided constraint, not a box
 
 This is the subtle part. Bound pinning is **one-sided per tail**, not a clamp on
