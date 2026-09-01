@@ -619,14 +619,14 @@ async def _resolution_html_outcome(resp: Any, current_url: str, content_type: st
             http_status=status,
             content_type=content_type or None,
         )
-    # Datawrapper embeds are only visible in the RAW HTML —
+    # Both embed scans are only possible on the RAW HTML —
     # trafilatura drops iframes and embed scripts at every
-    # setting — so the scan runs on the raw body, before
-    # (and regardless of) main-text extraction. Decoded
-    # through the shared helper so a BOM'd / non-UTF-8 page's
-    # embeds are still findable; the page's main text is
-    # trafilatura's to decode, which is why no vacuity check
-    # runs on this branch (an empty extraction is `js_wall`).
+    # setting — so they run on the raw body, before (and
+    # regardless of) main-text extraction. Decoded through the
+    # shared helper so a BOM'd / non-UTF-8 page's embeds are
+    # still findable; the page's main text is trafilatura's to
+    # decode, which is why no vacuity check runs on this branch
+    # (a thin extraction is classified below instead).
     html_text = decode_text_body(body, content_type)[0]
     charts = extract_datawrapper_charts(html_text)
     unreadable_embeds = unreadable_data_embed_providers(html_text)
