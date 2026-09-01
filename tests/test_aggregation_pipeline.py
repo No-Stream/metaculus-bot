@@ -619,13 +619,14 @@ class TestThinPublishFloorInBaseCombine:
         assert not [r for r in caplog.records if "THIN_PUBLISH_FLOOR" in r.getMessage()]
 
     @pytest.mark.asyncio
-    async def test_a_fired_stack_clears_a_stale_single_forecaster_reason(self):
-        # Every path that decides an outcome overwrites ``outcomes[qid]``, but only the
-        # skip paths write ``skip_reasons``, so an entry orphaned by a crash between
-        # routing and comment-building (which is where it is popped) could outlive its
-        # question. Were the same qid then stacked on the same pipeline, its lone
-        # pre-stacked output would meet a stale ``single_forecaster`` and be floored. The
-        # stacked path therefore clears the reason when it fires.
+    async def test_a_fired_stack_leaves_the_skip_reason_untouched(self):
+        """The floor only READS ``skip_reasons``; no aggregation path writes or clears it.
+
+        ``skip_reasons`` belongs to the routing step and to the comment builder that pops
+        it, and the stacked path deliberately stays out of it. Mutating it here to defend
+        against a reason orphaned by a mid-run crash would cost the reachable case
+        instead: see ``test_a_discarded_stack_attempt_leaves_a_sibling_reports_reason``.
+        """
         pipeline = _make_pipeline()
         question = _make_binary_question(qid=907)
         pipeline.skip_reasons[907] = "single_forecaster"
@@ -638,12 +639,51 @@ class TestThinPublishFloorInBaseCombine:
             stacked = await pipeline.aggregate(
                 predictions=[0.02, 0.04], question=question, research="research", reasoned_predictions=reasoned
             )
-        assert 907 not in pipeline.skip_reasons
+
+        assert stacked == 0.03
+        assert pipeline.skip_reasons[907] == "single_forecaster"
         assert pipeline.outcomes[907] == "primary"
 
+    @pytest.mark.asyncio
+    async def test_a_discarded_stack_attempt_leaves_a_sibling_reports_reason(self, caplog):
+        """A failed stack must not consume the reason another report legitimately wrote.
+
+        ``research_reports_per_question > 1`` (no entrypoint configures it, but the
+        framework supports it and this bot sets ``required_successful_predictions=0.0``,
+        so a partial report survival still publishes) has every report share ONE pipeline
+        instance. Report A survives on a single forecaster and writes
+        ``single_forecaster``; report B tries to stack, raises, and its whole task is
+        dropped from ``valid_prediction_set``. The framework then flattens report A's lone
+        value into one base combine, where that reason is the only thing left saying the
+        published value has no aggregation behind it — so it has to still be there, and
+        still be there afterwards for the STACKER_SKIP_REASON comment marker.
+        """
+        pipeline = _make_pipeline(stacking_fallback_on_failure=False)
+        question = _make_binary_question(qid=911)
+        pipeline.skip_reasons[911] = "single_forecaster"  # report A's routing
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
+            ReasonedPrediction(prediction_value=0.30, reasoning="Model: m1\n\nmid"),
+            ReasonedPrediction(prediction_value=0.60, reasoning="Model: m2\n\nmid"),
+        ]
+
+        with (
+            patch.object(pipeline, "run_stacking", new=AsyncMock(side_effect=RuntimeError("stacker down"))),
+            pytest.raises(RuntimeError),
+        ):
+            await pipeline.aggregate(  # report B, discarded
+                predictions=[0.30, 0.60], question=question, research="research", reasoned_predictions=reasoned
+            )
+        assert pipeline.skip_reasons[911] == "single_forecaster"
+
         pipeline.register_expected_base_combine(question)
-        republished = await pipeline.aggregate(predictions=[stacked], question=question, research=None)
-        assert republished == 0.03
+        with caplog.at_level("WARNING", logger="metaculus_bot.aggregation_pipeline"):
+            published = await pipeline.aggregate(predictions=[0.03], question=question, research=None)
+
+        assert published == THIN_PUBLISH_BINARY_FLOOR
+        assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("THIN_PUBLISH_FLOOR:")] == [
+            "THIN_PUBLISH_FLOOR: question=911 raw=0.0300 clamped=0.0500 survivors=1"
+        ]
+        assert pipeline.skip_reasons[911] == "single_forecaster"
 
     @pytest.mark.asyncio
     async def test_a_lone_mc_survivor_is_returned_as_is(self):

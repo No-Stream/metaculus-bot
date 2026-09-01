@@ -41,7 +41,11 @@ the memo's headline gemini row (7 extreme, 3 lone). Receipts:
 ``scratch/next_season_bundle_2026-09/item15/``.
 
 The band is a MEASUREMENT boundary here: this module reads probabilities and returns
-strings, and never changes a forecast.
+strings, and never changes a forecast. ``THIN_PUBLISH_BINARY_FLOOR`` / ``_CEIL`` alias the
+same two constants and DO clamp a published probability, but that is a separate rule keyed
+on the survivor count and wired in ``aggregation_pipeline.py``; the two share one
+definition of "extreme" so the exposure this marker measures and the price that rule pays
+cannot drift apart.
 """
 
 from __future__ import annotations
