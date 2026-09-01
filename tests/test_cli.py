@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
 
 from metaculus_bot.cli import RunMode, _forecast_with_callback_drain, _run_forecasts
@@ -50,7 +51,7 @@ from metaculus_bot.constants import (
     PROVIDER_DEGRADATION_SUPPRESSED_UNTIL,
     credit_alerts_active,
 )
-from metaculus_bot.credit_telemetry import DonatedKeyState, reset_donated_key_state_cache
+from metaculus_bot.credit_telemetry import DonatedKeyState, RoleSpendTracker, reset_donated_key_state_cache
 from metaculus_bot.fallback_openrouter import (
     reset_credit_key_fallback_count,
     reset_donated_404_fallback_count,
@@ -201,6 +202,14 @@ def _cli_main_test_mode(
             # anyway to keep the test surface small.
             patch.object(type(stub_bot), "log_report_summary", create=True, return_value=None),
             patch("metaculus_bot.cli.CreditTelemetry", return_value=stub_telemetry),
+            # The real install appends a RoleSpendTracker to litellm's process-global
+            # callbacks list, and nothing here would remove it — so every test driving
+            # cli_main used to leak one into the rest of the session. That breaks the
+            # invariant test_credit_telemetry's clean_role_ledger fixture states, and it
+            # made that file's test_install_is_idempotent pass on the leaked instance
+            # instead of on one it installed itself. The tests that assert the install
+            # HAPPENED patch this same name again, one layer in (TestCliRoleSpendWiring).
+            patch("metaculus_bot.cli.install_role_spend_tracker"),
         ):
             yield stub_telemetry
     finally:
@@ -368,6 +377,18 @@ class TestCliRoleSpendWiring:
             cli_main()
         install.assert_called_once_with()
         log_roles.assert_called_once_with()
+
+    def test_driving_cli_main_leaves_no_tracker_in_litellms_globals(self) -> None:
+        """The harness must not leak the process-global callback the real install adds.
+
+        ``install_role_spend_tracker`` is stubbed in ``_cli_main_test_mode`` for exactly
+        this reason; without the stub a run of this suite left a live RoleSpendTracker
+        registered for every later test in the session.
+        """
+        before = sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks)
+        with _cli_main_test_mode(alertable_count=0):
+            cli_main()
+        assert sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks) == before
 
     def test_ledger_logged_when_forecasting_crashes(self) -> None:
         def _crash(*_args: object, **_kwargs: object) -> None:
