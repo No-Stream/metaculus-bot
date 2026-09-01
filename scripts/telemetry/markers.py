@@ -101,7 +101,8 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   end-of-run breakdown, emitted on EVERY path — degraded, fully-suppressed green,
   crashed, and fully clean — so the archive holds one record per run; the ``clean``
   variant is the 2026-08-25 addition that keeps a healthy run in the census)
-* ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
+* ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_ROLE_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
+  (``CREDIT_ROLE_SPEND`` is per-RUN, per-(role, key): where the run's OpenRouter dollars went)
 * ``STACKER_OUTCOME`` / ``STACKER_SKIP_REASON`` / ``TOOLS_USED`` /
   ``ANCHOR_OVERSHOOT_PP`` / ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
 
@@ -909,6 +910,22 @@ MARKER_SPECS: list[MarkerSpec] = [
         re.compile(
             r"CREDIT_SPEND:\s*key=(?P<key>\S+)\s+run_delta_usd=(?P<run_delta_usd>\S+)\s+remaining=(?P<remaining>\S+)"
             r"(?:\s+source=(?P<source>\S+))?"
+        ),
+    ),
+    MarkerSpec(
+        "credit_role_spend",
+        # Per-(role, key) decomposition of the run's OpenRouter spend, read off
+        # OpenRouter's own per-call usage accounting (credit_telemetry.py "Per-role
+        # dollar attribution"). ``usd`` is ``n/a`` when no call of that row carried cost
+        # data — never a fabricated zero — and ``costed_calls`` says how many of
+        # ``calls`` the sum covers. ``byok_usd`` is the upstream-provider component,
+        # i.e. the part the donated key books as ``byok_usage``; the personal key is
+        # not BYOK, so its rows carry ``byok_usd=0.0000``. Roles are the names in
+        # ``credit_telemetry.llm_call_metadata`` (``forecaster:<vendor>``, ``parser``,
+        # ``native_search``, ...); ``untagged`` means a completion nobody stamped.
+        re.compile(
+            r"CREDIT_ROLE_SPEND:\s*role=(?P<role>\S+)\s+key=(?P<key>\S+)\s+usd=(?P<usd>\S+)\s+calls=(?P<calls>\d+)"
+            r"\s+costed_calls=(?P<costed_calls>\d+)\s+byok_usd=(?P<byok_usd>\S+)"
         ),
     ),
     MarkerSpec(

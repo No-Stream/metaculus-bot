@@ -49,6 +49,7 @@ from metaculus_bot.constants import (
     PERPLEXITY_WALL_TIMEOUT,
     RESEARCH_PROVIDER_ENV,
 )
+from metaculus_bot.credit_telemetry import llm_call_metadata, plain_llm_key_alias
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.prompts import web_research_prompt
@@ -415,7 +416,12 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
         # the personal key while the orchestrator's switches. The real fix is to
         # collapse the two builders (forge flagged the duplication); until then, don't
         # "clean up" this asymmetry by deleting the orchestrator's api_key argument.
-        model = GeneralLlm(model=model_name, temperature=None, allowed_tries=1)
+        model = GeneralLlm(
+            model=model_name,
+            temperature=None,
+            allowed_tries=1,
+            metadata=llm_call_metadata("perplexity_research", plain_llm_key_alias(model_name)),
+        )
         # Exclude prediction markets research when benchmarking to avoid data leakage
         prediction_markets_instruction = (
             "" if is_benchmarking else "In addition to news, consider all relevant prediction markets.\n"
@@ -441,11 +447,15 @@ def build_native_search_llm(
     *,
     reasoning_effort: str | None = None,
     verbosity: str | None = None,
+    role: str = "native_search",
 ) -> GeneralLlm:
     """Build a GeneralLlm configured for OpenAI native web search via OpenRouter.
 
     Shared by the native search research provider, the targeted research module,
-    and the gap-fill resolver.
+    and the gap-fill resolver. ``role`` is the CREDIT_ROLE_SPEND line the completions
+    book under: the provider keeps the default, the other two callers pass their own
+    (``targeted_search`` / ``gap_fill_resolver``) so the three search spend lines stay
+    separable in the run log.
 
     Reasoning effort and verbosity come from the global NATIVE_SEARCH_REASONING_EFFORT
     / NATIVE_SEARCH_VERBOSITY env at call time (so workflow overrides take effect
@@ -461,6 +471,7 @@ def build_native_search_llm(
 
     kwargs: dict = {
         "model": model_with_search,
+        "role": role,
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
         # kept to pin provider-default sampling against a future default flip. reasoning

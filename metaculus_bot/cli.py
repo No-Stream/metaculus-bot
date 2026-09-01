@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from forecasting_tools import MetaculusApi
@@ -20,7 +21,13 @@ from metaculus_bot.constants import (
     credit_alerts_active,
     env_flag_enabled,
 )
-from metaculus_bot.credit_telemetry import CreditTelemetry, get_probed_donated_key_state
+from metaculus_bot.credit_telemetry import (
+    CreditTelemetry,
+    drain_litellm_callbacks,
+    get_probed_donated_key_state,
+    install_role_spend_tracker,
+    log_role_spend,
+)
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
     get_credit_key_fallback_count,
@@ -100,6 +107,22 @@ def _parse_run_mode() -> RunMode:
     return run_mode
 
 
+async def _forecast_with_callback_drain(start_forecast: Callable[[], Awaitable[list[Any]]]) -> list[Any]:
+    """Run one forecast coroutine, then drain litellm's success callbacks on the SAME loop.
+
+    The ``CREDIT_ROLE_SPEND`` ledger is fed by a litellm callback that the logging worker
+    delivers a tick after each completion, on the loop the completion ran on; the worker's
+    queue is bound to that loop and ``asyncio.run`` tears it down on return, so the drain
+    cannot sit beside ``log_role_spend`` in ``main``'s ``finally`` — it has to happen here.
+    Takes a factory rather than a coroutine so the coroutine is created inside the loop it
+    runs on (and so a test stub that closes this wrapper unrun leaves nothing un-awaited).
+    """
+    try:
+        return await start_forecast()
+    finally:
+        await drain_litellm_callbacks()
+
+
 def _forecast_test_questions(template_bot: TemplateForecaster) -> list[Any]:
     """Forecast the evergreen example set, or a TEST_QUESTIONS_OVERRIDE list."""
     EXAMPLE_QUESTIONS = [
@@ -123,7 +146,9 @@ def _forecast_test_questions(template_bot: TemplateForecaster) -> list[Any]:
             len(override_urls),
         )
     questions = [MetaculusApi.get_question_by_url(url) for url in question_urls]
-    return asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
+    return asyncio.run(
+        _forecast_with_callback_drain(lambda: template_bot.forecast_questions(questions, return_exceptions=True))
+    )
 
 
 def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
@@ -136,18 +161,28 @@ def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[
         check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return asyncio.run(template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True))
+        return asyncio.run(
+            _forecast_with_callback_drain(
+                lambda: template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
+            )
+        )
     if run_mode == "minibench":
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
         return asyncio.run(
-            template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+            _forecast_with_callback_drain(
+                lambda: template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+            )
         )
     if run_mode in ("quarterly_cup", "metaculus_cup"):
         # The metaculus cup is a good way to test the bot's performance on regularly open questions
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return asyncio.run(template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True))
+        return asyncio.run(
+            _forecast_with_callback_drain(
+                lambda: template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
+            )
+        )
     if run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
         return _forecast_test_questions(template_bot)
@@ -212,6 +247,13 @@ def main() -> None:
     # on the shared donated key durably grep-able. The end fetch runs in a
     # finally so a crashed run still logs its spend; the floor check result is
     # consumed AFTER forecasting/publishing below (reminder signal, not abort).
+    #
+    # The per-role ledger (CREDIT_ROLE_SPEND) rides the same finally. Its tracker is a
+    # litellm success callback, installed here before the first completion; the
+    # callbacks themselves are drained inside the forecast loop
+    # (_forecast_with_callback_drain), so by the time log_role_spend runs every
+    # completion of the run has been booked.
+    install_role_spend_tracker()
     credit_telemetry = CreditTelemetry()
     credit_telemetry.log_start()
     donated_below_floor = False
@@ -219,6 +261,7 @@ def main() -> None:
         forecast_reports = _run_forecasts(template_bot, run_mode)
     finally:
         donated_below_floor = credit_telemetry.log_end_and_check_floor()
+        log_role_spend()
         # Flush inside the finally: records accumulate in memory for the whole run,
         # so an exception escaping asyncio.run (an OSError, the invalid-run-mode
         # ValueError above, a KeyboardInterrupt, the 300-minute timeout-minutes

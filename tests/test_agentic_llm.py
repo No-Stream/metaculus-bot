@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from metaculus_bot import fallback_openrouter
+from metaculus_bot.credit_telemetry import DONATED_KEY_ALIAS, PERSONAL_KEY_ALIAS, llm_call_metadata
 from metaculus_bot.research.agentic import llm as agentic_llm
 from metaculus_bot.research.agentic.types import LoopConfig
 
@@ -136,6 +137,36 @@ class TestKeyRouting:
         first, second = acompletion.await_args_list
         assert first.kwargs["api_key"] == _DONATED
         assert second.kwargs["api_key"] == _PERSONAL
+
+    @pytest.mark.asyncio
+    async def test_credit_role_metadata_names_the_key_each_attempt_bills(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The raw-acompletion transport stamps the CREDIT_ROLE_SPEND tag itself, per call,
+        so a donated→personal fallback books its spend on the key that actually paid."""
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: True)
+        monkeypatch.setattr(agentic_llm, "should_retry_with_general_key", lambda exc: True)
+        acompletion.side_effect = [RuntimeError("401 unauthorized: invalid api key"), {"ok": True}]
+
+        await agentic_llm.build_default_llm_call(_config())(_messages(), None)
+
+        first, second = acompletion.await_args_list
+        assert first.kwargs["metadata"] == llm_call_metadata(agentic_llm.GAP_FILL_V2_DRIVER_ROLE, DONATED_KEY_ALIAS)
+        assert second.kwargs["metadata"] == llm_call_metadata(agentic_llm.GAP_FILL_V2_DRIVER_ROLE, PERSONAL_KEY_ALIAS)
+
+    @pytest.mark.asyncio
+    async def test_credit_role_metadata_on_the_single_key_path(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_keys(monkeypatch, donated=None, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: False)
+
+        await agentic_llm.build_default_llm_call(_config())(_messages(), None)
+
+        assert _last_kwargs(acompletion)["metadata"] == llm_call_metadata(
+            agentic_llm.GAP_FILL_V2_DRIVER_ROLE, PERSONAL_KEY_ALIAS
+        )
 
     @pytest.mark.asyncio
     async def test_fallback_is_counted_and_logged_like_the_wrapper(

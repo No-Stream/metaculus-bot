@@ -8,7 +8,15 @@ from litellm.exceptions import APIError, RateLimitError
 
 from metaculus_bot import fallback_openrouter
 from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE
-from metaculus_bot.credit_telemetry import DonatedKeyState, reset_donated_key_state_cache
+from metaculus_bot.credit_telemetry import (
+    DIRECT_KEY_ALIAS,
+    DONATED_KEY_ALIAS,
+    PERSONAL_KEY_ALIAS,
+    UNTAGGED_ROLE,
+    DonatedKeyState,
+    llm_call_metadata,
+    reset_donated_key_state_cache,
+)
 from metaculus_bot.fallback_openrouter import (
     DONATED_KEY_PROVIDERS,
     FallbackOpenRouterLlm,
@@ -902,6 +910,54 @@ class TestBuilder:
         monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)
         llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.5-flash")
         assert isinstance(llm, FallbackOpenRouterLlm)
+
+
+class TestRoleTagging:
+    """Every LLM the builder returns carries the ``CREDIT_ROLE_SPEND`` metadata tag, stamped
+    with the key that instance actually bills — the ledger's join onto ``CREDIT_SPEND key=``
+    depends on the alias being right per branch, not just present."""
+
+    def test_wrapper_tags_primary_donated_and_secondary_personal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        llm = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5.1", role="parser")
+        assert isinstance(llm, FallbackOpenRouterLlm)
+        assert llm.litellm_kwargs["metadata"] == llm_call_metadata("parser", DONATED_KEY_ALIAS)
+        assert llm._secondary_llm is not None
+        assert llm._secondary_llm.litellm_kwargs["metadata"] == llm_call_metadata("parser", PERSONAL_KEY_ALIAS)
+
+    def test_single_key_branch_tags_whichever_key_it_uses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OAI_ANTH_OPENROUTER_KEY", raising=False)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        personal_only = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5.1", role="summarizer")
+        assert personal_only.litellm_kwargs["metadata"] == llm_call_metadata("summarizer", PERSONAL_KEY_ALIAS)
+
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        donated_only = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5.1", role="summarizer")
+        assert donated_only.litellm_kwargs["metadata"] == llm_call_metadata("summarizer", DONATED_KEY_ALIAS)
+
+    def test_plain_branch_tags_personal_for_openrouter_and_direct_otherwise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        # Blocklisted google pro is pinned to the personal key with no donated attempt.
+        pinned = build_llm_with_openrouter_fallback(
+            "openrouter/google/gemini-3.1-pro-preview", role="forecaster:google"
+        )
+        assert not isinstance(pinned, FallbackOpenRouterLlm)
+        assert pinned.litellm_kwargs["metadata"] == llm_call_metadata("forecaster:google", PERSONAL_KEY_ALIAS)
+        # A non-OpenRouter slug bills its own provider's key: outside the ledger's remit,
+        # but still counted under a label that says so.
+        direct = build_llm_with_openrouter_fallback("perplexity/sonar-reasoning", role="perplexity_research")
+        assert direct.litellm_kwargs["metadata"] == llm_call_metadata("perplexity_research", DIRECT_KEY_ALIAS)
+
+    def test_missing_role_books_as_untagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        llm = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5.1")
+        assert llm.litellm_kwargs["metadata"]["role"] == UNTAGGED_ROLE
 
 
 class TestDeprecationTripwire:

@@ -820,6 +820,7 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
     """
     classifier_llm = build_llm_with_openrouter_fallback(
         model=FINANCIAL_CLASSIFIER_MODEL,
+        role="financial_classifier",
         # temperature=None defers reasoning models to provider defaults; redundant
         # on ft 0.2.92 (GeneralLlm ctor default is already None). No top_p.
         temperature=None,

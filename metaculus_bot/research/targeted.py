@@ -101,7 +101,7 @@ async def run_targeted_search(crux: str, question_text: str, *, is_benchmarking:
     Returns:
         Search results with inline citations addressing the crux.
     """
-    llm = build_native_search_llm()
+    llm = build_native_search_llm(role="targeted_search")
     prompt = targeted_search_prompt(crux, question_text, is_benchmarking=is_benchmarking)
     logger.info(f"Running targeted search via {llm.model} for crux: {crux[:100]}...")
     # Wall-clock backstop (now owned by invoke_with_transient_retry): shares
@@ -198,6 +198,7 @@ async def _run_analyzer(
 
     llm = build_llm_with_openrouter_fallback(
         model=GAP_FILL_ANALYZER_MODEL,
+        role="gap_fill_analyzer",
         reasoning={"effort": "low"},
         # temperature=None defers reasoning models to provider defaults; redundant
         # on ft 0.2.92 (GeneralLlm ctor default is already None). No top_p.
@@ -255,7 +256,9 @@ async def _resolve_single_gap(
         question_text=question_text,
         is_benchmarking=is_benchmarking,
     )
-    llm = build_native_search_llm(GAP_FILL_RESOLVER_MODEL, reasoning_effort=GAP_FILL_RESOLVER_REASONING_EFFORT)
+    llm = build_native_search_llm(
+        GAP_FILL_RESOLVER_MODEL, reasoning_effort=GAP_FILL_RESOLVER_REASONING_EFFORT, role="gap_fill_resolver"
+    )
     # Wall-clock backstop (now owned by invoke_with_transient_retry) shared with
     # the native_search provider / targeted search (same build_native_search_llm
     # config); the wall_timeout is the hard cap regardless of upstream

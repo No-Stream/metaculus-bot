@@ -16,7 +16,13 @@ needs real keys. Pins:
   and keeps reporting a breach either way,
 - the drained-vs-revoked donated-key discriminator (``classify_donated_key_state``),
   which decides whether a credit-shaped failure is the EXPECTED empty wallet
-  (suppressible) or real breakage (must stay red).
+  (suppressible) or real breakage (must stay red),
+- the per-role dollar ledger behind ``CREDIT_ROLE_SPEND`` (``record_llm_call_spend``,
+  ``RoleSpendTracker``): OpenRouter's own per-call ``usage.cost`` /
+  ``cost_details.upstream_inference_cost`` reaching the litellm success callback
+  tagged with the ``role`` / ``key_alias`` metadata the LLM builders stamp on every
+  completion, and a role with no cost data rendering ``usd=n/a`` rather than a
+  fabricated zero.
 """
 
 from __future__ import annotations
@@ -31,17 +37,50 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
+import litellm
 import pytest
+from forecasting_tools import GeneralLlm
+from forecasting_tools.ai_models import general_llm as ft_general_llm
+from litellm.types.utils import ModelResponse, Usage
 
+from metaculus_bot.check_openrouter_credits import KEY_SPECS
 from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, _date_env, credit_alerts_active
 from metaculus_bot.credit_telemetry import (
+    DIRECT_KEY_ALIAS,
+    DONATED_KEY_ALIAS,
     DONATED_KEY_PROBE_TIMEOUT_S,
+    KEY_ALIAS_METADATA_KEY,
+    PERSONAL_KEY_ALIAS,
+    ROLE_METADATA_KEY,
+    UNKNOWN_KEY_ALIAS,
+    UNTAGGED_ROLE,
     CreditTelemetry,
     DonatedKeyState,
+    RoleSpendTracker,
     _fetch_snapshot,
     classify_donated_key_state,
+    drain_litellm_callbacks,
+    forecaster_role,
     get_probed_donated_key_state,
+    install_role_spend_tracker,
+    llm_call_metadata,
+    log_role_spend,
+    plain_llm_key_alias,
+    record_llm_call_spend,
     reset_donated_key_state_cache,
+    reset_role_spend,
+    role_spend_rows,
+)
+from metaculus_bot.fallback_openrouter import FallbackOpenRouterLlm, build_llm_with_openrouter_fallback
+from metaculus_bot.llm_configs import (
+    DISAGREEMENT_ANALYZER_LLM,
+    FORECASTER_LLMS,
+    MARKET_QUERY_AUTHOR_LLM_CONFIG,
+    MARKET_RANKER_LLM_CONFIG,
+    PARSER_LLM,
+    STACKER_FALLBACK_LLM,
+    STACKER_LLM,
+    SUMMARIZER_LLM,
 )
 
 DONATED_KEY = "sk-or-v1-DONATEDsecretAB12"
@@ -771,3 +810,282 @@ class TestDonatedKeyStateProbe:
 
         assert any("DONATED_KEY_STATE: state=drained" in r.getMessage() for r in caplog.records)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# --- Per-role dollar attribution (CREDIT_ROLE_SPEND) --------------------------
+
+
+@pytest.fixture
+def clean_role_ledger() -> Iterator[None]:
+    """Empty ledger before AND after, and no ``RoleSpendTracker`` left in litellm's
+    process-global callback lists — the tracker is installed once per process in prod,
+    so a test that installs it must not leak it into the rest of the session."""
+    reset_role_spend()
+    yield
+    for callback in list(litellm.callbacks):
+        if isinstance(callback, RoleSpendTracker):
+            litellm.logging_callback_manager.remove_callback_from_all_lists(callback)
+    reset_role_spend()
+
+
+def _role_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("CREDIT_ROLE_SPEND:")]
+
+
+def _success_kwargs(metadata: dict[str, str] | None) -> dict[str, Any]:
+    """The ``kwargs`` litellm hands a success callback: our tag rides
+    ``litellm_params["metadata"]`` (verified against litellm 1.92's function_setup)."""
+    return {"model": "openai/gpt-5.6-luna", "litellm_params": {"acompletion": True, "metadata": metadata}}
+
+
+def _response_with_usage(**usage_fields: Any) -> ModelResponse:
+    """A litellm ModelResponse whose usage carries OpenRouter's accounting fields.
+
+    ``litellm.Usage`` keeps every extra constructor kwarg as an attribute (``cost``,
+    ``cost_details``), which is exactly how an OpenRouter body's ``usage`` object reaches
+    the callback in prod (``convert_dict_to_response`` builds ``Usage(**body["usage"])``).
+    """
+    return ModelResponse(usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15, **usage_fields))
+
+
+@pytest.mark.usefixtures("clean_role_ledger")
+class TestRoleSpendLedger:
+    def test_rows_sum_cost_and_byok_upstream_per_role_and_key(self, caplog) -> None:
+        # Two donated-key forecaster calls (BYOK: a small OpenRouter fee in ``cost`` plus the
+        # provider charge in ``upstream_inference_cost``) and one personal-key call
+        # (non-BYOK: the whole charge is ``cost``). Same role, different keys → two rows.
+        record_llm_call_spend("forecaster:openai", DONATED_KEY_ALIAS, cost_usd=0.001, byok_upstream_usd=0.12)
+        record_llm_call_spend("forecaster:openai", DONATED_KEY_ALIAS, cost_usd=0.002, byok_upstream_usd=0.08)
+        record_llm_call_spend("forecaster:openai", PERSONAL_KEY_ALIAS, cost_usd=0.25, byok_upstream_usd=None)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_role_spend()
+
+        assert _role_lines(caplog) == [
+            "CREDIT_ROLE_SPEND: role=forecaster:openai key=personal usd=0.2500 calls=1 costed_calls=1 byok_usd=0.0000",
+            "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000",
+        ]
+
+    def test_uncosted_calls_render_na_not_zero(self, caplog) -> None:
+        # A completion that carried no usage.cost is still a call, but its dollars are
+        # UNKNOWN. Rendering 0.0000 would read as "this role is free".
+        record_llm_call_spend("perplexity_research", DIRECT_KEY_ALIAS, cost_usd=None, byok_upstream_usd=None)
+        record_llm_call_spend("perplexity_research", DIRECT_KEY_ALIAS, cost_usd=None, byok_upstream_usd=None)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_role_spend()
+
+        assert _role_lines(caplog) == [
+            "CREDIT_ROLE_SPEND: role=perplexity_research key=direct usd=n/a calls=2 costed_calls=0 byok_usd=n/a",
+        ]
+
+    def test_mixed_costed_and_uncosted_reports_both_counts(self, caplog) -> None:
+        # The sum covers only the costed calls, and ``costed_calls < calls`` says so.
+        record_llm_call_spend("parser", DONATED_KEY_ALIAS, cost_usd=0.01, byok_upstream_usd=None)
+        record_llm_call_spend("parser", DONATED_KEY_ALIAS, cost_usd=None, byok_upstream_usd=None)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_role_spend()
+
+        assert _role_lines(caplog) == [
+            "CREDIT_ROLE_SPEND: role=parser key=donated usd=0.0100 calls=2 costed_calls=1 byok_usd=0.0000",
+        ]
+
+    def test_rows_sort_by_usd_descending_with_uncosted_last(self) -> None:
+        record_llm_call_spend("parser", DONATED_KEY_ALIAS, cost_usd=0.01, byok_upstream_usd=None)
+        record_llm_call_spend("untagged", UNKNOWN_KEY_ALIAS, cost_usd=None, byok_upstream_usd=None)
+        record_llm_call_spend("forecaster:google", PERSONAL_KEY_ALIAS, cost_usd=0.30, byok_upstream_usd=None)
+        record_llm_call_spend("summarizer", DONATED_KEY_ALIAS, cost_usd=0.0, byok_upstream_usd=0.05)
+
+        assert [(row.role, row.key_alias) for row in role_spend_rows()] == [
+            ("forecaster:google", PERSONAL_KEY_ALIAS),
+            ("summarizer", DONATED_KEY_ALIAS),
+            ("parser", DONATED_KEY_ALIAS),
+            ("untagged", UNKNOWN_KEY_ALIAS),
+        ]
+
+    def test_empty_ledger_says_so_without_the_row_shape(self, caplog) -> None:
+        # A run with zero completions must still leave a line (silence is indistinguishable
+        # from a run that died first), but not one the harvester could mistake for a row.
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_role_spend()
+
+        (line,) = _role_lines(caplog)
+        assert "role=" not in line
+        assert "no successful LLM completions" in line
+
+    def test_key_aliases_are_the_credit_spend_key_names(self) -> None:
+        # ``CREDIT_ROLE_SPEND key=`` must join onto ``CREDIT_SPEND key=`` / ``CREDIT_BALANCE
+        # key=``, whose vocabulary is KEY_SPECS.
+        assert {DONATED_KEY_ALIAS, PERSONAL_KEY_ALIAS} == set(KEY_SPECS)
+        assert DIRECT_KEY_ALIAS not in KEY_SPECS
+        assert UNKNOWN_KEY_ALIAS not in KEY_SPECS
+
+
+class TestLlmCallMetadata:
+    def test_role_and_key_ride_the_two_metadata_keys(self) -> None:
+        assert llm_call_metadata("stacker", DONATED_KEY_ALIAS) == {
+            ROLE_METADATA_KEY: "stacker",
+            KEY_ALIAS_METADATA_KEY: DONATED_KEY_ALIAS,
+        }
+
+    def test_missing_role_is_tagged_untagged_at_construction(self) -> None:
+        # Construction, not the callback, owns the default: every metaculus_bot-built LLM
+        # carries an explicit role token, so an ``untagged`` row in a run log means a
+        # builder call site forgot its ``role=``.
+        assert llm_call_metadata(None, PERSONAL_KEY_ALIAS)[ROLE_METADATA_KEY] == UNTAGGED_ROLE
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("openrouter/openai/gpt-5.6-sol", "forecaster:openai"),
+            ("openrouter/anthropic/claude-opus-4.8", "forecaster:anthropic"),
+            ("openrouter/google/gemini-3.1-pro-preview", "forecaster:google"),
+        ],
+    )
+    def test_forecaster_role_is_the_vendor_slot(self, model: str, expected: str) -> None:
+        # Latest-per-vendor roster: the slot outlives any one model, so the role does too.
+        assert forecaster_role(model) == expected
+
+    def test_forecaster_role_rejects_a_non_openrouter_slug(self) -> None:
+        with pytest.raises(ValueError, match="openrouter/<vendor>/<model>"):
+            forecaster_role("perplexity/sonar")
+
+    def test_plain_llm_key_alias(self) -> None:
+        # A plain GeneralLlm with no api_key reads OPENROUTER_API_KEY from the environment
+        # for openrouter/ slugs; anything else bills a provider-direct key.
+        assert plain_llm_key_alias("openrouter/x-ai/grok-4.5") == PERSONAL_KEY_ALIAS
+        assert plain_llm_key_alias("perplexity/sonar-reasoning") == DIRECT_KEY_ALIAS
+
+
+@pytest.mark.usefixtures("clean_role_ledger")
+class TestRoleSpendTracker:
+    async def test_callback_reads_role_key_and_openrouter_usage_fields(self) -> None:
+        tracker = RoleSpendTracker()
+        response = _response_with_usage(cost=0.0015, cost_details={"upstream_inference_cost": 0.31})
+
+        await tracker.async_log_success_event(
+            _success_kwargs(llm_call_metadata("stacker", DONATED_KEY_ALIAS)), response, None, None
+        )
+
+        (row,) = role_spend_rows()
+        assert (row.role, row.key_alias, row.calls, row.costed_calls) == ("stacker", DONATED_KEY_ALIAS, 1, 1)
+        assert row.usd == pytest.approx(0.3115)
+        assert row.byok_usd == pytest.approx(0.31)
+
+    async def test_non_byok_usage_has_no_upstream_component(self) -> None:
+        tracker = RoleSpendTracker()
+        # OpenRouter sends upstream_inference_cost as null (or omits cost_details) off BYOK.
+        response = _response_with_usage(cost=0.02, cost_details={"upstream_inference_cost": None})
+
+        await tracker.async_log_success_event(
+            _success_kwargs(llm_call_metadata("parser", PERSONAL_KEY_ALIAS)), response, None, None
+        )
+
+        (row,) = role_spend_rows()
+        assert (row.usd, row.byok_usd, row.costed_calls) == (pytest.approx(0.02), 0.0, 1)
+
+    async def test_missing_metadata_files_under_untagged_and_unknown_key(self) -> None:
+        # Any litellm completion the bot did not build (forecasting-tools' own helpers, an
+        # ablation harness) still counts — visibly, under the two sentinel labels.
+        tracker = RoleSpendTracker()
+        await tracker.async_log_success_event(_success_kwargs(None), _response_with_usage(cost=0.5), None, None)
+
+        (row,) = role_spend_rows()
+        assert (row.role, row.key_alias, row.calls) == (UNTAGGED_ROLE, UNKNOWN_KEY_ALIAS, 1)
+
+    async def test_usage_without_cost_is_a_call_but_not_a_costed_call(self) -> None:
+        tracker = RoleSpendTracker()
+        await tracker.async_log_success_event(
+            _success_kwargs(llm_call_metadata("perplexity_research", DIRECT_KEY_ALIAS)),
+            _response_with_usage(),
+            None,
+            None,
+        )
+
+        (row,) = role_spend_rows()
+        assert (row.calls, row.costed_calls, row.usd) == (1, 0, None)
+
+    async def test_non_finite_cost_is_treated_as_unreported(self) -> None:
+        # Same rule as the balance parser: NaN would poison every sum it touched.
+        tracker = RoleSpendTracker()
+        await tracker.async_log_success_event(
+            _success_kwargs(llm_call_metadata("parser", DONATED_KEY_ALIAS)),
+            _response_with_usage(cost=float("nan")),
+            None,
+            None,
+        )
+
+        (row,) = role_spend_rows()
+        assert (row.calls, row.costed_calls, row.usd) == (1, 0, None)
+
+    def test_install_is_idempotent(self) -> None:
+        install_role_spend_tracker()
+        install_role_spend_tracker()
+        assert sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks) == 1
+
+    async def test_real_litellm_mock_path_delivers_the_role_tag_after_drain(self, monkeypatch) -> None:
+        """End to end through forecasting-tools and REAL litellm (network short-circuited by
+        ``mock_response``): the builder's ``role=`` reaches the ledger via
+        ``metadata`` → ``litellm_params`` → the success callback → the logging worker.
+
+        The drain is load-bearing: litellm enqueues the callback from a ``create_task``,
+        so without it the row is not there yet when the awaited call returns."""
+        _set_keys(monkeypatch)
+        install_role_spend_tracker()
+        real_acompletion = litellm.acompletion
+
+        async def mocked_acompletion(**kwargs: Any) -> Any:
+            return await real_acompletion(**kwargs, mock_response="ok")
+
+        monkeypatch.setattr(ft_general_llm, "acompletion", mocked_acompletion)
+        llm = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5.6-luna", role="parser", allowed_tries=1)
+        assert isinstance(llm, FallbackOpenRouterLlm)
+
+        assert await llm.invoke("hi") == "ok"
+        await drain_litellm_callbacks()
+
+        (row,) = role_spend_rows()
+        # The mock body carries token counts but no OpenRouter ``usage.cost``, so the call
+        # is counted and its dollars stay unknown — the honest shape, not a zero.
+        assert (row.role, row.key_alias, row.calls, row.costed_calls, row.usd) == (
+            "parser",
+            DONATED_KEY_ALIAS,
+            1,
+            0,
+            None,
+        )
+
+    async def test_drain_is_bounded_and_a_no_op_with_no_pending_callbacks(self) -> None:
+        # cli.main's finally must never stall on telemetry; with nothing queued this
+        # returns immediately rather than waiting on a worker that never started.
+        await asyncio.wait_for(drain_litellm_callbacks(), timeout=1.0)
+
+
+class TestProdLlmsAreRoleTagged:
+    """Every LLM ``llm_configs`` builds for prod carries its role tag, and the roster slots
+    derive theirs from the slug. Roster-agnostic on purpose: a swap must not be able to
+    leave a slot booking as ``untagged``."""
+
+    def test_roster_slots_are_tagged_by_vendor(self) -> None:
+        assert FORECASTER_LLMS, "roster must be non-empty for this pin to mean anything"
+        for llm in FORECASTER_LLMS:
+            assert llm.litellm_kwargs["metadata"][ROLE_METADATA_KEY] == forecaster_role(llm.model)
+
+    @pytest.mark.parametrize(
+        ("llm", "role"),
+        [
+            (SUMMARIZER_LLM, "summarizer"),
+            (PARSER_LLM, "parser"),
+            (STACKER_LLM, "stacker"),
+            (STACKER_FALLBACK_LLM, "stacker_fallback"),
+            (DISAGREEMENT_ANALYZER_LLM, "crux_analyzer"),
+        ],
+    )
+    def test_support_slots_carry_their_role(self, llm: GeneralLlm, role: str) -> None:
+        assert llm.litellm_kwargs["metadata"][ROLE_METADATA_KEY] == role
+
+    def test_market_stage_configs_carry_their_role(self) -> None:
+        # Raw dicts fed to build_llm_with_openrouter_fallback(**config) at call time.
+        assert MARKET_RANKER_LLM_CONFIG["role"] == "market_ranker"
+        assert MARKET_QUERY_AUTHOR_LLM_CONFIG["role"] == "market_query_author"

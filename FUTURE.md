@@ -141,11 +141,23 @@ questions.
    split is the config spaghetti the operator would rather avoid, and it only earns its cost
    under that condition.
 
-**Cost context for the re-add decision.** The drop cut per-question reasoning spend from
-~$3.05 to ~$1.65 (three fewer xhigh forecasters), and removing grok also ends routine
-personal-key forecaster spend. Weigh that saving against the numeric lean when deciding whether
-to reintroduce members — a re-add must clear both the score bar above *and* justify the cost it
-brings back.
+**Cost context for the re-add decision.** The MEASURED per-question OpenRouter spend in the
+triple era is **$0.38–0.41/question** — an OpenRouter-only lower bound; excludes Google AI Studio
+prepaid (Gemini grounded search, gap-fill v2 document reads), the AskNews subscription, and Exa;
+measured over 29 triple-era runs / 33 questions ($0.4082/question; $0.3836 in the ranked-markets
+window). Receipt: `scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md` §3, "Cost, and a
+standing figure that should stop being quoted". The earlier estimate that the 6→3 drop cut
+per-question reasoning spend from ~$3.05 to ~$1.65 (three fewer xhigh forecasters) was never
+measured and is an order of magnitude too high; it is superseded and must not appear in a re-add
+decision. Removing grok did also end routine personal-key forecaster spend. A 4th reasoning
+forecaster is plausibly +$0.10–0.15/question, but the measured total cannot yet be split into
+forecaster versus research versus ranker, so that increment is an assertion until the per-role
+ledger accumulates a season of runs: `CREDIT_ROLE_SPEND` (`metaculus_bot/credit_telemetry.py`,
+"Per-role dollar attribution", shipped in the 2026-09 bundle) books every OpenRouter completion
+under its role (`forecaster:<vendor>`, `native_search`, `gap_fill_resolver`, `parser`, ...), and
+`scripts/reconcile_credit_spend.py --roles` tabulates it against settled per-run spend. Price a
+re-add off those rows, not off this paragraph. A re-add must clear both the score bar above *and*
+justify the cost it brings back.
 
 **Discrete-calibration note (2026-08-24).** The post-fix (`9f1175c`) discrete cohort has ZERO
 max-step-bug exposure by composition: all four resolved triple-era discretes are fine-grid

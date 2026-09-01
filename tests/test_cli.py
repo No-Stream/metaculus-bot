@@ -37,10 +37,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from metaculus_bot.cli import _forecast_with_callback_drain
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
@@ -348,6 +350,57 @@ class TestCliCreditFloor:
                 cli_main()
             telemetry.log_start.assert_called_once()
             telemetry.log_end_and_check_floor.assert_called_once()
+
+
+class TestCliRoleSpendWiring:
+    """cli.main installs the CREDIT_ROLE_SPEND tracker before the first completion and logs
+    the ledger from the same ``finally`` as the balance telemetry, so a crashed run still
+    reports where its money went. The ledger itself is unit tested in
+    test_credit_telemetry.py; these pin the wiring.
+    """
+
+    def test_tracker_installed_and_ledger_logged_on_a_clean_run(self) -> None:
+        with (
+            _cli_main_test_mode(alertable_count=0),
+            patch("metaculus_bot.cli.install_role_spend_tracker") as install,
+            patch("metaculus_bot.cli.log_role_spend") as log_roles,
+        ):
+            cli_main()
+        install.assert_called_once_with()
+        log_roles.assert_called_once_with()
+
+    def test_ledger_logged_when_forecasting_crashes(self) -> None:
+        def _crash(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("forecasting blew up")
+
+        with (
+            _cli_main_test_mode(alertable_count=0),
+            patch("metaculus_bot.cli.log_role_spend") as log_roles,
+            patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)),
+            pytest.raises(RuntimeError, match="forecasting blew up"),
+        ):
+            cli_main()
+        log_roles.assert_called_once_with()
+
+    async def test_forecast_wrapper_drains_callbacks_after_the_forecast(self) -> None:
+        """The drain has to run INSIDE the forecast loop (the litellm logging worker's queue is
+        bound to it), after the forecast, and still run when the forecast raises."""
+        drained = AsyncMock()
+
+        async def _forecast() -> list[Any]:
+            return ["report"]
+
+        with patch("metaculus_bot.cli.drain_litellm_callbacks", drained):
+            assert await _forecast_with_callback_drain(_forecast) == ["report"]
+        drained.assert_awaited_once_with()
+
+        async def _boom() -> list[Any]:
+            raise RuntimeError("forecasting blew up")
+
+        drained.reset_mock()
+        with patch("metaculus_bot.cli.drain_litellm_callbacks", drained), pytest.raises(RuntimeError):
+            await _forecast_with_callback_drain(_boom)
+        drained.assert_awaited_once_with()
 
 
 class TestCliFallCupReminderExit:

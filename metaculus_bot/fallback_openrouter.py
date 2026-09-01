@@ -15,9 +15,13 @@ from metaculus_bot.constants import (
     gemini_use_donated_openrouter_key,
 )
 from metaculus_bot.credit_telemetry import (
+    DONATED_KEY_ALIAS,
     DONATED_KEY_PROBE_TIMEOUT_S,
+    PERSONAL_KEY_ALIAS,
     DonatedKeyState,
     classify_donated_key_state,
+    llm_call_metadata,
+    plain_llm_key_alias,
 )
 from metaculus_bot.llm_retry import llm_status_code
 
@@ -685,6 +689,10 @@ class FallbackOpenRouterLlm(GeneralLlm):
     """A GeneralLlm wrapper that prefers a Metaculus-donated OpenRouter key, falling back to the
     operator's general key on credential/credit/allowed-providers errors. Used for models routed
     through providers covered by the donated key (see ``DONATED_KEY_PROVIDERS``).
+
+    ``role`` tags every completion for the ``CREDIT_ROLE_SPEND`` ledger
+    (``credit_telemetry.llm_call_metadata``); the primary is stamped ``donated`` and the
+    secondary ``personal``, so a fallback's spend lands on the key that actually billed it.
     """
 
     def __init__(
@@ -693,11 +701,18 @@ class FallbackOpenRouterLlm(GeneralLlm):
         model: str,
         primary_api_key: str | None,
         secondary_api_key: str | None,
+        role: str | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(model=model, api_key=primary_api_key, **kwargs)
+        super().__init__(
+            model=model, api_key=primary_api_key, metadata=llm_call_metadata(role, DONATED_KEY_ALIAS), **kwargs
+        )
         self._secondary_llm: GeneralLlm | None = (
-            GeneralLlm(model=model, api_key=secondary_api_key, **kwargs) if secondary_api_key else None
+            GeneralLlm(
+                model=model, api_key=secondary_api_key, metadata=llm_call_metadata(role, PERSONAL_KEY_ALIAS), **kwargs
+            )
+            if secondary_api_key
+            else None
         )
 
     async def invoke(self, prompt: Any, system_prompt: str | None = None) -> str:  # type: ignore[override]
@@ -732,11 +747,15 @@ class FallbackOpenRouterLlm(GeneralLlm):
         return await self._secondary_llm.invoke(prompt, system_prompt)
 
 
-def build_llm_with_openrouter_fallback(model: str, **kwargs: Any) -> GeneralLlm:
+def build_llm_with_openrouter_fallback(model: str, *, role: str | None = None, **kwargs: Any) -> GeneralLlm:
     """
     Construct a GeneralLlm that automatically falls back from the Metaculus-donated OpenRouter
     key to the operator's general key for providers covered by the donated key (see
     ``DONATED_KEY_PROVIDERS``). For other models, returns a plain GeneralLlm.
+
+    ``role`` names the spend line every completion of this LLM is booked under in the
+    ``CREDIT_ROLE_SPEND`` ledger (``credit_telemetry.llm_call_metadata`` lists the roles in
+    use). Pass it at every production call site; a missing role books as ``untagged``.
     """
     if should_route_via_donated_key(model):
         special_key = os.getenv(OAI_ANTH_OPENROUTER_KEY_ENV)
@@ -748,12 +767,14 @@ def build_llm_with_openrouter_fallback(model: str, **kwargs: Any) -> GeneralLlm:
                 model=model,
                 primary_api_key=special_key,
                 secondary_api_key=general_key,
+                role=role,
                 **kwargs,
             )
 
         # Else fall back to whichever key is available (no runtime fallback possible)
         api_key = special_key or general_key
-        return GeneralLlm(model=model, api_key=api_key, **kwargs)
+        key_alias = DONATED_KEY_ALIAS if special_key else PERSONAL_KEY_ALIAS
+        return GeneralLlm(model=model, api_key=api_key, metadata=llm_call_metadata(role, key_alias), **kwargs)
 
     # OpenRouter models that bypass the donated wrapper: plain GeneralLlm.
     # Covers (a) providers not in DONATED_KEY_PROVIDERS (x-ai, qwen, etc.),
@@ -763,4 +784,4 @@ def build_llm_with_openrouter_fallback(model: str, **kwargs: Any) -> GeneralLlm:
     # the personal key even when the toggle is ON.
     # No api_key passed — litellm picks up OPENROUTER_API_KEY from env. This
     # mirrors how Grok-via-OpenRouter has always worked in production.
-    return GeneralLlm(model=model, **kwargs)
+    return GeneralLlm(model=model, metadata=llm_call_metadata(role, plain_llm_key_alias(model)), **kwargs)

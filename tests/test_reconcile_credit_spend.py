@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.reconcile_credit_spend import reconcile
+from scripts.reconcile_credit_spend import aggregate_roles, reconcile, role_spend_by_run
 
 
 def _snapshot(run_id: str, phase: str, usage: float | None, *, ts: str, key: str = "personal") -> dict:
@@ -115,3 +115,70 @@ class TestSettledSpendRecovery:
         rows = reconcile(records, "personal")
         assert rows[0].within_run_usd is None
         assert rows[0].settled_usd is None
+
+
+def _role_row(
+    run_id: str, role: str, key: str, *, usd: float | None, calls: int, costed_calls: int | None = None
+) -> dict:
+    """One credit_role_spend archive record (the harvested CREDIT_ROLE_SPEND line)."""
+    return {
+        "marker": "credit_role_spend",
+        "run_id": run_id,
+        "role": role,
+        "key": key,
+        "usd": usd,
+        "calls": calls,
+        "costed_calls": calls if costed_calls is None else costed_calls,
+        "byok_usd": None if usd is None else 0.0,
+    }
+
+
+class TestRoleLedgerReconciliation:
+    """The per-role ledger measures the same money as the settled delta from the other end
+    (OpenRouter's per-call accounting vs. the key's booked balance), so the script has to sum
+    it per run ON THE SAME KEY and keep "no cost data" distinct from zero."""
+
+    def test_per_run_total_is_summed_for_the_requested_key_only(self) -> None:
+        records = [
+            _role_row("A", "forecaster:google", "personal", usd=0.25, calls=1),
+            _role_row("A", "parser", "personal", usd=0.0012, calls=3),
+            _role_row("A", "forecaster:openai", "donated", usd=0.40, calls=1),  # other key
+            _role_row("B", "forecaster:google", "personal", usd=0.30, calls=1),
+        ]
+        by_run = role_spend_by_run(records, "personal")
+        assert by_run["A"].usd == pytest.approx(0.2512)
+        assert (by_run["A"].rows, by_run["A"].costed_rows) == (2, 2)
+        assert by_run["B"].usd == pytest.approx(0.30)
+
+    def test_run_with_only_uncosted_rows_reports_none_not_zero(self) -> None:
+        records = [_role_row("A", "perplexity_research", "personal", usd=None, calls=2, costed_calls=0)]
+        run_a = role_spend_by_run(records, "personal")["A"]
+        assert run_a.usd is None
+        assert (run_a.rows, run_a.costed_rows) == (1, 0)
+
+    def test_aggregate_orders_by_usd_with_uncosted_last_and_respects_the_run_filter(self) -> None:
+        records = [
+            _role_row("A", "parser", "donated", usd=0.01, calls=3),
+            _role_row("A", "forecaster:openai", "donated", usd=0.40, calls=1),
+            _role_row("B", "forecaster:openai", "donated", usd=0.35, calls=1),
+            _role_row("B", "untagged", "unknown", usd=None, calls=1, costed_calls=0),
+            _role_row("EXCLUDED", "forecaster:openai", "donated", usd=9.0, calls=1),
+        ]
+        totals = aggregate_roles(records, {"A", "B"})
+        assert [(t.role, t.key) for t in totals] == [
+            ("forecaster:openai", "donated"),
+            ("parser", "donated"),
+            ("untagged", "unknown"),
+        ]
+        assert totals[0].usd == pytest.approx(0.75)
+        assert (totals[0].calls, totals[0].costed_calls) == (2, 2)
+        assert totals[2].usd is None
+
+    def test_aggregate_without_a_filter_covers_every_run(self) -> None:
+        records = [
+            _role_row("A", "parser", "donated", usd=0.01, calls=1),
+            _role_row("B", "parser", "donated", usd=0.02, calls=1),
+        ]
+        (total,) = aggregate_roles(records)
+        assert total.usd == pytest.approx(0.03)
+        assert total.calls == 2
