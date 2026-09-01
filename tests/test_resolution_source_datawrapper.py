@@ -114,6 +114,31 @@ def _embed_shell_page_with_datawrapper(chart_id: str) -> bytes:
     ).encode()
 
 
+def _prose_page_with_both_embeds(chart_id: str) -> bytes:
+    """Real prose plus BOTH an Infogram embed (no route) and a Datawrapper one (the hop).
+
+    The page is a `success` carrying the unreadable-embed disclosure, and its chart's
+    dataset renders as its own section — so this is the one shape where the page-level
+    disclosure and the Tier-2 liveness lead both apply to the same fetch.
+    """
+    return (
+        "<!doctype html><html><head><title>Poll tracker</title></head><body>"
+        "<article><h1>The latest on the tracker</h1>"
+        "<p>Updated recently. As of today, just 33 percent of Americans support "
+        "the conflict, while about 59 percent oppose it. The chart below is "
+        "updated whenever new qualifying polls are released, and the modeled "
+        "average weights each pollster by sample size and track record.</p>"
+        '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive"></div>'
+        f'<div id="datawrapper-iframe" data-attrs="{{&quot;url&quot;:&quot;'
+        f"https://datawrapper.dwcdn.net/{chart_id}/11/&quot;,"
+        f'&quot;title&quot;:&quot;Tracker chart {chart_id}&quot;}}"></div>'
+        "<p>Methodology: polls are adjusted for house effects and recency; the "
+        "downloadable data under the chart takes precedence over the prose, and "
+        "the crosstabs behind the interactive are not reproduced in this text.</p>"
+        "</article></body></html>"
+    ).encode()
+
+
 def _csv_body(n_rows: int) -> str:
     lines = ["modeldate,approve,disapprove"]
     lines.extend(f"day-{i:04d},38.5,57.9" for i in range(n_rows))
@@ -1050,3 +1075,38 @@ class TestProviderEndToEnd:
         out = await resolution_source_provider(is_benchmarking=True)(q)
         assert out == ""
         assert session.requested == []  # leakage guard fires before any fetch
+
+
+class TestUnreadableEmbedBesideADataset:
+    """One page can BOTH hide numbers in a routeless embed and expose a Datawrapper chart the
+    hop reaches. That renders two sections, each led by its own lead: the page's
+    unreadable-embed disclosure and the dataset's liveness stamp. Both LEAD for the same
+    reason — every truncator on this text preserves the head, so a trailing note is what a
+    later trim deletes first (F6, which found the disclosure being trimmed away)."""
+
+    async def test_each_section_is_led_by_its_own_lead(self, monkeypatch):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_prose_page_with_both_embeds(CHART_ID), content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL])
+
+        assert [r.status for r in results] == ["success", "success"]
+        assert results[0].unreadable_embeds == ["infogram"]
+        assert results[0].text.startswith("[This page displays data through infogram")
+        assert results[1].text.startswith('Live "Get the data" dataset for Datawrapper chart')
+
+        out = format_resolution_sections(results, datetime(2026, 9, 1, tzinfo=UTC))
+
+        # Each lead sits immediately under its own heading; neither displaces the other,
+        # because the page text and the dataset are separate sections on separate budgets.
+        assert f"### {PAGE_URL}\n(fetched 2026-09-01)\n\n[This page displays data through infogram" in out
+        assert f'### {DATASET_URL}\n(fetched 2026-09-01)\n\nLive "Get the data" dataset' in out
+        assert out.index(PAGE_URL) < out.index(DATASET_URL)
+        assert "NOT in the page text below" in out
+        assert "day-0019,38.5,57.9" in out  # the dataset's rows still arrive

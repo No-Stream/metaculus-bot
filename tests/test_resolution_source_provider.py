@@ -33,6 +33,7 @@ from metaculus_bot.research.resolution_source import (
     FetchResult,
     _fetch_one,
     _fetch_result_sources,
+    _unreadable_embed_disclosure,
     extract_source_urls,
     fetch_resolution_sources,
     format_resolution_sections,
@@ -1033,7 +1034,10 @@ class TestEmbedShapedPages:
         assert "simulate the election 50,000 times" in result.text
         assert result.unreadable_embeds == ["infogram"]
         assert "infogram embed(s) that this fetch cannot read" in result.text
-        assert "NOT in the text above" in result.text
+        # The note LEADS the page text, and says "below" because of it — as a trailer
+        # a head-preserving trim deleted it (see the aggregate-trim test below).
+        assert result.text.startswith("[This page displays data through infogram")
+        assert "NOT in the page text below" in result.text
 
     async def test_the_disclosure_is_budgeted_inside_the_per_url_cap(self, tracker_with_infogram_html, monkeypatch):
         # The note is budgeted out of the cap (like the Tier-2 dataset lead), never added
@@ -1046,7 +1050,60 @@ class TestEmbedShapedPages:
 
         assert result.status == "success"
         assert len(result.text) <= cap
-        assert "NOT in the text above" in result.text
+        assert "NOT in the page text below" in result.text
+        # The page text is what the cap truncates; the note is not the thing cut.
+        body_cap = cap - len(_unreadable_embed_disclosure(["infogram"])) - 2
+        assert f"[truncated at {body_cap} chars" in result.text
+
+    def test_the_disclosure_survives_the_aggregate_section_budget_trim(self):
+        """F6: the note used to TRAIL the page text, and every truncator here preserves the
+        HEAD, so the aggregate cut in `_budgeted_success_sections` deleted it outright — the
+        page then rendered under the "primary grading evidence" caption with no mention of the
+        unreadable embed at all, which is the q44554/44556 failure the disclosure exists to
+        prevent. Sizes are derived from the prod constants so the scenario stays a REACHABLE
+        one: earlier full-size pages spend most of the total, and the embed page lands last.
+        """
+        per_url = resolution_source.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        total = resolution_source.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+        leftover = per_url // 2  # what the embed page is left to render in
+        spend = total - leftover
+        filler_sizes = [per_url] * (spend // per_url)
+        if spend % per_url:
+            filler_sizes.append(spend % per_url)
+        # Reachable on prod constants, which is what makes this a regression rather
+        # than a hypothetical: the pages fit inside RESOLUTION_SOURCE_MAX_URLS.
+        assert len(filler_sizes) + 1 <= resolution_source.RESOLUTION_SOURCE_MAX_URLS
+
+        fillers = [
+            FetchResult(
+                url=f"https://p{i}.example.com/x",
+                status="success",
+                text="F" * size,
+                http_status=200,
+                content_type="text/html",
+            )
+            for i, size in enumerate(filler_sizes)
+        ]
+        embed_text = resolution_source._page_text_with_embed_disclosure(
+            "lorem ipsum " * (per_url // 2), "https://tracker.example.com/senate", ["infogram"]
+        )
+        embed = FetchResult(
+            url="https://tracker.example.com/senate",
+            status="success",
+            text=embed_text,
+            http_status=200,
+            content_type="text/html",
+            unreadable_embeds=["infogram"],
+        )
+
+        out = format_resolution_sections([*fillers, embed], datetime(2026, 9, 1, tzinfo=UTC))
+
+        # The trim really fired — otherwise this test would pass for the wrong reason.
+        assert embed_text not in out
+        assert "infogram embed(s) that this fetch cannot read" in out
+        assert "NOT in the page text below" in out
+        # And it leads its own section, immediately under the heading.
+        assert "### https://tracker.example.com/senate\n(fetched 2026-09-01)\n\n[This page displays" in out
 
     async def test_an_ordinary_article_carries_no_disclosure(self, article_html):
         session = FakeSession({"https://news.example.com/report": FakeResponse(200, body=article_html)})

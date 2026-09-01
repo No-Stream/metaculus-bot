@@ -480,8 +480,8 @@ class TestUnreadableDataEmbedProviders:
         assert unreadable_data_embed_providers(html) == ["infogram"]
 
     def test_prose_naming_a_provider_is_not_an_embed(self):
-        # The disclosure this feeds is forecaster-facing ("the numbers are not in the
-        # text above"), so a page that merely CREDITS a tool in prose must not trip it.
+        # The disclosure this feeds is forecaster-facing ("the figures are NOT in the
+        # page text below"), so a page that merely CREDITS a tool in prose must not trip it.
         html = "<p>The chart was built with Infogram and Tableau by our data team.</p>"
         assert unreadable_data_embed_providers(html) == []
 

@@ -338,22 +338,32 @@ def _unreadable_embed_disclosure(providers: list[str]) -> str:
     """
     return (
         f"[This page displays data through {', '.join(providers)} embed(s) that this fetch cannot read — "
-        f"any figures shown inside them are NOT in the text above.]"
+        f"any figures shown inside them are NOT in the page text below.]"
     )
 
 
 def _page_text_with_embed_disclosure(extracted: str, url: str, providers: list[str]) -> str:
-    """Per-URL-capped page text, with the unreadable-embed disclosure appended.
+    """Per-URL-capped page text, LED by the unreadable-embed disclosure.
 
-    The disclosure is budgeted out of the cap rather than added on top (same shape
-    as the Tier-2 dataset lead) so the per-URL bound still holds, and it is appended
-    AFTER truncation so the truncation marker cannot swallow it.
+    The disclosure leads (exactly like the Tier-2 dataset lead) because every
+    truncator on this text is head-preserving, so anything at the tail is the
+    first thing a later trim discards. As a trailer it survived the per-URL
+    truncation here but not the aggregate `_budgeted_success_sections` cut, which
+    re-truncates an over-budget body through `_truncate_with_marker` — on prod
+    constants (5 x 6000 per-URL against an 18000 total) a fourth Infogram page
+    rendered under the "primary grading evidence" caption with the disclosure
+    gone and only a generic truncation marker left, which is the q44554/44556
+    failure this disclosure exists to prevent. Leading it also puts the caveat
+    ahead of the text it qualifies, which is why the wording says "below".
+
+    The disclosure is budgeted out of the cap rather than added on top, so the
+    per-URL bound the section budget relies on still holds.
     """
     if not providers:
         return _truncate_with_marker(extracted, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
     disclosure = _unreadable_embed_disclosure(providers)
     body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(disclosure) - 2
-    return f"{_truncate_with_marker(extracted, body_cap, url)}\n\n{disclosure}"
+    return f"{disclosure}\n\n{_truncate_with_marker(extracted, body_cap, url)}"
 
 
 def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -> tuple[list[str], int]:
