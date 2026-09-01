@@ -91,12 +91,26 @@ def _today_utc() -> date:
 
 
 def _fmt(v: float) -> str:
-    """Sensible sig figs: thousands-separated for large magnitudes, 4 sig figs otherwise."""
-    a = abs(float(v))
-    if a >= 10000:
-        return f"{v:,.0f}"
-    if a >= 100:
-        return f"{v:,.1f}"
+    """Published precision on levels, thousands-separated, 4 significant figures below 100.
+
+    Fixed-point above 100 with trailing zeros stripped. The old `:,.1f` rounded a Case-Shiller
+    level of 331.893 to "331.9" on a question with 0.02-point buckets, and `:,.0f` above 10,000
+    dropped an index level's decimals entirely — the same `.4g`-class defect fixed at the FRED
+    render sites, in the other renderer of the same series (both providers append
+    unconditionally, so one bundle stated two different values for one observation).
+
+    Capped at three decimals rather than ``financial_data._format_fred_value``'s six because
+    this formatter also renders the empirical P10/P50/P90 band, where six decimals on an
+    estimate would be fabricated precision; three is enough to carry a level's published digits
+    (and the band's quantiles, which a forecaster sizes an interval from, are worth up to 0.05
+    index points — roughly 1-2 buckets on the questions this feeds). Below 100 stays `:.4g` so a
+    small month-over-month % change or a percentage-point spread band keeps its significant
+    figures instead of rounding to "0.000".
+    """
+    if abs(float(v)) >= 100:
+        # rstrip("0") halts at the ".", so an integer's own zeros are never eaten
+        # (1200.0 -> "1,200"); the same idiom _format_fred_value uses.
+        return f"{v:,.3f}".rstrip("0").rstrip(".")
     return f"{v:.4g}"
 
 

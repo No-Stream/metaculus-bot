@@ -952,6 +952,34 @@ class TestAnchorRealizedVolNoiseFlag:
         assert tsrender._realized_vol_lines(short, self._clock(), symbol="CSUSHPISA") == []
 
 
+class TestAnchorValueFormatter:
+    """`_fmt` renders the anchor's levels, history rows, 52-week range and band quantiles.
+
+    It was the last `.4g`-class precision sibling: `:,.1f` between 100 and 10,000 rounded a
+    Case-Shiller level of 331.893 to "331.9" on a question with 0.02-point buckets, and
+    `:,.0f` above that dropped an index level's decimals entirely — while the FRED block in
+    the OTHER provider rendered the same observation at full precision in the same bundle
+    (q44944 carried both providers, with true prints 331.020 / 331.172 / 332.105 / 327.462).
+    """
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (331.893, "331.893"),  # the motivating case: was "331.9"
+            (334.5123456, "334.512"),  # capped at three decimals, not six
+            (20150.55, "20,150.55"),  # was "20,151" — decimals dropped above 10,000
+            (6699580.0, "6,699,580"),  # WALCL: thousands-separated, never scientific
+            (1200.0, "1,200"),  # rstrip halts at the "." — integer zeros survive
+            (100.0, "100"),  # the branch boundary
+            (-331.893, "-331.893"),  # sign does not change the branch
+            (4.2, "4.2"),  # below 100 keeps 4 significant figures
+            (0.00012345, "0.0001234"),  # a MoM % change must not round to "0.000"
+        ],
+    )
+    def test_the_four_magnitude_bands(self, value: float, expected: str) -> None:
+        assert tsrender._fmt(value) == expected
+
+
 class TestSharedVolEstimator:
     """The one vol definition (`annualized_realized_vol_pct`), after the q44882 defect was
     fixed in one of its two byte-identical copies weeks before the other."""
