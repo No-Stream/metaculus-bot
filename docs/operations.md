@@ -683,6 +683,9 @@ scanned side with its verdict, flagged or not. This is a DETECTOR: any width
 response stays gated on the standing `k_tail` hold. On the archived cohort it
 fires on 68 of 417 measurable open-bound sides across 49 questions, so a fire
 means "this question carries a cliff" rather than "something went wrong here".
+There is no publish-time twin of this detector, deliberately; the comment above
+`STARVED_OUTER_TAIL_FLOOR_MULTIPLE` in `width_monitor.py` records why, and what a
+version that needed no new publish-path plumbing would have to measure instead.
 
 Its era boundaries are **merge-to-main timestamps** (`WIDENING_FLIP`,
 `TS_ANCHOR_ENABLE`), not authoring dates — prod runs from `main`, so a change is

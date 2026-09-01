@@ -134,6 +134,19 @@ MIN_N_FOR_POINT_METRICS: int = 10
 # 417 measurable open-bound sides in the archived cohort (16%, across 49 distinct questions,
 # 19 of them starved on both sides) sit at the floor. Read a fire as "this question carries a
 # cliff", not as "something went wrong on this question".
+#
+# There is deliberately NO publish-time twin of this detector (a ``STARVED_OUTER_TAIL`` WARN
+# beside ``OPEN_BOUND_PILING``), and the reason is worth keeping: on DISCRETE questions —
+# exactly where both motivating records live — ``numeric.pipeline._build_discrete_distribution``
+# overwrites ``declared_percentiles`` with a resample grid pinned to the raw bounds, so a
+# detector reading that field at publish time would put the anchor AT the bound and quietly
+# never fire on the cohort it exists for. That is the same trap
+# ``log_open_bound_piling_diagnostics`` documents and dodges by taking the sanitized
+# declarations as an argument. Firing correctly on the published aggregate needs each member's
+# sanitized declarations threaded from ``forecaster_runners`` to the aggregation site, i.e. new
+# plumbing on the publish path. The alternative that needs no plumbing is to locate the band
+# WITHOUT the declaration — the terminal run of bins sitting at the min step — which is a
+# second trigger definition to calibrate, so it is a decision rather than an oversight.
 
 # A band whose MEAN per-bin mass is below this multiple of the platform's per-bin minimum
 # step (``0.01 / N``, the server's ``round(0.01 / N, 9)`` rule) holds no declared shape — it
