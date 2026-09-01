@@ -577,6 +577,37 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
     ),
     MarkerSpec(
+        "extreme_call",
+        # Per-MEMBER extreme binary call, emitted by metaculus_bot/extreme_call.py's
+        # format_extreme_call_markers from forecaster.py's _research_and_make_predictions,
+        # right after the survivor count above (which is this marker's denominator: only
+        # extreme members get a line, so a rate needs the survivor list from
+        # forecasters_survived plus the question's type).
+        #
+        # ``lone`` is the finding, not ``p``: a member at 0.03 with nobody else in the
+        # extreme band on the SAME side behaves nothing like one whose neighbour agrees
+        # (4 of 9 right versus 21 of 23 —
+        # scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2), and it was
+        # re-derived by hand from parsed comments every residual round before this line
+        # existed. ``survivors`` rides along because "lone" is vacuous at k=1, so a cut
+        # can drop those records instead of joining out to another marker to find them.
+        # Those 4-of-9 / 21-of-23 counts come from the memo's own scripts, which read lone
+        # as "no other extreme member on EITHER side"; this marker uses the same-side rule
+        # the memo's prose states, and extreme_call.py's docstring measures where the two
+        # part company before anyone pools old and new counts.
+        #
+        # Binary questions only — a dominant MC option is a different measurement. The
+        # ``model`` field is a bare display-name slug (spaceless), "unknown" when the
+        # forecaster's reasoning carried no ``Model:`` prefix; ``lone`` is rendered
+        # lowercase and coerce_value lowercases before its bool test, so it harvests as a
+        # bool.
+        re.compile(
+            r"EXTREME_CALL:\s*question=(?P<question>\S+)\s+model=(?P<model>\S+)\s+p=(?P<p>\S+)"
+            r"\s+side=(?P<side>\S+)\s+lone=(?P<lone>\S+)\s+survivors=(?P<survivors>\d+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
+    ),
+    MarkerSpec(
         "degradation_counters",
         # The per-run summary that DECIDES CI COLOR (cli.py exits non-zero on a
         # positive alertable_count), emitted by forecaster.py's forecast_questions.

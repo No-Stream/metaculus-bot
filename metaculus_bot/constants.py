@@ -366,6 +366,23 @@ def provider_degradation_alerts_active(venue: str, today: date | None = None) ->
 BINARY_PROB_MIN: float = 0.02
 BINARY_PROB_MAX: float = 0.98
 
+# The "extreme band" on a binary probability: a member call at or past either edge.
+# Nothing here clamps or gates anything — the band only decides which per-member
+# EXTREME_CALL telemetry lines get logged (metaculus_bot/extreme_call.py), so that
+# the lone-versus-accompanied extreme split is a query instead of a hand
+# reconstruction from parsed comments every residual round. Membership is inclusive
+# at both edges.
+#
+# These values deliberately equal the floor a single-survivor binary publish is
+# clamped to (THIN_PUBLISH_BINARY_FLOOR / THIN_PUBLISH_BINARY_CEIL, in this same
+# section): one definition of "extreme", so the telemetry that measures the exposure
+# and the clamp that prices it cannot drift apart. Retune them together or not at all.
+# Evidence for the 0.05/0.95 edges:
+# scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 ("The mechanism")
+# — 9 lone extreme binary calls, 4 right, at a mean stated confidence of 0.972.
+EXTREME_CALL_LOW: float = 0.05
+EXTREME_CALL_HIGH: float = 0.95
+
 # Multiple-choice prediction clamp. Aligned to forecasting-tools 0.2.92's
 # PredictedOptionList validator, which unconditionally clamps every option into
 # [0.01, 0.99], renormalizes, and raises ValueError when any option moves > 0.05

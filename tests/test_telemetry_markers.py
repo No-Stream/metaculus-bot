@@ -1116,6 +1116,65 @@ class TestForecastersSurvived:
         assert rec["models"] == "unknown"
 
 
+# Verbatim from metaculus_bot/extreme_call.py:format_extreme_call_markers, which
+# forecaster.py logs immediately after the survivor count above. One line per
+# extreme-band member of a BINARY question; the lone/accompanied flag is the
+# measurement (see the spec comment in scripts/telemetry/markers.py).
+EXTREME_CALL_LONE_LINE = (
+    PFX + "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=3"
+)
+EXTREME_CALL_ACCOMPANIED_LINE = (
+    PFX + "EXTREME_CALL: question=44870 model=gpt-5.6-sol p=0.9700 side=high lone=false survivors=3"
+)
+EXTREME_CALL_SOLO_PUBLISH_LINE = (
+    PFX + "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=1"
+)
+EXTREME_CALL_UNKNOWN_MODEL_LINE = (
+    PFX + "EXTREME_CALL: question=44874 model=unknown p=0.0200 side=low lone=true survivors=2"
+)
+
+
+class TestExtremeCall:
+    def test_lone_low_call_fields(self):
+        rec = _parse_one(EXTREME_CALL_LONE_LINE)
+        assert rec["marker"] == "extreme_call"
+        assert rec["model"] == "gemini-3.1-pro-preview"
+        assert rec["p"] == 0.03
+        assert rec["side"] == "low"
+        assert rec["lone"] is True
+        assert rec["survivors"] == 3
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # forecaster.py emits question.id_of_question, the same space as
+        # forecasters_survived, which is what makes the join to the survivor count free.
+        rec = _parse_one(EXTREME_CALL_LONE_LINE)
+        assert rec["qid"] == 44874
+        assert rec["qid_kind"] == "question_id"
+
+    def test_accompanied_high_call_is_distinguishable_from_a_lone_one(self):
+        # The whole finding lives in this field: lone extremes were right 4 of 9,
+        # accompanied ones 21 of 23. A lone flag that harvested as a string ("true")
+        # rather than a bool would still filter, but a `rec["lone"] is True` cut
+        # elsewhere would silently select nothing.
+        rec = _parse_one(EXTREME_CALL_ACCOMPANIED_LINE)
+        assert rec["lone"] is False
+        assert rec["side"] == "high"
+        assert rec["p"] == 0.97
+
+    def test_single_survivor_publish_carries_its_survivor_count(self):
+        # "lone" is vacuous when the member WAS the ensemble, so a rate cut has to be
+        # able to drop these records; survivors=1 is how it finds them.
+        rec = _parse_one(EXTREME_CALL_SOLO_PUBLISH_LINE)
+        assert rec["survivors"] == 1
+        assert rec["lone"] is True
+
+    def test_unknown_model_sentinel_survives_as_a_string(self):
+        # Same sentinel and same reason as forecasters_survived's models= field: it is
+        # not in _NONE_SENTINELS, so it must not coerce to None.
+        rec = _parse_one(EXTREME_CALL_UNKNOWN_MODEL_LINE)
+        assert rec["model"] == "unknown"
+
+
 # The FORECASTERS_USED ensemble-size marker is an HTML comment injected into the
 # published comment (metaculus_bot/comment/markers.py); its durable home is the
 # comment, but the run-log parser carries a spec too (same as STACKER_OUTCOME /
