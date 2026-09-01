@@ -455,6 +455,26 @@ class TestCliRoleSpendWiring:
         with pytest.raises(ValueError, match="Invalid run mode"):
             _run_forecasts(MagicMock(), "not_a_mode")  # type: ignore[arg-type]
 
+    def test_a_forecast_failure_propagates_out_of_run_forecasts_unchanged(self) -> None:
+        """A forecast exception keeps its own type through the consolidated dispatch, and the
+        drain still runs — main's finally and the emit-then-raise block depend on both.
+
+        Drives the real ``asyncio.run`` and the real wrapper (only the drain is stubbed), so
+        this exercises the propagation path rather than a patched ``asyncio.run``.
+        """
+        bot = MagicMock()
+        bot.forecast_on_tournament = AsyncMock(side_effect=RuntimeError("forecasting blew up"))
+        drained = AsyncMock()
+
+        with (
+            patch("metaculus_bot.cli.check_tournament_dates"),
+            patch("metaculus_bot.cli.drain_litellm_callbacks", drained),
+            pytest.raises(RuntimeError, match="forecasting blew up"),
+        ):
+            _run_forecasts(bot, "tournament")
+
+        drained.assert_awaited_once_with()
+
 
 class TestCliFallCupReminderExit:
     """The fall-cup reminder reddens the run the same way the credit floor does.

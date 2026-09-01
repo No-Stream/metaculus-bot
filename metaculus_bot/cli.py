@@ -165,7 +165,7 @@ def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Cal
     re-run can't re-spend on questions already forecast.
     """
     if run_mode == "tournament":
-        check_tournament_dates(logger)  # Warn/error if tournament dates are stale
+        check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
         return lambda: template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
