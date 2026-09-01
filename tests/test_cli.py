@@ -378,18 +378,6 @@ class TestCliRoleSpendWiring:
         install.assert_called_once_with()
         log_roles.assert_called_once_with()
 
-    def test_driving_cli_main_leaves_no_tracker_in_litellms_globals(self) -> None:
-        """The harness must not leak the process-global callback the real install adds.
-
-        ``install_role_spend_tracker`` is stubbed in ``_cli_main_test_mode`` for exactly
-        this reason; without the stub a run of this suite left a live RoleSpendTracker
-        registered for every later test in the session.
-        """
-        before = sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks)
-        with _cli_main_test_mode(alertable_count=0):
-            cli_main()
-        assert sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks) == before
-
     def test_ledger_logged_when_forecasting_crashes(self) -> None:
         def _crash(*_args: object, **_kwargs: object) -> None:
             raise RuntimeError("forecasting blew up")
@@ -402,6 +390,18 @@ class TestCliRoleSpendWiring:
         ):
             cli_main()
         log_roles.assert_called_once_with()
+
+    def test_driving_cli_main_leaves_no_tracker_in_litellms_globals(self) -> None:
+        """The harness must not leak the process-global callback the real install adds.
+
+        ``install_role_spend_tracker`` is stubbed in ``_cli_main_test_mode`` for exactly
+        this reason; without the stub a run of this suite left a live RoleSpendTracker
+        registered for every later test in the session.
+        """
+        before = sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks)
+        with _cli_main_test_mode(alertable_count=0):
+            cli_main()
+        assert sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks) == before
 
     async def test_forecast_wrapper_drains_callbacks_after_the_forecast(self) -> None:
         """The drain has to run INSIDE the forecast loop (the litellm logging worker's queue is

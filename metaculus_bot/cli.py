@@ -126,9 +126,8 @@ async def _forecast_with_callback_drain(start_forecast: Callable[[], Awaitable[l
 def _test_questions_source(template_bot: TemplateForecaster) -> Callable[[], Awaitable[list[Any]]]:
     """Forecast-factory over the evergreen example set, or a TEST_QUESTIONS_OVERRIDE list.
 
-    The questions are fetched HERE, synchronously, before the factory is ever called —
-    same order as every other mode, whose question list is fetched inside
-    ``forecast_on_tournament``.
+    Resolving the URLs is a synchronous Metaculus fetch and stays OUTSIDE the event loop,
+    where it has always been; only the forecast itself is deferred into the factory.
     """
     EXAMPLE_QUESTIONS = [
         "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
