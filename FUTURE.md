@@ -214,6 +214,15 @@ budget. Prefer SOTA forecasters over fitted calibration.** Do NOT ship isotonic 
 directional-shrink layers (see the killed-calibration entries; the Beta-Bernoulli "calibrator"
 from arXiv 2605.27668 degrades OOD in its own tables — cite it as anti-adoption evidence).
 
+**If Platt is ever enabled, one published binary path would bypass it.** `_base_combine`
+(`aggregation_pipeline.py`) returns from its `len(predictions) == 1` branch above the
+`_apply_platt_calibration` tail, so a lone raw binary survivor is the one published binary value that
+never reaches Platt. `_simple_aggregate` is its mirror: it calibrates a single prediction but applies
+no single-survivor publish floor. Inert while `PLATT_CALIBRATION_ENABLED` is unset in every workflow,
+which is the standing state and the reason this is recorded rather than fixed. Whoever turns the flag
+on decides whether the k=1 floor and Platt compose, and in which order; the branch comment carries
+the same note.
+
 **DO promote the audit to a standing monitoring module (free, zero scar risk).** Complementary to
 `performance_analysis/analysis.py` (point-estimate buckets, a single `bias_pp` scalar, PIT
 coverage): the audit adds multi-era comparison, Beta-Binomial CIs per bucket, the slope/intercept

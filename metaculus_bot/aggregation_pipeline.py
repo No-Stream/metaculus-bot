@@ -277,7 +277,7 @@ class AggregationPipeline:
             # STACKER_SKIP_REASON. Binary only — a lone numeric survivor keeps its snap
             # path below and a lone MC survivor is returned as is.
             #
-            # Two asymmetries are accepted here rather than papered over with a second
+            # Three asymmetries are accepted here rather than papered over with a second
             # wiring. (1) skip_reasons is written only under STACKING /
             # CONDITIONAL_STACKING, so a single survivor under plain MEAN/MEDIAN routes
             # through _simple_aggregate and is NOT floored; prod and the code default
@@ -291,6 +291,15 @@ class AggregationPipeline:
             # instance, so one report's failed stack attempt would erase the reason a
             # sibling report's genuine lone survivor wrote, un-flooring the value the
             # framework then publishes and losing its STACKER_SKIP_REASON marker.
+            # (3) This branch returns above the Platt tail at the bottom of the method, so
+            # a lone raw binary member is the only published binary path that never
+            # receives Platt calibration — the exact mirror of _simple_aggregate, which
+            # calibrates a single prediction but never floors it. Inert today: no workflow
+            # sets PLATT_CALIBRATION_ENABLED, and the standing operator decision is that
+            # fitted calibration layers are not a lever, so this is recorded rather than
+            # wired. Whoever turns Platt on decides whether a floored single-survivor value
+            # should also be calibrated and in which order (see FUTURE.md's calibration
+            # entry, which carries the same note).
             if (
                 isinstance(question, BinaryQuestion)
                 and qkey is not None
