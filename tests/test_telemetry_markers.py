@@ -1804,7 +1804,7 @@ class TestGeminiGroundingDensity:
         assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
 
 
-# read_document's twin of the WARN above (metaculus_bot/research/agentic/tools.py): Gemini's
+# read_document's twin of GEMINI_UNGROUNDED_SUPPRESSED (metaculus_bot/research/agentic/tools.py): Gemini's
 # url_context tool retrieved nothing, so the "fetched" tier is withheld rather than granting a
 # parametric-recall answer the authority to supersede the briefing for every forecaster.
 AGENTIC_DOCUMENT_UNGROUNDED_LINE = (

@@ -800,7 +800,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "agentic_document_ungrounded_suppressed",
-        # The read_document twin of the marker above (research/agentic/tools.py
+        # The read_document twin of GEMINI_UNGROUNDED_SUPPRESSED (research/agentic/tools.py
         # read_document): Gemini's url_context tool retrieved nothing, so the answer would
         # be unsourced recall and the "fetched" verification tier is withheld. Worth
         # measuring separately because a "fetched" document discrepancy is the only kind
