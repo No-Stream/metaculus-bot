@@ -530,6 +530,12 @@ How the number is produced, because it decides how to read it:
 - The lines are logged from the same `finally` as `CREDIT_SPEND`, after the
   forecast loop has drained litellm's callback queue (`cli.py`
   `_forecast_with_callback_drain`), so a crashed run still reports what it booked.
+  That drain is bounded at `LITELLM_CALLBACK_DRAIN_TIMEOUT_S` (10s) and swallows
+  its own timeout, because telemetry must never be able to fail a run that already
+  published. When the bound trips, the run logs one
+  `LITELLM_CALLBACK_DRAIN_TIMEOUT` WARNING and the rows below it may be missing
+  the last few completions. Treat that warning as "this run's ledger is a lower
+  bound"; without it, the ledger covers every completion of the run.
 
 Harvested as `credit_role_spend.jsonl` in the telemetry archive.
 `uv run python scripts/reconcile_credit_spend.py --roles` (free, offline) prints

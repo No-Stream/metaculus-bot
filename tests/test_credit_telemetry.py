@@ -41,6 +41,7 @@ import litellm
 import pytest
 from forecasting_tools import GeneralLlm
 from forecasting_tools.ai_models import general_llm as ft_general_llm
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.types.utils import ModelResponse, Usage
 
 from metaculus_bot.check_openrouter_credits import KEY_SPECS
@@ -1060,6 +1061,32 @@ class TestRoleSpendTracker:
         # cli.main's finally must never stall on telemetry; with nothing queued this
         # returns immediately rather than waiting on a worker that never started.
         await asyncio.wait_for(drain_litellm_callbacks(), timeout=1.0)
+
+    async def test_drain_timeout_warns_and_returns_instead_of_raising(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A flush that never finishes must not turn a published run into a crashed one.
+
+        The timeout is reachable without a bug on our side: litellm allows each queued
+        callback 20s (``LOGGING_WORKER_MAX_TIME_PER_COROUTINE``), twice this drain's
+        bound, and a worker loop that dies on a non-``CancelledError`` leaves
+        ``queue.join()`` outstanding forever. The drain runs from
+        ``cli._forecast_with_callback_drain``'s ``finally``, and nothing between there
+        and process exit catches — so a raise here discarded a fully published run's
+        reports and skipped ``log_report_summary`` plus the whole degradation/exit
+        block (the q45085 failure shape), or demoted a real forecast error to
+        ``__context__``. It warns and returns; the ledger may under-count.
+        """
+
+        async def never_finishes() -> None:
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(GLOBAL_LOGGING_WORKER, "flush", never_finishes)
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"):
+            await asyncio.wait_for(drain_litellm_callbacks(timeout_s=0.01), timeout=5.0)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(msg.startswith("LITELLM_CALLBACK_DRAIN_TIMEOUT:") for msg in warnings), warnings
 
 
 class TestProdLlmsAreRoleTagged:

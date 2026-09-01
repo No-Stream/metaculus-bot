@@ -521,9 +521,15 @@ UNKNOWN_KEY_ALIAS: str = "unknown"
 UNTAGGED_ROLE: str = "untagged"
 
 # How long cli.main may wait for litellm's logging worker to deliver the last success
-# callbacks before the ledger is logged. Each queued callback is itself bounded by
-# litellm (``LOGGING_WORKER_MAX_TIME_PER_COROUTINE``), so this only guards against a
-# wedged worker — telemetry must never stall the end of a run.
+# callbacks before the ledger is logged. Telemetry must never stall the end of a run, and
+# the bound is reachable two ways, not one: a wedged worker (a worker loop that dies on
+# any non-``CancelledError`` leaves ``queue.join()`` outstanding forever), AND a single
+# callback slower than 10s — litellm allows each queued coroutine 20s
+# (``LOGGING_WORKER_MAX_TIME_PER_COROUTINE``), twice this window, so a callback litellm
+# still considers healthy trips us. Left at 10.0 deliberately: both callbacks we register
+# are in-memory arithmetic, so raising it is an unverified retune that would only lengthen
+# a pointless wait on a dead worker. Exceeding it costs the last few completions' rows,
+# never the run (see ``drain_litellm_callbacks``).
 LITELLM_CALLBACK_DRAIN_TIMEOUT_S: float = 10.0
 
 
@@ -705,7 +711,27 @@ async def drain_litellm_callbacks(timeout_s: float = LITELLM_CALLBACK_DRAIN_TIME
     litellm enqueues each callback from a ``create_task``, so yield to the loop first —
     otherwise ``flush`` can find an empty queue with the enqueue still a tick away — then
     join the queue, bounded so telemetry can never hold the end of a run hostage.
+
+    The bound is caught HERE, not at the call site, so every caller inherits the promise
+    this docstring makes. Its one caller awaits this from a ``finally``
+    (``cli._forecast_with_callback_drain``) and nothing between there and process exit
+    catches, so a raise would discard a fully published run's reports and skip
+    ``log_report_summary`` plus the whole degradation/exit block — the q45085 failure
+    shape, on a run where every question published — or, on a run that was already
+    failing, demote the real forecast error to ``__context__``. ``CancelledError`` is a
+    ``BaseException`` and still propagates, so the GHA SIGTERM path is unaffected.
     """
     for _ in range(2):
         await asyncio.sleep(0)
-    await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=timeout_s)
+    try:
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=timeout_s)
+    except TimeoutError:
+        # Distinct marker on purpose: the CREDIT_ROLE_SPEND harvester spec expects
+        # role=/key=/usd=/calls= fields, so prose under that prefix would pollute every
+        # grep of a run log without ever parsing as a row.
+        logger.warning(
+            "LITELLM_CALLBACK_DRAIN_TIMEOUT: litellm's logging worker did not deliver its queued "
+            "success callbacks within %.1fs; continuing so the run can finish. The CREDIT_ROLE_SPEND "
+            "ledger below may under-count this run's last completions.",
+            timeout_s,
+        )
