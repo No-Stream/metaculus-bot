@@ -672,6 +672,40 @@ class TestSourceProvenanceLadder:
         assert "centered near this value" in lowered
 
 
+class TestPresentTenseInstrumentGaps:
+    """The Nebraska/Texas natural experiment (44554 miss vs 44556 control — same
+    template, same day, same roster): Texas's gap-fill asked what the polling
+    tracker reads NOW and got a live value; Nebraska asked what the tracker would
+    display on the resolution date and got "August 31, 2026 has not occurred".
+    Scoped to questions resolving off a live data source."""
+
+    def _analyzer(self) -> str:
+        return gap_fill_analyzer_prompt(
+            "Will the challenger lead the polling average on 2026-08-31?",
+            "Resolves YES if the tracker's average shows the challenger ahead.",
+            "The tracker is RaceToTheWH.",
+            "First pass: no current average retrieved.",
+            is_benchmarking=False,
+        )
+
+    def test_analyzer_requires_gaps_answerable_from_todays_sources(self) -> None:
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "answerable from sources that exist today" in lowered
+        # The live-data-source scope, named by instrument kind.
+        assert "tracker, index" in lowered
+        assert "dashboard" in lowered
+
+    def test_analyzer_requires_one_present_tense_current_value_gap(self) -> None:
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "at least one gap must ask what that source reads now" in lowered
+        assert "present tense" in lowered
+
+    def test_analyzer_forbids_future_dated_gaps(self) -> None:
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "never phrase a gap as that source's value on the resolution date" in lowered
+        assert "rewrite it as the present-tense observable or drop it" in lowered
+
+
 class TestNullResultReadingClause:
     """A search that found nothing licenses "could not find evidence of X", never
     "X did not happen". On qid 44799 four of six forecasters read the gap-fill
