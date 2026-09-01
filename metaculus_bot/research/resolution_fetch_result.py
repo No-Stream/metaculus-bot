@@ -4,9 +4,11 @@ One responsibility: what a single fetch attempt is allowed to SAY. That is the
 ``FetchStatus`` set, the one HTTP-status table both the Tier-1 page fetch and the
 Tier-2 Datawrapper CDN hop read, the ``FetchResult`` record with its
 success-implies-content invariant, the content-vacuity rule that hands a 200
-carrying nothing a failure status instead, and the two pure reductions over a
-finished result list (the provider-diagnostics source map and the compact
-failure line the section renders).
+carrying nothing a failure status instead, the one token an outcome is REPORTED
+as (``ok`` or the verbatim status, shared by the diagnostics map and the run-log
+marker), and the two pure reductions over a finished result list (the
+provider-diagnostics source map and the compact failure line the section
+renders).
 
 Split out of ``research.resolution_source`` so the status contract — the thing
 the section renderer, the diagnostics block and the run-log telemetry all key on
