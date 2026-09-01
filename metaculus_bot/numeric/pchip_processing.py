@@ -80,7 +80,7 @@ def generate_pchip_cdf_with_smoothing(
 ) -> tuple[list[float], bool, bool]:
     """Generate PCHIP CDF with optional ramp smoothing.
 
-    ``model_name`` only labels the ``CDF_MAXSTEP_SMEAR`` marker (see ``safe_cdf_bounds``).
+    ``model_name`` only labels the ``CDF_MAXSTEP_CLIP`` marker (see ``safe_cdf_bounds``).
     """
     from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415  # function-scoped: call-time lookup keeps tests patching metaculus_bot.numeric.pchip_cdf.* effective
         generate_pchip_cdf,

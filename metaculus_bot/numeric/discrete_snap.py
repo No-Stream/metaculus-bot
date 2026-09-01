@@ -147,7 +147,7 @@ def snap_cdf_to_integers(
 
     Returns snapped CDF values (list of 201 floats), or None if snapping
     should be skipped (too many integers, etc.). ``question_id`` only labels the
-    ``CDF_MAXSTEP_SMEAR`` marker ``safe_cdf_bounds`` may emit below.
+    ``CDF_MAXSTEP_CLIP`` marker ``safe_cdf_bounds`` may emit below.
     """
     n_points = len(cdf_values)
     x_grid = np.linspace(lower_bound, upper_bound, n_points)

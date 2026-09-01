@@ -87,7 +87,7 @@ def build_numeric_distribution(
 ) -> NumericDistribution:
     """Create a numeric distribution, falling back to a heuristic on failure.
 
-    ``model_name`` only labels the ``CDF_MAXSTEP_SMEAR`` marker (whose declaration the
+    ``model_name`` only labels the ``CDF_MAXSTEP_CLIP`` marker (whose declaration the
     platform's per-bin cap had to clip), the same way ``sanitize_percentiles`` labels
     ``NUMERIC_DEGENERATE_DECLARATION``.
     """

@@ -43,7 +43,7 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``NUMERIC_AGGREGATE_GRID_MISMATCH`` — ``metaculus_bot/numeric/utils.py``
   ``aggregate_numeric`` (per-MODEL CDF whose grid length disagreed with the
   question's; expect zero in prod, so any record means a length drifted)
-* ``CDF_MAXSTEP_SMEAR`` — ``metaculus_bot/numeric/pchip_cdf.py`` ``safe_cdf_bounds``
+* ``CDF_MAXSTEP_CLIP`` — ``metaculus_bot/numeric/pchip_cdf.py`` ``safe_cdf_bounds``
   (per-CDF-BUILD max-step clip: a declared single-bin mass the platform's per-bin
   cap cannot hold, and where the displaced mass went — the repair that reshaped
   47% of q45065's published forecast while logging at DEBUG)
@@ -118,7 +118,7 @@ and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
 types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
 ``CLOSE_MARGIN`` / ``MARKET_RANKING`` / ``MARKET_RANKING_DEGRADED`` /
 ``NUMERIC_DEGENERATE_DECLARATION`` / ``NUMERIC_AGGREGATE_GRID_MISMATCH`` /
-``CDF_MAXSTEP_SMEAR`` /
+``CDF_MAXSTEP_CLIP`` /
 ``SPREAD_UNDEFINED`` / ``numeric_pchip_fallback`` emit ``question.id_of_question``
 (the QUESTION id) while
 ``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
@@ -434,7 +434,7 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # numeric/utils.py emits question.id_of_question
     ),
     MarkerSpec(
-        "cdf_maxstep_smear",
+        "cdf_maxstep_clip",
         # Per-CDF-BUILD max-step clip (numeric/pchip_cdf.py safe_cdf_bounds): a bin whose
         # mass exceeded the server's per-bin cap (0.2 * 200 / N) was clipped and the excess
         # moved elsewhere. NOT a bot defect and NOT alertable — the cap is the platform's,
@@ -455,7 +455,7 @@ MARKER_SPECS: list[MarkerSpec] = [
         # label (``ensemble_median`` / ``ensemble_mean`` / ``ensemble_discrete_snap``) for
         # the aggregation stages; the ablation/pooling callers pass none and read "unknown".
         re.compile(
-            r"CDF_MAXSTEP_SMEAR:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
+            r"CDF_MAXSTEP_CLIP:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
             r"\s+clipped_mass=(?P<clipped_mass>\S+)\s+over_cap_bins=(?P<over_cap_bins>\S+)"
             r"\s+bins_displaced=(?P<bins_displaced>\S+)\s+max_offset_bins=(?P<max_offset_bins>\S+)"
             r"\s+pre_max_step=(?P<pre_max_step>\S+)\s+max_step=(?P<max_step>\S+)"

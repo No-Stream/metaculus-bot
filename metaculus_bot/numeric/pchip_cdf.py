@@ -149,7 +149,7 @@ def safe_cdf_bounds(
     per-bin constraints match the server's ``round(0.01 / N, 9)`` min-step and
     ``0.2 * 200 / N`` max-step formulas, where ``N = cdf_size - 1``.
 
-    ``question_id`` / ``model_name`` only label the ``CDF_MAXSTEP_SMEAR`` marker emitted
+    ``question_id`` / ``model_name`` only label the ``CDF_MAXSTEP_CLIP`` marker emitted
     when the max-step cap displaces mass; they are absent on the ablation/pooling callers,
     where the repair is not a production forecast.
     """
@@ -171,7 +171,7 @@ def safe_cdf_bounds(
         # trace in the run logs, so the 2026-07-15 "repair-tier WARNs never fire" audit
         # never saw it. NOT alertable — the cap is the platform's, not a bot defect.
         logger.warning(
-            "CDF_MAXSTEP_SMEAR: question=%s model=%s clipped_mass=%.6f over_cap_bins=%d "
+            "CDF_MAXSTEP_CLIP: question=%s model=%s clipped_mass=%.6f over_cap_bins=%d "
             "bins_displaced=%d max_offset_bins=%d pre_max_step=%.6f max_step=%.6f",
             question_id,
             model_name or "unknown",
@@ -614,7 +614,7 @@ def generate_pchip_cdf(
     ``N = num_points - 1``. Passing the 201-grid ``max_step`` (0.2) on a coarse discrete grid
     wrongly clips each bin to 20% and shoves the excess onto higher bins.
 
-    ``model_name`` only labels the ``CDF_MAXSTEP_SMEAR`` marker (which forecaster's
+    ``model_name`` only labels the ``CDF_MAXSTEP_CLIP`` marker (which forecaster's
     declaration the cap had to clip); callers that build an ensemble CDF pass a label for
     the aggregation stage instead.
 

@@ -54,8 +54,8 @@ _CONCENTRATED_LOW_COUNT: list[tuple[float, float]] = [
 ]
 
 
-def _smear_markers(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records if "CDF_MAXSTEP_SMEAR:" in r.getMessage()]
+def _clip_markers(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "CDF_MAXSTEP_CLIP:" in r.getMessage()]
 
 
 def _discrete_count_question(**overrides) -> NumericQuestion:
@@ -191,7 +191,7 @@ class TestBuildNumericDistributionDiscrete:
         with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
             build_numeric_distribution(sanitized, question, zero_point, model_name="some/forecaster")
 
-        assert not _smear_markers(caplog)
+        assert not _clip_markers(caplog)
 
 
 # claude-opus-4.8's actual declared percentiles for q45065 (post 44916, "how many deaths
@@ -293,7 +293,7 @@ class TestQ45065NearestFirstPacking:
         with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
             build_numeric_distribution(sanitized, question, zero_point, model_name=self._MODEL)
 
-        markers = _smear_markers(caplog)
+        markers = _clip_markers(caplog)
         assert len(markers) == 1
         assert f"question={question.id_of_question}" in markers[0]
         assert f"model={self._MODEL}" in markers[0]
@@ -316,7 +316,7 @@ class TestQ45065NearestFirstPacking:
 
         steps = np.diff(np.asarray([p.percentile for p in prediction.get_cdf()], dtype=float))
         assert float(steps.max()) < NUM_MAX_STEP
-        assert not _smear_markers(caplog)
+        assert not _clip_markers(caplog)
 
     def test_coarse_grid_never_reaches_the_max_step_repair(self, caplog):
         """The relaxed coarse-grid cap means the repair does not fire at all there.
@@ -331,4 +331,4 @@ class TestQ45065NearestFirstPacking:
         with caplog.at_level(logging.WARNING, logger=_PCHIP_LOGGER):
             build_numeric_distribution(sanitized, question, zero_point, model_name="some/forecaster")
 
-        assert not _smear_markers(caplog)
+        assert not _clip_markers(caplog)

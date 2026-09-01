@@ -183,7 +183,7 @@ bins are near-empty is a near-uniform spread: q45065 had all three forecasters d
 ~0.72 on the count that resolved, and published 47% of its mass above 35 deaths against
 their own ~2%. The cap itself is the platform's and is untouched — a 0.72 single-bin mass
 is simply not expressible on a 201-point grid — so the honest repair is the legal shape
-closest to the declaration. Every clip emits a `CDF_MAXSTEP_SMEAR` WARN naming the
+closest to the declaration. Every clip emits a `CDF_MAXSTEP_CLIP` WARN naming the
 forecaster, the mass displaced, and how far it travelled (`scripts/telemetry/markers.py`
 harvests it); it is deliberately **not** alertable, since a spike above a platform cap is
 a forecaster's declaration rather than a bot defect.

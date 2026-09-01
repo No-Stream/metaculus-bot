@@ -169,7 +169,7 @@ def test_build_numeric_distribution_fallback(monkeypatch):
 
     assert result == "fallback"
     # model_name rides through to the fallback builder too: its get_cdf() runs its own
-    # safe_cdf_bounds pass, so a CDF_MAXSTEP_SMEAR from there must name the forecaster.
+    # safe_cdf_bounds pass, so a CDF_MAXSTEP_CLIP from there must name the forecaster.
     fallback.assert_called_once_with(sanitized, question, None, model_name="some/forecaster")
     validate.assert_called_once_with("fallback", question)
 

@@ -614,15 +614,15 @@ SPREAD_UNDEFINED_LINE = (
 # Verbatim bytes from replaying q45065's opus-4.8 declaration through
 # build_numeric_distribution (numeric/pchip_cdf.py safe_cdf_bounds), and from the
 # conc21_closed snap golden in tests/test_discrete_snap.py.
-CDF_MAXSTEP_SMEAR_LINE = (
+CDF_MAXSTEP_CLIP_LINE = (
     "2026-08-31 23:02:02,257 - metaculus_bot.numeric.pchip_cdf - WARNING - "
-    "CDF_MAXSTEP_SMEAR: question=45065 model=openrouter/anthropic/claude-opus-4.8 "
+    "CDF_MAXSTEP_CLIP: question=45065 model=openrouter/anthropic/claude-opus-4.8 "
     "clipped_mass=0.517852 over_cap_bins=1 bins_displaced=4 max_offset_bins=2 "
     "pre_max_step=0.717852 max_step=0.200000"
 )
-CDF_MAXSTEP_SMEAR_ENSEMBLE_LINE = (
+CDF_MAXSTEP_CLIP_ENSEMBLE_LINE = (
     "2026-08-31 23:02:02,258 - metaculus_bot.numeric.pchip_cdf - WARNING - "
-    "CDF_MAXSTEP_SMEAR: question=None model=ensemble_discrete_snap "
+    "CDF_MAXSTEP_CLIP: question=None model=ensemble_discrete_snap "
     "clipped_mass=0.399018 over_cap_bins=3 bins_displaced=4 max_offset_bins=1 "
     "pre_max_step=0.499480 max_step=0.200000"
 )
@@ -703,8 +703,8 @@ class TestCdfMaxstepSmear:
     """
 
     def test_fields(self):
-        rec = _parse_one(CDF_MAXSTEP_SMEAR_LINE)
-        assert rec["marker"] == "cdf_maxstep_smear"
+        rec = _parse_one(CDF_MAXSTEP_CLIP_LINE)
+        assert rec["marker"] == "cdf_maxstep_clip"
         assert rec["model"] == "openrouter/anthropic/claude-opus-4.8"
         assert rec["clipped_mass"] == pytest.approx(0.517852)
         assert rec["over_cap_bins"] == 1
@@ -714,7 +714,7 @@ class TestCdfMaxstepSmear:
         assert rec["max_step"] == pytest.approx(0.2)
 
     def test_question_ref_is_a_question_id(self):
-        rec = _parse_one(CDF_MAXSTEP_SMEAR_LINE)
+        rec = _parse_one(CDF_MAXSTEP_CLIP_LINE)
         assert rec["qid"] == 45065
         assert rec["qid_kind"] == "question_id"
 
@@ -722,7 +722,7 @@ class TestCdfMaxstepSmear:
         # The aggregation stages have no forecaster to name, so they label the stage; a
         # caller with no question in scope renders "None", which must coerce to a real
         # absent field rather than the string.
-        rec = _parse_one(CDF_MAXSTEP_SMEAR_ENSEMBLE_LINE)
+        rec = _parse_one(CDF_MAXSTEP_CLIP_ENSEMBLE_LINE)
         assert rec["model"] == "ensemble_discrete_snap"
         assert rec["qid"] is None
         assert rec["over_cap_bins"] == 3
