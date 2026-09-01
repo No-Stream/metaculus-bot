@@ -124,6 +124,12 @@ through the dry run, note:
     question looks fuzzy, the market's ACTUAL resolution terms (criteria,
     date) are a verify target — the panel weights markets heavily and
     discounts only by specifically named term mismatches.
+  - Any question that resolves off a live data source (a tracker, index,
+    average, counter, or dashboard): its CURRENT reading, together with the
+    date it was last updated, is a verify target, and it comes from the
+    instrument itself. Never make a target of what that source will read on
+    the resolution date — no source can answer that yet, and the budget is
+    spent for nothing.
 
   Common fill tells: the briefing uses vague quantifiers ("several", "high",
   "recently") where the question turns on a number or a date; or it shows no

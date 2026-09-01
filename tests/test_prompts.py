@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from metaculus_bot.prompts import (
+    _OUTSIDE_VENUE_MARKET_ODDS_BULLET,
     _SOURCE_TIER_TAG_INSTRUCTION,
     TS_ANCHOR_SECTION_HEADER,
     asknews_summarizer_prompt,
@@ -487,14 +488,66 @@ class TestWebResearchPromptPrimarySources:
         assert "benchmarking run" in lowered
         assert "data leakage" in lowered
 
-    def test_prediction_market_nudge_only_when_not_benchmarking(self) -> None:
-        """Regression: the existing FOCUS AREAS 'Prediction market odds' bullet
-        must still appear only when is_benchmarking=False."""
+    def test_market_odds_bullet_only_when_not_benchmarking(self) -> None:
+        """Regression: the FOCUS AREAS market-odds bullet must still appear only when
+        is_benchmarking=False (backtests must not see market data at all)."""
         non_bench = web_research_prompt("Q?", is_benchmarking=False)
         bench = web_research_prompt("Q?", is_benchmarking=True)
 
-        assert "Prediction market odds" in non_bench
-        assert "Prediction market odds" not in bench
+        assert _OUTSIDE_VENUE_MARKET_ODDS_BULLET in non_bench
+        assert _OUTSIDE_VENUE_MARKET_ODDS_BULLET not in bench
+        assert "Market-implied or crowd odds" not in bench
+
+    def test_market_odds_bullet_points_away_from_the_covered_venues(self) -> None:
+        """Across 42 ranked-era bundles the bullet's covered-venue half produced one
+        content-redundant retrieval and three stale prices that contradicted correct
+        live snapshot rows, while every realized instance of decisive market evidence
+        came from a venue OUTSIDE the four the live snapshot covers (GJO q44869, CME
+        FedWatch q45401, Metaculus q20683). So the bullet is narrowed, not removed:
+        the outside venues stay named, the four covered ones are ruled out, and the
+        price must carry an observation date."""
+        prompt = web_research_prompt("Q?", is_benchmarking=False)
+        collapsed = " ".join(prompt.split())
+
+        for outside_venue in ("Metaculus", "Good Judgment Open", "CME FedWatch", "bookmakers"):
+            assert outside_venue in collapsed
+        assert "Do NOT report Polymarket/Kalshi/Manifold/PredictIt prices from search results" in collapsed
+        # The item-2 vintage rule landing on this surface too.
+        assert "always name the market and the date you observed the price" in collapsed
+        assert "usually days stale" in collapsed
+
+    def test_auto_annotated_style_bans_model_authored_citation_indices(self) -> None:
+        """Half of all archived gemini sections (173 of 323) carry the model's own
+        hierarchical [1.2.3] indices alongside the [N] markers our formatter splices
+        from real grounding metadata, so a forecaster cannot tell which brackets are
+        checkable. The formatter strips them; this tells the model not to write them.
+        Gemini-only: the markdown branch (native search) is untouched."""
+        auto = web_research_prompt("Q?", citation_style="auto_annotated")
+        markdown = web_research_prompt("Q?", citation_style="markdown")
+
+        lowered = " ".join(auto.lower().split())
+        assert "do not write your own citation markers" in lowered
+        assert "[1.2.3]" in auto
+        assert "[1.2.3]" not in markdown
+        assert "do not write your own citation markers" not in " ".join(markdown.lower().split())
+
+    def test_vintage_clause_present_for_both_citation_styles(self) -> None:
+        """qid 44872: gemini searched correctly, Google attached no grounding, and it
+        answered from memory of 2021/2022 OCEARCH press releases restamped as 2026
+        plans. The prompt had "say so explicitly" and "DO NOT hallucinate sources"
+        and no date discipline at all, so nothing in it made an undated recollection
+        look wrong. Shared by both consumers (native search + gemini) on purpose."""
+        for citation_style in ("markdown", "auto_annotated"):
+            for is_benchmarking in (False, True):
+                result = web_research_prompt(
+                    "Will X happen?",
+                    citation_style=citation_style,
+                    is_benchmarking=is_benchmarking,
+                )
+                lowered = " ".join(result.lower().split())
+                assert "publication date" in lowered
+                assert "state when and where it was announced" in lowered
+                assert "never present an undated recollection as a current fact" in lowered
 
     def test_reference_class_frequency_instruction_present(self) -> None:
         """The prompt must ask for historical frequencies (with source and
@@ -625,16 +678,21 @@ class TestPredictionMarketFraming:
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         self._assert_general_expertise_principle(result)
 
-    def test_strong_evidence_framing_present_non_benchmarking_absent_benchmarking(self) -> None:
-        """Leakage guard: the prediction-market nudge in the research prompt is
-        present only when NOT benchmarking. This is the mode-dependent surface
-        — the forecaster prompts above are mode-agnostic because the provider
-        data is suppressed upstream during backtests."""
+    def test_market_ask_present_non_benchmarking_absent_benchmarking(self) -> None:
+        """Leakage guard: the market/crowd-odds ask in the research prompt is present
+        only when NOT benchmarking. This is the mode-dependent surface — the
+        forecaster prompts above are mode-agnostic because the provider data is
+        suppressed upstream during backtests. Since the bullet was narrowed (it now
+        names venues on both sides of the line), a benchmarking prompt must name
+        none of them."""
         non_bench = web_research_prompt("Will X happen?", is_benchmarking=False)
         bench = web_research_prompt("Will X happen?", is_benchmarking=True)
 
-        assert "Prediction market" in non_bench
-        assert "Prediction market" not in bench
+        assert "crowd odds" in non_bench
+        assert "crowd odds" not in bench
+        for venue in ("Polymarket", "Kalshi", "Manifold", "PredictIt", "Metaculus", "CME FedWatch"):
+            assert venue in non_bench, f"expected {venue} named in the narrowed bullet"
+            assert venue not in bench, f"{venue} leaked into a benchmarking prompt"
 
 
 # Source-provenance / motivation trust ladder
@@ -670,6 +728,98 @@ class TestSourceProvenanceLadder:
         lowered = " ".join(result.lower().split())
         assert "most recent authoritative measurement" in lowered
         assert "centered near this value" in lowered
+
+
+class TestPresentTenseInstrumentGaps:
+    """The Nebraska/Texas natural experiment (44554 miss vs 44556 control — same
+    template, same day, same roster): Texas's gap-fill asked what the polling
+    tracker reads NOW and got a live value; Nebraska asked what the tracker would
+    display on the resolution date and got "August 31, 2026 has not occurred".
+    Scoped to questions resolving off a live data source."""
+
+    def _analyzer(self) -> str:
+        return gap_fill_analyzer_prompt(
+            "Will the challenger lead the polling average on 2026-08-31?",
+            "Resolves YES if the tracker's average shows the challenger ahead.",
+            "The tracker is RaceToTheWH.",
+            "First pass: no current average retrieved.",
+            is_benchmarking=False,
+        )
+
+    def test_analyzer_requires_gaps_answerable_from_todays_sources(self) -> None:
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "answerable from sources that exist today" in lowered
+        # The live-data-source scope, named by instrument kind.
+        assert "tracker, index" in lowered
+        assert "dashboard" in lowered
+
+    def test_analyzer_requires_one_present_tense_current_value_gap(self) -> None:
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "at least one gap must ask what that source reads now" in lowered
+        assert "present tense" in lowered
+
+    def test_analyzer_forbids_future_dated_gaps(self) -> None:
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "never phrase a gap as that source's value on the resolution date" in lowered
+        assert "rewrite it as the present-tense observable or drop it" in lowered
+
+
+class TestNullResultReadingClause:
+    """A search that found nothing licenses "could not find evidence of X", never
+    "X did not happen". On qid 44799 four of six forecasters read the gap-fill
+    resolver's "I found no authoritative public record" as "the permit is absent",
+    and the two members that discounted it scored best in the ensemble. Every base
+    forecaster prompt must carry the reading rule; the gap-fill analyzer carries the
+    auditor's version of it."""
+
+    def _assert_forecaster_clause_present(self, prompt: str) -> None:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        lowered = " ".join(prompt.lower().split())
+        assert "read a null search result as a null search result" in lowered
+        assert "could not find evidence of x" in lowered
+        # Coverage-conditioned strength, and the demonstrated-capability discount.
+        assert "weight the absence by how well the topic is covered" in lowered
+        assert "already demonstrated the capability" in lowered
+
+    def test_binary_prompt_carries_null_result_clause(self) -> None:
+        self._assert_forecaster_clause_present(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_carries_null_result_clause(self) -> None:
+        self._assert_forecaster_clause_present(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_carries_null_result_clause(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_forecaster_clause_present(result)
+
+    def test_clause_sits_with_the_evidence_weighting_rubric(self) -> None:
+        """The clause is an evidence-weighting rule, so it must land after the
+        Strong/Moderate/Weak rubric rather than displacing it."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        rubric_at = prompt.index("Weak: anecdotes")
+        clause_at = prompt.index("Read a null search result")
+        assert rubric_at < clause_at
+
+    def test_stacking_prompts_do_not_carry_the_clause(self) -> None:
+        """Scope guard: the clause ships to the base prompts only (stacking is
+        prod-disabled, so the diff stays minimal)."""
+        stacked = stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"])
+        assert "Read a null search result" not in stacked
+
+    def test_gap_fill_analyzer_carries_the_auditor_version(self) -> None:
+        """Auditor phrasing, not forecaster phrasing: the analyzer must not bank a
+        first-pass "found nothing" as an established negative, and must point the
+        gap at the authoritative place that would hold the record."""
+        prompt = gap_fill_analyzer_prompt(
+            "Will the permit be granted?",
+            "Resolves YES if the regulator lists the permit.",
+            "See the regulator's public register.",
+            "First pass: no authoritative public record found.",
+            is_benchmarking=False,
+        )
+        lowered = " ".join(prompt.lower().split())
+        assert "null results are search outcomes" in lowered
+        assert "not as an established negative fact" in lowered
+        assert "name that source in the search query" in lowered
 
 
 class TestStatusQuoDerivation:

@@ -320,6 +320,24 @@ class TestDriverSystemPromptBaseRateTriage:
         assert "A rate drawn from a changed regime is itself a finding worth recording" in collapsed
 
 
+class TestDriverSystemPromptLiveDataSource:
+    """Nebraska/Texas lesson (44554 vs 44556): a question resolving off a live
+    tracker needs that tracker's CURRENT reading, and a target phrased as the
+    tracker's value on the resolution date cannot be answered by any search. The
+    numeric default already covers a measured quantity; this bullet covers the
+    same failure on binary and MC questions that resolve off an instrument."""
+
+    def test_system_prompt_makes_the_current_reading_a_verify_target(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "resolves off a live data source" in collapsed
+        assert "tracker, index, average, counter, or dashboard" in collapsed
+        assert "its CURRENT reading, together with the date it was last updated, is a verify target" in collapsed
+
+    def test_system_prompt_bans_future_dated_targets(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "Never make a target of what that source will read on the resolution date" in collapsed
+
+
 class TestDriverSystemPromptCatalyst:
     """BTF-2 lesson: exact-entity search misses scheduled 'catalyst' events that
     change what the deciding actor wants (their case: 17 searches about a bill,

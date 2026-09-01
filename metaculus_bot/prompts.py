@@ -233,6 +233,40 @@ def _mc_options_line(options: Sequence[str] | None) -> str:
     return "Options (in resolution order): " + " | ".join(names)
 
 
+# The FOCUS AREAS market-odds bullet, narrowed away from the four venues the
+# structured prediction-market snapshot already covers live. In 42 ranked-era
+# bundles the old blanket bullet ("Prediction market odds and forecasts (if
+# available)") produced exactly one content-redundant retrieval plus three stale
+# covered-venue prices that contradicted correct live snapshot rows — the only
+# measured harm mode — while every realized instance of decisive market evidence
+# came from OUTSIDE those four venues (Good Judgment Open on q44869, CME FedWatch
+# on q45401, the Metaculus crowd on q20683). Hence narrowed rather than removed.
+# Wording confirmed verbatim by the operator 2026-09-01; receipts in
+# scratch/residual_2026-08-31/market_odds_coverage.md.
+_OUTSIDE_VENUE_MARKET_ODDS_BULLET = (
+    "- Market-implied or crowd odds from sources OTHER than Polymarket, Kalshi, Manifold, or PredictIt "
+    "(e.g. Metaculus, Good Judgment Open, CME FedWatch, bookmakers) — always name the market and the date "
+    "you observed the price. Do NOT report Polymarket/Kalshi/Manifold/PredictIt prices from search results: "
+    "a dedicated live snapshot of those venues is provided separately, and search-indexed copies of their "
+    "prices are usually days stale."
+)
+
+
+# Citation instruction for the Gemini grounding provider. The SDK returns grounding
+# metadata that `research/gemini_search.py` splices in as plain `[N]` markers; the
+# model ALSO writes its own hierarchical `[1.2.3]` indices, which index a chunk list
+# we do not hold — 173 of 323 archived gemini sections carried them, 163 of those
+# alongside our real markers, so a forecaster reading the section cannot tell which
+# brackets are checkable. The formatter strips them after splicing; this stops the
+# model producing them in the first place. Gemini-only: the markdown branch is the
+# native-search provider, whose citations are the model's own by design.
+_AUTO_ANNOTATED_CITATION_CLAUSE = (
+    "Include inline citations for all factual claims (the tool will auto-annotate) — do NOT write your own "
+    "citation markers or index numbers: no hierarchical tokens like [1.2.3], no self-invented bracketed "
+    "source numbering. The tool attaches the real markers"
+)
+
+
 def web_research_prompt(
     question_text: str,
     *,
@@ -250,7 +284,7 @@ def web_research_prompt(
     citation_clause = (
         "Include inline citations [source name](url) for all factual claims"
         if citation_style == "markdown"
-        else "Include inline citations for all factual claims (the tool will auto-annotate)"
+        else _AUTO_ANNOTATED_CITATION_CLAUSE
     )
     footer = (
         "Provide a factual research summary with citations:"
@@ -262,9 +296,7 @@ def web_research_prompt(
         if allow_resolution_source_reading
         else ""
     )
-    prediction_markets_instruction = (
-        "" if is_benchmarking else "\n- Prediction market odds and forecasts (if available)"
-    )
+    prediction_markets_instruction = "" if is_benchmarking else f"\n{_OUTSIDE_VENUE_MARKET_ODDS_BULLET}"
     benchmarking_warning = _benchmarking_warning("search") if is_benchmarking else ""
     options_block = f"\n{_mc_options_line(options)}" if options else ""
 
@@ -276,6 +308,8 @@ GUIDELINES:
 - Search thoroughly — issue multiple queries if needed to fill gaps
 - Be factual and unbiased — report what you find, not what you think
 - {citation_clause}
+- Carry the publication date of every dated or forward-looking claim ("announced <date>", "published <date>", "as of <date>")
+- For a schedule, plan, target, or other forward-looking claim, state when and where it was announced — never present an undated recollection as a current fact; if you cannot date it, say so
 - If you cannot find reliable information on something, say so explicitly
 - DO NOT hallucinate sources — only cite what you actually found
 - DO NOT make predictions or forecasts yourself
@@ -450,6 +484,28 @@ _SOURCE_PROVENANCE_LADDER = """
                  attests, even though the party is biased.
                • Implausibility check: a figure that is internally implausible or off by ~an order of magnitude versus
                  corroborating sources is likely a transcription or translation error — flag it, don't anchor on it."""
+
+
+# How to read a searched-and-found-nothing result, shared verbatim across the three
+# forecaster prompts. On qid 44799 the gap-fill resolver reported "I found no
+# authoritative public record" and four of six forecasters converted that into
+# "the authorization is absent"; the two that discounted it scored best in the
+# ensemble. Same pre-indent contract as _SOURCE_PROVENANCE_LADDER above: every line
+# is at >= 15 spaces so clean_indents preserves the nesting in all three prompts
+# despite their differing baselines (binary 12, MC/numeric 8).
+_NULL_RESULT_READING = """
+               • Read a null search result as a null search result. "No record found", "no authoritative
+                 source located", or "could not confirm" licenses only "we could not find evidence of X" —
+                 it does NOT establish that X does not exist or did not happen. Never convert an absence of
+                 retrieved evidence into a positive finding of absence.
+               • Weight the absence by how well the topic is covered. Silence from a comprehensive,
+                 well-indexed source that this domain reliably reports through (a regulator's filing
+                 database, an official statistics release, an official registry) is real evidence, but only
+                 weak-to-moderate. Silence from general web search on a poorly-covered, local, or
+                 fast-moving topic is nearly no evidence at all.
+               • Absence is weaker still where the actor has already demonstrated the capability or behavior
+                 in question (same firm, same jurisdiction, same process) — there, a missing public record is
+                 more often a gap in reporting than a missing event."""
 
 
 # The liquidity/participation weighting sentence, appended to the shared strong-evidence
@@ -739,6 +795,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                  - Strong: multiple independent sources; clear causal mechanisms; strong precedent
                  - Moderate: one good source; indirect links; weak precedent
                  - Weak: anecdotes; speculative logic; volatile indicators
+{_NULL_RESULT_READING}
 
             5) Competing cases and red-teaming
                • Strongest Bear Case (No): most compelling, evidence-based argument for No.
@@ -868,6 +925,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
               - Strong: multiple independent sources; clear causality; strong precedent
               - Moderate: one good source; indirect links; weak precedent
               - Weak: anecdotes; speculative logic; volatile indicators
+{_NULL_RESULT_READING}
 
         (5) Strongest pro case for the currently most-likely option
             • Use weighted evidence and explicit causal chains.
@@ -1038,6 +1096,7 @@ def numeric_prompt(
             - Strong: multiple independent sources, clear causal links, strong precedent
             - Moderate: one good source, indirect links, weak precedent
             - Weak: anecdotes, speculative logic, volatile indicators
+{_NULL_RESULT_READING}
 
         (6) Tail scenarios
             - Coherent pathway for unusually low results.
@@ -1542,6 +1601,23 @@ def gap_fill_analyzer_prompt(
            than current search (e.g., no {datetime.now(UTC).year} data on a near-term question).
         9. Missing counter-evidence — first pass is one-sided; a "consider the
            opposite" search would strengthen the forecast.
+
+        ANSWERABLE NOW. Every gap must be answerable from sources that exist today.
+        When the question resolves off a live data source — a tracker, index, polling or
+        rate average, counter, league table, or dashboard — at least ONE gap must ask what
+        that source reads NOW, in the present tense ("what value does <tracker> currently
+        display for <series>, and when was it last updated?"). Never phrase a gap as that
+        source's value on the resolution date ("what will <tracker> show on <date>"): no
+        search can answer it, the resolver comes back "that date has not occurred yet",
+        and the slot is spent for nothing. If a candidate gap can only be answered by a
+        future observation, rewrite it as the present-tense observable or drop it.
+
+        NULL RESULTS ARE SEARCH OUTCOMES. Where the first pass says it searched and
+        found nothing ("no record found", "no authoritative source located"), treat that
+        as an open question, not as an established negative fact. If the missing record
+        is load-bearing, the gap is to look for it in the specific authoritative place
+        that would hold it — name that source in the search query — and to establish what
+        its silence there would and would not show.
 
         ORDER THE GAPS BY DECISION-RELEVANCE, most forecast-moving first. Before you
         finalize the list, compare the candidate gaps against each other and rank

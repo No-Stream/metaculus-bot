@@ -210,7 +210,7 @@ async def test_provider_attaches_google_search_and_url_context_tools(
 
 @pytest.mark.asyncio
 async def test_benchmarking_carve_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    """is_benchmarking=True: prompt contains 'benchmarking run' and NOT 'Prediction market'."""
+    """is_benchmarking=True: prompt contains 'benchmarking run' and no market/crowd-odds ask."""
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
     response = _make_response("research text")
@@ -225,12 +225,12 @@ async def test_benchmarking_carve_out(monkeypatch: pytest.MonkeyPatch) -> None:
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
     prompt = call_kwargs["contents"]
     assert "benchmarking run" in prompt
-    assert "Prediction market" not in prompt
+    assert "Market-implied or crowd odds" not in prompt
 
 
 @pytest.mark.asyncio
 async def test_non_benchmarking_includes_prediction_markets(monkeypatch: pytest.MonkeyPatch) -> None:
-    """is_benchmarking=False: prompt includes 'Prediction market' line."""
+    """is_benchmarking=False: prompt includes the market/crowd-odds bullet."""
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
     response = _make_response("research text")
@@ -244,7 +244,7 @@ async def test_non_benchmarking_includes_prediction_markets(monkeypatch: pytest.
 
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
     prompt = call_kwargs["contents"]
-    assert "Prediction market" in prompt
+    assert "Market-implied or crowd odds" in prompt
     assert "benchmarking run" not in prompt
 
 
