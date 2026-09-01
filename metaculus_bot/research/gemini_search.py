@@ -13,6 +13,7 @@ import asyncio
 import functools
 import logging
 import os
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -164,6 +165,72 @@ def _splice_inline_citations(text: str, supports: Sequence[Any] | None) -> str:
         return text
 
 
+# Gemini writes its OWN hierarchical citation indices — ``[2.4.1]``, ``[1.1.1, 1.1.2]``,
+# ``[A: NASA, 1.1.2]`` — indexing a source list that does not exist on our side, alongside the
+# resolvable ``[N]`` markers ``_splice_inline_citations`` puts in from real grounding metadata.
+# 173 of 323 archived sections carry them and 163 carry BOTH families, so half the corpus hands a
+# forecaster a bracket field where some brackets resolve and some are decoration, with nothing to
+# tell them apart (scratch/residual_2026-08-31/gemini_search_audit/cutB_pattern.md §3.1).
+#
+# A dotted run only counts as an index when it is DELIMITED the way a citation is — sitting at a
+# group edge or against whitespace/``,``/``;``/``:`` — and when every component is at most two
+# digits. Both bounds are measured, not guessed: across the 2,609 archived bracket groups that
+# hold a dotted token, first components run 1..6 and the largest component anywhere is 39. The
+# two-digit bound is therefore comfortably above real indices while excluding the content classes
+# that would otherwise match — a year (``[2026.08]``), an IP octet (``[192.168.1.1]``) — and the
+# delimiter rule excludes a quantity (``[3.8%]``, ``[$1.5]``, ``[1.5 million]``) and a version
+# (``[v2.1.3]``). Zero of those 2,609 groups is anything but a citation index (validation:
+# scratch/next_season_bundle_2026-09/item3_citation_strip/VALIDATION.md).
+_BRACKET_GROUP_RE = re.compile(r"(?P<pre>(?<=\S) )?\[(?P<inner>[^\[\]\n]*)\]")
+_CITATION_INDEX_RE = re.compile(r"(?<![^\s,;:])\d{1,2}(?:\.\d{1,2})+(?=\s*(?:[,;:]|$))")
+_GROUP_ITEM_SPLIT_RE = re.compile(r"([,;])")
+
+
+def _tidy_group_item(item: str) -> str:
+    """Normalize one comma/semicolon item of a bracket group after index removal.
+
+    Drops the separator a removed index left behind (``2.1.4: A`` -> ``A``,
+    ``A: official 2.4.1`` -> ``A: official``) and collapses the whitespace it opened up.
+    """
+    return re.sub(r"\s+", " ", item).strip().strip(":").strip()
+
+
+def _strip_model_citation_indices(text: str) -> str:
+    """Remove Gemini's self-authored hierarchical citation indices from bracket groups.
+
+    MUST run AFTER ``_splice_inline_citations``: that function indexes the ORIGINAL response
+    text by grounding-support BYTE offsets, so editing the text first would shift every offset
+    and land our real ``[N]`` markers mid-word. Our markers are plain integers, so they survive
+    this pass untouched; only dotted runs go.
+
+    A group emptied of everything but punctuation is removed along with one preceding space, so
+    ``"office [1.1.1, 1.1.2]. He"`` reads ``"office. He"`` rather than ``"office . He"``.
+    Idempotent: a second pass finds no qualifying token.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        inner = match.group("inner")
+        stripped_inner = _CITATION_INDEX_RE.sub("", inner)
+        if stripped_inner == inner:
+            return match.group(0)
+        parts = _GROUP_ITEM_SPLIT_RE.split(stripped_inner)
+        # parts alternates item, separator, item, ... — pair each item with the separator
+        # that introduced it so a surviving item keeps the model's own ``,`` vs ``;``.
+        kept: list[tuple[str, str]] = []
+        for index in range(0, len(parts), 2):
+            item = _tidy_group_item(parts[index])
+            if not any(char.isalnum() for char in item):
+                continue
+            separator = parts[index - 1] if index else ""
+            kept.append((separator, item))
+        if not kept:
+            return ""
+        rebuilt = kept[0][1] + "".join(f"{separator} {item}" for separator, item in kept[1:])
+        return f"{match.group('pre') or ''}[{rebuilt}]"
+
+    return _BRACKET_GROUP_RE.sub(replace, text)
+
+
 def _render_sources_section(chunks: Sequence[Any]) -> str:
     """Render the trailing ``### Sources`` block, or ``""`` when no chunk carries a label.
 
@@ -201,7 +268,10 @@ def _format_grounded_response(
     Inline citation markers are inserted per-segment using
     grounding_metadata.grounding_supports, iterating in reverse end_index order
     so index offsets stay valid while we mutate the string. Falls back to a
-    plain-text + sources-list if supports are missing.
+    plain-text + sources-list if supports are missing. The model's own hierarchical
+    ``[2.4.1]`` indices are then stripped (``_strip_model_citation_indices``) so every
+    bracket left in the body resolves against the rendered ``### Sources`` list; the
+    sources block itself is appended after the strip and never passes through it.
 
     Grounded-chunk floor: a response with no grounding evidence at all — zero
     google_search chunks AND no successful url_context read — is suppressed
@@ -249,10 +319,10 @@ def _format_grounded_response(
         # url_context grounded the text but google_search produced no chunks: keep
         # the text as-is (no citation markers to splice, no Sources block). The
         # caller appends the url_context fetch marker.
-        return text
+        return _strip_model_citation_indices(text)
 
     annotated = _splice_inline_citations(text, metadata.grounding_supports)
-    return annotated + _render_sources_section(metadata.grounding_chunks)
+    return _strip_model_citation_indices(annotated) + _render_sources_section(metadata.grounding_chunks)
 
 
 async def invoke_gemini_grounded(
