@@ -139,7 +139,7 @@ async def test_native_search_strips_utm_from_output_but_not_raw_log(
 async def test_native_search_provider_includes_prediction_markets_when_not_benchmarking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify prediction markets are included in prompt when not benchmarking."""
+    """Verify the market/crowd-odds ask is included in the prompt when not benchmarking."""
     captured_prompt: str | None = None
 
     class MockLlm:
@@ -158,14 +158,14 @@ async def test_native_search_provider_includes_prediction_markets_when_not_bench
         await provider(_make_q("Will X happen?"))
 
     assert captured_prompt is not None
-    assert "Prediction market" in captured_prompt
+    assert "Market-implied or crowd odds" in captured_prompt
 
 
 @pytest.mark.asyncio
 async def test_native_search_provider_excludes_prediction_markets_when_benchmarking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify prediction markets are excluded from prompt when benchmarking."""
+    """Verify the market/crowd-odds ask is excluded from the prompt when benchmarking."""
     captured_prompt: str | None = None
 
     class MockLlm:
@@ -184,7 +184,7 @@ async def test_native_search_provider_excludes_prediction_markets_when_benchmark
         await provider(_make_q("Will X happen?"))
 
     assert captured_prompt is not None
-    assert "Prediction market" not in captured_prompt
+    assert "Market-implied or crowd odds" not in captured_prompt
 
 
 @pytest.mark.asyncio
