@@ -283,7 +283,18 @@ def _check_attributions(text: str, chunks: Sequence[Any], *, qid: int | None) ->
     if not labels:
         return text
     checked = rewrite_unsupported_attributions(text, labels)
-    record_provider_detail(qid, "gemini_search", {"counts": {"unsupported_attributions": checked.unsupported}})
+    # ``tier_tags`` rides alongside because the count this check exists to report is not
+    # readable without it: the marker below is gated on ``unsupported``, so a response that
+    # carried no tier tags at all and one whose every tag was backed both archive as
+    # ``unsupported_attributions=0`` and log nothing. It counts OUTLET-NAMED tier items only
+    # (generic tier words like "official" — 307 of the corpus's 790 items — are excluded
+    # before matching), so a 0 reads as "no outlet-named tags", not "no tier tags"; the
+    # definitive check for the latter is a grep for "[A: " over the archived section.
+    record_provider_detail(
+        qid,
+        "gemini_search",
+        {"counts": {"tier_tags": checked.tagged, "unsupported_attributions": checked.unsupported}},
+    )
     if checked.unsupported:
         # ``labels`` rides the line because the same count reads completely differently
         # against it: q38195 named 21 outlets over ONE grounded domain.

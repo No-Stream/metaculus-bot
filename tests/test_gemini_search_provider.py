@@ -869,6 +869,7 @@ async def test_unsupported_attribution_rewritten_and_counted_on_the_grounded_pat
     assert "GEMINI_UNSUPPORTED_ATTRIBUTION: question=44953 tagged=2 unsupported=1 groups=1 labels=2" in caplog.text
     detail = pop_provider_detail(44953, "gemini_search")
     assert detail["counts"]["unsupported_attributions"] == 1
+    assert detail["counts"]["tier_tags"] == 2
 
 
 @pytest.mark.asyncio
@@ -897,7 +898,43 @@ async def test_fully_supported_attributions_record_zero_and_log_no_marker(
 
     assert "[C: Time and Date]" in out
     assert "GEMINI_UNSUPPORTED_ATTRIBUTION" not in caplog.text
-    assert pop_provider_detail(44953, "gemini_search")["counts"]["unsupported_attributions"] == 0
+    counts = pop_provider_detail(44953, "gemini_search")["counts"]
+    assert counts["unsupported_attributions"] == 0
+    assert counts["tier_tags"] == 1
+
+
+@pytest.mark.asyncio
+async def test_untagged_response_records_zero_tier_tags_beside_zero_unsupported(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The denominator has to ride along or the recorded zero is unreadable: this response
+    carried NO tier tag, the test above carried one and it was backed, and both log nothing
+    because the marker is gated on ``unsupported``. Without ``tier_tags`` the two archive
+    identically as ``unsupported_attributions=0``, so "the model stopped tagging" — the
+    over-compliance risk the prompt's carve-out addresses (F10) — would read as "every tag
+    was backed". ``tier_tags`` counts OUTLET-named items only, so a generic ``[A: official]``
+    still reads 0 here; the definitive check is a grep for the tag in the archived section.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response(
+        "Cloud cover is 76%, per the forecast office [A: official].",
+        chunks=[CannedWebChunk(uri=_BLOB, title="timeanddate.com", domain="timeanddate.com")],
+        supports=None,
+    )
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=44953)
+
+    assert "[A: official]" in out
+    assert "GEMINI_UNSUPPORTED_ATTRIBUTION" not in caplog.text
+    counts = pop_provider_detail(44953, "gemini_search")["counts"]
+    assert counts == {"tier_tags": 0, "unsupported_attributions": 0}
 
 
 @pytest.mark.asyncio

@@ -260,10 +260,22 @@ _OUTSIDE_VENUE_MARKET_ODDS_BULLET = (
 # brackets are checkable. The formatter strips them after splicing; this stops the
 # model producing them in the first place. Gemini-only: the markdown branch is the
 # native-search provider, whose citations are the model's own by design.
+#
+# The closing carve-out is spelled out because ``_SOURCE_TIER_TAG_INSTRUCTION`` renders
+# 26 lines further down the SAME prompt and orders the model to write bracketed
+# ``[A: official]`` tier tags, so an unqualified ban on "self-invented bracketed"
+# annotation reads as a contradiction. Over-compliance is the direction nothing guards:
+# a model that stops tagging costs the forecaster prompts the source-tier signal they
+# weight on and leaves ``research/gemini_attribution.py`` no tags to check, whereas
+# UNDER-compliance is already handled downstream by ``_strip_model_citation_indices``,
+# which removes the dotted indices and keeps the tier tags in a mixed group. Phrased as
+# "still applies" rather than as a requirement, because the tier block's own closing
+# line licenses leaving a claim untagged when its tier is unclear.
 _AUTO_ANNOTATED_CITATION_CLAUSE = (
     "Include inline citations for all factual claims (the tool will auto-annotate) — do NOT write your own "
     "citation markers or index numbers: no hierarchical tokens like [1.2.3], no self-invented bracketed "
-    "source numbering. The tool attaches the real markers"
+    "source numbering. The tool attaches the real markers. This bans invented CITATION indices only: the "
+    "SOURCE TIER TAGS instruction below still applies, and its [A: ...] tags are not citation markers"
 )
 
 
