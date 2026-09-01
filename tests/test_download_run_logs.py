@@ -44,6 +44,11 @@ PUBLISH_HARDENING_LINE = (
     '(HTTPError: Error while posting prediction: Status code: 405. Response: {"error":"closed"})'
 )
 STACKER_SKIP_REASON_LINE = "<!-- STACKER_SKIP_REASON=single_forecaster -->"
+# One extreme-band member call, in the shape metaculus_bot/extreme_call.py emits.
+EXTREME_CALL_LINE = (
+    "2026-09-01 12:00:00,000 - metaculus_bot.forecaster - INFO - "
+    "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=1"
+)
 
 
 class TestWorkflowSlugFromPath:
@@ -204,6 +209,27 @@ class TestNewMarkerSpecsReachTheArchive:
         assert archived[0]["run_id"] == "900"
         assert archived[0]["workflow"] == "tournament"
         assert archived[0]["error_type"] == "HTTPError"
+
+    def test_extreme_call_round_trips_to_jsonl(self, tmp_path: Path):
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text(EXTREME_CALL_LINE + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="901", workflow="metaculus_cup", artifact="research-901", run_date="2026-09-01T00:00:00Z"
+        )
+        assert run is not None
+
+        archive_dir = tmp_path / "archive"
+        assert merge_and_write(archive_dir, [run])["extreme_call"] == 1
+        archived = load_marker_records(archive_dir, "extreme_call")
+        assert len(archived) == 1
+        # The three fields a lone-extreme cut reads, through the whole durable path:
+        # without them in the archive the split goes back to being reconstructed from
+        # published comments once the 90-day GHA log window closes.
+        assert archived[0]["model"] == "gemini-3.1-pro-preview"
+        assert archived[0]["lone"] is True
+        assert archived[0]["survivors"] == 1
 
 
 class TestDownloadTimeoutResilience:

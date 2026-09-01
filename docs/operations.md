@@ -735,6 +735,19 @@ the telemetry markers:
   numeric question, without declaring any percentile beyond the edge, to trip
   `OPEN_BOUND_PILING_THRESHOLD` (`numeric/config.py`). Emitted by
   `numeric/diagnostics.py`.
+- `EXTREME_CALL: question=... model=... p=... side=low|high lone=... survivors=...`
+  — one line per surviving ensemble member of a BINARY question whose probability
+  sat at or past an edge of the extreme band (`EXTREME_CALL_LOW` /
+  `EXTREME_CALL_HIGH` in `constants.py`, currently 0.05 / 0.95, inclusive).
+  Emitted by `extreme_call.py` right after `FORECASTERS_SURVIVED`, which supplies
+  the denominator: a member inside the band leaves no line, so a rate needs the
+  survivor list too. `lone=true` means no other survivor was extreme on the same
+  side, which is the measurement: the 2026-08-31 round found lone extremes right 4
+  of 9 against 21 of 23 for accompanied ones (those counts used a looser
+  either-side rule — `extreme_call.py` explains the difference before you pool old
+  and new numbers). `survivors=1` marks a record where "lone" is vacuous because
+  that member was the whole ensemble; drop those from a lone rate. Nothing here
+  gates or clamps a forecast.
 - `GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=...
   rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=...
   wall_s=... findings=... pending_leads=... lint_rejections=...

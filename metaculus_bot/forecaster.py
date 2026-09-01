@@ -54,6 +54,7 @@ from metaculus_bot.drop_telemetry import (
     classify_raised_drop_cause,
     emit_drop_telemetry,
 )
+from metaculus_bot.extreme_call import format_extreme_call_markers
 from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
@@ -889,6 +890,33 @@ class TemplateForecaster(CompactLoggingForecastBot):
             len(self._forecaster_llms),
             ",".join(survivor_models) if survivor_models else "unknown",
         )
+
+        # Per-member extreme-call telemetry, alongside the survivor count that supplies
+        # its denominator. Emitted HERE because this is the one point where the surviving
+        # predictions and their own model prefixes are both in hand and nothing has
+        # aggregated them yet — downstream, route_after_forecasts collapses the set to a
+        # published value and the per-member calls are only recoverable from parsed
+        # comments. Binary only, and no line for a member inside the band; see
+        # extreme_call.py for what the marker measures and why.
+        #
+        # The cast narrows PredictionTypes to the float a binary question's members carry
+        # by construction: this is the same isinstance predicate _make_prediction dispatches
+        # on, so the questions that reach here are exactly the ones routed to
+        # run_binary_forecast, which returns ReasonedPrediction[float] (a conditional or
+        # date question raises NotImplementedError there and never yields a prediction). An
+        # isinstance filter over the values would silently drop a member instead.
+        if isinstance(question, BinaryQuestion):
+            for marker in format_extreme_call_markers(
+                qid_for_log,
+                [
+                    (
+                        extract_model_display_name_from_reasoning(pred.reasoning),
+                        cast(float, pred.prediction_value),
+                    )
+                    for pred in valid_predictions
+                ],
+            ):
+                logger.info(marker)
 
         return await route_after_forecasts(
             self,
