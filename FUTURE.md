@@ -1632,7 +1632,8 @@ hedge-audit narrowing push and Step-9b's LOW→wide IQR prescription from the nu
 
 ### Starved outer tails: the detector shipped, the publish-time WARN did not (added 2026-09-01, medium)
 
-`scan_outer_tails` (`performance_analysis/width_monitor.py`) landed 2026-09-01. It finds a defect
+`scan_outer_tails` (`performance_analysis/outer_tail.py`, rendered by the width monitor's CLI)
+landed 2026-09-01. It finds a defect
 distinct from the max-step smear: on an open bound the declared outer tail can route past the
 displayed range entirely, leaving every in-range bin above the members' declared p99 pinned at the
 platform's per-bin minimum step, so any resolution in that band earns the same ~−219 floor score

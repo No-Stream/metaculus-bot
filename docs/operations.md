@@ -778,7 +778,8 @@ open-bound floor) still misses the band, because that interval lies wholly above
 0.90.
 
 The same command prints a second, per-QUESTION section: the **starved outer tail**
-scan. On an open bound the declared outer tail can end up routed past the
+scan, which lives in `performance_analysis/outer_tail.py` (the width monitor owns
+only the CLI wiring). On an open bound the declared outer tail can end up routed past the
 displayed range entirely, leaving every in-range bin above the members' declared
 p99 pinned at the platform's per-bin minimum step (`0.01/N`). Every resolution in
 that band then earns the same floor score, about -219 on any grid size, so the
@@ -797,7 +798,7 @@ response stays gated on the standing `k_tail` hold. On the archived cohort it
 fires on 68 of 417 measurable open-bound sides across 49 questions, so a fire
 means "this question carries a cliff" rather than "something went wrong here".
 There is no publish-time twin of this detector, deliberately; the comment above
-`STARVED_OUTER_TAIL_FLOOR_MULTIPLE` in `width_monitor.py` records why, and what a
+`STARVED_OUTER_TAIL_FLOOR_MULTIPLE` in `outer_tail.py` records why, and what a
 version that needed no new publish-path plumbing would have to measure instead.
 
 Its era boundaries are **merge-to-main timestamps** (`WIDENING_FLIP`,
