@@ -5,9 +5,9 @@ generic pieces live here — session construction, a size-capped body read, and
 provider-agnostic HTML/URL helpers (the two embed scans below: Datawrapper
 charts, shared so the resolution-source Tier-2 hop and any future
 agentic-fetch integration can't drift on the route, and the routeless
-data-embed providers a page can hide its numbers behind). Retry/backoff logic stays provider-private
-(prediction_market's is JSON-API shaped; the resolution-source fetcher
-deliberately does no retries).
+data-embed providers a page can hide its numbers behind). Retry/backoff logic
+stays provider-private (prediction_market's is JSON-API shaped; the
+resolution-source fetcher deliberately does no retries).
 """
 
 from __future__ import annotations
