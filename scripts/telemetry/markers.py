@@ -955,8 +955,11 @@ MARKER_SPECS: list[MarkerSpec] = [
         # The embellishment channel, per response (research/gemini_search.py
         # _check_attributions): outlet-named source-tier tags — ``[A: NASA]``, ``[B: Reuters]``
         # — that the SAME response's own grounded-domain list does not name, rewritten to
-        # ``[unverified attribution]`` at format time. 76% of the 685 tier attributions in the
-        # 323 archived Gemini sections are that shape and the zero-chunk floor cannot see any
+        # ``[unverified attribution]`` at format time. 70% (478 of 681) of the outlet-named tier
+        # attributions in the 323 archived Gemini sections are that shape under the shipped
+        # keep-biased matcher (86% under the audit's looser rule; receipts in
+        # scratch/next_season_bundle_2026-09/item4_attribution_check/VALIDATION.md) and the
+        # zero-chunk floor cannot see any
         # of them (it fires only when nothing grounded at all), so before this the rate was a
         # hand audit. ``labels`` is load-bearing context, not decoration: the same
         # ``unsupported`` count reads completely differently against it — q38195 named 21
