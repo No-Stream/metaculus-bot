@@ -438,10 +438,14 @@ def _process_single_question(
         # actual_resolve_time stamp on the question.
         "bot_comment_created_at": comment_created_at,
         # Metaculus-computed scores from my_forecasts.score_data. Contains
-        # peer_score (ascending: negative = worse than crowd), spot_peer_score,
-        # baseline_score, spot_baseline_score, coverage, weighted_coverage,
+        # spot_peer_score, peer_score (both ascending: negative = worse than crowd),
+        # spot_baseline_score, baseline_score, coverage, weighted_coverage,
         # relative_legacy_score. None for records fetched before score data
         # was captured; always populated on fresh pulls of resolved questions.
+        # READ SPOT_PEER, NOT PEER: the tournament leaderboard ranks on spot peer, and
+        # peer is the same quantity scaled by coverage. Accessors that encode that
+        # preference live in performance_analysis/platform_scores.py — use them rather
+        # than indexing this dict, so the convention can't drift per consumer.
         "metaculus_scores": metaculus_scores,
         "metadata": {
             # The Metaculus CROWD size, which lives on the POST, not on the question

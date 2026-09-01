@@ -16,6 +16,7 @@ from metaculus_bot.performance_analysis.analysis import (
     numeric_pit_analysis,
     per_model_binary_scores,
     per_model_cohort,
+    platform_score_summary,
     stacking_effectiveness,
 )
 from metaculus_bot.performance_analysis.audit import (
@@ -55,6 +56,15 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_stacker_outcome_marker,
     parse_stacker_skip_reason_marker,
 )
+from metaculus_bot.performance_analysis.platform_scores import (
+    PEER_FIELD,
+    SPOT_PEER_FIELD,
+    RankingScore,
+    peer_score,
+    platform_score_fragments,
+    ranking_score,
+    spot_peer_score,
+)
 from metaculus_bot.performance_analysis.ranking_cohort import (
     PerModelRankingCohort,
     log_ranking_cohort,
@@ -81,10 +91,28 @@ from metaculus_bot.performance_analysis.stacker_detection import (
     has_was_stacked_flag,
 )
 
+# The standing scoring-exclusion cohorts, re-exported so a round script can reach them
+# without knowing they live in the width monitor — retyping the ids is what the constants
+# exist to stop.
+from metaculus_bot.performance_analysis.width_monitor import (
+    DEGRADED_RUN_QIDS,
+    EXCLUSION_COHORTS,
+    KNOWN_BUG_QIDS,
+    PARTIAL_DEGRADED_QIDS,
+    parse_exclude_qids,
+)
+
 __all__ = [
+    "DEGRADED_RUN_QIDS",
+    "EXCLUSION_COHORTS",
+    "KNOWN_BUG_QIDS",
     "MIN_SCOREABLE_ANCHORS",
+    "PARTIAL_DEGRADED_QIDS",
+    "PEER_FIELD",
+    "SPOT_PEER_FIELD",
     "DetectorVerdict",
     "PerModelRankingCohort",
+    "RankingScore",
     "annotate_forecaster_bullets_with_models",
     "anonymous_model_key",
     "attach_research_tags",
@@ -121,6 +149,7 @@ __all__ = [
     "no_bias_check",
     "numeric_log_score",
     "numeric_pit_analysis",
+    "parse_exclude_qids",
     "parse_forecaster_model_map",
     "parse_inferred_stacker_outcome",
     "parse_per_model_forecasts",
@@ -130,16 +159,21 @@ __all__ = [
     "parse_stacked_marker",
     "parse_stacker_outcome_marker",
     "parse_stacker_skip_reason_marker",
+    "peer_score",
     "per_model_binary_scores",
     "per_model_cohort",
     "per_model_ranking_cohort",
+    "platform_score_fragments",
+    "platform_score_summary",
     "rank_our_models_by_accuracy",
     "ranking_caveats",
+    "ranking_score",
     "rescore_records",
     "research_tags_for_qid",
     "research_tags_for_record",
     "save_dataset",
     "select_cohort",
     "select_worst_misses",
+    "spot_peer_score",
     "stacking_effectiveness",
 ]

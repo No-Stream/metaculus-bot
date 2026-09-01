@@ -12,8 +12,11 @@ import pytest
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, GRID_SCALED_MAX_STEP_MERGED_AT
 from metaculus_bot.performance_analysis.width_monitor import (
+    DEGRADED_RUN_QIDS,
+    EXCLUSION_COHORTS,
     KNOWN_BUG_QIDS,
     MIN_N_FOR_POINT_METRICS,
+    PARTIAL_DEGRADED_QIDS,
     TS_ANCHOR_ENABLE,
     WIDENING_FLIP,
     _cdf_and_grid,
@@ -704,6 +707,86 @@ class TestParseExcludeQids:
         help_text = capsys.readouterr().out
         assert "composes" in help_text
         assert "known_bug,43800" in help_text
+
+    def test_the_help_text_names_every_cohort_shorthand(self, capsys):
+        """A cohort nobody can discover from ``--help`` gets hardcoded in a round script
+        instead, which is how the degraded-run ids ended up copied three times."""
+        with pytest.raises(SystemExit):
+            main(["--help"])
+
+        help_text = capsys.readouterr().out
+        for name in EXCLUSION_COHORTS:
+            assert name in help_text
+
+
+class TestDegradedRunCohorts:
+    """The dry-donated-key incident cohorts (2026-07-26 .. 07-28), now tracked constants.
+
+    They were standing scoring exclusions living only in playbook prose, and three separate
+    analysis rounds hardcoded private copies of the ids. Membership is a dated decision per
+    question, so it is pinned here rather than left to whatever a caller retypes.
+    """
+
+    def test_degraded_run_qids_pins_the_eight_one_of_three_publishes(self):
+        assert frozenset({"44870", "44871", "44872", "44873", "44874", "44875", "44876", "44877"}) == DEGRADED_RUN_QIDS
+
+    def test_partial_degraded_qids_pins_the_three_two_of_three_publishes(self):
+        assert frozenset({"44841", "44856", "44912"}) == PARTIAL_DEGRADED_QIDS
+
+    def test_the_cohorts_are_disjoint_from_each_other_and_from_the_bug_pair(self):
+        """Overlap would double-count a question in the excluded tally and make the two
+        forecaster-count arms non-exclusive."""
+        assert not DEGRADED_RUN_QIDS & PARTIAL_DEGRADED_QIDS
+        assert not DEGRADED_RUN_QIDS & KNOWN_BUG_QIDS
+        assert not PARTIAL_DEGRADED_QIDS & KNOWN_BUG_QIDS
+
+    def test_the_ids_are_question_ids_not_the_post_ids_of_the_same_questions(self):
+        """The eight questions carry post ids 44721-44728. Storing those instead would make
+        every question-id-keyed join miss, and minibench POST ids 44873-44877 sit inside the
+        question-id range, so a "match either id" join admits five unrelated questions."""
+        post_ids = {str(pid) for pid in range(44721, 44729)}
+        assert not DEGRADED_RUN_QIDS & post_ids
+
+    def test_every_cohort_is_reachable_by_its_shorthand(self):
+        assert EXCLUSION_COHORTS == {
+            "known_bug": KNOWN_BUG_QIDS,
+            "degraded_run": DEGRADED_RUN_QIDS,
+            "partial_degraded": PARTIAL_DEGRADED_QIDS,
+        }
+
+    def test_each_shorthand_expands_and_composes(self):
+        assert parse_exclude_qids("degraded_run") == DEGRADED_RUN_QIDS
+        assert parse_exclude_qids("partial_degraded") == PARTIAL_DEGRADED_QIDS
+        assert parse_exclude_qids("degraded_run,partial_degraded") == DEGRADED_RUN_QIDS | PARTIAL_DEGRADED_QIDS
+        assert parse_exclude_qids("known_bug, degraded_run ,43800") == (KNOWN_BUG_QIDS | DEGRADED_RUN_QIDS | {"43800"})
+
+    def test_an_unrecognized_non_numeric_token_raises_instead_of_excluding_nothing(self):
+        """With one shorthand a typo was survivable; with three, ``degraded`` would drop
+        nothing while the ``excl`` column read 0 — indistinguishable from a cohort whose
+        questions aren't in this pull."""
+        with pytest.raises(ValueError, match="neither a question id nor a cohort shorthand"):
+            parse_exclude_qids("degraded")
+        with pytest.raises(ValueError, match="known_bug"):
+            parse_exclude_qids("43800,knownbug")
+        # str.isdigit() alone accepts a fullwidth digit, which would pass the guard and then
+        # match no question id: exactly the silent no-op the guard exists to prevent.
+        fullwidth_43800 = "".join(chr(0xFF10 + int(digit)) for digit in "43800")
+        with pytest.raises(ValueError, match="neither a question id"):
+            parse_exclude_qids(fullwidth_43800)
+
+    def test_a_degraded_run_question_actually_leaves_the_rows(self):
+        """End-to-end through the metrics: the constant is only worth anything if the id
+        matches the int question_id the collector writes."""
+        data = [
+            _record_with_pit(0.5, created_at="2026-08-01T00:00:00Z"),
+            _record_with_pit(0.025, created_at="2026-08-01T00:00:00Z", question_id=44872),
+            _record_with_pit(0.975, created_at="2026-08-01T00:00:00Z", question_id=44841),
+        ]
+        by_label = {
+            m.label: m for m in compute_all_eras(data, exclude_qids=parse_exclude_qids("degraded_run,partial_degraded"))
+        }
+        assert by_label["all"].n_pit == 1
+        assert by_label["all"].n_excluded == 2
 
 
 class TestBandMissSplit:
