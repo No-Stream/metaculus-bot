@@ -589,6 +589,55 @@ class TestMarketRankingDegraded:
         assert len(harvested["market_ranking"]) == 1
 
 
+# Copied from the emitting format string (prediction_market.py:_log_tier_caps). One line per
+# question whose top-tier grade the staleness cap refused, and none at all otherwise.
+MARKET_TIER_CAPPED_LINE = PFX + "MARKET_TIER_CAPPED: question=45163 rows=1 capped=manifold@0"
+MARKET_TIER_CAPPED_MULTI_LINE = PFX + "MARKET_TIER_CAPPED: question=45163 rows=2 capped=manifold@0,kalshi@3"
+
+
+class TestMarketTierCapped:
+    """The staleness tier cap, harvested because it fires on nothing yet.
+
+    Zero of the 102 archived snapshots carry a cap, and q45163's own offending row was graded
+    one tier below the cap's reach, so the interesting record is the FIRST one: it means the
+    ranker called a long-closed market same-quantity-same-date. A marker that is expected to
+    stay empty still needs a spec, or "did this ever fire in prod" becomes a re-scrape of GHA
+    logs that expire at 90 days.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(MARKET_TIER_CAPPED_LINE)
+        assert rec["marker"] == "market_tier_capped"
+        assert rec["rows"] == 1
+        assert rec["capped"] == "manifold@0"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(MARKET_TIER_CAPPED_LINE)
+        # prediction_market.py emits question.id_of_question, matching its three siblings.
+        assert rec["qid"] == 45163
+        assert rec["qid_kind"] == "question_id"
+
+    def test_a_multi_row_cap_survives_whole(self):
+        # `capped` is a comma-joined venue@rank list with no spaces, so the whole field has
+        # to arrive as one string — a per-row split is the analyst's job, not the parser's.
+        rec = _parse_one(MARKET_TIER_CAPPED_MULTI_LINE)
+        assert rec["rows"] == 2
+        assert rec["capped"] == "manifold@0,kalshi@3"
+
+    def test_does_not_collide_with_the_two_market_ranking_specs(self):
+        # All three tokens start `MARKET_`, and both ranking specs sit EARLIER in
+        # MARKER_SPECS, so under the one-marker-per-line break a loose prefix match there
+        # would have swallowed every cap line before its own spec was reached. Pinned in
+        # both directions: each of the three lines harvests as exactly itself.
+        harvested = parse_log_text(
+            "\n".join([MARKET_TIER_CAPPED_LINE, MARKET_RANKING_RANKED_LINE, MARKET_RANKING_DEGRADED_SHAPE_LINE]) + "\n",
+            **_META,
+        )
+        assert len(harvested["market_tier_capped"]) == 1
+        assert len(harvested["market_ranking"]) == 1
+        assert len(harvested["market_ranking_degraded"]) == 1
+
+
 # Verbatim emitted bytes from metaculus_bot/numeric/pipeline.py (captured under the prod log
 # format), metaculus_bot/numeric/utils.py, and metaculus_bot/spread_metrics.py. All three
 # lines carry trailing em-dash prose, so none of the specs may be end-anchored.
@@ -851,6 +900,78 @@ class TestFinancialStaleLatest:
         rec = _parse_one(FINANCIAL_STALE_LATEST_YFINANCE_LINE)
         assert "qid" not in rec
         assert "qid_kind" not in rec
+
+
+# Copied from the two emitting format strings (financial_data.py:_volatility_lines and
+# ts_render.py:_realized_vol_lines). The two surfaces differ by one field: only
+# financial_data holds a long volatility window to print alongside the 30-row one.
+FINANCIAL_NOISE_FLAG_YFINANCE_LINE = (
+    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data vr_lag=5 vr=0.369 floor=0.6 "
+    "short_vol=17.9 long_vol=15.2 robust_vol=10.8"
+)
+FINANCIAL_NOISE_FLAG_TS_ANCHOR_LINE = (
+    PFX + "FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag=5 vr=0.412 floor=0.6 short_vol=14.6 robust_vol=9.4"
+)
+FINANCIAL_NOISE_FLAG_NO_ESTIMATES_LINE = (
+    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data vr_lag=5 vr=0.369 floor=0.6 "
+    "short_vol=17.9 long_vol=None robust_vol=None"
+)
+
+
+class TestFinancialNoiseFlag:
+    """The vendor-noise flag, one spec for both emitting surfaces.
+
+    Informational and not alertable, like its stale-latest sibling: the rendered block already
+    tells the forecaster the one-day-return volatility is inflated and leads with the
+    noise-robust figure instead. Harvesting it is what turns "how often does each surface
+    serve a noise-dominated volatility" into a query after the 90-day GHA log expiry.
+    """
+
+    def test_yfinance_surface_fields(self):
+        rec = _parse_one(FINANCIAL_NOISE_FLAG_YFINANCE_LINE)
+        assert rec["marker"] == "financial_noise_flag"
+        assert rec["surface"] == "financial_data"
+        assert rec["vr_lag"] == 5
+        assert rec["vr"] == 0.369
+        assert rec["floor"] == 0.6
+        assert rec["short_vol"] == 17.9
+        assert rec["long_vol"] == 15.2
+        assert rec["robust_vol"] == 10.8
+
+    def test_ts_anchor_surface_omits_the_long_window(self):
+        # The ts_anchor emitter prints no long_vol at all, so the optional group does not
+        # participate and the field reads None rather than dropping the whole record.
+        rec = _parse_one(FINANCIAL_NOISE_FLAG_TS_ANCHOR_LINE)
+        assert rec["surface"] == "ts_anchor"
+        assert rec["short_vol"] == 14.6
+        assert rec["robust_vol"] == 9.4
+        assert rec["long_vol"] is None
+
+    def test_a_refused_estimate_reads_none(self):
+        # Both estimators return None on a series with no measurable return variation (an
+        # administratively fixed quote), and the emitter renders that as "None" — a
+        # _NONE_SENTINELS member, so it coerces to None instead of a fabricated 0.0.
+        rec = _parse_one(FINANCIAL_NOISE_FLAG_NO_ESTIMATES_LINE)
+        assert rec["long_vol"] is None
+        assert rec["robust_vol"] is None
+        assert rec["short_vol"] == 17.9
+
+    def test_no_question_ref(self):
+        # Per-identifier like the stale-latest sibling, and neither call site has the
+        # question in scope, so the record carries no qid at all.
+        rec = _parse_one(FINANCIAL_NOISE_FLAG_YFINANCE_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_collide_with_the_stale_latest_spec(self):
+        # Both tokens start `FINANCIAL_`, and financial_stale_latest sits EARLIER in
+        # MARKER_SPECS, so under the one-marker-per-line break a loose prefix match there
+        # would have swallowed every noise-flag line.
+        harvested = parse_log_text(
+            FINANCIAL_NOISE_FLAG_YFINANCE_LINE + "\n" + FINANCIAL_STALE_LATEST_YFINANCE_LINE + "\n", **_META
+        )
+        assert len(harvested["financial_noise_flag"]) == 1
+        assert len(harvested["financial_stale_latest"]) == 1
 
 
 # Copied from the emitting format string

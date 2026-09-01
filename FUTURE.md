@@ -689,6 +689,16 @@ how that gets measured instead of re-run offline.
 density, which on a 24/7 series drew a 62-step band under a 90-day label. Detail in the resolved
 entry "financial_data / ts-anchor: calendar time converted on a hardcoded trading-day density".
 
+**LOW — `ts_render._fmt` is the last `.4g`-class precision sibling (added 2026-09-01).** The
+2026-09-01 bundle replaced `:.4g` at the five FRED render sites (a Case-Shiller print of 331.893 was
+rendering as "331.9" on a question whose displayed range was four index points wide), but the
+anchor section's own formatter still renders anything between 100 and 10,000 at ONE decimal and
+drops decimals entirely above that. It was left alone because it needs a taste call: `_fmt` formats
+both resolving LEVELS, where full precision is clearly right, and P10/P50/P90 BAND estimates, where
+one decimal is arguably honest about an estimate's precision. So the likely fix is a separate level
+formatter at the "latest value" and history-table call sites rather than a global change. The
+anchor's tests assert structure rather than exact numbers, so the churn is small either way.
+
 ### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-21 (added 2026-07-16)
 
 **FLAG STATUS: `GAP_FILL_V2_ENABLED: 'true'` in all four yamls** — flipped ON in the branch 2026-07-17
@@ -790,11 +800,26 @@ in writing — so the binding constraint had moved to RENDERING. Status of the f
    disagree the liquidity warning governs the price, so an other-cut extrapolation from a thin
    strike widens rather than shifts. q45189's anchor strike had $1,377 of volume, all three
    forecasters called it thin, and all three resolved the conflict in favour of relation.
-3. **Staleness guard on tier grading — STILL OPEN.** A market whose `close_time` precedes the
-   question's `open_time` cannot be `same_quantity_same_date`, and an `other_cut` grade on one must
-   name the period gap in its `why`. Would have caught 3 of the 5 over-graded top-tier rank-0 rows
-   (all Manifold; the worst a 2023-resolved market graded "near-identical"). The ranker prompt does
-   render each candidate's close date, but nothing deterministic enforces the implication.
+3. **Staleness guard on tier grading — SHIPPED NARROW 2026-09-01, one operator decision left.**
+   `ranking.cap_stale_top_tier` now demotes a row graded `same_quantity_same_date` exactly one rung
+   when its close precedes the question's `open_time` by more than `MARKET_STALENESS_TIER_CAP_DAYS`
+   (60), recording the ranker's own grade in `MarketMatch.tier_cap_note`; the render also appends
+   `(Nd ago)` to any already-passed close cell, the ranker prompt gained a `closes` recency
+   tiebreaker, and the legend now says `close` is the trading close and not the settlement date.
+   **The open decision is whether to widen the cap.** The q45163 dossier's own recommendation was
+   stronger than what shipped — a stale market "cannot be `same_quantity_same_date` OR
+   `same_quantity_other_cut`" — and widening it matters because 45163's offending row was graded
+   tier 2, so the shipped pass would not have touched it (the `(Nd ago)` disclosure and the prompt
+   bullet are what cover that case today). The reason it was not widened unilaterally: tier 3
+   (`driver_or_consequence`) is described to the forecaster as context rather than an anchor, so the
+   demotion would change how the prompt weights the row, and a resolved market on an adjacent cut is
+   legitimately informative (it says what actually happened). It is a two-line change in
+   `_tier_cap_note` if wanted. **Watch item either way:** the cap fires on nothing in the 102
+   archived snapshots (only 9 rows are graded tier 1 at all, none stale), so the first
+   `MARKET_TIER_CAPPED` line in a prod run log — harvested as `market_tier_capped` — IS the finding:
+   it means the ranker called a long-closed market same-quantity-same-date. Read the archive for it
+   after a few weeks of fall-cup runs; a continued zero is also an answer (the ranker does not make
+   that mistake at tier 1) and would argue for the wider rule rather than against it.
 4. ~~**Render an explicit zero-rows line**~~ — **SHIPPED** in `4e342da`: a deliberate zero-row
    ranking over a non-empty candidate pool now renders one sentence naming it as a considered empty
    result. Before that, q45200's ranker validly returned zero rows over a healthy 381-candidate pool
@@ -803,9 +828,11 @@ in writing — so the binding constraint had moved to RENDERING. Status of the f
    still renders nothing, which is what keeps the two readings distinguishable.
 
 Also still worth one upstream check: the Kalshi `close` column is not a settle date (median +114
-days vs the question's own resolve time; 14/78 rows at +300d or more). Re-read the informativeness
-question at ~41 ranked-era resolutions (late September / early October), not ~09-01 (which buys only
-~7).
+days vs the question's own resolve time; 14/78 rows at +300d or more). The forecaster-facing half of
+that is now disclosed — the legend sentence added 2026-09-01 says outright that `close` is the
+venue's trading close and not its settlement date — so what is left here is the upstream question of
+whether to render a settle date at all. Re-read the informativeness question at ~41 ranked-era
+resolutions (late September / early October), not ~09-01 (which buys only ~7).
 
 5. **Retune `KALSHI_NO_PRICE_SPREAD` from prod telemetry (added 2026-08-25, owner: the next
    residual round).** The 0.40 book-width threshold that blanks a Kalshi midpoint as
@@ -817,6 +844,12 @@ question at ~41 ranked-era resolutions (late September / early October), not ~09
    near-zero on liquid families and nonzero exactly on empty books means the threshold is
    right; a material rate on books that later traded near their midpoint means it is blanking
    real prices and should come down.
+6. **LOW — the shared Manifold test payload is unfaithful (added 2026-09-01).** It carries no
+   `outcomeType` key, so every pipeline test using it logs a venue-parser warning ("Manifold None
+   market carries a market-level probability but no readable value"); live Manifold always ships that
+   field. Adding `outcomeType: BINARY` would give that row a price where several tests currently
+   expect none, so the fixture and those expectations have to move together — which is why it was
+   left alone during a parallel fan-out that had other agents in the same file.
 
 ### Sentinel-value sweep leftovers: three deliberate deferrals (added 2026-08-26)
 
@@ -936,7 +969,10 @@ Follow-ups:
    (provenance); URLs 2+ / whales (≥~10k chars) go through the cheap summarizer (`gpt-5.6-luna`, temp
    0, a rounding error at $0.10/$0.60 per 1M). ~5 whale sources per 40 questions no cap captures.
 2. **MEDIUM — Tier-2 LLM fetch** for the js_wall/blocked slice (~15%; Masters.com, childmortality.org,
-   UNICEF, Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked/js_wall) is the seam.
+   UNICEF, Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked / js_wall / and since
+   2026-09-01 `no_resolving_content`, the embed-shaped 200 whose numbers sit inside an Infogram,
+   Flourish or Tableau widget) is the seam. Those three are pages we could not READ; `empty_body`
+   and `unsupported_type` are bodies that carried nothing and are NOT escalation seams.
    **Precondition:** ~~the Gemini `url_context` probe above~~ — SATISFIED 2026-08 (probe negative,
    0/271 sections carry the marker). *Note 2026-07-16:* the gap-fill v2 fetch
    ladder gives the driver this capability inside the loop, so the js_wall slice may get covered
@@ -954,6 +990,12 @@ Follow-ups:
    `ssrf_guard.py`). The "~670 LoC" in the original note is stale — it is **1,175** as of 2026-08-25
    after the Datawrapper hop, and the shared embed-detection primitives already moved to
    `http_fetch.py`, so the seam is visible.
+4. **LOW — the all-failed section notice now overclaims for one status.** When every URL fails, the
+   rendered notice still says the resolving page "was unreachable", which is imprecise for a
+   `no_resolving_content`: we reached it, got a 200, and could not read the embed. The same notice
+   names the real status token beside it and the instruction to the forecaster is unchanged, so this
+   is wording, not a defect. The fix is per-status phrasing in that one render string; it was left
+   alone in the 2026-09-01 bundle rather than reworking shared render wording under an unrelated item.
 
 ### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
 
@@ -1259,6 +1301,16 @@ them OUT of feature work, land as their own PRs.
 - **Give the anchor-chart `_session_charts` global a public accessor** — still open; it is a
   module-level dict at `research/timeseries_anchor.py:94` (moved by the split) mutated and read by
   qid. Expose a small get/set/clear surface instead of touching the global directly.
+- **Hoist a public `metaculus_get` and repoint the three private copies (added 2026-09-01).** There
+  are now three separate authenticated Metaculus GET helpers with the same `Authorization: Token`
+  header shape and offset/limit paging: `performance_analysis/collector.py`'s private `_api_get`
+  (three 429 retries, then a bare `RuntimeError`), `scripts/backfill_research_from_comments.py`'s own
+  copy, and `scripts/supply_probe.py`'s `_get_json` (a larger rate-limit budget, and it raises
+  `requests` exceptions rather than `RuntimeError` because its caller soft-fails per slug). The probe
+  deliberately did NOT import collector's private helper — the contract does not fit and promoting it
+  would have edited a shared file mid-fan-out — so the consolidation is this follow-up: one public
+  helper in a shared module, parameterized on retry budget and raising `requests` exceptions, with
+  all three call sites repointed.
 
 ## Medium-term (requires more exploration)
 
@@ -1577,6 +1629,39 @@ hedge-audit narrowing push and Step-9b's LOW→wide IQR prescription from the nu
    pooled across treated and untreated. Split them and the anchor-effect read is unblocked — read
    `anchor_present=False` through `anchor_confidence`, since a trimmed comment-backfill record can
    read absent when it isn't.
+
+### Starved outer tails: the detector shipped, the publish-time WARN did not (added 2026-09-01, medium)
+
+`scan_outer_tails` (`performance_analysis/width_monitor.py`) landed 2026-09-01. It finds a defect
+distinct from the max-step smear: on an open bound the declared outer tail can route past the
+displayed range entirely, leaving every in-range bin above the members' declared p99 pinned at the
+platform's per-bin minimum step, so any resolution in that band earns the same ~−219 floor score
+whatever the grid size. That makes it a cliff at a fixed location rather than a band of the wrong
+width, which is why widening does not address it and why the standing `k_tail` hold above is not in
+tension with the detector. Two items are open.
+
+1. **No publish-time `STARVED_OUTER_TAIL` WARN, deliberately, and a second trigger to calibrate if
+   one is wanted.** On DISCRETE questions — exactly where both motivating records live, q45218 and
+   q44182 — `numeric.pipeline._build_discrete_distribution` overwrites `declared_percentiles` with a
+   resample grid pinned to the raw bounds, so a detector reading that field at publish time would put
+   the anchor AT the bound and quietly never fire on the cohort it exists for. (Same trap
+   `log_open_bound_piling_diagnostics` dodges by taking the sanitized declarations as an argument.)
+   Firing correctly on the published aggregate needs each member's sanitized declarations threaded
+   from `forecaster_runners` to the aggregation site, which is new plumbing on the publish path. **The
+   alternative that needs no plumbing is to locate the band WITHOUT the declaration — the terminal run
+   of bins sitting at the minimum step.** That is a second trigger definition with its own
+   calibration, so it was written down rather than improvised; the reasoning is in the code comment
+   above `STARVED_OUTER_TAIL_FLOOR_MULTIPLE`. No telemetry marker is registered while the WARN does
+   not exist.
+2. **The prevalence is a watch item, and it stays gated on the `k_tail` hold.** The shape is
+   SYSTEMATIC, not a per-question accident: 68 of the 417 measurable open-bound sides in the archived
+   cohort fire, across 49 distinct questions, 19 of them starved on BOTH sides, and the distribution
+   is bimodal with 44 sides sitting essentially exactly at the pipeline's own applied floor (~1.1x the
+   platform minimum). So read a fire as "this question carries a cliff", not "something broke here".
+   Whether that prevalence justifies revisiting the CDF construction itself is an operator decision
+   and explicitly out of scope of the detector; nothing about it licenses a width change, since the
+   whole point is that the band is at the structural floor rather than the wrong width. Receipts:
+   `scratch/next_season_bundle_2026-09/item19/`.
 
 ### Ideas reverse-engineered from high-scoring competitor bots (added 2026-06-26)
 
