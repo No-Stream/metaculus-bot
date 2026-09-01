@@ -373,10 +373,11 @@ BINARY_PROB_MAX: float = 0.98
 # reconstruction from parsed comments every residual round. Membership is inclusive
 # at both edges.
 #
-# These values deliberately equal the floor a single-survivor binary publish is
-# clamped to (THIN_PUBLISH_BINARY_FLOOR / THIN_PUBLISH_BINARY_CEIL, in this same
-# section): one definition of "extreme", so the telemetry that measures the exposure
-# and the clamp that prices it cannot drift apart. Retune them together or not at all.
+# The clamp a single-survivor binary publish goes through is DEFINED as these two
+# constants: THIN_PUBLISH_BINARY_FLOOR / THIN_PUBLISH_BINARY_CEIL in this same section
+# alias them rather than restating the literals, so the telemetry that measures the
+# exposure and the clamp that prices it cannot drift apart. Retuning the band here
+# retunes both, which is the intent — retune them together or not at all.
 # Evidence for the 0.05/0.95 edges:
 # scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 ("The mechanism")
 # — 9 lone extreme binary calls, 4 right, at a mean stated confidence of 0.972.
@@ -388,8 +389,10 @@ EXTREME_CALL_HIGH: float = 0.95
 # AggregationPipeline._base_combine on the "single_forecaster" skip reason).
 #
 # Mechanism, not a fit: the median of an intact ensemble absorbs a member's extreme
-# tail call, and median-of-1 supplies no such variance reduction, so the admissible
-# range is widened in exactly that state to price the missing aggregation. It fires
+# tail call, and median-of-1 supplies no such variance reduction, so the range the
+# published value may occupy is NARROWED in exactly that state to price the missing
+# aggregation — [0.05, 0.95] sits strictly inside the per-model clamp
+# [BINARY_PROB_MIN, BINARY_PROB_MAX] = [0.02, 0.98] the member already passed. It fires
 # ONLY on a single-survivor publish — a multi-member median publishes as is, even one
 # below 0.05 — and never touches the per-model record (the survivor's declared value
 # stays on the comment's summary bullet; only the published aggregate moves).
@@ -407,10 +410,12 @@ EXTREME_CALL_HIGH: float = 0.95
 # scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 (clamp-variant table
 # + "A synthesis correction the individual cuts miss") and §3 option "1=".
 #
-# Deliberately equal to EXTREME_CALL_LOW / EXTREME_CALL_HIGH above: one definition of
-# "extreme" for the telemetry and the clamp. Retune them together or not at all.
-THIN_PUBLISH_BINARY_FLOOR: float = 0.05
-THIN_PUBLISH_BINARY_CEIL: float = 0.95
+# The edges REUSE the extreme-band constants above by aliasing them, so there is one
+# definition of "extreme" serving both the telemetry and the clamp and no pair of
+# literals to fall out of step. Retune EXTREME_CALL_LOW / EXTREME_CALL_HIGH to move
+# both, or neither.
+THIN_PUBLISH_BINARY_FLOOR: float = EXTREME_CALL_LOW
+THIN_PUBLISH_BINARY_CEIL: float = EXTREME_CALL_HIGH
 
 # Multiple-choice prediction clamp. Aligned to forecasting-tools 0.2.92's
 # PredictedOptionList validator, which unconditionally clamps every option into

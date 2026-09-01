@@ -152,10 +152,10 @@ class TestMaybeSnapToIntegers:
 class TestApplyThinPublishFloor:
     """The single-survivor binary floor is a function of the survivor COUNT, not the value.
 
-    Median-of-1 supplies no variance reduction, so the admissible range is widened in
-    exactly that state; at any other count the value passes through untouched, however
-    extreme (the multi-member median self-clamps, and the receipt priced a global clamp
-    at -52.02 spot peer). Bounds are THIN_PUBLISH_BINARY_FLOOR / _CEIL.
+    Median-of-1 supplies no variance reduction, so the range the published value may
+    occupy is narrowed in exactly that state; at any other count the value passes through
+    untouched, however extreme (the multi-member median self-clamps, and the receipt priced
+    a global clamp at -52.02 spot peer). Bounds are THIN_PUBLISH_BINARY_FLOOR / _CEIL.
     """
 
     def test_lone_survivor_below_the_floor_is_raised_to_it(self) -> None:

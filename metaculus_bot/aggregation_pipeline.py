@@ -272,15 +272,25 @@ class AggregationPipeline:
             # objects — the lone RAW member the single-forecaster short-circuit hands
             # through, and the single PRE-STACKED output of a fired stacker — so the
             # count alone is not the trigger: the skip reason route_after_forecasts
-            # writes for exactly the first event is (the stacked path never writes it,
-            # and clears any stale one when it fires). Read, not popped: the comment
-            # builder pops it to publish STACKER_SKIP_REASON. Binary only — a lone
-            # numeric survivor keeps its snap path below and a lone MC survivor is
-            # returned as is. Accepted gap, stated rather than papered over with a
-            # second wiring: skip_reasons is written only under STACKING /
+            # writes for exactly the first event is, and the stacked path never writes
+            # one. Read, not popped: the comment builder pops it to publish
+            # STACKER_SKIP_REASON. Binary only — a lone numeric survivor keeps its snap
+            # path below and a lone MC survivor is returned as is.
+            #
+            # Two asymmetries are accepted here rather than papered over with a second
+            # wiring. (1) skip_reasons is written only under STACKING /
             # CONDITIONAL_STACKING, so a single survivor under plain MEAN/MEDIAN routes
             # through _simple_aggregate and is NOT floored; prod and the code default
-            # both run CONDITIONAL_STACKING.
+            # both run CONDITIONAL_STACKING. (2) outcomes[qid] is overwritten by every
+            # routing path, while skip_reasons[qid] is written only by the skip paths and
+            # cleared only by the comment builder — so a stale reason could reach this
+            # read only if a run died between routing and comment-building AND the same
+            # qid were routed again on the same pipeline instance, which no entrypoint
+            # does. Clearing it on the stacked path would just trade that for the mirror
+            # case: with research_reports_per_question > 1 the reports share this
+            # instance, so one report's failed stack attempt would erase the reason a
+            # sibling report's genuine lone survivor wrote, un-flooring the value the
+            # framework then publishes and losing its STACKER_SKIP_REASON marker.
             if (
                 isinstance(question, BinaryQuestion)
                 and qkey is not None
@@ -390,13 +400,6 @@ class AggregationPipeline:
 
         qid_for_outcome = question.id_of_question
         assert qid_for_outcome is not None
-        # Every outcome below overwrites outcomes[qid], but only the SKIP paths write
-        # skip_reasons, and the comment builder is what pops it. An entry orphaned by a
-        # crash between routing and comment-building would otherwise outlive its
-        # question, and a later stack of the same qid on this pipeline would hand its
-        # lone pre-stacked output to _base_combine under a stale "single_forecaster" —
-        # the one reading that floors a stacked value. A fired stack has no skip reason.
-        self.skip_reasons.pop(qid_for_outcome, None)
 
         stacking_fn = self._get_stacking_fn()
 

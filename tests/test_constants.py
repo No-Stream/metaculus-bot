@@ -161,9 +161,10 @@ class TestPerTypeStackingEnvVarNames:
 
 
 class TestThinPublishBinaryFloor:
-    """The single-survivor publish floor is [0.05, 0.95] and shares its edges with the
-    EXTREME_CALL band: one definition of "extreme", so the telemetry that measures the
-    exposure and the clamp that prices it cannot drift apart. Receipt for the values:
+    """The single-survivor publish floor is [0.05, 0.95], aliased to the EXTREME_CALL band.
+
+    One definition of "extreme" serves both the telemetry that measures the exposure and
+    the clamp that prices it, so the two cannot drift apart. Receipt for the values:
     scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 (clamp-variant table).
     """
 
@@ -173,7 +174,9 @@ class TestThinPublishBinaryFloor:
     def test_ceiling_is_0_95(self):
         assert THIN_PUBLISH_BINARY_CEIL == 0.95
 
-    def test_floor_and_ceiling_equal_the_extreme_call_band(self):
+    def test_floor_and_ceiling_alias_the_extreme_call_band(self):
+        # Trivially true while the alias holds, which is the point: paired with the two
+        # literal pins above, it fails the moment somebody re-hardcodes either edge.
         assert THIN_PUBLISH_BINARY_FLOOR == EXTREME_CALL_LOW
         assert THIN_PUBLISH_BINARY_CEIL == EXTREME_CALL_HIGH
 

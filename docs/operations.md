@@ -897,13 +897,20 @@ the telemetry markers:
   of 9 against 21 of 23 for accompanied ones (those counts used a looser
   either-side rule — `extreme_call.py` explains the difference before you pool old
   and new numbers). `survivors=1` marks a record where "lone" is vacuous because
-  that member was the whole ensemble; drop those from a lone rate. Nothing here
-  gates or clamps a forecast.
+  that member was the whole ensemble; drop those from a lone rate. This band
+  membership check gates and clamps nothing; the single-survivor publish clamp
+  below is a separate rule, keyed on the survivor count, that reuses the same two
+  constants.
 - `THIN_PUBLISH_FLOOR: question=... raw=... clamped=... survivors=1` — a WARN
   that a BINARY question published on exactly ONE surviving forecaster had its
   published probability clamped into `[THIN_PUBLISH_BINARY_FLOOR,
-  THIN_PUBLISH_BINARY_CEIL]` (`constants.py`, currently 0.05 / 0.95, deliberately
-  the EXTREME_CALL band). `raw` is what the survivor declared and is what the
+  THIN_PUBLISH_BINARY_CEIL]`, which `constants.py` defines by aliasing
+  `EXTREME_CALL_LOW` / `EXTREME_CALL_HIGH` (currently 0.05 / 0.95), so the band is
+  one definition rather than a second pair of literals. That range is narrower
+  than the per-model `[BINARY_PROB_MIN, BINARY_PROB_MAX]` = [0.02, 0.98] clamp
+  every member already passed: median-of-1 supplies no variance reduction, so the
+  published value's admissible range is narrowed in exactly that state to price
+  the missing aggregation. `raw` is what the survivor declared and is what the
   comment's per-model summary bullet still shows; `clamped` is what went to
   Metaculus. Emitted by `aggregation_pipeline.py` at the base-combine step, only
   when the value actually moved, so the line count is the floor's incidence: a
