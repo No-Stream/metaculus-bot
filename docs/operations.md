@@ -104,6 +104,22 @@ session does not run them — it proposes, the operator runs and decides.
 - **Refresh the tournament constants** (`TOURNAMENT_ID`, the date checks in
   `constants.py`) and flip the fall-cup reminder off once configured
   (`FALL_CUP_CONFIGURED`), or every scheduled run reddens on the reminder.
+- **Take a question-supply census with `make supply_probe`.** It counts posts and
+  questions at each status per tournament slug, and unlike the two scratch probes
+  it replaces it counts post status `closed` — closed to forecasting but not yet
+  resolved — which is what made two consecutive residual rounds' supply
+  projections miss. It also lists the backlog of unresolved questions already past
+  their own `scheduled_resolve_time`, worst overdue first, which is how you tell
+  "Metaculus is late resolving" from "our pull is missing questions". Default slugs
+  come from the repo's own constants (`TOURNAMENT_ID`, `METACULUS_CUP_ID`,
+  `FALL_CUP_SLUG`, plus minibench off `MetaculusApi.CURRENT_MINIBENCH_ID`), so it
+  needs no arguments; scope or redirect it with
+  `ARGS="--slugs metaculus-cup-fall-2026 --output /tmp/supply.json"`. Read-only and
+  free — the Metaculus posts list only, no LLM, research, or publish call — so it
+  sits outside the cost gate. A dead slug renders as one error row and the rest
+  report normally, which makes this the cheapest way to watch for the fall cup
+  opening: the `metaculus-cup-fall-2026` row goes from zero posts to non-zero on
+  the day it does.
 
 ## API keys and the shared-vs-personal key model
 
@@ -908,6 +924,18 @@ the telemetry markers:
   each fetch appears exactly once; the remaining free-text lines are REASON lines (a
   decode score, an unread content-type, an SSRF rejection) carrying what the marker
   cannot.
+- `FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor vr_lag=... vr=... floor=...
+  short_vol=... [long_vol=...] robust_vol=...` — the series behind a rendered
+  volatility is noise-dominated: its variance ratio sits below
+  `FINANCIAL_VARIANCE_RATIO_FLOOR`, meaning most of each day's move is reversed the
+  next, which inflates any volatility computed from one-day returns. The flagged
+  block leads with `robust_vol`, measured on overlapping `vr_lag`-step returns, and
+  labels the short-window figure noise-suspect. Two surfaces emit it, sharing the
+  estimator: `financial_data.py`'s `_volatility_lines` and `ts_render.py`'s
+  `_realized_vol_lines`. Only the financial-data surface prints `long_vol`, so a
+  `ts_anchor` record reads that field as null rather than zero. Per-identifier, so
+  one question can fire several and the line carries no question id. Informational
+  and NOT alertable — it describes the vendor's data, not a bot defect.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH`
   — credit telemetry, described above. `CREDIT_FLOOR_BREACH` keeps firing during
   the credit-alert suppression window, so seeing one on a green run is expected
@@ -978,6 +1006,18 @@ it") to forecasters. `reason=unreadable` means the completion was not a ranking 
 at all. Both are harvested as `market_ranking_degraded`, so the split survives the
 90-day GHA log expiry; a `MARKET_RANKING` line with `outcome=failopen` and no
 degraded sibling in the archive predates this marker.
+
+A third market line, `MARKET_TIER_CAPPED: question=... rows=... capped=venue@rank`,
+fires only when the deterministic staleness pass refuses a row the top relation tier
+— the ranker graded a market that stopped trading more than
+`MARKET_STALENESS_TIER_CAP_DAYS` (60, in `market_retrieval/ranking.py`) before the
+question opened as `same_quantity_same_date`. The row keeps its rank, price and
+liquidity cells; what it gains is a note in the `why` cell saying what the ranker
+said. Silence is the normal case, and the cap fires on nothing in the 102 archived
+snapshots, so a first line in a run log IS the finding. The demotion also rides the
+archived snapshot as `MarketMatch.tier_cap_note`, so its incidence is answerable
+offline; this line is the prod-log half and the one that survives a run whose
+snapshot the research archive never captured.
 
 A run can also exit non-zero for degradation alerts — the counters above,
 personal-key fallbacks, or the model-deprecation tripwire — even when every
