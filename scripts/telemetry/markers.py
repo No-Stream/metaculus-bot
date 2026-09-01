@@ -134,18 +134,20 @@ both work).
 
 POST-ID vs QUESTION-ID (the ``qid_kind`` field): Metaculus posts contain questions,
 and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
-types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
-``CLOSE_MARGIN`` / ``MARKET_RANKING`` / ``MARKET_RANKING_DEGRADED`` /
-``MARKET_TIER_CAPPED`` /
-``NUMERIC_DEGENERATE_DECLARATION`` / ``NUMERIC_AGGREGATE_GRID_MISMATCH`` /
-``CDF_MAXSTEP_CLIP`` / ``RESOLUTION_SOURCE_FETCH`` /
-``SPREAD_UNDEFINED`` / ``numeric_pchip_fallback`` emit ``question.id_of_question``
-(the QUESTION id) while
-``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
-``GHOST_FORECAST_JSON`` emit ``question.page_url`` (a POST id). Each :class:`MarkerSpec` therefore declares
-``qid_kind`` and every harvested record carries it, so a residual join keyed on one
-id can TRANSLATE into the record's own space rather than silently dropping the
+types are keyed in DIFFERENT spaces, so each :class:`MarkerSpec` declares its own
+``qid_kind`` and every harvested record carries it — a residual join keyed on one id
+can then TRANSLATE into the record's own space instead of silently dropping the
 records keyed on the other (see :mod:`metaculus_bot.performance_analysis.id_mapping`).
+The split is mechanical: a marker that logs ``question.id_of_question`` is
+``question_id`` and one that logs ``question.page_url`` is ``post_id`` (the gap-fill
+v2 / ghost family, whose ``log_prefix`` carries the page URL).
+
+That per-spec field is the ONLY membership statement. This docstring used to also
+enumerate which markers were in which space, and the list rotted to 12 of the 26
+question-keyed specs, which made the partiality read as if the unlisted ones were
+keyed some third way. The current membership is one filter over the registry:
+
+    [spec.name for spec in MARKER_SPECS if spec.qid_kind == QID_KIND_QUESTION_ID]
 """
 
 from __future__ import annotations
