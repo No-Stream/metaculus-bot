@@ -123,8 +123,12 @@ async def _forecast_with_callback_drain(start_forecast: Callable[[], Awaitable[l
         await drain_litellm_callbacks()
 
 
-def _forecast_test_questions(template_bot: TemplateForecaster) -> list[Any]:
-    """Forecast the evergreen example set, or a TEST_QUESTIONS_OVERRIDE list."""
+def _test_questions_source(template_bot: TemplateForecaster) -> Callable[[], Awaitable[list[Any]]]:
+    """Forecast-factory over the evergreen example set, or a TEST_QUESTIONS_OVERRIDE list.
+
+    Resolving the URLs is a synchronous Metaculus fetch and stays OUTSIDE the event loop,
+    where it has always been; only the forecast itself is deferred into the factory.
+    """
     EXAMPLE_QUESTIONS = [
         "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
         "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
@@ -146,13 +150,16 @@ def _forecast_test_questions(template_bot: TemplateForecaster) -> list[Any]:
             len(override_urls),
         )
     questions = [MetaculusApi.get_question_by_url(url) for url in question_urls]
-    return asyncio.run(
-        _forecast_with_callback_drain(lambda: template_bot.forecast_questions(questions, return_exceptions=True))
-    )
+    return lambda: template_bot.forecast_questions(questions, return_exceptions=True)
 
 
-def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
-    """Dispatch one run mode to its question source and forecast it.
+def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Callable[[], Awaitable[list[Any]]]:
+    """Resolve one run mode to the factory that forecasts its questions.
+
+    Returns a factory rather than forecasting here so that every mode goes through the
+    single ``asyncio.run`` + callback drain in ``_run_forecasts``. The drain has to happen
+    on the loop the completions ran on, and stating it once means a mode added here cannot
+    silently report no per-role spend by forgetting to wrap itself.
 
     Every tournament-shaped mode pins ``skip_previously_forecasted_questions`` on so a
     re-run can't re-spend on questions already forecast.
@@ -161,32 +168,30 @@ def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[
         check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return asyncio.run(
-            _forecast_with_callback_drain(
-                lambda: template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
-            )
-        )
+        return lambda: template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
     if run_mode == "minibench":
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return asyncio.run(
-            _forecast_with_callback_drain(
-                lambda: template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
-            )
-        )
+        return lambda: template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
     if run_mode in ("quarterly_cup", "metaculus_cup"):
         # The metaculus cup is a good way to test the bot's performance on regularly open questions
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return asyncio.run(
-            _forecast_with_callback_drain(
-                lambda: template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
-            )
-        )
+        return lambda: template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
     if run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
-        return _forecast_test_questions(template_bot)
+        return _test_questions_source(template_bot)
     raise ValueError(f"Invalid run mode: {run_mode}")
+
+
+def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
+    """Forecast one run mode's questions, on one event loop, with the callback drain.
+
+    The only ``asyncio.run`` in the module: the loop is created here and torn down on
+    return, and ``_forecast_with_callback_drain`` drains litellm's success callbacks
+    inside it while the queue bound to it is still alive.
+    """
+    return asyncio.run(_forecast_with_callback_drain(_question_source(template_bot, run_mode)))
 
 
 def main() -> None:
