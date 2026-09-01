@@ -30,6 +30,7 @@ from metaculus_bot.prompts import (
     stacking_numeric_prompt,
     web_research_prompt,
 )
+from metaculus_bot.research.gemini_attribution import UNVERIFIED_ATTRIBUTION_MARKER
 
 # gap_fill_analyzer_prompt
 
@@ -710,6 +711,35 @@ class TestSourceProvenanceLadder:
         lowered = " ".join(prompt.lower().split())
         assert "proximity to the primary record" in lowered
         assert "against the speaker's interest" in lowered
+
+    def _assert_unverified_attribution_defined(self, prompt: str) -> None:
+        """`[unverified attribution]` reaches the forecaster in gemini research sections
+        (`research/gemini_attribution.py` writes it over a tier tag whose named outlet the
+        grounding record cannot back), and it lands on a bundle whose ladder tells the model to
+        weight by tier. Undefined, it is a token the forecaster has to guess at, on exactly the
+        claims where the guess matters."""
+        lowered = " ".join(prompt.lower().split())
+        assert "[unverified attribution]" in lowered
+        assert "could not match the outlet the text named against its own retrieval record" in lowered
+        # The two halves that keep it from reading as "this fact is false" or as a tier grade.
+        assert "the claim itself may still be correct" in lowered
+        assert "untiered, unattributed evidence rather than as a named outlet's authority" in lowered
+
+    def test_binary_prompt_defines_the_unverified_attribution_token(self) -> None:
+        self._assert_unverified_attribution_defined(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_defines_the_unverified_attribution_token(self) -> None:
+        self._assert_unverified_attribution_defined(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_defines_the_unverified_attribution_token(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_unverified_attribution_defined(result)
+
+    def test_the_definition_matches_the_marker_the_rewriter_actually_writes(self) -> None:
+        """Pinned against the emitting constant rather than a copied string: if the rewriter's
+        wording changes, the forecaster-facing definition has to move with it or the prompt
+        defines a token no section carries."""
+        assert f"[{UNVERIFIED_ATTRIBUTION_MARKER}]" in binary_prompt(_binary_q(), research="r")
 
     def test_binary_prompt_carries_provenance_ladder(self) -> None:
         self._assert_ladder_present(binary_prompt(_binary_q(), research="r"))

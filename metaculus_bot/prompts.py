@@ -477,6 +477,11 @@ _SOURCE_PROVENANCE_LADDER = """
                  (C) aggregators, advocacy or partisan outlets, and translated or single-outlet reports —
                      use the underlying cited facts, not their framing or causal narrative;
                  (D) anonymous, social, rumor, or untraceable AI-generated summaries — suggestive only.
+               • `[unverified attribution]` stands where a source tag would be: the research pipeline
+                 could not match the outlet the text named against its own retrieval record, so the tag
+                 and its tier were removed together. The claim itself may still be correct, and nothing
+                 in the sentence was changed — treat it as untiered, unattributed evidence rather than as
+                 a named outlet's authority, and do not read it as a low tier either.
                • Weigh motivation, not just authority: discount claims that serve the speaker's interest (hype,
                  marketing, sponsor optimism). Treat a statement AGAINST the speaker's interest — a company tempering
                  its own timeline, an on-record denial of a favorable rumor — as strong evidence.
