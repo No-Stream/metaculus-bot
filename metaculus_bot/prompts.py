@@ -276,6 +276,8 @@ GUIDELINES:
 - Search thoroughly — issue multiple queries if needed to fill gaps
 - Be factual and unbiased — report what you find, not what you think
 - {citation_clause}
+- Carry the publication date of every dated or forward-looking claim ("announced <date>", "published <date>", "as of <date>")
+- For a schedule, plan, target, or other forward-looking claim, state when and where it was announced — never present an undated recollection as a current fact; if you cannot date it, say so
 - If you cannot find reliable information on something, say so explicitly
 - DO NOT hallucinate sources — only cite what you actually found
 - DO NOT make predictions or forecasts yourself

@@ -496,6 +496,24 @@ class TestWebResearchPromptPrimarySources:
         assert "Prediction market odds" in non_bench
         assert "Prediction market odds" not in bench
 
+    def test_vintage_clause_present_for_both_citation_styles(self) -> None:
+        """qid 44872: gemini searched correctly, Google attached no grounding, and it
+        answered from memory of 2021/2022 OCEARCH press releases restamped as 2026
+        plans. The prompt had "say so explicitly" and "DO NOT hallucinate sources"
+        and no date discipline at all, so nothing in it made an undated recollection
+        look wrong. Shared by both consumers (native search + gemini) on purpose."""
+        for citation_style in ("markdown", "auto_annotated"):
+            for is_benchmarking in (False, True):
+                result = web_research_prompt(
+                    "Will X happen?",
+                    citation_style=citation_style,
+                    is_benchmarking=is_benchmarking,
+                )
+                lowered = " ".join(result.lower().split())
+                assert "publication date" in lowered
+                assert "state when and where it was announced" in lowered
+                assert "never present an undated recollection as a current fact" in lowered
+
     def test_reference_class_frequency_instruction_present(self) -> None:
         """The prompt must ask for historical frequencies (with source and
         denominator) on reference-class questions — prioritizing niche,
