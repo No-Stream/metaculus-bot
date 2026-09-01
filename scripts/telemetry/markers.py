@@ -36,6 +36,11 @@ against the ACTUAL emitted format strings (the source of truth):
   ``_rank_pool`` (per-QUESTION ranker fail-open, and WHY: ``shape_regression``
   means our own prompt/parser contract broke, which used to pass silently as
   ``ok(0)``, i.e. as a deliberate "we reviewed the markets and none bore on it")
+* ``MARKET_TIER_CAPPED`` — ``metaculus_bot/research/prediction_market.py``
+  ``_log_tier_caps`` (per-QUESTION staleness tier cap: the ranker graded a market
+  that stopped trading long before the question opened as ``same_quantity_same_date``
+  and the deterministic pass refused it that top tier; silent otherwise, and it
+  fires on nothing in the archive, so a first record is itself the finding)
 * ``NUMERIC_DEGENERATE_DECLARATION`` — ``metaculus_bot/numeric/pipeline.py``
   ``_apply_jitter_and_clamp`` (per-FORECASTER point-mass numeric declaration that
   is no longer cluster-spread into a width nobody stated — a fabrication-attempt
@@ -78,6 +83,12 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   observation is older than its own cadence explains, so the rendered latest
   value — and anything anchored on it — was flagged stale to the forecaster;
   informational data-quality signal, NOT alertable)
+* ``FINANCIAL_NOISE_FLAG`` — ``metaculus_bot/research/financial_data.py``
+  ``_volatility_lines`` and ``metaculus_bot/research/ts_render.py``
+  ``_realized_vol_lines`` (per-IDENTIFIER vendor-noise disclosure: the series'
+  variance ratio says most of each day's move is reversed the next, so every
+  volatility computed from one-day returns is inflated and the block leads with the
+  noise-robust multi-period figure instead; informational, NOT alertable)
 * ``RESOLUTION_SOURCE_FETCH`` — ``metaculus_bot/research/resolution_source.py``
   ``_log_fetch_outcome_markers`` (per-URL Tier-1 page fetch AND Tier-2 Datawrapper
   dataset hop: the outcome, the HTTP code, and the routeless data-embed providers
@@ -125,6 +136,7 @@ POST-ID vs QUESTION-ID (the ``qid_kind`` field): Metaculus posts contain questio
 and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
 types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
 ``CLOSE_MARGIN`` / ``MARKET_RANKING`` / ``MARKET_RANKING_DEGRADED`` /
+``MARKET_TIER_CAPPED`` /
 ``NUMERIC_DEGENERATE_DECLARATION`` / ``NUMERIC_AGGREGATE_GRID_MISMATCH`` /
 ``CDF_MAXSTEP_CLIP`` / ``RESOLUTION_SOURCE_FETCH`` /
 ``SPREAD_UNDEFINED`` / ``numeric_pchip_fallback`` emit ``question.id_of_question``
@@ -401,6 +413,27 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
     ),
     MarkerSpec(
+        "market_tier_capped",
+        # Per-question staleness tier cap (research/prediction_market.py:_log_tier_caps,
+        # over `market_retrieval.ranking.cap_stale_top_tier`). Silent on the no-cap case, so
+        # a harvested record means the ranker graded a market that stopped trading more than
+        # MARKET_STALENESS_TIER_CAP_DAYS before the question opened as `same_quantity_same_date`
+        # — the claim a long-closed market cannot make. The demotion also rides the archived
+        # snapshot as `MarketMatch.tier_cap_note`, so the incidence is answerable offline
+        # too; this line is the prod-log half and the one that survives a snapshot the
+        # research archive never captured.
+        #
+        # It fires on NOTHING in the 102 archived snapshots, and would not have fired on
+        # q45163 either (that row was graded one tier lower — see AGENTS.md's
+        # prediction-market paragraph), so a first record is itself the finding. `capped` is
+        # a comma-joined `venue@rank` list with no spaces, so `\S+` takes the whole field.
+        re.compile(
+            r"MARKET_TIER_CAPPED:\s*question=(?P<question>\S+)\s+rows=(?P<rows>\S+)"
+            r"\s+capped=(?P<capped>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
+    ),
+    MarkerSpec(
         "numeric_degenerate_declaration",
         # Per-FORECASTER point-mass numeric declaration (numeric/pipeline.py
         # _apply_jitter_and_clamp): the model put (near-)identical values at every
@@ -550,6 +583,37 @@ MARKER_SPECS: list[MarkerSpec] = [
         re.compile(
             r"FINANCIAL_STALE_LATEST:\s*surface=(?P<surface>\S+)\s+symbol=(?P<symbol>\S+)"
             r"\s+age_d=(?P<age_d>\S+)\s+cadence=(?P<cadence>\S+)"
+        ),
+    ),
+    MarkerSpec(
+        "financial_noise_flag",
+        # Vendor-noise flag on a rendered volatility, the sibling of financial_stale_latest
+        # and non-alertable for the same reason: the render already tells the forecaster the
+        # one-day-return volatility is inflated, so this line exists to make each surface's
+        # prod incidence a query rather than a guess. The two emitters again share one shape
+        # because they share the estimator (``ts_estimators.variance_ratio`` /
+        # ``multi_period_annualized_vol_pct``): ``surface=financial_data`` is
+        # financial_data.py's ``_volatility_lines``, ``surface=ts_anchor`` is ts_render.py's
+        # ``_realized_vol_lines``.
+        #
+        # ``vr`` is the Lo-MacKinlay overlapping variance ratio at lag ``vr_lag`` over the
+        # provider's full held history; a random walk reads ~1.0 and the flag fires below
+        # ``floor``. ``robust_vol`` is the volatility measured on overlapping ``vr_lag``-step
+        # returns (the flagged block's headline figure) and reads "None" when the estimator
+        # refused the sample. ``long_vol`` is an OPTIONAL group: only the financial_data
+        # surface holds a long window to compare against, so the ts_anchor line goes straight
+        # from ``short_vol`` to ``robust_vol``. A non-participating group still lands in the
+        # record, so a ts_anchor row reads ``long_vol`` as None exactly as a financial_data
+        # row whose long window was unavailable does — read ``surface`` to tell "this emitter
+        # has no long window" from "this series was too short for one".
+        #
+        # No question ref: like its stale-latest sibling the flag is per-IDENTIFIER (one
+        # question can fire several) and neither call site has the question in scope, so
+        # qid_kind stays None.
+        re.compile(
+            r"FINANCIAL_NOISE_FLAG:\s*surface=(?P<surface>\S+)\s+vr_lag=(?P<vr_lag>\S+)"
+            r"\s+vr=(?P<vr>\S+)\s+floor=(?P<floor>\S+)\s+short_vol=(?P<short_vol>\S+)"
+            r"(?:\s+long_vol=(?P<long_vol>\S+))?\s+robust_vol=(?P<robust_vol>\S+)"
         ),
     ),
     MarkerSpec(

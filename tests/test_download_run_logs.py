@@ -49,6 +49,16 @@ EXTREME_CALL_LINE = (
     "2026-09-01 12:00:00,000 - metaculus_bot.forecaster - INFO - "
     "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=1"
 )
+# The ts_anchor surface of the vendor-noise flag: the emitter with NO long_vol field, which is
+# the shape whose optional group has to survive the whole durable path.
+FINANCIAL_NOISE_FLAG_LINE = (
+    "2026-09-01 12:00:00,000 - metaculus_bot.research.ts_render - INFO - "
+    "FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag=5 vr=0.412 floor=0.6 short_vol=14.6 robust_vol=9.4"
+)
+MARKET_TIER_CAPPED_LINE = (
+    "2026-09-01 12:00:00,000 - metaculus_bot.research.prediction_market - INFO - "
+    "MARKET_TIER_CAPPED: question=45163 rows=1 capped=manifold@0"
+)
 
 
 class TestWorkflowSlugFromPath:
@@ -230,6 +240,34 @@ class TestNewMarkerSpecsReachTheArchive:
         assert archived[0]["model"] == "gemini-3.1-pro-preview"
         assert archived[0]["lone"] is True
         assert archived[0]["survivors"] == 1
+
+    def test_financial_noise_flag_and_tier_cap_round_trip_to_jsonl(self, tmp_path: Path):
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text(FINANCIAL_NOISE_FLAG_LINE + "\n" + MARKET_TIER_CAPPED_LINE + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="902", workflow="tournament", artifact="research-902", run_date="2026-09-01T00:00:00Z"
+        )
+        assert run is not None
+
+        archive_dir = tmp_path / "archive"
+        totals = merge_and_write(archive_dir, [run])
+        assert totals["financial_noise_flag"] == 1
+        assert totals["market_tier_capped"] == 1
+
+        noise = load_marker_records(archive_dir, "financial_noise_flag")
+        assert len(noise) == 1
+        # The three fields a noise-incidence cut reads. `long_vol` is absent from the
+        # ts_anchor emitter, so it must arrive as a null rather than sinking the record.
+        assert noise[0]["surface"] == "ts_anchor"
+        assert noise[0]["robust_vol"] == 9.4
+        assert noise[0]["long_vol"] is None
+
+        capped = load_marker_records(archive_dir, "market_tier_capped")
+        assert len(capped) == 1
+        assert capped[0]["qid"] == 45163
+        assert capped[0]["capped"] == "manifold@0"
 
 
 class TestDownloadTimeoutResilience:
