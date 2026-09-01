@@ -28,6 +28,12 @@ from metaculus_bot.constants import (
     GOOGLE_API_KEY_ENV,
 )
 from metaculus_bot.prompts import web_research_prompt
+from metaculus_bot.research.bracket_groups import (
+    BRACKET_GROUP_RE,
+    iter_group_items,
+    join_group_items,
+    rebuild_group,
+)
 from metaculus_bot.research.gemini_attribution import rewrite_unsupported_attributions
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -182,9 +188,12 @@ def _splice_inline_citations(text: str, supports: Sequence[Any] | None) -> str:
 # delimiter rule excludes a quantity (``[3.8%]``, ``[$1.5]``, ``[1.5 million]``) and a version
 # (``[v2.1.3]``). Zero of those 2,609 groups is anything but a citation index (validation:
 # scratch/next_season_bundle_2026-09/item3_citation_strip/VALIDATION.md).
-_BRACKET_GROUP_RE = re.compile(r"(?P<pre>(?<=\S) )?\[(?P<inner>[^\[\]\n]*)\]")
+#
+# What a bracket group IS, where its items split, and how a rewritten one is put back
+# together all come from ``research/bracket_groups.py`` — the same grammar the attribution
+# check reads the same text through immediately after this pass, so the two cannot come to
+# disagree about one string. Only the index token itself is this pass's own.
 _CITATION_INDEX_RE = re.compile(r"(?<![^\s,;:])\d{1,2}(?:\.\d{1,2})+(?=\s*(?:[,;:]|$))")
-_GROUP_ITEM_SPLIT_RE = re.compile(r"([,;])")
 
 
 def _tidy_group_item(item: str) -> str:
@@ -214,22 +223,19 @@ def _strip_model_citation_indices(text: str) -> str:
         stripped_inner = _CITATION_INDEX_RE.sub("", inner)
         if stripped_inner == inner:
             return match.group(0)
-        parts = _GROUP_ITEM_SPLIT_RE.split(stripped_inner)
-        # parts alternates item, separator, item, ... — pair each item with the separator
-        # that introduced it so a surviving item keeps the model's own ``,`` vs ``;``.
+        # An item that is nothing but punctuation once its index is gone said only the
+        # index; dropping it (rather than emptying it) is this pass's own filter, which is
+        # why ``iter_group_items`` hands items over raw.
         kept: list[tuple[str, str]] = []
-        for index in range(0, len(parts), 2):
-            item = _tidy_group_item(parts[index])
-            if not any(char.isalnum() for char in item):
-                continue
-            separator = parts[index - 1] if index else ""
-            kept.append((separator, item))
+        for separator, item in iter_group_items(stripped_inner):
+            tidied = _tidy_group_item(item)
+            if any(char.isalnum() for char in tidied):
+                kept.append((separator, tidied))
         if not kept:
             return ""
-        rebuilt = kept[0][1] + "".join(f"{separator} {item}" for separator, item in kept[1:])
-        return f"{match.group('pre') or ''}[{rebuilt}]"
+        return rebuild_group(match, join_group_items(kept))
 
-    return _BRACKET_GROUP_RE.sub(replace, text)
+    return BRACKET_GROUP_RE.sub(replace, text)
 
 
 def _grounded_source_labels(chunks: Sequence[Any]) -> list[tuple[int, str]]:

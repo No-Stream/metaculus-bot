@@ -34,6 +34,13 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from metaculus_bot.research.bracket_groups import (
+    BRACKET_GROUP_RE,
+    iter_group_items,
+    join_group_items,
+    rebuild_group,
+)
+
 __all__ = ["AttributionCheck", "rewrite_unsupported_attributions"]
 
 # What we render in place of an attribution the grounding record cannot back. Wording is
@@ -107,11 +114,12 @@ _STOP_TOKENS = frozenset(
 # outlet names to credit one in the reverse direction.
 _MIN_DOMAIN_CORE_CHARS = 3
 
-# Same bracket-group and item-split grammar the citation-index strip runs on (see
-# ``gemini_search._strip_model_citation_indices``), restated here rather than imported so
-# this module stays a leaf: the provider imports it, not the other way round.
-_BRACKET_GROUP_RE = re.compile(r"\[(?P<inner>[^\[\]\n]*)\]")
-_GROUP_ITEM_SPLIT_RE = re.compile(r"([,;])")
+# The bracket-group and item-split grammar comes from ``research/bracket_groups.py``, which
+# the citation-index strip reads the same text through immediately before this pass (see
+# ``gemini_search._strip_model_citation_indices``). Shared rather than restated so the two
+# cannot come to disagree about what one string's groups and items are; that module is a
+# leaf below both, so importing it keeps this module's own leaf position (the provider
+# imports it, not the other way round).
 # ``A: NASA`` -> tier grade + outlet. An item with no grade is a continuation name under
 # the previous one (``[D: GrackerAI, siberX]``).
 _TIER_ITEM_RE = re.compile(r"^([A-Z]):\s*(.+)$")
@@ -247,18 +255,14 @@ def _is_supported(name: str, labels: Sequence[str]) -> bool:
 
 
 def _split_group_items(inner: str) -> list[tuple[str, str]]:
-    """One ``(introducing separator, item text)`` pair per comma/semicolon item.
+    """One ``(introducing separator, stripped item text)`` pair per non-empty item.
 
-    Carrying each item's own separator is what lets a rewritten group keep the model's
-    ``;`` where it wrote one (``[A: ILA; C: Sea news]``) instead of normalizing to ``,``.
+    The split itself is the shared grammar; what this adds is THIS pass's reading of an
+    item — stripped, and dropped when nothing is left. (The citation-index strip drops an
+    item with no alphanumeric character instead, which is why the shared iterator hands
+    items over raw.)
     """
-    parts = _GROUP_ITEM_SPLIT_RE.split(inner)
-    items: list[tuple[str, str]] = []
-    for index in range(0, len(parts), 2):
-        item = parts[index].strip()
-        if item:
-            items.append((parts[index - 1] if index else "", item))
-    return items
+    return [(separator, item.strip()) for separator, item in iter_group_items(inner) if item.strip()]
 
 
 def _rewrite_group(inner: str, labels: Sequence[str]) -> tuple[str | None, int, int]:
@@ -293,8 +297,7 @@ def _rewrite_group(inner: str, labels: Sequence[str]) -> tuple[str | None, int, 
             rendered.append((separator, UNVERIFIED_ATTRIBUTION_MARKER))
     if not unsupported:
         return None, tagged, 0
-    rebuilt = rendered[0][1] + "".join(f"{separator} {item}" for separator, item in rendered[1:])
-    return rebuilt, tagged, unsupported
+    return join_group_items(rendered), tagged, unsupported
 
 
 def rewrite_unsupported_attributions(text: str, labels: Sequence[str]) -> AttributionCheck:
@@ -331,10 +334,12 @@ def rewrite_unsupported_attributions(text: str, labels: Sequence[str]) -> Attrib
         if rebuilt is None:
             return match.group(0)
         groups_rewritten += 1
-        return f"[{rebuilt}]"
+        # ``rebuild_group`` re-emits the space the shared pattern may have consumed in front
+        # of the group; this pass never deletes a group, so that space always comes back.
+        return rebuild_group(match, rebuilt)
 
     return AttributionCheck(
-        text=_BRACKET_GROUP_RE.sub(replace, text),
+        text=BRACKET_GROUP_RE.sub(replace, text),
         tagged=tagged,
         unsupported=unsupported,
         groups_rewritten=groups_rewritten,

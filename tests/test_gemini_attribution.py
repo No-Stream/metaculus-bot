@@ -6,6 +6,12 @@ tier-tag syntax census and the false-strip review are in
 out-of-scope cases, which pin the boundary the check must not cross.
 """
 
+from metaculus_bot.research.bracket_groups import (
+    BRACKET_GROUP_RE,
+    iter_group_items,
+    join_group_items,
+    rebuild_group,
+)
 from metaculus_bot.research.gemini_attribution import (
     UNVERIFIED_ATTRIBUTION_MARKER,
     rewrite_unsupported_attributions,
@@ -245,3 +251,38 @@ class TestCounts:
     def test_a_fully_supported_response_reports_zero(self) -> None:
         result = rewrite_unsupported_attributions("Cloudy [C: Time and Date].", ["timeanddate.com"])
         assert (result.tagged, result.unsupported, result.groups_rewritten) == (1, 0, 0)
+
+
+class TestTheSharedBracketGrammar:
+    """This check and ``gemini_search``'s citation-index strip run back to back over one
+    response body and read it through one grammar (``research/bracket_groups.py``), so the
+    grammar's own contract is pinned here rather than only through its two consumers —
+    written twice, the two passes could come to disagree about the same string.
+    """
+
+    def test_items_come_through_raw_with_the_separator_that_introduced_them(self) -> None:
+        # Raw, because the two passes disagree about what an item still SAYS: the strip
+        # drops one left with no alphanumeric character, this check drops one that is empty
+        # once stripped. Tidying inside the split would silently change both.
+        assert list(iter_group_items("A: NASA, 1.1.2; C: Time and Date")) == [
+            ("", "A: NASA"),
+            (",", " 1.1.2"),
+            (";", " C: Time and Date"),
+        ]
+
+    def test_the_first_surviving_item_drops_the_separator_that_introduced_it(self) -> None:
+        # The item that now LEADS the group cannot keep a separator, or a group whose first
+        # item was removed renders ``[, B: Reuters]``. Later items keep the model's own
+        # ``,`` versus ``;``.
+        assert join_group_items([(",", "B: Reuters"), (";", "C: MIT Sloan")]) == "B: Reuters; C: MIT Sloan"
+        assert join_group_items([]) == ""
+
+    def test_a_rewritten_group_keeps_the_space_the_pattern_consumed(self) -> None:
+        # The shared pattern optionally eats the space in front of a group, so the one
+        # consumer that can DELETE a group ("office [1.1.1]. He" -> "office. He") can take
+        # the space with it. Every other rewrite has to put it back, which is what
+        # ``rebuild_group`` is for.
+        match = BRACKET_GROUP_RE.search("The agency named the supplier [A: FDA]")
+        assert match is not None
+        assert match.group(0) == " [A: FDA]"
+        assert rebuild_group(match, "A: FDA, unverified attribution") == " [A: FDA, unverified attribution]"
