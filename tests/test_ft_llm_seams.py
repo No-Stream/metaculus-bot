@@ -76,7 +76,7 @@ from forecasting_tools.ai_models import general_llm as ft_general_llm
 from litellm.files.main import ModelResponse
 from litellm.types.utils import Choices, Message, Usage
 
-from metaculus_bot.credit_telemetry import reset_donated_key_state_cache
+from metaculus_bot.credit_telemetry import ROLE_METADATA_KEY, reset_donated_key_state_cache
 from metaculus_bot.fallback_openrouter import FallbackOpenRouterLlm
 from metaculus_bot.llm_configs import FORECASTER_LLMS
 from metaculus_bot.research.agentic import llm as agentic_llm
@@ -231,6 +231,12 @@ class TestProductionKwargShapesReachAcompletion:
         assert sent["extra_body"] == {"provider": {"require_parameters": True}}
         assert sent["reasoning"] == {"effort": "low"}
         assert sent["temperature"] is None
+        # role="parser" books the constrained primary on the same CREDIT_ROLE_SPEND line as
+        # PARSER_LLM (both are one parsing job on the same tier). Dropped, it books as
+        # ``untagged`` and the parser row silently vanishes from a run's ledger — asserted
+        # here because every construction path in build_llm_with_openrouter_fallback stamps
+        # the tag as litellm ``metadata``, so this is where a dropped kwarg is observable.
+        assert sent["metadata"][ROLE_METADATA_KEY] == "parser"
 
     async def test_real_forecaster_roster_funnels_declared_kwargs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every real forecaster slot funnels its declared kwargs (and temperature=None) intact.
