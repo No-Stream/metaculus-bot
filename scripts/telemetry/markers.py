@@ -951,6 +951,27 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
     ),
     MarkerSpec(
+        "gemini_unsupported_attribution",
+        # The embellishment channel, per response (research/gemini_search.py
+        # _check_attributions): outlet-named source-tier tags — ``[A: NASA]``, ``[B: Reuters]``
+        # — that the SAME response's own grounded-domain list does not name, rewritten to
+        # ``[unverified attribution]`` at format time. 76% of the 685 tier attributions in the
+        # 323 archived Gemini sections are that shape and the zero-chunk floor cannot see any
+        # of them (it fires only when nothing grounded at all), so before this the rate was a
+        # hand audit. ``labels`` is load-bearing context, not decoration: the same
+        # ``unsupported`` count reads completely differently against it — q38195 named 21
+        # outlets over ONE grounded domain — and ``groups`` is the render footprint, below
+        # ``unsupported`` because several unsupported names in one bracket collapse to a single
+        # marker. Emitted only when ``unsupported`` > 0; a checked response with none logs
+        # nothing and carries its zero in the research archive's provider details instead.
+        # NOT alertable: an absent outlet is the model's habit, not a bot defect.
+        re.compile(
+            r"GEMINI_UNSUPPORTED_ATTRIBUTION:\s*question=(?P<question>\S+)\s+tagged=(?P<tagged>\S+)"
+            r"\s+unsupported=(?P<unsupported>\S+)\s+groups=(?P<groups>\S+)\s+labels=(?P<labels>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
+    ),
+    MarkerSpec(
         "agentic_document_ungrounded_suppressed",
         # The read_document twin of GEMINI_UNGROUNDED_SUPPRESSED (research/agentic/tools.py
         # read_document): Gemini's url_context tool retrieved nothing, so the answer would

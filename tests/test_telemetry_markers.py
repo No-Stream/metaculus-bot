@@ -2157,6 +2157,47 @@ class TestGeminiGroundingDensity:
         assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
 
 
+# The embellishment channel, per response (metaculus_bot/research/gemini_search.py
+# _check_attributions): outlet-named tier tags the same response's own grounded-domain list
+# does not name, rewritten to ``[unverified attribution]``. ``labels`` is what makes the count
+# readable — q38195 named 21 outlets over one grounded domain.
+GEMINI_UNSUPPORTED_ATTRIBUTION_LINE = (
+    PFX + "GEMINI_UNSUPPORTED_ATTRIBUTION: question=44953 tagged=2 unsupported=1 groups=1 labels=7"
+)
+
+
+class TestGeminiUnsupportedAttribution:
+    def test_fields(self):
+        rec = _parse_one(GEMINI_UNSUPPORTED_ATTRIBUTION_LINE)
+        assert rec["marker"] == "gemini_unsupported_attribution"
+        assert rec["tagged"] == 2
+        assert rec["unsupported"] == 1
+        assert rec["groups"] == 1
+        # The denominator the count has to be read against; without it a bare
+        # ``unsupported=21`` cannot be told from a thin grounding record.
+        assert rec["labels"] == 7
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GEMINI_UNSUPPORTED_ATTRIBUTION_LINE)
+        # gemini_search.py passes question.id_of_question, same as its two siblings.
+        assert rec["qid"] == 44953
+        assert rec["qid_kind"] == "question_id"
+
+    def test_absent_qid_coerces_to_none(self):
+        rec = _parse_one(
+            PFX + "GEMINI_UNSUPPORTED_ATTRIBUTION: question=None tagged=21 unsupported=21 groups=14 labels=1"
+        )
+        assert rec["qid"] is None
+        assert rec["unsupported"] == 21
+
+    def test_does_not_collide_with_its_two_gemini_siblings(self):
+        # All three start GEMINI_ and two of the three come out of the same function, so each
+        # spec must claim only its own line or the archive double-counts.
+        assert _parse_one(GEMINI_UNSUPPORTED_ATTRIBUTION_LINE)["marker"] == "gemini_unsupported_attribution"
+        assert _parse_one(GEMINI_GROUNDING_DENSITY_LINE)["marker"] == "gemini_grounding_density"
+        assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
+
+
 # read_document's twin of GEMINI_UNGROUNDED_SUPPRESSED (metaculus_bot/research/agentic/tools.py): Gemini's
 # url_context tool retrieved nothing, so the "fetched" tier is withheld rather than granting a
 # parametric-recall answer the authority to supersede the briefing for every forecaster.

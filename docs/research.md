@@ -226,6 +226,35 @@ years and IP-like tokens survive; the `### Sources` block is appended afterwards
 and never passes through the strip. Validated over all 323 archived sections at
 zero false positives (`scratch/next_season_bundle_2026-09/item3_citation_strip/`).
 
+**Attributions the response's own grounding record cannot back.** Gemini also
+writes self-invented source-tier tags — `[A: NASA]`, `[B: Reuters]`,
+`[C: Time and Date]` — and across the 323 archived sections, 478 of the 681
+outlet-named tier attributions (70%) name an outlet absent from that same
+response's grounded-domain list. q44953 claimed `[A: NASA]` for the eclipse path
+over a source list of perlan.is / guidetoiceland.is / timeanddate.com; q45401
+named 19 institutions (Bloomberg, FactSet, Goldman Sachs, Kalshi, AP, …) over a
+single grounded domain. The zero-chunk floor cannot see any of this, because it
+fires only when nothing grounded at all, and the forecaster prompts instruct
+weighting by source tier — so an unbacked tier tag is an authority claim we
+manufactured. `gemini_attribution.rewrite_unsupported_attributions` replaces each
+one with `[unverified attribution]` at format time, after the citation-index
+strip, keeping any outlet in the same bracket that the record does name and
+dropping the tier grade along with the outlet it was read off. It never touches a
+word outside a bracket: the FACT is not what is being disputed (an aggregator
+domain can carry another outlet's copy), only the provenance claim. Matching is
+biased hard toward keeping, on six rules — concatenation, all-tokens,
+token-overlap, parent-domain-inside-name (`Chosunbiz` / chosun.com),
+name-abbreviates-outlet (`WaPo` / washingtonpost.com), domain-abbreviates-name
+(`Times of Central Asia` / timesca.com) — because a false strip discards real
+provenance while a false keep leaves one tag standing. A response whose chunks
+carry no renderable label is skipped rather than blanket-marked: with no evidence
+base, a rewrite would dress our own render failure as the model's embellishment.
+Per-response counts ride `GEMINI_UNSUPPORTED_ATTRIBUTION` (only when non-zero)
+and the provider-diagnostics `unsupported_attributions` count (always, so a zero
+is a measurement); nothing keys on either. Validation over all 323 sections,
+including the hand review of every section where every attribution was marked:
+`scratch/next_season_bundle_2026-09/item4_attribution_check/`.
+
 **Grounding density, as telemetry only.** Every response that passes the floor
 below logs `GEMINI_GROUNDING_DENSITY: question=... chunks=... supports=...
 chars=...`, where `chars` is the raw model text. Post-floor the median response

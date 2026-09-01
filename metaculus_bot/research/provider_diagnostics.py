@@ -49,7 +49,10 @@ class ProviderResult:
     # is an ordered ``{source_name: token}`` map; a token starting with ``"ok"``
     # contributed, ``"none"`` was queried-but-empty (benign), anything else is a
     # loss (``"dropped(size_cap)"`` / ``"blocked"`` / ``"js_wall"`` / ``"error(...)"`` /
-    # ``"empty"``). ``asdict(r)`` serializes this straight into the research archive.
+    # ``"empty"``). ``details["counts"]`` is the second convention: an ordered
+    # ``{name: number}`` map of provider-internal quantities that are neither a source
+    # outcome nor a failure (see :func:`_counts_suffix`).
+    # ``asdict(r)`` serializes this straight into the research archive.
     details: dict = field(default_factory=dict)
     # On ``status == "fallback"``, the vendor that actually answered ("openrouter" /
     # "perplexity" / "exa"). ``name`` deliberately keeps the PRIMARY's identity so the
@@ -163,10 +166,29 @@ def pop_provider_detail(qid: int | None, provider: str) -> dict:
 SUCCEEDED_STATUSES: tuple[ProviderStatus, ...] = ("ok", "fallback")
 
 
+def _counts_suffix(details: dict) -> str:
+    """Render the ``| <name>=<value>`` segment for ``details["counts"]``, or "".
+
+    Second detail convention beside ``sources``: ``details["counts"]`` is an ordered
+    ``{name: number}`` map of provider-INTERNAL quantities that are neither a source
+    outcome nor a failure — ``gemini_search``'s ``unsupported_attributions`` is the first.
+    A zero renders nothing, so a healthy provider's line stays byte-identical to what it
+    was before the map existed, while the archive keeps the zero (``asdict`` serializes
+    the whole ``details``) — which is what makes "the check ran and found none"
+    distinguishable from "the check never ran".
+    """
+    counts = details.get("counts")
+    if not isinstance(counts, dict):
+        return ""
+    rendered = [f"{name}={value}" for name, value in counts.items() if value]
+    return f" | {' | '.join(rendered)}" if rendered else ""
+
+
 def _format_one(result: ProviderResult) -> str:
     line = f"- {result.name}: {result.status} | {result.chars} chars | {result.latency_ms} ms"
     if result.status == "errored" and result.error_type is not None:
         line += f" | {result.error_type}"
+    line += _counts_suffix(result.details)
     line += _partial_loss_suffix(result.details)
     return line
 
