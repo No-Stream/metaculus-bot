@@ -763,6 +763,19 @@ class TestPresentTenseInstrumentGaps:
         assert "never phrase a gap as that source's value on the resolution date" in lowered
         assert "rewrite it as the present-tense observable or drop it" in lowered
 
+    def test_analyzer_does_not_spend_a_slot_on_a_reading_the_briefing_already_dates(self) -> None:
+        """The present-tense rule says what the resolver has to come back WITH, not that the
+        slot must be spent regardless. On a question whose first pass already reports the
+        source's current dated reading, re-asking buys a value the briefing holds, and this
+        pass is roughly 44% of research spend. The carve-out also keeps the block from
+        fighting the prompt's own "DO NOT invent gaps" discipline."""
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "if the first pass already states that source's current reading with the date it was read" in lowered
+        assert "no slot should be spent re-fetching a value the briefing holds" in lowered
+        # The two conditions that still earn a verify-style gap.
+        assert "carries no as-of date" in lowered
+        assert "older than the source's own update cadence" in lowered
+
 
 class TestNullResultReadingClause:
     """A search that found nothing licenses "could not find evidence of X", never

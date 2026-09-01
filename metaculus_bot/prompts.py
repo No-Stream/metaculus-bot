@@ -1606,11 +1606,17 @@ def gap_fill_analyzer_prompt(
         When the question resolves off a live data source — a tracker, index, polling or
         rate average, counter, league table, or dashboard — at least ONE gap must ask what
         that source reads NOW, in the present tense ("what value does <tracker> currently
-        display for <series>, and when was it last updated?"). Never phrase a gap as that
-        source's value on the resolution date ("what will <tracker> show on <date>"): no
-        search can answer it, the resolver comes back "that date has not occurred yet",
-        and the slot is spent for nothing. If a candidate gap can only be answered by a
-        future observation, rewrite it as the present-tense observable or drop it.
+        display for <series>, and when was it last updated?"). ALREADY ANSWERED COUNTS AS
+        ANSWERED: if the first pass already states that source's current reading with the
+        date it was read, that requirement is met and no slot should be spent re-fetching a
+        value the briefing holds — spend it on something the briefing lacks. Re-asking for
+        that reading earns a slot only when the stated reading carries no as-of date, or is
+        older than the source's own update cadence (a daily average quoted from last month).
+        Never phrase a gap as that source's value on the resolution date ("what will
+        <tracker> show on <date>"): no search can answer it, the resolver comes back "that
+        date has not occurred yet", and the slot is spent for nothing. If a candidate gap
+        can only be answered by a future observation, rewrite it as the present-tense
+        observable or drop it.
 
         NULL RESULTS ARE SEARCH OUTCOMES. Where the first pass says it searched and
         found nothing ("no record found", "no authoritative source located"), treat that
