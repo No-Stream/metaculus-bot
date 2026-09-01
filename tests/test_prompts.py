@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from metaculus_bot.prompts import (
+    _OUTSIDE_VENUE_MARKET_ODDS_BULLET,
     _SOURCE_TIER_TAG_INSTRUCTION,
     TS_ANCHOR_SECTION_HEADER,
     asknews_summarizer_prompt,
@@ -487,14 +488,33 @@ class TestWebResearchPromptPrimarySources:
         assert "benchmarking run" in lowered
         assert "data leakage" in lowered
 
-    def test_prediction_market_nudge_only_when_not_benchmarking(self) -> None:
-        """Regression: the existing FOCUS AREAS 'Prediction market odds' bullet
-        must still appear only when is_benchmarking=False."""
+    def test_market_odds_bullet_only_when_not_benchmarking(self) -> None:
+        """Regression: the FOCUS AREAS market-odds bullet must still appear only when
+        is_benchmarking=False (backtests must not see market data at all)."""
         non_bench = web_research_prompt("Q?", is_benchmarking=False)
         bench = web_research_prompt("Q?", is_benchmarking=True)
 
-        assert "Prediction market odds" in non_bench
-        assert "Prediction market odds" not in bench
+        assert _OUTSIDE_VENUE_MARKET_ODDS_BULLET in non_bench
+        assert _OUTSIDE_VENUE_MARKET_ODDS_BULLET not in bench
+        assert "Market-implied or crowd odds" not in bench
+
+    def test_market_odds_bullet_points_away_from_the_covered_venues(self) -> None:
+        """Across 42 ranked-era bundles the bullet's covered-venue half produced one
+        content-redundant retrieval and three stale prices that contradicted correct
+        live snapshot rows, while every realized instance of decisive market evidence
+        came from a venue OUTSIDE the four the live snapshot covers (GJO q44869, CME
+        FedWatch q45401, Metaculus q20683). So the bullet is narrowed, not removed:
+        the outside venues stay named, the four covered ones are ruled out, and the
+        price must carry an observation date."""
+        prompt = web_research_prompt("Q?", is_benchmarking=False)
+        collapsed = " ".join(prompt.split())
+
+        for outside_venue in ("Metaculus", "Good Judgment Open", "CME FedWatch", "bookmakers"):
+            assert outside_venue in collapsed
+        assert "Do NOT report Polymarket/Kalshi/Manifold/PredictIt prices from search results" in collapsed
+        # The item-2 vintage rule landing on this surface too.
+        assert "always name the market and the date you observed the price" in collapsed
+        assert "usually days stale" in collapsed
 
     def test_auto_annotated_style_bans_model_authored_citation_indices(self) -> None:
         """Half of all archived gemini sections (173 of 323) carry the model's own
@@ -658,16 +678,21 @@ class TestPredictionMarketFraming:
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         self._assert_general_expertise_principle(result)
 
-    def test_strong_evidence_framing_present_non_benchmarking_absent_benchmarking(self) -> None:
-        """Leakage guard: the prediction-market nudge in the research prompt is
-        present only when NOT benchmarking. This is the mode-dependent surface
-        — the forecaster prompts above are mode-agnostic because the provider
-        data is suppressed upstream during backtests."""
+    def test_market_ask_present_non_benchmarking_absent_benchmarking(self) -> None:
+        """Leakage guard: the market/crowd-odds ask in the research prompt is present
+        only when NOT benchmarking. This is the mode-dependent surface — the
+        forecaster prompts above are mode-agnostic because the provider data is
+        suppressed upstream during backtests. Since the bullet was narrowed (it now
+        names venues on both sides of the line), a benchmarking prompt must name
+        none of them."""
         non_bench = web_research_prompt("Will X happen?", is_benchmarking=False)
         bench = web_research_prompt("Will X happen?", is_benchmarking=True)
 
-        assert "Prediction market" in non_bench
-        assert "Prediction market" not in bench
+        assert "crowd odds" in non_bench
+        assert "crowd odds" not in bench
+        for venue in ("Polymarket", "Kalshi", "Manifold", "PredictIt", "Metaculus", "CME FedWatch"):
+            assert venue in non_bench, f"expected {venue} named in the narrowed bullet"
+            assert venue not in bench, f"{venue} leaked into a benchmarking prompt"
 
 
 # Source-provenance / motivation trust ladder

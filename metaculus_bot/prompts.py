@@ -233,6 +233,25 @@ def _mc_options_line(options: Sequence[str] | None) -> str:
     return "Options (in resolution order): " + " | ".join(names)
 
 
+# The FOCUS AREAS market-odds bullet, narrowed away from the four venues the
+# structured prediction-market snapshot already covers live. In 42 ranked-era
+# bundles the old blanket bullet ("Prediction market odds and forecasts (if
+# available)") produced exactly one content-redundant retrieval plus three stale
+# covered-venue prices that contradicted correct live snapshot rows — the only
+# measured harm mode — while every realized instance of decisive market evidence
+# came from OUTSIDE those four venues (Good Judgment Open on q44869, CME FedWatch
+# on q45401, the Metaculus crowd on q20683). Hence narrowed rather than removed.
+# Wording confirmed verbatim by the operator 2026-09-01; receipts in
+# scratch/residual_2026-08-31/market_odds_coverage.md.
+_OUTSIDE_VENUE_MARKET_ODDS_BULLET = (
+    "- Market-implied or crowd odds from sources OTHER than Polymarket, Kalshi, Manifold, or PredictIt "
+    "(e.g. Metaculus, Good Judgment Open, CME FedWatch, bookmakers) — always name the market and the date "
+    "you observed the price. Do NOT report Polymarket/Kalshi/Manifold/PredictIt prices from search results: "
+    "a dedicated live snapshot of those venues is provided separately, and search-indexed copies of their "
+    "prices are usually days stale."
+)
+
+
 # Citation instruction for the Gemini grounding provider. The SDK returns grounding
 # metadata that `research/gemini_search.py` splices in as plain `[N]` markers; the
 # model ALSO writes its own hierarchical `[1.2.3]` indices, which index a chunk list
@@ -277,9 +296,7 @@ def web_research_prompt(
         if allow_resolution_source_reading
         else ""
     )
-    prediction_markets_instruction = (
-        "" if is_benchmarking else "\n- Prediction market odds and forecasts (if available)"
-    )
+    prediction_markets_instruction = "" if is_benchmarking else f"\n{_OUTSIDE_VENUE_MARKET_ODDS_BULLET}"
     benchmarking_warning = _benchmarking_warning("search") if is_benchmarking else ""
     options_block = f"\n{_mc_options_line(options)}" if options else ""
 
