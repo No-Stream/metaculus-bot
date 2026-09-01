@@ -883,6 +883,18 @@ the telemetry markers:
   and new numbers). `survivors=1` marks a record where "lone" is vacuous because
   that member was the whole ensemble; drop those from a lone rate. Nothing here
   gates or clamps a forecast.
+- `THIN_PUBLISH_FLOOR: question=... raw=... clamped=... survivors=1` — a WARN
+  that a BINARY question published on exactly ONE surviving forecaster had its
+  published probability clamped into `[THIN_PUBLISH_BINARY_FLOOR,
+  THIN_PUBLISH_BINARY_CEIL]` (`constants.py`, currently 0.05 / 0.95, deliberately
+  the EXTREME_CALL band). `raw` is what the survivor declared and is what the
+  comment's per-model summary bullet still shows; `clamped` is what went to
+  Metaculus. Emitted by `aggregation_pipeline.py` at the base-combine step, only
+  when the value actually moved, so the line count is the floor's incidence: a
+  lone survivor already inside the band leaves no line, and a multi-member median
+  is never floored, however extreme (the receipt behind the rule priced that
+  global variant at -52.02 spot peer). Expect it only alongside a
+  `FORECASTERS_SURVIVED: ... survived=1/N` line for the same question.
 - `GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=...
   rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=...
   wall_s=... findings=... pending_leads=... lint_rejections=...

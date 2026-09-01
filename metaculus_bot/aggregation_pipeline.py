@@ -12,6 +12,7 @@ import random
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import cast
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -39,7 +40,7 @@ from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bou
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages
 from metaculus_bot.numeric.validation import detect_unit_mismatch
-from metaculus_bot.post_processing import apply_platt_calibration, maybe_snap_to_integers
+from metaculus_bot.post_processing import apply_platt_calibration, apply_thin_publish_floor, maybe_snap_to_integers
 
 logger = logging.getLogger(__name__)
 
@@ -266,13 +267,33 @@ class AggregationPipeline:
                 logger.info("STACKING base combine: single pre-stacked output; returning as-is")
             else:
                 logger.warning("Unexpected STACKING combine: single input without stacking context; returning as-is")
+            lone = predictions[0]
+            # Single-survivor binary publish floor. This branch serves two different
+            # objects — the lone RAW member the single-forecaster short-circuit hands
+            # through, and the single PRE-STACKED output of a fired stacker — so the
+            # count alone is not the trigger: the skip reason route_after_forecasts
+            # writes for exactly the first event is (the stacked path never writes it,
+            # and clears any stale one when it fires). Read, not popped: the comment
+            # builder pops it to publish STACKER_SKIP_REASON. Binary only — a lone
+            # numeric survivor keeps its snap path below and a lone MC survivor is
+            # returned as is. Accepted gap, stated rather than papered over with a
+            # second wiring: skip_reasons is written only under STACKING /
+            # CONDITIONAL_STACKING, so a single survivor under plain MEAN/MEDIAN routes
+            # through _simple_aggregate and is NOT floored; prod and the code default
+            # both run CONDITIONAL_STACKING.
+            if (
+                isinstance(question, BinaryQuestion)
+                and qkey is not None
+                and self.skip_reasons.get(qkey) == "single_forecaster"
+            ):
+                return self._floor_single_survivor_binary(cast(float, lone), qkey)
             # Snap-to-integers for a lone numeric prediction — the
             # min-forecasters=1 single-survivor path (forecaster.py short-circuits
             # spread + stacking and hands the raw prediction through). No-op for
             # binary/MC and for the pre-stacked STACKING output (whose discrete
             # votes were already consumed in _stacking_aggregate, so the vote list
             # is empty and majority_votes_discrete([]) is False).
-            return self._maybe_snap_to_integers(predictions[0], question)
+            return self._maybe_snap_to_integers(lone, question)
 
         # CONDITIONAL_STACKING uses MEDIAN; regular STACKING uses MEAN
         base_combine_strategy = (
@@ -306,6 +327,26 @@ class AggregationPipeline:
         if apply_platt_after_combine:
             return self._apply_platt_calibration(combined, question)
         return combined
+
+    @staticmethod
+    def _floor_single_survivor_binary(raw: float, qid: int) -> float:
+        """Apply the k=1 publish floor and log the move, if any, as THIN_PUBLISH_FLOOR.
+
+        The value is a float by construction on this path: a BinaryQuestion's members
+        come out of run_binary_forecast as ``ReasonedPrediction[float]``. No line when the
+        lone value already sits inside the band — the single-survivor EVENT is already
+        observable via FORECASTERS_SURVIVED and the skip reason, so silence here means
+        exactly "nothing moved".
+        """
+        clamped = apply_thin_publish_floor(raw, survivors=1)
+        if clamped != raw:
+            logger.warning(
+                "THIN_PUBLISH_FLOOR: question=%s raw=%.4f clamped=%.4f survivors=1",
+                qid,
+                raw,
+                clamped,
+            )
+        return clamped
 
     def _log_base_combine_strategy(self, n_predictions: int, strategy_name: str, *, expected: bool) -> None:
         """One line naming how many pre-stacked outputs are being combined, and by what.
@@ -349,6 +390,13 @@ class AggregationPipeline:
 
         qid_for_outcome = question.id_of_question
         assert qid_for_outcome is not None
+        # Every outcome below overwrites outcomes[qid], but only the SKIP paths write
+        # skip_reasons, and the comment builder is what pops it. An entry orphaned by a
+        # crash between routing and comment-building would otherwise outlive its
+        # question, and a later stack of the same qid on this pipeline would hand its
+        # lone pre-stacked output to _base_combine under a stale "single_forecaster" —
+        # the one reading that floors a stacked value. A fired stack has no skip reason.
+        self.skip_reasons.pop(qid_for_outcome, None)
 
         stacking_fn = self._get_stacking_fn()
 

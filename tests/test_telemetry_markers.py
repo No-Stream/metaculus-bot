@@ -1309,6 +1309,45 @@ class TestExtremeCall:
         assert rec["model"] == "unknown"
 
 
+# Verbatim from metaculus_bot/aggregation_pipeline.py:_floor_single_survivor_binary —
+# the single-survivor binary publish floor, logged at WARNING from the base-combine
+# re-entry only when the lone value actually moved.
+THIN_PUBLISH_FLOOR_LOW_LINE = PFX_WARN + "THIN_PUBLISH_FLOOR: question=44874 raw=0.0300 clamped=0.0500 survivors=1"
+THIN_PUBLISH_FLOOR_HIGH_LINE = PFX_WARN + "THIN_PUBLISH_FLOOR: question=44870 raw=0.9700 clamped=0.9500 survivors=1"
+
+
+class TestThinPublishFloor:
+    def test_low_side_fields(self):
+        rec = _parse_one(THIN_PUBLISH_FLOOR_LOW_LINE)
+        assert rec["marker"] == "thin_publish_floor"
+        # raw is the member's declared value (still on the comment bullet); clamped is
+        # what was published. Both harvest as floats so a cut can difference them.
+        assert rec["raw"] == 0.03
+        assert rec["clamped"] == 0.05
+        assert rec["survivors"] == 1
+
+    def test_high_side_fields(self):
+        rec = _parse_one(THIN_PUBLISH_FLOOR_HIGH_LINE)
+        assert rec["raw"] == 0.97
+        assert rec["clamped"] == 0.95
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # aggregation_pipeline.py emits question.id_of_question — the same space as
+        # forecasters_survived and extreme_call, so the join to the survivor count and
+        # to the member's own EXTREME_CALL line is free.
+        rec = _parse_one(THIN_PUBLISH_FLOOR_LOW_LINE)
+        assert rec["qid"] == 44874
+        assert rec["qid_kind"] == "question_id"
+
+    def test_does_not_collide_with_the_extreme_call_line_it_follows(self):
+        # The two markers fire on the same question in the same run (the member's
+        # EXTREME_CALL at the fan-out, then the floor at aggregation); each must harvest
+        # into its own file with its own fields.
+        harvested = parse_log_text(EXTREME_CALL_SOLO_PUBLISH_LINE + "\n" + THIN_PUBLISH_FLOOR_LOW_LINE + "\n", **_META)
+        assert [r["p"] for r in harvested["extreme_call"]] == [0.03]
+        assert [r["clamped"] for r in harvested["thin_publish_floor"]] == [0.05]
+
+
 # The FORECASTERS_USED ensemble-size marker is an HTML comment injected into the
 # published comment (metaculus_bot/comment/markers.py); its durable home is the
 # comment, but the run-log parser carries a spec too (same as STACKER_OUTCOME /

@@ -643,6 +643,28 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
     ),
     MarkerSpec(
+        "thin_publish_floor",
+        # Per-QUESTION single-survivor binary publish floor, emitted by
+        # aggregation_pipeline.py's _floor_single_survivor_binary from the base-combine
+        # re-entry, ONLY when the lone survivor's value actually moved: ``raw`` is the
+        # member's declared probability (what the comment's summary bullet still
+        # carries) and ``clamped`` is what was published (THIN_PUBLISH_BINARY_FLOOR /
+        # _CEIL in constants.py). A lone value already inside the band leaves no line,
+        # so this marker's count IS the floor's prod incidence; the single-survivor
+        # EVENT itself is forecasters_survived's ``survived=1``.
+        #
+        # ``survivors`` is always 1 today and rides along so the record stays
+        # self-describing if the k<=2 generalisation the receipt discusses
+        # (scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §3, "1=") is ever
+        # enabled — a cut can then split the two regimes without a join. ``raw`` and
+        # ``clamped`` are %.4f, so coerce_value reads them as floats.
+        re.compile(
+            r"THIN_PUBLISH_FLOOR:\s*question=(?P<question>\S+)\s+raw=(?P<raw>\S+)\s+clamped=(?P<clamped>\S+)"
+            r"\s+survivors=(?P<survivors>\d+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # same id space as forecasters_survived / extreme_call
+    ),
+    MarkerSpec(
         "degradation_counters",
         # The per-run summary that DECIDES CI COLOR (cli.py exits non-zero on a
         # positive alertable_count), emitted by forecaster.py's forecast_questions.
