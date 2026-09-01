@@ -212,6 +212,30 @@ response's grounding metadata, plus a `### Sources` list
 run collapses to a terse `_url_context: none_` marker rather than pushing dead
 URLs at the model).
 
+**Two citation systems, one of them ours.** Gemini also writes its own
+hierarchical `[2.4.1]` / `[1.1.1, 1.1.2]` / `[A: NASA, 1.1.2]` indices, pointing
+at a source list nobody outside the model holds. 173 of 323 archived sections
+carried them and 163 carried both families at once, so half the corpus handed a
+forecaster a bracket field where some brackets resolve against the rendered
+`### Sources` list and some are decoration, with nothing to tell them apart.
+`_strip_model_citation_indices` removes them, running after the citation splice
+because that splice indexes the original response text by byte offset. It only
+removes a dotted run that is delimited the way a citation is and whose every
+component is at most two digits, so bracketed quantities, currency, versions,
+years and IP-like tokens survive; the `### Sources` block is appended afterwards
+and never passes through the strip. Validated over all 323 archived sections at
+zero false positives (`scratch/next_season_bundle_2026-09/item3_citation_strip/`).
+
+**Grounding density, as telemetry only.** Every response that passes the floor
+below logs `GEMINI_GROUNDING_DENSITY: question=... chunks=... supports=...
+chars=...`, where `chars` is the raw model text. Post-floor the median response
+carries one grounding support per ~872 chars and 41% of passers carry three or
+fewer, which is the surface the floor cannot see. Nothing keys on these values
+and there is deliberately no density gate: a decisive, true, later-verified
+figure once came out of a one-support response, so a gate would have suppressed
+it. The marker exists so "did embellishment move" is a query over the telemetry
+archive rather than a hand audit.
+
 **Grounded-chunk floor.** A response with no grounding evidence at all — zero
 `google_search` chunks AND no successful `url_context` read — is suppressed
 (returns `""`, logs `GEMINI_UNGROUNDED_SUPPRESSED`, records a
