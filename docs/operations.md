@@ -779,16 +779,16 @@ open-bound floor) still misses the band, because that interval lies wholly above
 
 The same command prints a second, per-QUESTION section: the **starved outer tail**
 scan, which lives in `performance_analysis/outer_tail.py` (the width monitor owns
-only the CLI wiring). On an open bound the declared outer tail can end up routed past the
-displayed range entirely, leaving every in-range bin above the members' declared
-p99 pinned at the platform's per-bin minimum step (`0.01/N`). Every resolution in
-that band then earns the same floor score, about -219 on any grid size, so the
-band is a cliff at a fixed location rather than a band of the wrong width — which
-is why it reads per question rather than per era, and why widening does not fix
-it. q45218 published its winning rig-count forecast with 27 such bins starting
-one rig above its declared p99, a flat -219.5 zone sixteen rigs from the
-resolution, and the same shape is what made q44182 (-219.0) the worst record on
-the board. A side is flagged when its band's mean per-bin mass is under
+only the CLI wiring). On an open bound the declared outer tail can end up routed
+past the displayed range entirely, leaving every in-range bin above the members'
+declared p99 pinned at the platform's per-bin minimum step (`0.01/N`). Every
+resolution in that band then earns the same floor score, about -219 on any grid
+size, so the band is a cliff at a fixed location rather than a band of the wrong
+width — which is why it reads per question rather than per era, and why widening
+does not fix it. q45218 published its winning rig-count forecast with 27 such
+bins starting one rig above its declared p99, a flat -219.5 zone sixteen rigs
+from the resolution, and the same shape is what made q44182 (-219.0) the worst
+record on the board. A side is flagged when its band's mean per-bin mass is under
 `STARVED_OUTER_TAIL_FLOOR_MULTIPLE` (2.0) times that minimum step; each flagged
 row reports the declared anchor, the displayed bound, the band's mass and bin
 count, the mass sitting beyond the bound, and the log score a resolution in the

@@ -1633,13 +1633,12 @@ hedge-audit narrowing push and Step-9b's LOW→wide IQR prescription from the nu
 ### Starved outer tails: the detector shipped, the publish-time WARN did not (added 2026-09-01, medium)
 
 `scan_outer_tails` (`performance_analysis/outer_tail.py`, rendered by the width monitor's CLI)
-landed 2026-09-01. It finds a defect
-distinct from the max-step smear: on an open bound the declared outer tail can route past the
-displayed range entirely, leaving every in-range bin above the members' declared p99 pinned at the
-platform's per-bin minimum step, so any resolution in that band earns the same ~−219 floor score
-whatever the grid size. That makes it a cliff at a fixed location rather than a band of the wrong
-width, which is why widening does not address it and why the standing `k_tail` hold above is not in
-tension with the detector. Two items are open.
+landed 2026-09-01. It finds a defect distinct from the max-step smear: on an open bound the
+declared outer tail can route past the displayed range entirely, leaving every in-range bin above
+the members' declared p99 pinned at the platform's per-bin minimum step, so any resolution in that
+band earns the same ~−219 floor score whatever the grid size. That makes it a cliff at a fixed
+location rather than a band of the wrong width, which is why widening does not address it and why
+the standing `k_tail` hold above is not in tension with the detector. Two items are open.
 
 1. **No publish-time `STARVED_OUTER_TAIL` WARN, deliberately, and a second trigger to calibrate if
    one is wanted.** On DISCRETE questions — exactly where both motivating records live, q45218 and
