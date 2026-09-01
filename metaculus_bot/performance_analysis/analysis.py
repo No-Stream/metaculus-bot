@@ -433,7 +433,8 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
 
     On a coarse discrete grid the pre-``9f1175c`` flat 0.2 cap can hold the realized
     bin far below what every member asked for (q43913: published 0.200 where members'
-    own curves wanted 0.575-0.823 — peer -38.67). That is a pipeline defect
+    own curves wanted 0.575-0.823 — spot peer -41.20, coverage-scaled peer
+    -38.67). That is a pipeline defect
     masquerading as a forecast error, and it manufactures apparent dissent: each
     member keeps its concentrated mass while the published curve does not.
 
