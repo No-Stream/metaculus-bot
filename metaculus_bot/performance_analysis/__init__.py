@@ -5,6 +5,7 @@ and provides reusable analysis functions.
 """
 
 from metaculus_bot.performance_analysis.analysis import (
+    PitReading,
     binary_summary,
     declared_percentile_pit,
     disagreement_predicts_error,
@@ -14,8 +15,11 @@ from metaculus_bot.performance_analysis.analysis import (
     mc_summary,
     no_bias_check,
     numeric_pit_analysis,
+    out_of_range_pit_reading,
     per_model_binary_scores,
     per_model_cohort,
+    pit_band_count,
+    pit_point_values,
     platform_score_summary,
     stacking_effectiveness,
 )
@@ -108,6 +112,7 @@ __all__ = [
     "SPOT_PEER_FIELD",
     "DetectorVerdict",
     "PerModelRankingCohort",
+    "PitReading",
     "RankingScore",
     "annotate_forecaster_bullets_with_models",
     "anonymous_model_key",
@@ -145,6 +150,7 @@ __all__ = [
     "no_bias_check",
     "numeric_log_score",
     "numeric_pit_analysis",
+    "out_of_range_pit_reading",
     "parse_exclude_qids",
     "parse_forecaster_model_map",
     "parse_inferred_stacker_outcome",
@@ -159,6 +165,8 @@ __all__ = [
     "per_model_binary_scores",
     "per_model_cohort",
     "per_model_ranking_cohort",
+    "pit_band_count",
+    "pit_point_values",
     "platform_score_fragments",
     "platform_score_summary",
     "rank_our_models_by_accuracy",

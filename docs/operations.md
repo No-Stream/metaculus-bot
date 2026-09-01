@@ -649,6 +649,21 @@ elevated) from one of roughly the right width that is mis-centered (misses piled
 in one tail), which `cov80` cannot express and which call for opposite
 corrections.
 
+A resolution the platform reports as out of range (`above_upper_bound` /
+`below_lower_bound`) carries no value, so its PIT is a SET rather than a number:
+`[cdf[-1], 1]` above the ceiling, `[0, cdf[0]]` below the floor. Those readings
+count toward every coverage column when the interval intersects the band, and are
+excluded from PIT std and mean PIT, where no midpoint is imputed; the
+`set-valued (pt n)` column states how many were excluded and what the
+point-metric denominator therefore is. The convention lives in
+`analysis.out_of_range_pit_reading` / `analysis.PitReading` and both PIT paths
+read it. It matters because our own CDF decides the interval: q44842 deliberately
+published 13% of its mass above the displayed ceiling, resolved
+`above_upper_bound` and won spot peer +24.4, which the old PIT-1.0 convention
+scored as a high-side band miss. A starved tail (`cdf[-1]` at the 0.999
+open-bound floor) still misses the band, because that interval lies wholly above
+0.90.
+
 Its era boundaries are **merge-to-main timestamps** (`WIDENING_FLIP`,
 `TS_ANCHOR_ENABLE`), not authoring dates — prod runs from `main`, so a change is
 live only once its merge commit lands there, and keying on the authoring date

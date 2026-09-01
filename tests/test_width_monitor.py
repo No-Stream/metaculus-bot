@@ -30,7 +30,7 @@ from metaculus_bot.performance_analysis.width_monitor import (
     compute_all_eras,
     compute_era_metrics,
     compute_pit,
-    compute_pit_details,
+    compute_pit_reading,
     default_eras,
     jeffreys_ci,
     main,
@@ -77,10 +77,16 @@ def _row_cells(md: str, label: str) -> list[str]:
     """The stripped cells of one rendered table row, indexed as in the header.
 
     1=era, 2=n, 3=excl, 4=n_eff, 5=cov80, 6=cov50, 7=cov@10, 8=cov@50, 9=cov@90,
-    10=PIT std, 11=mean PIT, 12=med rel width, 13=band_miss, 14=OOB.
+    10=PIT std, 11=mean PIT, 12=med rel width, 13=band_miss, 14=OOB, 15=set-valued (pt n).
     """
     [row] = [line for line in md.splitlines() if line.startswith(f"| {label} |")]
     return [cell.strip() for cell in row.split("|")]
+
+
+def _pit_and_side(record: dict) -> tuple[float | None, str | None]:
+    """``(point PIT, oob_side)`` for a record, for the point-valued cases below."""
+    reading = compute_pit_reading(record)
+    return (None, None) if reading is None else (reading.point, reading.oob_side)
 
 
 class TestPit:
@@ -90,7 +96,10 @@ class TestPit:
             rec = _linear_cdf_record(resolution=res)
             assert compute_pit(rec) == pytest.approx(expected, abs=1e-9)
 
-    def test_pit_out_of_bounds(self):
+    def test_pit_out_of_bounds_degenerates_to_a_point_when_no_mass_is_out_there(self):
+        # The identity ramp spans the full [0, 1], so cdf[0] == 0 and cdf[-1] == 1: the
+        # out-of-range INTERVAL collapses to the single value the old convention forced,
+        # and `compute_pit` still answers it.
         assert compute_pit(_linear_cdf_record(resolution="below_lower_bound")) == 0.0
         assert compute_pit(_linear_cdf_record(resolution="above_upper_bound")) == 1.0
 
@@ -101,6 +110,135 @@ class TestPit:
         assert compute_pit(rec) is None
         # Non-numeric, non-OOB resolution.
         assert compute_pit(_linear_cdf_record(resolution="annulled")) is None
+
+
+def _out_of_range_mass_record(*, resolution, cdf_start: float = 0.0, cdf_end: float = 1.0, **kwargs) -> dict:
+    """A record whose published CDF ramps ``cdf_start -> cdf_end`` over the displayed range.
+
+    ``1 - cdf_end`` is the mass declared ABOVE the displayed ceiling and ``cdf_start`` the
+    mass below the floor, which is what an out-of-range resolution's PIT interval is read
+    off.
+    """
+    rec = _linear_cdf_record(resolution=resolution, **kwargs)
+    rec["our_forecast_values"] = np.linspace(cdf_start, cdf_end, GRID_N).tolist()
+    return rec
+
+
+class TestSetValuedOutOfRangePit:
+    """An out-of-range resolution pins the PIT to a SET, not to 1.0 / 0.0.
+
+    Metaculus reports "beyond the displayed range" as a string, so the resolution VALUE is
+    unknown; all that is known is that ``F(resolution)`` lies in ``[cdf[-1], 1]`` (above) or
+    ``[0, cdf[0]]`` (below). On an open bound our own CDF is free to put real mass out there:
+    q44842 published 13% of its mass above the displayed ceiling, resolved
+    ``above_upper_bound`` and won spot peer +24.4, while the old PIT-1.0 convention scored it
+    a high-side band miss. The shape here is that record's (``cdf[-1] = 0.87``).
+    """
+
+    def test_above_upper_bound_reads_as_the_interval_above_the_cdf_end(self):
+        reading = compute_pit_reading(_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87))
+        assert reading is not None
+        assert reading.is_interval
+        assert (reading.low, reading.high) == pytest.approx((0.87, 1.0))
+        assert reading.oob_side == "high"
+        # There is no point PIT to report, and none is invented.
+        assert reading.point is None
+        assert compute_pit(_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87)) is None
+
+    def test_below_lower_bound_reads_as_the_interval_below_the_cdf_start(self):
+        reading = compute_pit_reading(_out_of_range_mass_record(resolution="below_lower_bound", cdf_start=0.13))
+        assert reading is not None
+        assert reading.is_interval
+        assert (reading.low, reading.high) == pytest.approx((0.0, 0.13))
+        assert reading.oob_side == "low"
+
+    def test_the_q44842_shape_counts_as_covered_at_cov80(self):
+        # [0.87, 1] intersects [0.10, 0.90], so the record is covered rather than a miss.
+        m = compute_era_metrics("test", [_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87)])
+        assert m is not None
+        assert m.n_pit == 1
+        assert m.cov80 == pytest.approx(jeffreys_ci(1, 1))
+        assert m.band_hi == pytest.approx(0.0)
+        assert m.band_miss == pytest.approx(0.0)
+        # cov@90 = P(PIT <= 0.90): the interval reaches below 0.90, so it counts.
+        assert m.cov_at_90 == pytest.approx(1.0)
+        assert m.cov_at_10 == pytest.approx(0.0)
+
+    def test_a_starved_tail_is_still_a_high_side_band_miss(self):
+        # cdf[-1] = 0.999 (the open-bound structural floor): the whole interval sits above
+        # 0.90, so the record misses the band exactly as it should.
+        m = compute_era_metrics("test", [_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.999)])
+        assert m is not None
+        assert m.cov80 == pytest.approx(jeffreys_ci(0, 1))
+        assert m.band_hi == pytest.approx(1.0)
+        assert m.band_lo == pytest.approx(0.0)
+        assert m.cov_at_90 == pytest.approx(0.0)
+
+    def test_a_starved_low_tail_is_still_a_low_side_band_miss(self):
+        m = compute_era_metrics("test", [_out_of_range_mass_record(resolution="below_lower_bound", cdf_start=0.001)])
+        assert m is not None
+        assert m.cov80 == pytest.approx(jeffreys_ci(0, 1))
+        assert m.band_lo == pytest.approx(1.0)
+        assert m.cov_at_10 == pytest.approx(1.0)
+
+    def test_the_q44842_low_side_mirror_counts_as_covered(self):
+        m = compute_era_metrics("test", [_out_of_range_mass_record(resolution="below_lower_bound", cdf_start=0.13)])
+        assert m is not None
+        assert m.cov80 == pytest.approx(jeffreys_ci(1, 1))
+        assert m.band_lo == pytest.approx(0.0)
+
+    def test_interval_records_are_excluded_from_point_metrics_and_the_count_is_disclosed(self):
+        # Nine point PITs spread across the unit interval plus one set-valued record.
+        recs = [_record_with_pit(p) for p in np.linspace(0.05, 0.95, MIN_N_FOR_POINT_METRICS)]
+        recs.append(_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87))
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_pit == MIN_N_FOR_POINT_METRICS + 1
+        assert m.n_point == MIN_N_FOR_POINT_METRICS
+        assert m.n_oob_interval == 1
+        # Point statistics see only the ten point readings — an imputed midpoint (0.935)
+        # would have pulled both of these.
+        points = np.linspace(0.05, 0.95, MIN_N_FOR_POINT_METRICS)
+        assert m.mean_pit == pytest.approx(points.mean())
+        assert m.pit_std == pytest.approx(points.std())
+        # The interval still counts in coverage: 8 of the 10 point PITs are inside
+        # [0.10, 0.90] (0.05 and 0.95 are not) and [0.87, 1] intersects the band, so 9 of 11.
+        assert m.cov80 == pytest.approx(jeffreys_ci(9, 11))
+
+    def test_an_all_interval_era_reports_no_point_statistics_rather_than_nan(self):
+        recs = [_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87)]
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_point == 0
+        assert m.pit_std is None
+        assert m.mean_pit is None
+        cells = _row_cells(render_markdown([m]), "test")
+        assert cells[10] == "n/a"
+        assert cells[11] == "n/a"
+
+    def test_the_disclosure_count_is_rendered_and_serialized(self):
+        recs = [_record_with_pit(0.5), _out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87)]
+        metrics = compute_all_eras(recs)
+        [m] = [row for row in metrics if row.label == "all"]
+        assert m.to_dict()["n_oob_interval"] == 1
+        assert m.to_dict()["n_point"] == 1
+        md = render_markdown(metrics)
+        assert "set-valued" in md
+        # Last column: set-valued readings, with the point-metric denominator beside them.
+        assert _row_cells(md, "all")[15] == "1 (1)"
+
+    def test_a_numeric_out_of_grid_resolution_stays_a_point_reading(self):
+        # Only the STRING markers are set-valued: when the platform gives the value, the
+        # members' declared curves read a real quantile off it (see TestOutOfGridPit).
+        rec = _below_bound_mass_record(
+            resolution=50.0,
+            per_model_percentiles={"model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]]},
+        )
+        reading = compute_pit_reading(rec)
+        assert reading is not None
+        assert not reading.is_interval
+        assert reading.point == pytest.approx(0.10, abs=1e-9)
+        assert reading.oob_side == "low"
 
 
 def _below_bound_mass_record(*, resolution, per_model_percentiles=None, **kwargs) -> dict:
@@ -132,7 +270,7 @@ class TestOutOfGridPit:
                 "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
             },
         )
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side == "low"
         assert pit == pytest.approx(0.10, abs=1e-9)
         assert compute_pit(rec) == pytest.approx(0.10, abs=1e-9)
@@ -147,7 +285,7 @@ class TestOutOfGridPit:
                 "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
             },
         )
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side == "low"
         assert pit == pytest.approx((0.6333333 + 0.50) / 2, abs=1e-6)
 
@@ -156,7 +294,7 @@ class TestOutOfGridPit:
             resolution=250.0,
             per_model_percentiles={"model-a": [[10.0, 120.0], [50.0, 150.0], [90.0, 220.0]]},
         )
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side == "high"
         assert pit == pytest.approx(0.90, abs=1e-9)
 
@@ -164,19 +302,19 @@ class TestOutOfGridPit:
         # Degraded path (e.g. stacked-era records with no per-model bullets): the
         # grid-endpoint read is kept, but the OOB side still surfaces the record.
         rec = _below_bound_mass_record(resolution=50.0)
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side == "low"
         assert pit == pytest.approx(0.90, abs=1e-9)
 
     def test_in_grid_resolution_has_no_oob_side(self):
-        pit, oob_side = compute_pit_details(_linear_cdf_record(resolution=50.0))
+        pit, oob_side = _pit_and_side(_linear_cdf_record(resolution=50.0))
         assert oob_side is None
         assert pit == pytest.approx(0.50, abs=1e-9)
 
     def test_resolution_exactly_at_bound_keeps_endpoint_read(self):
         # AT a bound the clamp IS the correct PIT: F(bound) = cdf[0].
         rec = _below_bound_mass_record(resolution=100.0)
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side is None
         assert pit == pytest.approx(0.90, abs=1e-9)
 

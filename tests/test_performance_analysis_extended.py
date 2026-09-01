@@ -18,6 +18,7 @@ from metaculus_bot import performance_analysis
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis import collector
 from metaculus_bot.performance_analysis.analysis import (
+    PitReading,
     _interpolate_pit,
     _single_curve_pit,
     binary_summary,
@@ -28,6 +29,7 @@ from metaculus_bot.performance_analysis.analysis import (
     mc_summary,
     no_bias_check,
     numeric_pit_analysis,
+    out_of_range_pit_reading,
     per_model_binary_scores,
     per_model_cohort,
     stacking_effectiveness,
@@ -1246,6 +1248,114 @@ class TestNumericPitAnalysisValueGrid:
         result = numeric_pit_analysis([log_rec])
         assert result["count"] == 1
         assert result["pit_values"][0] == pytest.approx(0.5, abs=0.02)
+
+
+class TestSetValuedOutOfRangePit:
+    """An out-of-range resolution's PIT is a SET, and point statistics exclude it.
+
+    The platform reports "beyond the displayed range" as a string, so the resolution VALUE
+    is unknown and ``F(resolution)`` is only pinned to ``[cdf[-1], 1]`` (above) or
+    ``[0, cdf[0]]`` (below). Forcing it to 1.0 / 0.0 counted q44842 as a high-side band
+    miss: an open-bound record that deliberately published 13% of its mass above the
+    displayed ceiling, resolved ``above_upper_bound``, and won spot peer +24.4.
+    """
+
+    @staticmethod
+    def _record(resolution, *, cdf_start: float = 0.0, cdf_end: float = 1.0) -> dict:
+        cdf = list(np.linspace(cdf_start, cdf_end, 201))
+        return {
+            "post_id": 1,
+            "type": "numeric",
+            "our_forecast_values": cdf,
+            "resolution_parsed": resolution,
+            "scaling": {"range_min": 0.0, "range_max": 100.0, "zero_point": None},
+            "open_lower_bound": True,
+            "open_upper_bound": True,
+            "numeric_log_score": 0.0,
+            "metadata": {"category": None},
+        }
+
+    def test_the_interval_is_read_off_our_own_published_tail_mass(self):
+        above = out_of_range_pit_reading("above_upper_bound", list(np.linspace(0.0, 0.87, 201)))
+        assert above is not None
+        assert (above.low, above.high) == pytest.approx((0.87, 1.0))
+        assert above.oob_side == "high"
+        assert above.is_interval
+        assert above.point is None
+
+        below = out_of_range_pit_reading("below_lower_bound", list(np.linspace(0.13, 1.0, 201)))
+        assert below is not None
+        assert (below.low, below.high) == pytest.approx((0.0, 0.13))
+        assert below.oob_side == "low"
+
+        # Not an out-of-range marker at all.
+        assert out_of_range_pit_reading("annulled", [0.0, 1.0]) is None
+        assert out_of_range_pit_reading(50.0, [0.0, 1.0]) is None
+
+    def test_a_closed_bound_interval_collapses_to_the_old_point_convention(self):
+        # With no mass beyond the bound, [cdf[-1], 1] == [1, 1]: the set-valued reading
+        # degenerates to exactly the 1.0 the old convention forced, so nothing changes on
+        # records that put nothing out of range.
+        reading = out_of_range_pit_reading("above_upper_bound", list(np.linspace(0.0, 1.0, 201)))
+        assert reading is not None
+        assert not reading.is_interval
+        assert reading.point == pytest.approx(1.0)
+
+    def test_a_point_reading_answers_the_band_predicates_like_a_scalar(self):
+        point = PitReading.from_point(0.42)
+        assert point.point == pytest.approx(0.42)
+        assert point.intersects(0.10, 0.90)
+        assert point.at_or_below(0.50)
+        assert not point.at_or_below(0.40)
+        assert not point.entirely_below(0.10)
+        assert not point.entirely_above(0.90)
+
+    def test_q44842_shape_is_covered_and_excluded_from_the_histogram(self):
+        result = numeric_pit_analysis([self._record("above_upper_bound", cdf_end=0.87)])
+        assert result["count"] == 1
+        assert result["n_point"] == 0
+        assert result["n_oob_interval"] == 1
+        assert result["pit_values"] == []
+        assert result["pit_intervals"] == [(pytest.approx(0.87), 1.0)]
+        # [0.87, 1] intersects [0.05, 0.95] and [0.25, 0.75] it does not.
+        assert result["coverage_90"] == pytest.approx(1.0)
+        assert result["coverage_50"] == pytest.approx(0.0)
+        assert sum(result["histogram"]) == 0
+
+    def test_a_starved_tail_is_still_outside_the_coverage_band(self):
+        # cdf[-1] = 0.999 is the open-bound structural floor: [0.999, 1] lies wholly above
+        # 0.95, so this record is the band miss the q44842 shape is not.
+        result = numeric_pit_analysis([self._record("above_upper_bound", cdf_end=0.999)])
+        assert result["coverage_90"] == pytest.approx(0.0)
+
+    def test_the_below_bound_mirror(self):
+        covered = numeric_pit_analysis([self._record("below_lower_bound", cdf_start=0.13)])
+        assert covered["coverage_90"] == pytest.approx(1.0)
+        assert covered["n_oob_interval"] == 1
+        starved = numeric_pit_analysis([self._record("below_lower_bound", cdf_start=0.001)])
+        assert starved["coverage_90"] == pytest.approx(0.0)
+
+    def test_point_records_and_intervals_share_the_coverage_denominator(self):
+        data = [
+            self._record(50.0),  # PIT 0.50 — covered
+            self._record(1.0),  # PIT 0.01 — outside [0.05, 0.95]
+            self._record("above_upper_bound", cdf_end=0.87),  # interval — covered
+        ]
+        result = numeric_pit_analysis(data)
+        assert result["count"] == 3
+        assert result["n_point"] == 2
+        assert result["n_oob_interval"] == 1
+        assert result["coverage_90"] == pytest.approx(2 / 3)
+        # The histogram (a point statistic) counts only the two point readings.
+        assert sum(result["histogram"]) == 2
+
+    def test_the_report_discloses_the_excluded_count(self):
+        report = performance_analysis.generate_report(
+            [self._record(50.0), self._record("above_upper_bound", cdf_end=0.87)]
+        )
+        assert "## Numeric Questions" in report
+        assert "Out-of-range resolutions (set-valued PIT" in report
+        assert "excluded from the histogram): 1" in report
 
 
 class TestRescoreRecords:
