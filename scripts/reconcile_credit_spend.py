@@ -30,7 +30,8 @@ total for the same key beside its settled spend — the two measure the same mon
 from opposite ends (OpenRouter's per-call usage accounting vs. the key's booked
 balance), so their ratio is the ledger's own coverage check — plus a per-(role, key)
 table over the selected runs, which is the decomposition every cost argument used
-to lack.
+to lack. Both printed coverage ratios cover the SETTLED runs only, since the trailing
+run's settled spend is unknown and every figure states the run set it sums.
 
 Usage
 -----
@@ -127,6 +128,25 @@ def reconcile(records: list[dict], key: str) -> list[RunSpend]:
 
 
 @dataclass(frozen=True)
+class SettledCohort:
+    """The runs whose spend OpenRouter has booked, and their total.
+
+    Carried around rather than passed as a bare float because it is the denominator of every
+    coverage percentage the script prints, and each numerator has to be summed over the SAME
+    runs. The trailing run has no successor, so its settled spend is unknown; counting its
+    marker or its role rows against a total that cannot include it reads over 100%.
+    """
+
+    run_ids: frozenset[str]
+    usd: float
+
+    @property
+    def label(self) -> str:
+        """How a printed ratio names its own run set, so no total is labelled just ``total``."""
+        return f"the {len(self.run_ids)} runs with a successor"
+
+
+@dataclass(frozen=True)
 class RunRoleSpend:
     """One run's role-ledger total on one key. ``usd`` is None when no row carried cost."""
 
@@ -208,6 +228,12 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 
 def _print_role_table(role_records: list[dict], run_ids: set[str]) -> None:
+    """The per-(role, key) decomposition of the selected runs.
+
+    The table spans both keys — a cost argument wants the whole ledger, not one key's half —
+    so its grand total and the ``share`` column read against it say so. The key-filtered total
+    printed just above it is a different number over a different set.
+    """
     totals = aggregate_roles(role_records, run_ids)
     if not totals:
         print("\nno credit_role_spend rows for the selected runs")
@@ -217,7 +243,7 @@ def _print_role_table(role_records: list[dict], run_ids: set[str]) -> None:
     for total in totals:
         share = "   n/a" if total.usd is None or grand <= 0 else f"{total.usd / grand:6.0%}"
         print(f"{total.role:24} {total.key:9} {total.calls:6d} {total.costed_calls:6d} {_fmt4(total.usd)} {share}")
-    print(f"{'total (costed rows)':24} {'':9} {'':6} {'':6} {_fmt4(grand)}")
+    print(f"{'total (all keys, costed)':24} {'':9} {'':6} {'':6} {_fmt4(grand)}")
 
 
 def _load_role_ledger(balance_archive: Path) -> list[dict]:
@@ -251,17 +277,25 @@ def _print_run_table(rows: list[RunSpend], role_totals: dict[str, RunRoleSpend] 
         )
 
 
-def _print_key_totals(rows: list[RunSpend]) -> float:
-    """Marker-vs-settled totals for the key; returns the settled total for the role summary."""
+def _print_key_totals(rows: list[RunSpend]) -> SettledCohort:
+    """Marker-vs-settled totals for the key; returns the settled cohort for the role summary."""
+    settled_rows = [row for row in rows if row.settled_usd is not None]
+    cohort = SettledCohort(
+        run_ids=frozenset(row.run_id for row in settled_rows),
+        usd=sum(row.settled_usd for row in settled_rows if row.settled_usd is not None),
+    )
     marker_total = sum(row.within_run_usd or 0.0 for row in rows)
-    settled_total = sum(row.settled_usd or 0.0 for row in rows if row.settled_usd is not None)
-    print(f"\nmarker-reported total: ${marker_total:.2f}")
-    print(f"settled total:         ${settled_total:.2f}")
-    if settled_total > 0:
-        print(f"marker captured:       {marker_total / settled_total:.0%} of settled spend")
+    print(f"\nmarker-reported total: ${marker_total:.2f}  (all {len(rows)} runs)")
+    print(f"settled total:         ${cohort.usd:.2f}  ({cohort.label})")
+    if cohort.usd > 0:
+        # Numerator restricted to the settled cohort, because the denominator is: summing the
+        # markers of runs whose settled spend is unknown against a total that cannot include
+        # them overstates capture, and reads over 100% whenever the trailing run spent much.
+        marker_on_settled = sum(row.within_run_usd or 0.0 for row in settled_rows)
+        print(f"marker captured:       {marker_on_settled / cohort.usd:.0%} of settled spend ({cohort.label})")
     zeros = sum(1 for row in rows if row.within_run_usd == 0.0)
     print(f"runs whose marker read exactly 0.00: {zeros}/{len(rows)}")
-    return settled_total
+    return cohort
 
 
 def _print_role_summary(
@@ -270,13 +304,21 @@ def _print_role_summary(
     *,
     rows: list[RunSpend],
     key: str,
-    settled_total: float,
+    settled: SettledCohort,
 ) -> None:
+    """The role ledger read against the settled delta, then decomposed per (role, key).
+
+    Three figures over three different sets sit next to each other here, so each names its
+    own: this key's ledger total over every selected run, the coverage ratio over the settled
+    cohort alone (the ratio's denominator excludes the trailing run, so its numerator must
+    too), and the table's grand total, which spans BOTH keys because its rows do.
+    """
     selected_run_ids = {row.run_id for row in rows}
     roles_total = sum(run.usd or 0.0 for run_id, run in role_totals.items() if run_id in selected_run_ids)
-    print(f"role-ledger total ({key}): ${roles_total:.4f}")
-    if settled_total > 0:
-        print(f"role ledger covers:    {roles_total / settled_total:.0%} of settled spend")
+    print(f"role-ledger total ({key}, all {len(rows)} runs): ${roles_total:.4f}")
+    if settled.usd > 0:
+        roles_on_settled = sum(run.usd or 0.0 for run_id, run in role_totals.items() if run_id in settled.run_ids)
+        print(f"role ledger covers:    {roles_on_settled / settled.usd:.0%} of settled spend ({settled.label})")
     _print_role_table(role_records, selected_run_ids)
 
 
@@ -303,9 +345,9 @@ def main() -> None:
     role_totals = role_spend_by_run(role_records, args.key) if role_records else None
 
     _print_run_table(rows, role_totals)
-    settled_total = _print_key_totals(rows)
+    settled = _print_key_totals(rows)
     if role_totals is not None:
-        _print_role_summary(role_records, role_totals, rows=rows, key=args.key, settled_total=settled_total)
+        _print_role_summary(role_records, role_totals, rows=rows, key=args.key, settled=settled)
 
 
 if __name__ == "__main__":
