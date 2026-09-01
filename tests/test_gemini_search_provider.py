@@ -757,6 +757,97 @@ async def test_url_context_only_path_is_also_stripped(monkeypatch: pytest.Monkey
 
 
 # ---------------------------------------------------------------------------
+# GEMINI_GROUNDING_DENSITY telemetry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_grounding_density_marker_emitted_on_the_grounded_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Post-floor, 41% of passing responses carry <=3 grounding supports and the median
+    response has one support per ~872 chars — the floor-immune surface where the embellishment
+    rate lives. The marker makes "did that move" a query instead of a hand audit; it is
+    deliberately NOT a gate (q44944's decisive, true ICE figure came out of a 1-support
+    response). ``chars`` is the RAW model text, the denominator the audit measured.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+
+    text = "Alpha fact. Beta fact."
+    blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/zzz"
+    chunks = [
+        CannedWebChunk(uri=blob, title="A", domain="a.example.com"),
+        CannedWebChunk(uri=blob, title="B", domain="b.example.com"),
+    ]
+    supports = [CannedSupport(seg=CannedSegment(end_index=len(text), text=""), indices=[1])]
+    response = _make_response(text, chunks=chunks, supports=supports)
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        await invoke_gemini_grounded("prompt", qid=44944)
+
+    assert f"GEMINI_GROUNDING_DENSITY: question=44944 chunks=2 supports=1 chars={len(text)}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_grounding_density_marker_absent_when_the_floor_suppresses(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A suppressed response renders nothing, so it has no density to report — and counting it
+    would put ungrounded parametric text in the same cohort as grounded sections.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response("Ungrounded prose.", chunks=None, supports=None, web_search_queries=["q"])
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        await invoke_gemini_grounded("prompt", qid=38195)
+
+    assert "GEMINI_GROUNDING_DENSITY" not in caplog.text
+    assert "GEMINI_UNGROUNDED_SUPPRESSED" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_grounding_density_marker_absent_on_the_url_context_only_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The marker measures google_search grounding density, so it is scoped to responses that
+    carry grounding chunks. A url_context-only response has neither chunks nor supports: its
+    density is undefined rather than zero, and a ``chunks=0 supports=0`` row would pool a
+    structurally different response shape into the same cohort.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response(
+        "Read straight off the resolving page.",
+        chunks=None,
+        supports=None,
+        url_metadata=[CannedUrlMeta("https://gov.example/report", CannedStatus("URL_RETRIEVAL_STATUS_SUCCESS"))],
+    )
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=1)
+
+    assert out.startswith("Read straight off the resolving page.")
+    assert "GEMINI_GROUNDING_DENSITY" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # url_context telemetry: extract_url_context_telemetry
 # ---------------------------------------------------------------------------
 

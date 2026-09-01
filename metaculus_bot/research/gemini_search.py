@@ -318,10 +318,23 @@ def _format_grounded_response(
             return ""
         # url_context grounded the text but google_search produced no chunks: keep
         # the text as-is (no citation markers to splice, no Sources block). The
-        # caller appends the url_context fetch marker.
+        # caller appends the url_context fetch marker. No GEMINI_GROUNDING_DENSITY here:
+        # the marker measures google_search support density, and a response with neither
+        # chunks nor supports has an undefined density rather than a zero one.
         return _strip_model_citation_indices(text)
 
-    annotated = _splice_inline_citations(text, metadata.grounding_supports)
+    supports = metadata.grounding_supports or ()
+    # Grounding DENSITY, as telemetry and never as a gate: post-floor the median response
+    # carries one support per ~872 chars and 41% of passing responses have <=3 supports,
+    # which is the floor-immune surface where the ~33% embellishment rate lives. Not a gate
+    # because q44944's decisive, true, later-verified ICE figure came out of a 1-support
+    # response (gemini_search_audit/VERDICT.md §2-3). ``chars`` is the RAW model text — the
+    # denominator the audit measured — not the annotated or sources-appended length.
+    logger.info(
+        f"GEMINI_GROUNDING_DENSITY: question={qid} chunks={len(metadata.grounding_chunks)} "
+        f"supports={len(supports)} chars={len(text)}"
+    )
+    annotated = _splice_inline_citations(text, supports)
     return _strip_model_citation_indices(annotated) + _render_sources_section(metadata.grounding_chunks)
 
 
