@@ -2,11 +2,12 @@
 
 Right-sized extraction (2026-07 resolution-source plan): only the genuinely
 generic pieces live here — session construction, a size-capped body read, and
-provider-agnostic HTML/URL helpers (the Datawrapper embed scan below, shared
-so the resolution-source Tier-2 hop and any future agentic-fetch integration
-can't drift on the route). Retry/backoff logic stays provider-private
-(prediction_market's is JSON-API shaped; the resolution-source fetcher
-deliberately does no retries).
+provider-agnostic HTML/URL helpers (the two embed scans below: Datawrapper
+charts, shared so the resolution-source Tier-2 hop and any future
+agentic-fetch integration can't drift on the route, and the routeless
+data-embed providers a page can hide its numbers behind). Retry/backoff logic
+stays provider-private (prediction_market's is JSON-API shaped; the
+resolution-source fetcher deliberately does no retries).
 """
 
 from __future__ import annotations
@@ -374,6 +375,69 @@ def extract_datawrapper_charts(html_text: str) -> list[DatawrapperChartRef]:
         title = html_entities.unescape(raw_title) if raw_title else None
         charts.append(DatawrapperChartRef(chart_id=chart_id, title=title))
     return charts
+
+
+# ---------------------------------------------------------------------------
+# Third-party data embeds we have NO route to (resolution-source Tier-1)
+# ---------------------------------------------------------------------------
+#
+# The Datawrapper scan above exists because trafilatura drops embeds; these
+# providers are the same failure with no second hop behind it. Flourish's own
+# developer docs state the mechanism: "A Flourish embed is a placeholder plus a
+# script that builds the chart in the browser. AI assistants and crawlers
+# usually read a page's raw HTML once and don't run JavaScript, so to them the
+# chart doesn't exist."
+#
+# qids 44554/44556 (2026-08-31 dossiers): racetothewh.com/senate/26 returned
+# HTTP 200 and extracted 2.9k chars of forecast background, while the resolving
+# Nebraska polling average lived in two Infogram iframes. The fetch reported an
+# unqualified `success` and the section rendered under the "primary grading
+# evidence" caveat with zero polling numbers in it, byte-identical across three
+# questions. Naming the providers is what lets a caller either withhold an
+# embed-only page (`no_resolving_content`) or tell the forecaster the numbers
+# are not in the text it did get.
+#
+# Datawrapper is deliberately NOT here: it has a live-dataset route (the Tier-2
+# hop), so its embeds are readable and its outcome is carried by the hop's own
+# FetchStatus.
+#
+# Each provider matches either its embed-container marker (the class/element the
+# loader script looks for) or its own host, with `\\?/` after the host so a
+# JSON-escaped embed URL inside a `data-attrs` blob still matches — the same
+# tolerance the Datawrapper id regex carries.
+_DATA_EMBED_PROVIDER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("infogram", re.compile(r"infogram-embed|infogram-async|(?:e\.)?infogram\.com\\?/", re.IGNORECASE)),
+    ("flourish", re.compile(r"flourish-embed|(?:public\.)?flourish\.studio\\?/|flo\.uri\.sh\\?/", re.IGNORECASE)),
+    (
+        "tableau",
+        re.compile(
+            r"tableauPlaceholder|tableauViz|<tableau-viz|public\.tableau\.com\\?/"
+            r"|tableauusercontent\.com\\?/|tableau\.com\\?/views\\?/",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def unreadable_data_embed_providers(html_text: str) -> list[str]:
+    """Names of third-party data-embed providers referenced by ``html_text``.
+
+    Runs on RAW page HTML for the same reason the Datawrapper scan does:
+    trafilatura emits neither iframe ``src`` attributes nor embed-script URLs at
+    any setting, so extracted text can never reveal that a chart was there.
+
+    One entry per provider, ordered by where each first appears. Only providers
+    with no fetch route of their own are reported (see the note above on Datawrapper's exemption), so a
+    non-empty return means "this page displays data we cannot read".
+    """
+    if not html_text:
+        return []
+    hits: list[tuple[int, str]] = []
+    for provider, pattern in _DATA_EMBED_PROVIDER_PATTERNS:
+        match = pattern.search(html_text)
+        if match is not None:
+            hits.append((match.start(), provider))
+    return [provider for _, provider in sorted(hits)]
 
 
 _DATAWRAPPER_CHART_ID_SHAPE = re.compile(r"[A-Za-z0-9]{5}\Z")

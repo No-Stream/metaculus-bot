@@ -9,6 +9,8 @@ Covers:
   and delegates `close()` to its inner resolver.
 - Datawrapper embed detection (`extract_datawrapper_charts`) on real-shaped
   tracker HTML, the live-data URL builder, and Last-Modified parsing.
+- Routeless data-embed detection (`unreadable_data_embed_providers`) on each
+  provider's own published embed snippet.
 - `decode_text_body`: BOM-then-declared-charset precedence, and the undecodable-char
   score that lets a caller refuse mojibake instead of rendering it as evidence.
 
@@ -39,6 +41,7 @@ from metaculus_bot.research.http_fetch import (
     parse_http_last_modified,
     read_body_capped,
     undecodable_char_ratio,
+    unreadable_data_embed_providers,
 )
 
 
@@ -405,6 +408,86 @@ class TestExtractDatawrapperCharts:
     def test_no_embeds_returns_empty(self):
         assert extract_datawrapper_charts("<html><body>No charts here.</body></html>") == []
         assert extract_datawrapper_charts("") == []
+
+
+# Each snippet below is the provider's OWN published embed code (Infogram's
+# embed-code generator, Flourish's developer docs, Tableau's "Writing Embed
+# Code" help page), trimmed of the minified loader body. They are what a page
+# author pastes in, so they are the shapes the scan has to recognize.
+_INFOGRAM_EMBED_SNIPPET = (
+    '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive" '
+    'data-title="NE - Osborn v. Ricketts"></div>'
+    '<script>!function(e,i,n,s){var t="InfogramEmbeds";}(document,0,"infogram-async",'
+    '"https://e.infogram.com/js/dist/embed-loader-min.js");</script>'
+)
+_FLOURISH_EMBED_SNIPPET = (
+    '<div class="flourish-embed flourish-chart" data-src="visualisation/4853699">'
+    '<script src="https://public.flourish.studio/resources/embed.js"></script></div>'
+)
+_TABLEAU_V1_EMBED_SNIPPET = (
+    "<script type='text/javascript' src='https://public.tableau.com/javascripts/api/viz_v1.js'></script>"
+    "<div class='tableauPlaceholder' style='width:800; height:600;'>"
+    "<object class='tableauViz' width='800' height='600' style='display:none;'></object></div>"
+)
+_TABLEAU_V3_EMBED_SNIPPET = (
+    '<script type="module" src="https://public.tableau.com/javascripts/api/tableau.embedding.3.latest.min.js">'
+    '</script><tableau-viz id="tableauViz" src="https://public.tableau.com/views/wb/view"></tableau-viz>'
+)
+
+
+class TestUnreadableDataEmbedProviders:
+    """The routeless half of embed detection: providers whose numbers we cannot reach.
+
+    qids 44554/44556 — a tracker page served 2.9k chars of forecast background over
+    HTTP 200 while the resolving polling average sat in two Infogram iframes, and the
+    fetch reported an unqualified success. Naming the provider is what lets the caller
+    withhold an embed-only page or disclose the gap on a page that also carried prose.
+    """
+
+    def test_infogram_embed_snippet(self):
+        assert unreadable_data_embed_providers(_INFOGRAM_EMBED_SNIPPET) == ["infogram"]
+
+    def test_flourish_embed_snippet(self):
+        assert unreadable_data_embed_providers(_FLOURISH_EMBED_SNIPPET) == ["flourish"]
+
+    def test_tableau_v1_and_v3_embed_snippets(self):
+        assert unreadable_data_embed_providers(_TABLEAU_V1_EMBED_SNIPPET) == ["tableau"]
+        assert unreadable_data_embed_providers(_TABLEAU_V3_EMBED_SNIPPET) == ["tableau"]
+
+    def test_infogram_iframe_form_matches_on_the_host(self):
+        # The iframe variant carries no `infogram-embed` class — only the host.
+        html = '<iframe src="https://e.infogram.com/_/vs9b6iAeARko8cuwH51x?src=embed"></iframe>'
+        assert unreadable_data_embed_providers(html) == ["infogram"]
+
+    def test_json_escaped_embed_url_matches(self):
+        # Same tolerance the Datawrapper id regex carries: a `data-attrs` JSON blob
+        # escapes its slashes.
+        html = r'{"url":"https:\/\/public.flourish.studio\/visualisation\/4853699\/"}'
+        assert unreadable_data_embed_providers(html) == ["flourish"]
+
+    def test_datawrapper_is_not_reported(self):
+        # Datawrapper HAS a route (the Tier-2 live-dataset hop), so its embeds are not
+        # unreadable and its outcome rides that hop's own FetchStatus. Reporting it here
+        # would relabel every js-walled tracker the hop already rescues.
+        assert unreadable_data_embed_providers(_IRAN_TRACKER_SHAPED_HTML) == []
+
+    def test_multiple_providers_in_document_order(self):
+        html = f"<body><p>intro</p>{_TABLEAU_V1_EMBED_SNIPPET}<p>mid</p>{_INFOGRAM_EMBED_SNIPPET}</body>"
+        assert unreadable_data_embed_providers(html) == ["tableau", "infogram"]
+
+    def test_one_entry_per_provider_however_many_embeds(self):
+        html = _INFOGRAM_EMBED_SNIPPET + _INFOGRAM_EMBED_SNIPPET
+        assert unreadable_data_embed_providers(html) == ["infogram"]
+
+    def test_prose_naming_a_provider_is_not_an_embed(self):
+        # The disclosure this feeds is forecaster-facing ("the numbers are not in the
+        # text above"), so a page that merely CREDITS a tool in prose must not trip it.
+        html = "<p>The chart was built with Infogram and Tableau by our data team.</p>"
+        assert unreadable_data_embed_providers(html) == []
+
+    def test_no_embeds_returns_empty(self):
+        assert unreadable_data_embed_providers("<html><body>Plain prose.</body></html>") == []
+        assert unreadable_data_embed_providers("") == []
 
 
 class TestDatawrapperLiveDataUrl:

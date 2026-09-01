@@ -516,6 +516,19 @@ RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = (
 )
 RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
 RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
+# An extraction at or above the JS-wall floor can still be pure page chrome when the
+# page's numbers live in a third-party data embed our fetch has no route to (Infogram /
+# Flourish / Tableau — see `unreadable_data_embed_providers`). Below this many extracted
+# chars, such a page is an embed SHELL and is withheld as `no_resolving_content` instead
+# of rendered as grading evidence. Calibrated on the 89 archived resolution_source
+# records (2026-09-01): every archived success under 400 chars is site chrome — region
+# selectors (data.wastewaterscan.org, 127), a feedback-form blurb (camara.leg.br, 157),
+# org boilerplate (apnews.com, 355) — and the SHORTEST archived extraction that actually
+# carries the resolving content is 401 (myfloridaelections.com's election-date table).
+# So this is the observed elbow, and it stays deliberately below it: an embed-carrying
+# page above the floor keeps its text and gets the disclosure note instead, because
+# withholding a terse-but-real data table costs more than leaving one shell visible.
+RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
 # --- Datawrapper second hop (Tier 2) ---
 # Poll-tracker pages lock their resolving daily series inside Datawrapper
 # iframes that trafilatura drops (qids 44858/44841). The hop fetches the

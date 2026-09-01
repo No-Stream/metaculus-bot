@@ -4,9 +4,11 @@ One responsibility: what a single fetch attempt is allowed to SAY. That is the
 ``FetchStatus`` set, the one HTTP-status table both the Tier-1 page fetch and the
 Tier-2 Datawrapper CDN hop read, the ``FetchResult`` record with its
 success-implies-content invariant, the content-vacuity rule that hands a 200
-carrying nothing a failure status instead, and the two pure reductions over a
-finished result list (the provider-diagnostics source map and the compact
-failure line the section renders).
+carrying nothing a failure status instead, the one token an outcome is REPORTED
+as (``ok`` or the verbatim status, shared by the diagnostics map and the run-log
+marker), and the two pure reductions over a finished result list (the
+provider-diagnostics source map and the compact failure line the section
+renders).
 
 Split out of ``research.resolution_source`` so the status contract — the thing
 the section renderer, the diagnostics block and the run-log telemetry all key on
@@ -32,6 +34,17 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 # every sibling URL, and reported `ok` to provider diagnostics. It is a FAILURE
 # status for the same reason the HTML branch treats an empty extraction as
 # `js_wall`: content is what makes a fetch a success.
+#
+# `no_resolving_content` is the 200 whose extracted text is EMBED SCAFFOLDING:
+# the page's numbers exist, but they live inside a third-party data embed
+# (Infogram / Flourish / Tableau) our extractor cannot read, and what trafilatura
+# returned is the page chrome around it. Distinct from `empty_body` (nothing was
+# there at all) and from `js_wall` (the page needs JS to assemble ANY content):
+# here we know where the content is and that we have no route to it, which is why
+# — like `blocked` / `js_wall` — it is a Tier-2 ESCALATION SEAM rather than a
+# refusal. Shipped for qids 44554/44556, whose tracker page rendered 2.9k chars of
+# forecast background as "primary grading evidence" with zero polling numbers in
+# it while the resolving average sat in two Infogram iframes.
 FetchStatus = Literal[
     "success",
     "blocked",
@@ -42,6 +55,7 @@ FetchStatus = Literal[
     "ssrf_blocked",
     "stale_data",
     "empty_body",
+    "no_resolving_content",
 ]
 
 # HTTP status -> FetchStatus for non-OK terminal responses — the ONE table both the
@@ -68,6 +82,11 @@ class FetchResult:
     # Charts seen in a fetched page's raw HTML (set on Tier-1 HTML results,
     # including js_wall pages — a JS-walled page still exposes its embeds).
     datawrapper_charts: list[DatawrapperChartRef] = field(default_factory=list)
+    # Data-embed providers the page references that we have NO route to
+    # (`unreadable_data_embed_providers`). Set on Tier-1 HTML results. Drives both
+    # the `no_resolving_content` verdict and, on a page that DID carry prose, the
+    # disclosure appended to its rendered text.
+    unreadable_embeds: list[str] = field(default_factory=list)
     # Provenance for Tier-2 dataset results (None on ordinary page fetches).
     chart_id: str | None = None
     chart_title: str | None = None
@@ -140,15 +159,27 @@ def vacuous_body_status(text: str, undecodable_ratio: float, *, require_csv_rows
     return None
 
 
+def fetch_outcome_token(result: FetchResult) -> str:
+    """The telemetry token for one fetch: ``"ok"`` for a success, else the verbatim status.
+
+    Shared by the provider-diagnostics source map below and the per-URL
+    ``RESOLUTION_SOURCE_FETCH`` run-log marker, so the two can never disagree about
+    what a fetch outcome is called. ``"ok"`` (not ``"success"``) because the
+    diagnostics formatter recognizes that prefix as "this source contributed".
+    """
+    return "ok" if result.status == "success" else result.status
+
+
 def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     """Per-URL outcome map for provider diagnostics: ``{domain: "ok" | <FetchStatus>}``.
 
     A fetched URL normalizes to ``"ok"`` (the shared "contributed" token the
     diagnostics formatter recognizes); every other ``FetchStatus``
     (``blocked`` / ``js_wall`` / ``not_found`` / ``error`` / ``unsupported_type`` /
-    ``ssrf_blocked``) is kept verbatim as the loss token so the reason survives
-    into the ``lost=`` segment. Duplicate domains are disambiguated with a ``#N``
-    suffix so no per-URL outcome is silently overwritten.
+    ``ssrf_blocked`` / ``empty_body`` / ``no_resolving_content``) is kept verbatim
+    as the loss token so the reason survives into the ``lost=`` segment. Duplicate
+    domains are disambiguated with a ``#N`` suffix so no per-URL outcome is silently
+    overwritten.
 
     Tier-2 dataset results are keyed ``datawrapper:<chart_id>`` — they are hop
     artifacts, not cited sources, and every dataset URL shares one CDN netloc, so
@@ -176,12 +207,10 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
             while f"{key}#{n}" in sources:
                 n += 1
             key = f"{key}#{n}"
-        if r.status == "success":
-            sources[key] = "ok"
-        elif r.chart_id is not None and r.status == "stale_data":
+        if r.chart_id is not None and r.status == "stale_data":
             sources[key] = "none"
         else:
-            sources[key] = r.status
+            sources[key] = fetch_outcome_token(r)
     return sources
 
 

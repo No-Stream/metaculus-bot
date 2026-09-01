@@ -12,6 +12,7 @@ tests loudly instead of silently dropping records from the archive:
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
 * MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
+* RESOLUTION_SOURCE_FETCH -> metaculus_bot/research/resolution_source.py:_log_fetch_outcome_markers
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
 * STACKER_OUTCOME/TOOLS_USED/ANCHOR_OVERSHOOT_PP/CLAUSE_PRODUCT_DIVERGENCE_PP
   -> metaculus_bot/comment/markers.py (HTML-comment markers; see module docstring
@@ -850,6 +851,84 @@ class TestFinancialStaleLatest:
         rec = _parse_one(FINANCIAL_STALE_LATEST_YFINANCE_LINE)
         assert "qid" not in rec
         assert "qid_kind" not in rec
+
+
+# Copied from the emitting format string
+# (resolution_source.py:_log_fetch_outcome_markers). One line per fetched URL: a
+# Tier-1 cited page, and a Tier-2 Datawrapper dataset hop told apart by its CDN url.
+RESOLUTION_SOURCE_FETCH_OK_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
+    "status=ok http=200 embeds=none"
+)
+RESOLUTION_SOURCE_FETCH_EMBED_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
+    "status=ok http=200 embeds=infogram,tableau"
+)
+RESOLUTION_SOURCE_FETCH_NO_CONTENT_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44556 url=https://tracker.example.com/senate "
+    "status=no_resolving_content http=200 embeds=infogram"
+)
+RESOLUTION_SOURCE_FETCH_BLOCKED_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
+    "status=blocked http=403 embeds=none"
+)
+RESOLUTION_SOURCE_FETCH_NO_RESPONSE_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://slow.example.com/x status=error http=n/a embeds=none"
+)
+RESOLUTION_SOURCE_FETCH_DATASET_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44841 url=https://static.dwcdn.net/data/kSCt4.csv "
+    "status=ok http=200 embeds=none"
+)
+
+
+class TestResolutionSourceFetch:
+    """Per-URL fetch outcomes, harvested (item 19d).
+
+    They used to live only in free-text log lines and the published comment's
+    provider-diagnostics block, so "cdc.gov is 0 successes in 1,069 fetch records"
+    meant re-scraping run logs that expire from GHA at 90 days.
+    """
+
+    def test_success_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_OK_LINE)
+        assert rec["marker"] == "resolution_source_fetch"
+        assert rec["url"] == "https://www.racetothewh.com/senate/26"
+        assert rec["status"] == "ok"
+        assert rec["http"] == 200
+        # The `none` sentinel harvests as None rather than the string "none".
+        assert rec["embeds"] is None
+        assert rec["qid"] == 44554
+        assert rec["qid_kind"] == "question_id"
+
+    def test_unreadable_embeds_are_captured_on_a_successful_fetch(self):
+        # The qids 44554/44556 shape: the fetch legitimately succeeded and the page
+        # carried prose, so this field is the only thing that makes the missing
+        # embedded figures queryable.
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_EMBED_LINE)
+        assert rec["status"] == "ok"
+        assert rec["embeds"] == "infogram,tableau"
+
+    def test_no_resolving_content_status(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_NO_CONTENT_LINE)
+        assert rec["status"] == "no_resolving_content"
+        assert rec["http"] == 200  # the FETCH succeeded; the content did not arrive
+        assert rec["embeds"] == "infogram"
+        assert rec["qid"] == 44556
+
+    def test_non_success_status_keeps_its_http_code(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_BLOCKED_LINE)
+        assert rec["status"] == "blocked"
+        assert rec["http"] == 403
+
+    def test_a_fetch_with_no_response_harvests_a_null_http_code(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_NO_RESPONSE_LINE)
+        assert rec["status"] == "error"
+        assert rec["http"] is None
+
+    def test_a_datawrapper_hop_is_identifiable_by_its_url(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_DATASET_LINE)
+        assert rec["url"] == "https://static.dwcdn.net/data/kSCt4.csv"
+        assert rec["status"] == "ok"
 
 
 class TestCredit:

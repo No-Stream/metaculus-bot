@@ -759,6 +759,20 @@ the telemetry markers:
   `GHOST_PRE_JSON` and `GHOST_FORECAST` / `GHOST_FORECAST_JSON` lines log the
   loop's pre- and post-research private forecasts for telemetry only; neither is
   ever published. `docs/agentic_gap_fill.md` reads the fields in full.
+- `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=...` —
+  one line per URL the resolution-source provider fetched, emitted by
+  `_log_fetch_outcome_markers` in `research/resolution_source.py`. `status` is `ok`
+  for a success and the verbatim `FetchStatus` otherwise (`blocked`, `js_wall`,
+  `no_resolving_content`, `stale_data`, ...); `http` is `n/a` when no response ever
+  arrived; `embeds` names the routeless data-embed providers (Infogram / Flourish /
+  Tableau) found in the page's raw HTML, which is what makes an unreadable-embed
+  page queryable even when its prose made the fetch a legitimate `ok`. Tier-2
+  Datawrapper dataset hops ride the same line and are identifiable by their url
+  (`static.dwcdn.net/data/<chart_id>.csv`). This replaced the older free-text
+  `resolution_source fetched <netloc> (<status>)` lines rather than joining them, so
+  each fetch appears exactly once; the remaining free-text lines are REASON lines (a
+  decode score, an unread content-type, an SSRF rejection) carrying what the marker
+  cannot.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_FLOOR_BREACH` — credit telemetry,
   described above. `CREDIT_FLOOR_BREACH` keeps firing during the credit-alert
   suppression window, so seeing one on a green run is expected until 2026-09-10;

@@ -78,6 +78,13 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   observation is older than its own cadence explains, so the rendered latest
   value — and anything anchored on it — was flagged stale to the forecaster;
   informational data-quality signal, NOT alertable)
+* ``RESOLUTION_SOURCE_FETCH`` — ``metaculus_bot/research/resolution_source.py``
+  ``_log_fetch_outcome_markers`` (per-URL Tier-1 page fetch AND Tier-2 Datawrapper
+  dataset hop: the outcome, the HTTP code, and the routeless data-embed providers
+  found in the page's raw HTML. Before this the per-URL outcomes lived only in
+  free-text log lines and the comment's provider-diagnostics block, so a cut like
+  "cdc.gov is 0 successes in 1,069 fetch records" meant re-scraping GHA logs that
+  expire at 90 days)
 * ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
   ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
   whether it counted toward the exit code)
@@ -118,7 +125,7 @@ and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
 types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
 ``CLOSE_MARGIN`` / ``MARKET_RANKING`` / ``MARKET_RANKING_DEGRADED`` /
 ``NUMERIC_DEGENERATE_DECLARATION`` / ``NUMERIC_AGGREGATE_GRID_MISMATCH`` /
-``CDF_MAXSTEP_CLIP`` /
+``CDF_MAXSTEP_CLIP`` / ``RESOLUTION_SOURCE_FETCH`` /
 ``SPREAD_UNDEFINED`` / ``numeric_pchip_fallback`` emit ``question.id_of_question``
 (the QUESTION id) while
 ``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
@@ -543,6 +550,33 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"FINANCIAL_STALE_LATEST:\s*surface=(?P<surface>\S+)\s+symbol=(?P<symbol>\S+)"
             r"\s+age_d=(?P<age_d>\S+)\s+cadence=(?P<cadence>\S+)"
         ),
+    ),
+    MarkerSpec(
+        "resolution_source_fetch",
+        # One line per FETCHED URL, emitted at the per-question aggregation point in the
+        # provider (that is where the question id exists — threading it down through the
+        # monkeypatched fetch surface would change every signature for a log line). The
+        # free-text `resolution_source fetched <netloc> (<status>)` lines it replaces were
+        # deleted, so no fetch is recorded twice.
+        #
+        # ``status`` is ``ok`` for a success and the verbatim ``FetchStatus`` otherwise
+        # (``blocked`` / ``js_wall`` / ``no_resolving_content`` / ``stale_data`` / ...), the
+        # same token the provider-diagnostics source map uses, minus that map's
+        # dataset-``stale_data``-to-``none`` amnesty — telemetry keeps the reason verbatim.
+        # ``http`` is ``n/a`` when no response ever arrived (timeout, client error, SSRF
+        # rejection). ``embeds`` names the routeless data-embed providers found in the
+        # page's raw HTML, or the ``none`` sentinel (which harvests as None); it is what
+        # makes an unreadable-embed page queryable on the qids 44554/44556 shape, where the
+        # page carried real prose and the fetch was a legitimate ``ok``.
+        #
+        # Tier-2 dataset hops ride this marker too and are told apart by ``url``: every
+        # dataset is ``static.dwcdn.net/data/<chart_id>.csv``, a host reachable no other
+        # way, so a query partitions cited pages from hop artifacts on it.
+        re.compile(
+            r"RESOLUTION_SOURCE_FETCH:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
+            r"\s+status=(?P<status>\S+)\s+http=(?P<http>\S+)\s+embeds=(?P<embeds>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),
     MarkerSpec(
         "forecaster_drops",
