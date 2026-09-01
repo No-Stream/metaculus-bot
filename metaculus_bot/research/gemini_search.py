@@ -28,6 +28,7 @@ from metaculus_bot.constants import (
     GOOGLE_API_KEY_ENV,
 )
 from metaculus_bot.prompts import web_research_prompt
+from metaculus_bot.research.gemini_attribution import rewrite_unsupported_attributions
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
@@ -231,6 +232,23 @@ def _strip_model_citation_indices(text: str) -> str:
     return _BRACKET_GROUP_RE.sub(replace, text)
 
 
+def _grounded_source_labels(chunks: Sequence[Any]) -> list[tuple[int, str]]:
+    """``(1-based chunk index, rendered label)`` for every chunk that carries a label.
+
+    The single derivation of "what our grounding record says", read by both the
+    ``### Sources`` block and the unsupported-attribution check — so the check can never
+    judge an attribution against a source list different from the one the forecaster is
+    shown. The index is the CHUNK's, not the surviving entry's, because the spliced inline
+    ``[N]`` markers point at chunk positions; renumbering would misaim them.
+    """
+    labels = []
+    for idx, chunk in enumerate(chunks, start=1):
+        label = _format_source_label(chunk.web)
+        if label:
+            labels.append((idx, label))
+    return labels
+
+
 def _render_sources_section(chunks: Sequence[Any]) -> str:
     """Render the trailing ``### Sources`` block, or ``""`` when no chunk carries a label.
 
@@ -242,11 +260,38 @@ def _render_sources_section(chunks: Sequence[Any]) -> str:
     would misalign them).
     """
     sources_lines = ["", "", "### Sources"]
-    for idx, chunk in enumerate(chunks, start=1):
-        label = _format_source_label(chunk.web)
-        if label:
-            sources_lines.append(f"[{idx}] {label}")
+    sources_lines.extend(f"[{idx}] {label}" for idx, label in _grounded_source_labels(chunks))
     return "\n".join(sources_lines) if len(sources_lines) > _SOURCES_HEADER_LEN else ""
+
+
+def _check_attributions(text: str, chunks: Sequence[Any], *, qid: int | None) -> str:
+    """Mark the tier-tag attributions this response's own grounding record cannot back.
+
+    Runs AFTER the citation-index strip, on the annotated body only (the ``### Sources``
+    block is appended afterwards and never passes through), and only where we have
+    renderable grounded labels to compare against — an empty label list is a measurement
+    failure rather than a verdict, so it leaves every tag standing and records nothing.
+    That absence is the signal: on a schema-v2 record, no ``unsupported_attributions``
+    count means the check had no evidence base (or the record predates it), while a
+    recorded 0 means it ran and found nothing.
+
+    Deliberately NOT alertable and nothing keys on the count: 70% of the archived corpus's
+    outlet-named tier tags are unsupported, so this is the model's habitual embellishment
+    rather than a bot defect, and an absent outlet does not make the FACT wrong.
+    """
+    labels = [label for _idx, label in _grounded_source_labels(chunks)]
+    if not labels:
+        return text
+    checked = rewrite_unsupported_attributions(text, labels)
+    record_provider_detail(qid, "gemini_search", {"counts": {"unsupported_attributions": checked.unsupported}})
+    if checked.unsupported:
+        # ``labels`` rides the line because the same count reads completely differently
+        # against it: q38195 named 21 outlets over ONE grounded domain.
+        logger.info(
+            f"GEMINI_UNSUPPORTED_ATTRIBUTION: question={qid} tagged={checked.tagged} "
+            f"unsupported={checked.unsupported} groups={checked.groups_rewritten} labels={len(labels)}"
+        )
+    return checked.text
 
 
 def _format_grounded_response(
@@ -270,8 +315,11 @@ def _format_grounded_response(
     so index offsets stay valid while we mutate the string. Falls back to a
     plain-text + sources-list if supports are missing. The model's own hierarchical
     ``[2.4.1]`` indices are then stripped (``_strip_model_citation_indices``) so every
-    bracket left in the body resolves against the rendered ``### Sources`` list; the
-    sources block itself is appended after the strip and never passes through it.
+    bracket left in the body resolves against the rendered ``### Sources`` list, and the
+    surviving source-tier tags are checked against that same list (``_check_attributions``)
+    so an outlet our own grounding record cannot back reads as
+    ``[unverified attribution]``; the sources block itself is appended after both passes
+    and never goes through either.
 
     Grounded-chunk floor: a response with no grounding evidence at all — zero
     google_search chunks AND no successful url_context read — is suppressed
@@ -334,8 +382,10 @@ def _format_grounded_response(
         f"GEMINI_GROUNDING_DENSITY: question={qid} chunks={len(metadata.grounding_chunks)} "
         f"supports={len(supports)} chars={len(text)}"
     )
-    annotated = _splice_inline_citations(text, supports)
-    return _strip_model_citation_indices(annotated) + _render_sources_section(metadata.grounding_chunks)
+    annotated = _strip_model_citation_indices(_splice_inline_citations(text, supports))
+    return _check_attributions(annotated, metadata.grounding_chunks, qid=qid) + _render_sources_section(
+        metadata.grounding_chunks
+    )
 
 
 async def invoke_gemini_grounded(

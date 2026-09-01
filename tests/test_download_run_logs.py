@@ -49,6 +49,12 @@ EXTREME_CALL_LINE = (
     "2026-09-01 12:00:00,000 - metaculus_bot.forecaster - INFO - "
     "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=1"
 )
+# One response whose tier tags outran its own grounding record, in the shape
+# metaculus_bot/research/gemini_search.py _check_attributions emits.
+GEMINI_UNSUPPORTED_ATTRIBUTION_LINE = (
+    "2026-09-01 12:00:00,000 - metaculus_bot.research.gemini_search - INFO - "
+    "GEMINI_UNSUPPORTED_ATTRIBUTION: question=44953 tagged=2 unsupported=1 groups=1 labels=7"
+)
 
 
 class TestWorkflowSlugFromPath:
@@ -230,6 +236,27 @@ class TestNewMarkerSpecsReachTheArchive:
         assert archived[0]["model"] == "gemini-3.1-pro-preview"
         assert archived[0]["lone"] is True
         assert archived[0]["survivors"] == 1
+
+    def test_unsupported_attribution_round_trips_to_jsonl(self, tmp_path: Path):
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text(GEMINI_UNSUPPORTED_ATTRIBUTION_LINE + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="902", workflow="tournament", artifact="research-902", run_date="2026-09-01T00:00:00Z"
+        )
+        assert run is not None
+
+        archive_dir = tmp_path / "archive"
+        assert merge_and_write(archive_dir, [run])["gemini_unsupported_attribution"] == 1
+        archived = load_marker_records(archive_dir, "gemini_unsupported_attribution")
+        assert len(archived) == 1
+        # The three fields an "did embellishment move" cut reads: how many outlets the
+        # response named, how many its own grounding record could not back, and the label
+        # count that makes the ratio meaningful.
+        assert archived[0]["tagged"] == 2
+        assert archived[0]["unsupported"] == 1
+        assert archived[0]["labels"] == 7
 
 
 class TestDownloadTimeoutResilience:

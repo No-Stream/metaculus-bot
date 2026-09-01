@@ -829,6 +829,165 @@ async def test_grounding_density_marker_absent_on_the_url_context_only_path(
 
 
 # ---------------------------------------------------------------------------
+# Unsupported-attribution check (rewrite_unsupported_attributions, wired at format time)
+# ---------------------------------------------------------------------------
+
+_BLOB = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/zzz"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_attribution_rewritten_and_counted_on_the_grounded_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """cutB's worked example, end to end: q44953 claimed ``[A: NASA]`` for the path of
+    totality while its own grounded domains were perlan.is / timeanddate.com, and 76% of
+    the corpus's outlet-named tier tags are that shape. The tag also carries one of
+    Gemini's hierarchical indices, so this pins the ORDER too — the index strip runs first
+    and the attribution check still sees the tier tag behind it.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    text = "Reykjavik lies in the path of totality [A: NASA, 1.1.2]. Cloud cover is 76% [C: Time and Date, 1.3.4]."
+    chunks = [
+        CannedWebChunk(uri=_BLOB, title="perlan.is", domain="perlan.is"),
+        CannedWebChunk(uri=_BLOB, title="timeanddate.com", domain="timeanddate.com"),
+    ]
+    response = _make_response(text, chunks=chunks, supports=None)
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=44953)
+
+    assert "Reykjavik lies in the path of totality [unverified attribution]." in out
+    assert "NASA" not in out
+    # The outlet our own record DOES name survives, and so does the sentence it decorates.
+    assert "Cloud cover is 76% [C: Time and Date]." in out
+    assert "GEMINI_UNSUPPORTED_ATTRIBUTION: question=44953 tagged=2 unsupported=1 groups=1 labels=2" in caplog.text
+    detail = pop_provider_detail(44953, "gemini_search")
+    assert detail["counts"]["unsupported_attributions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fully_supported_attributions_record_zero_and_log_no_marker(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A zero recorded on a response the check RAN over is the measurement that makes the
+    incidence a rate rather than a count of complaints; the marker stays quiet so the run
+    log only carries responses that lost an attribution.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response(
+        "Cloud cover is 76% [C: Time and Date].",
+        chunks=[CannedWebChunk(uri=_BLOB, title="timeanddate.com", domain="timeanddate.com")],
+        supports=None,
+    )
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=44953)
+
+    assert "[C: Time and Date]" in out
+    assert "GEMINI_UNSUPPORTED_ATTRIBUTION" not in caplog.text
+    assert pop_provider_detail(44953, "gemini_search")["counts"]["unsupported_attributions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_attribution_check_skipped_when_no_chunk_carries_a_label(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Chunks with nothing renderable (one archived section, q44802) leave the check with
+    no evidence base, so every tag stands and NOTHING is recorded — an absent count reads
+    as "not measured" rather than as a clean response, and rewriting here would dress our
+    own render failure as the model's embellishment.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response(
+        "The notice was revised [A: official, B: Reuters].",
+        chunks=[CannedWebChunk(uri=_BLOB, title=None, domain=None)],
+        supports=None,
+    )
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=44802)
+
+    assert "[A: official, B: Reuters]" in out
+    assert "### Sources" not in out
+    assert "GEMINI_UNSUPPORTED_ATTRIBUTION" not in caplog.text
+    assert "counts" not in pop_provider_detail(44802, "gemini_search")
+
+
+@pytest.mark.asyncio
+async def test_attribution_check_not_applied_on_the_suppressed_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A suppressed response renders nothing, so there is no forecaster-facing attribution
+    to mark and no count to record; the recorded detail stays the grounding loss token.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response("Ungrounded prose [A: NASA].", chunks=None, supports=None, web_search_queries=["q"])
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=38195)
+
+    assert out == ""
+    assert "GEMINI_UNSUPPORTED_ATTRIBUTION" not in caplog.text
+    detail = pop_provider_detail(38195, "gemini_search")
+    assert "counts" not in detail
+    assert "ungrounded" in detail["sources"]["grounding"]
+
+
+@pytest.mark.asyncio
+async def test_attribution_check_not_applied_on_the_url_context_only_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The url_context escape branch has no grounding chunks at all, so it has no
+    grounded-domain list to check against — the same no-evidence-base rule as above,
+    reached by a different route.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response(
+        "Read straight off the resolving page [A: NASA].",
+        chunks=None,
+        supports=None,
+        url_metadata=[CannedUrlMeta("https://gov.example/report", CannedStatus("URL_RETRIEVAL_STATUS_SUCCESS"))],
+    )
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("INFO"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=1)
+
+    assert "Read straight off the resolving page [A: NASA]." in out
+    assert "GEMINI_UNSUPPORTED_ATTRIBUTION" not in caplog.text
+    assert "counts" not in pop_provider_detail(1, "gemini_search")
+
+
+# ---------------------------------------------------------------------------
 # url_context telemetry: extract_url_context_telemetry
 # ---------------------------------------------------------------------------
 

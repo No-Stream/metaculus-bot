@@ -244,6 +244,61 @@ class TestPartialDegradationRendering:
         assert line == "- financial_data: ok | 50 chars | 30 ms"
 
 
+class TestInternalCountsRendering:
+    """``details["counts"]`` is the second detail convention: provider-internal quantities
+    that are neither a source outcome nor a failure. First user is ``gemini_search``'s
+    ``unsupported_attributions`` — the tier-tag attributions a response's own grounding
+    record could not back. A zero must render nothing, because the count is recorded on
+    EVERY checked response (so the archive can tell "ran, found none" from "never ran")
+    and a `=0` on every gemini line would be noise in the published comment.
+    """
+
+    def test_nonzero_count_rides_the_line(self) -> None:
+        results = [
+            ProviderResult(
+                name="gemini_search",
+                status="ok",
+                chars=3535,
+                latency_ms=21044,
+                details={"counts": {"unsupported_attributions": 3}},
+            )
+        ]
+        line = _line_for(format_provider_diagnostics_block(results), "gemini_search")
+        assert line == "- gemini_search: ok | 3535 chars | 21044 ms | unsupported_attributions=3"
+
+    def test_zero_count_renders_nothing(self) -> None:
+        clean = ProviderResult(
+            name="gemini_search",
+            status="ok",
+            chars=3535,
+            latency_ms=21044,
+            details={"counts": {"unsupported_attributions": 0}},
+        )
+        no_details = ProviderResult(name="gemini_search", status="ok", chars=3535, latency_ms=21044)
+        block = format_provider_diagnostics_block([clean])
+        assert _line_for(block, "gemini_search") == _line_for(
+            format_provider_diagnostics_block([no_details]), "gemini_search"
+        )
+
+    def test_counts_and_a_source_loss_coexist(self) -> None:
+        """Both suffixes are additive, and the loss tail stays last so its `+N more`
+        truncation is still the end of the line."""
+        results = [
+            ProviderResult(
+                name="gemini_search",
+                status="ok",
+                chars=900,
+                latency_ms=1000,
+                details={
+                    "counts": {"unsupported_attributions": 2},
+                    "sources": {"grounding": "error(ungrounded_suppressed)"},
+                },
+            )
+        ]
+        line = _line_for(format_provider_diagnostics_block(results), "gemini_search")
+        assert line.index("unsupported_attributions=2") < line.index("lost=grounding:")
+
+
 class TestProviderDetailRegistry:
     """The seam that carries a provider's per-source outcome from the provider (which knows
     it) to the orchestrator's _run_one (which builds the ProviderResult). Keyed by
