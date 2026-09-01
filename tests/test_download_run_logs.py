@@ -59,7 +59,8 @@ THIN_PUBLISH_FLOOR_LINE = (
 # the shape whose optional group has to survive the whole durable path.
 FINANCIAL_NOISE_FLAG_LINE = (
     "2026-09-01 12:00:00,000 - metaculus_bot.research.ts_render - INFO - "
-    "FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag=5 vr=0.412 floor=0.6 short_vol=14.6 robust_vol=9.4"
+    "FINANCIAL_NOISE_FLAG: surface=ts_anchor symbol=CSUSHPISA vr_lag=5 vr=0.412 floor=0.6 "
+    "short_vol=14.6 robust_vol=9.4"
 )
 MARKET_TIER_CAPPED_LINE = (
     "2026-09-01 12:00:00,000 - metaculus_bot.research.prediction_market - INFO - "
@@ -297,6 +298,7 @@ class TestNewMarkerSpecsReachTheArchive:
         # The three fields a noise-incidence cut reads. `long_vol` is absent from the
         # ts_anchor emitter, so it must arrive as a null rather than sinking the record.
         assert noise[0]["surface"] == "ts_anchor"
+        assert noise[0]["symbol"] == "CSUSHPISA"
         assert noise[0]["robust_vol"] == 9.4
         assert noise[0]["long_vol"] is None
 

@@ -607,12 +607,22 @@ MARKER_SPECS: list[MarkerSpec] = [
         # row whose long window was unavailable does — read ``surface`` to tell "this emitter
         # has no long window" from "this series was too short for one".
         #
+        # ``symbol`` is the ticker or FRED series id the flagged volatility was computed on,
+        # in the same field position its stale-latest sibling carries it. It is REQUIRED, not
+        # optional-wrapped: the marker ships in the same diff as this spec, so no archived
+        # record predates the field. Without it every record was anonymous, and the fan-out is
+        # one thread per ticker up to MAX_FINANCIAL_IDENTIFIERS with nondeterministic line
+        # order, so two flagged tickers in one run were byte-identical apart from ``seq`` — no
+        # join to the stale-latest record for the same series, and no way to tell a pegged-cross
+        # true positive from a `^GSPC` false positive at n=1.
+        #
         # No question ref: like its stale-latest sibling the flag is per-IDENTIFIER (one
         # question can fire several) and neither call site has the question in scope, so
         # qid_kind stays None.
         re.compile(
-            r"FINANCIAL_NOISE_FLAG:\s*surface=(?P<surface>\S+)\s+vr_lag=(?P<vr_lag>\S+)"
-            r"\s+vr=(?P<vr>\S+)\s+floor=(?P<floor>\S+)\s+short_vol=(?P<short_vol>\S+)"
+            r"FINANCIAL_NOISE_FLAG:\s*surface=(?P<surface>\S+)\s+symbol=(?P<symbol>\S+)"
+            r"\s+vr_lag=(?P<vr_lag>\S+)\s+vr=(?P<vr>\S+)\s+floor=(?P<floor>\S+)"
+            r"\s+short_vol=(?P<short_vol>\S+)"
             r"(?:\s+long_vol=(?P<long_vol>\S+))?\s+robust_vol=(?P<robust_vol>\S+)"
         ),
     ),

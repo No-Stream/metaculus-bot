@@ -681,7 +681,7 @@ class TestSeriesClockAndCalendarBases:
         expected = float(returns.std() * np.sqrt(CALENDAR_DAYS_PER_YEAR) * 100.0)
         shipped_252 = float(returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
 
-        lines = tsrender._realized_vol_lines(continuous, clock)
+        lines = tsrender._realized_vol_lines(continuous, clock, symbol="BTC-USD")
 
         assert lines == [f"- 30-calendar-day annualized realized volatility: {expected:.1f}%"]
         # The defect was worth a factor of sqrt(365/252) = 1.2035; make sure the old number is
@@ -697,7 +697,7 @@ class TestSeriesClockAndCalendarBases:
         returns = business.pct_change().dropna().tail(tsrender.REALIZED_VOL_WINDOW)
         expected = float(returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
 
-        assert tsrender._realized_vol_lines(business, clock) == [
+        assert tsrender._realized_vol_lines(business, clock, symbol="^GSPC") == [
             f"- 30-trading-day annualized realized volatility: {expected:.1f}%"
         ]
 
@@ -923,7 +923,7 @@ class TestAnchorRealizedVolNoiseFlag:
         return SeriesClock(freq="daily", periods_per_year=TRADING_DAYS_PER_YEAR)
 
     def test_a_clean_series_renders_one_unqualified_line(self):
-        lines = tsrender._realized_vol_lines(random_walk_close_series(seed=3), self._clock())
+        lines = tsrender._realized_vol_lines(random_walk_close_series(seed=3), self._clock(), symbol="CSUSHPISA")
 
         assert len(lines) == 1
         assert lines[0].startswith("- 30-trading-day annualized realized volatility:")
@@ -939,7 +939,7 @@ class TestAnchorRealizedVolNoiseFlag:
         )
         assert robust is not None
 
-        lines = tsrender._realized_vol_lines(noisy, self._clock())
+        lines = tsrender._realized_vol_lines(noisy, self._clock(), symbol="CSUSHPISA")
 
         assert len(lines) == 2
         assert lines[0].endswith("— noise-suspect")
@@ -949,7 +949,7 @@ class TestAnchorRealizedVolNoiseFlag:
 
     def test_a_short_series_renders_nothing(self):
         short = random_walk_close_series(seed=3, n=20)
-        assert tsrender._realized_vol_lines(short, self._clock()) == []
+        assert tsrender._realized_vol_lines(short, self._clock(), symbol="CSUSHPISA") == []
 
 
 class TestSharedVolEstimator:

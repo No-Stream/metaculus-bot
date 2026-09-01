@@ -552,7 +552,7 @@ def _yfinance_latest_lines(
     return parts
 
 
-def _volatility_lines(close: pd.Series, periods_per_year: int) -> list[str]:
+def _volatility_lines(close: pd.Series, periods_per_year: int, *, symbol: str) -> list[str]:
     """Annualized volatility at two horizons, plus the vendor-noise flag when it fires.
 
     Two horizons because a single 30-row window is both a noisy estimate and, on a thin
@@ -623,7 +623,7 @@ def _volatility_lines(close: pd.Series, periods_per_year: int) -> list[str]:
         flagged.append(f"{long_line} (from one-day returns, noise included)")
     flagged.append(f"{short_line} (from one-day returns, noise included; noise-suspect)")
     logger.info(
-        f"FINANCIAL_NOISE_FLAG: surface=financial_data vr_lag={FINANCIAL_VARIANCE_RATIO_LAG} "
+        f"FINANCIAL_NOISE_FLAG: surface=financial_data symbol={symbol} vr_lag={FINANCIAL_VARIANCE_RATIO_LAG} "
         f"vr={noise_ratio:.3f} floor={FINANCIAL_VARIANCE_RATIO_FLOOR} short_vol={short_vol:.1f} "
         f"long_vol={long_vol if long_vol is None else round(long_vol, 1)} "
         f"robust_vol={robust_vol if robust_vol is None else round(robust_vol, 1)}"
@@ -631,7 +631,7 @@ def _volatility_lines(close: pd.Series, periods_per_year: int) -> list[str]:
     return flagged
 
 
-def _yfinance_stats_lines(close: pd.Series, periods_per_year: int) -> list[str]:
+def _yfinance_stats_lines(close: pd.Series, periods_per_year: int, *, symbol: str) -> list[str]:
     """Period returns, annualized volatility, and the 52-week range."""
     parts: list[str] = []
     # Period returns
@@ -639,7 +639,7 @@ def _yfinance_stats_lines(close: pd.Series, periods_per_year: int) -> list[str]:
     if returns_section:
         parts.append(returns_section)
 
-    parts.extend(_volatility_lines(close, periods_per_year))
+    parts.extend(_volatility_lines(close, periods_per_year, symbol=symbol))
 
     # 52-week range, windowed by DATE like the period returns: a row-count slice
     # under a fixed "52-week" label spans ~13 months on a gapped 24/7 series and
@@ -763,7 +763,7 @@ def _render_yfinance_block(ticker: str, *, as_of: datetime | None = None, is_ben
         peg = _peg_for_ticker(ticker)
         if peg is not None:
             parts.extend(_peg_disclosure_lines(ticker, peg))
-        parts.extend(_yfinance_stats_lines(close, periods_per_year))
+        parts.extend(_yfinance_stats_lines(close, periods_per_year, symbol=ticker))
         parts.extend(_yfinance_fundamentals_lines(close, info, is_benchmarking=is_benchmarking))
         return "\n".join(parts)
 

@@ -906,14 +906,15 @@ class TestFinancialStaleLatest:
 # ts_render.py:_realized_vol_lines). The two surfaces differ by one field: only
 # financial_data holds a long volatility window to print alongside the 30-row one.
 FINANCIAL_NOISE_FLAG_YFINANCE_LINE = (
-    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data vr_lag=5 vr=0.369 floor=0.6 "
+    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data symbol=USDSZL=X vr_lag=5 vr=0.369 floor=0.6 "
     "short_vol=17.9 long_vol=15.2 robust_vol=10.8"
 )
 FINANCIAL_NOISE_FLAG_TS_ANCHOR_LINE = (
-    PFX + "FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag=5 vr=0.412 floor=0.6 short_vol=14.6 robust_vol=9.4"
+    PFX + "FINANCIAL_NOISE_FLAG: surface=ts_anchor symbol=CSUSHPISA vr_lag=5 vr=0.412 floor=0.6 "
+    "short_vol=14.6 robust_vol=9.4"
 )
 FINANCIAL_NOISE_FLAG_NO_ESTIMATES_LINE = (
-    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data vr_lag=5 vr=0.369 floor=0.6 "
+    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data symbol=USDSZL=X vr_lag=5 vr=0.369 floor=0.6 "
     "short_vol=17.9 long_vol=None robust_vol=None"
 )
 
@@ -931,6 +932,9 @@ class TestFinancialNoiseFlag:
         rec = _parse_one(FINANCIAL_NOISE_FLAG_YFINANCE_LINE)
         assert rec["marker"] == "financial_noise_flag"
         assert rec["surface"] == "financial_data"
+        # The ticker the flagged volatility was computed on: without it two flagged
+        # identifiers in one run harvest as byte-identical anonymous records.
+        assert rec["symbol"] == "USDSZL=X"
         assert rec["vr_lag"] == 5
         assert rec["vr"] == 0.369
         assert rec["floor"] == 0.6
@@ -943,6 +947,7 @@ class TestFinancialNoiseFlag:
         # participate and the field reads None rather than dropping the whole record.
         rec = _parse_one(FINANCIAL_NOISE_FLAG_TS_ANCHOR_LINE)
         assert rec["surface"] == "ts_anchor"
+        assert rec["symbol"] == "CSUSHPISA"
         assert rec["short_vol"] == 14.6
         assert rec["robust_vol"] == 9.4
         assert rec["long_vol"] is None

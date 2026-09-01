@@ -228,7 +228,7 @@ def _fifty_two_week_line(series: pd.Series, ceiling: date, last: float) -> str:
     return f"- {label}: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"  # noqa: RUF001  # en dash is deliberate range typography in rendered research
 
 
-def _realized_vol_lines(series: pd.Series, clock: SeriesClock) -> list[str]:
+def _realized_vol_lines(series: pd.Series, clock: SeriesClock, *, symbol: str) -> list[str]:
     """Annualized realized volatility over the last ``REALIZED_VOL_WINDOW`` observations,
     plus the vendor-noise flag when the series' variance ratio trips the screen.
 
@@ -275,7 +275,7 @@ def _realized_vol_lines(series: pd.Series, clock: SeriesClock) -> list[str]:
         )
     )
     logger.info(
-        f"FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag={FINANCIAL_VARIANCE_RATIO_LAG} "
+        f"FINANCIAL_NOISE_FLAG: surface=ts_anchor symbol={symbol} vr_lag={FINANCIAL_VARIANCE_RATIO_LAG} "
         f"vr={noise_ratio:.3f} floor={FINANCIAL_VARIANCE_RATIO_FLOOR} short_vol={annualized:.1f} "
         f"robust_vol={robust_vol if robust_vol is None else round(robust_vol, 1)}"
     )
@@ -472,7 +472,7 @@ def _render_single(
     parts.extend(band_lines)
 
     if clock.freq == "daily" and use_log:
-        parts.extend(_realized_vol_lines(derived, clock))
+        parts.extend(_realized_vol_lines(derived, clock, symbol=route.spec.series_id))
 
     parts.append(f"\n_{PROVENANCE_FOOTER}_")
     return "\n".join(parts), band

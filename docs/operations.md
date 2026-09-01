@@ -943,8 +943,8 @@ the telemetry markers:
   each fetch appears exactly once; the remaining free-text lines are REASON lines (a
   decode score, an unread content-type, an SSRF rejection) carrying what the marker
   cannot.
-- `FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor vr_lag=... vr=... floor=...
-  short_vol=... [long_vol=...] robust_vol=...` — the series behind a rendered
+- `FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor symbol=... vr_lag=... vr=...
+  floor=... short_vol=... [long_vol=...] robust_vol=...` — the series behind a rendered
   volatility is noise-dominated: its variance ratio sits below
   `FINANCIAL_VARIANCE_RATIO_FLOOR`, meaning most of each day's move is reversed the
   next, which inflates any volatility computed from one-day returns. The flagged
@@ -953,8 +953,11 @@ the telemetry markers:
   estimator: `financial_data.py`'s `_volatility_lines` and `ts_render.py`'s
   `_realized_vol_lines`. Only the financial-data surface prints `long_vol`, so a
   `ts_anchor` record reads that field as null rather than zero. Per-identifier, so
-  one question can fire several and the line carries no question id. Informational
-  and NOT alertable — it describes the vendor's data, not a bot defect.
+  one question can fire several and the line carries no question id — `symbol` (the
+  ticker or FRED series id, same field position as `FINANCIAL_STALE_LATEST`) is what
+  tells two flagged identifiers in one run apart and joins a noise-flag record to the
+  stale-latest record for the same series. Informational and NOT alertable — it
+  describes the vendor's data, not a bot defect.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH`
   — credit telemetry, described above. `CREDIT_FLOOR_BREACH` keeps firing during
   the credit-alert suppression window, so seeing one on a green run is expected
