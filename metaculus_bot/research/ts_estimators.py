@@ -163,6 +163,99 @@ def annualized_realized_vol_pct(series: pd.Series, *, window: int, periods_per_y
     return float(returns.tail(window).std() * np.sqrt(periods_per_year) * 100.0)
 
 
+# Variance of the 1-period log returns below which the sample carries no MEASURABLE
+# variation, so the overlapping-window estimators below would be dividing float rounding
+# noise by float rounding noise. A truly administratively fixed quote (or a synthetic
+# constant-step ramp) has a 1-period variance around 1e-33, and the ratio of two such
+# numbers read 0.37 on an exact ramp — a confident noise flag manufactured out of mantissa
+# bits. Real daily FX log returns run sd ~1e-3 (variance ~1e-6), and even a quote quantized
+# to 1e-6 relative steps sits at ~1e-12, so this floor is orders of magnitude below
+# anything measurable and orders above float noise.
+_DEGENERATE_RETURN_VARIANCE = 1e-24
+
+
+def _overlapping_log_return_sample(series: pd.Series, *, lag: int, min_returns: int) -> tuple[np.ndarray, float] | None:
+    """``(lag-period log returns, variance of the 1-period log returns)``, or ``None``.
+
+    ONE refusal policy for both overlapping-window estimators below, so a sample either
+    supports both or neither — a series that got a variance ratio but no noise-robust
+    volatility (or the reverse) would render a flag with no remedy beside it.
+
+    ``None`` when the sample cannot carry the statistic: fewer than ``min_returns``
+    1-period returns, a non-positive or non-finite value (log returns are undefined there —
+    spread/difference series cross zero, price series do not), or returns whose variance is
+    at float-noise level. Never a nan, which would compare False against any threshold and
+    read as "no flag".
+    """
+    values = series.to_numpy(dtype="float64")
+    if values.size <= lag or not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+        return None
+    log_prices = np.log(values)
+    single = np.diff(log_prices)
+    if single.size < min_returns:
+        return None
+    single_var = float(np.var(single, ddof=1))
+    if single_var <= _DEGENERATE_RETURN_VARIANCE:
+        return None
+    return (log_prices[lag:] - log_prices[:-lag], single_var)
+
+
+def variance_ratio(series: pd.Series, *, lag: int, min_returns: int) -> float | None:
+    """Overlapping variance ratio VR(``lag``) of a price series' log returns.
+
+    ``VR(q) = Var(q-period log return) / (q * Var(1-period log return))``, both variances
+    taken over OVERLAPPING windows with ddof=1. This is the plain Lo-MacKinlay ratio
+    without their small-sample bias corrections: under a random walk it is ~1, above 1
+    means moves persist (momentum), and below 1 means each move is partly reversed — which
+    is what a thin vendor quote on a fixed cross looks like, since independent quote noise
+    cancels once the series is sampled over several days.
+
+    Log returns rather than simple ones because the statistic is about additivity: q log
+    returns SUM to the q-period log return exactly, which is what makes the null value
+    exactly 1.
+
+    ``None`` on any sample the estimator cannot honestly answer for — see
+    ``_overlapping_log_return_sample``. At q=5 the null standard error is ~sqrt(4.8/n), so
+    the caller's ``min_returns`` is what keeps a 30-row window from producing a number.
+    """
+    sample = _overlapping_log_return_sample(series, lag=lag, min_returns=min_returns)
+    if sample is None:
+        return None
+    multi, single_var = sample
+    return float(np.var(multi, ddof=1)) / (lag * single_var)
+
+
+def multi_period_annualized_vol_pct(
+    series: pd.Series, *, lag: int, periods_per_year: int, min_returns: int
+) -> float | None:
+    """Annualized volatility (%) measured on OVERLAPPING ``lag``-period log returns.
+
+    ``sd(lag-period log return) / sqrt(lag) * sqrt(periods_per_year) * 100`` — the same
+    annualized quantity ``annualized_realized_vol_pct`` reports, but sampled at a horizon
+    over which independent quote noise has already cancelled. By construction it equals the
+    1-period figure times ``sqrt(variance_ratio(...))``, which is why it belongs beside the
+    ratio rather than as an unrelated second number: where the ratio says two thirds of
+    daily variance reverses, this is the volatility that remains. Applying that identity to
+    the two figures the q44797 verification reported for ``USDSZL=X`` — a 30-row vol of
+    17.85% and VR(5) = 0.472 — puts this estimator around 12%, inside the 11-14% band that
+    verification called economically correct, where the 1-year 1-period figure only fell to
+    15.2%. (Derived from their numbers under this identity, not measured on their data: they
+    ran a differently parameterised ratio and a simple-return vol.)
+
+    Uses LOG returns, unlike ``annualized_realized_vol_pct``'s simple returns (whose
+    formula is pinned by the anchor stack and by the q44797 reproduction). The two differ in
+    the fourth significant figure at daily FX magnitudes — 17.05% simple against 17.02% log
+    on that series — but log returns are what make the lag scaling exact.
+
+    Same refusals as ``variance_ratio``.
+    """
+    sample = _overlapping_log_return_sample(series, lag=lag, min_returns=min_returns)
+    if sample is None:
+        return None
+    multi, _ = sample
+    return float(np.std(multi, ddof=1) / np.sqrt(lag) * np.sqrt(periods_per_year) * 100.0)
+
+
 @dataclass(frozen=True)
 class SeriesClock:
     """A fetched series' observation clock: native resolution AND observed sampling density.

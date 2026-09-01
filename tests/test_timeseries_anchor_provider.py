@@ -39,6 +39,11 @@ import pandas as pd
 import pytest
 from forecasting_tools import BinaryQuestion
 
+from metaculus_bot.constants import (
+    FINANCIAL_VARIANCE_RATIO_FLOOR,
+    FINANCIAL_VARIANCE_RATIO_LAG,
+    FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+)
 from metaculus_bot.research import timeseries_anchor as ts
 from metaculus_bot.research import ts_fetch as tf
 from metaculus_bot.research import ts_render as tsrender
@@ -64,6 +69,7 @@ from metaculus_bot.research.ts_estimators import (
     horizon_steps,
     observed_periods_per_year,
     series_clock,
+    variance_ratio,
 )
 from metaculus_bot.research.ts_fetch import FRED_CSV_URL, SeriesSpec
 from metaculus_bot.research.ts_render import (
@@ -74,7 +80,14 @@ from metaculus_bot.research.ts_render import (
     _truncate_section,
 )
 from metaculus_bot.research.ts_routing import _Route
-from tests.ts_anchor_fakes import _DGS10_RC, FakeHttp, _csv, _make_numeric_q
+from tests.ts_anchor_fakes import (
+    _DGS10_RC,
+    FakeHttp,
+    _csv,
+    _make_numeric_q,
+    noise_dominated_close_series,
+    random_walk_close_series,
+)
 
 
 # Test isolation: the provider keeps a rendered-section cache and the fetch layer
@@ -910,6 +923,132 @@ class TestSharedVolEstimator:
             index=pd.date_range(end="2026-06-30", periods=30, freq="D"),
         )
         assert annualized_realized_vol_pct(short, window=30, periods_per_year=365) is None
+
+
+class TestVarianceRatio:
+    """`variance_ratio` is the vendor-noise screen behind financial_data's noise flag.
+
+    q44797 handed six forecasters a 17.8% "volatility" computed on a pegged cross whose
+    daily returns were 79% quote noise; the honest like-for-like figure off the liquid
+    anchor was ~10.6%. The screen has to separate those two regimes at the sample size the
+    provider actually holds (~265 daily bars) and stay silent on a clean series, since a
+    false flag would demote a perfectly good short-window volatility.
+    """
+
+    def test_clean_random_walk_reads_near_one_and_clears_the_floor(self):
+        clean = random_walk_close_series(seed=3)
+        ratio = variance_ratio(
+            clean,
+            lag=FINANCIAL_VARIANCE_RATIO_LAG,
+            min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+        )
+        assert ratio is not None
+        # A walk's null value is 1; the null sd of VR(5) at n~264 is ~0.13, so anything in
+        # this band is ordinary sampling noise and must NOT fire the flag.
+        assert 0.7 <= ratio <= 1.3
+        assert ratio > FINANCIAL_VARIANCE_RATIO_FLOOR
+
+    def test_quote_noise_dominated_series_falls_below_the_floor(self):
+        noisy = noise_dominated_close_series(seed=3)
+        ratio = variance_ratio(
+            noisy,
+            lag=FINANCIAL_VARIANCE_RATIO_LAG,
+            min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+        )
+        assert ratio is not None
+        # iid quote noise contributing a fraction p of return variance drives VR(5) to
+        # 1 - 0.8p; at p ~ 2/3 that is ~0.47, the value the 44797 verification measured on
+        # USDSZL=X. The floor must sit between this and the clean case above.
+        assert ratio == pytest.approx(0.47, abs=0.12)
+        assert ratio < FINANCIAL_VARIANCE_RATIO_FLOOR
+
+    def test_the_floor_operating_point_across_twenty_seeds(self):
+        """One seed proves nothing about a threshold, and the two distributions genuinely
+        overlap in the tails, so the honest claim is an operating point rather than perfect
+        separation. Measured over seeds 0-19 (scratch/next_season_bundle_2026-09/item10/
+        vr_calibration.py): clean VR mean 1.005, min 0.636; noisy VR mean 0.465, max 0.617.
+        At the 0.60 floor that is 0 of 20 clean series flagged and 18 of 20 noisy ones
+        caught. A false positive costs a demoted-but-still-printed short-window figure; a
+        false negative reproduces q44797, so the asymmetry favours keeping the floor high
+        enough to catch most noise and low enough to never flag a walk."""
+        flagged_clean = 0
+        flagged_noisy = 0
+        for seed in range(20):
+            clean = variance_ratio(
+                random_walk_close_series(seed=seed),
+                lag=FINANCIAL_VARIANCE_RATIO_LAG,
+                min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+            )
+            noisy = variance_ratio(
+                noise_dominated_close_series(seed=seed),
+                lag=FINANCIAL_VARIANCE_RATIO_LAG,
+                min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+            )
+            assert clean is not None
+            assert noisy is not None
+            flagged_clean += clean < FINANCIAL_VARIANCE_RATIO_FLOOR
+            flagged_noisy += noisy < FINANCIAL_VARIANCE_RATIO_FLOOR
+        assert flagged_clean == 0, "a clean random walk must never be called vendor noise"
+        assert flagged_noisy >= 17, f"the screen caught only {flagged_noisy}/20 noise-dominated series"
+
+    def test_the_thirty_row_vol_window_is_refused_not_estimated(self):
+        """The 44797 verification's §11 constraint: the null sd of VR(5) is ~0.40 at n=30,
+        so the statistic is uninformative on the window the volatility line uses. Refusing
+        it is the only honest answer — a number there would read as measurement."""
+        thirty_rows = noise_dominated_close_series(seed=1, n=31)
+        assert (
+            variance_ratio(
+                thirty_rows,
+                lag=FINANCIAL_VARIANCE_RATIO_LAG,
+                min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+            )
+            is None
+        )
+
+    def test_a_momentum_series_reads_above_one(self):
+        """Sign check in the other direction. Returns with positive autocorrelation (rho =
+        0.3) persist rather than reverse, so VR(5) sits above 1 — around 1.6 by
+        1 + (2/q)*sum_k (q-k)*rho^k. Confirms the statistic is measuring return
+        autocorrelation and not just any departure from a straight line."""
+        rng = np.random.default_rng(5)
+        shocks = rng.normal(0.0, 0.006, 300)
+        returns = np.zeros(300)
+        for i in range(1, 300):
+            returns[i] = 0.3 * returns[i - 1] + shocks[i]
+        momentum = pd.Series(
+            16.4 * np.exp(np.cumsum(returns)),
+            index=pd.bdate_range(end="2026-07-17", periods=300),
+        )
+        ratio = variance_ratio(momentum, lag=5, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS)
+        assert ratio is not None
+        assert ratio > 1.2
+
+    def test_a_constant_step_series_returns_none_rather_than_float_noise(self):
+        """A series with no measurable return variation — an administratively fixed quote,
+        or a constant-log-step ramp — makes the ratio a quotient of float rounding noise. An
+        exact ramp read 0.369 before the degeneracy guard, i.e. a confident noise flag
+        manufactured out of the last bits of two mantissas."""
+        ramp = pd.Series(
+            100.0 * np.exp(np.linspace(0.0, 0.5, 300)),
+            index=pd.bdate_range(end="2026-07-17", periods=300),
+        )
+        assert variance_ratio(ramp, lag=5, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS) is None
+
+    def test_a_non_positive_value_returns_none_rather_than_a_nan(self):
+        """Log returns are undefined at or below zero (a spread series crosses it), and a
+        nan ratio compares False against the floor — a silent no-flag."""
+        crosses_zero = pd.Series(
+            np.linspace(-1.0, 1.0, 200),
+            index=pd.bdate_range(end="2026-07-17", periods=200),
+        )
+        assert variance_ratio(crosses_zero, lag=5, min_returns=120) is None
+
+    def test_a_flat_series_returns_none_rather_than_dividing_by_zero(self):
+        flat = pd.Series(
+            np.full(200, 5.0),
+            index=pd.bdate_range(end="2026-07-17", periods=200),
+        )
+        assert variance_ratio(flat, lag=5, min_returns=120) is None
 
 
 class TestDerivationFrequencyInvariant:

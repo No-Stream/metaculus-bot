@@ -700,6 +700,30 @@ FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
 #     windows), ~12 bars of margin where the old 372 measured margin EXACTLY zero.
 FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 390
 FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
+# Variance-ratio screen for a vendor-noise-dominated daily series (q44797: USD/SZL's
+# 17.8% "volatility" was 79% quote noise on a pegged cross, and all six forecasters sized
+# their intervals off it). VR(q) near 1 is a random walk; well below 1 means each day's
+# move is largely reversed the next, which is what a thin quote on a fixed cross looks
+# like and what cancels over multi-day windows.
+#   - LAG 5 (one trading week) because it is the horizon where the two cases separate: the
+#     44797 verification (§11) measured VR(5) 0.472 on the noisy series against 0.740 on
+#     the clean anchor, while at VR(10) the CLEAN series read 0.208 — no separation left.
+#   - FLOOR 0.6 sits between those two, and is calibrated against seeded fixtures in
+#     tests/test_timeseries_anchor_provider.py (TestVarianceRatio) rather than against the
+#     receipt's own numbers, which came from a differently-parameterised estimator.
+#   - MIN_RETURNS 120 because the null standard error of VR(5) is ~sqrt(4.8/n): ~0.20 at
+#     n=120 and ~0.40 at n=30, so the 30-row vol window cannot carry this statistic. The
+#     provider's own FINANCIAL_YFINANCE_LOOKBACK_DAYS window holds ~265 daily bars, so a
+#     normal fetch clears the floor with room; a short/gappy one gets no flag at all.
+FINANCIAL_VARIANCE_RATIO_LAG: int = 5
+FINANCIAL_VARIANCE_RATIO_FLOOR: float = 0.6
+FINANCIAL_VARIANCE_RATIO_MIN_RETURNS: int = 120
+# How many recent FRED prints the first-release-vs-current-vintage table covers. Revising
+# macro series resolve on the FIRST print (q44944 resolved on first-release Case-Shiller)
+# while the levels rendered beside it are today's revised vintage, so the gap between the
+# two is a forecastable, signed quantity. Four prints is enough to read a revision
+# direction on a monthly series without turning the block into a table nobody reads.
+FINANCIAL_FRED_VINTAGE_PRINTS: int = 4
 # Cap on how many tickers + FRED series one question may fetch. The identifier list is
 # whatever an LLM classifier named plus whatever URL extraction found, and it was
 # previously unbounded: each identifier gets its own asyncio.to_thread, all of them
