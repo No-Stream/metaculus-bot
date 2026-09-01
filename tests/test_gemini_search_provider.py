@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.genai import types as genai_types
 
+from metaculus_bot.research.gemini_search import _strip_model_citation_indices
 from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
 
 
@@ -626,50 +627,36 @@ async def test_malformed_supports_fall_back_to_unspliced_text(
 class TestStripModelCitationIndices:
     """Gemini writes its OWN hierarchical ``[2.4.1]`` indices alongside the ``[N]`` markers
     our formatter splices from real grounding metadata: 173 of 323 archived sections carry
-    them, 2,504 markers, resolving to nothing we hold, so a forecaster cannot tell which
+    them and they resolve to nothing we hold, so a forecaster cannot tell which
     brackets are checkable (scratch/residual_2026-08-31/gemini_search_audit/cutB_pattern.md
     §3.1). Every example below is a shape the archived corpus actually contains, except the
     preserved-numeric cases, which pin the false-positive boundary.
     """
 
     def test_removes_a_lone_index_and_the_space_it_leaves(self) -> None:
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         assert _strip_model_citation_indices("tag more sharks [2.4.1]. The count") == "tag more sharks. The count"
 
     def test_removes_a_multi_token_group(self) -> None:
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         assert _strip_model_citation_indices("office [1.1.1, 1.1.2]. He") == "office. He"
 
     def test_keeps_a_tier_tag_and_drops_the_index_beside_it(self) -> None:
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         assert _strip_model_citation_indices("path of totality [A: NASA, 1.1.2].") == "path of totality [A: NASA]."
 
     def test_keeps_a_tier_tag_whose_index_is_space_separated(self) -> None:
         # q45081's shape: the index sits inside the tier item with no comma before it.
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         assert _strip_model_citation_indices("[A: official 2.4.1, 3.2.5].") == "[A: official]."
         assert _strip_model_citation_indices("[B: Access Newswire 1.1.4, 3.3.4].") == "[B: Access Newswire]."
 
     def test_keeps_a_trailing_tier_grade_when_the_index_comes_first(self) -> None:
         # q44944's shape: ``index: tier`` rather than ``tier: outlet, index``.
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         assert _strip_model_citation_indices("HPI rose [1.1.8, 2.1.4: A].") == "HPI rose [A]."
 
     def test_preserves_semicolon_separated_tier_groups(self) -> None:
         # q44841's shape: two tier tags in one bracket, semicolon-delimited.
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         stripped = _strip_model_citation_indices("[B: Forbes, 1.6.4; C: Newsweek, 3.2.2].")
         assert stripped == "[B: Forbes; C: Newsweek]."
 
     def test_preserves_our_spliced_markers(self) -> None:
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         text = "Alpha.[1] Beta.[12] Gamma.[1, 3] Delta.[11, 12]"
         assert _strip_model_citation_indices(text) == text
 
@@ -679,8 +666,6 @@ class TestStripModelCitationIndices:
         word, a 4-digit component (a year) or a 3-digit component (an IP octet) is content,
         not a citation index, so the rule must leave every one of these alone.
         """
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         for text in (
             "gasoline [3.8%] higher",
             "priced at [$1.5] a share",
@@ -693,15 +678,11 @@ class TestStripModelCitationIndices:
             assert _strip_model_citation_indices(text) == text, text
 
     def test_is_idempotent(self) -> None:
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         text = "office [1.1.1, 1.1.2]. NASA [A: NASA, 1.1.2] said.[1]"
         once = _strip_model_citation_indices(text)
         assert _strip_model_citation_indices(once) == once
 
     def test_empties_a_table_cell_without_eating_the_pipes(self) -> None:
-        from metaculus_bot.research.gemini_search import _strip_model_citation_indices
-
         assert _strip_model_citation_indices("| **2024** | 2.2% | [1.4, 1.23] |") == "| **2024** | 2.2% | |"
 
 
