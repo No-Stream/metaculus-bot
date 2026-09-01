@@ -49,6 +49,12 @@ EXTREME_CALL_LINE = (
     "2026-09-01 12:00:00,000 - metaculus_bot.forecaster - INFO - "
     "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=1"
 )
+# The single-survivor publish floor moving that same lone call, in the shape
+# metaculus_bot/aggregation_pipeline.py emits at the base-combine re-entry.
+THIN_PUBLISH_FLOOR_LINE = (
+    "2026-09-01 12:00:05,000 - metaculus_bot.aggregation_pipeline - WARNING - "
+    "THIN_PUBLISH_FLOOR: question=44874 raw=0.0300 clamped=0.0500 survivors=1"
+)
 
 
 class TestWorkflowSlugFromPath:
@@ -229,6 +235,30 @@ class TestNewMarkerSpecsReachTheArchive:
         # published comments once the 90-day GHA log window closes.
         assert archived[0]["model"] == "gemini-3.1-pro-preview"
         assert archived[0]["lone"] is True
+        assert archived[0]["survivors"] == 1
+
+    def test_thin_publish_floor_round_trips_to_jsonl(self, tmp_path: Path):
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text(EXTREME_CALL_LINE + "\n" + THIN_PUBLISH_FLOOR_LINE + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="902", workflow="metaculus_cup", artifact="research-902", run_date="2026-09-01T00:00:00Z"
+        )
+        assert run is not None
+
+        archive_dir = tmp_path / "archive"
+        totals = merge_and_write(archive_dir, [run])
+        assert totals["thin_publish_floor"] == 1
+        assert totals["extreme_call"] == 1
+        archived = load_marker_records(archive_dir, "thin_publish_floor")
+        assert len(archived) == 1
+        # raw is what the member declared, clamped is what was published; the pair is
+        # the floor's whole footprint on a forecast, and it has to outlive the 90-day
+        # GHA log window for the next residual round to price the rule on real fires.
+        assert archived[0]["qid"] == 44874
+        assert archived[0]["raw"] == 0.03
+        assert archived[0]["clamped"] == 0.05
         assert archived[0]["survivors"] == 1
 
 

@@ -383,6 +383,35 @@ BINARY_PROB_MAX: float = 0.98
 EXTREME_CALL_LOW: float = 0.05
 EXTREME_CALL_HIGH: float = 0.95
 
+# Floor on the PUBLISHED binary probability when exactly ONE forecaster survived
+# (apply_thin_publish_floor in post_processing.py, wired in
+# AggregationPipeline._base_combine on the "single_forecaster" skip reason).
+#
+# Mechanism, not a fit: the median of an intact ensemble absorbs a member's extreme
+# tail call, and median-of-1 supplies no such variance reduction, so the admissible
+# range is widened in exactly that state to price the missing aggregation. It fires
+# ONLY on a single-survivor publish — a multi-member median publishes as is, even one
+# below 0.05 — and never touches the per-model record (the survivor's declared value
+# stays on the comment's summary bullet; only the published aggregate moves).
+#
+# Evidence, with its honest caveat: the whole measured benefit is ONE question. q44874
+# published gemini's lone 0.03 on a YES resolution and took -105.27 spot peer; at
+# [0.05, 0.95] it is +51.08 with zero measured cost on the other three archived solo
+# binaries (one win, three exact zeros — n=4, one non-zero row). The value 0.05 is
+# informed by that question; 0.07 / 0.10 buy more on 44874 but start taxing 44870 and
+# 44873, which were right. Bounded downside: publishing 5% where a correct sub-5% call
+# would have scored costs ~-3.11 spot peer per instance, against a -105 tail.
+# Always-on and global variants were priced and REJECTED (always-on never improves the
+# published pre-flip ensemble; global [0.05, 0.95] over 408 binaries is -52.02, 50
+# losses to 1 win) — do not widen the trigger. Receipt:
+# scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 (clamp-variant table
+# + "A synthesis correction the individual cuts miss") and §3 option "1=".
+#
+# Deliberately equal to EXTREME_CALL_LOW / EXTREME_CALL_HIGH above: one definition of
+# "extreme" for the telemetry and the clamp. Retune them together or not at all.
+THIN_PUBLISH_BINARY_FLOOR: float = 0.05
+THIN_PUBLISH_BINARY_CEIL: float = 0.95
+
 # Multiple-choice prediction clamp. Aligned to forecasting-tools 0.2.92's
 # PredictedOptionList validator, which unconditionally clamps every option into
 # [0.01, 0.99], renormalizes, and raises ValueError when any option moves > 0.05

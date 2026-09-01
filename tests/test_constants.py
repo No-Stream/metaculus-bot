@@ -10,6 +10,8 @@ from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
     BINARY_STACKING_ENABLED_ENV,
+    EXTREME_CALL_HIGH,
+    EXTREME_CALL_LOW,
     MC_PROB_MAX,
     MC_PROB_MIN,
     MC_STACKING_ENABLED_ENV,
@@ -18,6 +20,8 @@ from metaculus_bot.constants import (
     NATIVE_SEARCH_TIMEOUT,
     NATIVE_SEARCH_VERBOSITY_DEFAULT,
     NUMERIC_STACKING_ENABLED_ENV,
+    THIN_PUBLISH_BINARY_CEIL,
+    THIN_PUBLISH_BINARY_FLOOR,
     env_flag_enabled,
 )
 
@@ -154,3 +158,26 @@ class TestPerTypeStackingEnvVarNames:
 
     def test_numeric_stacking_enabled_env_name(self):
         assert NUMERIC_STACKING_ENABLED_ENV == "NUMERIC_STACKING_ENABLED"
+
+
+class TestThinPublishBinaryFloor:
+    """The single-survivor publish floor is [0.05, 0.95] and shares its edges with the
+    EXTREME_CALL band: one definition of "extreme", so the telemetry that measures the
+    exposure and the clamp that prices it cannot drift apart. Receipt for the values:
+    scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 (clamp-variant table).
+    """
+
+    def test_floor_is_0_05(self):
+        assert THIN_PUBLISH_BINARY_FLOOR == 0.05
+
+    def test_ceiling_is_0_95(self):
+        assert THIN_PUBLISH_BINARY_CEIL == 0.95
+
+    def test_floor_and_ceiling_equal_the_extreme_call_band(self):
+        assert THIN_PUBLISH_BINARY_FLOOR == EXTREME_CALL_LOW
+        assert THIN_PUBLISH_BINARY_CEIL == EXTREME_CALL_HIGH
+
+    def test_floor_sits_strictly_inside_the_per_model_clamp(self):
+        # A 0.03 member call passes the per-model [0.02, 0.98] clamp untouched, which is
+        # why the floor is a new mechanism rather than a retune of BINARY_PROB_MIN/MAX.
+        assert BINARY_PROB_MIN < THIN_PUBLISH_BINARY_FLOOR < THIN_PUBLISH_BINARY_CEIL < BINARY_PROB_MAX
