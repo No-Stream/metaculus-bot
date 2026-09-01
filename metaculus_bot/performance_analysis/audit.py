@@ -6,6 +6,11 @@ a cut that ranks the *individual ensemble members* on each wrong question so
 the per-question reasoning can be diffed — e.g. "gpt-5.2 got closest at 55%,
 the ensemble dragged it down to 22%."
 
+Cohort selection ranks on SPOT peer score (``platform_scores``), the metric the
+tournament leaderboard actually uses. Coverage-scaled ``peer_score`` is reported beside
+it as a labelled secondary and is only ever a ranking key for records that carry no spot
+peer, in its own sort tier.
+
 Every ranking here goes through ``ranking_cohort.per_model_ranking_cohort``,
 which applies the two exclusions the aggregate cuts in ``analysis.py`` get from
 ``per_model_cohort`` (stacker-fired records, anonymous positional keys) plus one
@@ -37,6 +42,16 @@ from metaculus_bot.performance_analysis.parsing import (
     declared_anchors,
     parse_per_model_forecasts,
 )
+from metaculus_bot.performance_analysis.platform_scores import (
+    FALLBACK_TIER,
+    NO_SCORE_TIER,
+    RANKING_FIELDS,
+    SPOT_PEER_FIELD,
+    log_ranking_score_sources,
+    platform_score_fragments,
+    ranking_score,
+    score_field,
+)
 from metaculus_bot.performance_analysis.ranking_cohort import (
     PerModelRankingCohort,
     log_ranking_cohort,
@@ -66,14 +81,8 @@ def load_combined_dataset(q1_path: str, q2_path: str) -> list[dict]:
     return list(merged.values())
 
 
-def _record_peer_score(record: dict) -> float | None:
-    """Return the Metaculus peer score on a record, or None if unavailable."""
-    sd = record.get("metaculus_scores") or {}
-    return sd.get("peer_score")
-
-
 def _has_rankable_score(r: dict, fallback_field: str) -> bool:
-    return _record_peer_score(r) is not None or r.get(fallback_field) is not None
+    return ranking_score(r) is not None or r.get(fallback_field) is not None
 
 
 def _filter_by_type(records: list[dict], q_types: tuple[str, ...], fallback_field: str) -> list[dict]:
@@ -81,60 +90,71 @@ def _filter_by_type(records: list[dict], q_types: tuple[str, ...], fallback_fiel
 
 
 def _rank_key_worst_binary(r: dict) -> tuple[int, float]:
-    peer = _record_peer_score(r)
-    if peer is not None:
-        return (0, peer)  # primary: peer ascending (most negative = worst)
+    ranked = ranking_score(r)
+    if ranked is not None:
+        return (ranked.tier, ranked.value)  # primary: platform score ascending (most negative = worst)
     brier = r.get("brier_score")
     if brier is None:
-        return (2, 0.0)
-    return (1, -brier)  # fallback: higher Brier = worse
+        return (NO_SCORE_TIER, 0.0)
+    return (FALLBACK_TIER, -brier)  # fallback: higher Brier = worse
 
 
 def _rank_key_worst_logscore(r: dict, field: str) -> tuple[int, float]:
-    peer = _record_peer_score(r)
-    if peer is not None:
-        return (0, peer)
+    ranked = ranking_score(r)
+    if ranked is not None:
+        return (ranked.tier, ranked.value)
     log = r.get(field)
     if log is None:
-        return (2, 0.0)
-    return (1, log)  # fallback: lower log = worse
+        return (NO_SCORE_TIER, 0.0)
+    return (FALLBACK_TIER, log)  # fallback: lower log = worse
 
 
 def _rank_key_best_binary(r: dict) -> tuple[int, float]:
-    peer = _record_peer_score(r)
-    if peer is not None:
-        return (0, -peer)  # primary: peer descending (most positive = best)
+    ranked = ranking_score(r)
+    if ranked is not None:
+        return (ranked.tier, -ranked.value)  # primary: platform score descending (most positive = best)
     brier = r.get("brier_score")
     if brier is None:
-        return (2, 0.0)
-    return (1, brier)  # fallback: lower Brier = better
+        return (NO_SCORE_TIER, 0.0)
+    return (FALLBACK_TIER, brier)  # fallback: lower Brier = better
 
 
 def _rank_key_best_logscore(r: dict, field: str) -> tuple[int, float]:
-    peer = _record_peer_score(r)
-    if peer is not None:
-        return (0, -peer)
+    ranked = ranking_score(r)
+    if ranked is not None:
+        return (ranked.tier, -ranked.value)
     log = r.get(field)
     if log is None:
-        return (2, 0.0)
-    return (1, -log)  # fallback: higher log = better
+        return (NO_SCORE_TIER, 0.0)
+    return (FALLBACK_TIER, -log)  # fallback: higher log = better
 
 
 def _middle_band(records: list[dict]) -> list[dict]:
-    """Return the records whose peer_score falls in the 20-80 percentile band.
+    """Return the records in the 20-80 percentile band of the platform peer score.
 
-    Records without a peer_score are dropped — middle-mode is peer-anchored
-    only. This is intentional: the cohort is meant to surface "ordinary
-    questions" relative to the crowd, which requires peer comparability.
+    Banded on ONE field across the whole cohort — spot peer whenever any record carries
+    it, coverage-scaled peer only when none does. Mixing the two would band a set whose
+    order is partly submission timing rather than skill (see ``platform_scores``).
+
+    Records without the banding field are dropped — middle-mode is peer-anchored only.
+    That is intentional: the cohort is meant to surface "ordinary questions" relative to
+    the crowd, which requires peer comparability.
     """
-    with_peer = [r for r in records if _record_peer_score(r) is not None]
-    if not with_peer:
-        return []
-    sorted_records = sorted(with_peer, key=lambda r: _record_peer_score(r) or 0.0)
-    n = len(sorted_records)
-    lower_idx = int(0.2 * n)
-    upper_idx = max(lower_idx, int(0.8 * n))
-    return sorted_records[lower_idx:upper_idx]
+    for field in RANKING_FIELDS:
+        with_score = [r for r in records if score_field(r, field) is not None]
+        if not with_score:
+            continue
+        if field != SPOT_PEER_FIELD:
+            logger.warning(
+                f"_middle_band: no record carries {SPOT_PEER_FIELD}; banding on coverage-scaled "
+                f"{field} instead, so the band's edges reflect submission timing as well as skill"
+            )
+        sorted_records = sorted(with_score, key=lambda r: score_field(r, field) or 0.0)
+        n = len(sorted_records)
+        lower_idx = int(0.2 * n)
+        upper_idx = max(lower_idx, int(0.8 * n))
+        return sorted_records[lower_idx:upper_idx]
+    return []
 
 
 def select_cohort(
@@ -147,28 +167,30 @@ def select_cohort(
     extra_post_ids: list[int] | None = None,
     seed: int = 42,
 ) -> list[dict]:
-    """Pick records per question type, ranked by peer score under one of three modes.
+    """Pick records per question type, ranked by SPOT peer score under one of three modes.
 
-    Peer score compares our log score to the crowd's mean log score (negative =
-    worse than peers). When populated on ``metaculus_scores.peer_score``, it's
-    the canonical ranking signal because it's comparable across question types
-    and accounts for question difficulty.
+    Peer score compares our log score to the crowd's mean log score (negative = worse
+    than peers). ``metaculus_scores.spot_peer_score`` is the canonical ranking signal:
+    it's comparable across question types, accounts for question difficulty, AND it is
+    the metric the tournament leaderboard ranks on. Coverage-scaled ``peer_score`` is a
+    strictly worse ranking key and is used only for records that carry no spot peer, in
+    a separate sort tier so the two are never interleaved — see ``platform_scores``.
 
     Modes:
-    - ``"worst"``: peer ascending (most negative = worst). Fallback: highest
+    - ``"worst"``: spot peer ascending (most negative = worst). Fallback: highest
       Brier (binary) / lowest log score (numeric, MC).
-    - ``"best"``: peer descending (most positive = best). Fallback: lowest
+    - ``"best"``: spot peer descending (most positive = best). Fallback: lowest
       Brier / highest log score.
-    - ``"middle"``: rank by peer_score, drop the bottom 20% and top 20% as
+    - ``"middle"``: rank by spot peer, drop the bottom 20% and top 20% as
       extremes, then ``random.Random(seed).sample(...)`` to draw N per type.
       Middle 60% (not pure random) so the cohort surfaces "ordinary"
       questions; pure random risks repeatedly drawing near-extremes that
-      defeat the purpose. Records without peer_score are dropped from middle
-      mode (no peer comparability → no "middle").
+      defeat the purpose. Records with no platform peer score at all are dropped
+      from middle mode (no peer comparability → no "middle").
 
-    Records missing both peer score and the type-specific fallback are
-    dropped (worst/best modes). Middle mode additionally drops records
-    without peer score regardless of fallback availability.
+    Records missing both a platform peer score and the type-specific fallback are
+    dropped (worst/best modes). Middle mode additionally drops records without a
+    platform peer score regardless of fallback availability.
 
     ``extra_post_ids`` unions a manually-curated list of post_ids onto the
     selection (deduplicated, appended in input order). Useful for spot_peer
@@ -176,6 +198,7 @@ def select_cohort(
 
     Returns concatenated list in (binary, numeric, mc, extras) order.
     """
+    log_ranking_score_sources(records, cut=f"select_cohort:{mode}")
     if mode == "worst":
         binary_pool = _filter_by_type(records, ("binary",), "brier_score")
         numeric_pool = _filter_by_type(records, ("numeric", "discrete"), "numeric_log_score")
@@ -481,14 +504,10 @@ def _summarize_percentiles(percentile_dict: dict[float, float]) -> str:
 
 def _format_score_header(record: dict) -> str:
     q_type = record["type"]
-    parts: list[str] = []
-    sd = record.get("metaculus_scores") or {}
-    peer = sd.get("peer_score")
-    spot_peer = sd.get("spot_peer_score")
-    if peer is not None:
-        parts.append(f"peer **{peer:+.1f}**")
-    if spot_peer is not None:
-        parts.append(f"spot peer **{spot_peer:+.1f}**")
+    # Spot peer leads and is bolded; peer follows with its scaling named. The tournament
+    # ranks on spot peer, and the two differ enough on the same record (q44872: -38.8 vs
+    # -15.0) that an unlabelled peer figure reads as a much smaller miss than it was.
+    parts: list[str] = platform_score_fragments(record)
     if q_type == "binary":
         b = record.get("brier_score")
         log = record.get("log_score")

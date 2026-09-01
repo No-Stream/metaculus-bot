@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, ClassVar, cast
 
 import pytest
@@ -962,6 +963,87 @@ class TestSelectCohortMiddle:
         # Middle 60% of 10 = 6 records. Asking for 20 should return ≤6.
         result = select_cohort(records, mode="middle", n_binary=20, n_numeric=0, n_mc=0, seed=42)
         assert 1 <= len(result) <= 6
+
+
+class TestSpotPeerIsThePrimaryRankingKey:
+    """The tournament ranks on spot peer; ``peer_score`` is that quantity scaled by
+    coverage, so it orders records partly by how early each was submitted. These tests
+    pin the preference and the tier separation that stops the two interleaving.
+    """
+
+    def test_spot_peer_decides_the_order_when_both_fields_are_present(self):
+        # `mild` looks worst on coverage-scaled peer but is the BETTER spot-peer record.
+        # Ranking on peer would invert the pair, which is the bug this pins.
+        mild = _binary_record(1, 0.45, True)
+        mild["metaculus_scores"] = {"spot_peer_score": -5.0, "peer_score": -40.0}
+        severe = _binary_record(2, 0.40, True)
+        severe["metaculus_scores"] = {"spot_peer_score": -38.8, "peer_score": -15.0}
+        worst = select_worst_misses([mild, severe], n_binary=2, n_numeric=0, n_mc=0)
+        assert [r["post_id"] for r in worst] == [2, 1]
+
+    def test_best_mode_also_ranks_on_spot_peer(self):
+        good_spot = _binary_record(1, 0.90, True)
+        good_spot["metaculus_scores"] = {"spot_peer_score": 40.0, "peer_score": 1.0}
+        good_peer = _binary_record(2, 0.90, True)
+        good_peer["metaculus_scores"] = {"spot_peer_score": 2.0, "peer_score": 60.0}
+        best = select_cohort([good_peer, good_spot], mode="best", n_binary=2, n_numeric=0, n_mc=0)
+        assert [r["post_id"] for r in best] == [1, 2]
+
+    def test_a_peer_only_record_never_interleaves_with_spot_scored_ones(self):
+        """Spot and coverage-scaled peer are different quantities, so a peer-only record
+        sorts in its own tier behind every spot-scored one rather than being compared to
+        them numerically. Here the peer-only record's -90 would otherwise rank worst."""
+        spot_bad = _binary_record(1, 0.40, True)
+        spot_bad["metaculus_scores"] = {"spot_peer_score": -30.0}
+        spot_mild = _binary_record(2, 0.45, True)
+        spot_mild["metaculus_scores"] = {"spot_peer_score": -1.0}
+        peer_only = _binary_record(3, 0.40, True)
+        peer_only["metaculus_scores"] = {"peer_score": -90.0}
+        worst = select_worst_misses([spot_mild, peer_only, spot_bad], n_binary=3, n_numeric=0, n_mc=0)
+        assert [r["post_id"] for r in worst] == [1, 2, 3]
+
+    def test_peer_only_cohorts_still_rank_on_peer(self):
+        """Records pulled before spot peer was captured must not silently drop to the
+        Brier fallback — coverage-scaled peer still beats an unadjusted Brier."""
+        mild = _binary_record(1, 0.45, True)
+        mild["metaculus_scores"] = {"peer_score": -1.0}
+        severe = _binary_record(2, 0.40, True)
+        severe["metaculus_scores"] = {"peer_score": -80.0}
+        worst = select_worst_misses([mild, severe], n_binary=1, n_numeric=0, n_mc=0)
+        assert worst[0]["post_id"] == 2
+
+    def test_middle_mode_bands_on_spot_peer(self):
+        """Peer is deliberately anti-correlated with spot here, so a peer-banded cohort
+        would return the complementary set."""
+        records = []
+        for i in range(10):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"spot_peer_score": float(i), "peer_score": float(-i)}
+            records.append(r)
+        result = select_cohort(records, mode="middle", n_binary=10, n_numeric=0, n_mc=0, seed=42)
+        # Spot-banded middle 60% of 0..9 is spot 2..7; peer-banded would be spot 2..7's
+        # complement mirrored, i.e. it would admit 8 and 9.
+        assert {r["post_id"] for r in result} == {2, 3, 4, 5, 6, 7}
+
+    def test_middle_mode_warns_when_it_has_to_band_on_coverage_scaled_peer(self, caplog):
+        records = []
+        for i in range(10):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"peer_score": -float(i)}
+            records.append(r)
+        with caplog.at_level(logging.WARNING):
+            result = select_cohort(records, mode="middle", n_binary=10, n_numeric=0, n_mc=0, seed=42)
+        assert len(result) == 6
+        assert any("coverage-scaled" in r.message for r in caplog.records if r.levelno == logging.WARNING)
+
+    def test_score_header_leads_with_spot_and_labels_peer(self):
+        record = _binary_record(1, 0.40, True)
+        record["metaculus_scores"] = {"spot_peer_score": -38.8, "peer_score": -15.0}
+        header = audit._format_score_header(record)
+        assert header.startswith("spot peer **-38.8**")
+        assert "peer -15.0 (coverage-scaled, secondary)" in header
+        # The bot-side scores still follow the platform ones.
+        assert "Brier" in header
 
 
 class TestSelectCohortValidation:

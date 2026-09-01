@@ -10,6 +10,7 @@ from scipy.stats import spearmanr
 
 from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.performance_analysis import platform_scores
 from metaculus_bot.performance_analysis.parsing import (
     MIN_SCOREABLE_ANCHORS,
     _parse_probability,
@@ -44,6 +45,40 @@ def _mean(values: list[float]) -> float | None:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def _score_stats(values: list[float]) -> dict:
+    """``{count, mean, median}`` for one platform-score field; mean/median None when empty."""
+    return {
+        "count": len(values),
+        "mean": _mean(values),
+        "median": float(np.median(values)) if values else None,
+    }
+
+
+def platform_score_summary(data: list[dict]) -> dict:
+    """Metaculus's own scores on the published forecasts, SPOT peer first.
+
+    The tournament leaderboard ranks on ``spot_peer_score``. ``peer_score`` is the same
+    quantity scaled by coverage, which for a bot that submits once and never revises is
+    mostly a function of how early it submitted — so it is reported as a labelled
+    secondary and never used to rank. Same split for the two baseline scores. Full
+    reasoning and the accessors live in ``performance_analysis.platform_scores``.
+
+    Every field is counted over the records that actually carry it, so the per-metric
+    ``count`` differs from ``count`` (all records) whenever a pull predates score capture.
+    """
+    fields = {
+        "spot_peer": platform_scores.spot_peer_score,
+        "peer": platform_scores.peer_score,
+        "spot_baseline": platform_scores.spot_baseline_score,
+        "baseline": platform_scores.baseline_score,
+    }
+    summary: dict = {"count": len(data)}
+    for name, reader in fields.items():
+        summary[name] = _score_stats([v for v in (reader(r) for r in data) if v is not None])
+    summary["mean_coverage"] = _mean([v for v in (platform_scores.coverage(r) for r in data) if v is not None])
+    return summary
 
 
 def per_model_cohort(data: list[dict], *, cut: str) -> list[tuple[dict, dict]]:
@@ -761,6 +796,50 @@ def _question_count_lines(data: list[dict]) -> list[str]:
     return lines
 
 
+_PLATFORM_SCORE_ROWS: tuple[tuple[str, str], ...] = (
+    ("spot_peer", "spot peer (PRIMARY, the leaderboard metric)"),
+    ("peer", "peer (coverage-scaled, secondary)"),
+    ("spot_baseline", "spot baseline (primary)"),
+    ("baseline", "baseline (coverage-scaled, secondary)"),
+)
+
+
+def _platform_score_section_lines(data: list[dict]) -> list[str]:
+    """Metaculus's own scores, spot peer first. Empty when no record carries any.
+
+    Every other section of this report is a BOT-side score (Brier, log score) computed
+    here from the resolution. This one is the platform's own arithmetic, and it is the
+    only thing in the report that corresponds to tournament standing — which is why the
+    spot/coverage-scaled split is labelled in the row names rather than left to the
+    reader.
+    """
+    ps = platform_score_summary(data)
+    if not any(ps[key]["count"] for key, _label in _PLATFORM_SCORE_ROWS):
+        return []
+
+    lines = [
+        "## Metaculus Platform Scores",
+        "",
+        "The tournament leaderboard ranks on SPOT peer. `peer` is the same quantity scaled by "
+        "coverage (`peer ~= spot_peer * coverage`); this bot submits once and never revises, so "
+        "its coverage is mostly a function of how early it submitted. Rank on spot, read peer as "
+        "a diagnostic only.",
+        "",
+        "| metric | n | mean | median |",
+        "|--------|---|------|--------|",
+    ]
+    for key, label in _PLATFORM_SCORE_ROWS:
+        stats = ps[key]
+        if not stats["count"]:
+            continue
+        lines.append(f"| {label} | {stats['count']} | {stats['mean']:+.2f} | {stats['median']:+.2f} |")
+    if ps["mean_coverage"] is not None:
+        lines.append("")
+        lines.append(f"- Mean coverage: {ps['mean_coverage']:.3f}")
+    lines.append("")
+    return lines
+
+
 def _binary_section_lines(data: list[dict]) -> list[str]:
     """Binary headline scores plus the calibration-bucket table. Empty when no binaries."""
     bs = binary_summary(data)
@@ -846,7 +925,11 @@ def _mc_section_lines(data: list[dict]) -> list[str]:
 
 
 def generate_report(data: list[dict]) -> str:
-    """Baseline markdown report (binary, numeric, MC summaries + per-model binary).
+    """Baseline markdown report (platform scores, binary, numeric, MC + per-model binary).
+
+    Platform scores lead: they're the only section that maps to tournament standing, and
+    the spot/coverage-scaled distinction is easy to get backwards when it appears only in
+    a per-question dossier.
 
     For extended analyses -- NO-bias check, financial split, stacking effectiveness,
     disagreement-error correlation -- call those functions directly; see
@@ -854,6 +937,7 @@ def generate_report(data: list[dict]) -> str:
     """
     lines: list[str] = ["# Performance Analysis Report", ""]
     lines.extend(_question_count_lines(data))
+    lines.extend(_platform_score_section_lines(data))
     lines.extend(_binary_section_lines(data))
     lines.extend(_per_model_section_lines(data))
     lines.extend(_numeric_section_lines(data))

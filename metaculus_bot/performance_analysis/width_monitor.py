@@ -139,23 +139,75 @@ TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
 #   (2026-07-21T17:07:37Z), so no post-triple-era question can carry this shape.
 KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747", "43913"})
 
-# The CLI token standing in for KNOWN_BUG_QIDS in --exclude-qids.
+# The CANONICAL degraded-ensemble cohort: the dry-donated-key incident window
+# (2026-07-26 .. 07-28), when OpenRouter reported the drained donated key's breached spend
+# cap as a 403 the classifier vetoed, so the wrapper never fell back to the funded personal
+# key. These questions published at 1 of 3 forecasters — gemini alone, the only slot pinned
+# to the personal key by DONATED_KEY_BLOCKED_GOOGLE_MODELS — with native search, the AskNews
+# summarizer, the financial classifier, prediction-market keyword extraction and BOTH
+# gap-fill passes down alongside it. Their forecasts came from a thinned pipeline rather
+# than the current bot, so they belong in the same "exclude from headline aggregates, report
+# separately" bucket as KNOWN_BUG_QIDS.
+#
+# THESE ARE QUESTION IDS. The same eight questions carry post ids 44721-44728, and the two
+# spaces share one integer namespace: minibench POST ids 44873-44877 land inside this
+# question-id range, so a join that matches "either id" silently admits five unrelated
+# questions. Key every join on the question id, translating through
+# ``performance_analysis.id_mapping`` when the other side is post-keyed.
+#
+# Receipts: scratch/residual_2026-08-24/degraded_cohort.json; incident write-up in
+# docs/operations.md "What a dry donated key actually returns".
+DEGRADED_RUN_QIDS: frozenset[str] = frozenset({"44870", "44871", "44872", "44873", "44874", "44875", "44876", "44877"})
+
+# The PARTIAL half of the same incident: published at 2 of 3 forecasters. Kept separate
+# because the forecaster count differs, but note 44841 and 44856 are degraded IDENTICALLY
+# to the full cohort on the RESEARCH side (native search errored, both gap-fill passes
+# dead), so any research-conditioned cut must exclude both sets together even though a
+# forecaster-count cut can legitimately keep these three.
+PARTIAL_DEGRADED_QIDS: frozenset[str] = frozenset({"44841", "44856", "44912"})
+
+# The known-bug cohort's CLI shorthand. Named because --help quotes it as the worked
+# example, and a literal there could drift from the dict key below.
 KNOWN_BUG_SHORTHAND = "known_bug"
+
+# The CLI tokens standing in for a whole cohort in --exclude-qids. Each name is the
+# cohort's canonical shorthand; adding a cohort here is all it takes to make it available
+# to every caller of parse_exclude_qids.
+EXCLUSION_COHORTS: dict[str, frozenset[str]] = {
+    KNOWN_BUG_SHORTHAND: KNOWN_BUG_QIDS,
+    "degraded_run": DEGRADED_RUN_QIDS,
+    "partial_degraded": PARTIAL_DEGRADED_QIDS,
+}
 
 
 def parse_exclude_qids(raw: str) -> frozenset[str]:
-    """A ``--exclude-qids`` comma list, with the ``known_bug`` shorthand expanded in place.
+    """A ``--exclude-qids`` comma list, with every cohort shorthand expanded in place.
 
-    The shorthand COMPOSES with explicit ids rather than only standing alone. It used to be
+    A shorthand COMPOSES with explicit ids rather than only standing alone. It used to be
     recognized only as the whole argument, so ``--exclude-qids known_bug,43800`` produced the
     literal set ``{"known_bug", "43800"}``: no question id matches the word, so the bug pair
     stayed in every row while the table's ``excl`` column reported one exclusion and looked
     like it had worked.
+
+    A token that is neither a known cohort name nor a bare question id RAISES. With one
+    shorthand a typo was survivable; with three, ``degraded`` for ``degraded_run`` would
+    exclude nothing while the ``excl`` column read 0 — indistinguishable from a cohort
+    whose questions simply aren't in this pull.
     """
     tokens = {token.strip() for token in raw.split(",") if token.strip()}
-    if KNOWN_BUG_SHORTHAND not in tokens:
-        return frozenset(tokens)
-    return frozenset((tokens - {KNOWN_BUG_SHORTHAND}) | KNOWN_BUG_QIDS)
+    cohort_names = tokens & EXCLUSION_COHORTS.keys()
+    unknown = sorted(t for t in tokens - cohort_names if not t.isdigit())
+    if unknown:
+        raise ValueError(
+            f"--exclude-qids: {unknown} is neither a question id nor a cohort shorthand "
+            f"({', '.join(sorted(EXCLUSION_COHORTS))})"
+        )
+    qids = tokens - cohort_names
+    for name in sorted(cohort_names):
+        cohort = EXCLUSION_COHORTS[name]
+        logger.info(f"--exclude-qids: expanded cohort {name} -> {len(cohort)} question ids")
+        qids |= cohort
+    return frozenset(qids)
 
 
 def default_eras() -> list[Era]:
@@ -490,9 +542,10 @@ def compute_all_eras(
 
     ``exclude_qids`` drops the named questions from every row and reports the
     dropped count per row (``EraWidthMetrics.n_excluded``, rendered in the
-    table), so an exclusion is never silent. Pass ``KNOWN_BUG_QIDS`` for the
-    documented known-pipeline-bug cohort, which every other dimension of the
-    residual analysis already excludes.
+    table), so an exclusion is never silent. Pass one of the documented cohorts in
+    ``EXCLUSION_COHORTS`` — ``KNOWN_BUG_QIDS`` (known pipeline bugs),
+    ``DEGRADED_RUN_QIDS`` (dry-key 1-of-3 publishes) or ``PARTIAL_DEGRADED_QIDS``
+    (2-of-3) — rather than re-hardcoding ids; every private copy has drifted.
     """
     if eras is None:
         eras = default_eras()
@@ -627,10 +680,11 @@ def main(argv: list[str] | None = None) -> None:
         default="",
         help=(
             "Comma-separated question ids to drop from every row (the count is rendered in the table "
-            "so the exclusion is visible). The documented known-pipeline-bug cohort is "
-            f"{','.join(sorted(KNOWN_BUG_QIDS))}; pass '{KNOWN_BUG_SHORTHAND}' as shorthand for it, "
-            f"anywhere in the list — it composes with explicit ids, so '{KNOWN_BUG_SHORTHAND},43800' "
-            "excludes the cohort AND 43800. Default: exclude nothing."
+            "so the exclusion is visible). Each cohort shorthand below composes with explicit ids "
+            "and is recognized anywhere in the list: "
+            + "; ".join(f"'{name}' = {','.join(sorted(ids))}" for name, ids in sorted(EXCLUSION_COHORTS.items()))
+            + f". So '{KNOWN_BUG_SHORTHAND},43800' excludes that cohort AND 43800. An unrecognized "
+            "non-numeric token is an error rather than a silent no-op. Default: exclude nothing."
         ),
     )
     args = parser.parse_args(argv)
