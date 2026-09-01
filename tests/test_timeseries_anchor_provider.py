@@ -31,6 +31,7 @@ The fetch layer itself is covered in ``test_ts_fetch.py`` and routing in
 from __future__ import annotations
 
 import logging
+import math
 from datetime import UTC, date, datetime
 from unittest.mock import MagicMock
 
@@ -1096,6 +1097,57 @@ class TestVarianceRatio:
         ratio = variance_ratio(momentum, lag=5, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS)
         assert ratio is not None
         assert ratio > 1.2
+
+    def test_hand_computed_ratio_on_a_short_deterministic_series(self):
+        """VR(2) = 1.5375 on log prices [0, 1, 2, 4, 7, 11, 16], by hand.
+
+        Every other numeric assertion on this estimator is a tolerance band on a seeded
+        pseudo-random series, and both it and `multi_period_annualized_vol_pct` read their
+        multi-period returns from the same helper — so the sqrt(VR) identity between them is
+        algebraically vacuous on the lag window, and a consistent slip in the window shifts
+        both together. Four plausible mutations of `_overlapping_log_return_sample` left the
+        whole suite green: a lag off-by-one, numpy's default ddof=0 on the multi variance, a
+        NON-overlapping window (`lp[lag::lag]`), and simple instead of log returns.
+
+        The arithmetic, all exact in binary except the final division:
+          1-step log returns [1, 1, 2, 3, 4, 5], mean 8/3, sum of squared deviations 120/9,
+            so var(ddof=1) = 120/45 = 8/3.
+          2-step log returns [2, 3, 5, 7, 9], mean 26/5, sum of squared deviations 32.8,
+            so var(ddof=1) = 8.2.
+          VR(2) = 8.2 / (2 * 8/3) = 1.5375.
+        A non-overlapping window gives 2.3125, ddof=0 gives 1.23.
+        """
+        series = pd.Series(np.exp(np.array([0.0, 1.0, 2.0, 4.0, 7.0, 11.0, 16.0])))
+        assert variance_ratio(series, lag=2, min_returns=6) == pytest.approx(8.2 / (2 * 8 / 3))
+
+    def test_an_alternating_series_reads_exactly_zero_at_the_reversal_lag(self):
+        """Lag sensitivity, which the series above lacks (it is nearly lag-invariant).
+
+        On log prices [0, 1, 0, 1, ...] every 2-step return is zero — perfect mean reversion
+        — so VR(2) is 0, while the 3-step returns are [1, -1, 1, -1, 1, -1] with
+        var(ddof=1) = 6/5 = 1.2 against a 1-step var of 8/7, giving VR(3) = 1.2 / (3 * 8/7) =
+        0.35. A lag off-by-one flips the first value from 0 to 1.0, which no tolerance band on
+        a random series would have caught.
+        """
+        series = pd.Series(np.exp(np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0])))
+        # Tolerance rather than `== 0.0`: the 2-step differences are zero only because
+        # log(exp(x)) round-trips exactly here, which is a libm property, not arithmetic.
+        assert variance_ratio(series, lag=2, min_returns=6) == pytest.approx(0.0, abs=1e-12)
+        assert variance_ratio(series, lag=3, min_returns=6) == pytest.approx(1.2 / (3 * 8 / 7))
+
+    def test_hand_computed_multi_period_volatility_on_the_same_series(self):
+        """`multi_period_annualized_vol_pct` = sd(lag-step) / sqrt(lag) * sqrt(252) * 100.
+
+        On the same log prices the 2-step returns have var(ddof=1) = 8.2, so the annualized
+        figure is sqrt(8.2 / 2 * 252) * 100 = 3214.3428... — an absurd volatility, which is
+        the point: the series is a synthetic ramp chosen so the arithmetic is checkable by
+        hand rather than a tolerance band on a random walk. This is the number the flagged
+        block promotes to the headline and tells a forecaster to size intervals from, so it
+        needs one assertion that is not the vacuous sqrt(VR) identity.
+        """
+        series = pd.Series(np.exp(np.array([0.0, 1.0, 2.0, 4.0, 7.0, 11.0, 16.0])))
+        vol = multi_period_annualized_vol_pct(series, lag=2, periods_per_year=252, min_returns=6)
+        assert vol == pytest.approx(math.sqrt(8.2 / 2 * 252) * 100)
 
     def test_a_constant_step_series_returns_none_rather_than_float_noise(self):
         """A series with no measurable return variation — an administratively fixed quote,
