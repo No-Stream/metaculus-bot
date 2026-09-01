@@ -496,6 +496,21 @@ class TestWebResearchPromptPrimarySources:
         assert "Prediction market odds" in non_bench
         assert "Prediction market odds" not in bench
 
+    def test_auto_annotated_style_bans_model_authored_citation_indices(self) -> None:
+        """Half of all archived gemini sections (173 of 323) carry the model's own
+        hierarchical [1.2.3] indices alongside the [N] markers our formatter splices
+        from real grounding metadata, so a forecaster cannot tell which brackets are
+        checkable. The formatter strips them; this tells the model not to write them.
+        Gemini-only: the markdown branch (native search) is untouched."""
+        auto = web_research_prompt("Q?", citation_style="auto_annotated")
+        markdown = web_research_prompt("Q?", citation_style="markdown")
+
+        lowered = " ".join(auto.lower().split())
+        assert "do not write your own citation markers" in lowered
+        assert "[1.2.3]" in auto
+        assert "[1.2.3]" not in markdown
+        assert "do not write your own citation markers" not in " ".join(markdown.lower().split())
+
     def test_vintage_clause_present_for_both_citation_styles(self) -> None:
         """qid 44872: gemini searched correctly, Google attached no grounding, and it
         answered from memory of 2021/2022 OCEARCH press releases restamped as 2026

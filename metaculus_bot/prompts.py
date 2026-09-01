@@ -233,6 +233,21 @@ def _mc_options_line(options: Sequence[str] | None) -> str:
     return "Options (in resolution order): " + " | ".join(names)
 
 
+# Citation instruction for the Gemini grounding provider. The SDK returns grounding
+# metadata that `research/gemini_search.py` splices in as plain `[N]` markers; the
+# model ALSO writes its own hierarchical `[1.2.3]` indices, which index a chunk list
+# we do not hold — 173 of 323 archived gemini sections carried them, 163 of those
+# alongside our real markers, so a forecaster reading the section cannot tell which
+# brackets are checkable. The formatter strips them after splicing; this stops the
+# model producing them in the first place. Gemini-only: the markdown branch is the
+# native-search provider, whose citations are the model's own by design.
+_AUTO_ANNOTATED_CITATION_CLAUSE = (
+    "Include inline citations for all factual claims (the tool will auto-annotate) — do NOT write your own "
+    "citation markers or index numbers: no hierarchical tokens like [1.2.3], no self-invented bracketed "
+    "source numbering. The tool attaches the real markers"
+)
+
+
 def web_research_prompt(
     question_text: str,
     *,
@@ -250,7 +265,7 @@ def web_research_prompt(
     citation_clause = (
         "Include inline citations [source name](url) for all factual claims"
         if citation_style == "markdown"
-        else "Include inline citations for all factual claims (the tool will auto-annotate)"
+        else _AUTO_ANNOTATED_CITATION_CLAUSE
     )
     footer = (
         "Provide a factual research summary with citations:"
