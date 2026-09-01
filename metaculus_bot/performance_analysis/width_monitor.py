@@ -43,11 +43,22 @@ Per era it reports, on the bot's PUBLISHED 201-point CDF:
     opposite corrections.
 
 PIT is F_bot(resolution) evaluated on the canonical Metaculus value grid
-(``build_cdf_value_grid``); string out-of-bound resolutions map to PIT 0.0
-(below lower) / 1.0 (above upper), and a NUMERIC resolution beyond the grid is
-scored off the members' declared-percentile curves rather than the grid clamp
-(see ``compute_pit_details``). Method mirrors
+(``build_cdf_value_grid``). Two out-of-range cases, and they differ by what the
+platform told us (see ``compute_pit_reading``): a STRING marker
+(``below_lower_bound`` / ``above_upper_bound``) gives no value, so the reading is
+the INTERVAL our own tail mass pins F to and every coverage column counts it on
+band INTERSECTION while PIT std / mean PIT exclude it; a NUMERIC resolution
+beyond the grid keeps a point PIT, scored off the members' declared-percentile
+curves rather than the grid clamp. Method mirrors
 ``scratch/calibration_audit_2026-07-16/mc_numeric_calibration.py``.
+
+Alongside the era table it renders a per-QUESTION section, the STARVED OUTER TAIL
+scan: open bounds whose published mass beyond the members' declared outer anchor
+is pinned at the platform's structural minimum step, so every resolution out
+there earns the same floor score. That is a different failure from a
+mis-calibrated width — it is a cliff at a fixed location rather than a band of
+the wrong size — which is why it reads per question and not per era. See
+``STARVED_OUTER_TAIL_FLOOR_MULTIPLE``.
 """
 
 from __future__ import annotations
@@ -56,22 +67,34 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 
 import numpy as np
 from scipy import stats
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
-from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, pit_on_grid
+from metaculus_bot.performance_analysis.analysis import (
+    B4E9DF0_MERGED_AT,
+    PitReading,
+    out_of_range_pit_reading,
+    pit_band_count,
+    pit_on_grid,
+    pit_point_values,
+)
 from metaculus_bot.performance_analysis.cohorts import (
     EXCLUSION_COHORTS,
     KNOWN_BUG_SHORTHAND,
     parse_exclude_qids,
 )
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
+from metaculus_bot.performance_analysis.parsing import declared_anchors, is_anonymous_model_key
 from metaculus_bot.performance_analysis.scaling import grid_zero_point as _grid_zero_point
+from metaculus_bot.performance_analysis.scoring import numeric_log_score
 from metaculus_bot.time_utils import parse_iso_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -93,6 +116,68 @@ UNIFORM_PIT_STD: float = 1.0 / np.sqrt(12.0)  # ~0.2887
 # that widen honestly at small n, which is exactly the disclosure the point
 # metrics lack.
 MIN_N_FOR_POINT_METRICS: int = 10
+
+# --- Starved outer tails (the open-bound p99 cliff) --------------------------------------
+#
+# Distinct from the max-step smear ``CDF_MAXSTEP_CLIP`` already covers. On an OPEN bound the
+# declared outer tail can end up routed past the displayed range entirely, leaving every
+# in-range bin above the declared p99 pinned at the platform's structural minimum step
+# (``0.01 / N`` per bin). Every resolution in that band then earns the same floor score —
+# ``50 * ln(min_step / baseline)``, about -219 on ANY grid size — so the band is a cliff
+# rather than a gradient, and no modest widening walks out of it: the defect is a step
+# function in where the declared p99 lands. q45218 published its WINNING rig-count forecast
+# with 27 such bins starting one rig above its declared p99 (a flat -219.5 zone 16 rigs from
+# the resolution), and the same shape is what made q44182 (-219.0) the worst record on the
+# board. Detector only: any width response stays gated on the standing ``k_tail`` hold.
+#
+# The first thing it measured is that the shape is SYSTEMATIC, not a rare accident: 68 of the
+# 417 measurable open-bound sides in the archived cohort (16%, across 49 distinct questions,
+# 19 of them starved on both sides) sit at the floor. Read a fire as "this question carries a
+# cliff", not as "something went wrong on this question".
+#
+# There is deliberately NO publish-time twin of this detector (a ``STARVED_OUTER_TAIL`` WARN
+# beside ``OPEN_BOUND_PILING``), and the reason is worth keeping: on DISCRETE questions —
+# exactly where both motivating records live — ``numeric.pipeline._build_discrete_distribution``
+# overwrites ``declared_percentiles`` with a resample grid pinned to the raw bounds, so a
+# detector reading that field at publish time would put the anchor AT the bound and quietly
+# never fire on the cohort it exists for. That is the same trap
+# ``log_open_bound_piling_diagnostics`` documents and dodges by taking the sanitized
+# declarations as an argument. Firing correctly on the published aggregate needs each member's
+# sanitized declarations threaded from ``forecaster_runners`` to the aggregation site, i.e. new
+# plumbing on the publish path. The alternative that needs no plumbing is to locate the band
+# WITHOUT the declaration — the terminal run of bins sitting at the min step — which is a
+# second trigger definition to calibrate, so it is a decision rather than an oversight.
+
+# A band whose MEAN per-bin mass is below this multiple of the platform's per-bin minimum
+# step (``0.01 / N``, the server's ``round(0.01 / N, 9)`` rule) holds no declared shape — it
+# is carrying the structural minimum and nothing else. Scale-free on purpose: an absolute
+# mass threshold cannot tell a 2-bin band holding 0.003 (real density, harmless) from a
+# 27-bin band holding 0.004 (the cliff), and the pipeline's own applied floor is ~1.1x the
+# platform's, so a multiple is the quantity that means "flat".
+#
+# Calibrated against the archived performance dataset (271 numeric/discrete records, 417
+# measurable open-bound sides): q45218 reads 1.12 on both sides and q44182 1.46 high / 1.13
+# low, so both fire, and their measured flat-zone scores reproduce the published ones exactly
+# (-219.53 and -219.02). q44842 — which deliberately declared its p99 past the displayed
+# ceiling and won spot peer +24.4 — is not measurable on either side, so it cannot fire. The
+# measured distribution is bimodal: 44 sides sit in [1.00, 1.25), right at the pipeline's own
+# applied floor, then roughly 8 per 0.25-wide bucket up to 3.0, then the bulk above (median
+# 10.3). So the exact cut is not load-bearing — 1.5 fires 52 sides, 2.0 fires 68, 2.5 fires 79
+# — and 2.0 keeps margin over q44182's 1.46 without reaching into bands that carry shape.
+# Receipts: scratch/next_season_bundle_2026-09/item19/.
+STARVED_OUTER_TAIL_FLOOR_MULTIPLE: float = 2.0
+
+# The band is measured from the most extreme percentile EVERY member declared, and that
+# anchor has to actually be a tail anchor. A trimmed comment can leave the members sharing
+# only their p50, and reading the band as "everything above the median" would call almost
+# every record starved. Applied symmetrically: the low side needs an anchor at or below
+# ``100 - this``. The canonical sets both clear it (p99 today, p97.5 in the 11-point era).
+STARVED_OUTER_TAIL_MIN_ANCHOR_PERCENTILE: float = 90.0
+
+# The platform's per-bin minimum step is ``round(0.01 / N, 9)`` where N = cdf_size - 1 (see
+# the Metaculus CDF constraints in the repo instructions); the rounding is irrelevant at the
+# ratios this detector reads.
+_PLATFORM_MIN_STEP_NUMERATOR: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -196,38 +281,44 @@ def _cdf_and_grid(record: dict) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def compute_pit(record: dict) -> float | None:
-    """PIT = F_bot(resolution) on the canonical value grid.
+    """The record's POINT PIT = F_bot(resolution) on the canonical value grid.
 
-    STRING out-of-bound resolutions (``below_lower_bound`` / ``above_upper_bound``)
-    map to 0.0 / 1.0; a NUMERIC resolution beyond the grid is read off the members'
-    declared-percentile curves instead of the grid clamp (see
-    :func:`compute_pit_details` for why). Returns None when the record can't be
-    scored."""
-    return compute_pit_details(record)[0]
+    None when the record can't be scored AND when the reading is set-valued (a STRING
+    out-of-range resolution, whose PIT is an interval — see :func:`compute_pit_reading`).
+    A NUMERIC resolution beyond the grid still has a point PIT, read off the members'
+    declared-percentile curves rather than the grid clamp."""
+    reading = compute_pit_reading(record)
+    return reading.point if reading is not None else None
 
 
-def compute_pit_details(record: dict) -> tuple[float | None, str | None]:
-    """``(pit, oob_side)`` — ``oob_side`` is ``"low"``/``"high"`` when the resolution
-    fell beyond the value grid (string marker or numeric), else None.
+def compute_pit_reading(record: dict) -> PitReading | None:
+    """The record's :class:`PitReading`, or None when the record can't be scored.
 
-    String out-of-bound markers map to 0.0/1.0; a numeric resolution goes through
-    the shared :func:`pit_on_grid`, whose docstring holds the out-of-grid rule
-    (declared-percentile fallback beyond the grid, endpoint clamp only when no
-    member curve is usable). ``oob_side`` surfaces beyond-grid records in the
-    ``n_oob_*`` counters either way.
+    Two cases, and the difference is what the platform told us:
+
+    * A STRING out-of-range resolution (``below_lower_bound`` / ``above_upper_bound``)
+      gives no value, so the reading is the INTERVAL our own published tail mass pins
+      ``F(resolution)`` to — ``[cdf[-1], 1]`` or ``[0, cdf[0]]``. The convention lives in
+      ``analysis.out_of_range_pit_reading``.
+    * A NUMERIC resolution gives a point PIT through the shared :func:`pit_on_grid`, whose
+      docstring holds the out-of-grid rule (declared-percentile fallback beyond the grid,
+      endpoint clamp only when no member curve is usable).
+
+    ``PitReading.oob_side`` reports the beyond-grid side in both cases, which is what the
+    ``n_oob_*`` counters read.
     """
     built = _cdf_and_grid(record)
     if built is None:
-        return None, None
+        return None
     cdf, grid = built
     res = record.get("resolution_parsed")
-    if res == "below_lower_bound":
-        return 0.0, "low"
-    if res == "above_upper_bound":
-        return 1.0, "high"
+    out_of_range = out_of_range_pit_reading(res, cdf)
+    if out_of_range is not None:
+        return out_of_range
     if isinstance(res, (int, float)) and not isinstance(res, bool):
-        return pit_on_grid(float(res), grid, cdf, record.get("per_model_numeric_percentiles"))
-    return None, None
+        pit, oob_side = pit_on_grid(float(res), grid, cdf, record.get("per_model_numeric_percentiles"))
+        return PitReading.from_point(pit, oob_side=oob_side)
+    return None
 
 
 def relative_band_width(record: dict, *, median_floor: float = 1e-9) -> float | None:
@@ -252,6 +343,15 @@ def relative_band_width(record: dict, *, median_floor: float = 1e-9) -> float | 
 class EraWidthMetrics:
     label: str
     n_pit: int
+    """PIT READINGS in this row — the coverage denominator, points and intervals together."""
+    n_point: int
+    """Readings carrying a point value: the denominator of pit_std / mean_pit."""
+    n_oob_interval: int
+    """``n_pit - n_point``: out-of-range resolutions whose PIT is a set (see ``PitReading``).
+
+    A subset of ``n_oob_low + n_oob_high``, which also counts NUMERIC beyond-grid
+    resolutions — those keep a point PIT off the members' declared curves.
+    """
     n_eff: int
     n_width: int
     n_excluded: int
@@ -262,8 +362,8 @@ class EraWidthMetrics:
     cov_at_10: float
     cov_at_50: float
     cov_at_90: float
-    pit_std: float
-    mean_pit: float
+    pit_std: float | None
+    mean_pit: float | None
     median_rel_width: float | None
     band_miss: float
     band_lo: float
@@ -283,13 +383,26 @@ class EraWidthMetrics:
 
     @property
     def underpowered(self) -> bool:
-        """True when this row has too few PITs for its point metrics to be read."""
+        """True when this row has too few PIT readings for its point metrics to be read."""
         return self.n_pit < MIN_N_FOR_POINT_METRICS
+
+    @property
+    def point_metrics_underpowered(self) -> bool:
+        """Same floor applied to the point-only denominator, which set-valued readings shrink.
+
+        pit_std and mean_pit are computed over ``n_point``, so a row can clear the floor on
+        readings and still be under it on point values — that row's std is as uninformative
+        as any other under-floor one.
+        """
+        return self.n_point < MIN_N_FOR_POINT_METRICS
 
     def to_dict(self) -> dict:
         return {
             "label": self.label,
             "n_pit": self.n_pit,
+            "n_point": self.n_point,
+            "n_oob_interval": self.n_oob_interval,
+            "point_metrics_underpowered": self.point_metrics_underpowered,
             "n_eff": self.n_eff,
             "ci_clustered": self.ci_clustered,
             "underpowered": self.underpowered,
@@ -341,7 +454,7 @@ def _n_effective_clusters(post_ids: list[object]) -> int:
 class _EraSamples:
     """The per-record readings one era contributes: PITs, their posts, and band widths."""
 
-    pits: list[float]
+    readings: list[PitReading]
     pit_post_ids: list[object]
     widths: list[float]
     n_oob_low: int
@@ -349,15 +462,15 @@ class _EraSamples:
 
 
 def _collect_era_samples(records: list[dict]) -> _EraSamples:
-    """Read every numeric/discrete record's PIT and relative band width.
+    """Read every numeric/discrete record's PIT reading and relative band width.
 
     OOB is a property of the RESOLUTION (beyond the grid), not of the PIT value: an
     out-of-grid resolution scored off the declared-percentile curves rarely lands at
     exactly 0.0/1.0, and an in-grid PIT of exactly 0.0 (closed bound, resolution at the
-    minimum) is not OOB — which is why the side comes from ``compute_pit_details`` rather
-    than from comparing the PIT against 0 or 1.
+    minimum) is not OOB — which is why the side comes from the reading rather than from
+    comparing the PIT against 0 or 1.
     """
-    pits: list[float] = []
+    readings: list[PitReading] = []
     pit_post_ids: list[object] = []
     widths: list[float] = []
     n_oob_low = 0
@@ -366,25 +479,30 @@ def _collect_era_samples(records: list[dict]) -> _EraSamples:
     for r in records:
         if r.get("type") not in NUMERIC_TYPES:
             continue
-        pit, oob_side = compute_pit_details(r)
-        if pit is not None:
-            pits.append(pit)
+        reading = compute_pit_reading(r)
+        if reading is not None:
+            readings.append(reading)
             pit_post_ids.append(r.get("post_id"))
-            if oob_side == "low":
+            if reading.oob_side == "low":
                 n_oob_low += 1
-            elif oob_side == "high":
+            elif reading.oob_side == "high":
                 n_oob_high += 1
         w = relative_band_width(r)
         if w is not None:
             widths.append(w)
 
     return _EraSamples(
-        pits=pits,
+        readings=readings,
         pit_post_ids=pit_post_ids,
         widths=widths,
         n_oob_low=n_oob_low,
         n_oob_high=n_oob_high,
     )
+
+
+def _fraction(readings: list[PitReading], predicate: Callable[[PitReading], bool]) -> float:
+    """Fraction of readings satisfying ``predicate`` (readings is never empty here)."""
+    return sum(1 for reading in readings if predicate(reading)) / len(readings)
 
 
 def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) -> EraWidthMetrics | None:
@@ -396,13 +514,16 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
     that rows were dropped rather than silently reporting a smaller n.
     """
     samples = _collect_era_samples(records)
-    if not samples.pits:
+    if not samples.readings:
         return None
 
-    arr = np.asarray(samples.pits, dtype=float)
-    n = len(arr)
-    cov80_k = int(((arr >= 0.10) & (arr <= 0.90)).sum())
-    cov50_k = int(((arr >= 0.25) & (arr <= 0.75)).sum())
+    readings = samples.readings
+    n = len(readings)
+    # Point statistics run on the point readings only: a set-valued (out-of-range)
+    # reading has no value to average, and imputing its midpoint would manufacture one.
+    points = np.asarray(pit_point_values(readings), dtype=float)
+    cov80_k = pit_band_count(readings, 0.10, 0.90)
+    cov50_k = pit_band_count(readings, 0.25, 0.75)
 
     # Coverage CIs are computed at n_eff (distinct post_ids) rather than the raw
     # question count, so that a post carrying several correlated sub-questions
@@ -422,12 +543,17 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
     # a band that is too tight (both tails elevated) from one of roughly the
     # right width that is mis-centered (misses piled in one tail), which cov80
     # cannot, and which call for opposite corrections.
-    band_lo = float((arr < 0.10).mean())
-    band_hi = float((arr > 0.90).mean())
+    # A set-valued reading misses a tail only when the WHOLE interval lies outside it,
+    # which keeps the band_miss == 1 - cov80 identity exact (an interval that fails to
+    # intersect [0.10, 0.90] lies entirely on one side of it).
+    band_lo = _fraction(readings, lambda reading: reading.entirely_below(0.10))
+    band_hi = _fraction(readings, lambda reading: reading.entirely_above(0.90))
 
     return EraWidthMetrics(
         label=label,
         n_pit=n,
+        n_point=len(points),
+        n_oob_interval=n - len(points),
         n_eff=n_eff,
         n_width=len(samples.widths),
         n_excluded=n_excluded,
@@ -435,11 +561,11 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
         n_oob_high=samples.n_oob_high,
         cov80=cov80,
         cov50=cov50,
-        cov_at_10=float((arr <= 0.10).mean()),
-        cov_at_50=float((arr <= 0.50).mean()),
-        cov_at_90=float((arr <= 0.90).mean()),
-        pit_std=float(arr.std()),
-        mean_pit=float(arr.mean()),
+        cov_at_10=_fraction(readings, lambda reading: reading.at_or_below(0.10)),
+        cov_at_50=_fraction(readings, lambda reading: reading.at_or_below(0.50)),
+        cov_at_90=_fraction(readings, lambda reading: reading.at_or_below(0.90)),
+        pit_std=(float(points.std()) if len(points) else None),
+        mean_pit=(float(points.mean()) if len(points) else None),
         median_rel_width=(float(np.median(samples.widths)) if samples.widths else None),
         band_miss=band_lo + band_hi,
         band_lo=band_lo,
@@ -495,6 +621,386 @@ def compute_all_eras(
     return results
 
 
+class OuterTailVerdict(StrEnum):
+    """What one open-bound side of one published CDF was found to be.
+
+    Only ``STARVED`` and ``HEALTHY`` are measurements; the rest say why no measurement was
+    possible, and are counted and rendered rather than folded into ``HEALTHY`` — an absent
+    declaration must never read as "this tail is fine".
+    """
+
+    STARVED = "starved"
+    HEALTHY = "healthy"
+    NO_USABLE_CDF = "no_usable_cdf"
+    NO_MEMBER_CURVE = "no_member_curve"
+    NO_SHARED_ANCHOR = "no_shared_anchor"
+    ANCHOR_NOT_EXTREME = "anchor_not_extreme"
+    DECLARED_BEYOND_BOUND = "declared_beyond_bound"
+    EMPTY_BAND = "empty_band"
+
+
+@dataclass(frozen=True, slots=True)
+class OuterTailReading:
+    """One open-bound side of one record, measured for outer-tail starvation.
+
+    The measured fields are None exactly when ``verdict`` is one of the unmeasurable ones.
+    ``DECLARED_BEYOND_BOUND`` is the common and legitimate case: the members put their outer
+    anchor past the displayed bound, so the tail is expressed as out-of-range mass and there
+    is no in-range band to starve.
+    """
+
+    question_id: object
+    title: str
+    side: str
+    verdict: OuterTailVerdict
+    declared_percentile: float | None = None
+    declared_value: float | None = None
+    bound_value: float | None = None
+    tail_mass: float | None = None
+    """Published mass in the bins lying fully beyond the declared anchor."""
+    beyond_bound_mass: float | None = None
+    """Published mass beyond the DISPLAYED bound (``1 - cdf[-1]`` / ``cdf[0]``).
+
+    Reported beside ``tail_mass`` because the inversion is the defect's signature: q45218 held
+    0.0042 across the 27 in-range bins above its declared p99 and 0.0100 past the ceiling.
+    """
+    band_bins: int | None = None
+    mean_bin_mass: float | None = None
+    platform_min_step: float | None = None
+    floor_multiple: float | None = None
+    """``mean_bin_mass / platform_min_step`` — the trigger. 1.0 is exactly at the floor."""
+    flat_zone_log_score: float | None = None
+    """Bot-side Metaculus log score a resolution in the band's THINNEST bin would earn."""
+
+    @property
+    def starved(self) -> bool:
+        return self.verdict is OuterTailVerdict.STARVED
+
+    def to_dict(self) -> dict:
+        return {
+            "question_id": self.question_id,
+            "title": self.title,
+            "side": self.side,
+            "verdict": self.verdict,
+            "declared_percentile": self.declared_percentile,
+            "declared_value": self.declared_value,
+            "bound_value": self.bound_value,
+            "tail_mass": self.tail_mass,
+            "beyond_bound_mass": self.beyond_bound_mass,
+            "band_bins": self.band_bins,
+            "mean_bin_mass": self.mean_bin_mass,
+            "platform_min_step": self.platform_min_step,
+            "floor_multiple": self.floor_multiple,
+            "flat_zone_log_score": self.flat_zone_log_score,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OuterTailScan:
+    """Every open-bound side scanned in one dataset, plus the exclusion count."""
+
+    readings: list[OuterTailReading]
+    n_excluded: int = 0
+
+    @property
+    def n_scanned(self) -> int:
+        return len(self.readings)
+
+    @property
+    def starved(self) -> list[OuterTailReading]:
+        """The flagged sides, worst flat-zone score first."""
+        return sorted((r for r in self.readings if r.starved), key=_flat_zone_sort_key)
+
+    @property
+    def verdict_counts(self) -> Counter[OuterTailVerdict]:
+        return Counter(r.verdict for r in self.readings)
+
+    def to_dict(self) -> dict:
+        return {
+            "n_scanned": self.n_scanned,
+            "n_excluded": self.n_excluded,
+            "verdict_counts": dict(self.verdict_counts),
+            "readings": [r.to_dict() for r in self.readings],
+        }
+
+
+def _flat_zone_sort_key(reading: OuterTailReading) -> float:
+    """Worst-first key. Only measured readings are ranked, so the fallback never applies."""
+    return reading.flat_zone_log_score if reading.flat_zone_log_score is not None else 0.0
+
+
+def _member_declared_anchors(record: dict) -> dict[str, dict[float, float]]:
+    """``{model: {percentile label: value}}`` for the members whose curve is usable.
+
+    Anonymous ``Forecaster N`` keys are EXCLUDED, matching ``declared_percentile_pit`` and
+    ``max_step_clamp_screen``: on a stacker-fired record that positional bucket holds the
+    stacker's AGGREGATE, so pooling it into a median-of-members moves the anchor.
+    """
+    curves: dict[str, dict[float, float]] = {}
+    for model, pairs in (record.get("per_model_numeric_percentiles") or {}).items():
+        if is_anonymous_model_key(str(model)):
+            continue
+        try:
+            anchors, _conflicts = declared_anchors(pairs)
+        except (TypeError, ValueError, IndexError):
+            # Archived per-model pairs are parsed from comment text and can be malformed;
+            # an unusable curve reads as no-curve rather than raising (same rule as
+            # ``analysis._single_curve_pit``).
+            continue
+        if len(anchors) >= 2:
+            curves[str(model)] = anchors
+    return curves
+
+
+def _shared_extreme_anchor(record: dict, side: str) -> tuple[float, float] | OuterTailVerdict:
+    """``(percentile label, median member value)`` at the most extreme SHARED anchor.
+
+    Shared across members on purpose: medianing p99 against p97.5 would mix two different
+    quantities, and the canonical percentile set changed mid-season (11-point p2.5..p97.5 ->
+    13-point p1..p99), so the label cannot be hardcoded. Returns the verdict that explains
+    itself when no anchor qualifies.
+    """
+    curves = _member_declared_anchors(record)
+    if not curves:
+        return OuterTailVerdict.NO_MEMBER_CURVE
+    shared_labels = set.intersection(*(set(anchors) for anchors in curves.values()))
+    if not shared_labels:
+        return OuterTailVerdict.NO_SHARED_ANCHOR
+    label = max(shared_labels) if side == "high" else min(shared_labels)
+    extreme_enough = (
+        label >= STARVED_OUTER_TAIL_MIN_ANCHOR_PERCENTILE
+        if side == "high"
+        else label <= 100.0 - STARVED_OUTER_TAIL_MIN_ANCHOR_PERCENTILE
+    )
+    if not extreme_enough:
+        return OuterTailVerdict.ANCHOR_NOT_EXTREME
+    return label, float(np.median([anchors[label] for anchors in curves.values()]))
+
+
+def measure_outer_tails(
+    record: dict,
+    *,
+    floor_multiple: float = STARVED_OUTER_TAIL_FLOOR_MULTIPLE,
+) -> list[OuterTailReading]:
+    """One :class:`OuterTailReading` per OPEN bound of a numeric/discrete record.
+
+    A closed bound is never scanned: the CDF is pinned to 0.0 / 1.0 there, so a thin terminal
+    band is the question's own edge rather than a tail our declaration put out of reach.
+    """
+    built = _cdf_and_grid(record)
+    readings: list[OuterTailReading] = []
+    for side, is_open in (("low", record.get("open_lower_bound")), ("high", record.get("open_upper_bound"))):
+        if not is_open:
+            continue
+        if built is None:
+            readings.append(_unmeasurable(record, side, OuterTailVerdict.NO_USABLE_CDF))
+            continue
+        cdf, grid = built
+        readings.append(_measure_one_outer_tail(record, side, cdf, grid, floor_multiple=floor_multiple))
+    return readings
+
+
+def _unmeasurable(record: dict, side: str, verdict: OuterTailVerdict) -> OuterTailReading:
+    """A reading that carries only the reason no measurement was possible."""
+    return OuterTailReading(
+        question_id=record.get("question_id"),
+        title=str(record.get("title") or ""),
+        side=side,
+        verdict=verdict,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _OuterBand:
+    """The published bins lying FULLY beyond the declared anchor: which ones, and their mass.
+
+    Fully beyond on purpose, so the mass and the bin count describe the same segment — a
+    partially-covered bin would inflate one and not the other, and the ratio between them is
+    the whole measurement.
+    """
+
+    bin_indices: range
+    mass: float
+
+
+def _outer_band(cdf: np.ndarray, grid: np.ndarray, declared_value: float, side: str) -> _OuterBand | OuterTailVerdict:
+    """The band beyond ``declared_value``, or the verdict explaining why there isn't one."""
+    if side == "high":
+        if declared_value >= float(grid[-1]):
+            return OuterTailVerdict.DECLARED_BEYOND_BOUND
+        first_band_bin = int(np.searchsorted(grid, declared_value, side="left"))
+        band = _OuterBand(range(first_band_bin, len(cdf) - 1), float(cdf[-1] - cdf[first_band_bin]))
+    else:
+        if declared_value <= float(grid[0]):
+            return OuterTailVerdict.DECLARED_BEYOND_BOUND
+        last_band_edge = int(np.searchsorted(grid, declared_value, side="right")) - 1
+        band = _OuterBand(range(last_band_edge), float(cdf[last_band_edge] - cdf[0]))
+    return band if len(band.bin_indices) else OuterTailVerdict.EMPTY_BAND
+
+
+def _flat_zone_log_score(record: dict, cdf: np.ndarray, grid: np.ndarray, band: _OuterBand) -> float:
+    """The bot-side log score a resolution in the band's THINNEST bin would earn.
+
+    The thinnest bin rather than the mean one: on a starved band every bin sits at the same
+    floor, so this reads the cliff's depth, and on a band that still carries shape it reads
+    the worst landing rather than an average nobody experiences.
+    """
+    scaling = record["scaling"]
+    lower = float(scaling["range_min"])
+    thinnest_bin = min(band.bin_indices, key=lambda j: float(cdf[j + 1] - cdf[j]))
+    return numeric_log_score(
+        [float(v) for v in cdf],
+        float((grid[thinnest_bin] + grid[thinnest_bin + 1]) / 2.0),
+        lower,
+        float(scaling["range_max"]),
+        open_lower_bound=bool(record.get("open_lower_bound")),
+        open_upper_bound=bool(record.get("open_upper_bound")),
+        zero_point=_grid_zero_point(scaling.get("zero_point"), lower),
+    )
+
+
+def _measure_one_outer_tail(
+    record: dict,
+    side: str,
+    cdf: np.ndarray,
+    grid: np.ndarray,
+    *,
+    floor_multiple: float,
+) -> OuterTailReading:
+    scaling = record.get("scaling") or {}
+    if float(scaling["range_max"]) <= float(scaling["range_min"]):
+        # A degenerate range has no bins to score; the same guard numeric_pit_analysis applies.
+        return _unmeasurable(record, side, OuterTailVerdict.NO_USABLE_CDF)
+
+    anchor = _shared_extreme_anchor(record, side)
+    if isinstance(anchor, OuterTailVerdict):
+        return _unmeasurable(record, side, anchor)
+    percentile, declared_value = anchor
+
+    band = _outer_band(cdf, grid, declared_value, side)
+    if isinstance(band, OuterTailVerdict):
+        return _unmeasurable(record, side, band)
+
+    platform_min_step = _PLATFORM_MIN_STEP_NUMERATOR / (len(cdf) - 1)
+    mean_bin_mass = band.mass / len(band.bin_indices)
+    measured_floor_multiple = mean_bin_mass / platform_min_step
+
+    return OuterTailReading(
+        question_id=record.get("question_id"),
+        title=str(record.get("title") or ""),
+        side=side,
+        verdict=(OuterTailVerdict.STARVED if measured_floor_multiple < floor_multiple else OuterTailVerdict.HEALTHY),
+        declared_percentile=percentile,
+        declared_value=declared_value,
+        bound_value=float(grid[-1] if side == "high" else grid[0]),
+        tail_mass=band.mass,
+        beyond_bound_mass=float(1.0 - cdf[-1]) if side == "high" else float(cdf[0]),
+        band_bins=len(band.bin_indices),
+        mean_bin_mass=mean_bin_mass,
+        platform_min_step=platform_min_step,
+        floor_multiple=measured_floor_multiple,
+        flat_zone_log_score=_flat_zone_log_score(record, cdf, grid, band),
+    )
+
+
+def scan_outer_tails(
+    data: list[dict],
+    *,
+    floor_multiple: float = STARVED_OUTER_TAIL_FLOOR_MULTIPLE,
+    exclude_qids: frozenset[str] | None = None,
+) -> OuterTailScan:
+    """Measure every open-bound side of every numeric/discrete record in ``data``.
+
+    ``exclude_qids`` takes the same cohorts as ``compute_all_eras`` and the count is reported,
+    so an exclusion is a visible choice: a known-bug record's starved tail measures a retired
+    defect, not the current pipeline.
+    """
+    excluded = exclude_qids or frozenset()
+    readings: list[OuterTailReading] = []
+    n_excluded = 0
+    for record in data:
+        if record.get("type") not in NUMERIC_TYPES:
+            continue
+        if str(record.get("question_id")) in excluded:
+            n_excluded += 1
+            continue
+        readings.extend(measure_outer_tails(record, floor_multiple=floor_multiple))
+    return OuterTailScan(readings=readings, n_excluded=n_excluded)
+
+
+def _fmt_measured(value: float | None, spec: str) -> str:
+    """Format a measured field; only starved rows are rendered, so None never reaches here."""
+    return "n/a" if value is None else format(value, spec)
+
+
+def render_starved_outer_tails(
+    scan: OuterTailScan, *, floor_multiple: float = STARVED_OUTER_TAIL_FLOOR_MULTIPLE
+) -> str:
+    """Markdown section listing the flagged sides, worst flat-zone score first."""
+    counts = scan.verdict_counts
+    unmeasurable = {
+        verdict.value: counts[verdict]
+        for verdict in OuterTailVerdict
+        if verdict not in (OuterTailVerdict.STARVED, OuterTailVerdict.HEALTHY) and counts[verdict]
+    }
+    lines = [
+        "## Starved outer tails (open-bound p99 cliff)",
+        "",
+        "An OPEN bound's outer band is STARVED when the published bins lying beyond the most "
+        "extreme percentile every member declared carry no more than "
+        f"{floor_multiple:g}x the platform's per-bin minimum step (0.01/N) on average: the band "
+        "holds the structural minimum and nothing else, so every resolution in it earns the same "
+        "floor score (~-219 on any grid) — a cliff nobody declared. Compare `tail mass` against "
+        "`beyond bound`: the signature is the inversion, the declared outer mass sitting past the "
+        "displayed bound instead of spread across the band the declaration pointed at. DETECTOR "
+        "ONLY; any width response stays gated on the standing k_tail hold.",
+        "",
+        (
+            f"Scanned {scan.n_scanned} open-bound side(s); starved "
+            f"{counts[OuterTailVerdict.STARVED]}, healthy {counts[OuterTailVerdict.HEALTHY]}; "
+            f"excluded records {scan.n_excluded}. Unmeasurable: "
+            + (", ".join(f"{name}: {n}" for name, n in unmeasurable.items()) if unmeasurable else "none")
+            + ". `declared_beyond_bound` is not a defect — the members put their outer anchor past "
+            "the displayed bound, so the tail is out-of-range mass and there is no in-range band "
+            "to starve."
+        ),
+        "",
+    ]
+    if not scan.starved:
+        lines.append("Starved sides: none.")
+        lines.append("")
+        return "\n".join(lines)
+
+    header = (
+        "| question | side | declared p | declared value | displayed bound | tail mass | bins "
+        "| mean bin / min step | beyond bound | flat-zone log score | title |"
+    )
+    lines.append(header)
+    lines.append("|" + "|".join(["---"] * (header.count("|") - 1)) + "|")
+    for r in scan.starved:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(r.question_id),
+                    r.side,
+                    _fmt_measured(r.declared_percentile, "g"),
+                    _fmt_measured(r.declared_value, ".6g"),
+                    _fmt_measured(r.bound_value, ".6g"),
+                    _fmt_measured(r.tail_mass, ".4f"),
+                    str(r.band_bins),
+                    _fmt_measured(r.floor_multiple, ".2f"),
+                    _fmt_measured(r.beyond_bound_mass, ".4f"),
+                    _fmt_measured(r.flat_zone_log_score, ".1f"),
+                    r.title[:60],
+                ]
+            )
+            + " |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _fmt_ci(ci: tuple[float, float, float]) -> str:
     m, lo, hi = ci
     return f"{m:.3f} [{lo:.3f}, {hi:.3f}]"
@@ -544,9 +1050,18 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "declared-percentile curves). excl = records dropped by --exclude-qids."
     )
     lines.append("")
+    lines.append(
+        "set-valued (pt n) = out-of-range resolutions whose PIT is an INTERVAL rather than a value "
+        "(`above_upper_bound` -> [cdf[-1], 1], `below_lower_bound` -> [0, cdf[0]]: the platform gives "
+        "no value, and on an open bound our own CDF says how much mass we put out there), with the "
+        "point-metric denominator beside it. Those readings count in every coverage column when the "
+        "interval INTERSECTS the band, and are EXCLUDED from PIT std / mean PIT, which is why the two "
+        "denominators can differ. No midpoint is imputed."
+    )
+    lines.append("")
     header = (
         "| era | n | excl | n_eff | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
-        "| PIT std | mean PIT | med rel width (n) | band_miss (lo/hi) | OOB lo/hi |"
+        "| PIT std | mean PIT | med rel width (n) | band_miss (lo/hi) | OOB lo/hi | set-valued (pt n) |"
     )
     sep = "|" + "|".join(["---"] * (header.count("|") - 1)) + "|"
     lines.append(header)
@@ -554,8 +1069,8 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
     for m in metrics:
         rel = f"{m.median_rel_width:.3f} ({m.n_width})" if m.median_rel_width is not None else f"n/a ({m.n_width})"
 
-        def _point(value: float, *, underpowered: bool = m.underpowered) -> str:
-            return "n/a" if underpowered else f"{value:.3f}"
+        def _point(value: float | None, *, underpowered: bool = m.underpowered) -> str:
+            return "n/a" if underpowered or value is None else f"{value:.3f}"
 
         band = "n/a" if m.underpowered else f"{m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f})"
         cells = [
@@ -568,11 +1083,12 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
             _point(m.cov_at_10),
             _point(m.cov_at_50),
             _point(m.cov_at_90),
-            _point(m.pit_std),
-            _point(m.mean_pit),
+            _point(m.pit_std, underpowered=m.point_metrics_underpowered),
+            _point(m.mean_pit, underpowered=m.point_metrics_underpowered),
             rel,
             band,
             f"{m.n_oob_low}/{m.n_oob_high}",
+            f"{m.n_oob_interval} ({m.n_point})",
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
@@ -591,6 +1107,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Instead of --cached, pull a tournament live (read-only, free). Overrides --cached when set.",
     )
     parser.add_argument("--output-json", default=None, help="Optional path to also write the metrics as JSON.")
+    parser.add_argument(
+        "--output-starved-json",
+        default=None,
+        help=(
+            "Optional path to write the starved-outer-tail scan as JSON (every scanned side with "
+            "its verdict, not just the flagged ones). The markdown section is always printed."
+        ),
+    )
     parser.add_argument(
         "--exclude-qids",
         default="",
@@ -646,10 +1170,22 @@ def main(argv: list[str] | None = None) -> None:
     # is deliberately pinned to stderr so the report can be piped on its own.
     print(render_markdown(metrics))  # noqa: T201
 
+    # The starved-outer-tail scan reads the same records and the same exclusions. It is a
+    # per-QUESTION report rather than a per-era one, so it renders as its own section instead
+    # of a column, and it is printed unconditionally — a monitor nobody has to ask for.
+    scan = scan_outer_tails(data, exclude_qids=exclude_qids)
+    print()  # noqa: T201
+    print(render_starved_outer_tails(scan))  # noqa: T201
+
     if args.output_json:
         with open(args.output_json, "w") as f:
             json.dump([m.to_dict() for m in metrics], f, indent=2)
         logger.info(f"Wrote {len(metrics)} era rows to {args.output_json}")
+
+    if args.output_starved_json:
+        with open(args.output_starved_json, "w") as f:
+            json.dump(scan.to_dict(), f, indent=2)
+        logger.info(f"Wrote {scan.n_scanned} outer-tail side readings to {args.output_starved_json}")
 
 
 if __name__ == "__main__":

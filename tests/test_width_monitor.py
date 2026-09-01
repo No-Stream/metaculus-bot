@@ -22,20 +22,26 @@ from metaculus_bot.performance_analysis.cohorts import (
 )
 from metaculus_bot.performance_analysis.width_monitor import (
     MIN_N_FOR_POINT_METRICS,
+    STARVED_OUTER_TAIL_FLOOR_MULTIPLE,
     TS_ANCHOR_ENABLE,
     WIDENING_FLIP,
+    OuterTailReading,
+    OuterTailVerdict,
     _cdf_and_grid,
     _grid_zero_point,
     assign_era,
     compute_all_eras,
     compute_era_metrics,
     compute_pit,
-    compute_pit_details,
+    compute_pit_reading,
     default_eras,
     jeffreys_ci,
     main,
+    measure_outer_tails,
     relative_band_width,
     render_markdown,
+    render_starved_outer_tails,
+    scan_outer_tails,
 )
 
 GRID_N = 201
@@ -77,10 +83,16 @@ def _row_cells(md: str, label: str) -> list[str]:
     """The stripped cells of one rendered table row, indexed as in the header.
 
     1=era, 2=n, 3=excl, 4=n_eff, 5=cov80, 6=cov50, 7=cov@10, 8=cov@50, 9=cov@90,
-    10=PIT std, 11=mean PIT, 12=med rel width, 13=band_miss, 14=OOB.
+    10=PIT std, 11=mean PIT, 12=med rel width, 13=band_miss, 14=OOB, 15=set-valued (pt n).
     """
     [row] = [line for line in md.splitlines() if line.startswith(f"| {label} |")]
     return [cell.strip() for cell in row.split("|")]
+
+
+def _pit_and_side(record: dict) -> tuple[float | None, str | None]:
+    """``(point PIT, oob_side)`` for a record, for the point-valued cases below."""
+    reading = compute_pit_reading(record)
+    return (None, None) if reading is None else (reading.point, reading.oob_side)
 
 
 class TestPit:
@@ -90,7 +102,10 @@ class TestPit:
             rec = _linear_cdf_record(resolution=res)
             assert compute_pit(rec) == pytest.approx(expected, abs=1e-9)
 
-    def test_pit_out_of_bounds(self):
+    def test_pit_out_of_bounds_degenerates_to_a_point_when_no_mass_is_out_there(self):
+        # The identity ramp spans the full [0, 1], so cdf[0] == 0 and cdf[-1] == 1: the
+        # out-of-range INTERVAL collapses to the single value the old convention forced,
+        # and `compute_pit` still answers it.
         assert compute_pit(_linear_cdf_record(resolution="below_lower_bound")) == 0.0
         assert compute_pit(_linear_cdf_record(resolution="above_upper_bound")) == 1.0
 
@@ -101,6 +116,135 @@ class TestPit:
         assert compute_pit(rec) is None
         # Non-numeric, non-OOB resolution.
         assert compute_pit(_linear_cdf_record(resolution="annulled")) is None
+
+
+def _out_of_range_mass_record(*, resolution, cdf_start: float = 0.0, cdf_end: float = 1.0, **kwargs) -> dict:
+    """A record whose published CDF ramps ``cdf_start -> cdf_end`` over the displayed range.
+
+    ``1 - cdf_end`` is the mass declared ABOVE the displayed ceiling and ``cdf_start`` the
+    mass below the floor, which is what an out-of-range resolution's PIT interval is read
+    off.
+    """
+    rec = _linear_cdf_record(resolution=resolution, **kwargs)
+    rec["our_forecast_values"] = np.linspace(cdf_start, cdf_end, GRID_N).tolist()
+    return rec
+
+
+class TestSetValuedOutOfRangePit:
+    """An out-of-range resolution pins the PIT to a SET, not to 1.0 / 0.0.
+
+    Metaculus reports "beyond the displayed range" as a string, so the resolution VALUE is
+    unknown; all that is known is that ``F(resolution)`` lies in ``[cdf[-1], 1]`` (above) or
+    ``[0, cdf[0]]`` (below). On an open bound our own CDF is free to put real mass out there:
+    q44842 published 13% of its mass above the displayed ceiling, resolved
+    ``above_upper_bound`` and won spot peer +24.4, while the old PIT-1.0 convention scored it
+    a high-side band miss. The shape here is that record's (``cdf[-1] = 0.87``).
+    """
+
+    def test_above_upper_bound_reads_as_the_interval_above_the_cdf_end(self):
+        reading = compute_pit_reading(_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87))
+        assert reading is not None
+        assert reading.is_interval
+        assert (reading.low, reading.high) == pytest.approx((0.87, 1.0))
+        assert reading.oob_side == "high"
+        # There is no point PIT to report, and none is invented.
+        assert reading.point is None
+        assert compute_pit(_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87)) is None
+
+    def test_below_lower_bound_reads_as_the_interval_below_the_cdf_start(self):
+        reading = compute_pit_reading(_out_of_range_mass_record(resolution="below_lower_bound", cdf_start=0.13))
+        assert reading is not None
+        assert reading.is_interval
+        assert (reading.low, reading.high) == pytest.approx((0.0, 0.13))
+        assert reading.oob_side == "low"
+
+    def test_the_q44842_shape_counts_as_covered_at_cov80(self):
+        # [0.87, 1] intersects [0.10, 0.90], so the record is covered rather than a miss.
+        m = compute_era_metrics("test", [_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87)])
+        assert m is not None
+        assert m.n_pit == 1
+        assert m.cov80 == pytest.approx(jeffreys_ci(1, 1))
+        assert m.band_hi == pytest.approx(0.0)
+        assert m.band_miss == pytest.approx(0.0)
+        # cov@90 = P(PIT <= 0.90): the interval reaches below 0.90, so it counts.
+        assert m.cov_at_90 == pytest.approx(1.0)
+        assert m.cov_at_10 == pytest.approx(0.0)
+
+    def test_a_starved_tail_is_still_a_high_side_band_miss(self):
+        # cdf[-1] = 0.999 (the open-bound structural floor): the whole interval sits above
+        # 0.90, so the record misses the band exactly as it should.
+        m = compute_era_metrics("test", [_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.999)])
+        assert m is not None
+        assert m.cov80 == pytest.approx(jeffreys_ci(0, 1))
+        assert m.band_hi == pytest.approx(1.0)
+        assert m.band_lo == pytest.approx(0.0)
+        assert m.cov_at_90 == pytest.approx(0.0)
+
+    def test_a_starved_low_tail_is_still_a_low_side_band_miss(self):
+        m = compute_era_metrics("test", [_out_of_range_mass_record(resolution="below_lower_bound", cdf_start=0.001)])
+        assert m is not None
+        assert m.cov80 == pytest.approx(jeffreys_ci(0, 1))
+        assert m.band_lo == pytest.approx(1.0)
+        assert m.cov_at_10 == pytest.approx(1.0)
+
+    def test_the_q44842_low_side_mirror_counts_as_covered(self):
+        m = compute_era_metrics("test", [_out_of_range_mass_record(resolution="below_lower_bound", cdf_start=0.13)])
+        assert m is not None
+        assert m.cov80 == pytest.approx(jeffreys_ci(1, 1))
+        assert m.band_lo == pytest.approx(0.0)
+
+    def test_interval_records_are_excluded_from_point_metrics_and_the_count_is_disclosed(self):
+        # Nine point PITs spread across the unit interval plus one set-valued record.
+        recs = [_record_with_pit(p) for p in np.linspace(0.05, 0.95, MIN_N_FOR_POINT_METRICS)]
+        recs.append(_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87))
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_pit == MIN_N_FOR_POINT_METRICS + 1
+        assert m.n_point == MIN_N_FOR_POINT_METRICS
+        assert m.n_oob_interval == 1
+        # Point statistics see only the ten point readings — an imputed midpoint (0.935)
+        # would have pulled both of these.
+        points = np.linspace(0.05, 0.95, MIN_N_FOR_POINT_METRICS)
+        assert m.mean_pit == pytest.approx(points.mean())
+        assert m.pit_std == pytest.approx(points.std())
+        # The interval still counts in coverage: 8 of the 10 point PITs are inside
+        # [0.10, 0.90] (0.05 and 0.95 are not) and [0.87, 1] intersects the band, so 9 of 11.
+        assert m.cov80 == pytest.approx(jeffreys_ci(9, 11))
+
+    def test_an_all_interval_era_reports_no_point_statistics_rather_than_nan(self):
+        recs = [_out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87)]
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_point == 0
+        assert m.pit_std is None
+        assert m.mean_pit is None
+        cells = _row_cells(render_markdown([m]), "test")
+        assert cells[10] == "n/a"
+        assert cells[11] == "n/a"
+
+    def test_the_disclosure_count_is_rendered_and_serialized(self):
+        recs = [_record_with_pit(0.5), _out_of_range_mass_record(resolution="above_upper_bound", cdf_end=0.87)]
+        metrics = compute_all_eras(recs)
+        [m] = [row for row in metrics if row.label == "all"]
+        assert m.to_dict()["n_oob_interval"] == 1
+        assert m.to_dict()["n_point"] == 1
+        md = render_markdown(metrics)
+        assert "set-valued" in md
+        # Last column: set-valued readings, with the point-metric denominator beside them.
+        assert _row_cells(md, "all")[15] == "1 (1)"
+
+    def test_a_numeric_out_of_grid_resolution_stays_a_point_reading(self):
+        # Only the STRING markers are set-valued: when the platform gives the value, the
+        # members' declared curves read a real quantile off it (see TestOutOfGridPit).
+        rec = _below_bound_mass_record(
+            resolution=50.0,
+            per_model_percentiles={"model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]]},
+        )
+        reading = compute_pit_reading(rec)
+        assert reading is not None
+        assert not reading.is_interval
+        assert reading.point == pytest.approx(0.10, abs=1e-9)
+        assert reading.oob_side == "low"
 
 
 def _below_bound_mass_record(*, resolution, per_model_percentiles=None, **kwargs) -> dict:
@@ -132,7 +276,7 @@ class TestOutOfGridPit:
                 "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
             },
         )
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side == "low"
         assert pit == pytest.approx(0.10, abs=1e-9)
         assert compute_pit(rec) == pytest.approx(0.10, abs=1e-9)
@@ -147,7 +291,7 @@ class TestOutOfGridPit:
                 "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
             },
         )
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side == "low"
         assert pit == pytest.approx((0.6333333 + 0.50) / 2, abs=1e-6)
 
@@ -156,7 +300,7 @@ class TestOutOfGridPit:
             resolution=250.0,
             per_model_percentiles={"model-a": [[10.0, 120.0], [50.0, 150.0], [90.0, 220.0]]},
         )
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side == "high"
         assert pit == pytest.approx(0.90, abs=1e-9)
 
@@ -164,19 +308,19 @@ class TestOutOfGridPit:
         # Degraded path (e.g. stacked-era records with no per-model bullets): the
         # grid-endpoint read is kept, but the OOB side still surfaces the record.
         rec = _below_bound_mass_record(resolution=50.0)
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side == "low"
         assert pit == pytest.approx(0.90, abs=1e-9)
 
     def test_in_grid_resolution_has_no_oob_side(self):
-        pit, oob_side = compute_pit_details(_linear_cdf_record(resolution=50.0))
+        pit, oob_side = _pit_and_side(_linear_cdf_record(resolution=50.0))
         assert oob_side is None
         assert pit == pytest.approx(0.50, abs=1e-9)
 
     def test_resolution_exactly_at_bound_keeps_endpoint_read(self):
         # AT a bound the clamp IS the correct PIT: F(bound) = cdf[0].
         rec = _below_bound_mass_record(resolution=100.0)
-        pit, oob_side = compute_pit_details(rec)
+        pit, oob_side = _pit_and_side(rec)
         assert oob_side is None
         assert pit == pytest.approx(0.90, abs=1e-9)
 
@@ -951,3 +1095,275 @@ class TestLogScaleGrid:
         assert built is not None
         _cdf_arr, grid = built
         np.testing.assert_array_equal(grid, api_grid)
+
+
+def _rig_count_record(
+    *,
+    band_bin_multiple: float,
+    declared_top: tuple[float, ...] = (602.0, 603.0, 606.0),
+    top_label: float = 99.0,
+    lower_label: float = 1.0,
+    declared_bottom: tuple[float, ...] = (566.0, 568.0, 570.0),
+    open_upper: bool = True,
+    open_lower: bool = True,
+    question_id: object = 45218,
+    created_at: str = "2026-08-13T06:11:38Z",
+) -> dict:
+    """The q45218 geometry: the record whose flat -219.5 zone motivated the detector.
+
+    A 72-point discrete grid over [559.5, 630.5] (one rig per step), open on both ends, three
+    members declaring p99 at 602 / 603 / 606 (median 603) and p1 at 566 / 568 / 570 (median
+    568), ``cdf[0] = 0.01`` and ``cdf[-1] = 0.99`` — the canonical p1/p99 out-of-range mass.
+    Each bin fully above the declared p99 carries ``band_bin_multiple`` times the platform's
+    minimum step (``0.01 / 71``), so a caller dials starvation directly: the real record sat
+    at ~1.12, every one of its 27 upper bins pinned at the structural floor.
+
+    The mass below the declared p1 is left at a healthy density so a test can read one side at
+    a time; ``declared_bottom`` mirrors the geometry when the low side is the subject.
+    """
+    n_points = 72
+    grid = np.linspace(559.5, 630.5, n_points)
+    min_step = 0.01 / (n_points - 1)
+    cdf_start, cdf_end = 0.01, 0.99
+
+    anchor_high = float(np.median(declared_top))
+    first_band_bin = min(int(np.searchsorted(grid, anchor_high, side="left")), n_points - 1)
+    band_bins = (n_points - 1) - first_band_bin
+
+    if band_bins == 0:
+        # The declared p99 sits at or past the displayed ceiling (the q44842 shape): there is no
+        # in-range band to starve, so the CDF is a plain ramp across the whole displayed range.
+        cdf = np.linspace(cdf_start, cdf_end, n_points)
+    else:
+        band_mass = band_bins * band_bin_multiple * min_step
+        cdf = np.empty(n_points, dtype=float)
+        cdf[: first_band_bin + 1] = np.linspace(cdf_start, cdf_end - band_mass, first_band_bin + 1)
+        cdf[first_band_bin:] = cdf[first_band_bin] + np.arange(band_bins + 1) * (band_mass / band_bins)
+
+    percentiles = {
+        f"model-{i}": [[lower_label, low], [50.0, 586.0], [top_label, high]]
+        for i, (low, high) in enumerate(zip(declared_bottom, declared_top, strict=True))
+    }
+    return {
+        "type": "discrete",
+        "question_id": question_id,
+        "title": "How many active US drilling rigs will there be",
+        "our_forecast_values": cdf.tolist(),
+        "resolution_parsed": 588.0,
+        "scaling": {"range_min": 559.5, "range_max": 630.5, "zero_point": None},
+        "open_lower_bound": open_lower,
+        "open_upper_bound": open_upper,
+        "bot_comment_created_at": created_at,
+        "per_model_numeric_percentiles": percentiles,
+    }
+
+
+def _high_side(record: dict) -> OuterTailReading:
+    [reading] = [r for r in measure_outer_tails(record) if r.side == "high"]
+    return reading
+
+
+def _flat_zone_score(band_bin_multiple: float, *, n_points: int = 72, n_open_bounds: int = 2) -> float:
+    """The closed-form Metaculus log score for a bin holding ``multiple`` x the min step.
+
+    ``50 * ln(pmf / baseline)`` with ``pmf = multiple * 0.01 / N`` and
+    ``baseline = (1 - 0.05 * open_bounds) / N``. At a multiple near 1.1 that is about -219 on
+    ANY grid size, which is what makes a starved band a flat cliff rather than a gradient:
+    q45218 measured -219.5 and q44182, the worst record on the board, -219.0.
+    """
+    n_inbound = n_points - 1
+    pmf = band_bin_multiple * 0.01 / n_inbound
+    baseline = (1.0 - 0.05 * n_open_bounds) / n_inbound
+    return 50.0 * float(np.log(pmf / baseline))
+
+
+class TestStarvedOuterTail:
+    """The open-bound p99 cliff: mass beyond the declared outer anchor starved to the floor.
+
+    Distinct from the shipped ``CDF_MAXSTEP_CLIP`` smear. On an open bound the declared tail
+    can be routed out of the displayed range entirely, leaving every in-range bin above the
+    declared p99 pinned at the platform's structural minimum step — so every resolution out
+    there scores at the same floor (-219.5 on q45218, -219.0 on q44182, the worst record on
+    the board), a cliff nobody declared and one no modest widening walks out of, because the
+    defect is a step function in the declared p99.
+    """
+
+    def test_the_q45218_geometry_fires(self):
+        reading = _high_side(_rig_count_record(band_bin_multiple=1.12))
+        assert reading.verdict is OuterTailVerdict.STARVED
+        assert reading.starved
+        assert reading.declared_percentile == 99.0
+        assert reading.declared_value == pytest.approx(603.0)
+        assert reading.bound_value == pytest.approx(630.5)
+        assert reading.band_bins == 27
+        assert reading.tail_mass == pytest.approx(27 * 1.12 * 0.01 / 71)
+        assert reading.beyond_bound_mass == pytest.approx(0.01)
+        assert reading.floor_multiple == pytest.approx(1.12)
+        # The whole point: any resolution in that band earns the platform's floor score, which
+        # is what q45218 measured at -219.5 and q44182 at -219.0.
+        assert reading.flat_zone_log_score == pytest.approx(_flat_zone_score(1.12), abs=0.5)
+
+    def test_an_honest_tail_does_not_fire(self):
+        reading = _high_side(_rig_count_record(band_bin_multiple=6.0))
+        assert reading.verdict is OuterTailVerdict.HEALTHY
+        assert not reading.starved
+        assert reading.floor_multiple == pytest.approx(6.0)
+        # Still a bad place to resolve, but ~84 points off the cliff rather than sitting on it.
+        assert reading.flat_zone_log_score == pytest.approx(_flat_zone_score(6.0), abs=0.5)
+        assert reading.flat_zone_log_score is not None
+        assert reading.flat_zone_log_score - _flat_zone_score(1.12) > 80.0
+
+    def test_the_threshold_is_the_named_constant(self):
+        just_under = _high_side(_rig_count_record(band_bin_multiple=STARVED_OUTER_TAIL_FLOOR_MULTIPLE * 0.99))
+        just_over = _high_side(_rig_count_record(band_bin_multiple=STARVED_OUTER_TAIL_FLOOR_MULTIPLE * 1.01))
+        assert just_under.starved
+        assert not just_over.starved
+        # Calibrated over the archived performance dataset (271 numeric/discrete records, 417
+        # measurable open-bound sides; receipts in scratch/next_season_bundle_2026-09/item19/):
+        # q45218 reads 1.12 on both sides and q44182 1.46 high / 1.13 low, so both fire, while
+        # q44842 is not measurable on either side because its declaration routes the tail past
+        # the ceiling. The measured distribution is bimodal — 44 sides at [1.00, 1.25), then
+        # ~8 per 0.25 bucket to 3.0, median 10.3 — so the cut is not load-bearing, and 2.0
+        # keeps margin over q44182's 1.46.
+        assert STARVED_OUTER_TAIL_FLOOR_MULTIPLE == 2.0
+
+    def test_an_explicit_floor_multiple_overrides_the_default(self):
+        record = _rig_count_record(band_bin_multiple=3.0)
+        assert not _high_side(record).starved
+        [strict] = [r for r in measure_outer_tails(record, floor_multiple=4.0) if r.side == "high"]
+        assert strict.starved
+
+    def test_the_q44842_shape_is_unmeasurable_rather_than_starved(self):
+        # q44842 declared p99 at 20500 against a 14000 ceiling: the declaration itself routes
+        # the outer tail past the displayed range, which is the honest open-bound shape (that
+        # record won spot peer +24.4). There is no in-range band above the anchor to starve.
+        reading = _high_side(_rig_count_record(band_bin_multiple=1.12, declared_top=(640.0, 660.0, 700.0)))
+        assert reading.verdict is OuterTailVerdict.DECLARED_BEYOND_BOUND
+        assert reading.starved is False
+        assert reading.tail_mass is None
+
+    def test_the_low_side_mirror_fires_on_a_starved_floor(self):
+        # The same geometry read from below: the bins under the declared p1 (568) at 1.2x the
+        # min step, with the canonical 1% below the displayed floor.
+        record = _rig_count_record(band_bin_multiple=6.0)
+        cdf = np.asarray(record["our_forecast_values"])
+        grid = np.linspace(559.5, 630.5, 72)
+        last_bin = int(np.searchsorted(grid, 568.0, side="right")) - 1
+        min_step = 0.01 / 71
+        band_mass = last_bin * 1.2 * min_step
+        cdf[: last_bin + 1] = 0.01 + np.arange(last_bin + 1) * (band_mass / last_bin)
+        record["our_forecast_values"] = cdf.tolist()
+
+        [low] = [r for r in measure_outer_tails(record) if r.side == "low"]
+        assert low.verdict is OuterTailVerdict.STARVED
+        assert low.declared_percentile == 1.0
+        assert low.declared_value == pytest.approx(568.0)
+        assert low.bound_value == pytest.approx(559.5)
+        assert low.band_bins == last_bin
+        assert low.beyond_bound_mass == pytest.approx(0.01)
+        assert low.floor_multiple == pytest.approx(1.2)
+        assert low.flat_zone_log_score == pytest.approx(_flat_zone_score(1.2), abs=0.5)
+
+    def test_a_closed_bound_side_is_never_scanned(self):
+        readings = measure_outer_tails(_rig_count_record(band_bin_multiple=1.12, open_upper=False))
+        assert [r.side for r in readings] == ["low"]
+
+    def test_a_record_without_member_curves_is_unmeasurable_not_healthy(self):
+        # Stacked-era and trimmed comments lose the per-model percentile lines. The absence of
+        # a declaration must not read as "this tail is fine" — that silent pass is exactly
+        # what the verdict enum exists to prevent.
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {}
+        assert _high_side(record).verdict is OuterTailVerdict.NO_MEMBER_CURVE
+
+    def test_a_curve_whose_shared_anchor_is_not_extreme_is_unmeasurable(self):
+        # A trimmed recovery can leave the members sharing only their p50. Reading the band as
+        # "everything above the median" would call almost every record starved.
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "model-0": [[10.0, 575.0], [50.0, 586.0]],
+            "model-1": [[50.0, 586.0], [99.0, 603.0]],
+        }
+        assert _high_side(record).verdict is OuterTailVerdict.ANCHOR_NOT_EXTREME
+
+    def test_anonymous_forecaster_keys_are_excluded_from_the_anchor(self):
+        # On a stacker-fired record the positional `Forecaster N` bucket holds the stacker's
+        # AGGREGATE, not a member; pooling it into the median-of-members moves the anchor.
+        # Same rule as declared_percentile_pit and max_step_clamp_screen next door.
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "Forecaster 1": [[1.0, 560.0], [50.0, 586.0], [99.0, 628.0]],
+        }
+        assert _high_side(record).verdict is OuterTailVerdict.NO_MEMBER_CURVE
+
+    def test_a_record_without_a_usable_cdf_is_unmeasurable(self):
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["scaling"] = {}
+        assert {r.verdict for r in measure_outer_tails(record)} == {OuterTailVerdict.NO_USABLE_CDF}
+
+    def test_non_numeric_records_are_skipped_by_the_scan(self):
+        scan = scan_outer_tails([{"type": "binary", "our_prob_yes": 0.5}])
+        assert scan.readings == []
+        assert scan.starved == []
+
+    def test_the_scan_counts_verdicts_and_ranks_the_flagged_rows(self):
+        starved = _rig_count_record(band_bin_multiple=1.12, question_id=45218)
+        healthy = _rig_count_record(band_bin_multiple=6.0, question_id=44182)
+        blind = _rig_count_record(band_bin_multiple=1.12, question_id=44553)
+        blind["per_model_numeric_percentiles"] = {}
+        scan = scan_outer_tails([starved, healthy, blind])
+
+        assert scan.n_scanned == 6  # three records x two open sides
+        assert [r.question_id for r in scan.starved] == [45218]
+        assert scan.verdict_counts[OuterTailVerdict.STARVED] == 1
+        assert scan.verdict_counts[OuterTailVerdict.NO_MEMBER_CURVE] == 2
+
+    def test_excluded_qids_leave_the_scan(self):
+        scan = scan_outer_tails(
+            [_rig_count_record(band_bin_multiple=1.12, question_id=43913)],
+            exclude_qids=KNOWN_BUG_QIDS,
+        )
+        assert scan.readings == []
+        assert scan.n_excluded == 1
+
+    def test_the_rendered_section_states_every_reported_field(self):
+        scan = scan_outer_tails([_rig_count_record(band_bin_multiple=1.12)])
+        md = render_starved_outer_tails(scan)
+        assert "Starved outer tails" in md
+        assert "45218" in md
+        assert "603" in md  # the declared p99
+        assert "630.5" in md  # the displayed ceiling
+        assert "-219" in md  # the flat-zone log score
+        assert "| 27 |" in md  # band bins
+        assert "0.0043" in md  # tail mass, 27 bins x 1.12 x the min step
+
+    def test_a_scan_with_nothing_starved_says_so(self):
+        md = render_starved_outer_tails(scan_outer_tails([_rig_count_record(band_bin_multiple=6.0)]))
+        assert "Starved outer tails" in md
+        assert "none" in md.lower()
+
+    def test_the_unmeasurable_tally_is_disclosed(self):
+        blind = _rig_count_record(band_bin_multiple=1.12)
+        blind["per_model_numeric_percentiles"] = {}
+        md = render_starved_outer_tails(scan_outer_tails([blind]))
+        assert "no_member_curve: 2" in md
+
+    def test_the_cli_renders_the_section(self, tmp_path, capsys):
+        path = tmp_path / "data.json"
+        path.write_text(json.dumps([_rig_count_record(band_bin_multiple=1.12)]))
+        main(["--cached", str(path)])
+        out = capsys.readouterr().out
+        assert "Numeric width / calibration monitor" in out
+        assert "Starved outer tails" in out
+
+    def test_the_cli_can_write_the_scan_as_json(self, tmp_path):
+        data = tmp_path / "data.json"
+        data.write_text(json.dumps([_rig_count_record(band_bin_multiple=1.12)]))
+        out_json = tmp_path / "starved.json"
+        main(["--cached", str(data), "--output-starved-json", str(out_json)])
+        payload = json.loads(out_json.read_text())
+        [high] = [row for row in payload["readings"] if row["side"] == "high"]
+        assert high["verdict"] == "starved"
+        assert high["declared_value"] == pytest.approx(603.0)
+        assert high["flat_zone_log_score"] < -215.0
+        assert payload["verdict_counts"]["starved"] == 1

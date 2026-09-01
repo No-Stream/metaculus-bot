@@ -3,6 +3,7 @@
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import numpy as np
@@ -248,16 +249,111 @@ def per_model_binary_scores(data: list[dict]) -> dict[str, dict]:
     return result
 
 
+OUT_OF_RANGE_MARKER_SIDES: Mapping[str, str] = {"below_lower_bound": "low", "above_upper_bound": "high"}
+
+
+@dataclass(frozen=True, slots=True)
+class PitReading:
+    """One record's PIT reading: a point value, or an INTERVAL of possible values.
+
+    Metaculus reports a resolution past the displayed range as the string
+    ``above_upper_bound`` / ``below_lower_bound``, so the resolution VALUE is unknown and
+    ``F(resolution)`` is only pinned to a SET: ``[cdf[-1], 1]`` above the ceiling,
+    ``[0, cdf[0]]`` below the floor. On an open bound that set can be wide, because our own
+    CDF is free to put real mass out there — q44842 published 13% of its mass above the
+    displayed ceiling, resolved ``above_upper_bound``, and won spot peer +24.4, while the old
+    convention (PIT := 1.0) scored it a high-side band miss.
+
+    Two conventions ride on this type, and they differ deliberately:
+
+    * COVERAGE counts an interval as covered when it INTERSECTS the band — a band miss only
+      when the WHOLE interval lies outside it.
+    * POINT statistics (mean, std, histogram) EXCLUDE intervals and disclose how many were
+      excluded. Imputing a midpoint would manufacture a reading nobody measured.
+
+    An interval whose endpoints coincide (a closed bound, or an open one carrying no
+    out-of-range mass) IS a point reading: ``is_interval`` is False and ``point`` answers the
+    same value the old convention forced, so nothing changes on those records.
+    """
+
+    low: float
+    high: float
+    oob_side: str | None = None
+    """``"low"``/``"high"`` when the resolution fell beyond the value grid, else None."""
+
+    @classmethod
+    def from_point(cls, value: float, oob_side: str | None = None) -> "PitReading":
+        return cls(low=value, high=value, oob_side=oob_side)
+
+    @property
+    def is_interval(self) -> bool:
+        return self.high > self.low
+
+    @property
+    def point(self) -> float | None:
+        """The PIT when it is a single value; None for an interval reading."""
+        return None if self.is_interval else self.low
+
+    def intersects(self, band_low: float, band_high: float) -> bool:
+        """Coverage predicate: does any of this reading fall inside ``[band_low, band_high]``?"""
+        return self.high >= band_low and self.low <= band_high
+
+    def at_or_below(self, threshold: float) -> bool:
+        """Cumulative coverage ``PIT <= threshold`` — the band ``[0, threshold]``."""
+        return self.low <= threshold
+
+    def entirely_below(self, threshold: float) -> bool:
+        return self.high < threshold
+
+    def entirely_above(self, threshold: float) -> bool:
+        return self.low > threshold
+
+
+def out_of_range_pit_reading(resolution: object, cdf_values: Sequence[float] | np.ndarray) -> PitReading | None:
+    """The interval a STRING out-of-range resolution pins ``F(resolution)`` to.
+
+    Returns None for anything else (a numeric resolution, an annulled question), so callers
+    read it as "is this the set-valued case?" and fall through otherwise. THE single home of
+    the convention: ``numeric_pit_analysis`` here and ``width_monitor.compute_pit_reading``
+    both go through it.
+    """
+    side = OUT_OF_RANGE_MARKER_SIDES.get(resolution) if isinstance(resolution, str) else None
+    if side is None:
+        return None
+    if side == "high":
+        return PitReading(low=float(cdf_values[-1]), high=1.0, oob_side="high")
+    return PitReading(low=0.0, high=float(cdf_values[0]), oob_side="low")
+
+
+def pit_band_count(readings: Sequence[PitReading], band_low: float, band_high: float) -> int:
+    """How many readings the band covers (an interval counts when it intersects)."""
+    return sum(1 for reading in readings if reading.intersects(band_low, band_high))
+
+
+def pit_point_values(readings: Sequence[PitReading]) -> list[float]:
+    """The point PITs, dropping the set-valued readings that point statistics exclude."""
+    return [value for value in (reading.point for reading in readings) if value is not None]
+
+
 def numeric_pit_analysis(data: list[dict]) -> dict:
     """PIT (Probability Integral Transform) analysis for numeric questions.
 
-    Returns dict with pit_values, coverage stats, and histogram bin counts.
+    Coverage is computed over every reading, with an out-of-range resolution counted as
+    covered when its PIT INTERVAL intersects the band (see :class:`PitReading`). The
+    histogram and ``pit_values`` are POINT statistics and exclude interval readings;
+    ``n_oob_interval`` discloses how many were excluded, so a shrinking histogram is never
+    silent.
+
+    Keys: ``count`` (readings), ``n_point`` / ``n_oob_interval`` (its split),
+    ``pit_values`` (point readings only), ``pit_intervals`` (the set-valued ones as
+    ``(low, high)``), ``histogram``, ``coverage_90`` / ``coverage_50``,
+    ``mean_numeric_log_score``.
     """
     numeric = [r for r in data if r["type"] in ("numeric", "discrete") and r["numeric_log_score"] is not None]
     if not numeric:
         return {"count": 0}
 
-    pit_values: list[float] = []
+    readings: list[PitReading] = []
     for r in numeric:
         cdf_values = r["our_forecast_values"]
         resolution = r["resolution_parsed"]
@@ -271,50 +367,53 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
         lower_bound = float(lower_bound)
         upper_bound = float(upper_bound)
 
-        if resolution == "above_upper_bound":
-            pit = 1.0
-        elif resolution == "below_lower_bound":
-            pit = 0.0
-        elif isinstance(resolution, (int, float)):
+        out_of_range = out_of_range_pit_reading(resolution, cdf_values)
+        if out_of_range is not None:
+            readings.append(out_of_range)
+        elif isinstance(resolution, (int, float)) and not isinstance(resolution, bool):
             if upper_bound - lower_bound <= 0:
                 # No range, no interpolated PIT — the record is dropped rather than
                 # contributing the 0.5 that used to come back from _interpolate_pit, which
                 # is the single most favorable value available (inside BOTH coverage bands).
-                # Scoped to the interpolated branch: an out-of-bound resolution's 0.0/1.0 is
+                # Scoped to the interpolated branch: an out-of-range resolution's interval is
                 # a real reading that never touched the range.
                 continue
-            pit = _interpolate_pit(
-                float(resolution),
-                lower_bound,
-                upper_bound,
-                cdf_values,
-                value_grid=scaling.get("continuous_range"),
-                zero_point=grid_zero_point(scaling.get("zero_point"), lower_bound),
-                per_model_percentiles=r.get("per_model_numeric_percentiles"),
+            readings.append(
+                PitReading.from_point(
+                    _interpolate_pit(
+                        float(resolution),
+                        lower_bound,
+                        upper_bound,
+                        cdf_values,
+                        value_grid=scaling.get("continuous_range"),
+                        zero_point=grid_zero_point(scaling.get("zero_point"), lower_bound),
+                        per_model_percentiles=r.get("per_model_numeric_percentiles"),
+                    )
+                )
             )
-        else:
-            continue
 
-        pit_values.append(pit)
-
-    if not pit_values:
+    if not readings:
         return {"count": 0}
 
+    point_values = pit_point_values(readings)
     num_bins = 10
     histogram = [0] * num_bins
-    for pit in pit_values:
+    for pit in point_values:
         bin_idx = min(int(pit * num_bins), num_bins - 1)
         histogram[bin_idx] += 1
 
-    # Coverage: fraction of PIT values in [0.05, 0.95] (should be ~90% for well-calibrated)
-    coverage_90 = sum(1 for p in pit_values if 0.05 <= p <= 0.95) / len(pit_values)
-    coverage_50 = sum(1 for p in pit_values if 0.25 <= p <= 0.75) / len(pit_values)
+    # Coverage: fraction of readings the band covers (~90% / ~50% when well-calibrated).
+    coverage_90 = pit_band_count(readings, 0.05, 0.95) / len(readings)
+    coverage_50 = pit_band_count(readings, 0.25, 0.75) / len(readings)
 
     log_scores = [r["numeric_log_score"] for r in numeric]
 
     return {
-        "count": len(pit_values),
-        "pit_values": pit_values,
+        "count": len(readings),
+        "n_point": len(point_values),
+        "n_oob_interval": len(readings) - len(point_values),
+        "pit_values": point_values,
+        "pit_intervals": [(reading.low, reading.high) for reading in readings if reading.is_interval],
         "histogram": histogram,
         "coverage_90": coverage_90,
         "coverage_50": coverage_50,
@@ -913,7 +1012,12 @@ def _per_model_section_lines(data: list[dict]) -> list[str]:
 
 
 def _numeric_section_lines(data: list[dict]) -> list[str]:
-    """Numeric coverage headline plus the ten-bin PIT histogram. Empty when no PITs."""
+    """Numeric coverage headline plus the ten-bin PIT histogram. Empty when no PITs.
+
+    The set-valued count is rendered unconditionally: those records DO count toward the two
+    coverage lines (on band intersection) and do NOT appear in the histogram, so a reader
+    comparing the two needs the split stated rather than inferred.
+    """
     na = numeric_pit_analysis(data)
     if na["count"] <= 0:
         return []
@@ -924,6 +1028,8 @@ def _numeric_section_lines(data: list[dict]) -> list[str]:
         f"- Mean Numeric Log Score: {na['mean_numeric_log_score']:.2f}",
         f"- 90% Coverage (PIT in [0.05, 0.95]): {na['coverage_90']:.1%}",
         f"- 50% Coverage (PIT in [0.25, 0.75]): {na['coverage_50']:.1%}",
+        f"- Out-of-range resolutions (set-valued PIT; counted in coverage, "
+        f"excluded from the histogram): {na['n_oob_interval']}",
         "",
         "### PIT Histogram",
         "| Bin | Count |",
