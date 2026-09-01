@@ -269,17 +269,22 @@ def _get_json(params: dict[str, str | int], token: str) -> dict:
     scoped to the scoring pull (three retries, and a ``RuntimeError`` when they run out),
     while this probe pages several slugs in one pass and soft-fails per slug — so an
     exhausted retry has to arrive as a ``requests`` exception for the per-slug handler.
+
+    The exhausted 429 breaks out and raises the descriptive error below. It used to fall
+    through to ``raise_for_status`` on the last attempt, which made that raise unreachable
+    and reported six rate-limited attempts as one unlucky request.
     """
     headers = {"Authorization": f"Token {token}"}
     for attempt in range(MAX_RETRIES):
         response = requests.get(POSTS_URL, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECS)
-        if response.status_code == 429 and attempt < MAX_RETRIES - 1:
-            wait = RETRY_BACKOFF_SECS * (attempt + 1)
-            logger.warning(f"Rate limited (429); retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
-            time.sleep(wait)
-            continue
-        response.raise_for_status()
-        return response.json()
+        if response.status_code != 429:
+            response.raise_for_status()
+            return response.json()
+        if attempt == MAX_RETRIES - 1:
+            break
+        wait = RETRY_BACKOFF_SECS * (attempt + 1)
+        logger.warning(f"Rate limited (429); retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
+        time.sleep(wait)
     raise requests.HTTPError(f"429 rate limit: retries exhausted after {MAX_RETRIES} attempts")
 
 
