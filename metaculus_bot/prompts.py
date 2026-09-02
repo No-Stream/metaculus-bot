@@ -500,14 +500,14 @@ SUMMARIZER_SOFT_FAIL_BANNER = (
 _SOURCE_PROVENANCE_LADDER = """
                • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
                • Weight factual claims by proximity to the primary record. The briefing's claims arrive tagged by
-                 source tier where the tier was clear: [A: ...] official / primary record, including the question's
-                 own named resolution source; [B: ...] wire services and papers of record; [C: ...] aggregators,
-                 advocacy, partisan, translated or single-outlet reports (use their cited facts, not their framing
-                 or causal narrative); [D: ...] anonymous, social, rumor or untraceable AI summaries (suggestive only).
+                 source tier where it was clear: [A: ...] official or primary record (including the question's own
+                 resolution source), [B: ...] wire services and papers of record, [C: ...] aggregators, advocacy or
+                 single-outlet reports (use their cited facts, not their framing), [D: ...] anonymous, social or
+                 untraceable (suggestive only).
                • `[unverified attribution]` marks a claim whose named outlet the research pipeline could not match
-                 against its own retrieval record, so the tag and its tier were removed together. The claim itself
-                 may still be correct: treat it as untiered, unattributed evidence rather than as a named outlet's
-                 authority, and not as a low tier either.
+                 against its own retrieval record, so the tag and its tier were removed. The claim itself may still
+                 be correct: treat it as untiered, unattributed evidence rather than as a named outlet's authority,
+                 and not as a low tier either.
                • Weigh motivation, not just authority: discount claims that serve the speaker's interest (hype,
                  marketing, sponsor optimism). Treat a statement AGAINST the speaker's interest — a company tempering
                  its own timeline, an on-record denial of a favorable rumor — as strong evidence.
@@ -584,8 +584,8 @@ _REMAINING_EXPOSURE_SENTENCE = (
 # forecasters a vocabulary the table no longer uses. Ships in all three forecaster prompts,
 # gated with the rest of the clause on the snapshot section being present.
 _MARKET_READING_RULES = (
-    "The snapshot's legend defines its columns and markers; three reading rules sit on top. A "
-    "`same_quantity_other_cut` market measures the same thing at another date, threshold or source, so "
+    "Three reading rules for the snapshot (its legend defines the columns and markers). A "
+    "`same_quantity_other_cut` market measures the same thing at another date, threshold or source: "
     "extrapolate from it rather than discount it vaguely. When a market's relation is tight but its liquidity "
     "thin, the liquidity warning governs — a thin price is noisy however tight its relation — so widen around "
     "its implied value rather than transplant its price. A market with several `↳` outcomes is a DISTRIBUTION "
@@ -829,7 +829,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i) — union only over paths that cannot be the same event, since an overlapping term double-counts it). A rough quantitative estimate from data is more reliable than an intuitive guess.
                • {
             _REMAINING_EXPOSURE_SENTENCE
-        } For a recurring event with a history of inter-arrival gaps (product launches, elections, legislation, earnings), an unconditional "event per typical interval" rate is wrong once time has elapsed without the event: fit a simple model to the historical gaps (exponential with mean = average gap, or the observed gaps as an empirical distribution) and compute P(event by deadline | no event in the T days already elapsed), not P(event in a window of size W). Show the number. If the question is not of this recurring type, write "non-recurring, conditional-hazard skipped".
+        } For a recurring event with a history of inter-arrival gaps, fit a simple model to the gaps (exponential with mean = average gap, or the observed gaps as an empirical distribution), compute P(event by deadline | no event in the T days already elapsed), and show the number. Otherwise write "non-recurring, conditional-hazard skipped".
 {_COUNT_IN_PERIOD_REFERENCE_CLASS}
 
             3) Timeframe reasoning
@@ -1134,7 +1134,7 @@ def numeric_prompt(
             - Question-specific base rate: anchor on the historical frequency, trend, or variance for THIS specific indicator (e.g., "how much has this index moved in prior analogous windows"), not a generic "things are usually stable" or "things are usually volatile" prior.
 
         (8) Forecastability and width
-            - Decide how forecastable this quantity is from current information on this horizon. An administered or slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely predictable from its latest value and its historical variance: anchor tightly on recent observations with historically-appropriate width. A traded price, a volatile count or a novel metric on a short horizon is close to a random walk: centre on the current value, take the width from the series' realized variability over comparable windows, and do not expect movement you cannot source to a named cause.
+            - Decide how forecastable this quantity is from current information on this horizon. An administered or slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely predictable from its latest value and historical variance: anchor tightly on recent observations. A traded price, a volatile count or a novel metric on a short horizon is close to a random walk: centre on the current value, take the width from its realized variability over comparable windows, and do not expect movement you cannot source to a named cause.
             - Match your interval width to what your reasoning actually supports, and do not pad or sharpen out of a generic disposition. Log score punishes a narrow interval that misses far more than a wide one that covers, but a wide interval on a predictable quantity also bleeds points.
             - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution.
 
@@ -1216,7 +1216,7 @@ def stacking_binary_prompt(
         {_forecasting_window_str(question)}
 
         ── Multiple Expert Analyses ──
-        Each base-model analysis above carries its final forecast inside a fenced
+        Each base-model analysis below carries its final forecast inside a fenced
         ```json STRUCTURED FORECAST block at its tail (field `posterior_prob`, a
         decimal in [0,1]). Read those blocks to get each model's declared number,
         and read the surrounding reasoning to weight the analysis.
@@ -1308,7 +1308,7 @@ def stacking_multiple_choice_prompt(
         {_forecasting_window_str(question)}
 
         ── Multiple Expert Analyses ──
-        Each base-model analysis above carries its final forecast inside a fenced
+        Each base-model analysis below carries its final forecast inside a fenced
         ```json STRUCTURED FORECAST block at its tail (field `option_probs`, keyed
         by the exact option names, values as decimals summing to 1.0). Read those
         blocks to get each model's declared distribution, and read the surrounding
@@ -1423,7 +1423,7 @@ def stacking_numeric_prompt(
         {upper_bound_message}
 
         ── Multiple Expert Analyses ──
-        Each base-model analysis above carries its final forecast inside a fenced
+        Each base-model analysis below carries its final forecast inside a fenced
         ```json STRUCTURED FORECAST block at its tail (field `declared_percentiles`,
         an object keyed by the {EXPECTED_PERCENTILE_COUNT} standard percentiles as decimals from {
             _LOWEST_PERCENTILE_LABEL
@@ -1584,10 +1584,10 @@ def gap_fill_analyzer_prompt(
            not fetch a tiebreaker.
         6. Missing base rate / reference class — the question asks about a class of
            event but first pass gives anecdotes rather than historical frequency data.
-           Includes, where the question resolves through an institutional rule (an
-           electoral threshold, a quota, an allocation formula, a cut-off score), how that
-           rule actually applied at its most recent real application, as a realized count
-           or outcome — a different fact from the question's own resolution threshold.
+           Where the question resolves through an institutional rule (an electoral
+           threshold, a quota, an allocation formula, a cut-off score), this includes how
+           that rule actually applied at its most recent real application, as a realized
+           count or outcome — a different fact from the question's own resolution threshold.
         7. Missing expert opinion — first pass asserts a claim that should have a
            named expert or institution behind it but does not cite one.
         8. Stale first-pass info — first pass appears drawn from training data rather
