@@ -234,7 +234,11 @@ knows how much room it has left.
 The loop also does light stuck-detection: an exact-duplicate tool call (same
 tool, same normalized arguments) bumps a `dup_tool_calls` counter and gets a
 gentle warning appended to its result telling the driver the result won't have
-changed. There's no hard enforcement, just the nudge.
+changed. There's no hard enforcement, just the nudge. One exception: a fetch that
+came back throttled has its call key forgotten again as its tool message is
+written, because a throttle outcome is never cached and its message asks the
+driver to retry the same URL later in the run, so that retry really can return
+something different and must not be told otherwise.
 
 ## Soft-fail and isolation (load-bearing safety property)
 
