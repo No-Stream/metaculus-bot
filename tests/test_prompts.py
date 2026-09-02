@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from metaculus_bot.prompts import (
+    _AUTO_ANNOTATED_CITATION_CLAUSE,
     _OUTSIDE_VENUE_MARKET_ODDS_BULLET,
     _SOURCE_TIER_TAG_INSTRUCTION,
     TS_ANCHOR_SECTION_HEADER,
@@ -530,6 +531,31 @@ class TestWebResearchPromptPrimarySources:
         assert "[1.2.3]" in auto
         assert "[1.2.3]" not in markdown
         assert "do not write your own citation markers" not in " ".join(markdown.lower().split())
+
+    def test_citation_index_ban_carves_out_the_source_tier_tags_it_ships_with(self) -> None:
+        """The ban and the SOURCE TIER TAGS block ride the SAME rendered prompt, 26 lines
+        apart, and the tier block orders exactly what the ban's second half appears to
+        forbid: a bracketed, model-authored source annotation. A literal reader that
+        over-complies stops tagging, which costs the forecaster prompts the tier signal
+        they weight on and leaves gemini_attribution's unsupported-attribution check
+        nothing to check — the direction nothing downstream guards, unlike the dotted
+        indices _strip_model_citation_indices removes. So the carve-out ships in the same
+        clause, and it says "still applies" rather than "required", because the tier
+        block's own closing line licenses leaving an unclear claim untagged."""
+        auto = web_research_prompt("Q?", citation_style="auto_annotated")
+        collapsed = " ".join(auto.split())
+
+        assert "do NOT write your own citation markers" in collapsed
+        assert "This bans invented CITATION indices only" in collapsed
+        assert "the SOURCE TIER TAGS instruction below still applies" in collapsed
+        # The instruction the carve-out names, in the same prompt and BELOW the ban.
+        assert collapsed.index("SOURCE TIER TAGS instruction below") < collapsed.index(
+            "SOURCE TIER TAGS: annotate each factual claim"
+        )
+        assert '"[A: official]"' in collapsed
+        # Not phrased as a requirement, which would contradict the tier block's softener.
+        assert "requir" not in _AUTO_ANNOTATED_CITATION_CLAUSE.lower()
+        assert "leave a claim untagged if unsure" in collapsed
 
     def test_vintage_clause_present_for_both_citation_styles(self) -> None:
         """qid 44872: gemini searched correctly, Google attached no grounding, and it

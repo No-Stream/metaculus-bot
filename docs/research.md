@@ -225,6 +225,12 @@ component is at most two digits, so bracketed quantities, currency, versions,
 years and IP-like tokens survive; the `### Sources` block is appended afterwards
 and never passes through the strip. Validated over all 323 archived sections at
 zero false positives (`scratch/next_season_bundle_2026-09/item3_citation_strip/`).
+The Gemini-only prompt clause also asks the model not to write the indices in the
+first place, and it carves the source-tier tags back out by name, because the
+same prompt orders bracketed `[A: official]` tags 26 lines further down: a
+literal reader that over-complies stops tagging, which costs the forecaster
+prompts the tier signal they weight on and leaves the attribution check below
+nothing to check.
 
 **Attributions the response's own grounding record cannot back.** Gemini also
 writes self-invented source-tier tags — `[A: NASA]`, `[B: Reuters]`,
@@ -251,7 +257,15 @@ carry no renderable label is skipped rather than blanket-marked: with no evidenc
 base, a rewrite would dress our own render failure as the model's embellishment.
 Per-response counts ride `GEMINI_UNSUPPORTED_ATTRIBUTION` (only when non-zero)
 and the provider-diagnostics `unsupported_attributions` count (always, so a zero
-is a measurement); nothing keys on either. Validation over all 323 sections,
+is a measurement); nothing keys on either. The diagnostics line carries its
+denominator, `tier_tags`, next to it, because the marker is gated on
+`unsupported`: without the denominator a response that carried no outlet-named
+tier tag at all and one whose every tag was backed both archive as
+`unsupported_attributions=0`, so a model that quietly stopped tagging would read
+as a model that tagged accurately. `tier_tags` counts outlet-named items only
+(the generic tier words are excluded before matching), so a zero there means "no
+outlet-named tags"; the definitive check for whether any tag was written is a
+grep for `[A: ` over the archived section. Validation over all 323 sections,
 including the hand review of every section where every attribution was marked:
 `scratch/next_season_bundle_2026-09/item4_attribution_check/`.
 
