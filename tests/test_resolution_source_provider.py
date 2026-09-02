@@ -322,6 +322,24 @@ def _iom_shaped_page(prose: str = _IOM_PROSE, config: dict[str, Any] | None = No
     ).encode()
 
 
+def _mid_band_chart_page() -> bytes:
+    """An IOM-shaped chart page whose extraction lands strictly BETWEEN the JS-wall floor
+    and the chrome floor.
+
+    That band is where a chart rescue's counterfactual is `thin_page`, and it is where 7 of
+    the 8 archived sub-400 chrome extractions sit. The bare-prose fixture
+    (`prose="Mediterranean."`) extracts 43 chars, which is `js_wall` territory, and
+    `_IOM_PROSE` extracts 425, only 25 chars above the chrome floor — so neither of them
+    exercises the middle.
+    """
+    js_wall_floor = resolution_source.RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
+    chrome_floor = resolution_source.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
+    # Trafilatura emits the h1 and then the paragraph twice, so the extraction is
+    # 13 + 6n chars for an `"ab " * n` paragraph. The tests that use this measure the
+    # result rather than trusting that arithmetic.
+    return _iom_shaped_page(prose="ab " * ((js_wall_floor + chrome_floor) // 2 // 6))
+
+
 @pytest.fixture
 def tracker_with_infogram_html() -> bytes:
     """The 44554 shape: real forecast prose (581 extracted chars) around the embed
@@ -1270,8 +1288,10 @@ class TestInlineChartData:
         assert "context in brief" in result.text
 
     async def test_a_chart_only_page_is_rescued_from_the_chrome_floor(self):
-        """The two fixes meet here: without the chart rung this page is 60 chars of chrome
-        and gets withheld as `thin_page`; with it, the numbers we recovered ARE the content."""
+        """The two fixes meet here: this page extracts 43 chars, so without the chart rung
+        it is withheld as `js_wall` (43 is under the 100-char JS-wall floor, not merely
+        under the 400-char chrome floor); with the rung, the numbers we recovered ARE the
+        content. The mid-band pair below covers the `thin_page` counterfactual."""
         session = FakeSession(
             {"https://iom.example.com/bare": FakeResponse(200, body=_iom_shaped_page(prose="Mediterranean."))}
         )
@@ -1281,6 +1301,41 @@ class TestInlineChartData:
         assert result.status == "success"
         assert result.status_reason is None
         assert "2026=1240" in result.text
+
+    async def test_a_mid_band_chart_page_is_rescued_from_the_thin_page_floor(self):
+        """The rescue's own band: the chrome floor says withhold, the JS-wall floor says no.
+
+        Nothing else constructs that combination — the other chart test extracts 43 chars
+        (`js_wall`) and the prose one 425 (above the chrome floor) — so narrowing the
+        rescue guard to `not (chart_block and looks_like_js_wall(extracted))` left the
+        whole suite green while dropping the recovered 2026=1240 on every page in this
+        band, which is 7 of the 8 archived sub-400 chrome extractions.
+        """
+        body = _mid_band_chart_page()
+        extracted = resolution_source._extract_main_text(body, "https://iom.example.com/mid") or ""
+        # The fixture is only meaningful if it really sits between the two floors.
+        assert looks_like_page_chrome(extracted) is True
+        assert looks_like_js_wall(extracted) is False
+        session = FakeSession({"https://iom.example.com/mid": FakeResponse(200, body=body)})
+
+        result = await _fetch_one(session, "https://iom.example.com/mid", {})
+
+        assert result.status == "success"
+        assert result.status_reason is None
+        assert "2026=1240" in result.text
+
+    async def test_the_same_mid_band_page_is_withheld_when_the_chart_rung_reads_nothing(self, monkeypatch):
+        """The negative twin: with the chart block empty the identical page is withheld —
+        and as `thin_page`, not `js_wall`, which is what makes the rescue above the chart
+        rung's doing rather than the floors'."""
+        monkeypatch.setattr(resolution_source, "render_inline_chart_data", lambda _: "")
+        session = FakeSession({"https://iom.example.com/mid": FakeResponse(200, body=_mid_band_chart_page())})
+
+        result = await _fetch_one(session, "https://iom.example.com/mid", {})
+
+        assert result.status == "no_resolving_content"
+        assert result.status_reason == "thin_page"
+        assert result.text == ""
 
     async def test_a_malformed_chart_payload_is_ignored_rather_than_raising(self):
         # A truncated attribute (`{"series":[{"name":}]`) is what a mid-response cut or a
@@ -1424,6 +1479,99 @@ class TestInlineChartData:
         out = render_inline_chart_data(html_text)
 
         assert out.count("\nChart ") == resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_CHARTS
+        # The cap leaves readable charts off the page, so it is an omission like the char
+        # budget and has to be stated: it used to `break` silently, which made the
+        # docstring's "the omitted count is stated" false on this exact shape.
+        omitted = 8 - resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_CHARTS
+        assert f"[{omitted} further chart(s) on this page omitted" in out
+
+    async def test_a_page_of_never_closing_chart_calls_costs_a_bounded_scan(self, monkeypatch):
+        """The candidate bound has to count sites EXAMINED, not configs KEPT.
+
+        A `Highcharts.chart({` whose braces never close appends no candidate, so under the
+        old `len(candidates)` test every such site paid its own brace scan and the page
+        cost sites x the config-char bound — quadratic, in an uncancellable thread under
+        the provider's 45 s wall, where blowing the wall discards every already-fetched
+        page. Asserted as outcomes (how many brace scans ran, what renders, what
+        publishes) and never as elapsed time, which would be flaky on shared CI.
+        """
+        scans = 0
+        real_balanced_object = resolution_chart_data._balanced_object
+
+        def counting_balanced_object(text: str, start: int) -> str | None:
+            nonlocal scans
+            scans += 1
+            return real_balanced_object(text, start)
+
+        monkeypatch.setattr(resolution_chart_data, "_balanced_object", counting_balanced_object)
+        prose = "Counts are compiled from monthly returns and revised annually. " * 8
+        body = (
+            "<!doctype html><html><head><title>Counts</title></head><body>"
+            f"<article><h1>Counts</h1><p>{prose}</p>"
+            + "<script>Highcharts.chart({'series':[1</script>" * 2000
+            + "</article></body></html>"
+        ).encode()
+
+        assert render_inline_chart_data(body.decode()) == ""
+        assert scans <= resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_CANDIDATES
+
+        session = FakeSession({"https://spin.example.com/p": FakeResponse(200, body=body)})
+        result = await _fetch_one(session, "https://spin.example.com/p", {})
+
+        # And the page itself is unaffected: a body full of unparseable decoration costs
+        # the chart rung a bounded scan and the page nothing.
+        assert result.status == "success"
+        assert CHART_DATA_LEAD not in result.text
+        assert "compiled from monthly returns" in result.text
+
+    def test_a_two_arg_chart_call_still_reaches_its_config_object(self):
+        """Why the fix bounds attempts rather than refusing a `{` far from the paren: a
+        real page passes its container element first, which puts the config's opening brace
+        tens of chars past `(`."""
+        html_text = (
+            "<script>Highcharts.chart(document.getElementById('a-long-container-id-here'), "
+            '{"series":[{"name":"Rate","data":[3]}]});</script>'
+        )
+
+        assert "Rate: 3" in render_inline_chart_data(html_text)
+
+    def test_the_series_cap_keeps_the_leading_series_and_drops_the_rest(self):
+        """The cap truncates silently, and nothing pinned it: the widest other fixture
+        builds exactly MAX_SERIES series, so neutralizing the slice passed the suite."""
+        cap = resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_SERIES
+        total = cap + 2
+        html_text = (
+            '<div data-chart="'
+            + _escape_config({"series": [{"name": f"series-{i}", "data": [100 + i]} for i in range(total)]})
+            + '"></div>'
+        )
+
+        out = render_inline_chart_data(html_text)
+
+        for i in range(cap):
+            assert f"series-{i}: {100 + i}" in out
+        for i in range(cap, total):
+            assert f"series-{i}" not in out
+
+    def test_the_candidate_scan_stops_at_the_bound(self):
+        """Asserted on the helper because the three-chart render cap hides it: a page with
+        hundreds of `data-chart` attributes renders the same three either way."""
+        cap = resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_CANDIDATES
+        one = _escape_config({"series": [{"name": "S", "data": [1]}]})
+        page = f'<div data-chart="{one}"></div>' * (cap + 5)
+
+        assert len(resolution_chart_data._candidate_configs(page)) == cap
+
+    def test_a_config_over_the_char_bound_is_skipped(self, monkeypatch):
+        """Both halves of the byte bound: `_render_config`'s per-config check and
+        `_balanced_object`'s scan window, which read the same constant."""
+        config = {"series": [{"name": "Rate", "data": list(range(12))}]}
+        assert len(json.dumps(config)) > 50
+        monkeypatch.setattr(resolution_chart_data, "RESOLUTION_SOURCE_CHART_MAX_CONFIG_CHARS", 50)
+        html_text = '<div data-chart="' + _escape_config(config) + '"></div>'
+
+        assert render_inline_chart_data(html_text) == ""
+        assert resolution_chart_data._balanced_object("{" + "a" * 200 + "}", 0) is None
 
     async def test_the_chart_block_is_budgeted_inside_the_per_url_cap(self, monkeypatch):
         # Same rule as the embed disclosure: leads come OUT of the per-URL cap, never on
