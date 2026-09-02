@@ -468,7 +468,12 @@ def _volatility_lines(close: pd.Series, periods_per_year: int, *, symbol: str) -
 
 
 def _yfinance_stats_lines(close: pd.Series, periods_per_year: int, *, symbol: str) -> list[str]:
-    """Period returns, annualized volatility, and the 52-week range."""
+    """Period returns, annualized volatility, and the 52-week range.
+
+    ``symbol`` is threaded purely for the noise flag's telemetry line, which is otherwise
+    anonymous: nothing on ``close`` names the ticker (its ``.name`` is "Close") and the fetch
+    fans out one thread per identifier, so line order does not identify it either.
+    """
     parts: list[str] = []
     # Period returns
     returns_section = _compute_period_returns(close, periods_per_year)
