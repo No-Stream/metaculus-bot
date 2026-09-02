@@ -700,9 +700,18 @@ MARKER_SPECS: list[MarkerSpec] = [
         # Tier-2 dataset hops ride this marker too and are told apart by ``url``: every
         # dataset is ``static.dwcdn.net/data/<chart_id>.csv``, a host reachable no other
         # way, so a query partitions cited pages from hop artifacts on it.
+        #
+        # ``reason`` (optional, 2026-09-02) disambiguates a status that has more than one
+        # rule behind it: ``no_resolving_content`` is ``embed_shell`` when the page named a
+        # routeless data embed and ``thin_page`` when the extraction was simply under the
+        # chrome floor, which is the population the floor gained when it stopped being gated
+        # on a named provider. The provider appends it only where it applies, so the group
+        # is optional in BOTH directions — absent on every line the archive already holds,
+        # and absent on a fresh line whose status carries no reason.
         re.compile(
             r"RESOLUTION_SOURCE_FETCH:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
             r"\s+status=(?P<status>\S+)\s+http=(?P<http>\S+)\s+embeds=(?P<embeds>\S+)"
+            r"(?:\s+reason=(?P<reason>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),

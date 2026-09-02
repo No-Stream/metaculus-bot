@@ -297,11 +297,11 @@ class TestDatawrapperHop:
         assert dataset.data_last_modified is not None
         # The formatter surfaces the withholding on the datasets' OWN line — a
         # chart CSV is not a cited resolution source, so it must not ride the
-        # "cited resolution source(s) could not be fetched" wording — and the
+        # "cited resolution source(s) yielded no usable content" wording — and the
         # (fresh) page content still renders.
         out = format_resolution_sections(results, datetime.now(UTC))
         assert "[1 embedded chart dataset(s) not served (stale_data)" in out
-        assert "could not be fetched" not in out
+        assert "yielded no usable content" not in out
         assert "day-0019" not in out
         assert "updated whenever new qualifying polls" in out
 

@@ -512,32 +512,59 @@ declared charset decodes to mojibake) are bodies that carried no information —
 rather than seams, because there is nothing on the other side to fetch harder. Both
 exist because `status="success"` has to mean CONTENT: as `success`, an empty body
 rendered an empty section under the "primary grading evidence" caveat, suppressed the
-"resolving page was unreachable" notice for every sibling URL, and reported `ok` to
-provider diagnostics.
+all-failed "yielded no usable content" notice for every sibling URL, and reported `ok`
+to provider diagnostics. That notice says "yielded no usable content" rather than "was
+unreachable" because two of the statuses it covers — `no_resolving_content` and
+`empty_body` — are pages that answered HTTP 200 and carried nothing, and "the tracker
+was down" is different evidence from "the tracker has no reading"; the per-domain status
+token beside it says which happened.
 
-`no_resolving_content` is the newest of those seams and covers the page whose numbers
-are real but locked inside a third-party data embed — Infogram, Flourish or Tableau,
-detected in the RAW HTML by `unreadable_data_embed_providers` because trafilatura emits
-no iframe or embed-script URLs at any setting. Datawrapper is deliberately excluded from
-that scan since the Tier-2 hop reaches it. What happens next depends on how much page
-text came back, and the split is the point. Below
-`RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS` of extracted text the page is an embed SHELL
-and is withheld under this status, which costs nothing because everything archived below
-that floor is site chrome. Above the floor the page kept real prose, so the prose is
-rendered and one bracketed line says plainly that the figures inside the embeds are not
-in it. Both halves come from qids 44554/44556, where a Senate-forecast tracker returned
-HTTP 200, extracted 2.9k chars of background, and published under the primary-grading-
-evidence caveat with zero polling numbers in it — byte-identical across three questions,
-with the resolving average sitting in two Infogram iframes and nothing anywhere saying
-so. A page can also draw both verdicts at once and should: Tier-1
-`no_resolving_content` on the page next to a Tier-2 `success` on its Datawrapper
-dataset is the correct reading of a tracker whose prose we cannot use and whose series
-we can.
+`no_resolving_content` is the newest of those seams and covers the page that answers 200
+with nothing but chrome. The floor is what decides it: below
+`RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS` of extracted text the page is withheld under
+this status, which costs nothing because everything archived below that floor is site
+chrome and the shortest archived extraction that carries the resolving content is 401
+chars. Above the floor the page kept real prose, so the prose is rendered, and where a
+third-party data embed hid figures from it one bracketed line says plainly that those
+figures are not in the text.
+
+`status_reason` records which shape of chrome it was. `embed_shell` means the RAW HTML
+named an embed whose numbers are real but locked inside it — Infogram, Flourish or
+Tableau, detected by `unreadable_data_embed_providers` because trafilatura emits no
+iframe or embed-script URLs at any setting; Datawrapper is deliberately excluded from
+that scan since the Tier-2 hop reaches it. `thin_page` means no such provider was named.
+That distinction used to be a GATE rather than a label, and the gate was wrong: the
+2026-09-01 residual round found five content-free `success` renders and not one of them
+named a provider, among them q45088's 127-char single-page-app tab list and q45215's 385
+chars of Kazakh region names, both published under the primary-grading-evidence caveat.
+The embed half of the story still comes from qids 44554/44556, where a Senate-forecast
+tracker returned HTTP 200, extracted 2.9k chars of background, and published with zero
+polling numbers in it — byte-identical across three questions, with the resolving average
+sitting in two Infogram iframes and nothing anywhere saying so. `js_wall` keeps its own,
+much lower floor and is checked between the two verdicts, so generalising the chrome
+floor did not absorb the JS-walled population. A page can also draw both verdicts at once
+and should: Tier-1 `no_resolving_content` on the page next to a Tier-2 `success` on its
+Datawrapper dataset is the correct reading of a tracker whose prose we cannot use and
+whose series we can.
+
+One more rung reads data out of the page we already hold, with no second request and no
+LLM call. `resolution_chart_data.render_inline_chart_data` scans the raw HTML for a
+Highcharts config — a `data-chart="{…}"` attribute, or a `Highcharts.chart(…)` call whose
+argument is strict JSON — and renders each series' most recent points as a compact
+labelled block that leads the page text. Nothing is summed, interpolated or
+unit-converted: the block states the values the page's own chart holds, and a config that
+does not parse is skipped at DEBUG. It runs on every fetched HTML page rather than only
+thin ones, because the record it exists for is q43949, whose resolving IOM page extracted
+roughly 80k chars of incident rows and prose carrying none of the resolving figures while
+its annual series sat in the attribute — reading 1,240 for 2026 in a snapshot 25 days
+before a forecast that landed about 340 too high. Because chart data counts as content,
+it also rescues a page the chrome floor would otherwise withhold.
 
 Every fetched URL emits one harvested `RESOLUTION_SOURCE_FETCH` line (status, HTTP
-code, and any routeless embed providers), so per-domain fetch health is a query
-against the telemetry archive instead of a re-scrape of run logs that expire from GHA
-at 90 days. See "Reading run logs" in `docs/operations.md` for the field meanings.
+code, any routeless embed providers, and `reason` where the status alone is ambiguous),
+so per-domain fetch health is a query against the telemetry archive instead of a
+re-scrape of run logs that expire from GHA at 90 days. See "Reading run logs" in
+`docs/operations.md` for the field meanings.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window).

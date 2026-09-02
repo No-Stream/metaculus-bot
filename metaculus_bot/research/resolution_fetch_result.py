@@ -35,16 +35,29 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 # status for the same reason the HTML branch treats an empty extraction as
 # `js_wall`: content is what makes a fetch a success.
 #
-# `no_resolving_content` is the 200 whose extracted text is EMBED SCAFFOLDING:
-# the page's numbers exist, but they live inside a third-party data embed
-# (Infogram / Flourish / Tableau) our extractor cannot read, and what trafilatura
-# returned is the page chrome around it. Distinct from `empty_body` (nothing was
-# there at all) and from `js_wall` (the page needs JS to assemble ANY content):
-# here we know where the content is and that we have no route to it, which is why
-# — like `blocked` / `js_wall` — it is a Tier-2 ESCALATION SEAM rather than a
-# refusal. Shipped for qids 44554/44556, whose tracker page rendered 2.9k chars of
-# forecast background as "primary grading evidence" with zero polling numbers in
-# it while the resolving average sat in two Infogram iframes.
+# `no_resolving_content` is the 200 whose extracted text carries no content worth
+# grading against — page chrome, and nothing else. Two ways a page earns it, told
+# apart by `FetchResult.status_reason`:
+#
+#   `embed_shell` — the page's numbers exist but live inside a third-party data
+#   embed (Infogram / Flourish / Tableau) our extractor cannot read, and what
+#   trafilatura returned is the chrome around it. Shipped for qids 44554/44556,
+#   whose tracker page rendered 2.9k chars of forecast background as "primary
+#   grading evidence" with zero polling numbers in it.
+#
+#   `thin_page` — the extraction is under the same shell floor with no named embed
+#   provider anywhere in the raw HTML. The 2026-09-01 round found five content-free
+#   `success` renders and the embed-gated verdict reached none of them: q45088's
+#   127-char SPA tab list (`Nationwide / Midwest / Northeast / …`) and q45215's
+#   385 chars of Kazakh region names both published under the "primary grading
+#   evidence" caption with nothing resolving in them. The floor is what the
+#   verdict rests on either way, so gating it on a named provider was withholding
+#   one shape of chrome and publishing the other.
+#
+# Distinct from `empty_body` (nothing was there at all) and from `js_wall` (the
+# page needs JS to assemble ANY content, i.e. under the much lower JS-wall floor):
+# here the page answered with prose-shaped chrome, which is why — like `blocked` /
+# `js_wall` — it is a Tier-2 ESCALATION SEAM rather than a refusal.
 FetchStatus = Literal[
     "success",
     "blocked",
@@ -57,6 +70,13 @@ FetchStatus = Literal[
     "empty_body",
     "no_resolving_content",
 ]
+
+# Which rule produced a `no_resolving_content` verdict. A telemetry token like every
+# `FetchStatus`: it rides the `RESOLUTION_SOURCE_FETCH` marker as `reason=`, which is
+# what separates the embed-gated population (queryable since 2026-08) from the
+# generalised thin-page one, so a later "how often does the floor withhold a page
+# nothing else would have caught?" cut is a query rather than a re-derivation.
+FetchStatusReason = Literal["embed_shell", "thin_page"]
 
 # HTTP status -> FetchStatus for non-OK terminal responses — the ONE table both the
 # Tier-1 page fetch (_resolution_status_outcome) and the Tier-2 Datawrapper CDN hop
@@ -87,6 +107,9 @@ class FetchResult:
     # the `no_resolving_content` verdict and, on a page that DID carry prose, the
     # disclosure appended to its rendered text.
     unreadable_embeds: list[str] = field(default_factory=list)
+    # Which rule produced the status, where the status alone is ambiguous. Set only
+    # on `no_resolving_content` (`embed_shell` / `thin_page`); None everywhere else.
+    status_reason: FetchStatusReason | None = None
     # Provenance for Tier-2 dataset results (None on ordinary page fetches).
     chart_id: str | None = None
     chart_title: str | None = None

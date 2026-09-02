@@ -1046,7 +1046,11 @@ RESOLUTION_SOURCE_FETCH_EMBED_LINE = (
 )
 RESOLUTION_SOURCE_FETCH_NO_CONTENT_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44556 url=https://tracker.example.com/senate "
-    "status=no_resolving_content http=200 embeds=infogram"
+    "status=no_resolving_content http=200 embeds=infogram reason=embed_shell"
+)
+RESOLUTION_SOURCE_FETCH_THIN_PAGE_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=45088 url=https://data.wastewaterscan.org/ "
+    "status=no_resolving_content http=200 embeds=none reason=thin_page"
 )
 RESOLUTION_SOURCE_FETCH_BLOCKED_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
@@ -1093,7 +1097,25 @@ class TestResolutionSourceFetch:
         assert rec["status"] == "no_resolving_content"
         assert rec["http"] == 200  # the FETCH succeeded; the content did not arrive
         assert rec["embeds"] == "infogram"
+        assert rec["reason"] == "embed_shell"
         assert rec["qid"] == 44556
+
+    def test_the_thin_page_reason_separates_the_ungated_population(self):
+        # q45088's 127-char SPA tab list: withheld by the same chrome floor with no
+        # embed provider anywhere in the raw HTML. Without `reason` the two rules are
+        # one bucket, and "how often does the floor catch a page the embed gate would
+        # have published?" stops being answerable from the archive.
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_THIN_PAGE_LINE)
+        assert rec["status"] == "no_resolving_content"
+        assert rec["embeds"] is None
+        assert rec["reason"] == "thin_page"
+
+    def test_lines_without_a_reason_still_parse_and_harvest_it_as_none(self):
+        # Back-compat in both directions: every line the archive already holds predates
+        # the field, and a fresh line whose status carries no reason omits it too. None
+        # means "no reason applies", which is what the absence has to keep meaning.
+        for line in (RESOLUTION_SOURCE_FETCH_OK_LINE, RESOLUTION_SOURCE_FETCH_BLOCKED_LINE):
+            assert _parse_one(line).get("reason") is None
 
     def test_non_success_status_keeps_its_http_code(self):
         rec = _parse_one(RESOLUTION_SOURCE_FETCH_BLOCKED_LINE)

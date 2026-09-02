@@ -954,14 +954,20 @@ the telemetry markers:
   `_throttled_fetch_outcome` in `research/agentic/tools.py`; harvested as
   `agentic_fetch_throttled`. Receipt: q45191, where two throttled ogimet.com fetches reached
   the driver as successful ones and the driver's own retry was served the cached refusal.
-- `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=...` —
+- `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=... [reason=...]` —
   one line per URL the resolution-source provider fetched, emitted by
   `_log_fetch_outcome_markers` in `research/resolution_source.py`. `status` is `ok`
   for a success and the verbatim `FetchStatus` otherwise (`blocked`, `js_wall`,
   `no_resolving_content`, `stale_data`, ...); `http` is `n/a` when no response ever
   arrived; `embeds` names the routeless data-embed providers (Infogram / Flourish /
   Tableau) found in the page's raw HTML, which is what makes an unreadable-embed
-  page queryable even when its prose made the fetch a legitimate `ok`. Tier-2
+  page queryable even when its prose made the fetch a legitimate `ok`. `reason` is
+  appended only where the status alone is ambiguous — today that is
+  `no_resolving_content`, which is `embed_shell` when the page named such a provider
+  and `thin_page` when the extraction was simply under the chrome floor, the
+  population the floor gained on 2026-09-02 when it stopped being gated on a named
+  provider. Its absence means no reason applies, on a fresh line as much as on an
+  archived one. Tier-2
   Datawrapper dataset hops ride the same line and are identifiable by their url
   (`static.dwcdn.net/data/<chart_id>.csv`). This replaced the older free-text
   `resolution_source fetched <netloc> (<status>)` lines rather than joining them, so
