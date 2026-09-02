@@ -27,7 +27,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_stacked_marker,
     parse_stacker_skip_reason_marker,
 )
-from metaculus_bot.performance_analysis.rescore_diff import diff_platform_rescores
+from metaculus_bot.performance_analysis.rescore_diff import RESCORE_ATOL, diff_platform_rescores
 from metaculus_bot.performance_analysis.research_tags import DEFAULT_RESEARCH_ARCHIVE_LATEST, attach_research_tags
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score, mc_log_score, numeric_log_score
@@ -670,11 +670,6 @@ def _rescorable(record: object) -> bool:
     return q_type not in ("numeric", "discrete") or all(k in record for k in ("open_lower_bound", "open_upper_bound"))
 
 
-# Recomputation float wiggle vs a genuinely different stored value. The scorer
-# reproduces the platform to ~1e-14; the known-stale gaps start at 0.6.
-_RESCORE_ATOL = 1e-6
-
-
 def rescore_records(records: list[dict]) -> int:
     """Recompute every record's score fields from its own stored inputs, in place.
 
@@ -701,7 +696,7 @@ def rescore_records(records: list[dict]) -> int:
         for field in _SCORE_FIELDS:
             new = fresh[field]
             old = record.get(field)
-            if new is not None and (old is None or abs(new - old) > _RESCORE_ATOL):
+            if new is not None and (old is None or abs(new - old) > RESCORE_ATOL):
                 record[field] = new
                 record_changed = True
         changed += record_changed

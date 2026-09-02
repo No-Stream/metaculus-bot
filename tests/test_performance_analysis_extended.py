@@ -94,6 +94,42 @@ def _binary_record(
     }
 
 
+def _binary_post(
+    post_id: int,
+    question_id: int,
+    resolution: str = "yes",
+    score_data: dict[str, float] | None = None,
+) -> dict:
+    """One resolved binary post in the shape ``fetch_resolved_questions`` returns.
+
+    ``score_data`` defaults to a peer-scored forecast; pass ``{}`` for a post whose
+    forecast carries no platform scores. ``nr_forecasters`` is deliberately set on the
+    QUESTION here as a decoy, since the collector must read the crowd size off the post.
+    """
+    return {
+        "id": post_id,
+        "title": f"Q{post_id}",
+        "question": {
+            "id": question_id,
+            "type": "binary",
+            "resolution": resolution,
+            "my_forecasts": {
+                "latest": {
+                    "forecast_values": [0.3, 0.7],
+                    "score_data": {"peer_score": 1.0} if score_data is None else score_data,
+                },
+            },
+            "scaling": {},
+            "options": None,
+            "open_lower_bound": False,
+            "open_upper_bound": False,
+            "nr_forecasters": 5,
+            "title": f"Q{post_id}",
+        },
+        "projects": {},
+    }
+
+
 def _numeric_record(
     post_id: int,
     cdf: list[float],
@@ -447,32 +483,8 @@ class TestCollectorCommentCreatedAt:
     ``created_at`` timestamp so cohort cuts can filter by submit-date (vs the
     coarser actual_resolve_time on the question)."""
 
-    def _post_data(self, post_id: int, question_id: int, resolution: str = "yes") -> dict:
-        return {
-            "id": post_id,
-            "title": f"Q{post_id}",
-            "question": {
-                "id": question_id,
-                "type": "binary",
-                "resolution": resolution,
-                "my_forecasts": {
-                    "latest": {
-                        "forecast_values": [0.3, 0.7],
-                        "score_data": {"peer_score": 1.0},
-                    },
-                },
-                "scaling": {},
-                "options": None,
-                "open_lower_bound": False,
-                "open_upper_bound": False,
-                "nr_forecasters": 5,
-                "title": f"Q{post_id}",
-            },
-            "projects": {},
-        }
-
     def test_record_includes_bot_comment_created_at(self):
-        post = self._post_data(1, 11)
+        post = _binary_post(1, 11)
         comment = {
             "id": 999,
             "text": "*Forecaster 1*: 70%\n",
@@ -484,7 +496,7 @@ class TestCollectorCommentCreatedAt:
         assert records[0]["bot_comment_created_at"] == "2026-04-30T12:34:56Z"
 
     def test_record_has_none_when_comment_missing(self):
-        post = self._post_data(2, 22)
+        post = _binary_post(2, 22)
         records = _process_post(post, {})
         assert len(records) == 1
         assert records[0]["bot_comment_created_at"] is None
@@ -493,7 +505,7 @@ class TestCollectorCommentCreatedAt:
         """``nr_forecasters`` is a POST field; reading it off the question dict with a 0
         default made it read 0 in all 2196 archived records — "never read", rendered as a
         measured empty crowd. This fixture deliberately keeps the decoy on the question."""
-        post = self._post_data(5, 55)
+        post = _binary_post(5, 55)
         post["nr_forecasters"] = 170
         records = _process_post(post, {})
 
@@ -503,14 +515,14 @@ class TestCollectorCommentCreatedAt:
         # None means "the post didn't say", which a crowd-size cut can drop. A 0 would
         # average a fabricated empty crowd into the cut, and would also silently kill
         # audit.py's `n/a` fallback (a real 0 is not a missing key).
-        post = self._post_data(6, 66)
+        post = _binary_post(6, 66)
         post.pop("nr_forecasters", None)
         records = _process_post(post, {})
 
         assert records[0]["metadata"]["nr_forecasters"] is None
 
     def test_record_has_none_when_comment_lacks_created_at(self):
-        post = self._post_data(3, 33)
+        post = _binary_post(3, 33)
         comment = {"id": 1000, "text": "*Forecaster 1*: 70%\n", "on_post": 3}
         records = _process_post(post, {3: comment})
         assert len(records) == 1
@@ -519,7 +531,7 @@ class TestCollectorCommentCreatedAt:
     def test_stacker_skip_reason_marker_round_trips_onto_record(self):
         # The additive STACKER_SKIP_REASON marker must reach the record dict —
         # its documented durable path is the comment, not the run log.
-        post = self._post_data(4, 44)
+        post = _binary_post(4, 44)
         comment = {
             "id": 1001,
             "text": "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=skipped -->\n<!-- STACKER_SKIP_REASON=single_forecaster -->\n",
@@ -531,7 +543,7 @@ class TestCollectorCommentCreatedAt:
         assert records[0]["stacker_outcome"] == "skipped"
 
     def test_stacker_skip_reason_none_without_marker(self):
-        post = self._post_data(5, 55)
+        post = _binary_post(5, 55)
         comment = {"id": 1002, "text": "*Forecaster 1*: 70%\n", "on_post": 5}
         records = _process_post(post, {5: comment})
         assert records[0]["stacker_skip_reason"] is None
@@ -539,7 +551,7 @@ class TestCollectorCommentCreatedAt:
     def test_practice_posts_produce_no_records(self):
         # Practice questions are not tournament scoring surface; they must never enter
         # the dataset (they would otherwise land in every calibration cut).
-        post = self._post_data(6, 66)
+        post = _binary_post(6, 66)
         post["title"] = "[PRACTICE] Will this be scored?"
         comment = {"id": 1003, "text": "*Forecaster 1*: 70%\n", "on_post": 6}
         assert _process_post(post, {6: comment}) == []
@@ -559,32 +571,8 @@ class TestCollectorStackerOutcome:
     consume ``stacker_outcome``.
     """
 
-    def _post_data(self, post_id: int, question_id: int) -> dict:
-        return {
-            "id": post_id,
-            "title": f"Q{post_id}",
-            "question": {
-                "id": question_id,
-                "type": "binary",
-                "resolution": "yes",
-                "my_forecasts": {
-                    "latest": {
-                        "forecast_values": [0.3, 0.7],
-                        "score_data": {"peer_score": 1.0},
-                    },
-                },
-                "scaling": {},
-                "options": None,
-                "open_lower_bound": False,
-                "open_upper_bound": False,
-                "nr_forecasters": 5,
-                "title": f"Q{post_id}",
-            },
-            "projects": {},
-        }
-
     def _run(self, post_id: int, question_id: int, comment_text: str | None) -> dict:
-        post = self._post_data(post_id, question_id)
+        post = _binary_post(post_id, question_id)
         if comment_text is None:
             records = _process_post(post, {})
         else:
@@ -1474,27 +1462,6 @@ class TestRescoreRecords:
         assert unscoreable_mc["mc_log_score"] == -1.0
 
 
-def _binary_post(post_id: int, question_id: int) -> dict:
-    """One resolved binary post in the shape ``fetch_resolved_questions`` returns."""
-    return {
-        "id": post_id,
-        "title": f"Q{post_id}",
-        "question": {
-            "id": question_id,
-            "type": "binary",
-            "resolution": "yes",
-            "my_forecasts": {"latest": {"forecast_values": [0.3, 0.7], "score_data": {}}},
-            "scaling": {},
-            "options": None,
-            "open_lower_bound": False,
-            "open_upper_bound": False,
-            "nr_forecasters": 5,
-            "title": f"Q{post_id}",
-        },
-        "projects": {},
-    }
-
-
 class TestBuildPerformanceDatasetResearchTags:
     """The dataset the analysis reads must arrive with the treatment tags stamped.
 
@@ -1514,7 +1481,9 @@ class TestBuildPerformanceDatasetResearchTags:
                 }
             )
         )
-        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(1, 11)])
+        monkeypatch.setattr(
+            collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(1, 11, score_data={})]
+        )
         monkeypatch.setattr(
             collector,
             "fetch_bot_comments",
@@ -1532,7 +1501,9 @@ class TestBuildPerformanceDatasetResearchTags:
     def test_question_without_an_archive_record_gets_none_not_false(self, tmp_path: Path, monkeypatch):
         # Absence of evidence is not an untreated record: a missing archive file (or a
         # whole missing archive) must never look like a measured False in the cuts.
-        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(2, 22)])
+        monkeypatch.setattr(
+            collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(2, 22, score_data={})]
+        )
         monkeypatch.setattr(collector, "fetch_bot_comments", lambda author_id, token: [])
 
         records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
@@ -1556,7 +1527,7 @@ class TestBuildPerformanceDatasetPriorDiff:
         monkeypatch.setattr(collector, "fetch_bot_comments", lambda author_id, token: [])
 
     def test_a_moved_resolution_is_tagged_on_the_built_records(self, tmp_path: Path, monkeypatch):
-        self._fetchers(monkeypatch, _binary_post(3, 33))
+        self._fetchers(monkeypatch, _binary_post(3, 33, score_data={}))
         prior = [{"post_id": 3, "question_id": 33, "resolution_raw": "no", "resolution_parsed": False}]
 
         records = build_performance_dataset(
@@ -1572,7 +1543,7 @@ class TestBuildPerformanceDatasetPriorDiff:
         # must produce the first, or every downstream cut reads silence as stability. The
         # keys are absent rather than explicitly None on this path, which is the same "not
         # compared" answer to every reader (the diff and the renderer both use ``.get``).
-        self._fetchers(monkeypatch, _binary_post(4, 44))
+        self._fetchers(monkeypatch, _binary_post(4, 44, score_data={}))
 
         records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
 
