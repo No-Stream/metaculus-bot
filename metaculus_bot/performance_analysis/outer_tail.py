@@ -139,6 +139,24 @@ class OuterTailReading:
     """``mean_bin_mass / platform_min_step`` — the trigger. 1.0 is exactly at the floor."""
     flat_zone_log_score: float | None = None
     """Bot-side Metaculus log score a resolution in the band's THINNEST bin would earn."""
+    members_used: int | None = None
+    """Member curves that set the anchor label and its median VALUE.
+
+    Disclosed because the survivors move the band boundary the verdict is measured against: an
+    anchor medianed over 5 of 6 members sits somewhere else than one medianed over all 6, so a
+    row reading HEALTHY on a partial set is a weaker claim than the same row on a whole one.
+    """
+    members_dropped: int | None = None
+    """Members present on the record that did not reach the anchor median.
+
+    Three causes, counted together because each has the same effect on the boundary: an
+    anonymous positional ``Forecaster N`` key (deliberately excluded — on a stacker-fired
+    record it holds the AGGREGATE), a curve too malformed to parse, and a curve carrying fewer
+    than two distinct percentile labels. ``members_used + members_dropped`` is the record's
+    member count, so the pair is checkable rather than indicative. Both are None on a side
+    whose members were never inspected (``NO_USABLE_CDF``), which is not the same as a side
+    that inspected them and found none.
+    """
 
     @property
     def starved(self) -> bool:
@@ -160,6 +178,8 @@ class OuterTailReading:
             "platform_min_step": self.platform_min_step,
             "floor_multiple": self.floor_multiple,
             "flat_zone_log_score": self.flat_zone_log_score,
+            "members_used": self.members_used,
+            "members_dropped": self.members_dropped,
         }
 
 
@@ -203,16 +223,42 @@ def _flat_zone_sort_key(reading: OuterTailReading) -> float:
     return reading.flat_zone_log_score
 
 
-def _member_declared_anchors(record: dict) -> dict[str, dict[float, float]]:
-    """``{model: {percentile label: value}}`` for the members whose curve is usable.
+@dataclass(frozen=True, slots=True)
+class _MemberCurves:
+    """The usable member curves on one record, and how many members did not make it.
+
+    The drop count travels with the curves rather than being recomputed downstream: the
+    survivors set both the shared anchor LABEL and its median VALUE, so a reading that does not
+    carry the count cannot say what its band boundary was measured over.
+    """
+
+    curves: dict[str, dict[float, float]]
+    n_dropped: int
+
+    @property
+    def n_used(self) -> int:
+        return len(self.curves)
+
+
+def _member_declared_anchors(record: dict) -> _MemberCurves:
+    """``{model: {percentile label: value}}`` for the members whose curve is usable, plus drops.
 
     Anonymous ``Forecaster N`` keys are EXCLUDED, matching ``declared_percentile_pit`` and
     ``max_step_clamp_screen``: on a stacker-fired record that positional bucket holds the
-    stacker's AGGREGATE, so pooling it into a median-of-members moves the anchor.
+    stacker's AGGREGATE, so pooling it into a median-of-members moves the anchor. That
+    exclusion is counted as a drop alongside the failures below, because the anchor moves the
+    same way whichever reason removed the member. On the archived cohort it is also the only
+    cause that fires at all — 12 members over 12 records, zero parse failures and zero short
+    curves — and the disclosure is not academic: 6 of those records are PARTIAL losses that
+    left 5 or 6 members standing, which is 12 of the 487 scanned sides, and 8 of them are
+    flagged rows. So roughly one flagged row in nine measured its band from an anchor a dropped
+    member had already moved.
     """
     curves: dict[str, dict[float, float]] = {}
+    n_dropped = 0
     for model, pairs in (record.get("per_model_numeric_percentiles") or {}).items():
         if is_anonymous_model_key(str(model)):
+            n_dropped += 1
             continue
         try:
             anchors, _conflicts = declared_anchors(pairs)
@@ -220,13 +266,16 @@ def _member_declared_anchors(record: dict) -> dict[str, dict[float, float]]:
             # Archived per-model pairs are parsed from comment text and can be malformed;
             # an unusable curve reads as no-curve rather than raising (same rule as
             # ``analysis._single_curve_pit``).
+            n_dropped += 1
             continue
         if len(anchors) >= 2:
             curves[str(model)] = anchors
-    return curves
+        else:
+            n_dropped += 1
+    return _MemberCurves(curves=curves, n_dropped=n_dropped)
 
 
-def _shared_extreme_anchor(record: dict, side: str) -> tuple[float, float] | OuterTailVerdict:
+def _shared_extreme_anchor(members: _MemberCurves, side: str) -> tuple[float, float] | OuterTailVerdict:
     """``(percentile label, median member value)`` at the most extreme SHARED anchor.
 
     Shared across members on purpose: medianing p99 against p97.5 would mix two different
@@ -234,7 +283,7 @@ def _shared_extreme_anchor(record: dict, side: str) -> tuple[float, float] | Out
     13-point p1..p99), so the label cannot be hardcoded. Returns the verdict that explains
     itself when no anchor qualifies.
     """
-    curves = _member_declared_anchors(record)
+    curves = members.curves
     if not curves:
         return OuterTailVerdict.NO_MEMBER_CURVE
     shared_labels = set.intersection(*(set(anchors) for anchors in curves.values()))
@@ -274,13 +323,21 @@ def measure_outer_tails(
     return readings
 
 
-def _unmeasurable(record: dict, side: str, verdict: OuterTailVerdict) -> OuterTailReading:
-    """A reading that carries only the reason no measurement was possible."""
+def _unmeasurable(
+    record: dict, side: str, verdict: OuterTailVerdict, *, members: _MemberCurves | None = None
+) -> OuterTailReading:
+    """A reading that carries the reason no measurement was possible, and the member census.
+
+    ``members`` is None only where the failure preceded any member inspection
+    (``NO_USABLE_CDF``), which the reading then reports as None rather than as an empty census.
+    """
     return OuterTailReading(
         question_id=record.get("question_id"),
         title=str(record.get("title") or ""),
         side=side,
         verdict=verdict,
+        members_used=None if members is None else members.n_used,
+        members_dropped=None if members is None else members.n_dropped,
     )
 
 
@@ -348,14 +405,15 @@ def _measure_one_outer_tail(
         # A degenerate range has no bins to score; the same guard numeric_pit_analysis applies.
         return _unmeasurable(record, side, OuterTailVerdict.NO_USABLE_CDF)
 
-    anchor = _shared_extreme_anchor(record, side)
+    members = _member_declared_anchors(record)
+    anchor = _shared_extreme_anchor(members, side)
     if isinstance(anchor, OuterTailVerdict):
-        return _unmeasurable(record, side, anchor)
+        return _unmeasurable(record, side, anchor, members=members)
     percentile, declared_value = anchor
 
     band = _outer_band(cdf, grid, declared_value, side)
     if isinstance(band, OuterTailVerdict):
-        return _unmeasurable(record, side, band)
+        return _unmeasurable(record, side, band, members=members)
 
     platform_min_step = _PLATFORM_MIN_STEP_NUMERATOR / (len(cdf) - 1)
     mean_bin_mass = band.mass / len(band.bin_indices)
@@ -376,6 +434,8 @@ def _measure_one_outer_tail(
         platform_min_step=platform_min_step,
         floor_multiple=measured_floor_multiple,
         flat_zone_log_score=_flat_zone_log_score(record, cdf, grid, band),
+        members_used=members.n_used,
+        members_dropped=members.n_dropped,
     )
 
 
@@ -409,6 +469,13 @@ def _fmt_measured(value: float | None, spec: str) -> str:
     return "n/a" if value is None else format(value, spec)
 
 
+def _fmt_members(reading: OuterTailReading) -> str:
+    """``used/dropped`` for the members the anchor was medianed over."""
+    if reading.members_used is None or reading.members_dropped is None:
+        return "n/a"
+    return f"{reading.members_used}/{reading.members_dropped}"
+
+
 def render_starved_outer_tails(
     scan: OuterTailScan, *, floor_multiple: float = STARVED_OUTER_TAIL_FLOOR_MULTIPLE
 ) -> str:
@@ -419,6 +486,8 @@ def render_starved_outer_tails(
         for verdict in OuterTailVerdict
         if verdict not in (OuterTailVerdict.STARVED, OuterTailVerdict.HEALTHY) and counts[verdict]
     }
+    dropped_total = sum(r.members_dropped or 0 for r in scan.readings)
+    dropped_sides = sum(1 for r in scan.readings if r.members_dropped)
     lines = [
         "## Starved outer tails (open-bound p99 cliff)",
         "",
@@ -441,6 +510,19 @@ def render_starved_outer_tails(
             "to starve."
         ),
         "",
+        (
+            f"Dropped an anchor member on {dropped_sides} of {scan.n_scanned} scanned side(s) "
+            f"({dropped_total} member-drop(s) in total, counted per side, so a record with two "
+            "open bounds contributes its drop twice)."
+            if dropped_total
+            else "Dropped an anchor member on no side."
+        )
+        + " The anchor is medianed over the members whose declared curve is usable, so a dropped "
+        "member (an anonymous positional `Forecaster N` bucket, an unparseable curve, or one "
+        "carrying fewer than two distinct labels) moves the boundary the verdict is measured "
+        "against. The `members` column states used/dropped per flagged row; every scanned side "
+        "carries the pair in `--output-starved-json`.",
+        "",
     ]
     if not scan.starved:
         lines.append("Starved sides: none.")
@@ -448,8 +530,9 @@ def render_starved_outer_tails(
         return "\n".join(lines)
 
     header = (
-        "| question | side | declared p | declared value | displayed bound | tail mass | bins "
-        "| mean bin / min step | beyond bound | flat-zone log score | title |"
+        "| question | side | declared p | declared value | members (used/dropped) | displayed "
+        "bound | tail mass | bins | mean bin / min step | beyond bound | flat-zone log score "
+        "| title |"
     )
     lines.append(header)
     lines.append("|" + "|".join(["---"] * (header.count("|") - 1)) + "|")
@@ -462,6 +545,7 @@ def render_starved_outer_tails(
                     r.side,
                     _fmt_measured(r.declared_percentile, "g"),
                     _fmt_measured(r.declared_value, ".6g"),
+                    _fmt_members(r),
                     _fmt_measured(r.bound_value, ".6g"),
                     _fmt_measured(r.tail_mass, ".4f"),
                     str(r.band_bins),

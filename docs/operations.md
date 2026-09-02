@@ -796,11 +796,18 @@ bins starting one rig above its declared p99, a flat -219.5 zone sixteen rigs
 from the resolution, and the same shape is what made q44182 (-219.0) the worst
 record on the board. A side is flagged when its band's mean per-bin mass is under
 `STARVED_OUTER_TAIL_FLOOR_MULTIPLE` (2.0) times that minimum step; each flagged
-row reports the declared anchor, the displayed bound, the band's mass and bin
-count, the mass sitting beyond the bound, and the log score a resolution in the
-band's thinnest bin would earn. `--output-starved-json <path>` writes every
-scanned side with its verdict, flagged or not. This is a DETECTOR: any width
-response stays gated on the standing `k_tail` hold. On the archived cohort it
+row reports the declared anchor, how many member curves set it and how many were
+dropped, the displayed bound, the band's mass and bin count, the mass sitting
+beyond the bound, and the log score a resolution in the band's thinnest bin would
+earn. The member census is there because the anchor is a median over the members
+whose declared curve is usable, so dropping one (an anonymous positional
+`Forecaster N` bucket, an unparseable curve, or one carrying fewer than two
+distinct percentile labels) moves the boundary the verdict is measured against;
+the section header states how many sides dropped a member, and every scanned side
+carries `members_used` / `members_dropped` in the JSON dump.
+`--output-starved-json <path>` writes every scanned side with its verdict,
+flagged or not. This is a DETECTOR: any width response stays gated on the
+standing `k_tail` hold. On the archived cohort it
 fires on 68 of 417 measurable open-bound sides across 49 questions, so a fire
 means "this question carries a cliff" rather than "something went wrong here".
 There is no publish-time twin of this detector, deliberately; the comment above
