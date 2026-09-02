@@ -766,6 +766,17 @@ class TestSourceProvenanceLadder:
         lowered = " ".join(prompt.lower().split())
         assert "proximity to the primary record" in lowered
         assert "against the speaker's interest" in lowered
+        # The A-D DEFINITIONS live once, in the research-side _SOURCE_TIER_TAG_INSTRUCTION, and
+        # the briefing arrives carrying the tags (99 of 1,069 archive records, every one since the
+        # tagging landed in prod). The forecaster ladder names the tag shape and keeps only the two
+        # USAGE clauses the tag instruction does not state: (C) facts-not-framing, (D) suggestive only.
+        assert "arrive tagged by source tier" in lowered
+        assert "[a: ...]" in lowered
+        assert "use their cited facts, not their framing" in lowered
+        assert "suggestive only" in lowered
+        assert "government statistics, regulatory filings" not in lowered, (
+            "the tier definitions were re-teaching what the research-side tag instruction already defines"
+        )
 
     def _assert_unverified_attribution_defined(self, prompt: str) -> None:
         """`[unverified attribution]` reaches the forecaster in gemini research sections
@@ -775,7 +786,7 @@ class TestSourceProvenanceLadder:
         claims where the guess matters."""
         lowered = " ".join(prompt.lower().split())
         assert "[unverified attribution]" in lowered
-        assert "could not match the outlet the text named against its own retrieval record" in lowered
+        assert "could not match against its own retrieval record" in lowered
         # The two halves that keep it from reading as "this fact is false" or as a tier grade.
         assert "the claim itself may still be correct" in lowered
         assert "untiered, unattributed evidence rather than as a named outlet's authority" in lowered

@@ -196,11 +196,12 @@ def _option_probs_example(options: list[str]) -> str:
 CitationStyle = Literal["markdown", "auto_annotated"]
 
 
-# Condensed source-tier vocabulary for the RESEARCH-side prompts (web research +
-# AskNews summarizer). The forecaster prompts carry the full provenance ladder
-# (``_SOURCE_PROVENANCE_LADDER`` below), but without research-side tags a C-tier
-# aggregator claim arrives in the briefing looking identical to a B-tier wire
-# fact and the forecasters' ladder has nothing left to weight. Deliberately
+# Source-tier vocabulary for the RESEARCH-side prompts (web research + AskNews
+# summarizer). This is the ONE place the A-D tiers are defined: the forecaster
+# prompts' provenance ladder (``_SOURCE_PROVENANCE_LADDER`` below) names the tag
+# shape and how to use each tier, and relies on the briefing arriving tagged.
+# Without research-side tags a C-tier aggregator claim arrives in the briefing
+# looking identical to a B-tier wire fact and the ladder has nothing to weight. Deliberately
 # short — research output is itself an input to further summarization — and
 # zero-indent so the text survives ``clean_indents`` verbatim in every consumer
 # (contrast the ladder's >=15-space pre-indent note).
@@ -487,23 +488,26 @@ SUMMARIZER_SOFT_FAIL_BANNER = (
 # competitor bots showed they rank factual claims by proximity to the primary
 # record and adjust by source motivation. Interpolated in place of the old
 # "Separate facts from opinions" bullet (which leads this block, so the swap is
-# clean and just appends the ladder). Every line is pre-indented to >= 15 spaces
-# so clean_indents preserves the (A)-(D) nesting in all three prompts despite
-# their differing baselines (binary baseline 12, MC/numeric baseline 8).
+# clean and just appends the ladder). The A-D tier DEFINITIONS are stated once,
+# in the research-side ``_SOURCE_TIER_TAG_INSTRUCTION`` above, and the briefing
+# arrives carrying the tags (every artifact record since the tagging landed in
+# prod); the ladder names the tag shape and keeps only the two usage clauses the
+# tag instruction does not carry. It used to restate all four definitions, which
+# re-taught the model a vocabulary the text in front of it was already written in.
+# Every line is pre-indented to >= 15 spaces so clean_indents preserves the
+# nesting in all three prompts despite their differing baselines (binary
+# baseline 12, MC/numeric baseline 8).
 _SOURCE_PROVENANCE_LADDER = """
                • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
-               • Rank factual claims by proximity to the primary record:
-                 (A) official / primary — government statistics, regulatory filings (e.g. SEC/EDGAR), court records,
-                     central-bank releases, and the question's own named resolution source;
-                 (B) wire services and papers of record carrying named-sourced facts (Reuters, AP, Bloomberg, FT);
-                 (C) aggregators, advocacy or partisan outlets, and translated or single-outlet reports —
-                     use the underlying cited facts, not their framing or causal narrative;
-                 (D) anonymous, social, rumor, or untraceable AI-generated summaries — suggestive only.
-               • `[unverified attribution]` stands where a source tag would be: the research pipeline
-                 could not match the outlet the text named against its own retrieval record, so the tag
-                 and its tier were removed together. The claim itself may still be correct, and nothing
-                 in the sentence was changed — treat it as untiered, unattributed evidence rather than as
-                 a named outlet's authority, and do not read it as a low tier either.
+               • Weight factual claims by proximity to the primary record. The briefing's claims arrive tagged by
+                 source tier where the tier was clear: [A: ...] official / primary record, including the question's
+                 own named resolution source; [B: ...] wire services and papers of record; [C: ...] aggregators,
+                 advocacy, partisan, translated or single-outlet reports (use their cited facts, not their framing
+                 or causal narrative); [D: ...] anonymous, social, rumor or untraceable AI summaries (suggestive only).
+               • `[unverified attribution]` marks a claim whose named outlet the research pipeline could not match
+                 against its own retrieval record, so the tag and its tier were removed together. The claim itself
+                 may still be correct: treat it as untiered, unattributed evidence rather than as a named outlet's
+                 authority, and not as a low tier either.
                • Weigh motivation, not just authority: discount claims that serve the speaker's interest (hype,
                  marketing, sponsor optimism). Treat a statement AGAINST the speaker's interest — a company tempering
                  its own timeline, an on-record denial of a favorable rumor — as strong evidence.
