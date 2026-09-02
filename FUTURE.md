@@ -58,21 +58,44 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 **Scope, per the operator: the checkpoint is the FULL triple-era read, not numerics alone.** Four
 reads come due at the same checkpoint and share one cohort, so they run together (the fourth added
 by the 2026-08-25 priority audit, when the ghost-scoring entry was demoted to Low and its re-read
-folded in here):
+folded in here). Read number 2 has since been answered ahead of the checkpoint and is kept below
+with its receipts, so three remain live:
 
 1. **The numeric ensemble delta** — the accepted +3.24 lean toward the retired 6-member roster,
    which is what this entry was originally opened for (detail and decision rule below).
-2. **The all-types peer gap.** The era's first scores came in mildly below the older eras: STRICT
-   triple mean peer **+4.28 (n=12)** against post_flip's +11.6 (n=104), and the first
-   within-tournament cut (summer-futureeval spans both eras, so the question generator is held
-   fixed) puts the gap at **−4.69 peer points after type-mix adjustment** (raw −7.3;
-   Mann-Whitney p=0.084 unmatched, 0.030 lag-matched — and the comparison arm is not
-   cluster-collapsed, so every p is generous). Effective independent n is **10 clusters, 8
-   conservative**, and the resolved 14 are by construction the era's short-horizon tail (median
-   submit-to-resolve 18.0 days vs 27.7 post-flip). So this is a flag to re-read on the full
-   cohort, not a finding: at the checkpoint the same cut should run on ~35 resolved records
-   instead of 12, and the question is whether the gap persists, shrinks, or was a
-   short-horizon-tail artifact. (`scratch/residual_2026-08-24/SYNTHESIS.md` §1.)
+2. **The all-types peer gap: RETIRED on 2026-08-31, re-confirmed retired on 2026-09-01. Stop
+   citing the gap.** What the flag said when it was raised on 2026-08-24: the triple era's first
+   scores came in mildly below the older eras, STRICT triple mean peer +4.28 (n=12) against
+   post_flip's +11.6 (n=104), and the within-tournament cut (summer-futureeval spans both eras, so
+   the question generator is held fixed) put the gap at −4.69 peer points after type-mix
+   adjustment (raw −7.3; Mann-Whitney p=0.084 unmatched, 0.030 lag-matched), on 10 effective
+   clusters and a resolved set that was by construction the era's short-horizon tail. It was
+   raised as a flag to re-read on a bigger cohort rather than as a finding, and two rounds have
+   now re-read it.
+
+   The 2026-08-31 round retired it at n=20. The STRICT triple cohort read spot peer +13.8 with
+   coverage-scaled peer +12.07, right at the post_flip level, and the within-tournament era cut
+   measured +1.26 peer after type-mix adjustment, cluster bootstrap 95% interval [−6.78,
+   +9.55], Mann-Whitney p between 0.44 and 0.95 under every collapse convention. The 2026-09-01
+   round confirmed that at n=30 (28 effective clusters, 25 conservative): STRICT triple spot peer
+   +17.46 against post_flip's summer-clean +14.33, a type-mix-adjusted gap of +3.66 spot with a
+   cluster bootstrap interval of [−6.67, +13.90], and +5.79 on the coverage-scaled field the
+   earlier round used, which sits inside that round's own reopen interval. The correct statement
+   is "no measurable era difference".
+
+   Two honesty notes travel with the retirement. Retired is not inverted: both rounds warn
+   explicitly that reading these numbers as "the triple is better" would be the same small-sample
+   error with the sign flipped, and the 2026-09-01 gap drifted positive mostly because the
+   comparison arm fell, since the 19 new post_flip records are that era's long-horizon "before
+   September" tail and scored +3.01 against +16.11 for the post_flip records already in hand. And
+   the −70.1 single-record reading that prompted the second look was the dry-key incident
+   scoring itself (q44874, coverage-scaled peer −70.1, published on one surviving forecaster),
+   not the live bot; it sits in `DEGRADED_RUN_QIDS` and is excluded from every figure above.
+   (Flag as raised: `scratch/residual_2026-08-24/SYNTHESIS.md` §1. Retirement:
+   `scratch/residual_2026-08-31/SYNTHESIS.md` §1 and
+   `scratch/residual_2026-08-31/dim_category-tournament.md`. Confirmation:
+   `scratch/residual_2026-09-01/SYNTHESIS.md` §1 and
+   `scratch/residual_2026-09-01/dim_category-tournament.md`.)
 3. **The anchored/unanchored and v2-treated/untreated splits**, which are newly cheap to run:
    `performance_analysis/research_tags.py` (shipped 2026-08-24, `dece67f`) now stamps
    `anchor_present` / `anchor_confidence` / `gfv2_present` / `gfv2_loop_ran` /
@@ -129,12 +152,23 @@ questions.
    the resolution lag. Run all four header items in ONE pass, since they read the same records
    and re-pulling is free: the triple-era numeric peer / log score and PIT against the post_flip
    cell (the "did the accepted lean show up as a visible loss" sanity check), the all-types
-   within-tournament peer gap on the full resolved cohort, the anchored/unanchored +
+   within-tournament peer gap on the full resolved cohort (a re-confirmation only now, since
+   header item 2 was retired at n=20 and again at n=30), the anchored/unanchored +
    v2-treated/untreated splits off the `research_tags.py` fields, and the ghost re-score. Each is
    descriptive at n≈35 with
    ~10 independent clusters — below the between-era floor above — so no fitted correction ships
    off them (AGENTS.md: fitted calibration layers need a decisive out-of-sample era test).
    (`scratch/residual_2026-08-24/dim_numeric-width.md` §2.)
+
+   **Update 2026-09-01: the resolution-lag projection above missed again, for the fourth round in
+   a row.** Of the 26 numeric-family questions sitting at post status `closed` on 2026-08-31,
+   exactly 3 resolved into the 2026-09-01 wave (45215 discrete, 45362 and 45363 numeric) and 23
+   remain unresolved, among them both pending degraded records (44875, 44876), all three pending
+   TS-anchored questions (44803, 44943, 45172), the post-fix replay 45241 and the TS-routing
+   target 45401. STRICT triple numeric-family n therefore went 10 to 13, not the 15 to 25 the
+   projection expected, so expect the 2026-09-12 checkpoint to read well short of n≈35, and treat
+   any date on this cohort as Metaculus's to set rather than ours to forecast.
+   (`scratch/residual_2026-09-01/FOLLOWUP_LEDGER.md`, the three framing facts at the top.)
 3. **Decision rule:** reintroduce the dropped numeric members ONLY if the frozen-era numeric
    delta *still* leans full with **P(loss>1pt/Q) ≥ 0.7 AND** the point estimate survives the
    top-2-question jackknife. Otherwise keep the uniform triple permanently — a per-qtype roster
@@ -931,6 +965,25 @@ and `options`). The two guarding the new staleness tier cap were fixed inside th
 is one mechanical sweep and deserves its own PR, because the MagicMock question fixtures several
 research tests build will need explicit attributes once those defaults stop covering for them.
 
+A sixth, accepted deliberately rather than fixed (added 2026-09-02, forge R1 from the 2026-08-31
+round; operator decision recorded in that round's SYNTHESIS decision table): **the ft-fallback
+numeric builder's CLOSED-bound path skips `safe_cdf_bounds` entirely.** In
+`create_fallback_numeric_distribution` (`metaculus_bot/numeric/pchip_processing.py`) the
+`BoundSafeNumericDistribution.get_cdf` override returns upstream's CDF unchanged when neither bound
+is open, so no min-step, max-step or endpoint enforcement runs on that output and no
+`CDF_MAXSTEP_CLIP` marker can fire; the forge reviewer measured a 0.2034 bin against the platform's
+0.2 cap on that path, and the stacker path publishes such output directly, so in principle an
+over-cap CDF is POSTed and Metaculus rejects the whole submission. It also falsifies the "single
+choke point" claim in `docs/numeric_pipeline.md`. Accepted because the failure is compound-rare: it
+needs closed bounds AND a PCHIP failure AND stacking enabled, and stacking is prod-disabled today,
+with zero measured fires in the archive. Restructuring the fallback path speculatively risks more
+than it buys, and timing/fallback paths in this pipeline have cost real questions before. If
+stacking is ever re-enabled, this becomes a real pre-flight item: route the closed-bound branch
+through `safe_cdf_bounds` too, with the grid-scaled step constraints the open-bound branch already
+computes.
+(`scratch/residual_2026-08-31/forge_report_resids-sept1.md` R1;
+`scratch/residual_2026-08-31/SYNTHESIS.md` decision table, decision (b).)
+
 ### Deterministic tail-consistency check on the numeric structured block (added 2026-08-24)
 
 From the q44453 dossier (July payrolls, peer −11.24; the whole field missed the −23k print, so the
@@ -946,6 +999,84 @@ de-skewing every member to a symmetric normal at its own declared p50 and 10–9
 **+11.93 baseline points, taking spot peer from −12.15 to −0.22** — roughly break-even with the
 crowd, from arithmetic the models had already done.
 (`scratch/residual_2026-08-24/dossiers/44453_dossier.md` + `44453_verification.md` C1.)
+
+### Anchor-date discipline, prompt-side: make a status-quo anchor state its date (added 2026-09-02, tracked at last; recommended by the 2026-08-24 round)
+
+**What.** One forecaster-prompt rule: when a member derives a status-quo or time-series anchor (a
+last print, a current polling level, a latest index value), it must state the DATE of the reading it
+anchored on and prefer the newest dated read available in the bundle. Nothing computes off it and it
+is not a clamp; it is an elicitation rule aimed at a specific failure.
+
+**Why.** The stale-anchor pattern is the common mechanism behind a whole run of misses. The
+2026-08-24 round named 44858, 44841, 44855, 44553 and 45115, with 45114 and 45174 as the saves that
+show what correct handling looks like, and the 2026-08-31 round added 44554 (sol published 17
+points below its own anchor on a polling-lead question, presumably off stale summer polls; that one
+is a plausible instance rather than a traced one). A member that never says when its anchor was
+measured cannot notice that the bundle carries a fresher number, and the reader of the rationale
+cannot tell a current read from a remembered one.
+
+**Status and the honest discount.** Unshipped, and until 2026-09-02 also untracked, which is why
+this entry exists. The RENDER side is now half-covered: `bc9d9ad` dates every rendered latest value
+and flags staleness, and the 2026-09-01 bundle added vintage / as-of bullets to
+`web_research_prompt` asking research output to carry the publication date of dated claims. That
+weakens the prompt-side case without retiring it, because those changes make the dates AVAILABLE to
+a forecaster without making a forecaster state which one it used. Not a fitted layer, so no
+out-of-sample era gate is needed to ship it; but do not quote 44553's +58 as an expected value, and
+size it against the fact that the bundle already carries several prompt rules whose combined effect
+is unmeasured until the fall cup resolves.
+(`scratch/residual_2026-08-24/SYNTHESIS.md` §6 item 6;
+`scratch/residual_2026-08-31/SYNTHESIS.md` free-recommendation item 10 and
+`dim_consensus-dissent.md` on 44554.)
+
+### ~~Anchor-overshoot self-consistency screen (the anchor half of the same check)~~: MEASURED and REJECTED 2026-08-31, priced again 2026-09-02. Do not build it.
+
+This is the sibling half of the tail-consistency check above, and unlike that half it has been
+measured and does not survive. The proposal was: flag or correct a binary forecast whose published
+probability sits outside the member's own declared `base_rate_anchor` range, on the theory that
+leaving your own stated anchor is an internal contradiction. Three findings kill it.
+
+**The premise is not a contradiction.** The prompt defines `base_rate_anchor` as the outside-view
+range stated in Phase 1 and `posterior_prob` as the post-update posterior, so publishing outside
+the range is licensed by construction: it means the inside view moved the model past its own base
+rate. The screen measures the size of that update, not an inconsistency.
+
+**The incidence is 3x what the screen was priced against, and the direction is INVERTED at the n
+it can be read at.** Over the triple era's clean published blocks the rate is 32 of 119 = **26.9%**
+(Wilson 95% 19.7 to 35.5), against the 8% a single earlier round had carried, and it is a stable
+property rather than an era effect (post_flip 21 of 87 = 24.1%, Fisher p=0.75 between eras). On the
+21 blocks that had resolved, blocks that LEFT their own anchor scored **+72.11 (n=3, none
+negative)** while blocks that stayed inside scored **+25.60 (n=18, 4 negative)**, and all three of
+the worst blocks (worse than −100) sat inside their anchors. All 3 resolved fires were hit-side, 0
+miss-side. The per-slot rates are a style difference, not an error signature: gpt-5.6-sol leaves
+its own anchor on 46.2% of blocks against opus-4.8's 7.5% (Fisher p=0.0001), and it is not a width
+artifact, since sol states the WIDEST intervals (mean 0.174 against opus's 0.139) and still leaves
+them most often, with the width-free distance-from-own-anchor-centre measure putting sol at about
+3x opus.
+
+**Priced field-free on the whole archive, "publish your anchor instead" is worth about zero with a
+parse-dependent sign.** The 2026-09-02 failure-mode audit re-medianed every binary ensemble with
+each member's stated anchor substituted for its published value: **minus 221 spot peer over 143
+records** under the strict parse (anchors written as a bare number) and **plus 789 over 376
+records** under the extended parse (leading number or range midpoint), with the **median record
+delta 0.00 under both**. Most overrides do move away from the resolution, but the moves toward it
+are individually larger (30 to 78 points each above the 15-point gap cut) and roughly cancel, so
+the net is a variance trade with no expected gain. The largest single contributors point opposite
+ways: q42304 would have gained +144 from keeping its anchor, q39747 (the US bailout of Argentina)
+would have lost 170, because there the members' 0.10 anchor was wrong and their 0.55 publish was
+right.
+
+**What to do instead.** Nothing automated. `_ANCHOR_CONSISTENCY_RULE` (shipped in the 2026-09
+bundle) already asks a member to state its outside-view number and to name the specific evidence
+when it lands more than about 15 points away; the audit endorses exactly that and warns against
+strengthening it into a clamp or a shrink. The one cheap thing worth continuing is the control:
+hand-run the single anchor-versus-published comparison on any new binary MISS dossier and record
+which side it fires on, because the resolved-fire cell is n=3 and every one of them is hit-side.
+Never propose it as a screen or a guard. Note also that any June-era hand-run of this check is
+unmeasurable: `base_rate_anchor` did not exist in the archive before `30bca2f` landed on main
+2026-07-11.
+(`scratch/residual_2026-08-31/dim_ghosts-guards.md` §3c and
+`scratch/residual_2026-08-31/SYNTHESIS.md` decision table;
+`scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md` §4.)
 
 ### Gap-fill v2 throttle handling: the request-spacing half the q45191 fix left (added 2026-09-02)
 
@@ -1078,6 +1209,28 @@ Follow-ups:
    fallback paths in this pipeline have cost real questions before (q45085). Blast radius is
    unmeasured, so size it first:
    `rg --no-ignore 'wall-clock timeout' backtests/telemetry_archive/`.
+6. **MEDIUM: trafilatura silently drops MediaWiki collapsible boxes, and the surviving text can
+   read as the inverse of the truth (verified 2026-08-24 on q44870; tracked here 2026-09-02).** On
+   an English Wikipedia endorsements page the box renders as
+   `<div class="endorsements-box mw-collapsible"><div class="endorsements-box-title">Declined to
+   endorse</div>...`. Under our production `favor_precision=True` settings trafilatura drops the
+   whole thing; under default/recall settings the list body survives but the box TITLE never does
+   (tested across txt, txt+formatting, markdown and xml output, and reproduced on the live page, so
+   it is systematic rather than a revision artifact). The consequences are worse than truncation and
+   worse than a plain miss. First, a cited grading page reports `status: ok` while the section the
+   resolution criteria point at is absent, so nothing downstream knows the evidence was lost.
+   Second, what the extraction DOES deliver from that section is unattributed: endorser bullets
+   arrive with the per-candidate box titles stripped, so a "Declined to endorse" entry can appear
+   immediately after another candidate's endorser list and read as an endorsement, which is the
+   exact inverse of the truth. Third, the obvious budget-side fixes do not work: a
+   subject-anchored truncation window and honouring the URL fragment both operate on the extracted
+   text, where the box's content does not exist, and no per-URL cap delivers it. The fix has to sit
+   at the extraction layer: for `en.wikipedia.org` specifically, pull section wikitext or
+   `action=parse` HTML through a purpose-built reader instead of generic main-content extraction;
+   or, generically, keep a structured pass over `<div>`-titled list blocks before handing off to
+   trafilatura. Same extraction-fidelity family as the Datawrapper hop in item 2, and NOT covered by
+   items 1 to 3 above (conditional summarization would summarize the same defective extraction).
+   (`scratch/residual_2026-08-24/dossiers/44870_verification.md` §2.1.)
 
 ### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
 
@@ -1325,7 +1478,29 @@ its gate must include a fall-like era-stability check (harvesting the spring mis
 damages the largest, best-calibrated era). Receipts: `scratch/residual_2026-07-08/ACID_TEST_VERDICT.md` §3,
 `scratch/residual_2026-07-08/experiments/GUARDS_SYNTHESIS.md`.
 
-### Telemetry-first guard revival program (added 2026-07-08, passive)
+### ~~Telemetry-first guard revival program~~: CLOSED 2026-09-02 (the field it accrues on is being removed) (added 2026-07-08, passive)
+
+**Why it is closed.** This program was a passive bet that the `base_rate_anchor` /
+`criteria_clauses` elicitation would keep accruing archive rows until the guard-revival conditions
+could be tested exactly rather than by parsing prose. The 2026-09 bundle retires that elicitation:
+Item D of `scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md` removes both
+fields from the binary prompt's schema instruction and example block (the Pydantic fields stay
+tolerant so archived comments still strict-parse), on the grounds that they restate prose the
+rationale already carries, their only consumer is `tool_runner` behind
+`PROBABILISTIC_TOOLS_ENABLED=false`, and their harvested marker holds zero rows. Once the prompt
+stops asking, no new question can carry the field, so neither free check below can accrue and the
+`base_rate_anchor` leg of the anchor-floor guard's revival condition (in "Killed by July 2026-07-08
+residual + competitor analysis") is frozen where it stands: about 40 triple-era binary questions
+carry the field against a threshold of 50, and only 21 of their 119 blocks had resolved as of
+2026-08-31.
+Reviving any of this now means re-adding the elicitation first, which is a prompt change and a
+config-era boundary, so it is a decision rather than a wait. `remaining_window_days` /
+`WINDOW_DECLARED`, shipped on the morning of 2026-09-02, is retired by the same item on the same
+day for the same reason; it never appears in this file, so there is nothing else here to update.
+The evidence below is kept because it is what stops the idea being re-proposed from memory.
+(`scratch/residual_2026-08-31/dim_ghosts-guards.md` §3b-3c for the archived counts;
+`scratch/residual_2026-09-01/FOLLOWUP_LEDGER.md` row 29.)
+
 
 Shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` + `criteria_clauses` on `BinaryStructured`;
 authored 2026-07-08, live on main 2026-07-11T16:37Z in merge `642b027` — that merge date is the era
@@ -1353,11 +1528,19 @@ post-bullet MC, all also post-clamp). The once-proposed prompt line ("price clea
 options near the 1% floor") has no evidential support and would now collide with the 0.01 clamp
 floor, which binds on 4 of 18 post-clamp ballots. **Do not conflate it with the MC top-band
 under-commitment, which is the one MC signal still worth watching**: combined ≥0.60 top bands
-over-resolve in all 4 eras, pooled exact p=0.097 at 32 questions, crossing p<0.05 at n≈41 — nine
-top-band questions away at ~1.2/month, so a next-season item for throughput reasons, not
-effect-size ones. The 1% floor stays (operator 2026-07-09: sub-1% headroom ~+0.01 nats/question vs
+over-resolve in all 4 eras (the direction replicates 4 of 4), and as of 2026-09-01 the STRICT
+cohort reads **35 questions, expected 26.11, observed 30, exact p = 0.1624**, with the sample size
+needed for exact p<0.05 now **57**, i.e. **short by 22 questions, not the 9 the 2026-08-24 reading
+implied**. The item moved AWAY from the gate rather than merely failing to move: the three new
+top-band ballots hit 2 of 3 against the cohort's own 0.857 realised rate, which lowers the effect
+size and raises the required n. **There is no accrual path inside summer-futureeval-2026.** The
+latest scored MC submission anywhere is 2026-08-15, the tournament closes 2026-09-06, and
+`metaculus-cup-fall-2026` existed but held no posts as of 2026-09-01. So this is not "nine
+questions away", it is a watch item with no remaining supply, to be revisited only if a successor
+tournament opens. The 1% floor stays (operator 2026-07-09: sub-1% headroom ~+0.01 nats/question vs
 parser/clamp regression risk — not worth it).
-(`scratch/residual_2026-08-24/dim_binary-mc-calibration.md` §3–4.)
+(`scratch/residual_2026-08-24/dim_binary-mc-calibration.md` §3–4;
+`scratch/residual_2026-09-01/dim_binary-mc-calibration.md` §5.3 and ledger row 11.)
 
 ### File splits + shared fetch-primitive promotion (added 2026-07-18, low, standalone PRs)
 
@@ -1554,9 +1737,18 @@ now the wrong one.
 
 Ask LLMs to parameterize a mixture (2-3 components: mean, std, weight) instead of percentiles, for
 smoother CDFs (Mantic reports good results). **Note:** a mixture path
-(`NumericStructured.mixture_components` + router branch) was built and REMOVED 2026-07-08 after zero
-prod fires — percentiles+PCHIP beat it in every benchmark (`mixtures.py` library preserved but dormant).
-Re-proposing the LLM-parameterized-mixture form has to clear that bar.
+(`NumericStructured.mixture_components` + router branch) was built and REMOVED 2026-07-08 (landed on
+main in `642b027`, 2026-07-11) because percentiles+PCHIP beat it in every benchmark; the `mixtures.py`
+library is preserved but dormant. **The removal was justified at the time as "zero prod fires", which
+turned out to be wrong.** The 2026-08-24 counterfactual round proved one confirmed prod fire (q43826,
+2026-06-06, gemini-3.1-pro, whose published CDF reproduces bit-exactly only through the mixture
+branch) and one rejected attempt (q43913, 2026-06-11, gpt-5.4). The removal decision itself stands on
+the benchmarks; do not cite "zero prod fires" as its evidence. Re-proposing the
+LLM-parameterized-mixture form has to clear the benchmark bar.
+(`scratch/residual_2026-08-24/dim_discrete-maxstep-counterfactual.md`, "Two side findings worth
+carrying forward" item 1; the same correction is in AGENTS.md's
+"Probabilistic tools" mixture-of-normals bullet. Corrected here 2026-09-02 after surviving three
+residual rounds.)
 
 ### Aggregation strategy improvements
 
@@ -1834,24 +2026,37 @@ priority audit.
 
 **Operator decision 2026-08-25 — moved off top-priority to LOW so it stops resurfacing.** Two
 reasons, both about today's configuration rather than the idea's merit: stacking is prod-disabled,
-so spread gates nothing we currently ship, and the measured trigger is dead for binaries on the
-3-member roster (0/4 would have fired; the gate fires on ~1/3 of questions overall and only in the
-numeric family). Revive if the roster grows back or stacking is re-enabled — and re-derive the
-binary threshold rather than inheriting it.
+so spread gates nothing we currently ship, and the measured trigger looked dead for binaries on the
+3-member roster (0 of 4 would have fired). **The second reason is now known to be wrong**: at
+n=11 the gate fires on 4 of 11 triple binaries, so the parking decision stands on the
+stacking-disabled reason alone; see the trigger measurement below before quoting the LOW label as
+evidence about the idea. Revive if the roster grows back or stacking is re-enabled, and re-derive
+the binary threshold rather than inheriting it.
 
-**Trigger measurement (load-bearing, read first — re-priced 2026-08-24 on the live roster).** The
-modal worst-miss remains consensus-with-zero-dissenters under a shared briefing (2026-07-18,
-reconfirmed 2026-08-24), so **spread carries no directional information when the ensemble shares an
-attractor**. On the frozen triple the gate also fires far less than the post-flip data implied: a
-3-member range is ~4x narrower (mean binary published range 0.055 vs 0.244 on ~6 models), and the
-first prod measurement (`skipped_config_off` telemetry, 13 spread-computable triple questions) has
-it firing on **~1/3 of questions instead of the 78–80% post_flip implied — and entirely
-numeric-family** (2/2 numeric, 3/4 discrete, 0/4 binary, 0/3 MC; triple binary spreads run
-0.04–0.08 against the 0.15 threshold). In practice this is a **numeric-only lever on the current
-roster**, addressing the disagreement subset only; do not expect it to fix the current worst
-misses. The consensus-miss counters are separate items (gap-fill v2 verify / DISCREPANCY channel;
-cross-question coherence / resolution-metric verification checks from the residual rounds).
-(`scratch/residual_2026-08-24/dim_consensus-dissent.md` §5b, `dim_aggregation-stacker.md` §4.)
+**Trigger measurement (load-bearing, read first; first priced 2026-08-24 on the live roster,
+re-measured 2026-08-31 and again 2026-09-01 as the triple cohort grew).** The modal worst-miss
+remains consensus-with-zero-dissenters under a shared briefing (2026-07-18, reconfirmed
+2026-08-24), so **spread carries no directional information when the ensemble shares an
+attractor**. On the frozen triple the gate does fire less often than the post-flip data implied,
+but the type story the first measurement told was an n=4 artifact. The 2026-09-01 recount over the
+STRICT triple cohort (`skipped_config_off` telemetry, 30 questions, the marker agreeing with a
+recomputed spread on 31 of 31 comparable records) has the gate firing on **15 of 30 questions:
+binary 4 of 11, MC 0 of 6, numeric 6 of 7, discrete 5 of 6**. So this is a **numeric-DOMINANT
+lever on the current roster, not a numeric-only one.** The correction matters because "dead for
+binaries" is the kind of statement that would stop the item ever being revisited, and the two
+newest binary firings are the widest three-member binary spreads on record (0.38 and 0.33 against
+the 0.15 threshold). MC is the only cell still empty. The three supporting figures the earlier
+measurement carried are superseded by the same recount: triple binary spreads run **0.0100 to
+0.3800** rather than 0.04 to 0.08, the three-member narrowing is **1.63x on the mean and 1.90x on
+the median** rather than about 4x, and the binary at-threshold rate is **36.4% against 63.0% for
+post_flip** rather than zero. The lever still addresses the disagreement subset only, so do not
+expect it to fix the current worst misses; the consensus-miss counters are separate items
+(gap-fill v2 verify / DISCREPANCY channel; cross-question coherence / resolution-metric
+verification checks from the residual rounds).
+(First pricing: `scratch/residual_2026-08-24/dim_consensus-dissent.md` §5b and
+`dim_aggregation-stacker.md` §4. Correction and recount:
+`scratch/residual_2026-08-31/dim_aggregation-stacker.md` §1 and
+`scratch/residual_2026-09-01/dim_aggregation-stacker.md`, ledger row 20.)
 
 **What.** On questions where forecaster spread exceeds the existing CONDITIONAL_STACKING
 thresholds (~30% of questions per the one recorded estimate): run the EXISTING crux extractor →
@@ -2185,8 +2390,15 @@ here so future sessions don't re-recommend them without new data.
 - **Anchor-floor guard on cheap tails** — median-band variant sign-flips (fall +1.68 / spring −2.19 total
   Brier at 10pp) because 76% of parsed anchor bands are degenerate points; union-band variant is
   sign-consistent but 100% top-5-concentrated (1–2 Qs/era) and catches 1/5 of known misses; same-side tail
-  clamping hurts both well-powered eras. Revival: ≥50 current-roster binaries with `base_rate_anchor`
-  telemetry (`30bca2f`, live on main 2026-07-11T16:37Z in `642b027`) AND an era-stable, top-5<50% replay.
+  clamping hurts both well-powered eras. Revival was: ≥50 current-roster binaries with
+  `base_rate_anchor` telemetry (`30bca2f`, live on main 2026-07-11T16:37Z in `642b027`) AND an
+  era-stable, top-5<50% replay. **That condition can no longer accrue as of 2026-09-02**: the
+  2026-09 bundle removes the `base_rate_anchor` elicitation from the binary prompt (Item D of
+  `scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md`), so the count is frozen
+  at about 40 triple-era binaries. Reviving this guard now starts with re-adding the field, which is
+  a prompt change and a config-era boundary; see the closed "Telemetry-first guard revival program"
+  entry. Note separately that the anchor-overshoot variant of the idea was measured and rejected on
+  its own evidence in 2026-08-31 (its entry is beside the numeric tail-consistency check).
   `.../GUARD1_FINDINGS.md`.
 - **No-market-no-extremize cap** — feasibility kill: market-presence signal exists in ~one era (fall 89%
   NO_SIGNAL, `## Prediction Market Snapshot` in exactly 1 archived binary), so era-stability un-testable;

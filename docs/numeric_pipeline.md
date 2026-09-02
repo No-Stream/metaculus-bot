@@ -188,11 +188,17 @@ forecaster, the mass displaced, and how far it travelled (`scripts/telemetry/mar
 harvests it); it is deliberately **not** alertable, since a spike above a platform cap is
 a forecaster's declaration rather than a bot defect.
 
-`safe_cdf_bounds` is the single choke point for this: the per-model build
-(`generate_pchip_cdf`), the per-model ramp pass, the ensemble CDF
-(`_postprocess_ensemble_cdf`, both branches), the discrete integer snap, the
-forecasting-tools fallback builder, and the offline pooling paths all reach the max-step
-rule through it, so the packing policy has exactly one implementation.
+`safe_cdf_bounds` holds the only implementation of this packing policy, and every path
+that enforces the max-step rule reaches it: the per-model build (`generate_pchip_cdf`),
+the per-model ramp pass, the ensemble CDF (`_postprocess_ensemble_cdf`, both branches),
+the discrete integer snap, the forecasting-tools fallback builder on an OPEN bound, and
+the offline pooling paths. It is not, however, a choke point every published CDF passes
+through: `BoundSafeNumericDistribution.get_cdf` in `numeric/pchip_processing.py` returns
+upstream's CDF unchanged when BOTH bounds are closed, so a closed-bound fallback
+distribution gets no step or endpoint enforcement and can emit no `CDF_MAXSTEP_CLIP`
+marker. That gap is accepted deliberately (it needs closed bounds and a PCHIP failure and
+stacking enabled, and stacking is prod-disabled); see the sentinel-value entry in
+FUTURE.md under "Sentinel-value sweep leftovers", sixth item.
 
 ### Open vs. closed bounds: a one-sided constraint, not a box
 
