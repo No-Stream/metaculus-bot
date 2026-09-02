@@ -517,6 +517,51 @@ class TestRunNumericForecast:
         assert mock_parse_structured.await_count == 0  # confirms parse_structured was never called
 
     @pytest.mark.asyncio
+    async def test_a_misspelled_outcome_type_falls_back_to_the_parser_call(
+        self, numeric_question, forecaster_llm, parser_llm
+    ) -> None:
+        """A stray spelling costs ONE parser call and keeps the percentiles on rung 1.
+
+        The schema reads an unrecognised outcome_type as absent (2026-09-02), so the block
+        still validates and ``_resolve_discrete_vote`` takes exactly the OutcomeTypeResult
+        fallback it already has for a block that declares nothing. Under the bare Literal
+        this same rationale failed the whole numeric block, which sent the FORECAST to the
+        LLM salvage rung and fired the parser call anyway.
+        """
+        reasoning_text = (
+            "Some rationale text.\n"
+            "```json\n"
+            '{"question_type": "numeric", "outcome_type": "integer",'
+            ' "declared_percentiles": {"0.1": 10.0, "0.5": 50.0, "0.9": 90.0}}\n'
+            "```\n"
+        )
+        mock_parse_structured = AsyncMock(return_value=OutcomeTypeResult(is_discrete_integer=True))
+
+        with (
+            patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
+            patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_parse_structured),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_numeric",
+                new=AsyncMock(
+                    return_value=ExtractionOutcome(value=_STANDARD_PERCENTILES, rung="block", block_present=True)
+                ),
+            ),
+            patch(
+                "metaculus_bot.forecaster_runners.sanitize_percentiles",
+                return_value=(_STANDARD_PERCENTILES, None),
+            ),
+            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+            patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
+            patch("metaculus_bot.forecaster_runners.log_final_prediction"),
+        ):
+            _, discrete_vote = await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm)
+
+        assert discrete_vote is True
+        assert mock_parse_structured.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_discrete_vote_none_when_parse_fails(self, numeric_question, forecaster_llm, parser_llm) -> None:
         """When OUTCOME_TYPE parsing fails, discrete_vote is None."""
         mock_parse_structured = AsyncMock(side_effect=ValidationError.from_exception_data(title="test", line_errors=[]))

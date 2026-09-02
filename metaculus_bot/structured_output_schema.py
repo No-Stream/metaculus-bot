@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Iterator
 from typing import Annotated, Literal
@@ -189,6 +190,36 @@ class CriteriaClause(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _readable_optional_float(value: object, *, low: float | None, high: float | None) -> float | None:
+    """A finite float inside [low, high], or None when the declaration is unusable.
+
+    The lenient half of the 2026-09-02 retirement of ``other_mass`` / ``concentration``.
+    Both were inputs to a Dirichlet tool behind ``PROBABILISTIC_TOOLS_ENABLED`` (off in
+    prod) and neither is prompted any more, so a value that fails its range is worth
+    nothing and must cost nothing: it reads as absent instead of raising. The strict
+    version cost a real forecast — on q45189 gemini wrote ``"concentration": 0.0`` beside
+    a valid three-option ballot, the ``> 0`` check rejected the whole block, ``json_repair``
+    cannot alter valid JSON, and MC has no telemetry strip-and-retry, so the ballot was
+    re-read by the LLM salvage rung (``rung=llm`` in the extraction archive).
+
+    None is the honest reading rather than a clamp: a value outside its own range means the
+    model was not declaring the quantity we asked for, and inventing an in-range substitute
+    for a dormant field would put a number nobody stated into the archive.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    if low is not None and number < low:
+        return None
+    if high is not None and number > high:
+        return None
+    return number
+
+
 def _validate_scenario_sum(scenarios: list[ScenarioBranch]) -> list[ScenarioBranch]:
     if not scenarios:
         return scenarios
@@ -243,6 +274,33 @@ class NumericStructured(BaseModel):
     outcome_type: Literal["discrete_integer", "continuous"] | None = None
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
 
+    @field_validator("outcome_type", mode="before")
+    @classmethod
+    def _tolerate_unknown_outcome_type(cls, v: object) -> str | None:
+        """An unrecognised spelling reads as absent instead of failing the whole block.
+
+        ``outcome_type`` gates discrete snapping, and the block value exists to save a
+        parser-LLM call (``forecaster_runners._resolve_discrete_vote``). Under a bare
+        ``Literal`` a near-miss spelling — "integer", "discrete", "count" — took the
+        PERCENTILES down with it: the numeric block has no strip-and-retry, so the whole
+        forecast dropped to LLM salvage AND the parser call fired anyway for the type.
+        Reading the strays as None costs exactly the one parser call the field was meant
+        to save, which is the right price for a misspelling.
+
+        Logged at WARNING with the raw value, because a spelling the roster starts using
+        is a prompt signal rather than noise.
+        """
+        if v is None:
+            return None
+        if v in ("discrete_integer", "continuous"):
+            return str(v)
+        logger.warning(
+            "Unrecognised outcome_type %r in numeric structured block; reading it as absent "
+            "(the discrete vote falls back to the parser call)",
+            v,
+        )
+        return None
+
     @field_validator("declared_percentiles")
     @classmethod
     def _check_percentiles(cls, v: dict[float, float] | None) -> dict[float, float] | None:
@@ -257,13 +315,23 @@ class NumericStructured(BaseModel):
         for pct in v:
             if not (0.0 <= pct <= 1.0):
                 raise ValueError(f"Percentile keys must be in [0, 1], got {pct}")
+        # NON-decreasing, not strictly increasing: a repeated value is a legitimate
+        # concentrated (often count-like) declaration — p1 = p2.5 = 0 on a question that
+        # usually reads zero — and both downstream layers are built for exactly that
+        # (``value_extraction._validate_numeric`` allows ties by name, and
+        # ``sanitize_percentiles``'s cluster spreader exists to separate them). While this
+        # schema demanded a strict increase, such a block failed rung 1, could not be
+        # repaired (it is valid JSON), and reached the pipeline only via LLM salvage. A
+        # strict DECREASE with rising percentile still raises: it is incoherent, and
+        # ``sort_percentiles_by_value`` sorts by LABEL, so a value-disordered set is
+        # force-monotonized rather than reordered.
         sorted_keys = sorted(v.keys())
         prev_value: float | None = None
         for key in sorted_keys:
             value = v[key]
-            if prev_value is not None and value <= prev_value:
+            if prev_value is not None and value < prev_value:
                 raise ValueError(
-                    f"declared_percentiles values must be strictly increasing with percentile; "
+                    f"declared_percentiles values must be non-decreasing with percentile; "
                     f"got {value} at pct {key} after {prev_value}"
                 )
             prev_value = value
@@ -291,15 +359,24 @@ class MultipleChoiceStructured(BaseModel):
     question_type: Literal["multiple_choice"]
     prior: StatedPrior | None = None
     option_probs: dict[str, float]
-    other_mass: float | None = Field(default=None, ge=0.0, le=1.0)
+    # ARCHIVED BLOCKS ONLY, and read leniently — see _readable_optional_float. Both were
+    # Dirichlet tool inputs; no longer prompted since 2026-09-02, and an unusable value
+    # now reads as absent rather than costing the ballot that carries the forecast.
+    other_mass: float | None = None
     concentration: float | None = None
 
-    @field_validator("concentration")
+    @field_validator("other_mass", mode="before")
     @classmethod
-    def _check_concentration(cls, v: float | None) -> float | None:
-        if v is not None and v <= 0:
-            raise ValueError(f"MultipleChoiceStructured.concentration must be > 0 if set, got {v}")
-        return v
+    def _tolerate_other_mass(cls, v: object) -> float | None:
+        return _readable_optional_float(v, low=0.0, high=1.0)
+
+    @field_validator("concentration", mode="before")
+    @classmethod
+    def _tolerate_concentration(cls, v: object) -> float | None:
+        # A concentration is a positive Dirichlet hyperparameter, so 0.0 and negatives are
+        # not readings; the widely-copied example value was 20.0, hence no upper bound.
+        read = _readable_optional_float(v, low=None, high=None)
+        return read if read is not None and read > 0.0 else None
 
     @field_validator("option_probs")
     @classmethod

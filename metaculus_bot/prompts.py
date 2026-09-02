@@ -1048,14 +1048,12 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         This block is the ONLY authoritative source of your forecast — a downstream
         deterministic parser reads it and nothing else. Responses without it are
         discarded.
-        Schema (`option_probs` is REQUIRED; others optional):
+        Schema:
 
         ```json
         {{
           "question_type": "multiple_choice",
-          "option_probs": {{{option_probs_example}}},
-          "other_mass": 0.0,
-          "concentration": 20.0
+          "option_probs": {{{option_probs_example}}}
         }}
         ```
 
@@ -1254,9 +1252,6 @@ def numeric_prompt(
         ```
 
         Notes:
-        - The `declared_percentiles` block is the ONLY source of your forecast — it
-          MUST contain all {EXPECTED_PERCENTILE_COUNT} standard percentiles
-          ({_STANDARD_PERCENTILES_DECIMAL_CSV}); a partial set cannot be salvaged.
         - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
           equal); floating-point numbers in the base unit; no scientific notation.
         - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
@@ -1566,7 +1561,7 @@ def stacking_numeric_prompt(
         deterministic parser reads it and nothing else. Responses without it are
         discarded.
         Schema (`declared_percentiles` is REQUIRED and MUST contain all {EXPECTED_PERCENTILE_COUNT} standard
-        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}; `outcome_type` is REQUIRED):
+        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}):
 
         ```json
         {{
@@ -1574,20 +1569,13 @@ def stacking_numeric_prompt(
           "declared_percentiles": {{
             "0.01": 0.5, "0.025": 1.2, "0.05": 10.1, "0.1": 12.3, "0.2": 23.4, "0.4": 34.5, "0.5": 45.6,
             "0.6": 56.7, "0.8": 67.8, "0.9": 78.9, "0.95": 89.0, "0.975": 123.4, "0.99": 140.2
-          }},
-          "outcome_type": "continuous"
+          }}
         }}
         ```
 
         Notes:
-        - The `declared_percentiles` block is the ONLY source of your forecast — it
-          MUST contain all {EXPECTED_PERCENTILE_COUNT} standard percentiles
-          ({_STANDARD_PERCENTILES_DECIMAL_CSV}); a partial set cannot be salvaged.
         - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
           equal); floating-point numbers in the base unit; no scientific notation.
-        - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
-          whole number (counts, rankings, number of events, number of countries),
-          "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
 
         The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """

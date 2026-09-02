@@ -1462,7 +1462,13 @@ class TestStructuredForecastExampleBlocks:
 
     # Retired 2026-09-02: each was read only by dormant telemetry, and every one of them
     # asked the model for post-hoc admin rather than for its forecast.
-    _RETIRED_KEYS = ("remaining_window_days", "base_rate_anchor", "criteria_clauses")
+    _RETIRED_KEYS = (
+        "remaining_window_days",
+        "base_rate_anchor",
+        "criteria_clauses",
+        "other_mass",
+        "concentration",
+    )
 
     @pytest.mark.parametrize("build_prompt", _EXAMPLE_BLOCK_BUILDERS)
     def test_example_block_parses(self, build_prompt: Callable[[], str]) -> None:
@@ -1473,6 +1479,43 @@ class TestStructuredForecastExampleBlocks:
     def test_example_block_carries_no_retired_key(self, build_prompt: Callable[[], str]) -> None:
         parsed = json.loads(_extract_last_json_block(build_prompt()))
         assert not [key for key in self._RETIRED_KEYS if key in parsed]
+
+    def test_only_the_base_numeric_prompt_asks_for_outcome_type(self) -> None:
+        """``outcome_type`` gates discrete snapping and saves a parser call, so the BASE
+        numeric prompt keeps it. The stacker's vote is never read — the discrete decision is
+        the base members' majority — so asking the stacker for it was pure admin, dropped
+        2026-09-02."""
+        base = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        stacking = stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        )
+        assert json.loads(_extract_last_json_block(base))["outcome_type"] == "continuous"
+        assert "outcome_type" not in json.loads(_extract_last_json_block(stacking))
+        # The stacking prompt still DESCRIBES the field where it names what the base
+        # members' own blocks carry; what went is its own schema instruction.
+        stacking_schema = stacking[stacking.rfind("STRUCTURED FORECAST") :]
+        assert "outcome_type" not in stacking_schema
+
+    def test_the_thirteen_percentile_requirement_is_stated_once_per_numeric_prompt(self) -> None:
+        """It was printed in the schema header line and again a few lines below in the
+        Notes, in both numeric prompts. The header keeps it (it is the definition)."""
+        for build in (
+            lambda: numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"),
+            lambda: stacking_numeric_prompt(
+                _numeric_q(),
+                research="r",
+                base_predictions=["a1", "a2"],
+                lower_bound_message="lbm",
+                upper_bound_message="ubm",
+            ),
+        ):
+            schema_section = build()
+            schema_section = schema_section[schema_section.rfind("STRUCTURED FORECAST") :]
+            assert schema_section.count("MUST contain all") == 1
 
 
 def _summarizer_prompt(**overrides) -> str:

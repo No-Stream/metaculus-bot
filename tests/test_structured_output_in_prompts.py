@@ -116,9 +116,18 @@ class TestMultipleChoicePromptSchemaInstruction:
         assert "STRUCTURED FORECAST" in prompt
         assert '"multiple_choice"' in prompt
         assert "option_probs" in prompt
-        # Optional tier-1 fields still shown in the example
-        for field in ("other_mass", "concentration"):
-            assert field in prompt, f"missing optional field {field!r} in MC schema"
+
+    def test_retired_dirichlet_inputs_are_not_asked_for(self):
+        """``other_mass`` and ``concentration`` were inputs to a Dirichlet tool that has
+        been dormant behind ``PROBABILISTIC_TOOLS_ENABLED`` since it shipped, and neither
+        improves a ballot: the option set is exhaustive so ``option_probs`` sums to 1
+        regardless, and 7 of 19 archived ``concentration`` fills just echoed the example's
+        20.0. Retired 2026-09-02 — asking for ``concentration`` also cost q45189 a rung-1
+        parse. The schema keeps both tolerant for archived comments."""
+        prompt = multiple_choice_prompt(_make_mc_q(), research="R")
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        assert "other_mass" not in structured_section
+        assert "concentration" not in structured_section
 
     def test_tier2_fields_not_demanded_in_mc_schema(self):
         """Tier-2 scaffold fields are no longer demanded in the MC JSON schema block (C2)."""
