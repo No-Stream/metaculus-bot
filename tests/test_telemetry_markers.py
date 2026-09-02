@@ -1513,15 +1513,19 @@ class TestExtremeCall:
 
 # Verbatim from metaculus_bot/forecaster_runners.py:_log_window_declared, emitted per
 # surviving BINARY / MC member that filled the optional remaining_window_days block
-# field. declared_days is the member's own count; actual_days is the real now->close gap.
+# field. declared_days is the member's own count; actual_days is the real
+# now->scheduled_resolution_time gap, the same deadline the prompt shows the model.
 WINDOW_DECLARED_FULL_WINDOW_LINE = (
     PFX + "WINDOW_DECLARED: question=43837 model=openai/gpt-5.6-sol declared_days=90 actual_days=74.3"
 )
 WINDOW_DECLARED_REMAINING_ONLY_LINE = (
     PFX + "WINDOW_DECLARED: question=43837 model=google/gemini-3.1-pro-preview declared_days=74 actual_days=74.3"
 )
-WINDOW_DECLARED_NO_CLOSE_TIME_LINE = (
+WINDOW_DECLARED_NO_RESOLUTION_TIME_LINE = (
     PFX + "WINDOW_DECLARED: question=43837 model=anthropic/claude-opus-4.8 declared_days=30 actual_days=n/a"
+)
+WINDOW_DECLARED_PAST_RESOLUTION_LINE = (
+    PFX + "WINDOW_DECLARED: question=43837 model=openai/gpt-5.6-sol declared_days=90 actual_days=-124.3"
 )
 
 
@@ -1549,11 +1553,20 @@ class TestWindowDeclared:
         assert full["declared_days"] / full["actual_days"] > 1.2
         assert remaining["declared_days"] / remaining["actual_days"] == pytest.approx(1.0, abs=0.01)
 
-    def test_absent_close_time_harvests_as_none_not_zero(self):
-        # Backtests and ablations run on resolved questions and can carry no close time.
-        rec = _parse_one(WINDOW_DECLARED_NO_CLOSE_TIME_LINE)
+    def test_absent_resolution_time_harvests_as_none_not_zero(self):
+        # scheduled_resolution_time is Optional upstream, so the sentinel has to survive as
+        # None; a measured zero would read as "the window had just run out".
+        rec = _parse_one(WINDOW_DECLARED_NO_RESOLUTION_TIME_LINE)
         assert rec["actual_days"] is None
         assert rec["declared_days"] == 30
+
+    def test_past_resolution_time_harvests_as_a_negative_float(self):
+        # Backtests and ablations forecast RESOLVED questions with their time fields
+        # untouched, so this is their shape — not "n/a". It has to arrive as a usable
+        # negative number, because a ratio cut can only drop non-positives if it can see
+        # the sign.
+        rec = _parse_one(WINDOW_DECLARED_PAST_RESOLUTION_LINE)
+        assert rec["actual_days"] == -124.3
 
     def test_one_record_per_member_on_the_same_question(self):
         harvested = parse_log_text(

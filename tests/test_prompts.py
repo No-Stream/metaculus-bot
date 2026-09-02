@@ -9,6 +9,7 @@ backtest scores would silently get polluted with prediction-market data.
 
 import json
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import ClassVar
 from unittest.mock import MagicMock
@@ -1387,17 +1388,23 @@ class TestNumericPromptThirteenPercentiles:
         assert "Percentile 99:" not in result
 
 
+def _extract_last_json_block(prompt: str) -> str:
+    """Return the body of the LAST fenced ```json block in a prompt.
+
+    Every forecasting prompt ends on its STRUCTURED FORECAST example, and the ladder
+    (``value_extraction``) reads that block as the authoritative forecast, so the example
+    is what teaches the model the schema. One regex for both classes below.
+    """
+    blocks = re.findall(r"```json\s*\n(.*?)\n\s*```", prompt, re.DOTALL)
+    assert blocks, "no fenced json block found in prompt"
+    return blocks[-1]
+
+
 class TestOptionProbsExampleJsonValidity:
     """The MC schema example is the forecaster's authoritative template — it must
     be VALID JSON for any real option names, including ones carrying quotes,
     backslashes, or newlines (F2). A naive f-string concat emitted invalid JSON
     for those and silently taught the model a broken schema."""
-
-    @staticmethod
-    def _extract_last_json_block(prompt: str) -> str:
-        blocks = re.findall(r"```json\s*\n(.*?)\n\s*```", prompt, re.DOTALL)
-        assert blocks, "no fenced json block found in prompt"
-        return blocks[-1]
 
     @pytest.mark.parametrize(
         "options",
@@ -1410,7 +1417,7 @@ class TestOptionProbsExampleJsonValidity:
         q = _mc_q()
         q.options = options
         prompt = multiple_choice_prompt(q, research="r")
-        body = self._extract_last_json_block(prompt)
+        body = _extract_last_json_block(prompt)
         parsed = json.loads(body)
         assert list(parsed["option_probs"].keys()) == options
 
@@ -1419,7 +1426,7 @@ class TestOptionProbsExampleJsonValidity:
         q = _mc_q()
         q.options = options
         prompt = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1"])
-        body = self._extract_last_json_block(prompt)
+        body = _extract_last_json_block(prompt)
         parsed = json.loads(body)
         assert list(parsed["option_probs"].keys()) == options
 
@@ -1428,10 +1435,74 @@ class TestOptionProbsExampleJsonValidity:
         q = _mc_q()
         q.options = options
         prompt = multiple_choice_prompt(q, research="r")
-        parsed = json.loads(self._extract_last_json_block(prompt))
+        parsed = json.loads(_extract_last_json_block(prompt))
         probs = list(parsed["option_probs"].values())
         assert sum(probs) == pytest.approx(1.0, abs=0.02)
         assert all(0.0 < p < 1.0 for p in probs)
+
+
+class TestStructuredForecastExampleBlocks:
+    """Every builder's STRUCTURED FORECAST example must PARSE, and carry
+    ``remaining_window_days`` on exactly the two question types whose schema declares it.
+
+    These examples are static literals, so the only thing that breaks them is a source
+    edit — and until this test existed most of them were guarded by substring checks only,
+    which a dropped comma sails straight past. Dropping the comma before
+    ``remaining_window_days`` in the binary block left the whole suite green; the same
+    mutation on the MC block failed five tests, because the MC example is separately
+    pinned by the class above. Parsing all six closes that gap in one place, and pinning
+    the field's presence per type means adding it to a numeric or stacking example has to
+    come through here.
+    """
+
+    _WINDOW_FIELD = "remaining_window_days"
+
+    @pytest.mark.parametrize(
+        ("build_prompt", "declares_window"),
+        [
+            pytest.param(lambda: binary_prompt(_binary_q(), research="r"), True, id="binary"),
+            pytest.param(lambda: multiple_choice_prompt(_mc_q(), research="r"), True, id="multiple_choice"),
+            pytest.param(
+                lambda: numeric_prompt(
+                    _numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"
+                ),
+                False,
+                id="numeric",
+            ),
+            pytest.param(
+                lambda: stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
+                False,
+                id="stacking_binary",
+            ),
+            pytest.param(
+                lambda: stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"]),
+                False,
+                id="stacking_multiple_choice",
+            ),
+            pytest.param(
+                lambda: stacking_numeric_prompt(
+                    _numeric_q(),
+                    research="r",
+                    base_predictions=["a1", "a2"],
+                    lower_bound_message="lbm",
+                    upper_bound_message="ubm",
+                ),
+                False,
+                id="stacking_numeric",
+            ),
+        ],
+    )
+    def test_example_block_parses_and_declares_the_window_field_only_where_expected(
+        self, build_prompt: Callable[[], str], declares_window: bool
+    ) -> None:
+        parsed = json.loads(_extract_last_json_block(build_prompt()))
+
+        if declares_window:
+            # 45 is the literal in the schema example; the value itself is arbitrary, but
+            # pinning it catches an edit that guts the field to a placeholder.
+            assert parsed[self._WINDOW_FIELD] == 45
+        else:
+            assert self._WINDOW_FIELD not in parsed
 
 
 def _summarizer_prompt(**overrides) -> str:

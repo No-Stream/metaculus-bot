@@ -104,9 +104,21 @@ def _log_window_declared(
     than "priced correctly". Emitted before extraction so it reports what the model
     wrote even when the value never survives to publish.
 
-    ``actual_days`` is ``n/a`` when the question carries no close time (backtests and
-    ablations run on resolved questions), which harvests as None rather than as a
-    measured zero.
+    ``actual_days`` measures the gap from now to ``scheduled_resolution_time``, which is
+    the deadline the prompt itself shows the model ("Scheduled to resolve: DATE (N days
+    from now)" in ``prompts._forecasting_window_str``) — so declared and actual count to
+    the same date and their ratio means something. ``close_time`` would not: scheduled
+    close precedes scheduled resolution by a median 33 days on live tournament questions,
+    and the bot submits hours before close, so a correctly-priced member would read a
+    ~170x ratio indistinguishable from the pathology this marker isolates.
+
+    Two readings of ``actual_days`` that are NOT failures. It is ``n/a`` only when the
+    field is None, which is Optional upstream but effectively unreachable in prod
+    (``_forecasting_window_str`` asserts it non-None on this same path). It is NEGATIVE on
+    any question already past its scheduled resolution, which is every backtest and
+    ablation question — those forecast resolved questions and ``_prepare_question_for_backtest``
+    leaves the time fields untouched (cf. ``time_budget.py``'s docstring). A ratio cut
+    therefore has to drop nulls AND non-positives.
     """
     # log_failures=False: the ladder below repairs blocks this strict read rejects, so a
     # warning here would flag a forecast that published fine.
@@ -117,11 +129,11 @@ def _log_window_declared(
     if declared is None:
         return
 
-    close_time = question.close_time
-    if close_time is None:
+    resolution_time = question.scheduled_resolution_time
+    if resolution_time is None:
         actual = "n/a"
     else:
-        remaining_s = (_as_utc(close_time) - datetime.now(UTC)).total_seconds()
+        remaining_s = (_as_utc(resolution_time) - datetime.now(UTC)).total_seconds()
         actual = f"{remaining_s / _SECONDS_PER_DAY:.1f}"
 
     logger.info(
