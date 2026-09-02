@@ -137,12 +137,14 @@ after clustering (same-day resolutions share a world state).
 - **Price a counterfactual with `spot_peer_delta`, never by hand.** Metaculus halves the peer
   score of a continuous question (numeric / discrete / date) and does not halve binary or
   multiple choice, so moving only our own mass on the resolving outcome is worth
-  `100·ln(new/old)`, halved for continuous. Both directions have already gone wrong in round
-  scripts: `numeric_log_score` already carries the halving (it returns `50·ln`), so doubling
-  its difference to "convert to peer" over-prices by 2× (the 2026-08-31 q45065 replay:
-  +404 where the truth is +202), while `binary_log_score` is log base 2, so quoting its
-  difference as peer points under-prices by 1/ln2 ≈ 1.44 (thirteen 2026-09-01 dossier
-  scripts). Import `spot_peer_delta` from `metaculus_bot.performance_analysis.scoring`.
+  `100·ln(new/old)`, halved for continuous. Both conversions have already gone wrong in round
+  scripts, and both mistakes inflate the figure: `numeric_log_score` already carries the
+  halving (it returns `50·ln`), so doubling its difference to "convert to peer" over-prices
+  by 2× (the 2026-08-31 q45065 replay: +404 where the truth is +202), while
+  `binary_log_score` is log base 2, so quoting its difference as peer points over-prices by
+  1/ln2 ≈ 1.44 (thirteen 2026-09-01 dossier scripts). Correcting one of those archived binary
+  figures means multiplying it by ln 2 ≈ 0.693, not dividing. Import `spot_peer_delta` from
+  `metaculus_bot.performance_analysis.scoring`.
 - Merge dates, not authoring dates, for every era boundary.
 - `performance_analysis.id_mapping` for any marker↔record join; never "match either id".
 - Never pool research-archive record classes (`artifact` / `comment_backfill` /
