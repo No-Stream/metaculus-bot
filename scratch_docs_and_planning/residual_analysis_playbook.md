@@ -41,6 +41,16 @@ stale archive silently drops recent questions and receipts. Non-negotiable first
   known-bug copies have drifted from the canonical set at least once. Excluded from
   headline aggregates, reported separately — never silently dropped.
 - Diff vs prior round (`new_since_prior.json`): the new cohort is what the round is about.
+- Diff the prior round's records at the VALUE level, not just by presence — pass
+  `--prior <prior dataset>` to the `performance_analysis` CLI, or call
+  `diff_platform_rescores(prior_records, new_records)`
+  (`metaculus_bot.performance_analysis.rescore_diff`). Metaculus re-resolves in place with no
+  timestamp moving: it edited q44798 from 80 to 82 and flipped that record's spot peer from
+  +5.41 to −5.42 while `resolution_set_time` still read a stamp preceding the pull that saw
+  80, so the 2026-08-31 round's tables for it went stale silently. Anything the diff tags
+  `platform_rescored` must be re-read before it is quoted, and the prior round's document
+  corrected. Read the tag as a ternary: None is "no prior record, never compared", only
+  False is "compared, nothing moved".
 - Spot-check re-pull stability (a handful of prior spot-peer scores must reproduce).
 
 ## Phase 3 — Automated dimensions (era-bucketed, parallel)
@@ -124,6 +134,15 @@ after clustering (same-day resolutions share a world state).
   misses (q44872: peer −15.0 vs spot peer −38.8). Read platform scores through
   `performance_analysis/platform_scores.py`, which prefers spot and keeps peer-only records
   in their own sort tier; report peer beside spot as a labelled secondary only.
+- **Price a counterfactual with `spot_peer_delta`, never by hand.** Metaculus halves the peer
+  score of a continuous question (numeric / discrete / date) and does not halve binary or
+  multiple choice, so moving only our own mass on the resolving outcome is worth
+  `100·ln(new/old)`, halved for continuous. Both directions have already gone wrong in round
+  scripts: `numeric_log_score` already carries the halving (it returns `50·ln`), so doubling
+  its difference to "convert to peer" over-prices by 2× (the 2026-08-31 q45065 replay:
+  +404 where the truth is +202), while `binary_log_score` is log base 2, so quoting its
+  difference as peer points under-prices by 1/ln2 ≈ 1.44 (thirteen 2026-09-01 dossier
+  scripts). Import `spot_peer_delta` from `metaculus_bot.performance_analysis.scoring`.
 - Merge dates, not authoring dates, for every era boundary.
 - `performance_analysis.id_mapping` for any marker↔record join; never "match either id".
 - Never pool research-archive record classes (`artifact` / `comment_backfill` /

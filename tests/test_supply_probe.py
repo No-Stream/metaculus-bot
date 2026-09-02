@@ -48,14 +48,31 @@ def _question(
     actual: str | None = None,
     resolution: object = None,
     qtype: str = "numeric",
+    forecast: bool | None = None,
+    open_time: str | None = "2026-07-20T03:00:00Z",
+    close_time: str | None = "2026-07-20T06:00:00Z",
 ) -> dict:
-    return {
+    """One question dict.
+
+    ``forecast`` models the three states the forfeit sweep distinguishes: None omits
+    ``my_forecasts`` entirely (a raw posts-LIST page, which is why the sweep needs detail
+    GETs), True carries a forecast, False carries the empty block a never-forecast question
+    shows under the bot's own token.
+    """
+    question = {
         "id": qid,
         "type": qtype,
         "scheduled_resolve_time": scheduled,
         "actual_resolve_time": actual,
         "resolution": resolution,
+        "open_time": open_time,
+        "actual_close_time": close_time,
     }
+    if forecast is True:
+        question["my_forecasts"] = {"latest": {"forecast_values": [0.4, 0.6]}, "history": [{"id": 1}]}
+    elif forecast is False:
+        question["my_forecasts"] = {"latest": None, "history": []}
+    return question
 
 
 def _post(post_id: int, question: dict, *, title: str = "Some question?") -> dict:
@@ -224,6 +241,220 @@ class TestBacklog:
         assert supply.worst_overdue_days == 0.0
 
 
+class TestBotForecastState:
+    """The three-state read of ``my_forecasts``. UNKNOWN is a measurement failure, not a
+    forfeit, and conflating the two is how a sweep reports a whole season as forfeited."""
+
+    def test_a_list_page_question_answers_unknown(self):
+        assert supply_probe.bot_forecast_state(_question(1)) == supply_probe.FORECAST_UNKNOWN
+
+    def test_an_empty_block_is_a_forfeit(self):
+        assert supply_probe.bot_forecast_state(_question(1, forecast=False)) == supply_probe.FORECAST_ABSENT
+
+    def test_a_populated_block_is_a_forecast(self):
+        assert supply_probe.bot_forecast_state(_question(1, forecast=True)) == supply_probe.FORECAST_PRESENT
+
+    def test_a_latest_without_a_history_still_counts_as_a_forecast(self):
+        # Never call a real forecast a forfeit: the scoring collector keys on `latest`, so a
+        # payload carrying it has a forecast whatever `history` looks like.
+        question = _question(1) | {"my_forecasts": {"latest": {"forecast_values": [0.5, 0.5]}, "history": []}}
+        assert supply_probe.bot_forecast_state(question) == supply_probe.FORECAST_PRESENT
+
+    def test_a_null_block_answers_unknown_not_forfeit(self):
+        question = _question(1) | {"my_forecasts": None}
+        assert supply_probe.bot_forecast_state(question) == supply_probe.FORECAST_UNKNOWN
+
+
+class TestForfeitSweep:
+    """Which questions the sweep files as forfeited, from payloads that already answer."""
+
+    def _summary(self, posts_by_status) -> SlugSupply:
+        return summarize_slug_supply("summer-futureeval-2026", posts_by_status, now=NOW)
+
+    def test_closed_and_resolved_unforecast_questions_are_forfeits(self):
+        supply = self._summary(
+            {
+                "closed": [_post(901, _question(91, forecast=False))],
+                "resolved": [_post(902, _question(92, actual="2026-08-01T00:00:00Z", resolution="3", forecast=False))],
+            }
+        )
+
+        assert {row.question_id for row in supply.forfeits} == {91, 92}
+        assert supply.forecast_states == supply_probe.ForecastStateCounts(
+            with_forecast=0, without_forecast=2, unknown=0
+        )
+
+    def test_an_open_unforecast_question_is_not_a_forfeit(self):
+        """An open question we have not forecast YET is supply, not loss."""
+        supply = self._summary({"open": [_post(903, _question(93, forecast=False))]})
+
+        assert supply.forfeits == ()
+        assert supply.forecast_states.total == 0
+
+    def test_a_forecast_question_is_counted_but_not_listed(self):
+        supply = self._summary({"closed": [_post(904, _question(94, forecast=True))]})
+
+        assert supply.forfeits == ()
+        assert supply.forecast_states.with_forecast == 1
+
+    def test_an_unknown_state_is_disclosed_rather_than_filed_as_a_forfeit(self):
+        supply = self._summary({"closed": [_post(905, _question(95))]})
+
+        assert supply.forfeits == ()
+        assert supply.forecast_states == supply_probe.ForecastStateCounts(
+            with_forecast=0, without_forecast=0, unknown=1
+        )
+
+    def test_group_members_are_swept_individually(self):
+        supply = self._summary(
+            {"closed": [_group_post(906, [_question(96, forecast=False), _question(97, forecast=True)])]}
+        )
+
+        assert [row.question_id for row in supply.forfeits] == [96]
+        assert supply.forecast_states.with_forecast == 1
+
+    def test_the_window_length_is_reported_in_hours(self):
+        supply = self._summary(
+            {
+                "closed": [
+                    _post(
+                        907,
+                        _question(
+                            98,
+                            forecast=False,
+                            open_time="2026-07-20T03:00:00Z",
+                            close_time="2026-07-20T06:00:00Z",
+                        ),
+                    )
+                ]
+            }
+        )
+
+        assert supply.forfeits[0].window_hours == pytest.approx(3.0)
+
+    def test_an_unreadable_window_is_none_not_zero(self):
+        supply = self._summary({"closed": [_post(908, _question(99, forecast=False, open_time=None))]})
+
+        assert supply.forfeits[0].window_hours is None
+
+    def test_forfeits_are_ordered_newest_window_first(self):
+        supply = self._summary(
+            {
+                "closed": [
+                    _post(910, _question(100, forecast=False, open_time="2026-07-01T00:00:00Z")),
+                    _post(911, _question(101, forecast=False, open_time="2026-08-15T00:00:00Z")),
+                ]
+            }
+        )
+
+        assert [row.question_id for row in supply.forfeits] == [101, 100]
+
+    def test_a_post_paged_under_two_statuses_is_counted_once(self):
+        """A post that resolves mid-probe pages under both `closed` and `resolved`."""
+        post = _post(912, _question(102, forecast=False))
+        supply = self._summary({"closed": [post], "resolved": [post]})
+
+        assert [row.question_id for row in supply.forfeits] == [102]
+        assert supply.forecast_states.total == 1
+
+
+class TestResolveBotForecasts:
+    """The one place the sweep spends requests, and what it refuses to spend them on."""
+
+    def _install_details(self, monkeypatch, details_by_post_id, *, failing_ids=()):
+        seen: list[str] = []
+        sleeps: list[float] = []
+
+        def _fake_get(params, token, *, url=supply_probe.POSTS_URL):
+            seen.append(url)
+            post_id = int(url.rstrip("/").rsplit("/", 1)[-1])
+            if post_id in failing_ids:
+                raise requests.HTTPError(f"429 rate limit on {post_id}")
+            return details_by_post_id[post_id]
+
+        monkeypatch.setattr(supply_probe, "_get_json", _fake_get)
+        monkeypatch.setattr(supply_probe.time, "sleep", sleeps.append)
+        return seen, sleeps
+
+    def test_one_detail_get_per_unanswered_post_and_the_payload_is_substituted(self, monkeypatch):
+        by_status = {"closed": [_post(920, _question(110))]}
+        detail = _post(920, _question(110, forecast=False))
+        seen, _sleeps = self._install_details(monkeypatch, {920: detail})
+
+        fetched = supply_probe.resolve_bot_forecasts(by_status, "token")
+
+        assert fetched == 1
+        assert seen == [f"{supply_probe.POSTS_URL}920/"]
+        supply = summarize_slug_supply("slug", by_status, now=NOW)
+        assert [row.question_id for row in supply.forfeits] == [110]
+
+    def test_a_post_that_already_answers_costs_no_request(self, monkeypatch):
+        by_status = {"closed": [_post(921, _question(111, forecast=True))]}
+        seen, _sleeps = self._install_details(monkeypatch, {})
+
+        assert supply_probe.resolve_bot_forecasts(by_status, "token") == 0
+        assert seen == []
+
+    def test_open_posts_are_never_fetched(self, monkeypatch):
+        by_status = {"open": [_post(922, _question(112))]}
+        seen, _sleeps = self._install_details(monkeypatch, {})
+
+        assert supply_probe.resolve_bot_forecasts(by_status, "token") == 0
+        assert seen == []
+
+    def test_a_post_paged_twice_is_fetched_once_and_substituted_in_both_lists(self, monkeypatch):
+        post = _post(923, _question(113))
+        by_status = {"closed": [post], "resolved": [post]}
+        detail = _post(923, _question(113, forecast=False))
+        seen, _sleeps = self._install_details(monkeypatch, {923: detail})
+
+        assert supply_probe.resolve_bot_forecasts(by_status, "token") == 1
+        assert seen == [f"{supply_probe.POSTS_URL}923/"]
+        assert all(
+            supply_probe.bot_forecast_state(questions_on_post(posts[0])[0]) == supply_probe.FORECAST_ABSENT
+            for posts in by_status.values()
+        )
+
+    def test_requests_are_spaced_between_posts_but_not_after_the_last(self, monkeypatch):
+        by_status = {"closed": [_post(924, _question(114)), _post(925, _question(115))]}
+        details = {924: _post(924, _question(114, forecast=False)), 925: _post(925, _question(115, forecast=True))}
+        _seen, sleeps = self._install_details(monkeypatch, details)
+
+        supply_probe.resolve_bot_forecasts(by_status, "token")
+
+        assert sleeps == [supply_probe.DETAIL_REQUEST_SPACING_SECS]
+
+    def test_a_failed_detail_fetch_leaves_the_state_unknown_and_does_not_raise(self, monkeypatch):
+        """One unreachable post must not cost the slug its census, and must never be filed as
+        a forfeit on the strength of a payload we could not read."""
+        by_status = {"closed": [_post(926, _question(116)), _post(927, _question(117))]}
+        details = {927: _post(927, _question(117, forecast=False))}
+        self._install_details(monkeypatch, details, failing_ids=(926,))
+
+        fetched = supply_probe.resolve_bot_forecasts(by_status, "token")
+
+        assert fetched == 1
+        supply = summarize_slug_supply("slug", by_status, now=NOW)
+        assert [row.question_id for row in supply.forfeits] == [117]
+        assert supply.forecast_states.unknown == 1
+
+    def test_probe_slugs_does_not_resolve_forfeits_unless_asked(self, monkeypatch):
+        monkeypatch.setattr(
+            supply_probe,
+            "fetch_posts_by_status",
+            lambda slug, statuses, token: {"closed": [_post(928, _question(118))]},
+        )
+        monkeypatch.setattr(
+            supply_probe,
+            "resolve_bot_forecasts",
+            lambda *_a, **_k: pytest.fail("probe_slugs must not spend requests by default"),
+        )
+
+        supplies = probe_slugs(["slug"], ("closed",), "token", now=NOW)
+
+        assert supplies[0].forecast_states.unknown == 1
+
+
 class TestRenderReport:
     def test_report_names_the_closed_count_and_the_worst_overdue(self):
         by_status = {
@@ -255,6 +486,58 @@ class TestRenderReport:
 
         assert "metaculus-cup" in text
         assert "HTTP 404" in text
+
+    def test_report_names_the_forfeits_with_their_window(self):
+        by_status = {
+            "closed": [
+                _post(
+                    404,
+                    _question(
+                        44,
+                        forecast=False,
+                        open_time="2026-08-03T12:00:00Z",
+                        close_time="2026-08-03T15:00:00Z",
+                    ),
+                    title="Late submit?",
+                )
+            ],
+            "resolved": [_post(405, _question(45, actual="2026-08-01T00:00:00Z", forecast=True))],
+        }
+        supply = summarize_slug_supply("slug", by_status, now=NOW)
+
+        text = render_report([supply], now=NOW)
+
+        assert "never forecast by the bot: 1 (of 2; forecast 1, unknown 0)" in text
+        assert "Late submit?" in text
+        assert "3.0" in text
+
+    def test_report_says_nothing_about_forfeits_when_nothing_was_eligible(self):
+        """An all-open slug has no forfeit-eligible question, so the block is absent rather
+        than reporting a zero that reads as a clean sweep."""
+        supply = summarize_slug_supply("slug", {"open": [_post(406, _question(46))]}, now=NOW)
+
+        assert "never forecast" not in render_report([supply], now=NOW)
+
+    def test_report_points_at_the_flag_when_every_state_is_unknown(self):
+        supply = summarize_slug_supply("slug", {"closed": [_post(407, _question(47))]}, now=NOW)
+
+        assert "--no-forfeits" in render_report([supply], now=NOW)
+
+    def test_report_flags_a_slug_where_nothing_carries_a_forecast(self):
+        """Far likelier a non-bot METACULUS_TOKEN than a total forfeit, and the report has to
+        say so rather than publish a 100% forfeit rate."""
+        by_status = {"closed": [_post(408 + i, _question(48 + i, forecast=False)) for i in range(3)]}
+        supply = summarize_slug_supply("slug", by_status, now=NOW)
+
+        assert "METACULUS_TOKEN is the bot's own token" in render_report([supply], now=NOW)
+
+    def test_report_caps_the_forfeit_table_and_names_the_remainder(self):
+        by_status = {"closed": [_post(420 + i, _question(60 + i, forecast=False)) for i in range(5)]}
+        supply = summarize_slug_supply("slug", by_status, now=NOW)
+
+        text = render_report([supply], now=NOW, max_forfeit_rows=2)
+
+        assert "+3 more forfeited" in text
 
 
 class TestRateLimitRetry:
@@ -432,9 +715,15 @@ class TestMain:
 
     def _run(self, monkeypatch, *, extra_argv=()) -> None:
         posts = {
-            "open": [_post(701, _question(71))],
-            "closed": [_post(702, _question(72, scheduled="2026-08-14T00:00:00Z"), title="Drilling rigs?")],
-            "resolved": [_post(703, _question(73, actual="2026-08-01T00:00:00Z", resolution="7"))],
+            "open": [_post(701, _question(71, forecast=True))],
+            "closed": [
+                _post(
+                    702,
+                    _question(72, scheduled="2026-08-14T00:00:00Z", forecast=False),
+                    title="Drilling rigs?",
+                )
+            ],
+            "resolved": [_post(703, _question(73, actual="2026-08-01T00:00:00Z", resolution="7", forecast=True))],
         }
         monkeypatch.setattr(supply_probe, "fetch_posts_by_status", lambda slug, statuses, token: posts)
         monkeypatch.setattr(supply_probe, "verify_metaculus_api_identity", lambda: None)
@@ -451,6 +740,28 @@ class TestMain:
         assert "closed" in out
         assert "Unresolved past scheduled_resolve_time: 1" in out
         assert "Drilling rigs?" in out
+
+    def test_main_sweeps_forfeits_by_default(self, monkeypatch, capsys):
+        """The list payloads here already carry ``my_forecasts``, so the default sweep runs
+        for real and issues no request — which is also the cheap-path assertion."""
+        self._run(monkeypatch)
+        out = capsys.readouterr().out
+
+        assert "Closed/resolved questions never forecast by the bot: 1 (of 2; forecast 1, unknown 0)" in out
+
+    def test_no_forfeits_skips_the_resolver_entirely(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            supply_probe,
+            "resolve_bot_forecasts",
+            lambda *_a, **_k: pytest.fail("--no-forfeits must not resolve forecasts"),
+        )
+
+        self._run(monkeypatch, extra_argv=["--no-forfeits"])
+        out = capsys.readouterr().out
+
+        # The flag only skips the RESOLVER; these fixtures already answer from their list
+        # payload, so the count still lands. On real list pages it would read all-unknown.
+        assert "never forecast by the bot: 1" in out
 
     def test_main_writes_the_json_dump(self, monkeypatch, tmp_path, capsys):
         dump = tmp_path / "supply.json"
@@ -478,7 +789,9 @@ class TestMain:
 
     def test_identity_preflight_runs_before_the_token_pull(self, monkeypatch, capsys):
         calls: list[str] = []
-        posts = {"closed": [_post(801, _question(81))]}
+        # forecast= is set so the default forfeit sweep answers off this payload and issues no
+        # detail GET; this test is about ordering, not about the sweep.
+        posts = {"closed": [_post(801, _question(81, forecast=True))]}
 
         def _fetch(slug, statuses, token):
             calls.append("fetch")

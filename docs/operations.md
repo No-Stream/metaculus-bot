@@ -110,13 +110,26 @@ session does not run them — it proposes, the operator runs and decides.
   resolved — which is what made two consecutive residual rounds' supply
   projections miss. It also lists the backlog of unresolved questions already past
   their own `scheduled_resolve_time`, worst overdue first, which is how you tell
-  "Metaculus is late resolving" from "our pull is missing questions". Default slugs
+  "Metaculus is late resolving" from "our pull is missing questions". It also sweeps
+  FORFEITS: every question on a `closed` or `resolved` post that the bot never
+  forecast at all, newest window first, with each window's length in hours. That
+  sweep exists because a forfeited question never enters the performance dataset, so
+  nothing downstream of the scoring pull can see one — the 2026-09-01 residual round
+  found six lost to delivery (a cron gap, a late submit, three cancelled runs, one
+  retroactive close) where the prior sweep had found one. Resolving "did we forecast
+  this" needs `my_forecasts`, which the posts list does not reliably carry, so the
+  sweep issues one extra read-only detail GET per closed/resolved post that the list
+  page did not already answer for; pass `ARGS="--no-forfeits"` to skip that, at the
+  cost of every question's state reading `unknown`. A question whose state stays
+  unreadable is reported as `unknown` rather than filed as a forfeit, and a slug
+  where NOTHING carries a bot forecast prints a warning to check that
+  `METACULUS_TOKEN` is the bot's own token before believing the number. Default slugs
   come from the repo's own constants (`TOURNAMENT_ID`, `METACULUS_CUP_ID`,
   `FALL_CUP_SLUG`, plus minibench off `MetaculusApi.CURRENT_MINIBENCH_ID`), so it
   needs no arguments; scope or redirect it with
   `ARGS="--slugs metaculus-cup-fall-2026 --output /tmp/supply.json"`. Read-only and
-  free — the Metaculus posts list only, no LLM, research, or publish call — so it
-  sits outside the cost gate. A dead slug renders as one error row and the rest
+  free — the Metaculus posts list and post detail only, no LLM, research, or publish
+  call — so it sits outside the cost gate. A dead slug renders as one error row and the rest
   report normally, which makes this the cheapest way to watch for the fall cup
   opening: the `metaculus-cup-fall-2026` row goes from zero posts to non-zero on
   the day it does.
