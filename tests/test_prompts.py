@@ -1066,41 +1066,18 @@ class TestLastRealApplicationGap:
             assert "LAST REAL APPLICATION OF THE RULE" not in prompt
 
 
-class TestRemainingWindowDaysField:
-    """The optional telemetry slot behind the WINDOW_DECLARED marker: the forecaster's
-    own count of the days it priced. Asked for in the binary and MC schema blocks only,
-    and asked for as OPTIONAL — an omitted field is the honest answer when no rate was
-    applied over a window, and the numeric schema does not declare the key at all."""
-
-    def test_binary_schema_block_asks_for_the_field_as_optional(self) -> None:
-        prompt = binary_prompt(_binary_q(), research="r")
-        structured = prompt[prompt.find("STRUCTURED FORECAST") :]
-        assert '"remaining_window_days"' in structured
-        assert "OPTIONAL, telemetry only" in structured
-        assert "days from now to the question's deadline" in structured
-
-    def test_mc_schema_block_asks_for_the_field_as_optional(self) -> None:
-        prompt = multiple_choice_prompt(_mc_q(), research="r")
-        structured = prompt[prompt.find("STRUCTURED FORECAST") :]
-        assert '"remaining_window_days"' in structured
-        assert "OPTIONAL, telemetry only" in structured
-
-    def test_numeric_schema_block_does_not_ask_for_it(self) -> None:
-        """Scope: the field is declared on the binary and MC schemas only, so asking a
-        numeric forecaster for it would put an extra="forbid" key in its block."""
-        prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
-        assert "remaining_window_days" not in prompt
+class TestMcExampleBlockEscaping:
+    """The MC example block is the forecaster's authoritative template, so it has to stay
+    valid JSON for option names carrying quotes or backslashes — the escaping is done by
+    ``_option_probs_example``, and a break there is invisible to substring assertions."""
 
     @pytest.mark.parametrize("options", [["Red", "Blue"], ['He said "yes"', r"C:\Windows"]])
     def test_mc_example_block_stays_valid_json(self, options: list[str]) -> None:
-        """The MC example is the forecaster's authoritative template, so the added key
-        must not break it for option names carrying quotes or backslashes."""
         q = _mc_q()
         q.options = options
         prompt = multiple_choice_prompt(q, research="r")
         body = re.findall(r"```json\s*\n(.*?)\n\s*```", prompt, re.DOTALL)[-1]
         parsed = json.loads(body)
-        assert parsed["remaining_window_days"] == 45
         assert list(parsed["option_probs"].keys()) == options
 
 
@@ -1441,68 +1418,61 @@ class TestOptionProbsExampleJsonValidity:
         assert all(0.0 < p < 1.0 for p in probs)
 
 
+_EXAMPLE_BLOCK_BUILDERS = [
+    pytest.param(lambda: binary_prompt(_binary_q(), research="r"), id="binary"),
+    pytest.param(lambda: multiple_choice_prompt(_mc_q(), research="r"), id="multiple_choice"),
+    pytest.param(
+        lambda: numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"),
+        id="numeric",
+    ),
+    pytest.param(
+        lambda: stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
+        id="stacking_binary",
+    ),
+    pytest.param(
+        lambda: stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"]),
+        id="stacking_multiple_choice",
+    ),
+    pytest.param(
+        lambda: stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        ),
+        id="stacking_numeric",
+    ),
+]
+
+
 class TestStructuredForecastExampleBlocks:
-    """Every builder's STRUCTURED FORECAST example must PARSE, and carry
-    ``remaining_window_days`` on exactly the two question types whose schema declares it.
+    """Every builder's STRUCTURED FORECAST example must PARSE, and must not re-grow a
+    key the 2026-09-02 de-bloat retired.
 
     These examples are static literals, so the only thing that breaks them is a source
     edit — and until this test existed most of them were guarded by substring checks only,
-    which a dropped comma sails straight past. Dropping the comma before
-    ``remaining_window_days`` in the binary block left the whole suite green; the same
-    mutation on the MC block failed five tests, because the MC example is separately
-    pinned by the class above. Parsing all six closes that gap in one place, and pinning
-    the field's presence per type means adding it to a numeric or stacking example has to
-    come through here.
+    which a dropped comma sails straight past. Dropping the comma before a field in the
+    binary block once left the whole suite green. Parsing all six closes that gap in one
+    place, and the retired-key check means re-adding a post-hoc telemetry slot to any
+    example has to come through here (the reasoning behind the removals is in
+    ``scratch/schema_bloat_audit_2026-09-02.md``: the block is written after the forecast
+    is fixed, so a slot in it cannot scaffold reasoning).
     """
 
-    _WINDOW_FIELD = "remaining_window_days"
+    # Retired 2026-09-02: each was read only by dormant telemetry, and every one of them
+    # asked the model for post-hoc admin rather than for its forecast.
+    _RETIRED_KEYS = ("remaining_window_days",)
 
-    @pytest.mark.parametrize(
-        ("build_prompt", "declares_window"),
-        [
-            pytest.param(lambda: binary_prompt(_binary_q(), research="r"), True, id="binary"),
-            pytest.param(lambda: multiple_choice_prompt(_mc_q(), research="r"), True, id="multiple_choice"),
-            pytest.param(
-                lambda: numeric_prompt(
-                    _numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"
-                ),
-                False,
-                id="numeric",
-            ),
-            pytest.param(
-                lambda: stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
-                False,
-                id="stacking_binary",
-            ),
-            pytest.param(
-                lambda: stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"]),
-                False,
-                id="stacking_multiple_choice",
-            ),
-            pytest.param(
-                lambda: stacking_numeric_prompt(
-                    _numeric_q(),
-                    research="r",
-                    base_predictions=["a1", "a2"],
-                    lower_bound_message="lbm",
-                    upper_bound_message="ubm",
-                ),
-                False,
-                id="stacking_numeric",
-            ),
-        ],
-    )
-    def test_example_block_parses_and_declares_the_window_field_only_where_expected(
-        self, build_prompt: Callable[[], str], declares_window: bool
-    ) -> None:
+    @pytest.mark.parametrize("build_prompt", _EXAMPLE_BLOCK_BUILDERS)
+    def test_example_block_parses(self, build_prompt: Callable[[], str]) -> None:
         parsed = json.loads(_extract_last_json_block(build_prompt()))
+        assert parsed["question_type"] in {"binary", "multiple_choice", "numeric"}
 
-        if declares_window:
-            # 45 is the literal in the schema example; the value itself is arbitrary, but
-            # pinning it catches an edit that guts the field to a placeholder.
-            assert parsed[self._WINDOW_FIELD] == 45
-        else:
-            assert self._WINDOW_FIELD not in parsed
+    @pytest.mark.parametrize("build_prompt", _EXAMPLE_BLOCK_BUILDERS)
+    def test_example_block_carries_no_retired_key(self, build_prompt: Callable[[], str]) -> None:
+        parsed = json.loads(_extract_last_json_block(build_prompt()))
+        assert not [key for key in self._RETIRED_KEYS if key in parsed]
 
 
 def _summarizer_prompt(**overrides) -> str:

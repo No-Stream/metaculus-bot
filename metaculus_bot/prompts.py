@@ -575,18 +575,6 @@ _ANCHOR_CONSISTENCY_RULE = """
                  counsels caution; if your analysis points somewhere, your probability should follow it."""
 
 
-# The optional telemetry slot behind the WINDOW_DECLARED marker (forecaster_runners.py):
-# the forecaster's own count of the days it priced. Nothing reads it to clamp or adjust a
-# forecast — it exists so a member that applied its rate over the FULL question window
-# instead of the exposure that remains (the qid 43837 miss) is a query rather than a
-# re-read of every rationale. Optional on purpose: an omitted field is the honest answer
-# when no rate was applied over a window, and a missing one never costs a forecast.
-_REMAINING_WINDOW_DAYS_FIELD_INSTRUCTION = (
-    "`remaining_window_days`: OPTIONAL, telemetry only — your count of days from now to the question's "
-    "deadline that your base rate was applied over. Omit it if you applied no rate over a window."
-)
-
-
 # The gap the qid 45215 miss needed and no bundle held: a training-data fact about how an
 # institutional rule last cashed out in practice (nobody asked how the electoral threshold
 # applied at the last election). Analyzer-only, since it directs a search slot, which the
@@ -932,15 +920,13 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
               "question_type": "binary",
               "posterior_prob": 0.28,
               "base_rate_anchor": {{"low": 0.15, "high": 0.35}},
-              "criteria_clauses": [{{"name": "formal instrument signed", "prob": 0.6}}, {{"name": "in-window", "prob": 0.8}}],
-              "remaining_window_days": 45
+              "criteria_clauses": [{{"name": "formal instrument signed", "prob": 0.6}}, {{"name": "in-window", "prob": 0.8}}]
             }}
             ```
 
             `posterior_prob`: ALWAYS populate as a decimal in [0,1] (e.g., 0.28 for 28%).
             `base_rate_anchor`: populate with the outside-view base-rate range you stated in PHASE 1 (as decimals, 0-1). Omit only if you truly stated no outside-view range.
             `criteria_clauses`: populate from your conjunctive criteria pricing table in 5b (one entry per clause, probs as decimals). Omit for single-condition questions.
-            {_REMAINING_WINDOW_DAYS_FIELD_INSTRUCTION}
 
             The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
             """
@@ -1073,13 +1059,11 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
           "question_type": "multiple_choice",
           "option_probs": {{{option_probs_example}}},
           "other_mass": 0.0,
-          "concentration": 20.0,
-          "remaining_window_days": 45
+          "concentration": 20.0
         }}
         ```
 
         The `option_probs` object must sum to 1.0 and use the exact option names above.
-        {_REMAINING_WINDOW_DAYS_FIELD_INSTRUCTION}
         The LAST thing you write MUST be this fenced ```json block, with a probability for EVERY option above (keys = exact option names, in order). Write nothing after it.
         """
     )

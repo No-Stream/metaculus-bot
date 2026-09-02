@@ -908,32 +908,6 @@ the telemetry markers:
   — one line per forecast value extraction. Watch for `rung=llm` (LLM salvage
   fired) and `block_present=false` (a forecaster stopped emitting a well-formed
   structured block). Emitted by `_log_extraction` in `value_extraction.py`.
-- `WINDOW_DECLARED: question=... model=... declared_days=... actual_days=...` —
-  one line per BINARY or MULTIPLE_CHOICE ensemble member that filled the optional
-  `remaining_window_days` field of its structured block: the number of days from
-  now to the deadline it says it applied its base rate over, beside the real
-  now-to-`scheduled_resolution_time` gap at forecast time. That is measured
-  against the scheduled resolution and NOT against `close_time`, because the
-  scheduled resolution is the deadline the prompt shows the model, whereas
-  scheduled close runs a median 33 days earlier on live tournament questions —
-  measuring to close would make a correctly-priced member read a ~170x ratio. The
-  cut is the ratio, not either number alone: a member pricing the FULL question
-  window on a question that is most of the way through it reads `declared_days`
-  near the whole window while `actual_days` is a fraction of it, which is the
-  q43837 miss the prompts' `_REMAINING_EXPOSURE_RULE` addresses. The field is
-  optional, so a member that declares nothing leaves NO line — read an absent
-  record as "did not declare", never as "priced the window correctly". Two
-  `actual_days` readings are not failures: `n/a` means the question carried no
-  scheduled resolution time (the field is Optional upstream, but the prompt
-  builder asserts it non-None on the same path, so this is effectively
-  unreachable in prod) and the marker parser coerces it to None rather than to
-  zero; a NEGATIVE number means the question is already past its scheduled
-  resolution, which is every backtest and ablation question. A ratio cut over the
-  archive has to drop nulls AND non-positives. Emitted by `_log_window_declared`
-  in `forecaster_runners.py` before extraction runs, so a member that is later
-  dropped still reports what it wrote. Pure measurement: nothing reads the field
-  to clamp or adjust a forecast, and it is deliberately not in the comment
-  trailer.
 - `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... ...` — a
   forecaster put enough mass on the terminal displayed bin of an open-bound
   numeric question, without declaring any percentile beyond the edge, to trip

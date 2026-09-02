@@ -510,96 +510,6 @@ class TestMultipleChoiceStructuredHappyPath:
         assert sum(m.option_probs.values()) == pytest.approx(0.99)
 
 
-class TestRemainingWindowDaysTelemetryField:
-    """The optional ``remaining_window_days`` slot (2026-09-02) behind the
-    WINDOW_DECLARED marker: the days-from-now-to-deadline the forecaster says it
-    priced. Two contracts. (1) Back-compat: a block without the key parses exactly as
-    before, on both the binary and MC schemas. (2) It can never cost a forecast — the
-    field is read leniently, because a formatting slip on a measurement field must not
-    drop the block that carries the forecast (MC has no telemetry strip-and-retry, so a
-    strict int there would push a good ballot down to the LLM salvage rung)."""
-
-    @staticmethod
-    def _binary_block(**extra: object) -> BinaryStructured | None:
-        payload = json.dumps({"question_type": "binary", "posterior_prob": 0.28, **extra})
-        block = parse_structured_block(f"```json\n{payload}\n```", "binary")
-        assert block is None or isinstance(block, BinaryStructured)
-        return block
-
-    @staticmethod
-    def _mc_block(**extra: object) -> MultipleChoiceStructured | None:
-        payload = json.dumps({"question_type": "multiple_choice", "option_probs": {"A": 0.6, "B": 0.4}, **extra})
-        block = parse_structured_block(f"```json\n{payload}\n```", "multiple_choice")
-        assert block is None or isinstance(block, MultipleChoiceStructured)
-        return block
-
-    def test_binary_block_with_the_field_round_trips(self) -> None:
-        block = self._binary_block(remaining_window_days=45)
-        assert block is not None
-        assert block.remaining_window_days == 45
-
-    def test_binary_block_without_the_field_parses_as_absent(self) -> None:
-        block = self._binary_block()
-        assert block is not None
-        assert block.posterior_prob == pytest.approx(0.28)
-        assert block.remaining_window_days is None
-
-    def test_mc_block_with_the_field_round_trips(self) -> None:
-        block = self._mc_block(remaining_window_days=12)
-        assert block is not None
-        assert block.remaining_window_days == 12
-
-    def test_mc_block_without_the_field_parses_as_absent(self) -> None:
-        block = self._mc_block()
-        assert block is not None
-        assert block.option_probs == {"A": 0.6, "B": 0.4}
-        assert block.remaining_window_days is None
-
-    def test_numeric_schema_still_forbids_the_key(self) -> None:
-        """The field ships on the binary and MC schemas only, and the numeric prompt is
-        deliberately not asked for it: on a numeric block the key is unexpected and
-        extra="forbid" drops the whole block. Pinned on the real parse path, and against
-        the same payload without the key, so a prompt edit that starts asking numeric
-        forecasters for it fails loudly here rather than in prod."""
-        percentiles = {"0.1": 1.0, "0.5": 2.0, "0.9": 3.0}
-        without_key = json.dumps({"question_type": "numeric", "declared_percentiles": percentiles})
-        with_key = json.dumps(
-            {"question_type": "numeric", "declared_percentiles": percentiles, "remaining_window_days": 45}
-        )
-        assert isinstance(parse_structured_block(f"```json\n{without_key}\n```", "numeric"), NumericStructured)
-        assert parse_structured_block(f"```json\n{with_key}\n```", "numeric") is None
-
-    @pytest.mark.parametrize(
-        ("declared", "expected"),
-        [
-            (45, 45),  # the ordinary case
-            ("45", 45),  # a quoted integer is the same declaration, written differently
-            (45.0, 45),  # so is a float
-            (44.6, 45),  # rounded rather than truncated
-            ("about 45 days", None),  # prose we decline to mine for a number
-            (True, None),  # a JSON bool is not a day count (and int(True) == 1)
-            ({"days": 45}, None),  # nested shapes carry no reading
-            (None, None),
-        ],
-    )
-    def test_unreadable_declarations_become_absent_and_never_drop_the_block(
-        self, declared: object, expected: int | None
-    ) -> None:
-        block = self._binary_block(remaining_window_days=declared)
-        assert block is not None, "an unreadable telemetry value must never cost the forecast"
-        assert block.posterior_prob == pytest.approx(0.28)
-        assert block.remaining_window_days == expected
-
-    def test_an_unreadable_mc_declaration_keeps_the_ballot(self) -> None:
-        """The MC half of the same guarantee: MC has no telemetry strip-and-retry, so
-        leniency at the field is the only thing standing between a malformed telemetry
-        value and a ballot that has to be re-parsed by the LLM salvage rung."""
-        block = self._mc_block(remaining_window_days="the whole window")
-        assert block is not None
-        assert block.option_probs == {"A": 0.6, "B": 0.4}
-        assert block.remaining_window_days is None
-
-
 class TestDiscreteCountStructuredHappyPath:
     def test_full_construction(self, valid_discrete_block: DiscreteCountStructured) -> None:
         d = valid_discrete_block
@@ -1222,21 +1132,6 @@ class TestParseStructuredBlock:
             r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")
         ]
         assert not our_warnings, [r.getMessage() for r in our_warnings]
-
-    def test_log_failures_false_silences_the_strict_failure(self, caplog: pytest.LogCaptureFixture) -> None:
-        """The publish-path telemetry read (``_log_window_declared`` in
-        ``forecaster_runners``) runs BESIDE the extraction ladder, which repairs blocks
-        this strict parse rejects. Logging the strict failure there would warn about a
-        forecast that published fine, so that caller passes ``log_failures=False`` and
-        both the no-block INFO and the validation WARNING go quiet. The return value is
-        unchanged — only the logging is."""
-        for rationale in ("Prose with no JSON block at all.", "```json\n{this is not valid json\n```"):
-            caplog.clear()
-            with caplog.at_level(logging.INFO, logger="metaculus_bot.structured_output_schema"):
-                result = parse_structured_block(rationale, "binary", log_failures=False)
-            assert result is None
-            ours = [r for r in caplog.records if r.name.startswith("metaculus_bot")]
-            assert not ours, [r.getMessage() for r in ours]
 
     def test_malformed_json_returns_none_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
         rationale = "```json\n{this is not valid json\n```"

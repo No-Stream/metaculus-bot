@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
 from collections.abc import Iterator
 from typing import Annotated, Literal
@@ -188,37 +187,6 @@ class CriteriaClause(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _readable_window_days(value: object) -> int | None:
-    """A declared ``remaining_window_days`` we can read, or None when we cannot.
-
-    Telemetry only (the ``WINDOW_DECLARED`` marker in ``forecaster_runners``): the
-    forecaster's own count of the days it applied its base rate over. Read
-    LENIENTLY on purpose, as a ``mode="before"`` validator rather than a strict
-    ``int``: a formatting slip on a measurement field must not cost the block that
-    carries the forecast. Binary blocks have the telemetry strip-and-retry below as
-    a second net, but MC blocks have none, so a strict int there would push a
-    perfectly good ballot down to the LLM salvage rung — the exact drift signal
-    ``EXTRACTION_RUNG`` exists to watch.
-
-    Unreadable becomes None (absent), never a guess: "45" and 45.0 are the same
-    declaration written differently, while "about 45 days" is prose we decline to
-    parse rather than mine for a number.
-    """
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return round(value) if math.isfinite(value) else None
-    if isinstance(value, str):
-        try:
-            parsed = float(value.strip())
-        except ValueError:
-            return None
-        return round(parsed) if math.isfinite(parsed) else None
-    return None
-
-
 def _validate_scenario_sum(scenarios: list[ScenarioBranch]) -> list[ScenarioBranch]:
     if not scenarios:
         return scenarios
@@ -251,15 +219,6 @@ class BinaryStructured(BaseModel):
     # priced resolution clauses. Old blocks without them must keep parsing.
     base_rate_anchor: BaseRateAnchor | None = None
     criteria_clauses: list[CriteriaClause] = Field(default_factory=list)
-    # Telemetry-only optional field (2026-09-02): the days-from-now-to-deadline the
-    # forecaster says it priced. Read against the question's real close time by the
-    # WINDOW_DECLARED marker; nothing clamps or adjusts on it.
-    remaining_window_days: int | None = None
-
-    @field_validator("remaining_window_days", mode="before")
-    @classmethod
-    def _tolerate_unreadable_window(cls, v: object) -> int | None:
-        return _readable_window_days(v)
 
     @field_validator("scenarios")
     @classmethod
@@ -328,13 +287,6 @@ class MultipleChoiceStructured(BaseModel):
     option_probs: dict[str, float]
     other_mass: float | None = Field(default=None, ge=0.0, le=1.0)
     concentration: float | None = None
-    # Same telemetry-only field as BinaryStructured — see _readable_window_days.
-    remaining_window_days: int | None = None
-
-    @field_validator("remaining_window_days", mode="before")
-    @classmethod
-    def _tolerate_unreadable_window(cls, v: object) -> int | None:
-        return _readable_window_days(v)
 
     @field_validator("concentration")
     @classmethod
@@ -699,8 +651,6 @@ def _retry_without_binary_telemetry(
 def parse_structured_block(
     rationale_text: str,
     question_type: Literal["binary", "numeric", "multiple_choice"],
-    *,
-    log_failures: bool = True,
 ) -> StructuredBlock | None:
     """
     Extract and validate a structured JSON block from a rationale.
@@ -729,20 +679,10 @@ def parse_structured_block(
     malformed final block beats a lower-ranked valid one and no superseded draft
     gets published. Callers of this function read a block for telemetry or
     analysis, where an unrepaired None is the honest answer.
-
-    ``log_failures=False`` silences the no-block INFO and the final-candidate
-    WARNING for a read that runs BESIDE the ladder on the publish path
-    (``_log_window_declared`` in ``forecaster_runners``): there, a block the strict
-    parse rejects is routinely recovered by the ladder's repair rung, so logging
-    the strict failure would raise a warning about a forecast that published fine.
-    The trailing-blocks-skipped INFO is never gated, on the same principle as
-    ``parse_structured_payload``'s recovery log: it reports on a block that IS
-    returned.
     """
     candidates = extract_json_block_candidates(rationale_text)
     if not candidates:
-        if log_failures:
-            logger.info("No JSON block found in rationale for question_type=%s", question_type)
+        logger.info("No JSON block found in rationale for question_type=%s", question_type)
         return None
 
     last_index = len(candidates) - 1
@@ -751,7 +691,7 @@ def parse_structured_block(
         # silently skipped (a valid block may still follow), while the final
         # failure's WARNING preserves the honest end-state signal. A single-block
         # rationale (the common case) is index==last, so its logging is unchanged.
-        parsed = parse_structured_payload(candidate, question_type, log_failures=log_failures and index == last_index)
+        parsed = parse_structured_payload(candidate, question_type, log_failures=index == last_index)
         if parsed is not None:
             if index > 0:
                 logger.info(

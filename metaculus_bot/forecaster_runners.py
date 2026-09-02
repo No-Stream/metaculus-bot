@@ -11,8 +11,6 @@ These are stateless — the caller is responsible for storing any side-effects
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
-from typing import Literal
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -38,19 +36,11 @@ from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_
 from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc
 from metaculus_bot.numeric.validation import detect_unit_mismatch
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
-from metaculus_bot.structured_output_schema import (
-    BinaryStructured,
-    MultipleChoiceStructured,
-    NumericStructured,
-    parse_structured_block,
-)
+from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 from metaculus_bot.structured_parse import parse_structured
-from metaculus_bot.time_utils import _as_utc
 from metaculus_bot.value_extraction import extract_binary, extract_mc, extract_numeric
 
 logger = logging.getLogger(__name__)
-
-_SECONDS_PER_DAY = 86_400.0
 
 
 def _log_llm_output(model_name: str, question_id: int | None, reasoning: str) -> None:
@@ -83,66 +73,6 @@ def _forecaster_input(prompt: str, chart_b64: str | None) -> str | VisionMessage
     if chart_b64 is None:
         return prompt
     return VisionMessageData(prompt=prompt, b64_image=chart_b64, image_resolution="low")
-
-
-def _log_window_declared(
-    reasoning: str,
-    question: BinaryQuestion | MultipleChoiceQuestion,
-    forecaster_llm: GeneralLlm,
-    qtype: Literal["binary", "multiple_choice"],
-) -> None:
-    """Log the window this forecaster says it priced, beside the window it actually had.
-
-    ``remaining_window_days`` is an optional telemetry field in the structured block
-    (see ``_readable_window_days`` in ``structured_output_schema``). A member that
-    applied its base rate over the FULL question window when most of that window had
-    already elapsed event-free is the qid 43837 miss; this line is what turns that
-    into a query over the telemetry archive instead of a re-read of every rationale.
-
-    Pure measurement: nothing downstream reads the field, and a member that declares
-    nothing leaves NO line, so the absence of a record means "not declared" rather
-    than "priced correctly". Emitted before extraction so it reports what the model
-    wrote even when the value never survives to publish.
-
-    ``actual_days`` measures the gap from now to ``scheduled_resolution_time``, which is
-    the deadline the prompt itself shows the model ("Scheduled to resolve: DATE (N days
-    from now)" in ``prompts._forecasting_window_str``) — so declared and actual count to
-    the same date and their ratio means something. ``close_time`` would not: scheduled
-    close precedes scheduled resolution by a median 33 days on live tournament questions,
-    and the bot submits hours before close, so a correctly-priced member would read a
-    ~170x ratio indistinguishable from the pathology this marker isolates.
-
-    Two readings of ``actual_days`` that are NOT failures. It is ``n/a`` only when the
-    field is None, which is Optional upstream but effectively unreachable in prod
-    (``_forecasting_window_str`` asserts it non-None on this same path). It is NEGATIVE on
-    any question already past its scheduled resolution, which is every backtest and
-    ablation question — those forecast resolved questions and ``_prepare_question_for_backtest``
-    leaves the time fields untouched (cf. ``time_budget.py``'s docstring). A ratio cut
-    therefore has to drop nulls AND non-positives.
-    """
-    # log_failures=False: the ladder below repairs blocks this strict read rejects, so a
-    # warning here would flag a forecast that published fine.
-    block = parse_structured_block(reasoning, qtype, log_failures=False)
-    if not isinstance(block, (BinaryStructured, MultipleChoiceStructured)):
-        return
-    declared = block.remaining_window_days
-    if declared is None:
-        return
-
-    resolution_time = question.scheduled_resolution_time
-    if resolution_time is None:
-        actual = "n/a"
-    else:
-        remaining_s = (_as_utc(resolution_time) - datetime.now(UTC)).total_seconds()
-        actual = f"{remaining_s / _SECONDS_PER_DAY:.1f}"
-
-    logger.info(
-        "WINDOW_DECLARED: question=%s model=%s declared_days=%s actual_days=%s",
-        question.id_of_question,
-        forecaster_llm.model,
-        declared,
-        actual,
-    )
 
 
 def build_parse_notes(question: NumericQuestion) -> str:
@@ -208,7 +138,6 @@ async def run_binary_forecast(
         label="forecaster_binary",
     )
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
-    _log_window_declared(reasoning, question, forecaster_llm, "binary")
 
     binary_parse_instructions = (
         "Return a single JSON object only. Set `prediction_in_decimal` strictly as a decimal in [0,1] "
@@ -244,7 +173,6 @@ async def run_mc_forecast(
         lambda: forecaster_llm.invoke(forecaster_input), wall_timeout=FORECASTER_SOFT_DEADLINE, label="forecaster_mc"
     )
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
-    _log_window_declared(reasoning, question, forecaster_llm, "multiple_choice")
 
     parsing_instructions = clean_indents(
         f"""
