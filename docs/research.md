@@ -249,6 +249,11 @@ name-abbreviates-outlet (`WaPo` / washingtonpost.com), domain-abbreviates-name
 provenance while a false keep leaves one tag standing. A response whose chunks
 carry no renderable label is skipped rather than blanket-marked: with no evidence
 base, a rewrite would dress our own render failure as the model's embellishment.
+The token is defined where the forecaster reads it: `prompts._SOURCE_PROVENANCE_LADDER`
+carries one bullet saying the pipeline could not match the named outlet against its
+own retrieval record, that the claim itself may still be correct, and that the
+evidence is untiered rather than low-tier. Without that, the ladder tells the model
+to weight by tier while a token it has never seen stands where the tier was.
 Per-response counts ride `GEMINI_UNSUPPORTED_ATTRIBUTION` (only when non-zero)
 and the provider-diagnostics `unsupported_attributions` count (always, so a zero
 is a measurement); nothing keys on either. Validation over all 323 sections,
