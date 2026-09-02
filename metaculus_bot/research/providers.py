@@ -52,7 +52,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.credit_telemetry import llm_call_metadata, plain_llm_key_alias
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
-from metaculus_bot.prompts import web_research_prompt
+from metaculus_bot.prompts import OUTSIDE_VENUE_MARKET_ODDS_POLICY, web_research_prompt
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.raw_log import record_raw_research
 
@@ -422,9 +422,14 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
             allowed_tries=1,
             metadata=llm_call_metadata("perplexity_research", plain_llm_key_alias(model_name)),
         )
-        # Exclude prediction markets research when benchmarking to avoid data leakage
+        # Exclude prediction markets research when benchmarking to avoid data leakage.
+        # The same narrowed policy `web_research_prompt` carries, interpolated rather than
+        # restated: this provider is the PRIMARY whenever AskNews credentials are absent, so a
+        # second copy of the market-odds ask is a live policy that drifts (it carried the retired
+        # blanket "consider all relevant prediction markets" version for a release after the
+        # first-pass prompt was narrowed to the venues the live snapshot does not cover).
         prediction_markets_instruction = (
-            "" if is_benchmarking else "In addition to news, consider all relevant prediction markets.\n"
+            "" if is_benchmarking else f"In addition to news, cover: {OUTSIDE_VENUE_MARKET_ODDS_POLICY}\n"
         )
         prompt = (
             "You are an assistant to a superforecaster.\n"
