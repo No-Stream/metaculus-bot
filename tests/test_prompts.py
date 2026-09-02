@@ -20,6 +20,7 @@ from metaculus_bot.prompts import (
     _AUTO_ANNOTATED_CITATION_CLAUSE,
     _OUTSIDE_VENUE_MARKET_ODDS_BULLET,
     _SOURCE_TIER_TAG_INSTRUCTION,
+    MARKET_SNAPSHOT_SECTION_HEADER,
     TS_ANCHOR_SECTION_HEADER,
     asknews_summarizer_prompt,
     binary_prompt,
@@ -33,6 +34,12 @@ from metaculus_bot.prompts import (
     web_research_prompt,
 )
 from metaculus_bot.research.gemini_attribution import UNVERIFIED_ATTRIBUTION_MARKER
+from metaculus_bot.research.section_format import PROVIDER_SECTION_HEADERS
+
+# Research that carries a rendered prediction-market section. The market clause in the three
+# forecaster prompts is gated on this header (see TestPredictionMarketFraming), so tests that
+# assert on the clause must hand the prompt research that would actually have carried a snapshot.
+_RESEARCH_WITH_MARKETS = f"Some news.\n\n{MARKET_SNAPSHOT_SECTION_HEADER}\n| venue | market | prob |\n| k | m | 0.4 |"
 
 # gap_fill_analyzer_prompt
 
@@ -604,12 +611,20 @@ class TestPredictionMarketFraming:
     that a forecaster may supplement the research with its own training
     knowledge is a SEPARATE, prompt-wide directive — not a market-specific one.
 
-    Leakage note: these forecaster prompts have no ``is_benchmarking`` branch —
-    benchmarking suppression happens upstream at the research-data layer (the
-    prediction-market provider is dropped, so ``{research}`` carries no market
-    prices during backtests), which makes this mode-agnostic framing inert
-    when benchmarking. The mode-dependent leakage guard lives on
-    ``web_research_prompt`` (see ``test_strong_evidence_framing_suppressed_when_benchmarking``).
+    Gate: the whole clause renders ONLY when the research carries the rendered
+    ``## Prediction Market Snapshot`` section (``MARKET_SNAPSHOT_SECTION_HEADER``), the
+    same way the numeric prompt gates its TS-anchor clause. Prod-neutral: the header is
+    emitted whenever the provider rendered anything, including the deliberate-empty "no
+    relevant market" sentence, and it is absent only when the provider returned ``""``
+    (benchmarking, flag off, soft-fail) — exactly the prompts where the market policy
+    had nothing to bear on. That also makes the leakage story simpler than it was: a
+    benchmarking prompt no longer carries three paragraphs about markets it cannot see.
+    The mode-dependent leakage guard on the RESEARCH side still lives on
+    ``web_research_prompt`` (see ``test_market_ask_present_non_benchmarking_absent_benchmarking``).
+
+    Notation vs policy: the rendered table's own legend (``MARKET_SIGNAL_LEGEND``) defines the
+    relation tiers, the evidential order, RESOLVED, the ``↳`` rows and ``[remaining N]``; the
+    prompt keeps only the three READING rules the legend does not carry.
     """
 
     def _assert_strong_evidence_framing(self, prompt: str) -> None:
@@ -625,59 +640,45 @@ class TestPredictionMarketFraming:
         assert "extrapolate" in lowered
         assert "constant-hazard" in lowered or "base-rate-over-time" in lowered
         assert "show the arithmetic" in lowered
-        # The liquidity-weighting sentence: weight a crowd signal by how informative it is.
-        assert "weight each market/crowd signal by its stated liquidity/participation label" in lowered
-        # The relation axis, which ranked retrieval added alongside liquidity. The table now
-        # arrives in evidential order with a per-row `relation` grade, so the prompt has to name
-        # the ORDER, name every tier a cell can hold, and say what RESOLVED means about a price —
-        # a forecaster told to weight by a label it was never taught will guess at it.
-        assert "listed in order of evidential value" in lowered
-        for tier in ("same_quantity_same_date", "same_quantity_other_cut", "driver_or_consequence"):
-            assert f"`{tier}`" in lowered, tier
-        assert "realized outcome rather than a forecast" in lowered
-        # Which label wins when the two axes disagree. A tight relation on a THIN market is the shape
-        # that cost q45189: all three forecasters imported a thin single-strike price at full weight,
-        # because the prompt named both labels and never said the liquidity warning governs the price.
-        # The instruction has to be directional too — widen around the implied value rather than
-        # transplant it — since "discount a thin market" alone is what they thought they were doing.
-        assert "the liquidity warning governs the price" in lowered
-        assert "widening your distribution around its implied value" in lowered
-        assert "rather than transplanting its price exactly" in lowered
-        # A multi-outcome market (Kalshi strike family, Polymarket event, PredictIt ballot) has no
-        # single price, so the row the forecaster is told to anchor on renders a blank `prob` cell
-        # and its outcomes carry the prices on indented sub-rows. Without this the strongest
-        # available evidence reads as a market with no price. The glyph itself is explained in the
-        # rendered table's legend; what belongs in the prompt is the anchoring rule.
-        assert "a market with several outcomes has no single price" in lowered
-        assert "anchor on the outcome matching this question" in lowered
-        # And the rule that anchoring on ONE of those outcomes is not enough. A family of `↳` rows is
-        # a distribution over the market's own question, so reading one bracket as an equality
-        # constraint on a tail is a category error — which is exactly what q45189 cost: all three
-        # forecasters correctly identified the margin-vs-share mismatch on a ten-bracket Kalshi ladder,
-        # then each anchored on the single bracket the render had shown them and cut the resolving
-        # bucket below its own prior. The render change makes the whole ladder available; this sentence
-        # is what tells a forecaster to read it as a distribution.
+        # Reading rule 1: an other-cut market is the same quantity at another date/threshold/source,
+        # so it is something to extrapolate from, not to haircut.
+        assert "`same_quantity_other_cut`" in lowered
+        assert "extrapolate from it rather than discount it vaguely" in lowered
+        # Reading rule 2: which label wins when the two axes disagree. A tight relation on a THIN
+        # market is the shape that cost q45189: all three forecasters imported a thin single-strike
+        # price at full weight. The rule carries its reason (a thin price is noisy however tight its
+        # relation) and is directional — widen around the implied value rather than transplant it.
+        assert "the liquidity warning governs" in lowered
+        assert "a thin price is noisy however tight its relation" in lowered
+        assert "widen around its implied value rather than transplant its price" in lowered
+        # Reading rule 3: a family of `↳` rows is a distribution over the market's own question, so
+        # reading one bracket as an equality constraint on a tail is a category error — the other
+        # half of q45189 (all three cut the resolving bucket below their own prior that way).
         assert "is a distribution over that market's own question" in lowered
         assert "read the whole ladder" in lowered
-        assert "[remaining n]" in lowered, "the prompt must name the row the rest of the ladder lives on"
-        # The ladder sentence must describe what the renderer actually does under
-        # compaction: outcomes are either named with their own price or inside a
-        # counted group with its summed price (rendering.py's collapse stages —
-        # unquoted, then settled, then the cheapest open outcomes).
-        assert "accounts for every outcome not given a row of its own" in lowered
-        assert "inside a counted group with its summed price" in lowered
-        # The pre-fix overstatement must stay gone: from stage 3 up some OPEN
-        # outcomes carry only a count and a summed price, so "prices every
-        # outcome" asserted a render the collapse stages do not always deliver
-        # (verify_market-render.md Issue D).
-        assert "which prices every outcome" not in lowered
         assert "never treat one outcome's price as an equality constraint" in lowered
+        assert "cut the resolving bucket below the forecaster's own prior" in lowered
+        # NOTATION is the legend's job, stated beside the table; the prompt must not re-teach it.
+        # These are the phrases the pre-2026-09 clause carried that duplicated MARKET_SIGNAL_LEGEND.
+        assert "weight each market/crowd signal by its stated liquidity/participation label" not in lowered
+        assert "listed in order of evidential value" not in lowered
+        assert "realized outcome rather than a forecast" not in lowered
+        assert "a market with several outcomes has no single price" not in lowered
+        assert "[remaining n]" not in lowered
+        assert "inside a counted group with its summed price" not in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
         # The mis-scoped "you may deviate from a market" carve-out must NOT be present —
         # it undercut the strong-evidence framing. The general expertise principle is
         # asserted separately below.
         assert "deviate from a market" not in lowered
+
+    def _assert_market_clause_absent(self, prompt: str) -> None:
+        lowered = " ".join(prompt.lower().split())
+        assert "prediction markets are strong evidence" not in lowered
+        assert "weight them heavily" not in lowered
+        assert "equality constraint" not in lowered
+        assert "liquidity warning" not in lowered
 
     def _assert_general_expertise_principle(self, prompt: str) -> None:
         """The prompt-wide directive that a forecaster may draw on its own training
@@ -687,14 +688,41 @@ class TestPredictionMarketFraming:
         assert "you are not required to ground every claim in the research" in lowered
 
     def test_binary_prompt_frames_markets_as_strong_evidence(self) -> None:
-        self._assert_strong_evidence_framing(binary_prompt(_binary_q(), research="r"))
+        self._assert_strong_evidence_framing(binary_prompt(_binary_q(), research=_RESEARCH_WITH_MARKETS))
 
     def test_multiple_choice_prompt_frames_markets_as_strong_evidence(self) -> None:
-        self._assert_strong_evidence_framing(multiple_choice_prompt(_mc_q(), research="r"))
+        self._assert_strong_evidence_framing(multiple_choice_prompt(_mc_q(), research=_RESEARCH_WITH_MARKETS))
 
     def test_numeric_prompt_frames_markets_as_strong_evidence(self) -> None:
-        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        result = numeric_prompt(
+            _numeric_q(), research=_RESEARCH_WITH_MARKETS, lower_bound_message="lbm", upper_bound_message="ubm"
+        )
         self._assert_strong_evidence_framing(result)
+
+    def test_market_clause_absent_when_research_carries_no_snapshot(self) -> None:
+        """No snapshot section, no market policy: the clause is ~1.5k chars of instruction about
+        a table the forecaster does not have, and before the gate every benchmarking, flag-off and
+        soft-failed prompt paid for it."""
+        self._assert_market_clause_absent(binary_prompt(_binary_q(), research="Just some news."))
+        self._assert_market_clause_absent(multiple_choice_prompt(_mc_q(), research="Just some news."))
+        self._assert_market_clause_absent(
+            numeric_prompt(
+                _numeric_q(), research="Just some news.", lower_bound_message="lbm", upper_bound_message="ubm"
+            )
+        )
+
+    def test_market_clause_not_triggered_by_another_providers_header(self) -> None:
+        research = f"{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20"
+        self._assert_market_clause_absent(
+            numeric_prompt(_numeric_q(), research=research, lower_bound_message="lbm", upper_bound_message="ubm")
+        )
+
+    def test_gate_header_is_the_one_the_provider_actually_renders(self) -> None:
+        """Pinned against the provider-to-header map rather than a copied string: if the market
+        provider's section header ever changes, the gate has to move with it or every prod prompt
+        silently loses the clause."""
+        assert PROVIDER_SECTION_HEADERS["prediction_market"] is MARKET_SNAPSHOT_SECTION_HEADER
+        assert MARKET_SNAPSHOT_SECTION_HEADER == "## Prediction Market Snapshot"
 
     def test_binary_prompt_carries_general_expertise_principle(self) -> None:
         self._assert_general_expertise_principle(binary_prompt(_binary_q(), research="r"))
@@ -1460,8 +1488,8 @@ class TestStructuredForecastExampleBlocks:
     is fixed, so a slot in it cannot scaffold reasoning).
     """
 
-    # Retired 2026-09-02: each was read only by dormant telemetry, and every one of them
-    # asked the model for post-hoc admin rather than for its forecast.
+    # Retired by the schema de-bloat: each was read only by dormant telemetry, and every one
+    # of them asked the model for post-hoc admin rather than for its forecast.
     _RETIRED_KEYS = (
         "remaining_window_days",
         "base_rate_anchor",

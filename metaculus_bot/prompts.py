@@ -592,65 +592,47 @@ _LAST_REAL_USE_GAP_RULE = """
         measurement."""
 
 
-# The liquidity/participation weighting sentence, appended to the shared strong-evidence
-# clause so every forecaster prompt tells the model to weight a crowd signal by how
-# informative it is (the prediction-market provider emits a per-market `signal` label
-# plus volume/OI — approximate USD on the real-money venues, play-money mana on Manifold,
-# which is why the rendered legend qualifies the unit per venue rather than venue-wide).
-#
-# The `no-liquidity-data` sentence is load-bearing and must stay in sync with
-# `prediction_market._liquidity_label`. That label means "this venue publishes no volume
-# figures", which is only ever true of PredictIt now that the Kalshi field names are
-# fixed — so it is an absence of measurement, not a measurement of thinness, and a
-# forecaster that collapses it into "thin" would discount a market for the wrong reason.
-_MARKET_LIQUIDITY_WEIGHTING_SENTENCE = (
-    "Weight each market/crowd signal by its stated liquidity/participation label: treat deep / "
-    "high-liquidity markets as a strong anchor, and discount thin markets (low volume, few participants) "
-    "as noisy. A `no-liquidity-data` label means the venue publishes no volume figures at all, so treat "
-    "that market's depth as unknown — judge it on its resolution-criteria match, and do not read it as thin."
+# The three READING rules for the rendered market table that its own legend does not carry.
+# The legend (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`, printed beside the table)
+# owns NOTATION: the liquidity labels and `no-liquidity-data`, the evidential row order, the
+# four `relation` tiers, RESOLVED, `↳` sub-rows, `[remaining N]`, `(Nd ago)`, `demoted from
+# same-date:`. Re-teaching any of that here gave the model two partially-overlapping glossaries
+# (the legend had grown labels the prompt never mentioned), so the prompt keeps only POLICY —
+# what to DO with a row the legend has already explained. Receipts: rule 2 and rule 3 are both
+# q45189, where all three forecasters imported a thin single-strike price at full weight, then
+# read one bracket of a ten-bracket Kalshi ladder as an equality constraint on a tail and cut
+# the resolving bucket below their own prior (published 0.130, spot -26.77). Rule 1 is the
+# ranked-retrieval design intent: an other-cut market is the same quantity, so it is something
+# to extrapolate from, not to haircut. `same_quantity_other_cut` is verbatim from
+# `market_retrieval.ranking.TIERS`; renaming it there without renaming it here silently teaches
+# forecasters a vocabulary the table no longer uses. Ships in all three forecaster prompts,
+# gated with the rest of the clause on the snapshot section being present.
+_MARKET_READING_RULES = (
+    "The snapshot's legend defines its columns and markers; three reading rules sit on top. A "
+    "`same_quantity_other_cut` market measures the same thing at another date, threshold or source, so "
+    "extrapolate from it rather than discount it vaguely. When a market's relation is tight but its liquidity "
+    "thin, the liquidity warning governs — a thin price is noisy however tight its relation — so widen around "
+    "its implied value rather than transplant its price. A market with several `↳` outcomes is a DISTRIBUTION "
+    "over that market's own question: read the whole ladder and translate it into this question's outcome "
+    "space. Never treat one outcome's price as an equality constraint that fixes a tail; reading one bracket "
+    "that way has cut the resolving bucket below the forecaster's own prior."
 )
 
-# The second axis market retrieval gained when it moved to ranked selection: the table arrives
-# in EVIDENTIAL order with a per-row `relation` grade and a one-phrase `why`, so a forecaster
-# has something better to weight on than word overlap. Kept next to the liquidity
-# sentence, inside the same shared constant region, so all three prompts stay in sync — which is
-# what the comment block above exists to protect. The four tier names are verbatim from
-# `market_retrieval.ranking.TIERS`; renaming one there without renaming it here silently teaches
-# forecasters a vocabulary the table no longer uses.
-#
-# The closing `↳` sentence is POLICY, not notation — the glyph itself is explained in the rendered
-# table's own legend (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`), beside the table where it
-# appears. What belongs here is the anchoring rule it changes: a multi-outcome market (a Kalshi
-# strike family, a Polymarket event, a PredictIt ballot) has no single price, so the row a forecaster
-# is told to anchor on renders an empty `prob` cell, and without this clause the strongest available
-# evidence can read as priceless. One sentence; this constant ships in all three prompts.
-_MARKET_RELATION_WEIGHTING_SENTENCE = (
-    "The markets are listed in order of evidential value, most valuable first, and each row carries a "
-    "`relation` label saying how it relates to this question: `same_quantity_same_date` measures the same "
-    "thing on the same date and is the strongest anchor available; `same_quantity_other_cut` measures the "
-    "same thing at a different date, threshold, or source, so extrapolate from it rather than discounting it "
-    "vaguely; `driver_or_consequence` and `weak` are context to reason from, not anchors. When the relation "
-    "and liquidity labels disagree — a tightly-related market whose signal is thin — the liquidity warning "
-    "governs the price: a thin market's price is noisy even when its relation is tight, so extrapolate from "
-    "a thin market by widening your distribution around its implied value rather than transplanting its "
-    "price exactly. A row marked "
-    "RESOLVED has already settled, so its price is a realized outcome rather than a forecast — read it as "
-    "evidence about what happened, not as a probability. A market with several outcomes has no single price, so "
-    "its own `prob` cell is blank and each outcome is listed beneath it on a `↳` row with its own price — anchor "
-    "on the outcome matching this question, and do not read the blank parent cell as a missing market. "
-    "A market with several `↳` outcomes is a DISTRIBUTION over that market's own question, not a set of "
-    "independent facts: read the whole ladder (including the `↳ [remaining N]` row, which accounts for every "
-    "outcome not given a row of its own — priced individually where space allows, otherwise inside a counted "
-    "group with its summed price, never silently dropped) and translate it into this question's outcome space. "
-    "Never treat one "
-    "outcome's price as an equality constraint that fixes a tail — a single bracket of a ten-bracket ladder "
-    "constrains almost nothing on its own, and reading it that way has cut the resolving bucket below the "
-    "forecaster's own prior."
-)
+
+# Header the prediction-market research provider emits (`research/section_format.py`
+# PROVIDER_SECTION_HEADERS imports it from here, the same way it imports
+# TS_ANCHOR_SECTION_HEADER). The three forecaster prompts gate the whole market clause on this
+# substring, so the policy appears only when a snapshot was actually rendered. Prod-neutral:
+# the provider emits the header whenever it rendered anything, including the deliberate-empty
+# "no sufficiently relevant market" sentence, and omits it only when it returned "" —
+# benchmarking, flag off, or a soft-fail — which are exactly the prompts where ~1.5k chars of
+# market policy had nothing to bear on.
+MARKET_SNAPSHOT_SECTION_HEADER = "## Prediction Market Snapshot"
 
 
 def _strong_evidence_market_clause(
     *,
+    research: str,
     subject: str,
     signal_noun: str,
     anchor_tail: str,
@@ -659,11 +641,14 @@ def _strong_evidence_market_clause(
 ) -> str:
     """Shared "prediction markets are strong evidence" clause for the three forecaster prompts.
 
-    The framing is identical across binary / MC / numeric; only a few type-specific words differ
-    (the signal noun, the anchor verb phrase, the extrapolation target, and the projection tail).
-    Centralizing it keeps the strong-evidence framing AND the liquidity-weighting sentence in sync
-    across all three prompts. Spliced into each prompt's ``clean_indents`` f-string; the embedded
-    newlines are cosmetic (``clean_indents`` and the whitespace-collapsing tests both ignore them).
+    Returns ``""`` unless ``research`` carries ``MARKET_SNAPSHOT_SECTION_HEADER`` — the clause
+    is about reading a table, so it renders only when the table does (mirrors the numeric
+    prompt's TS-anchor gate). The framing is identical across binary / MC / numeric; only a few
+    type-specific words differ (the signal noun, the anchor verb phrase, the extrapolation
+    target, and the projection tail). Centralizing it keeps the strong-evidence framing AND the
+    reading rules in sync across all three prompts. Spliced into each prompt's ``clean_indents``
+    f-string; the embedded newlines are cosmetic (``clean_indents`` and the whitespace-collapsing
+    tests both ignore them).
 
     Why the strong push is earned (don't re-litigate this in future prompt audits): past misses
     traced to forecasters ignoring prediction markets, and the evidence is that a liquid, closely
@@ -672,6 +657,8 @@ def _strong_evidence_market_clause(
     match/mismatch discounting (resolution criteria, resolution date, liquidity), not in waving the
     market off. The all-caps shouting was dropped 2026-07-18 as decoration; the strong push stays.
     """
+    if MARKET_SNAPSHOT_SECTION_HEADER not in research:
+        return ""
     return (
         "Prediction markets are strong evidence — weight them heavily, not as a footnote. When the research "
         f"includes a market on this {subject}, default to treating {signal_noun} as a serious signal: if the "
@@ -681,8 +668,7 @@ def _strong_evidence_market_clause(
         "burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. "
         "When the criteria are practically identical and the only material difference is the resolution date, do "
         f"NOT apply a vague haircut — EXPLICITLY EXTRAPOLATE {extrapolate_target} to our resolution date with a "
-        f"simple model and state the assumption. {projection} "
-        f"{_MARKET_LIQUIDITY_WEIGHTING_SENTENCE} {_MARKET_RELATION_WEIGHTING_SENTENCE}"
+        f"simple model and state the assumption. {projection} {_MARKET_READING_RULES}"
     )
 
 
@@ -800,6 +786,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             every claim in the research; just be clear when you're drawing on your own knowledge versus the research.
             {
             _strong_evidence_market_clause(
+                research=research,
                 subject="question",
                 signal_noun="its price",
                 anchor_tail="should anchor your forecast",
@@ -944,6 +931,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         in the research; just be clear when you're drawing on your own knowledge versus the research.
         {
             _strong_evidence_market_clause(
+                research=research,
                 subject="question",
                 signal_noun="its prices",
                 anchor_tail="should anchor your distribution",
@@ -1095,6 +1083,7 @@ def numeric_prompt(
         but penalties for overly wide intervals on predictable quantities also accumulate.{ts_anchor_clause}
         {
             _strong_evidence_market_clause(
+                research=research,
                 subject="quantity",
                 signal_noun="its implied range",
                 anchor_tail="your percentiles should center on it",

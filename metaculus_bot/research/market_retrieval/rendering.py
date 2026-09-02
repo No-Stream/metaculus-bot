@@ -233,6 +233,14 @@ TITLE_MAX_CHARS = 80
 # fixed overhead on every rendered snapshot and the snapshot goes to the expensive forecaster
 # models, so it earns its length: every label a cell can hold is named (a legend that omits one
 # teaches forecasters to guess at it) and nothing else is.
+#
+# This legend is the ONLY place the forecaster is taught the table's notation: the prompts'
+# market clause (`prompts._MARKET_READING_RULES`) used to restate the liquidity weighting, the
+# tier order, RESOLVED and the `↳` glyph, and now carries policy only. So the `no-liquidity-data`
+# sentence here must stay in sync with `market_retrieval.types._liquidity_label`: that label means
+# "this venue publishes no volume figures" (only PredictIt now), an absence of measurement rather
+# than a measurement of thinness, and a forecaster that collapses it into "thin" discounts a
+# market for the wrong reason.
 MARKET_SIGNAL_LEGEND = (
     "The `signal` column labels each market's liquidity/participation "
     "(thin/decent/deep for real-money venues, thin/decent/high for Manifold's play-money bettor count); "
