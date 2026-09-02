@@ -16,6 +16,7 @@ can assert an ``EXTRACTION_RUNG`` telemetry line was emitted.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm.exceptions as litellm_exc
@@ -35,7 +36,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
 
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
-from metaculus_bot.exceptions import UnitMismatchError
+from metaculus_bot.exceptions import UnitMismatchError, ValueExtractionError
 from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.llm_retry import TRANSIENT_RETRY_MAX_ELAPSED_S
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
@@ -185,6 +186,151 @@ class TestRunBinaryForecast:
         assert "qtype=binary" in msg
         assert "rung=block" in msg
         assert "block_present=True" in msg
+
+
+class TestWindowDeclaredTelemetry:
+    """``WINDOW_DECLARED`` reports the pricing window a member SAYS it used beside the
+    window it actually had. The optional ``remaining_window_days`` block field is the
+    source; a member that omits it leaves no line, so the archive is a declaration
+    census rather than a coverage one. On qid 43837 six members priced the full question
+    window when 16 days of it had already elapsed event-free, which this line makes a
+    query instead of a re-read of every rationale.
+
+    The block is parsed for telemetry only — nothing downstream reads the field — so
+    these tests run the real ``parse_structured_block`` and assert on the log.
+    """
+
+    _FUTURE_CLOSE = datetime(2026, 12, 31, tzinfo=UTC)
+
+    @staticmethod
+    def _window_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [r.getMessage() for r in caplog.records if "WINDOW_DECLARED" in r.getMessage()]
+
+    @staticmethod
+    def _binary_rationale(*, declared: int | None) -> str:
+        window = "" if declared is None else f', "remaining_window_days": {declared}'
+        return f'Analysis.\n\n```json\n{{"question_type": "binary", "posterior_prob": 0.4{window}}}\n```'
+
+    @pytest.mark.asyncio
+    async def test_declared_window_is_logged_against_the_real_one(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        binary_question.close_time = datetime.now(UTC) + timedelta(days=10)
+
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=self._binary_rationale(declared=90))),
+        ):
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        (msg,) = self._window_lines(caplog)
+        assert "question=1001" in msg
+        assert "model=test-forecaster" in msg
+        assert "declared_days=90" in msg
+        # The real remaining window, to one decimal — the ratio against declared_days is
+        # the cut (90 declared against 10 real is the full-window pricing shape). Rounding
+        # holds to one decimal until the test itself takes over an hour.
+        assert "actual_days=10.0" in msg
+
+    @pytest.mark.asyncio
+    async def test_no_line_when_the_forecaster_declares_nothing(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The field is optional, so silence must stay silence: an absent record means
+        "did not declare", never "priced the window correctly"."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        binary_question.close_time = self._FUTURE_CLOSE
+
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=self._binary_rationale(declared=None))),
+        ):
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        assert self._window_lines(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_no_line_when_the_rationale_has_no_block_at_all(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        binary_question.close_time = self._FUTURE_CLOSE
+
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="Analysis.\n\nProbability: 40%")),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_binary",
+                new=AsyncMock(return_value=_binary_outcome(0.40)),
+            ),
+        ):
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        assert self._window_lines(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_missing_close_time_logs_the_none_sentinel(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Backtests and ablations forecast resolved questions and can carry no close
+        time. ``n/a`` is what the marker parser coerces to None, so a ratio cut skips the
+        record instead of reading a measured zero."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        binary_question.close_time = None
+
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=self._binary_rationale(declared=30))),
+        ):
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        (msg,) = self._window_lines(caplog)
+        assert "declared_days=30" in msg
+        assert "actual_days=n/a" in msg
+
+    @pytest.mark.asyncio
+    async def test_mc_runner_logs_its_own_declaration(
+        self, mc_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        mc_question.close_time = datetime.now(UTC) + timedelta(days=5)
+        ballot = '{"Option A": 0.5, "Option B": 0.3, "Option C": 0.2}'
+        rationale = (
+            "Analysis.\n\n```json\n"
+            f'{{"question_type": "multiple_choice", "option_probs": {ballot}, "remaining_window_days": 60}}\n```'
+        )
+
+        with (
+            patch("metaculus_bot.forecaster_runners.multiple_choice_prompt", return_value="prompt"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=rationale)),
+        ):
+            await run_mc_forecast(mc_question, "research", forecaster_llm, parser_llm)
+
+        (msg,) = self._window_lines(caplog)
+        assert "question=2001" in msg
+        assert "declared_days=60" in msg
+
+    @pytest.mark.asyncio
+    async def test_line_survives_an_extraction_failure(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The declaration is logged before extraction, so it still reports what the
+        model wrote on a question whose forecaster is ultimately dropped."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        binary_question.close_time = self._FUTURE_CLOSE
+        boom = ValueExtractionError("no usable value")
+
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=self._binary_rationale(declared=15))),
+            patch("metaculus_bot.forecaster_runners.extract_binary", new=AsyncMock(side_effect=boom)),
+            pytest.raises(ValueExtractionError),
+        ):
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        (msg,) = self._window_lines(caplog)
+        assert "declared_days=15" in msg
 
 
 class TestForecasterBroadRetry:

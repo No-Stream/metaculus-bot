@@ -891,6 +891,218 @@ class TestNullResultReadingClause:
         assert "name that source in the search query" in lowered
 
 
+class TestOutsideViewRubricRules:
+    """The three 2026-09-01 outside-view rules, all from verified misses in that
+    residual round. qid 43837: six members applied a monthly announcement rate over the
+    FULL question window when 16 days had already elapsed event-free, then OR-ed it with
+    a specific scheduled path the rate already contained. qid 44557: four of six wrote a
+    17-25% base rate and published 35-55% on soft schedule signals. qid 44561: all six
+    built a "no failure announced yet, so Poisson(1.0)" schedule model instead of the
+    pooled FDIC failure rate. Each rule is a named module constant, so there is exactly
+    one place to read the wording."""
+
+    @staticmethod
+    def _flat(prompt: str) -> str:
+        # Collapse whitespace: the constants are pre-indented for clean_indents, so
+        # assertions must not depend on where the lines wrap.
+        return " ".join(prompt.lower().split())
+
+    def _binary(self) -> str:
+        return binary_prompt(_binary_q(), research="r")
+
+    def _mc(self) -> str:
+        return multiple_choice_prompt(_mc_q(), research="r")
+
+    def _numeric(self) -> str:
+        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+
+    # -- remaining exposure + disjointness (binary, MC) --------------------
+
+    def _assert_remaining_exposure(self, prompt: str) -> None:
+        flat = self._flat(prompt)
+        assert "outside-view rates apply to the exposure that remains" in flat
+        assert "apply it from now until the question's deadline" in flat
+        assert "already elapsed without the event as observed" in flat
+        # The double-count half: a named path and the rate that contains it.
+        assert "the two must be disjoint" in flat
+        assert "remove that path's own instances from the rate before combining" in flat
+
+    def test_binary_prompt_carries_remaining_exposure_rule(self) -> None:
+        self._assert_remaining_exposure(self._binary())
+
+    def test_multiple_choice_prompt_carries_remaining_exposure_rule(self) -> None:
+        self._assert_remaining_exposure(self._mc())
+
+    def test_binary_union_line_requires_disjoint_paths(self) -> None:
+        """The union instruction itself is what invited the qid 43837 double count, so
+        the disjointness requirement lands where the union is computed, not only in the
+        rule below it."""
+        flat = self._flat(self._binary())
+        assert "1 - product of (1-p_i)" in flat
+        assert "union only over paths that cannot be the same event" in flat
+
+    # -- anchor consistency (binary, MC) -----------------------------------
+
+    def _assert_anchor_consistency(self, prompt: str) -> None:
+        flat = self._flat(prompt)
+        assert "state the outside-view number you computed" in flat
+        assert "more than about 15 percentage points" in flat
+        assert "naming the specific evidence that justifies the gap" in flat
+        # And the reverse failure: drifting off your own number on disposition alone.
+        assert "do not move off your own number on a general feeling" in flat
+
+    def test_binary_prompt_carries_anchor_consistency_rule(self) -> None:
+        self._assert_anchor_consistency(self._binary())
+
+    def test_multiple_choice_prompt_carries_anchor_consistency_rule(self) -> None:
+        self._assert_anchor_consistency(self._mc())
+
+    # -- count-in-period reference class (all three types) -----------------
+
+    def _assert_count_in_period(self, prompt: str) -> None:
+        flat = self._flat(prompt)
+        assert "how many events of a kind occur in a period" in flat
+        assert "pooled realized rate of that event over the longest comparable history" in flat
+        # A known-candidate schedule updates the rate rather than replacing it.
+        assert "it does not replace it" in flat
+
+    def test_binary_prompt_carries_count_in_period_class(self) -> None:
+        self._assert_count_in_period(self._binary())
+
+    def test_multiple_choice_prompt_carries_count_in_period_class(self) -> None:
+        self._assert_count_in_period(self._mc())
+
+    def test_numeric_prompt_carries_count_in_period_class(self) -> None:
+        """Count questions arrive as all three question types, so this one rule ships to
+        the numeric prompt too — unlike the other two, which are probability-shaped."""
+        self._assert_count_in_period(self._numeric())
+
+    # -- placement + scope -------------------------------------------------
+
+    def test_rules_sit_in_the_outside_view_phase(self) -> None:
+        """All three are outside-view rules: they must land inside PHASE 1, before the
+        inside-view update, so the model reads them while computing the number."""
+        prompt = self._binary()
+        phase1_at = prompt.index("PHASE 1: OUTSIDE VIEW")
+        phase2_at = prompt.index("PHASE 2: INSIDE VIEW UPDATE")
+        for phrase in (
+            "For questions asking how many events",
+            "Outside-view rates apply to the exposure that REMAINS",
+            "State the outside-view number you computed",
+        ):
+            assert phase1_at < prompt.index(phrase) < phase2_at, f"{phrase!r} outside PHASE 1"
+
+    def test_stacking_prompts_do_not_carry_the_rules(self) -> None:
+        """Same scope guard as the null-result clause: base prompts only, since stacking
+        is prod-disabled."""
+        stacked = [
+            stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
+            stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"]),
+            stacking_numeric_prompt(
+                _numeric_q(),
+                research="r",
+                base_predictions=["a1", "a2"],
+                lower_bound_message="lbm",
+                upper_bound_message="ubm",
+            ),
+        ]
+        for prompt in stacked:
+            assert "Outside-view rates apply to the exposure that REMAINS" not in prompt
+            assert "State the outside-view number you computed" not in prompt
+            assert "For questions asking how many events of a kind occur in a period" not in prompt
+
+    def test_numeric_prompt_does_not_carry_the_probability_shaped_rules(self) -> None:
+        """Scope: the exposure and anchor rules are worded in probabilities, while the
+        numeric prompt anchors on a range. Only the reference-class rule ships there."""
+        numeric = self._numeric()
+        assert "Outside-view rates apply to the exposure that REMAINS" not in numeric
+        assert "State the outside-view number you computed" not in numeric
+
+
+class TestLastRealApplicationGap:
+    """qid 45215: the question turned on how an electoral threshold cashed out at the
+    last real election, a training-data fact no research bundle held and no gap asked
+    for. Analyzer-only — it directs a search slot, which a forecaster prompt cannot."""
+
+    def _analyzer(self) -> str:
+        return gap_fill_analyzer_prompt(
+            "Will party X clear the electoral threshold?",
+            "Resolves YES if the commission seats party X.",
+            "Threshold is 5% nationally.",
+            "First pass: polling summary only.",
+            is_benchmarking=False,
+        )
+
+    def test_analyzer_requires_a_last_real_application_gap(self) -> None:
+        flat = " ".join(self._analyzer().lower().split())
+        assert "last real application of the rule" in flat
+        assert "discontinuous institutional rule applied by a body" in flat
+        assert "at its most recent real application" in flat
+        assert "as a realized count or outcome" in flat
+
+    def test_analyzer_separates_the_institution_rule_from_the_question_threshold(self) -> None:
+        """The gap is about how the BODY applies its own rule, not a restatement of the
+        question's resolution threshold, which the analyzer already has in front of it."""
+        flat = " ".join(self._analyzer().lower().split())
+        assert "not about the question's own resolution threshold" in flat
+
+    def test_rule_does_not_override_the_do_not_invent_gaps_discipline(self) -> None:
+        flat = " ".join(self._analyzer().lower().split())
+        assert "do not invent gaps" in flat
+        assert "only when such a rule is actually in play" in flat
+
+    def test_rule_sits_with_the_answerable_now_block(self) -> None:
+        prompt = self._analyzer()
+        assert prompt.index("ANSWERABLE NOW") < prompt.index("LAST REAL APPLICATION OF THE RULE")
+
+    def test_forecaster_prompts_do_not_carry_the_gap_rule(self) -> None:
+        """Scope guard: this one is an instruction to the gap AUDITOR."""
+        for prompt in (
+            binary_prompt(_binary_q(), research="r"),
+            multiple_choice_prompt(_mc_q(), research="r"),
+            numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"),
+        ):
+            assert "LAST REAL APPLICATION OF THE RULE" not in prompt
+
+
+class TestRemainingWindowDaysField:
+    """The optional telemetry slot behind the WINDOW_DECLARED marker: the forecaster's
+    own count of the days it priced. Asked for in the binary and MC schema blocks only,
+    and asked for as OPTIONAL — an omitted field is the honest answer when no rate was
+    applied over a window, and the numeric schema does not declare the key at all."""
+
+    def test_binary_schema_block_asks_for_the_field_as_optional(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        structured = prompt[prompt.find("STRUCTURED FORECAST") :]
+        assert '"remaining_window_days"' in structured
+        assert "OPTIONAL, telemetry only" in structured
+        assert "days from now to the question's deadline" in structured
+
+    def test_mc_schema_block_asks_for_the_field_as_optional(self) -> None:
+        prompt = multiple_choice_prompt(_mc_q(), research="r")
+        structured = prompt[prompt.find("STRUCTURED FORECAST") :]
+        assert '"remaining_window_days"' in structured
+        assert "OPTIONAL, telemetry only" in structured
+
+    def test_numeric_schema_block_does_not_ask_for_it(self) -> None:
+        """Scope: the field is declared on the binary and MC schemas only, so asking a
+        numeric forecaster for it would put an extra="forbid" key in its block."""
+        prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        assert "remaining_window_days" not in prompt
+
+    @pytest.mark.parametrize("options", [["Red", "Blue"], ['He said "yes"', r"C:\Windows"]])
+    def test_mc_example_block_stays_valid_json(self, options: list[str]) -> None:
+        """The MC example is the forecaster's authoritative template, so the added key
+        must not break it for option names carrying quotes or backslashes."""
+        q = _mc_q()
+        q.options = options
+        prompt = multiple_choice_prompt(q, research="r")
+        body = re.findall(r"```json\s*\n(.*?)\n\s*```", prompt, re.DOTALL)[-1]
+        parsed = json.loads(body)
+        assert parsed["remaining_window_days"] == 45
+        assert list(parsed["option_probs"].keys()) == options
+
+
 class TestStatusQuoDerivation:
     """Every forecaster prompt must open PHASE 0 with a mandatory status-quo
     DERIVATION — a question the model answers itself before reviewing any

@@ -895,6 +895,23 @@ the telemetry markers:
   — one line per forecast value extraction. Watch for `rung=llm` (LLM salvage
   fired) and `block_present=false` (a forecaster stopped emitting a well-formed
   structured block). Emitted by `_log_extraction` in `value_extraction.py`.
+- `WINDOW_DECLARED: question=... model=... declared_days=... actual_days=...` —
+  one line per BINARY or MULTIPLE_CHOICE ensemble member that filled the optional
+  `remaining_window_days` field of its structured block: the number of days from
+  now to the deadline it says it applied its base rate over, beside the real
+  now-to-`close_time` gap at forecast time. The cut is the ratio, not either
+  number alone: a member pricing the FULL question window on a question that is
+  most of the way through it reads `declared_days` near the whole window while
+  `actual_days` is a fraction of it, which is the q43837 miss the prompts'
+  `_REMAINING_EXPOSURE_RULE` addresses. The field is optional, so a member that
+  declares nothing leaves NO line — read an absent record as "did not declare",
+  never as "priced the window correctly". `actual_days=n/a` means the question
+  carried no close time (every backtest and ablation), and the marker parser
+  coerces that to None rather than to zero. Emitted by `_log_window_declared` in
+  `forecaster_runners.py` before extraction runs, so a member that is later
+  dropped still reports what it wrote. Pure measurement: nothing reads the field
+  to clamp or adjust a forecast, and it is deliberately not in the comment
+  trailer.
 - `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... ...` — a
   forecaster put enough mass on the terminal displayed bin of an open-bound
   numeric question, without declaring any percentile beyond the edge, to trip
