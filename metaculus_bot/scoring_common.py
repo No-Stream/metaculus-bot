@@ -11,8 +11,18 @@ PROB_CLAMP_MIN: float = PROB_CLAMP_EPS
 PROB_CLAMP_MAX: float = 1.0 - PROB_CLAMP_EPS
 BOUNDARY_BASELINE: float = 0.05
 
+# Metaculus halves the peer and baseline score of a CONTINUOUS question. Its own
+# ``QUESTION_CONTINUOUS_TYPES`` is ``[numeric, date, discrete]`` (``questions/models.py``);
+# binary and multiple_choice are the un-halved family.
+CONTINUOUS_QUESTION_TYPES: frozenset[str] = frozenset({"numeric", "discrete", "date"})
+DISCRETE_QUESTION_TYPES: frozenset[str] = frozenset({"binary", "multiple_choice"})
+CONTINUOUS_PEER_DIVISOR: float = 2.0
+
 __all__ = [
     "BOUNDARY_BASELINE",
+    "CONTINUOUS_PEER_DIVISOR",
+    "CONTINUOUS_QUESTION_TYPES",
+    "DISCRETE_QUESTION_TYPES",
     "PROB_CLAMP_MAX",
     "PROB_CLAMP_MIN",
     "binary_log_score",
@@ -21,6 +31,7 @@ __all__ = [
     "mc_log_score",
     "numeric_log_score",
     "resolution_to_bucket_index",
+    "spot_peer_delta",
 ]
 
 
@@ -135,3 +146,45 @@ def mc_log_score(predicted_probs: list[float], correct_option_index: int) -> flo
 
     p_correct = clamp_prob(predicted_probs[correct_option_index])
     return 100.0 * (math.log2(p_correct) / math.log2(k) + 1.0)
+
+
+def spot_peer_delta(*, old_prob: float, new_prob: float, question_type: str) -> float:
+    """Spot-peer points gained by moving OUR mass on the resolving outcome old -> new.
+
+    Metaculus's spot peer score is ``100 * (N/(N-1)) * ln(p/gmp)``, halved when the
+    question is one of :data:`CONTINUOUS_QUESTION_TYPES` (``scoring/score_math.py``
+    ``evaluate_forecasts_peer_spot_forecast``, read from source 2026-09-02). Because the
+    crowd's geometric mean includes us, that ``N/(N-1)`` factor is exactly what turns the
+    expression into ``100 * (ln p_us - mean_others ln p_i)``, so a counterfactual that
+    changes only OUR forecast moves the score by ``100 * ln(new/old)`` — halved for a
+    continuous question — with no crowd term left in it.
+
+    This function exists because that halving is the easiest thing in the codebase to
+    apply twice. :func:`numeric_log_score` ALREADY carries it (it returns ``50 * ln(...)``,
+    which is the platform's ``100 * ln(...) / 2``), so a difference of two
+    ``numeric_log_score`` values is already on the spot-peer scale and must NOT be doubled
+    to "convert" it. A 2026-08-31 round script doubled exactly that difference and priced
+    a q45065 near-miss counterfactual at up to +404 peer points when the true figure was
+    +202 (receipt: ``scratch/residual_2026-09-01/DOSSIER_SYNTHESIS.md`` section 7.2).
+
+    The mirror-image trap sits on the other two types: :func:`binary_log_score` and
+    :func:`mc_log_score` are log-base-K baseline scores, so their differences are in
+    ``log_K`` units and need multiplying by ``ln(K)`` (``ln 2`` for binary) to reach
+    peer points. ``tests/test_peer_delta_convention.py`` pins both directions.
+
+    Raises ``ValueError`` on a non-positive probability (a zero mass on the resolving
+    outcome is a caller-side pmf extraction bug, not a -inf score) or an unrecognized
+    question type (silently taking the un-halved branch is the bug this guards).
+    """
+    if question_type in CONTINUOUS_QUESTION_TYPES:
+        divisor = CONTINUOUS_PEER_DIVISOR
+    elif question_type in DISCRETE_QUESTION_TYPES:
+        divisor = 1.0
+    else:
+        raise ValueError(
+            f"unrecognized {question_type=}; expected one of "
+            f"{sorted(CONTINUOUS_QUESTION_TYPES | DISCRETE_QUESTION_TYPES)}"
+        )
+    if old_prob <= 0.0 or new_prob <= 0.0:
+        raise ValueError(f"spot peer delta needs positive probabilities, got {old_prob=} {new_prob=}")
+    return 100.0 * math.log(new_prob / old_prob) / divisor

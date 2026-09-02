@@ -276,8 +276,13 @@ class TestQ45065NearestFirstPacking:
     Under slack-proportional redistribution opus's clipped 0.518 spread near-uniformly over
     ~198 bins, so the published ensemble asserted a 47% chance of 35+ deaths against the
     forecasters' own ~2%. The realized score barely noticed (the answer landed in the
-    declared bin) but a one-bin miss priced at +100 to +400 peer points, which is what these
-    pins protect.
+    declared bin) but a one-bin miss priced at +50 to +200 spot-peer points, which is what
+    these pins protect.
+
+    Those figures were +100 to +400 until 2026-09-02. The replay script they came from
+    doubled every continuous peer delta, and Metaculus HALVES a continuous peer score --
+    receipt in ``scratch/residual_2026-09-01/DOSSIER_SYNTHESIS.md`` section 7.2, convention
+    pinned in ``tests/test_peer_delta_convention.py``.
     """
 
     _MODEL: ClassVar[str] = "openrouter/anthropic/claude-opus-4.8"
