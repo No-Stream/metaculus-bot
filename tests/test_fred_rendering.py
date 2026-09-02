@@ -22,11 +22,10 @@ from metaculus_bot.research.fred_rendering import (
     UnknownFredSeries,
     _fetch_fred_data,
     _fetch_fred_data_ceiling,
-    _format_fred_change,
-    _format_fred_value,
     _render_fred_series,
     is_unknown_fred_series_error,
 )
+from metaculus_bot.research.number_format import format_decimal_change, format_decimal_value
 from scripts.telemetry.markers import MARKER_SPECS
 from tests.financial_fakes import _BENCH_OPEN_TIME, _make_q, _monthly_fred
 
@@ -284,15 +283,15 @@ class TestFredValuePrecision:
         """Unit-level, because the interesting inputs (float noise, a magnitude that rounds
         away, a true zero) do not arise from real FRED decimals. A negative sign on a
         magnitude that rounds to zero would not be information."""
-        assert _format_fred_value(331.893) == "331.893"
-        assert _format_fred_value(6_699_580.0) == "6699580"
-        assert _format_fred_value(4.2) == "4.2"
-        assert _format_fred_value(0.0) == "0"
-        assert _format_fred_value(331.893 - 331.020) == "0.873"
-        assert _format_fred_change(-0.749) == "-0.749"
-        assert _format_fred_change(0.0) == "+0"
-        assert _format_fred_change(-0.0) == "+0"
-        assert _format_fred_change(-1e-9) == "+0"
+        assert format_decimal_value(331.893) == "331.893"
+        assert format_decimal_value(6_699_580.0) == "6699580"
+        assert format_decimal_value(4.2) == "4.2"
+        assert format_decimal_value(0.0) == "0"
+        assert format_decimal_value(331.893 - 331.020) == "0.873"
+        assert format_decimal_change(-0.749) == "-0.749"
+        assert format_decimal_change(0.0) == "+0"
+        assert format_decimal_change(-0.0) == "+0"
+        assert format_decimal_change(-1e-9) == "+0"
 
 
 class TestFredFirstReleaseTable:

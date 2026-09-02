@@ -1409,6 +1409,21 @@ class TestInlineChartData:
         assert "Named: Jan=4, Feb=5" in out
         assert "Paired: Q1=10, Q2=11.5" in out
 
+    def test_a_value_too_small_to_display_renders_zero_not_minus_zero(self):
+        """A tiny negative delta is a rounding artifact, not a fall. The shared
+        ``number_format`` rule strips the sign off a magnitude that rounds away; this
+        module's own float branch used to render it as "-0"."""
+        html_text = (
+            '<div data-chart="'
+            + _escape_config({"series": [{"name": "Delta", "data": [["Jan", -1e-7], ["Feb", 1e-9]]}]})
+            + '"></div>'
+        )
+
+        out = render_inline_chart_data(html_text)
+
+        assert "Delta: Jan=0, Feb=0" in out
+        assert "-0" not in out
+
     def test_a_declared_datetime_axis_renders_dates_not_epoch_millis(self):
         # Highcharts defines a datetime axis in ms since the epoch, UTC. Without the
         # conversion a tracker's own daily series renders `1756771200000=42`, which is

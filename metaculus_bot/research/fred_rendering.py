@@ -25,6 +25,7 @@ import pandas as pd
 from fredapi import Fred
 
 from metaculus_bot.constants import FINANCIAL_FRED_VINTAGE_PRINTS
+from metaculus_bot.research.number_format import format_decimal_change, format_decimal_value
 from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -80,37 +81,6 @@ def _pct_clause(change: float, base: float) -> str:
     return f" ({(change / abs(base_value)) * 100:+.2f}%)"
 
 
-# Decimals kept on a rendered FRED level or change. Six covers everything FRED publishes
-# (index levels at three, most rates at two, a few series at four) and trailing zeros are
-# stripped, so a rate still renders "4.2". Replaces `:.4g`, which rounded a Case-Shiller
-# level of 331.893 to "331.9" on q44944 — a question whose displayed range was four index
-# points wide with 0.02-point buckets, so the digits `:.4g` threw away were the whole
-# forecast. `:.4g` also flipped to scientific notation on large series (WALCL's ~6.7e6
-# rendered as "6.7e+06"), which this format never does.
-_FRED_VALUE_DECIMALS = 6
-
-
-def _format_fred_value(value: float) -> str:
-    """A FRED level at its published precision: fixed-point, no scientific notation.
-
-    Also cleans up float subtraction artifacts for free — a change computed as
-    331.893 - 331.02 = 0.8729999999999905 renders "0.873".
-    """
-    text = f"{float(value):.{_FRED_VALUE_DECIMALS}f}".rstrip("0").rstrip(".")
-    return text if text not in {"", "-", "-0"} else "0"
-
-
-def _format_fred_change(change: float) -> str:
-    """A signed change at the same precision (``:+`` cannot drive a custom formatter).
-
-    A change that rounds to zero at this precision renders "+0", never "-0": the sign of a
-    quantity too small to display is not information.
-    """
-    magnitude = _format_fred_value(abs(float(change)))
-    sign = "-" if float(change) < 0 and magnitude != "0" else "+"
-    return f"{sign}{magnitude}"
-
-
 def _first_release_lines(data: pd.Series, first_releases: pd.Series) -> list[str]:
     """The first-release-versus-current-vintage table for the most recent prints.
 
@@ -133,9 +103,9 @@ def _first_release_lines(data: pd.Series, first_releases: pd.Series) -> list[str
     first_values = recent["first"].to_numpy(dtype="float64")
     revisions = current_values - first_values
     rows = [
-        f"  - {obs_date}: first release {_format_fred_value(first)} → current vintage "
-        f"{_format_fred_value(current)} "
-        + ("(unrevised)" if _format_fred_change(revision) == "+0" else f"(revised {_format_fred_change(revision)})")
+        f"  - {obs_date}: first release {format_decimal_value(first)} → current vintage "
+        f"{format_decimal_value(current)} "
+        + ("(unrevised)" if format_decimal_change(revision) == "+0" else f"(revised {format_decimal_change(revision)})")
         for obs_date, first, current, revision in zip(dates, first_values, current_values, revisions, strict=True)
     ]
     revised_up = int((revisions > 0).sum())
@@ -143,7 +113,7 @@ def _first_release_lines(data: pd.Series, first_releases: pd.Series) -> list[str
     unchanged = len(revisions) - revised_up - revised_down
     direction = (
         f"  - Of these {len(revisions)} prints, {revised_up} were revised up, {revised_down} down and "
-        f"{unchanged} not at all; mean revision {_format_fred_change(float(revisions.mean()))}."
+        f"{unchanged} not at all; mean revision {format_decimal_change(float(revisions.mean()))}."
     )
     return [
         "- First release vs current vintage (this series revises: a question resolving on the published print "
@@ -170,11 +140,11 @@ def _render_fred_series(series_id: str, data: pd.Series, title: str, *, first_re
 
     latest_value = data.iloc[-1]
     latest_date = data.index[-1]
-    parts.append(f"- Latest value: {_format_fred_value(latest_value)} ({latest_date.strftime('%Y-%m-%d')})")
+    parts.append(f"- Latest value: {format_decimal_value(latest_value)} ({latest_date.strftime('%Y-%m-%d')})")
 
     if len(data) >= 2:
         previous_value = data.iloc[-2]
-        parts.append(f"- Previous value: {_format_fred_value(previous_value)}")
+        parts.append(f"- Previous value: {format_decimal_value(previous_value)}")
 
     # Change from the previous OBSERVATION — a row step, whatever the series'
     # cadence (monthly CPI, quarterly GDP, weekly claims) — which is exactly what
@@ -182,7 +152,7 @@ def _render_fred_series(series_id: str, data: pd.Series, title: str, *, first_re
     if len(data) >= 2:
         mom_change = latest_value - data.iloc[-2]
         parts.append(
-            f"- Change from previous: {_format_fred_change(mom_change)}{_pct_clause(mom_change, data.iloc[-2])}"
+            f"- Change from previous: {format_decimal_change(mom_change)}{_pct_clause(mom_change, data.iloc[-2])}"
         )
 
     # Year-over-year change via a DATE-based lookup, not a fixed observation
@@ -197,12 +167,14 @@ def _render_fred_series(series_id: str, data: pd.Series, title: str, *, first_re
     if not prior.empty:
         yoy_value = prior.iloc[-1]
         yoy_change = latest_value - yoy_value
-        parts.append(f"- Year-over-year change: {_format_fred_change(yoy_change)}{_pct_clause(yoy_change, yoy_value)}")
+        parts.append(
+            f"- Year-over-year change: {format_decimal_change(yoy_change)}{_pct_clause(yoy_change, yoy_value)}"
+        )
 
     # Last 6 observations
     last_6 = data.tail(6)
     obs_lines = [
-        f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {_format_fred_value(val)}"
+        f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {format_decimal_value(val)}"
         for date, val in last_6.items()
     ]
     parts.append("- Recent observations:\n" + "\n".join(obs_lines))

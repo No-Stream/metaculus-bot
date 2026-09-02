@@ -64,6 +64,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_CHART_MAX_POINTS,
     RESOLUTION_SOURCE_CHART_MAX_SERIES,
 )
+from metaculus_bot.research.number_format import format_decimal_value
 
 logger = logging.getLogger(__name__)
 
@@ -159,11 +160,13 @@ def _candidate_configs(html_text: str) -> list[str]:
 def _format_number(value: Any) -> str | None:
     """``value`` as a plain decimal string, or None when it is not a number.
 
-    Fixed-point, never scientific notation, trailing zeros stripped — the same
-    rule the FRED renderer follows, and for the same reason: a resolution source
-    graded on an index level reads ``331.893``, not ``331.9`` or ``3.31893e+02``.
-    ``bool`` is excluded explicitly because it is an ``int`` subclass and a
-    ``True`` in a data array is a flag, not an observation.
+    Floats go through ``number_format.format_decimal_value``, the same rule the FRED
+    block renders by and for the same reason: a resolution source graded on an index
+    level reads ``331.893``, not ``331.9`` or ``3.31893e+02``. That shared home is also
+    where the "-0" guard lives, so a delta of ``-1e-7`` renders "0" rather than putting a
+    minus sign on a quantity too small to display. ``bool`` is excluded explicitly
+    because it is an ``int`` subclass and a ``True`` in a data array is a flag, not an
+    observation.
     """
     if isinstance(value, bool):
         return None
@@ -172,9 +175,7 @@ def _format_number(value: Any) -> str | None:
     if isinstance(value, float):
         if value != value or value in (float("inf"), float("-inf")):  # NaN / infinity
             return None
-        if value == int(value):
-            return str(int(value))
-        return f"{value:.6f}".rstrip("0").rstrip(".")
+        return format_decimal_value(value)
     if isinstance(value, str):
         # Some configs quote their numbers. Accept only a clean numeric literal;
         # anything else is a label that landed in the value slot.
