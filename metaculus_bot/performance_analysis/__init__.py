@@ -81,6 +81,12 @@ from metaculus_bot.performance_analysis.ranking_cohort import (
     log_ranking_cohort,
     per_model_ranking_cohort,
 )
+from metaculus_bot.performance_analysis.rescore_diff import (
+    FieldChange,
+    RescoreDiff,
+    diff_platform_rescores,
+    render_rescore_summary,
+)
 from metaculus_bot.performance_analysis.research_tags import (
     attach_research_tags,
     research_tags_for_qid,
@@ -91,6 +97,7 @@ from metaculus_bot.performance_analysis.scoring import (
     brier_score,
     mc_log_score,
     numeric_log_score,
+    spot_peer_delta,
 )
 from metaculus_bot.performance_analysis.stacker_detection import (
     DetectorVerdict,
@@ -111,9 +118,11 @@ __all__ = [
     "PEER_FIELD",
     "SPOT_PEER_FIELD",
     "DetectorVerdict",
+    "FieldChange",
     "PerModelRankingCohort",
     "PitReading",
     "RankingScore",
+    "RescoreDiff",
     "annotate_forecaster_bullets_with_models",
     "anonymous_model_key",
     "attach_research_tags",
@@ -126,6 +135,7 @@ __all__ = [
     "declared_percentile_pit",
     "detect_historical_stacker_signature",
     "detect_stacker_fired",
+    "diff_platform_rescores",
     "disagreement_predicts_error",
     "emit_combined_report",
     "emit_external_comment_stub",
@@ -172,12 +182,14 @@ __all__ = [
     "rank_our_models_by_accuracy",
     "ranking_caveats",
     "ranking_score",
+    "render_rescore_summary",
     "rescore_records",
     "research_tags_for_qid",
     "research_tags_for_record",
     "save_dataset",
     "select_cohort",
     "select_worst_misses",
+    "spot_peer_delta",
     "spot_peer_score",
     "stacking_effectiveness",
 ]

@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_stacked_marker,
     parse_stacker_skip_reason_marker,
 )
+from metaculus_bot.performance_analysis.rescore_diff import diff_platform_rescores
 from metaculus_bot.performance_analysis.research_tags import DEFAULT_RESEARCH_ARCHIVE_LATEST, attach_research_tags
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score, mc_log_score, numeric_log_score
@@ -472,6 +473,13 @@ def _process_single_question(
             "open_time": q.get("open_time"),
             "actual_resolve_time": q.get("actual_resolve_time"),
             "scheduled_resolve_time": q.get("scheduled_resolve_time"),
+            # Stored so a re-resolution has SOMETHING timestamp-shaped on the record, but
+            # never as the detector: Metaculus edited q44798 from 80 to 82 with this field
+            # left at 2026-08-31T21:38:45Z, a stamp that PRECEDES the pull which still read
+            # 80. Diff the resolution VALUE instead (performance_analysis/rescore_diff.py);
+            # this field is only useful once you already know an edit happened, for bounding
+            # when the original resolution was set.
+            "resolution_set_time": q.get("resolution_set_time"),
             "category": category,
         },
         "brier_score": None,
@@ -579,6 +587,8 @@ def build_performance_dataset(
     token: str | None = None,
     author_id: int = DEFAULT_BOT_USER_ID,
     research_archive_dir: str | Path = DEFAULT_RESEARCH_ARCHIVE_LATEST,
+    *,
+    prior_records: Sequence[dict] | None = None,
 ) -> list[dict]:
     """Fetch questions + comments, match them, parse per-model predictions, compute scores.
 
@@ -593,6 +603,13 @@ def build_performance_dataset(
     ``gfv2_loop_ran`` is additionally None on any record whose writer could not have
     carried the v2 payload, so the untreated arm of a v2 cut holds only measured
     Falses (see :mod:`metaculus_bot.performance_analysis.research_tags`).
+
+    Pass ``prior_records`` (a previous round's dataset) to diff this pull against it and tag
+    every question Metaculus re-resolved or re-scored in place — the q44798 failure mode,
+    where a resolution changed from 80 to 82 with no timestamp moving and a prior round's
+    tables went stale silently. See
+    :mod:`metaculus_bot.performance_analysis.rescore_diff`; with no prior supplied the tag
+    fields are None, meaning "not compared" rather than "unchanged".
     """
     if token is None:
         token = os.environ["METACULUS_TOKEN"]
@@ -612,6 +629,9 @@ def build_performance_dataset(
         records.extend(post_records)
 
     attach_research_tags(records, research_archive_dir)
+    if prior_records is not None:
+        diff = diff_platform_rescores(prior_records, records)
+        logger.info(f"Diffed against prior dataset: {diff.rescored} record(s) re-resolved or re-scored")
 
     logger.info(f"Collected {len(records)} question records")
     return records
