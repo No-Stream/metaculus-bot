@@ -13,18 +13,21 @@ BOUNDARY_BASELINE: float = 0.05
 
 # Metaculus halves the peer and baseline score of a CONTINUOUS question. Its own
 # ``QUESTION_CONTINUOUS_TYPES`` is ``[numeric, date, discrete]`` (``questions/models.py``);
-# binary and multiple_choice are the un-halved family.
+# binary and multiple_choice are the un-halved family. The second name says UNHALVED rather
+# than DISCRETE because "discrete" is one of the platform's CONTINUOUS types: a
+# ``DISCRETE_QUESTION_TYPES`` holding binary and multiple_choice inverts the platform's own
+# vocabulary inside the module that exists to stop the halving being misapplied.
 CONTINUOUS_QUESTION_TYPES: frozenset[str] = frozenset({"numeric", "discrete", "date"})
-DISCRETE_QUESTION_TYPES: frozenset[str] = frozenset({"binary", "multiple_choice"})
+UNHALVED_QUESTION_TYPES: frozenset[str] = frozenset({"binary", "multiple_choice"})
 CONTINUOUS_PEER_DIVISOR: float = 2.0
 
 __all__ = [
     "BOUNDARY_BASELINE",
     "CONTINUOUS_PEER_DIVISOR",
     "CONTINUOUS_QUESTION_TYPES",
-    "DISCRETE_QUESTION_TYPES",
     "PROB_CLAMP_MAX",
     "PROB_CLAMP_MIN",
+    "UNHALVED_QUESTION_TYPES",
     "binary_log_score",
     "brier_score",
     "clamp_prob",
@@ -178,12 +181,12 @@ def spot_peer_delta(*, old_prob: float, new_prob: float, question_type: str) -> 
     """
     if question_type in CONTINUOUS_QUESTION_TYPES:
         divisor = CONTINUOUS_PEER_DIVISOR
-    elif question_type in DISCRETE_QUESTION_TYPES:
+    elif question_type in UNHALVED_QUESTION_TYPES:
         divisor = 1.0
     else:
         raise ValueError(
             f"unrecognized {question_type=}; expected one of "
-            f"{sorted(CONTINUOUS_QUESTION_TYPES | DISCRETE_QUESTION_TYPES)}"
+            f"{sorted(CONTINUOUS_QUESTION_TYPES | UNHALVED_QUESTION_TYPES)}"
         )
     if old_prob <= 0.0 or new_prob <= 0.0:
         raise ValueError(f"spot peer delta needs positive probabilities, got {old_prob=} {new_prob=}")

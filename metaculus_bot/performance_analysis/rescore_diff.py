@@ -264,6 +264,12 @@ def render_rescore_summary(records: Sequence[dict]) -> list[str]:
     :func:`diff_platform_rescores` directly) gets its summary without a second pass and
     without a second set of WARN lines. Every old value printed comes off the record's own
     ``prior_resolution`` / ``prior_metaculus_scores``.
+
+    Carries the module's three-state tag through to the printed text: a zero ``compared``
+    count says nothing moved BECAUSE nothing was compared, which is a different fact from a
+    clean diff and must not print the reassurance. The reachable trigger is a ``--prior``
+    pointed at another round or another tournament, whose records share no
+    (question_id, post_id) with this pull at all.
     """
     compared = sum(1 for record in records if record.get("platform_rescored") is not None)
     rescored = [record for record in records if record.get("platform_rescored") is True]
@@ -271,6 +277,14 @@ def render_rescore_summary(records: Sequence[dict]) -> list[str]:
         f"Platform re-resolution diff: {compared} of {len(records)} record(s) matched a prior pull, "
         f"{len(rescored)} re-scored or re-resolved."
     ]
+    if compared == 0:
+        # Cause-agnostic: a dataset that never went through the diff and a prior pull with no
+        # overlapping key produce the identical tags, so the text claims neither.
+        lines.append(
+            "  Nothing was compared: no record carries a prior-pull match, so this says nothing "
+            "about whether prior-round tables are current."
+        )
+        return lines
     if not rescored:
         lines.append("  No resolution or platform score moved. Prior-round tables remain current.")
         return lines

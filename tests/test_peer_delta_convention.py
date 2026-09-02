@@ -10,10 +10,14 @@ form. Both errors are silent — they produce a plausible number with the wrong 
   halving (it returns ``50 * ln(...)``), so the difference was already in spot-peer points
   and the doubling made every figure in the column 2x too large. It priced a one-bin-miss
   counterfactual at +404 when the truth is +202.
-* **Binary / multiple choice, under-scaled.** ``binary_log_score`` and ``mc_log_score`` are
-  log-base-K BASELINE scores, so their differences are in ``log_K`` units. Reaching peer
-  points takes a ``ln(K)`` factor (``ln 2`` for binary). Thirteen dossier scripts in the
-  2026-09-01 round used a log2 form for a binary peer delta.
+* **Binary / multiple choice, mis-scaled by ln(K).** ``binary_log_score`` and
+  ``mc_log_score`` are log-base-K BASELINE scores, so their differences are in ``log_K``
+  units and reaching peer points takes a ``ln(K)`` factor. Which way an uncorrected figure
+  errs depends on K, so this bullet carries no direction: the quoted-over-true ratio is
+  ``1/ln(K)``, which is 1.44 at K=2 (binary OVER-states, correct it by multiplying by
+  ``ln 2`` ≈ 0.693) but 0.91 at K=3 and 0.40 at K=12 (multiple choice with three or more
+  options UNDER-states). Thirteen dossier scripts in the 2026-09-01 round used a log2 form
+  for a binary peer delta, so every one of those figures is 1.44x too large.
 
 The platform formulas these assert against were read from Metaculus's own
 ``scoring/score_math.py`` on 2026-09-02 (fetched copy:
@@ -139,8 +143,9 @@ class TestBaselineToPeerConversionOnTheOtherTypes:
         peer_delta = spot_peer_delta(old_prob=old_prob, new_prob=new_prob, question_type="binary")
 
         assert baseline_delta * math.log(2.0) == pytest.approx(peer_delta, rel=1e-12)
-        assert baseline_delta != pytest.approx(peer_delta, rel=1e-3), (
-            "the two scales differ by 1/ln2 ~ 1.44; quoting a log2 delta as peer points under-scales it"
+        assert baseline_delta / peer_delta == pytest.approx(1.0 / math.log(2.0), rel=1e-12), (
+            "the two scales differ by 1/ln2 ~ 1.44; quoting a log2 binary delta as peer points "
+            "OVER-states it, and the correction is multiplying by ln 2 ~ 0.693"
         )
 
     @pytest.mark.parametrize("n_options", [3, 5, 12])
@@ -155,6 +160,10 @@ class TestBaselineToPeerConversionOnTheOtherTypes:
         )
 
         assert baseline_delta * math.log(n_options) == pytest.approx(peer_delta, rel=1e-12)
+        # The error direction flips with K, which is why the module docstring's bullet states
+        # none: at three or more options an uncorrected log_K delta UNDER-states the peer delta
+        # (ratio 1/ln K < 1), the opposite of binary's 1.44x inflation.
+        assert baseline_delta < peer_delta
 
 
 class TestFailFast:
