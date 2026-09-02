@@ -886,9 +886,12 @@ class TestNullResultReadingClause:
         lowered = " ".join(prompt.lower().split())
         assert "read a null search result as a null search result" in lowered
         assert "could not find evidence of x" in lowered
-        # Coverage-conditioned strength, and the demonstrated-capability discount.
+        # Coverage-conditioned strength.
         assert "weight the absence by how well the topic is covered" in lowered
-        assert "already demonstrated the capability" in lowered
+        # The retired third bullet ("weaker still where the actor has already demonstrated the
+        # behavior") carried no receipt of its own and pushed the wrong way on qid 43837, where
+        # Metaculus had announced eleven prior tournaments, none was found, and the answer was NO.
+        assert "already demonstrated the capability" not in lowered
 
     def test_binary_prompt_carries_null_result_clause(self) -> None:
         self._assert_forecaster_clause_present(binary_prompt(_binary_q(), research="r"))
@@ -932,14 +935,29 @@ class TestNullResultReadingClause:
 
 
 class TestOutsideViewRubricRules:
-    """The three 2026-09-01 outside-view rules, all from verified misses in that
-    residual round. qid 43837: six members applied a monthly announcement rate over the
-    FULL question window when 16 days had already elapsed event-free, then OR-ed it with
-    a specific scheduled path the rate already contained. qid 44557: four of six wrote a
-    17-25% base rate and published 35-55% on soft schedule signals. qid 44561: all six
-    built a "no failure announced yet, so Poisson(1.0)" schedule model instead of the
-    pooled FDIC failure rate. Each rule is a named module constant, so there is exactly
-    one place to read the wording."""
+    """The outside-view corrections from the 2026-09-01 residual round, each stated ONCE.
+
+    qid 43837: six members applied a monthly announcement rate over the FULL question
+    window when 16 days had already elapsed event-free, then OR-ed it with a specific
+    scheduled path the rate already contained. The correction survives in two places
+    that were already there: the remaining-exposure sentence rides the binary
+    conditional-hazard bullet (and stands alone as one MC bullet, since MC has no
+    hazard bullet), and the disjointness half lives in the binary union line. The
+    standalone `_REMAINING_EXPOSURE_RULE` that restated both was retired.
+
+    qid 44557: four of six wrote a 17-25% base rate and published 35-55% on soft
+    schedule signals. What survives is the SIZE: the existing "Anchor on your math"
+    bullet now says a move of more than about 15 points needs a named reason. The
+    standalone `_ANCHOR_CONSISTENCY_RULE` was retired — its first bullet was the fourth
+    request to state the anchor, and its second ("do not move off your number on a
+    general feeling that history counsels caution") priced at zero on the whole archive
+    and would suppress good moves.
+
+    qid 44561: all six built a "no failure announced yet, so Poisson(1.0)" schedule
+    model instead of the pooled FDIC failure rate; `_COUNT_IN_PERIOD_REFERENCE_CLASS`
+    stays verbatim in all three prompts.
+
+    Receipts: scratch/prompt_bloat_audit_2026-09-02.md, scratch/prompt_debloat_2026-09-02/receipts.md."""
 
     @staticmethod
     def _flat(prompt: str) -> str:
@@ -956,46 +974,61 @@ class TestOutsideViewRubricRules:
     def _numeric(self) -> str:
         return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
 
-    # -- remaining exposure + disjointness (binary, MC) --------------------
+    # -- remaining exposure (binary, MC): once each --------------------------
 
-    def _assert_remaining_exposure(self, prompt: str) -> None:
+    _EXPOSURE_KEY = "rates apply to the exposure that remains"
+
+    def _assert_remaining_exposure_once(self, prompt: str) -> None:
         flat = self._flat(prompt)
-        assert "outside-view rates apply to the exposure that remains" in flat
-        assert "apply it from now until the question's deadline" in flat
-        assert "already elapsed without the event as observed" in flat
-        # The double-count half: a named path and the rate that contains it.
-        assert "the two must be disjoint" in flat
-        assert "remove that path's own instances from the rate before combining" in flat
+        assert flat.count(self._EXPOSURE_KEY) == 1, "the exposure rule must be stated exactly once"
+        assert "apply it from now until the deadline" in flat
+        assert "treating the elapsed event-free part of the window as observed" in flat
+        # The retired constant's phrasings must not come back beside the surviving statement.
+        assert "outside-view rates apply to the exposure" not in flat
+        assert "the two must be disjoint" not in flat
+        assert "remove that path's own instances from the rate before combining" not in flat
 
-    def test_binary_prompt_carries_remaining_exposure_rule(self) -> None:
-        self._assert_remaining_exposure(self._binary())
+    def test_binary_prompt_states_remaining_exposure_once_inside_the_hazard_bullet(self) -> None:
+        prompt = self._binary()
+        self._assert_remaining_exposure_once(prompt)
+        # Folded INTO the conditional-hazard bullet, which is the same rule for recurring events.
+        flat = self._flat(prompt)
+        bullet_at = flat.index(self._EXPOSURE_KEY)
+        assert "no event in the t days already elapsed" in flat[bullet_at : bullet_at + 900]
+        assert "non-recurring, conditional-hazard skipped" in flat[bullet_at : bullet_at + 900]
 
-    def test_multiple_choice_prompt_carries_remaining_exposure_rule(self) -> None:
-        self._assert_remaining_exposure(self._mc())
+    def test_multiple_choice_prompt_states_remaining_exposure_once(self) -> None:
+        self._assert_remaining_exposure_once(self._mc())
 
     def test_binary_union_line_requires_disjoint_paths(self) -> None:
         """The union instruction itself is what invited the qid 43837 double count, so
-        the disjointness requirement lands where the union is computed, not only in the
-        rule below it."""
+        the disjointness requirement lives where the union is computed — and only there,
+        since MC never computes a union."""
         flat = self._flat(self._binary())
         assert "1 - product of (1-p_i)" in flat
         assert "union only over paths that cannot be the same event" in flat
+        assert "union only over paths" not in self._flat(self._mc())
 
-    # -- anchor consistency (binary, MC) -----------------------------------
+    # -- anchor adherence (binary, MC): one rule, with a size ----------------
 
-    def _assert_anchor_consistency(self, prompt: str) -> None:
+    _ANCHOR_SIZE = "more than about 15 points"
+
+    def _assert_single_anchor_rule_with_size(self, prompt: str) -> None:
         flat = self._flat(prompt)
-        assert "state the outside-view number you computed" in flat
-        assert "more than about 15 percentage points" in flat
-        assert "naming the specific evidence that justifies the gap" in flat
-        # And the reverse failure: drifting off your own number on disposition alone.
-        assert "do not move off your own number on a general feeling" in flat
+        assert "anchor on your math" in flat
+        assert flat.count(self._ANCHOR_SIZE) == 1, "the 15-point size belongs to exactly one bullet"
+        assert "named, specific" in flat
+        # The retired `_ANCHOR_CONSISTENCY_RULE` phrasings.
+        assert "state the outside-view number you computed" not in flat
+        assert "more than about 15 percentage points" not in flat
+        assert "do not move off your own number on a general feeling" not in flat
+        assert "history counsels caution" not in flat
 
-    def test_binary_prompt_carries_anchor_consistency_rule(self) -> None:
-        self._assert_anchor_consistency(self._binary())
+    def test_binary_prompt_has_one_anchor_rule_sized_at_15_points(self) -> None:
+        self._assert_single_anchor_rule_with_size(self._binary())
 
-    def test_multiple_choice_prompt_carries_anchor_consistency_rule(self) -> None:
-        self._assert_anchor_consistency(self._mc())
+    def test_multiple_choice_prompt_has_one_anchor_rule_sized_at_15_points(self) -> None:
+        self._assert_single_anchor_rule_with_size(self._mc())
 
     # -- count-in-period reference class (all three types) -----------------
 
@@ -1014,23 +1047,21 @@ class TestOutsideViewRubricRules:
 
     def test_numeric_prompt_carries_count_in_period_class(self) -> None:
         """Count questions arrive as all three question types, so this one rule ships to
-        the numeric prompt too — unlike the other two, which are probability-shaped."""
+        the numeric prompt too — unlike the exposure rule, which is probability-shaped."""
         self._assert_count_in_period(self._numeric())
 
     # -- placement + scope -------------------------------------------------
 
-    def test_rules_sit_in_the_outside_view_phase(self) -> None:
-        """All three are outside-view rules: they must land inside PHASE 1, before the
-        inside-view update, so the model reads them while computing the number."""
+    def test_outside_view_rules_sit_in_the_outside_view_phase(self) -> None:
+        """Both outside-view rules must land inside PHASE 1, before the inside-view update,
+        so the model reads them while computing the number. The anchor size rides the
+        final-rationale bullet in PHASE 2, where the final number is written."""
         prompt = self._binary()
         phase1_at = prompt.index("PHASE 1: OUTSIDE VIEW")
         phase2_at = prompt.index("PHASE 2: INSIDE VIEW UPDATE")
-        for phrase in (
-            "For questions asking how many events",
-            "Outside-view rates apply to the exposure that REMAINS",
-            "State the outside-view number you computed",
-        ):
+        for phrase in ("For questions asking how many events", "Rates apply to the exposure that REMAINS"):
             assert phase1_at < prompt.index(phrase) < phase2_at, f"{phrase!r} outside PHASE 1"
+        assert prompt.index("Anchor on your math") > phase2_at
 
     def test_stacking_prompts_do_not_carry_the_rules(self) -> None:
         """Same scope guard as the null-result clause: base prompts only, since stacking
@@ -1047,16 +1078,18 @@ class TestOutsideViewRubricRules:
             ),
         ]
         for prompt in stacked:
-            assert "Outside-view rates apply to the exposure that REMAINS" not in prompt
-            assert "State the outside-view number you computed" not in prompt
-            assert "For questions asking how many events of a kind occur in a period" not in prompt
+            flat = self._flat(prompt)
+            assert self._EXPOSURE_KEY not in flat
+            assert self._ANCHOR_SIZE not in flat
+            assert "anchor on your math" not in flat
+            assert "how many events of a kind occur in a period" not in flat
 
     def test_numeric_prompt_does_not_carry_the_probability_shaped_rules(self) -> None:
-        """Scope: the exposure and anchor rules are worded in probabilities, while the
-        numeric prompt anchors on a range. Only the reference-class rule ships there."""
-        numeric = self._numeric()
-        assert "Outside-view rates apply to the exposure that REMAINS" not in numeric
-        assert "State the outside-view number you computed" not in numeric
+        """Scope: the exposure rule and the 15-point size are worded in probabilities, while
+        the numeric prompt anchors on a range. Only the reference-class rule ships there."""
+        flat = self._flat(self._numeric())
+        assert self._EXPOSURE_KEY not in flat
+        assert self._ANCHOR_SIZE not in flat
 
 
 class TestLastRealApplicationGap:

@@ -521,9 +521,12 @@ _SOURCE_PROVENANCE_LADDER = """
 # forecaster prompts. On qid 44799 the gap-fill resolver reported "I found no
 # authoritative public record" and four of six forecasters converted that into
 # "the authorization is absent"; the two that discounted it scored best in the
-# ensemble. Same pre-indent contract as _SOURCE_PROVENANCE_LADDER above: every line
-# is at >= 15 spaces so clean_indents preserves the nesting in all three prompts
-# despite their differing baselines (binary 12, MC/numeric 8).
+# ensemble. A third bullet ("absence is weaker still where the actor has already
+# demonstrated the behavior") was dropped: it carried no receipt of its own and pushed
+# the wrong way on qid 43837 (eleven prior tournaments announced, none found, answer NO).
+# Same pre-indent contract as _SOURCE_PROVENANCE_LADDER above: every line is at >= 15
+# spaces so clean_indents preserves the nesting in all three prompts despite their
+# differing baselines (binary 12, MC/numeric 8).
 _NULL_RESULT_READING = """
                • Read a null search result as a null search result. "No record found", "no authoritative
                  source located", or "could not confirm" licenses only "we could not find evidence of X" —
@@ -533,10 +536,7 @@ _NULL_RESULT_READING = """
                  well-indexed source that this domain reliably reports through (a regulator's filing
                  database, an official statistics release, an official registry) is real evidence, but only
                  weak-to-moderate. Silence from general web search on a poorly-covered, local, or
-                 fast-moving topic is nearly no evidence at all.
-               • Absence is weaker still where the actor has already demonstrated the capability or behavior
-                 in question (same firm, same jurisdiction, same process) — there, a missing public record is
-                 more often a gap in reporting than a missing event."""
+                 fast-moving topic is nearly no evidence at all."""
 
 
 # Which reference class is admissible for a "how many X in period P" question,
@@ -551,32 +551,21 @@ _COUNT_IN_PERIOD_REFERENCE_CLASS = """
                  about the pipeline and updates that rate; it does not replace it."""
 
 
-# Apply the rate to the exposure that is LEFT, and keep a named path disjoint from the
-# rate that already contains it. On qid 43837 six members applied a monthly announcement
-# rate across the FULL question window when 16 days had already elapsed event-free, then
-# OR-ed that rate with a specific scheduled path the rate already covered — the union
-# line in the same rubric invites exactly that double count, so it now states the
-# disjointness requirement too. Binary + MC only (numeric has no union step).
-_REMAINING_EXPOSURE_RULE = """
-               • Outside-view rates apply to the exposure that REMAINS. Estimate the rate over the longest
-                 window the evidence supports, then apply it from now until the question's deadline, treating
-                 the part of the window that has already elapsed without the event as observed.
-               • When you combine a specific known path (a scheduled event, an announced plan) with a base
-                 rate, the two must be DISJOINT: remove that path's own instances from the rate before
-                 combining, and keep the path's probability as its own term."""
-
-
-# Say the number, then stay near it unless specific evidence moves you. On qid 44557
-# four of six members wrote a 17-25% base rate and published 35-55% on soft schedule
-# signals, naming no evidence for the gap. The prompts' existing "Anchor on your math"
-# bullet fires only in the final-rationale step; this one lands where the number is
-# computed and puts a size on "close to it".
-_ANCHOR_CONSISTENCY_RULE = """
-               • State the outside-view number you computed. If your final probability for that outcome
-                 differs from it by more than about 15 percentage points, write one sentence naming the
-                 specific evidence that justifies the gap.
-               • Do not move off your own number on a general feeling that it is too extreme or that history
-                 counsels caution; if your analysis points somewhere, your probability should follow it."""
+# Apply the rate to the exposure that is LEFT. On qid 43837 six members applied a monthly
+# announcement rate across the FULL question window when 16 days had already elapsed
+# event-free (then OR-ed it with a scheduled path the rate already covered, which the
+# binary union line now forbids: "union only over paths that cannot be the same event").
+# One sentence, interpolated INLINE (no pre-indent) into the binary conditional-hazard
+# bullet, which is the same rule specialised to recurring events, and standing alone as
+# one bullet in the MC outside-view step, which has no hazard bullet. Binary + MC only:
+# the numeric prompt anchors on a range, not a rate. It replaced a two-bullet constant
+# that restated the hazard bullet twenty lines below it and the union clause five lines
+# above it, so the rule read three times and the model was told nothing new twice.
+_REMAINING_EXPOSURE_SENTENCE = (
+    "Rates apply to the exposure that REMAINS: estimate the rate over the longest window the evidence supports, "
+    "then apply it from now until the deadline, treating the elapsed event-free part of the window as observed "
+    "(a rate spread over the whole window prices time that has already passed)."
+)
 
 
 # The gap the qid 45215 miss needed and no bundle held: a training-data fact about how an
@@ -856,10 +845,10 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • List plausible reference classes for this question and evaluate suitability.
                • State the outside-view base rate(s) and how you combine them into a baseline probability.
                • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i) — union only over paths that cannot be the same event, since an overlapping term double-counts it). A rough quantitative estimate from data is more reliable than an intuitive guess.
-               • Conditional-hazard check (for recurring-event questions only — product launches, elections, legislation, earnings, etc. with a history of inter-arrival gaps): an unconditional "event per typical interval" rate is usually wrong when time has already elapsed without the event. Compute the *conditional* probability: fit a simple model to historical gaps (exponential with mean = average gap, or the set of observed gaps treated as an empirical distribution), then compute P(event by deadline | no event in the T days already elapsed) — not just P(event in a window of size W). Show the number. If the question is not of this recurring type, write "non-recurring, conditional-hazard skipped".
+               • {
+            _REMAINING_EXPOSURE_SENTENCE
+        } For a recurring event with a history of inter-arrival gaps (product launches, elections, legislation, earnings), an unconditional "event per typical interval" rate is wrong once time has elapsed without the event: fit a simple model to the historical gaps (exponential with mean = average gap, or the observed gaps as an empirical distribution) and compute P(event by deadline | no event in the T days already elapsed), not P(event in a window of size W). Show the number. If the question is not of this recurring type, write "non-recurring, conditional-hazard skipped".
 {_COUNT_IN_PERIOD_REFERENCE_CLASS}
-{_REMAINING_EXPOSURE_RULE}
-{_ANCHOR_CONSISTENCY_RULE}
 
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
@@ -890,7 +879,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
                • Small-delta check: would a ±10% change still be coherent with the rationale? Why?
                • Trajectory check: consider whether the "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion" (e.g., a deadline arriving, a trend continuing, a process completing). Justify predictions that diverge from the most likely trajectory.
-               • Anchor on your math: if you computed a probability from data (base rate, frequency, z-score, rate extrapolation, probability union), your final answer should stay close to that number. You can adjust, but name the SPECIFIC new evidence justifying the adjustment. "I'll hedge to 30% because this is a novel situation" is NOT a valid adjustment — either your base rate was wrong (redo the calculation with different inputs) or the base rate stands with minor refinement.
+               • Anchor on your math: if you computed a probability from data (base rate, frequency, z-score, rate extrapolation, probability union, clause product), your final answer should stay close to that number; a move of more than about 15 points needs a named, specific piece of new evidence. "I'll hedge to 30% because this is a novel situation" is NOT a valid adjustment — either your base rate was wrong (redo the calculation with different inputs) or the base rate stands with minor refinement.
 
             ── Brief checklist (keep concise) ───────────────────────────────
             • Paraphrase the resolution criteria (<30 words).
@@ -987,9 +976,8 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         (2) Reference class (outside view) analysis
             • Candidate reference classes and suitability.
             • Outside-view distribution over options; discuss the historical rate of upsets/unexpected outcomes in this domain and how that affects the distribution.
+            • {_REMAINING_EXPOSURE_SENTENCE}
 {_COUNT_IN_PERIOD_REFERENCE_CLASS}
-{_REMAINING_EXPOSURE_RULE}
-{_ANCHOR_CONSISTENCY_RULE}
 
         (3) Timeframe reasoning
             • Time to resolution; describe how halving/doubling the timeline might reshape the distribution.
@@ -1019,7 +1007,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
             • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
             • Small-delta check: would ±10% on the leading options remain coherent with your reasoning?
             • Blind-spot consideration: if the resolution is unexpected, what would likely be the reason, and how should that affect confidence spreads?
-            • Anchor on your math: if you computed probabilities from data (base rate, frequency, etc.), your final answers should stay close to those numbers. Adjust only with specific new evidence, not vibe.
+            • Anchor on your math: if you computed probabilities from data (base rate, frequency, etc.), your final answers should stay close to those numbers; a move of more than about 15 points on an option needs a named, specific piece of new evidence, not vibe.
             • Calibration audit: if one option is genuinely dominant, commit to it — don't flatten a well-supported favorite out of general conservatism; under-committing to strong favorites costs points. Hedge by keeping honest probability on plausible residual outcomes ("Other", "no decision", "none of the above", record-extreme buckets) — that is where surprises actually land — not by spreading mass across the board.
             Remember:
             • Use integers 1%-99% (no 0 % or 100 %).
