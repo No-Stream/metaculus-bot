@@ -1045,19 +1045,11 @@ def numeric_prompt(
         f"""
         You are a **senior forecaster** writing a public report for expert peers.
         You will be scored with Metaculus' log-score, so accuracy **and** calibration
-        (especially the width of your prediction interval) are critical.
+        (especially the width of your prediction interval) are critical; how to set that width
+        is step (8) of the template below.
         Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
         training that the research reports don't cover, you may rely on it. You are not required to ground every claim
-        in the research; just be clear when you're drawing on your own knowledge versus the research.
-        Calibration guidance: For volatile quantities (financial markets, novel events, short-horizon
-        relative returns), produce wide, diffuse distributions — these are fundamentally hard to predict.
-        For stable, well-measured indicators with recent data (economic indices, demographic measures,
-        climate data), anchor tightly to recent observations with historically-appropriate variance.
-        Do not over-hedge on quantities you can actually predict well.
-        Match your interval width to what your reasoning actually supports, and do not pad or sharpen
-        out of a generic disposition.
-        Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
-        but penalties for overly wide intervals on predictable quantities also accumulate.{ts_anchor_clause}
+        in the research; just be clear when you're drawing on your own knowledge versus the research.{ts_anchor_clause}
         {
             _strong_evidence_market_clause(
                 research=research,
@@ -1120,10 +1112,9 @@ def numeric_prompt(
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
-        (1) Source analysis and data anchor
+        (1) Source analysis
             - Summarize key sources; note recency, credibility, and scope.
 {_SOURCE_PROVENANCE_LADDER}
-            - Critical: what is the most recent authoritative measurement or data point for this quantity? Your prediction should be centered near this value unless you have strong, specific evidence for departure.
 
         (2) Outside view and quantitative modeling
             - Candidate reference classes and suitability.
@@ -1133,7 +1124,6 @@ def numeric_prompt(
 
         (3) Timeframe and dynamics
             - Time to resolution; describe how halving or doubling the timeline might shift percentiles.
-            - Status-quo outcome: what value is implied if current conditions simply persist.
             - Trend continuation: extrapolate historical data to the closing date.
 
         (4) Expert and market priors
@@ -1155,49 +1145,22 @@ def numeric_prompt(
 
         (7) Red team and final rationale — integrate outside→inside view
             - Challenge assumptions and data quality.
-            - Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
-            - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning
-            - Trajectory check: consider whether "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion." Justify deviations from the most likely trajectory.
+            - State your outside-view central estimate and range, then say what the current evidence moved and why.
+            - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning?
             - Anchor on your math: if you derived a central estimate or range from data (extrapolation, historical trend, explicit formula), your percentiles should stay close to it. Adjust only with specific evidence, not vibe.
             - Question-specific base rate: anchor on the historical frequency, trend, or variance for THIS specific indicator (e.g., "how much has this index moved in prior analogous windows"), not a generic "things are usually stable" or "things are usually volatile" prior.
 
-        (8) Calibration and distribution shaping
-            - Think in ranges, not single points.
+        (8) Forecastability and width
+            - Decide how forecastable this quantity is from current information on this horizon. An administered or slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely predictable from its latest value and its historical variance: anchor tightly on recent observations with historically-appropriate width. A traded price, a volatile count or a novel metric on a short horizon is close to a random walk: centre on the current value, take the width from the series' realized variability over comparable windows, and do not expect movement you cannot source to a named cause.
+            - Match your interval width to what your reasoning actually supports, and do not pad or sharpen out of a generic disposition. Log score punishes a narrow interval that misses far more than a wide one that covers, but a wide interval on a predictable quantity also bleeds points.
             - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution.
-            - Ensure strictly increasing percentiles.
-            - Avoid scientific notation.
-            - For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
 
-        (9) Outcome type classification
-            Determine whether the resolution value for this question will always be a whole integer
-            (e.g. counts, rankings, number of events, number of countries) or can be any real number
-            (e.g. temperatures, percentages, dollar amounts, ratios).
-            Record this decision in the `outcome_type` field of the STRUCTURED FORECAST block below
-            ("discrete_integer" for whole-integer resolutions, "continuous" otherwise).
+        (9) Outcome type: decide whether the resolution value is inherently a whole integer and record it in `outcome_type` in the block below (definition in the schema notes).
 
-        (9b) Forecastability classification
-            How inherently predictable is this quantity on the given time horizon?
-            - HIGH: stable indicator with recent data, low historical variance
-              (e.g., monthly unemployment rate, home price index, CO2 concentration)
-            - MEDIUM: event-based or moderately variable
-              (e.g., election results, quarterly earnings, box office)
-            - LOW: volatile or near-random on this horizon
-              (e.g., 2-week stock/futures returns, financial spreads, novel metrics)
-            Output exactly one of:
-            FORECASTABILITY: HIGH
-            FORECASTABILITY: MEDIUM
-            FORECASTABILITY: LOW
-            Use this classification as a self-check: your interval width should match how predictable the quantity actually is on this horizon.
-
-        (10) Brief checklist
+        (10) Final checks
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
-            - Paraphrase the resolution criteria and units in less than 30 words.
             - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
-            - State the outside view baseline used.
-            - Consistency line about which percentile corresponds to the status quo or trend.
-            - Top 3 to 5 evidence items plus a quick factual validity check.
-            - Blind spot scenario and expected effect on tails.
-            - Forecastability check: does your interval width match the forecastability classification?
+            - Consistency line: which percentile corresponds to the status quo or trend, and is that sensible?
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream

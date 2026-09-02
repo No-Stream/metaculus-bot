@@ -823,13 +823,21 @@ class TestSourceProvenanceLadder:
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         self._assert_ladder_present(result)
 
-    def test_numeric_prompt_preserves_data_anchor(self) -> None:
-        """Regression: appending the ladder must not displace the load-bearing
-        data-anchor bullet in the numeric Source-analysis section."""
+    def test_numeric_status_quo_derivation_is_the_one_anchor_to_latest_statement(self) -> None:
+        """The numeric prompt used to tell the model five times how to pick a centre: the
+        step-0 status-quo derivation, a step-1 "centered near this value" push, a step-3
+        "status-quo outcome" line, step-3 trend continuation and a step-7 trajectory check.
+        One anchor statement (step 0, which already says to move off the latest measurement
+        only for a named post-open event) and one trend statement (step 3) remain."""
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         lowered = " ".join(result.lower().split())
-        assert "most recent authoritative measurement" in lowered
-        assert "centered near this value" in lowered
+        assert lowered.count("most recent authoritative measurement") == 1
+        assert lowered.count("trend continuation") == 1
+        assert "centered near this value" not in lowered
+        assert "status-quo outcome" not in lowered
+        assert "trajectory check" not in lowered
+        # Step 1 no longer claims a "data anchor" it does not carry.
+        assert "source analysis and data anchor" not in lowered
 
 
 class TestPresentTenseInstrumentGaps:
@@ -1313,7 +1321,7 @@ class TestTemplateStatesEachCheckOnce:
         return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
 
     def test_final_checks_is_the_last_template_step_in_every_base_prompt(self) -> None:
-        for prompt in (self._binary(), self._mc()):
+        for prompt in (self._binary(), self._mc(), self._numeric()):
             flat = self._flat(prompt)
             assert flat.count("bait-and-switch check") == 1
             assert "brief checklist" not in flat
@@ -1324,12 +1332,13 @@ class TestTemplateStatesEachCheckOnce:
             assert "top 3 to 5 evidence items" not in flat
             assert "blind-spot scenario most likely" not in flat
             assert "blind-spot statement" not in flat
+            assert "blind spot scenario and expected effect" not in flat
             assert "state the outside-view base rate you anchored to" not in flat
             assert "state the outside-view distribution used as anchor" not in flat
             assert "state the outside view baseline used" not in flat
             # Placement: inside the template, after the final-rationale step, before the block.
-            final_checks_at = prompt.index("Final checks")
-            assert prompt.index("Final rationale") < final_checks_at < prompt.index("STRUCTURED FORECAST")
+            final_checks_at = flat.index("final checks")
+            assert flat.index("final rationale") < final_checks_at < flat.index("structured forecast")
 
     def test_binary_final_checks_keep_the_consistency_line(self) -> None:
         flat = self._flat(self._binary())
@@ -1338,6 +1347,34 @@ class TestTemplateStatesEachCheckOnce:
     def test_mc_final_checks_keep_the_consistency_line(self) -> None:
         flat = self._flat(self._mc())
         assert "most likely: __; least likely: __; coherent with rationale?" in flat
+
+    def test_numeric_final_checks_keep_units_and_the_percentile_consistency_line(self) -> None:
+        """Numeric adds the units bullet: the unit-mismatch guard withholds a forecaster that gets
+        the units wrong, so it is the one checklist item with a pipeline consequence."""
+        flat = self._flat(self._numeric())
+        final_checks = flat[flat.index("final checks") :]
+        assert "units: what are the units of the output values and why?" in final_checks
+        assert "which percentile corresponds to the status quo or trend" in final_checks
+
+    def test_numeric_step_seven_asks_for_a_central_estimate_not_a_probability(self) -> None:
+        """ "My base rate was X% ... moving to Y%" was a probability template copy-pasted onto a
+        distribution question (the sibling numeric odds check was cut for the same reason)."""
+        flat = self._flat(self._numeric())
+        assert (
+            "state your outside-view central estimate and range, then say what the current evidence moved and why"
+            in flat
+        )
+        assert "my base rate was x%" not in flat
+        assert "odds check" not in flat
+
+    def test_numeric_outcome_type_is_defined_once_in_the_schema_notes(self) -> None:
+        """The field was defined three times (step 9, schema notes, example). The schema note is
+        the definition; step 9 is a one-line pointer to it."""
+        flat = self._flat(self._numeric())
+        assert "outcome type classification" not in flat
+        assert flat.count("counts, rankings, number of events") == 1
+        assert "record it in `outcome_type`" in flat
+        assert "definition in the schema notes" in flat
 
     def test_odds_and_delta_are_one_check(self) -> None:
         for prompt in (self._binary(), self._mc()):

@@ -171,32 +171,70 @@ class TestNumericPromptDisplaysNominalBounds:
 
     def test_numeric_prompt_carries_replacement_open_bound_guidance(self):
         """Positive assertions on the NEW guidance (not just absence of the old): the
-        closed/open replacement sentence and the displayed-units note."""
+        closed/open semantics live ONCE, in the Units & Bounds bullet (plus the per-side bound
+        messages interpolated below it); the step-8 restatement that used to carry them was
+        retired as a duplicate, so the pins moved here rather than being deleted."""
         q = _discrete_question()
         upper_msg, lower_msg = bound_messages(q)
         prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
-        assert "the displayed edge is NOT a hard limit" in prompt
-        assert "For a closed bound, no percentile may cross it." in prompt
-        assert "displayed range is suggestive of units" in prompt
+        collapsed = " ".join(prompt.split())
+        assert "Keep them within a closed bound (the outcome cannot cross it)" in collapsed
+        assert (
+            "an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted"
+            in collapsed
+        )
+        assert "displayed range is suggestive of units" in collapsed
+        # The retired step-8 duplicates (the stacking prompt keeps its own copy, untouched).
+        assert "the displayed edge is NOT a hard limit" not in prompt
+        assert "For a closed bound, no percentile may cross it." not in prompt
+        assert "Think in ranges, not single points" not in prompt
+        assert "Ensure strictly increasing percentiles" not in prompt
+        assert "Avoid scientific notation" not in prompt
+        # The schema Notes stay the one copy of the mechanical format rules.
+        assert collapsed.count("no scientific notation") == 1
+        assert collapsed.count("strictly increasing") == 1
 
-    def test_numeric_prompt_forecastability_guidance_is_even_handed(self):
-        """The Step-9b forecastability block keeps its HIGH/MEDIUM/LOW classification and its
-        ``FORECASTABILITY:`` output line (the checklist echo depends on it), but the directional
-        IQR prescriptions authored in the retired k_tail=1.25 wide era are gone (2026-07-18 width
-        audit, Option B). What remains is a single even-handed self-check line."""
+    def test_numeric_prompt_forecastability_and_width_is_one_template_step(self):
+        """The old Step-9b asked for an output line ``FORECASTABILITY: HIGH/MEDIUM/LOW`` that
+        nothing parsed, and the preamble carried a separate 567-char calibration paragraph. The
+        operator's intent is real and now lives in ONE template step, "Forecastability and
+        width": decide whether the quantity is forecastable from current information or close to
+        a random walk, and if near-unforecastable centre on the current value with a width taken
+        from realized variability. It absorbs the calibration paragraph's kernel, keeps the
+        even-handed wording the 2026-07 width audit settled on (no directional push toward wide
+        or narrow), and asks for no output line; the preamble shrinks to a pointer."""
         q = _discrete_question()
         upper_msg, lower_msg = bound_messages(q)
         prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
-        # Classification + machine-readable output line survive (the checklist echoes FORECASTABILITY).
-        assert "FORECASTABILITY: HIGH" in prompt
-        assert "FORECASTABILITY: LOW" in prompt
-        # The new even-handed self-check line replaces the two directional prescriptions.
-        assert "your interval width should match how predictable the quantity actually is on this horizon" in prompt
+        collapsed = " ".join(prompt.split())
+        assert "Forecastability and width" in collapsed
+        # No output line: nothing downstream ever read it.
+        assert "FORECASTABILITY:" not in prompt
+        assert "HIGH / MEDIUM / LOW" not in prompt
+        # The decision the step asks for, and what to do at the unforecastable end.
+        assert "how forecastable this quantity is from current information" in collapsed
+        assert "close to a random walk" in collapsed
+        assert "centre on the current value" in collapsed
+        assert "realized variability" in collapsed
+        assert "do not expect movement you cannot source" in collapsed
+        # The calibration paragraph's even-handed kernel, stated once.
+        assert collapsed.count("Match your interval width to what your reasoning actually supports") == 1
+        assert collapsed.count("generic disposition") == 1
+        assert "Calibration guidance:" not in collapsed
+        # Both sides of the log-score asymmetry, so neither direction is a standing push.
+        assert "narrow" in collapsed
+        assert "wide" in collapsed
+        # The tails line survives inside the same step.
+        assert (
+            "Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name"
+            in collapsed
+        )
         # The removed directional pushes must not resurface (Step-9b widening + Step-7 narrowing).
         assert "large fraction of the displayed range" not in prompt
         assert "as narrow as the historical data justifies" not in prompt
         assert "you are losing points" not in prompt
         assert "hedge audit" not in prompt.lower()
+        assert "Forecastability check:" not in prompt
 
     def test_stacking_numeric_prompt_carries_replacement_open_bound_guidance(self):
         q = _discrete_question()
