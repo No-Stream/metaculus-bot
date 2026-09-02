@@ -82,6 +82,7 @@ from metaculus_bot.research.ts_render import (
     _truncate_section,
 )
 from metaculus_bot.research.ts_routing import _Route
+from scripts.telemetry.markers import MARKER_SPECS
 from tests.ts_anchor_fakes import (
     _DGS10_RC,
     FakeHttp,
@@ -947,6 +948,51 @@ class TestAnchorRealizedVolNoiseFlag:
         assert "Vendor-noise flag" in lines[1]
         assert f"the volatility is {robust:.1f}%" in lines[1]
         assert "The change band above is unaffected" in lines[1]
+
+    def test_the_emitted_marker_line_parses_under_the_spec(self, caplog: pytest.LogCaptureFixture):
+        """This surface had NO emitter-side assertion at all — deleting its `logger.info` was
+        green, and so was any field reorder, while the archive harvested nothing. The parser
+        tests could not catch it: they parse hand-typed strings whose comments only claim to
+        match what the emitter produces. Same pattern as test_ts_routing's ts_anchor_route test.
+
+        `long_vol` reads None here because the anchor computes no long-horizon window; the
+        field is present because both surfaces share one emitter and one shape.
+        """
+        noisy = noise_dominated_close_series(seed=3)
+        clock = self._clock()
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.ts_render"):
+            tsrender._realized_vol_lines(noisy, clock, symbol="CSUSHPISA")
+
+        ratio = variance_ratio(
+            noisy, lag=FINANCIAL_VARIANCE_RATIO_LAG, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS
+        )
+        robust = multi_period_annualized_vol_pct(
+            noisy,
+            lag=FINANCIAL_VARIANCE_RATIO_LAG,
+            periods_per_year=clock.periods_per_year,
+            min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+        )
+        short = annualized_realized_vol_pct(
+            noisy, window=tsrender.REALIZED_VOL_WINDOW, periods_per_year=clock.periods_per_year
+        )
+        assert ratio is not None
+        assert robust is not None
+        assert short is not None
+
+        (line,) = [r.getMessage() for r in caplog.records if "FINANCIAL_NOISE_FLAG" in r.getMessage()]
+        spec = next(s for s in MARKER_SPECS if s.name == "financial_noise_flag")
+        match = spec.regex.search(line)
+        assert match is not None
+        assert match.groupdict() == {
+            "surface": "ts_anchor",
+            "symbol": "CSUSHPISA",
+            "vr_lag": str(FINANCIAL_VARIANCE_RATIO_LAG),
+            "vr": f"{ratio:.3f}",
+            "floor": str(FINANCIAL_VARIANCE_RATIO_FLOOR),
+            "short_vol": f"{short:.1f}",
+            "long_vol": "None",
+            "robust_vol": str(round(robust, 1)),
+        }
 
     def test_a_short_series_renders_nothing(self):
         short = random_walk_close_series(seed=3, n=20)

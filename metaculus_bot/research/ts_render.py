@@ -99,7 +99,7 @@ def _fmt(v: float) -> str:
     render sites, in the other renderer of the same series (both providers append
     unconditionally, so one bundle stated two different values for one observation).
 
-    Capped at three decimals rather than ``financial_data._format_fred_value``'s six because
+    Capped at three decimals rather than ``fred_rendering._format_fred_value``'s six because
     this formatter also renders the empirical P10/P50/P90 band, where six decimals on an
     estimate would be fabricated precision; three is enough to carry a level's published digits
     (and the band's quantiles, which a forecaster sizes an interval from, are worth up to 0.05
