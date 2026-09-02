@@ -535,6 +535,75 @@ _NULL_RESULT_READING = """
                  more often a gap in reporting than a missing event."""
 
 
+# Which reference class is admissible for a "how many X in period P" question,
+# shared verbatim by the binary, MC and numeric prompts (count questions arrive as
+# all three types). On qid 44561 all six members built a "no failure announced yet,
+# so Poisson(1.0)" schedule model instead of the pooled FDIC bank-failure rate, and
+# published far too low. Same >= 15-space pre-indent contract as _NULL_RESULT_READING.
+_COUNT_IN_PERIOD_REFERENCE_CLASS = """
+               • For questions asking how many events of a kind occur in a period, the admissible outside
+                 view is the pooled realized rate of that event over the longest comparable history. A
+                 schedule of currently known candidates ("none announced yet", "one is due") is evidence
+                 about the pipeline and updates that rate; it does not replace it."""
+
+
+# Apply the rate to the exposure that is LEFT, and keep a named path disjoint from the
+# rate that already contains it. On qid 43837 six members applied a monthly announcement
+# rate across the FULL question window when 16 days had already elapsed event-free, then
+# OR-ed that rate with a specific scheduled path the rate already covered — the union
+# line in the same rubric invites exactly that double count, so it now states the
+# disjointness requirement too. Binary + MC only (numeric has no union step).
+_REMAINING_EXPOSURE_RULE = """
+               • Outside-view rates apply to the exposure that REMAINS. Estimate the rate over the longest
+                 window the evidence supports, then apply it from now until the question's deadline, treating
+                 the part of the window that has already elapsed without the event as observed.
+               • When you combine a specific known path (a scheduled event, an announced plan) with a base
+                 rate, the two must be DISJOINT: remove that path's own instances from the rate before
+                 combining, and keep the path's probability as its own term."""
+
+
+# Say the number, then stay near it unless specific evidence moves you. On qid 44557
+# four of six members wrote a 17-25% base rate and published 35-55% on soft schedule
+# signals, naming no evidence for the gap. The prompts' existing "Anchor on your math"
+# bullet fires only in the final-rationale step; this one lands where the number is
+# computed and puts a size on "close to it".
+_ANCHOR_CONSISTENCY_RULE = """
+               • State the outside-view number you computed. If your final probability for that outcome
+                 differs from it by more than about 15 percentage points, write one sentence naming the
+                 specific evidence that justifies the gap.
+               • Do not move off your own number on a general feeling that it is too extreme or that history
+                 counsels caution; if your analysis points somewhere, your probability should follow it."""
+
+
+# The optional telemetry slot behind the WINDOW_DECLARED marker (forecaster_runners.py):
+# the forecaster's own count of the days it priced. Nothing reads it to clamp or adjust a
+# forecast — it exists so a member that applied its rate over the FULL question window
+# instead of the exposure that remains (the qid 43837 miss) is a query rather than a
+# re-read of every rationale. Optional on purpose: an omitted field is the honest answer
+# when no rate was applied over a window, and a missing one never costs a forecast.
+_REMAINING_WINDOW_DAYS_FIELD_INSTRUCTION = (
+    "`remaining_window_days`: OPTIONAL, telemetry only — your count of days from now to the question's "
+    "deadline that your base rate was applied over. Omit it if you applied no rate over a window."
+)
+
+
+# The gap the qid 45215 miss needed and no bundle held: a training-data fact about how an
+# institutional rule last cashed out in practice (nobody asked how the electoral threshold
+# applied at the last election). Analyzer-only, since it directs a search slot, which the
+# forecaster prompts cannot do; worded to earn a slot only where such a rule exists so it
+# does not fight the same prompt's "DO NOT invent gaps" discipline. Pre-indented to 8
+# spaces to match the analyzer prompt's own baseline.
+_LAST_REAL_USE_GAP_RULE = """
+        LAST REAL APPLICATION OF THE RULE. When the question resolves through a
+        discontinuous institutional rule applied by a body — an electoral threshold, a
+        quota, an allocation formula, a cut-off score — one gap must ask how that rule
+        actually applied at its most recent real application, as a realized count or
+        outcome. This is about the institution's rule, not about the question's own
+        resolution threshold. Like every gap above it earns a slot only when such a rule
+        is actually in play; do not invent one where the question resolves on a plain
+        measurement."""
+
+
 # The liquidity/participation weighting sentence, appended to the shared strong-evidence
 # clause so every forecaster prompt tells the model to weight a crowd signal by how
 # informative it is (the prediction-market provider emits a per-market `signal` label
@@ -807,8 +876,11 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             2) Reference class and quantitative base rate
                • List plausible reference classes for this question and evaluate suitability.
                • State the outside-view base rate(s) and how you combine them into a baseline probability.
-               • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i)). A rough quantitative estimate from data is more reliable than an intuitive guess.
+               • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i) — union only over paths that cannot be the same event, since an overlapping term double-counts it). A rough quantitative estimate from data is more reliable than an intuitive guess.
                • Conditional-hazard check (for recurring-event questions only — product launches, elections, legislation, earnings, etc. with a history of inter-arrival gaps): an unconditional "event per typical interval" rate is usually wrong when time has already elapsed without the event. Compute the *conditional* probability: fit a simple model to historical gaps (exponential with mean = average gap, or the set of observed gaps treated as an empirical distribution), then compute P(event by deadline | no event in the T days already elapsed) — not just P(event in a window of size W). Show the number. If the question is not of this recurring type, write "non-recurring, conditional-hazard skipped".
+{_COUNT_IN_PERIOD_REFERENCE_CLASS}
+{_REMAINING_EXPOSURE_RULE}
+{_ANCHOR_CONSISTENCY_RULE}
 
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
@@ -860,13 +932,15 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
               "question_type": "binary",
               "posterior_prob": 0.28,
               "base_rate_anchor": {{"low": 0.15, "high": 0.35}},
-              "criteria_clauses": [{{"name": "formal instrument signed", "prob": 0.6}}, {{"name": "in-window", "prob": 0.8}}]
+              "criteria_clauses": [{{"name": "formal instrument signed", "prob": 0.6}}, {{"name": "in-window", "prob": 0.8}}],
+              "remaining_window_days": 45
             }}
             ```
 
             `posterior_prob`: ALWAYS populate as a decimal in [0,1] (e.g., 0.28 for 28%).
             `base_rate_anchor`: populate with the outside-view base-rate range you stated in PHASE 1 (as decimals, 0-1). Omit only if you truly stated no outside-view range.
             `criteria_clauses`: populate from your conjunctive criteria pricing table in 5b (one entry per clause, probs as decimals). Omit for single-condition questions.
+            {_REMAINING_WINDOW_DAYS_FIELD_INSTRUCTION}
 
             The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
             """
@@ -939,6 +1013,9 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         (2) Reference class (outside view) analysis
             • Candidate reference classes and suitability.
             • Outside-view distribution over options; discuss the historical rate of upsets/unexpected outcomes in this domain and how that affects the distribution.
+{_COUNT_IN_PERIOD_REFERENCE_CLASS}
+{_REMAINING_EXPOSURE_RULE}
+{_ANCHOR_CONSISTENCY_RULE}
 
         (3) Timeframe reasoning
             • Time to resolution; describe how halving/doubling the timeline might reshape the distribution.
@@ -996,11 +1073,13 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
           "question_type": "multiple_choice",
           "option_probs": {{{option_probs_example}}},
           "other_mass": 0.0,
-          "concentration": 20.0
+          "concentration": 20.0,
+          "remaining_window_days": 45
         }}
         ```
 
         The `option_probs` object must sum to 1.0 and use the exact option names above.
+        {_REMAINING_WINDOW_DAYS_FIELD_INSTRUCTION}
         The LAST thing you write MUST be this fenced ```json block, with a probability for EVERY option above (keys = exact option names, in order). Write nothing after it.
         """
     )
@@ -1106,6 +1185,7 @@ def numeric_prompt(
             - Candidate reference classes and suitability.
             - State the outside view range and how you anchor to it.
             - If the data supports it, perform an explicit quantitative estimate: extrapolate recent trends, compute historical mean and variance, or fit a simple model. A rough calculation from data is more reliable than an intuitive range estimate.
+{_COUNT_IN_PERIOD_REFERENCE_CLASS}
 
         (3) Timeframe and dynamics
             - Time to resolution; describe how halving or doubling the timeline might shift percentiles.
@@ -1644,6 +1724,7 @@ def gap_fill_analyzer_prompt(
         date has not occurred yet", and the slot is spent for nothing. If a candidate gap
         can only be answered by a future observation, rewrite it as the present-tense
         observable or drop it.
+{_LAST_REAL_USE_GAP_RULE}
 
         NULL RESULTS ARE SEARCH OUTCOMES. Where the first pass says it searched and
         found nothing ("no record found", "no authoritative source located"), treat that

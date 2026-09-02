@@ -45,6 +45,11 @@ against the ACTUAL emitted format strings (the source of truth):
   that stopped trading long before the question opened as ``same_quantity_same_date``
   and the deterministic pass refused it that top tier; silent otherwise, and it
   fires on nothing in the archive, so a first record is itself the finding)
+* ``WINDOW_DECLARED`` — ``metaculus_bot/forecaster_runners.py`` ``_log_window_declared``
+  (per-MEMBER declared pricing window against the question's real remaining window: a
+  member that priced the FULL window when most of it had already elapsed event-free is
+  the qid 43837 double-count shape. Optional field, so a member that declares nothing
+  leaves no line — an absent record means "not declared", never "priced correctly")
 * ``NUMERIC_DEGENERATE_DECLARATION`` — ``metaculus_bot/numeric/pipeline.py``
   ``_apply_jitter_and_clamp`` (per-FORECASTER point-mass numeric declaration that
   is no longer cluster-spread into a width nobody stated — a fabrication-attempt
@@ -777,6 +782,27 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+side=(?P<side>\S+)\s+lone=(?P<lone>\S+)\s+survivors=(?P<survivors>\d+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "window_declared",
+        # Per-MEMBER pricing-window declaration, emitted by forecaster_runners.py's
+        # _log_window_declared on BINARY and MULTIPLE_CHOICE questions right after the raw
+        # model output, from the OPTIONAL remaining_window_days field of the structured
+        # block. ``declared_days`` is the forecaster's own count; ``actual_days`` is the
+        # real now->close_time gap at forecast time to one decimal, so the interesting cut
+        # is the RATIO (a member pricing the full window reads declared ~= the whole
+        # window while actual is a fraction of it — the qid 43837 shape).
+        #
+        # A member that omits the field leaves NO line, so records are a declaration
+        # census, not a coverage one: read an absent record as "did not declare", never as
+        # a correctly-priced window. ``actual_days`` is "n/a" on a question with no close
+        # time (backtests, ablations) and coerce_value maps that to None, which is why a
+        # ratio cut has to skip nulls rather than treat them as zero.
+        re.compile(
+            r"WINDOW_DECLARED:\s*question=(?P<question>\S+)\s+model=(?P<model>\S+)"
+            r"\s+declared_days=(?P<declared_days>\S+)\s+actual_days=(?P<actual_days>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster_runners.py emits question.id_of_question
     ),
     MarkerSpec(
         "thin_publish_floor",
