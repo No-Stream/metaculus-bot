@@ -1432,6 +1432,31 @@ class TestExchangeRateRouting:
         assert sources["UNRATE"] == FRED_SKIPPED_NO_KEY_TOKEN
         assert _is_lost_source(sources["UNRATE"])
 
+    @pytest.mark.asyncio
+    async def test_a_keyless_fred_only_fetch_set_still_records_the_skip(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No ``FRED_API_KEY`` and nothing but FRED series: zero jobs, and the skip is the record.
+
+        This is the arm the retired ``if not jobs: return ""`` short-circuited — it returned before
+        the per-identifier ``record_provider_detail`` call, so ``pop_provider_detail`` gave ``{}``
+        and the requested series vanished from the archive entirely. Every other no-key test
+        classifies a ticker, so a job always existed and none of them reached this path. Deliberately
+        not routed through ``_run``, which pins ``FRED_API_KEY`` to a fake value.
+        """
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: UNRATE"
+        question = _make_q("Will unemployment fall below 4% in 2026?")
+        question.id_of_question = 45368
+        monkeypatch.delenv("FRED_API_KEY", raising=False)
+
+        with patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm):
+            result = await financial_data_provider()(question)
+
+        assert result == ""
+        assert pop_provider_detail(question.id_of_question, "financial_data") == {
+            "sources": {"UNRATE": FRED_SKIPPED_NO_KEY_TOKEN},
+            "counts": {"fx_identifiers_empty": 0},
+        }
+
     def test_the_prompt_routes_exchange_rates_to_a_yahoo_cross(self) -> None:
         """The cause of q45363 was a reference table with no FX coverage at all, so the classifier
         had nothing to route to and invented an id. The routing rule is the fix at that cause."""
@@ -1770,6 +1795,42 @@ class TestBenchmarkingDateCeiling:
         sources = pop_provider_detail(4242, "financial_data")["sources"]
         assert _is_lost_source(sources["classifier"]), f"a dead classifier must read as a LOST source; got {sources}"
         assert "RuntimeError" in sources["classifier"]
+
+    @pytest.mark.asyncio
+    async def test_dead_classifier_token_survives_beside_a_fetched_identifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The classifier loss has to reach the FINAL record too, not only the pre-return one.
+
+        ``record_provider_detail`` assigns the whole dict, so the per-identifier record written
+        after the fetches used to overwrite the classifier token wholesale. A dead classifier on a
+        question whose resolving FRED series was still recovered from its own resolution URL then
+        archived ``{"sources": {"CPIAUCSL": "ok"}}`` — a diagnostics line byte-identical to a fully
+        healthy run, leaving the outage's only trace an unstructured run-log WARN that dies with
+        the 90-day GHA artifact.
+        """
+        mock_llm = AsyncMock()
+        mock_llm.invoke.side_effect = RuntimeError("classifier model retired")
+        question = _make_q(
+            "A question the classifier never got to read.",
+            resolution_criteria="Resolves to https://fred.stlouisfed.org/series/CPIAUCSL on the close date.",
+        )
+        question.id_of_question = 4243
+        monkeypatch.setenv("FRED_API_KEY", "fake_key")
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
+        ):
+            result = await financial_data_provider()(question)
+
+        assert "### CPIAUCSL" in result, "the URL-extracted resolving series still fetches"
+        detail = pop_provider_detail(4243, "financial_data")
+        assert detail["sources"]["CPIAUCSL"] == "ok"
+        assert _is_lost_source(detail["sources"]["classifier"])
+        assert "RuntimeError" in detail["sources"]["classifier"]
+        # The token is not an identifier, so it must not read as a lost exchange rate.
+        assert detail["counts"]["fx_identifiers_empty"] == 0
 
     @pytest.mark.asyncio
     async def test_provider_default_is_live(self) -> None:

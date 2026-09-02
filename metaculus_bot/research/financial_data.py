@@ -881,15 +881,21 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
             fine_print=question.fine_print or "",
         )
         qid = getattr(question, "id_of_question", None)
-        if classifier_error is not None:
+        # Built once and re-seeded into the final record at the _assemble_financial_output
+        # call below: this ``if`` is the ONLY producer of a ``classifier`` key, since
+        # ``sources`` otherwise holds identifier keys only.
+        classifier_loss = {"classifier": f"error({classifier_error})"} if classifier_error is not None else {}
+        if classifier_loss:
             # Recorded HERE, above the empty-fetch-set early return below, because that
             # return happens before the per-identifier record_provider_detail call at the
             # end — so a dead classifier on a question with no extracted identifiers
             # produced NO diagnostics detail at all and read as "no financial angle".
-            # A later successful record for this qid overwrites the entry, which is
-            # correct: if identifiers were still fetched, their per-source map is the
-            # fuller picture and the classifier loss shows up there instead.
-            record_provider_detail(qid, "financial_data", {"sources": {"classifier": f"error({classifier_error})"}})
+            # record_provider_detail assigns the whole dict, so a later record for this qid
+            # REPLACES this one rather than merging — which is why the same token is merged
+            # into the per-identifier map below rather than left to survive on its own. It
+            # used to be dropped there, so a dead classifier beside a fetched identifier
+            # archived a record byte-identical to a fully healthy provider.
+            record_provider_detail(qid, "financial_data", {"sources": dict(classifier_loss)})
 
         # Sanitize classifier IDs (F2) BEFORE they reach the fetch set, marker, or
         # unknown-flagging: they come from comma-splitting with no char validation,
@@ -933,7 +939,7 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         sources.update(not_fetched)
         return _assemble_financial_output(
             non_empty_results,
-            sources,
+            {**classifier_loss, **sources},
             qid=qid,
             marker=_build_routing_marker(fred_series, tickers, extracted, unknown),
         )
@@ -957,6 +963,12 @@ def _assemble_financial_output(
     for: a non-empty return flips the orchestrator's status from ``empty`` to ``ok``, counts the
     provider in ``providers_succeeded``, and defeats every downstream empty guard at once, which is
     why AskNews' old ``No articles were found`` sentence was removed rather than reworded.
+
+    ``sources`` is per-IDENTIFIER with one exception: the caller merges in a dead classifier's
+    ``classifier`` token, since ``record_provider_detail`` assigns the whole dict and this record
+    would otherwise overwrite the earlier classifier-only one. It is not an identifier, so the FX
+    count below skips it, while ``is_lost_source`` still renders it in the diagnostics ``lost=``
+    suffix.
 
     ``counts["fx_identifiers_empty"]`` is what carries q45363's signal instead: how many attempted
     EXCHANGE-RATE identifiers came back with nothing in them (shape by ``is_fx_identifier``, outcome
