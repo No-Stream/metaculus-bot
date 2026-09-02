@@ -38,7 +38,7 @@ from metaculus_bot.research.resolution_source import (
     format_resolution_sections,
     resolution_source_provider,
 )
-from tests.test_resolution_source_provider import FakeResponse, FakeSession
+from tests.resolution_source_fakes import FakeResponse, FakeSession
 
 PAGE_URL = "https://tracker.example.com/polls"
 CHART_ID = "T3st1"

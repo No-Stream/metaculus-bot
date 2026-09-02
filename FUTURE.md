@@ -1585,6 +1585,21 @@ them OUT of feature work, land as their own PRs.
   to **1,691** and `resolution_source.py` to **1,294**, and three files over the ceiling are listed
   nowhere: `research/financial_data.py` **1,365**, this test file, and `tests/test_agentic_tools.py`
   **2,021**.
+
+  **Re-measured 2026-09-02, and one of them is closed.** `tests/test_resolution_source_provider.py`
+  (2,054 lines, the largest test file with no entry anywhere) is SPLIT: its three declared layers are
+  now `tests/resolution_source/test_resolution_source_helpers.py` (528),
+  `test_resolution_source_fetch.py` (1,070) and `test_resolution_source_provider_gating.py` (424),
+  with the fake aiohttp session and the HTML page builders in `tests/resolution_source_fakes.py`
+  (266) and the autouse DNS stub plus the page fixtures in the package's own `conftest.py`, following
+  the `tests/ablation/` precedent. Same 147 tests, none rewritten. `tests/test_resolution_source_datawrapper.py`
+  imported the fakes out of the old module and now imports them from the fakes module. Everything
+  else on this list grew again: `tests/test_telemetry_markers.py` **2,428**,
+  `tests/test_agentic_tools.py` **2,235**, `prompts.py` **1,805**, `resolution_source.py` **1,382**,
+  `research/financial_data.py` **1,033** (down, after `currency_pegs.py` and `fred_rendering.py`
+  came out of it). Read the prompts.py and resolution_source.py figures as a snapshot taken while
+  the 2026-09 bundle was still being edited. The re-measure keeps going stale because nothing
+  updates it except a round that trips over it, so measure before acting rather than quoting these.
 - **Dedupe the peg anchor when two tickers share one (added 2026-09-01, forge R15).** The bundle's
   peg-anchor block is decided per ticker inside `_fetch_yfinance_data`
   (`research/financial_data.py`), so a question naming two pegged crosses that share an anchor
