@@ -81,7 +81,7 @@ from metaculus_bot.constants import FALL_CUP_SLUG, METACULUS_CUP_ID, TOURNAMENT_
 # The scoring pull's own post-unwrapping, shared rather than re-derived: both read the same
 # posts list, and a probe that counted questions differently from the pull it exists to
 # project would be answering a subtly different question.
-from metaculus_bot.performance_analysis.collector import questions_on_post
+from metaculus_bot.performance_analysis.collector import FETCH_DELAY_SECS, questions_on_post
 from metaculus_bot.time_utils import _as_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -113,8 +113,13 @@ PAGE_SIZE = 100
 MAX_PAGES = 40  # 4,000 posts per status — an order of magnitude above any slug we probe
 REQUEST_SPACING_SECS = 1.0
 # Per-post detail GETs are spaced tighter than page GETs: the forfeit sweep can issue a few
-# hundred of them for a full season, and this matches the scoring pull's own FETCH_DELAY_SECS.
-DETAIL_REQUEST_SPACING_SECS = 0.5
+# hundred of them for a full season. Imported from the scoring pull rather than copied, so the
+# two read-only Metaculus walkers cannot drift into different politeness.
+DETAIL_REQUEST_SPACING_SECS = FETCH_DELAY_SECS
+# How often the sweep says where it is. Every GET is a DEBUG line; at 0.5 s spacing a
+# 25-post cadence puts an INFO line on the console about every 13 seconds, which is often
+# enough to tell a slow sweep from a wedged one without burying the slug's own summary.
+DETAIL_PROGRESS_EVERY = 25
 REQUEST_TIMEOUT_SECS = 45
 MAX_RETRIES = 6
 RETRY_BACKOFF_SECS = 6.0
@@ -496,12 +501,17 @@ def _posts_needing_detail(posts_by_status: Mapping[str, Sequence[dict]]) -> dict
     return needed
 
 
-def resolve_bot_forecasts(posts_by_status: dict[str, list[dict]], token: str) -> int:
+def resolve_bot_forecasts(posts_by_status: dict[str, list[dict]], token: str, *, slug: str | None = None) -> int:
     """Fill in ``my_forecasts`` on forfeit-eligible posts, in place. Returns fetches issued.
 
     One detail GET per post that needs one, and the fetched payload replaces that post under
     EVERY status it was paged under, so the two copies of a post that resolved mid-probe
     cannot disagree about whether we forecast it.
+
+    ``slug`` only labels the log lines. The sweep spends minutes issuing spaced GETs and used
+    to say nothing while it did, so a run that had wedged looked exactly like one that was
+    working; it now reports progress every ``DETAIL_PROGRESS_EVERY`` posts, with one DEBUG
+    line per GET for a per-URL trace.
 
     A post whose detail GET fails is left as it was, which reads through as ``unknown``
     rather than as a forfeit. The exception is swallowed per post on purpose: the sweep is a
@@ -511,16 +521,23 @@ def resolve_bot_forecasts(posts_by_status: dict[str, list[dict]], token: str) ->
     needed = _posts_needing_detail(posts_by_status)
     if not needed:
         return 0
-    logger.info(f"forfeit sweep: fetching my_forecasts detail for {len(needed)} post(s)")
+    total = len(needed)
+    label = f"{slug} forfeit sweep" if slug else "forfeit sweep"
+    logger.info(f"{label}: fetching my_forecasts detail for {total} post(s)")
 
     fetched: dict[object, dict] = {}
     for index, (post_id, status) in enumerate(needed.items()):
+        logger.debug(f"{label}: detail GET post {post_id} ({status}), {index + 1}/{total}")
         try:
             fetched[post_id] = _get_json({}, token, url=f"{POSTS_URL}{post_id}/")
         except requests.RequestException as exc:
-            logger.warning(f"forfeit sweep: post {post_id} ({status}) detail fetch failed ({exc}); state stays unknown")
-        if index < len(needed) - 1:
+            logger.warning(f"{label}: post {post_id} ({status}) detail fetch failed ({exc}); state stays unknown")
+        done = index + 1
+        if done % DETAIL_PROGRESS_EVERY == 0 and done < total:
+            logger.info(f"{label}: {done}/{total} detail GETs done ({len(fetched)} answered)")
+        if index < total - 1:
             time.sleep(DETAIL_REQUEST_SPACING_SECS)
+    logger.info(f"{label}: {total}/{total} detail GETs done ({len(fetched)} answered)")
 
     for status, posts in posts_by_status.items():
         posts_by_status[status] = [fetched.get(post.get("id"), post) for post in posts]
@@ -553,7 +570,7 @@ def probe_slugs(
         try:
             posts_by_status = fetch_posts_by_status(slug, statuses, token)
             if resolve_forfeits:
-                resolve_bot_forecasts(posts_by_status, token)
+                resolve_bot_forecasts(posts_by_status, token, slug=slug)
         except requests.RequestException as exc:
             logger.warning(f"{slug}: supply probe failed ({exc})")
             supplies.append(SlugSupply(slug=slug, error=str(exc)))

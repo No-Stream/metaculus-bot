@@ -20,6 +20,7 @@ any real connect anyway.
 """
 
 import json
+import logging
 from datetime import UTC, datetime
 
 import pytest
@@ -424,6 +425,28 @@ class TestResolveBotForecasts:
 
         assert sleeps == [supply_probe.DETAIL_REQUEST_SPACING_SECS]
 
+    def test_the_sweep_reports_progress_while_it_spends_minutes_of_spaced_gets(self, monkeypatch, caplog):
+        """A silent loop of hundreds of 0.5 s-spaced GETs reads exactly like a wedged run, so
+        the sweep names the slug, its total, and where it is every DETAIL_PROGRESS_EVERY posts,
+        with the final line always emitted however the count divides."""
+        monkeypatch.setattr(supply_probe, "DETAIL_PROGRESS_EVERY", 2)
+        posts = [_post(930 + offset, _question(130 + offset)) for offset in range(3)]
+        details = {930 + offset: _post(930 + offset, _question(130 + offset, forecast=False)) for offset in range(3)}
+        self._install_details(monkeypatch, details)
+
+        with caplog.at_level(logging.DEBUG, logger=supply_probe.logger.name):
+            supply_probe.resolve_bot_forecasts({"closed": posts}, "token", slug="summer-futureeval-2026")
+
+        info_lines = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+        assert info_lines == [
+            "summer-futureeval-2026 forfeit sweep: fetching my_forecasts detail for 3 post(s)",
+            "summer-futureeval-2026 forfeit sweep: 2/3 detail GETs done (2 answered)",
+            "summer-futureeval-2026 forfeit sweep: 3/3 detail GETs done (3 answered)",
+        ]
+        debug_lines = [record.getMessage() for record in caplog.records if record.levelno == logging.DEBUG]
+        assert len(debug_lines) == 3, "one DEBUG line per detail GET, for a per-post trace"
+        assert "detail GET post 931" in debug_lines[1]
+
     def test_a_failed_detail_fetch_leaves_the_state_unknown_and_does_not_raise(self, monkeypatch):
         """One unreachable post must not cost the slug its census, and must never be filed as
         a forfeit on the strength of a payload we could not read."""
@@ -606,6 +629,18 @@ class TestRateLimitRetry:
         assert "retries exhausted" in str(excinfo.value), (
             "the exhausted path must say six attempts were rate-limited, not report one unlucky request"
         )
+
+    def test_the_url_argument_reaches_requests_get(self, monkeypatch):
+        """The forfeit sweep's whole request budget rides on this kwarg. If it stopped being
+        driven down to ``requests.get``, every detail GET would silently hit the posts LIST
+        endpoint, which answers 200 with a page of other posts."""
+        calls, _sleeps = self._install_responses(monkeypatch, [200], payload={"id": 920})
+        detail_url = f"{supply_probe.POSTS_URL}920/"
+
+        data = supply_probe._get_json({}, "token", url=detail_url)
+
+        assert data == {"id": 920}
+        assert [call["url"] for call in calls] == [detail_url]
 
     def test_a_non_429_error_status_is_not_retried(self, monkeypatch):
         # A 404 slug is the expected case here (the bare `metaculus-cup` slug 404s today), and
