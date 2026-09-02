@@ -196,11 +196,15 @@ class TestWindowDeclaredTelemetry:
     window when 16 days of it had already elapsed event-free, which this line makes a
     query instead of a re-read of every rationale.
 
+    ``actual_days`` is measured to ``scheduled_resolution_time`` — the deadline the prompt
+    shows the model — and NOT to ``close_time``, which the model never sees and which runs
+    a median 33 days earlier on live questions.
+
     The block is parsed for telemetry only — nothing downstream reads the field — so
     these tests run the real ``parse_structured_block`` and assert on the log.
     """
 
-    _FUTURE_CLOSE = datetime(2026, 12, 31, tzinfo=UTC)
+    _FUTURE_RESOLUTION = datetime(2026, 12, 31, tzinfo=UTC)
 
     @staticmethod
     def _window_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -216,7 +220,7 @@ class TestWindowDeclaredTelemetry:
         self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
-        binary_question.close_time = datetime.now(UTC) + timedelta(days=10)
+        binary_question.scheduled_resolution_time = datetime.now(UTC) + timedelta(days=10)
 
         with (
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
@@ -228,9 +232,10 @@ class TestWindowDeclaredTelemetry:
         assert "question=1001" in msg
         assert "model=test-forecaster" in msg
         assert "declared_days=90" in msg
-        # The real remaining window, to one decimal — the ratio against declared_days is
-        # the cut (90 declared against 10 real is the full-window pricing shape). Rounding
-        # holds to one decimal until the test itself takes over an hour.
+        # The real days left until scheduled resolution, to one decimal — the ratio
+        # against declared_days is the cut, and 90 declared against 10 real is the
+        # full-window pricing shape. Rounding holds to one decimal until the test itself
+        # takes over an hour.
         assert "actual_days=10.0" in msg
 
     @pytest.mark.asyncio
@@ -240,7 +245,7 @@ class TestWindowDeclaredTelemetry:
         """The field is optional, so silence must stay silence: an absent record means
         "did not declare", never "priced the window correctly"."""
         caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
-        binary_question.close_time = self._FUTURE_CLOSE
+        binary_question.scheduled_resolution_time = self._FUTURE_RESOLUTION
 
         with (
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
@@ -255,7 +260,7 @@ class TestWindowDeclaredTelemetry:
         self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
-        binary_question.close_time = self._FUTURE_CLOSE
+        binary_question.scheduled_resolution_time = self._FUTURE_RESOLUTION
 
         with (
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
@@ -270,14 +275,16 @@ class TestWindowDeclaredTelemetry:
         assert self._window_lines(caplog) == []
 
     @pytest.mark.asyncio
-    async def test_missing_close_time_logs_the_none_sentinel(
+    async def test_missing_resolution_time_logs_the_none_sentinel(
         self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Backtests and ablations forecast resolved questions and can carry no close
-        time. ``n/a`` is what the marker parser coerces to None, so a ratio cut skips the
+        """``scheduled_resolution_time`` is Optional upstream, so the None branch has to
+        emit the sentinel rather than crash. It is effectively unreachable in prod —
+        ``_forecasting_window_str`` asserts the field non-None to build the same prompt —
+        and ``n/a`` is what the marker parser coerces to None, so a ratio cut skips the
         record instead of reading a measured zero."""
         caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
-        binary_question.close_time = None
+        binary_question.scheduled_resolution_time = None
 
         with (
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
@@ -290,11 +297,32 @@ class TestWindowDeclaredTelemetry:
         assert "actual_days=n/a" in msg
 
     @pytest.mark.asyncio
+    async def test_past_resolution_time_logs_negative_days(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The backtest and ablation shape: those forecast RESOLVED questions and
+        ``_prepare_question_for_backtest`` leaves the time fields untouched, so
+        ``actual_days`` is a large negative float rather than ``n/a``. A ratio cut over the
+        archive has to drop non-positives as well as nulls."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        binary_question.scheduled_resolution_time = datetime.now(UTC) - timedelta(days=30)
+
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=self._binary_rationale(declared=45))),
+        ):
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        (msg,) = self._window_lines(caplog)
+        assert "declared_days=45" in msg
+        assert "actual_days=-30.0" in msg
+
+    @pytest.mark.asyncio
     async def test_mc_runner_logs_its_own_declaration(
         self, mc_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
-        mc_question.close_time = datetime.now(UTC) + timedelta(days=5)
+        mc_question.scheduled_resolution_time = datetime.now(UTC) + timedelta(days=5)
         ballot = '{"Option A": 0.5, "Option B": 0.3, "Option C": 0.2}'
         rationale = (
             "Analysis.\n\n```json\n"
@@ -318,7 +346,7 @@ class TestWindowDeclaredTelemetry:
         """The declaration is logged before extraction, so it still reports what the
         model wrote on a question whose forecaster is ultimately dropped."""
         caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
-        binary_question.close_time = self._FUTURE_CLOSE
+        binary_question.scheduled_resolution_time = self._FUTURE_RESOLUTION
         boom = ValueExtractionError("no usable value")
 
         with (

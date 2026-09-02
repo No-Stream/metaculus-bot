@@ -789,15 +789,18 @@ MARKER_SPECS: list[MarkerSpec] = [
         # _log_window_declared on BINARY and MULTIPLE_CHOICE questions right after the raw
         # model output, from the OPTIONAL remaining_window_days field of the structured
         # block. ``declared_days`` is the forecaster's own count; ``actual_days`` is the
-        # real now->close_time gap at forecast time to one decimal, so the interesting cut
-        # is the RATIO (a member pricing the full window reads declared ~= the whole
-        # window while actual is a fraction of it — the qid 43837 shape).
+        # real now->scheduled_resolution_time gap at forecast time to one decimal — the
+        # same deadline the prompt shows the model, so the two count to one date and the
+        # interesting cut is the RATIO (a member pricing the full window reads declared ~=
+        # the whole window while actual is a fraction of it — the qid 43837 shape).
         #
         # A member that omits the field leaves NO line, so records are a declaration
         # census, not a coverage one: read an absent record as "did not declare", never as
-        # a correctly-priced window. ``actual_days`` is "n/a" on a question with no close
-        # time (backtests, ablations) and coerce_value maps that to None, which is why a
-        # ratio cut has to skip nulls rather than treat them as zero.
+        # a correctly-priced window. Two ``actual_days`` readings are not failures: "n/a"
+        # (the field was None, Optional upstream but effectively unreachable in prod),
+        # which coerce_value maps to None, and a NEGATIVE float on any question already
+        # past its scheduled resolution, which is every backtest and ablation question. So
+        # a ratio cut has to drop nulls AND non-positives, not treat either as zero.
         re.compile(
             r"WINDOW_DECLARED:\s*question=(?P<question>\S+)\s+model=(?P<model>\S+)"
             r"\s+declared_days=(?P<declared_days>\S+)\s+actual_days=(?P<actual_days>\S+)"
