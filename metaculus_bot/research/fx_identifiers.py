@@ -1,4 +1,4 @@
-"""What an exchange-rate identifier looks like on each vendor, and what to say when neither has one.
+"""What an exchange-rate identifier looks like on each vendor.
 
 q45363 ("What will be the Boliviano-USD exchange rate on August 31, 2026?") is the realized failure
 this module exists for. The classifier proposed the FRED series ``DEXBOUS``, which does not exist --
@@ -10,8 +10,23 @@ series, and the adversarial verification found that a member sized off the resol
 actually ran. The only trace of any of it was the diagnostics token ``DEXBOUS:empty``, which reads
 identically to a live series with no observations.
 
-Two shape predicates and one disclosure line. Stdlib-only (``re``), like ``currency_pegs``, so it can
-never cycle with the provider modules that import it.
+The fix at the cause is the exchange-rate routing rule in ``financial_data``'s classifier prompt; the
+fix at the trace is ``fred_rendering.UnknownFredSeries``, which turns that ``empty`` into
+``unknown_series``. These predicates are the third part: they let ``financial_data`` count how many
+attempted EXCHANGE-RATE identifiers carried nothing (``counts["fx_identifiers_empty"]``), so a
+currency question that got no financial block is a query over the archive rather than a
+re-derivation from identifier names.
+
+They deliberately do NOT feed a forecaster-facing "no exchange-rate data available" line. An earlier
+revision rendered one, and prose standing in for a provider's absent output is the AskNews
+``No articles were found`` shape (``research/providers.py``): the non-empty return flips the
+orchestrator's status from ``empty`` to ``ok``, counts in ``providers_succeeded``, and defeats every
+downstream empty guard. A financial section with nothing in it is ABSENT, and the per-identifier
+loss tokens are the whole record.
+
+Three shape predicates. Stdlib-only (``re``), like ``currency_pegs``, so it can never cycle with the
+provider modules that import it -- which is also why the count is computed in ``financial_data``,
+where ``provider_diagnostics.is_lost_source`` already lives.
 """
 
 import re
@@ -44,34 +59,3 @@ def is_yahoo_fx_ticker(identifier: str) -> bool:
 def is_fx_identifier(identifier: str) -> bool:
     """Whether ``identifier`` names an exchange rate on either vendor."""
     return is_fred_fx_series(identifier) or is_yahoo_fx_ticker(identifier)
-
-
-# Why one attempted identifier carried no data, in the disclosure's own words. Keys are the
-# ``details["sources"]`` tokens ``financial_data`` records; an unlisted token renders verbatim so a
-# newly-added one shows up as itself rather than being smoothed into prose that does not describe it.
-_OUTCOME_PHRASES: dict[str, str] = {
-    "unknown_series": "FRED reports no such series",
-    "empty": "the vendor returned no history",
-    "error": "the fetch failed",
-    "skipped(no_fred_api_key)": "not fetched, no FRED API key is configured",
-}
-
-FX_NO_DATA_HEADER = "### Exchange rate: no vendor data available"
-
-
-def fx_no_data_disclosure(attempted: dict[str, str]) -> str:
-    """One forecaster-facing block naming every exchange-rate source tried and why it carried nothing.
-
-    ``attempted`` maps identifier to its ``details["sources"]`` token, in the order the provider
-    requested them. Empty string for an empty map, so a caller can render it unconditionally.
-    """
-    if not attempted:
-        return ""
-    reasons = ", ".join(
-        f"`{identifier}` ({_OUTCOME_PHRASES.get(token, token)})" for identifier, token in attempted.items()
-    )
-    return (
-        f"{FX_NO_DATA_HEADER}\n\n"
-        "- ⚠ This bundle carries no level, range or volatility figure for this exchange rate. Every "
-        f"exchange-rate source attempted returned nothing: {reasons}."
-    )

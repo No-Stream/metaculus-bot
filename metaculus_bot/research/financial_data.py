@@ -31,9 +31,9 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.currency_pegs import peg_disclosure_lines, peg_for_ticker
 from metaculus_bot.research.fred_rendering import UnknownFredSeries, _fetch_fred_data, _fetch_fred_data_ceiling
-from metaculus_bot.research.fx_identifiers import fx_no_data_disclosure, is_fx_identifier
+from metaculus_bot.research.fx_identifiers import is_fx_identifier
 from metaculus_bot.research.noise_flag import noise_flag_line, screen_for_quote_noise
-from metaculus_bot.research.provider_diagnostics import record_provider_detail
+from metaculus_bot.research.provider_diagnostics import is_lost_source, record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.ts_estimators import (
     CALENDAR_DAYS_PER_YEAR,
@@ -948,30 +948,33 @@ def _assemble_financial_output(
     qid: int | None,
     marker: str,
 ) -> str:
-    """Join the fetched blocks, or fall back to the exchange-rate no-data disclosure, and record detail.
+    """Join the fetched blocks and record the per-identifier detail; "" when nothing was fetched.
 
-    The disclosure fires only when EVERY identifier came back empty and at least one of them named an
-    exchange rate. It is deliberately NOT a generic "no financial data found" sentence: prose standing
-    in for a provider's absent output is the AskNews ``No articles were found`` anti-pattern, which
-    turns a measurable ``empty`` into a ``chars > 0`` ``ok`` that every downstream empty guard reads as
-    success. Scoped this way it says which identifiers were tried and why each carried nothing, so a
-    forecaster on a currency question can tell "we looked and this pair is not quoted anywhere" from
-    "no financial angle was detected" -- the distinction q45363 could not make. The residual cost is
-    that ``providers_succeeded`` counts a disclosure-only render as a success; ``sources=0/N`` plus the
-    ``fx_no_data_disclosure`` count, recorded on every path so a 0 means the check ran, keep it
-    identifiable in the archive.
+    A section with nothing in it is ABSENT, and the per-identifier loss tokens in
+    ``details["sources"]`` are the whole record -- the same answer AskNews gives when both of its
+    search phases come back with no articles (``research/providers.py``). Prose must never stand in
+    for that absence, including on the exchange-rate question this helper's own predicates exist
+    for: a non-empty return flips the orchestrator's status from ``empty`` to ``ok``, counts the
+    provider in ``providers_succeeded``, and defeats every downstream empty guard at once, which is
+    why AskNews' old ``No articles were found`` sentence was removed rather than reworded.
+
+    ``counts["fx_identifiers_empty"]`` is what carries q45363's signal instead: how many attempted
+    EXCHANGE-RATE identifiers came back with nothing in them (shape by ``is_fx_identifier``, outcome
+    by the canonical ``is_lost_source``, so ``empty`` / ``unknown_series`` / ``error`` /
+    ``skipped(no_fred_api_key)`` all count). It is recorded on every path, so a 0 means the check ran
+    rather than that it never did, and it does not depend on whether the section rendered -- an FX
+    identifier lost beside a ticker that rendered fine is the same partial gap and reads the same
+    way.
     """
-    disclosure = (
-        ""
-        if non_empty_results
-        else fx_no_data_disclosure({i: token for i, token in sources.items() if is_fx_identifier(i)})
+    empty_fx_identifiers = sum(
+        1 for identifier, token in sources.items() if is_fx_identifier(identifier) and is_lost_source(token)
     )
     record_provider_detail(
         qid,
         "financial_data",
-        {"sources": sources, "counts": {"fx_no_data_disclosure": 1 if disclosure else 0}},
+        {"sources": sources, "counts": {"fx_identifiers_empty": empty_fx_identifiers}},
     )
-    body = "\n\n".join(non_empty_results) if non_empty_results else disclosure
+    body = "\n\n".join(non_empty_results)
     return body + marker if body else ""
 
 
