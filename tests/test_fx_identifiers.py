@@ -1,20 +1,16 @@
-"""Tests for the exchange-rate identifier shapes and the no-data disclosure.
+"""Tests for the exchange-rate identifier shapes.
 
-The predicates are what decides whether ``financial_data`` says anything at all when every one of
-its identifiers came back empty, so both halves matter: a false negative reproduces q45363 (silence
-on a currency question), and a false positive turns any empty stock or macro fetch into prose, which
-is the AskNews ``No articles were found`` anti-pattern.
+The predicates decide which identifiers ``financial_data`` counts under
+``counts["fx_identifiers_empty"]``, the one field that says a currency question's vendors carried
+nothing. Both directions matter: a false negative loses q45363's signal from the archive, and a
+false positive files an ordinary empty stock or macro fetch as a missing exchange rate. Nothing
+here renders to a forecaster -- a financial section with nothing in it is absent, per the AskNews
+``No articles were found`` rule.
 """
 
 import pytest
 
-from metaculus_bot.research.fx_identifiers import (
-    FX_NO_DATA_HEADER,
-    fx_no_data_disclosure,
-    is_fred_fx_series,
-    is_fx_identifier,
-    is_yahoo_fx_ticker,
-)
+from metaculus_bot.research.fx_identifiers import is_fred_fx_series, is_fx_identifier, is_yahoo_fx_ticker
 
 
 class TestFredFxSeriesShape:
@@ -67,27 +63,3 @@ class TestYahooFxTickerShape:
         assert is_fx_identifier("DEXBOUS")
         assert is_fx_identifier("USDBOB=X")
         assert not is_fx_identifier("UNRATE")
-
-
-class TestNoDataDisclosure:
-    def test_it_names_every_identifier_tried_and_why_each_carried_nothing(self) -> None:
-        rendered = fx_no_data_disclosure({"DEXBOUS": "unknown_series", "USDBOB=X": "empty"})
-
-        assert rendered.startswith(FX_NO_DATA_HEADER)
-        assert "`DEXBOUS` (FRED reports no such series)" in rendered
-        assert "`USDBOB=X` (the vendor returned no history)" in rendered
-        # One block, and short: it is a disclosure, not a research section.
-        assert rendered.count("###") == 1
-        assert len(rendered) < 400
-
-    def test_the_request_order_is_preserved(self) -> None:
-        rendered = fx_no_data_disclosure({"USDBOB=X": "empty", "DEXBOUS": "unknown_series"})
-        assert rendered.index("USDBOB=X") < rendered.index("DEXBOUS")
-
-    def test_an_unmapped_token_renders_verbatim_rather_than_being_smoothed(self) -> None:
-        """A token added later must show up as itself, not as prose that does not describe it."""
-        rendered = fx_no_data_disclosure({"USDBOB=X": "deadline"})
-        assert "`USDBOB=X` (deadline)" in rendered
-
-    def test_nothing_attempted_renders_nothing(self) -> None:
-        assert fx_no_data_disclosure({}) == ""

@@ -33,7 +33,6 @@ from metaculus_bot.research.financial_data import (
     financial_data_provider,
 )
 from metaculus_bot.research.fred_rendering import _fetch_fred_data_ceiling
-from metaculus_bot.research.fx_identifiers import FX_NO_DATA_HEADER
 from metaculus_bot.research.noise_flag import NoiseScreen, noise_flag_line, screen_for_quote_noise
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
@@ -1300,7 +1299,10 @@ class TestExchangeRateRouting:
 
     Three things have to hold. A nonexistent id is distinguishable from a live-but-empty series;
     the Yahoo cross the prompt now asks for renders on its own when FRED has nothing; and a pair
-    NEITHER vendor serves says so once instead of leaving the section absent.
+    NEITHER vendor serves leaves the section ABSENT while its loss shows up in the diagnostics
+    detail. The absence is deliberate and is the AskNews ``No articles were found`` rule: prose
+    standing in for a provider's absent output would flip the orchestrator's status from ``empty``
+    to ``ok`` and count in ``providers_succeeded``, so the count is where the signal lives.
     """
 
     FRED_400 = ValueError("The series does not exist.")
@@ -1352,40 +1354,45 @@ class TestExchangeRateRouting:
         assert detail["sources"]["DEXBOUS"] == "unknown_series"
         assert _is_lost_source(detail["sources"]["DEXBOUS"])
         assert detail["sources"]["USDBOB=X"] == "ok"
-        assert detail["counts"]["fx_no_data_disclosure"] == 0
+        # The count is a per-identifier vendor outcome, not a property of the section: the FRED id
+        # carried nothing even though the Yahoo cross rendered, so the partial gap is still visible.
+        assert detail["counts"]["fx_identifiers_empty"] == 1
 
     @pytest.mark.asyncio
-    async def test_a_pair_neither_vendor_serves_says_so_once(self) -> None:
+    async def test_a_pair_neither_vendor_serves_leaves_the_section_absent(self) -> None:
+        """Both vendors tried, neither carried anything: no section, and the loss in the detail.
+
+        Nothing renders -- not even the routing marker, which only ever rides a body. What a
+        residual round reads instead is the two loss tokens plus the count of exchange-rate
+        identifiers among them.
+        """
         question = self._fx_question(45364)
 
         result = await self._run(question, "FINANCIAL: YES\nTICKERS: USDBOB=X\nFRED_SERIES: DEXBOUS", yahoo={})
 
-        assert FX_NO_DATA_HEADER in result
-        assert "`DEXBOUS` (FRED reports no such series)" in result
-        assert "`USDBOB=X` (the vendor returned no history)" in result
-        # The routing marker rides along, so the disclosure path is as auditable as a data path.
-        assert "<!-- financial_routing:" in result
+        assert result == ""
         detail = pop_provider_detail(question.id_of_question, "financial_data")
-        assert detail["counts"]["fx_no_data_disclosure"] == 1
         assert detail["sources"] == {"USDBOB=X": "empty", "DEXBOUS": "unknown_series"}
+        assert detail["counts"]["fx_identifiers_empty"] == 2
 
     @pytest.mark.asyncio
-    async def test_a_fred_only_currency_question_still_discloses(self) -> None:
+    async def test_a_fred_only_currency_question_is_absent_but_counted(self) -> None:
         """The literal q45363 classification: one bogus FX series, no ticker at all."""
         question = self._fx_question(45365)
 
         result = await self._run(question, "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: DEXBOUS", yahoo={})
 
-        assert FX_NO_DATA_HEADER in result
-        assert "`DEXBOUS` (FRED reports no such series)" in result
+        assert result == ""
+        detail = pop_provider_detail(question.id_of_question, "financial_data")
+        assert detail["sources"] == {"DEXBOUS": "unknown_series"}
+        assert detail["counts"]["fx_identifiers_empty"] == 1
 
     @pytest.mark.asyncio
-    async def test_a_non_currency_question_with_nothing_to_render_stays_silent(self) -> None:
-        """The disclosure must NOT generalize into a "no financial data found" sentence.
+    async def test_a_non_currency_question_with_nothing_to_render_counts_nothing(self) -> None:
+        """A stock and a macro series carrying nothing are not exchange rates, so the count stays 0.
 
-        Prose standing in for a provider's absent output is the AskNews ``No articles were found``
-        anti-pattern: it turns a measurable ``empty`` into a ``chars > 0`` ``ok`` that every
-        downstream empty guard reads as success. Only an EXCHANGE-RATE identifier earns a line.
+        The 0 is itself a reading: it says the check ran on this question and found no lost FX
+        identifier, which is what separates it from a record where the check never ran.
         """
         question = _make_q("Will Apple stock exceed $200 by end of 2026?")
         question.id_of_question = 45366
@@ -1394,7 +1401,7 @@ class TestExchangeRateRouting:
 
         assert result == ""
         detail = pop_provider_detail(question.id_of_question, "financial_data")
-        assert detail["counts"]["fx_no_data_disclosure"] == 0
+        assert detail["counts"]["fx_identifiers_empty"] == 0
         assert detail["sources"] == {"AAPL": "empty", "NOTASERIES": "unknown_series"}
 
     @pytest.mark.asyncio
