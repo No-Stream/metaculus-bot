@@ -403,6 +403,57 @@ class TestGhostForecastJson:
         assert _parse_one(GHOST_FORECAST_JSON_LINE)["marker"] == "ghost_forecast_json"
 
 
+# Copied from the one emitting format string
+# (research/agentic/tools.py:_throttled_fetch_outcome). `phrase` is last because it holds a
+# multi-word entry of `fetch_outcomes.FETCH_THROTTLE_PHRASES`, so the spec captures it to
+# end-of-line. The URL and body below are the q45191 event: this is the 2022-08-31 daily
+# summary the loop asked for at step 11 and again at step 23 (from that run's archived
+# transcript), and ogimet.com answered both with a rate-limit interstitial under HTTP 200.
+# `chars` is the whitespace-stripped length the rule measured, 303 of the archived body's 304.
+_OGIMET_2022_URL = (
+    "https://www.ogimet.com/cgi-bin/gsynext?lang=en&state=United+S&rank=10&ano=2022&mes=08&day=31&hora=23&Send=send"
+)
+AGENTIC_FETCH_THROTTLED_LINE = (
+    PFX + "AGENTIC_FETCH_THROTTLED: url=" + _OGIMET_2022_URL + " method=rendered chars=303 phrase=query per"
+)
+
+
+class TestAgenticFetchThrottled:
+    """Per-fetch throttle-interstitial record.
+
+    Worth a spec because the event had no trace whatever before it, and its failure mode is
+    looking like a success: on q45191 two throttled fetches reached the driver as
+    ``status: ok``, were cached, and were replayed on its own retry. The pair of fields the
+    archive needs is ``chars`` + ``phrase`` — together they say whether a prod fire was a real
+    throttle or the rule over-reaching, which is what the cap and the phrase list get retuned
+    on.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(AGENTIC_FETCH_THROTTLED_LINE)
+        assert rec["marker"] == "agentic_fetch_throttled"
+        # A query-string URL with & and + survives the \S+ capture whole.
+        assert rec["url"] == _OGIMET_2022_URL
+        # Which rung served the interstitial: the receipt's arrived on the rendered one, and a
+        # plain-vs-rendered split says whether escalating spent a second same-host request.
+        assert rec["method"] == "rendered"
+        assert rec["chars"] == 303
+        assert rec["phrase"] == "query per"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        # The tool handlers run below the loop's log_prefix and have no question id, exactly
+        # like the credit markers. Asserting it here keeps a future "add question=" edit from
+        # landing without also declaring a qid_kind.
+        rec = _parse_one(AGENTIC_FETCH_THROTTLED_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_a_single_word_phrase_still_parses(self):
+        rec = _parse_one(PFX + "AGENTIC_FETCH_THROTTLED: url=https://x.test/a method=plain chars=42 phrase=ratelimit")
+        assert rec["phrase"] == "ratelimit"
+        assert rec["chars"] == 42
+
+
 class TestOpenBoundPiling:
     def test_fields(self):
         rec = _parse_one(OPEN_BOUND_PILING_LINE)

@@ -943,6 +943,17 @@ the telemetry markers:
   `GHOST_PRE_JSON` and `GHOST_FORECAST` / `GHOST_FORECAST_JSON` lines log the
   loop's pre- and post-research private forecasts for telemetry only; neither is
   ever published. `docs/agentic_gap_fill.md` reads the fields in full.
+- `AGENTIC_FETCH_THROTTLED: url=... method=... chars=... phrase=...` — a WARN, one per
+  gap-fill v2 fetch whose HTTP 200 body was the host's rate-limit interstitial rather than
+  the page (a body at or under `FETCH_THROTTLE_PAGE_MAX_CHARS` carrying one of
+  `FETCH_THROTTLE_PHRASES`, both in `research/agentic/fetch_outcomes.py`). Such a fetch
+  returns `status=throttled`, earns no verification tier, and is never cached, so the
+  driver's retry is a real request. `phrase` names the rule that fired and `chars` the body
+  it fired on: together they say whether a line is a true throttle or the rule over-reaching,
+  which is what the phrase list and the cap get retuned on. Emitted by
+  `_throttled_fetch_outcome` in `research/agentic/tools.py`; harvested as
+  `agentic_fetch_throttled`. Receipt: q45191, where two throttled ogimet.com fetches reached
+  the driver as successful ones and the driver's own retry was served the cached refusal.
 - `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=...` —
   one line per URL the resolution-source provider fetched, emitted by
   `_log_fetch_outcome_markers` in `research/resolution_source.py`. `status` is `ok`

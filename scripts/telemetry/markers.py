@@ -14,6 +14,10 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``GHOST_FORECAST_JSON`` — ``metaculus_bot/research/agentic/loop.py`` ``_run_ghost_phase``
   (additive full-fidelity companion to ``GHOST_FORECAST``; the ``forecast_json``
   field is a compact single-line JSON blob the ghost scorer ``json.loads``)
+* ``AGENTIC_FETCH_THROTTLED`` — ``metaculus_bot/research/agentic/tools.py``
+  ``_throttled_fetch_outcome`` (per-FETCH: a host answered the gap-fill v2 ladder with a
+  rate-limit interstitial under HTTP 200. Silent before this spec, and silent in the worst
+  way — the interstitial reached the driver as a successful fetch and was cached)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
 * ``FORECASTER_DROPS`` — ``metaculus_bot/drop_telemetry.py`` ``emit_drop_telemetry``
   (per-RUN summary: which models dropped and why)
@@ -326,6 +330,27 @@ MARKER_SPECS: list[MarkerSpec] = [
         "ghost_forecast_json",
         re.compile(r"(?:question=(?P<question>\S+)\s+)?GHOST_FORECAST_JSON:\s*(?P<forecast_json>\{.*\})\s*$"),
         qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py log_prefix = question.page_url (post id)
+    ),
+    MarkerSpec(
+        "agentic_fetch_throttled",
+        # Per-FETCH: the gap-fill v2 fetch ladder read a 200-OK body that was the host's
+        # rate-limit interstitial rather than the page it asked for
+        # (research/agentic/tools.py:_throttled_fetch_outcome). Registered because the event
+        # had NO trace at all before it and its whole failure mode is looking like a success:
+        # on q45191 two throttled ogimet.com fetches were served to the driver as
+        # `status: ok`, cached, and replayed on its own retry, so the exact-date reference
+        # class it published came to 4 years instead of 6. No `question=` — the tool handlers
+        # run below the loop's log_prefix and have no question id, exactly like the credit
+        # markers, so a join goes through the run id.
+        #
+        # `phrase` is the entry of ``fetch_outcomes.FETCH_THROTTLE_PHRASES`` that fired and
+        # is last because it contains spaces; with `chars` (the body's length) it is what
+        # lets a prod fire be graded true or false positive, and the phrase list and the
+        # ``FETCH_THROTTLE_PAGE_MAX_CHARS`` cap retuned on evidence rather than taste.
+        re.compile(
+            r"AGENTIC_FETCH_THROTTLED:\s*url=(?P<url>\S+)\s+method=(?P<method>\S+)"
+            r"\s+chars=(?P<chars>\S+)\s+phrase=(?P<phrase>.*)"
+        ),
     ),
     MarkerSpec(
         "open_bound_piling",

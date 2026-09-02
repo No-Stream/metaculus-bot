@@ -287,6 +287,21 @@ harvests pre-branch archived logs that end at `lint_rejections`. This marker is
 grep-able in the durable `run_logs/` artifacts every workflow tees, so the driver
 can be vibe-evaluated after the fact without pulling any research-archive JSON.
 
+One event outside that line has its own marker, because it is invisible in the counters:
+a fetch whose 200-OK body was the host's rate-limit interstitial rather than the page logs
+
+```
+AGENTIC_FETCH_THROTTLED: url=... method=... chars=... phrase=...
+```
+
+as a WARN from `tools.py`, harvested as `agentic_fetch_throttled`. It carries no `question=`
+(the tool handlers run below the loop's `log_prefix`), so a join goes through the run id.
+Such a fetch returns `status=throttled` and is never cached, so the driver's retry of the
+same URL is a real request; `chars` and `phrase` are the two fields that say whether a fire
+was a true throttle or the rule over-reaching. Receipt: q45191, where two throttled
+ogimet.com fetches reached the driver as successful ones and its own retry was served the
+cached refusal.
+
 For a richer trace, the seam accepts an `archive_sink` callback. When the loop
 actually ran, the orchestrator captures `{transcript, telemetry}` through it and
 writes it into the research archive (`persistence.py`), including empty-findings

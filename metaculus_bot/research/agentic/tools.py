@@ -50,6 +50,7 @@ from metaculus_bot.research.agentic.fetch_outcomes import (
     _plain_html_outcome,
     _plain_redirect_outcome,
     _plain_textual_outcome,
+    matched_throttle_phrase,
 )
 from metaculus_bot.research.agentic.tool_backends import (
     _call_asknews_search,
@@ -149,6 +150,48 @@ _NO_CONTENT_FETCH_MSG = (
     "read; do NOT cite it as a fetched source. Try read_document(url, ask) for a targeted "
     "extraction, or find another source."
 )
+
+
+_THROTTLED_FETCH_MSG = (
+    "Rate limited: {url} returned HTTP 200, but its body is a short interstitial carrying the "
+    'throttle phrase "{phrase}", not the page. Nothing from this URL was read: do NOT cite it as '
+    "a fetched source, and do NOT read it as evidence that the fact is unavailable — the page "
+    "exists and we were refused for asking too fast. Do other work now (a different host, "
+    "another gap) and call fetch on this URL again later in the run; a retry is a real request, "
+    "not a replay of this one."
+)
+
+
+def _throttled_fetch_outcome(url: str, text: str, phrase: str, *, method: str) -> ToolOutcome:
+    """Outcome for a 200-OK body that is the host's rate-limit interstitial, not the page.
+
+    Mirrors :func:`_empty_fetch_outcome` in both guards — a non-``"ok"`` status AND a method
+    absent from ``provenance._METHOD_TO_TIER`` — so an interstitial can never be stamped
+    ``fetched`` and supersede the briefing. Deliberately NOT cached, which is the half of
+    this fix that q45191 turned on: the interstitial was cached under ``method="rendered"``
+    and served straight back when the driver retried the same URL, so its retry could not
+    have succeeded however many slots it spent.
+    """
+    logger.warning(f"AGENTIC_FETCH_THROTTLED: url={url} method={method} chars={len(text.strip())} phrase={phrase}")
+    return ToolOutcome(
+        content_markdown=_THROTTLED_FETCH_MSG.format(url=url, phrase=phrase),
+        method="throttled",
+        status="throttled",
+    )
+
+
+def _read_content_outcome(url: str, text: str, links: list[str], *, method: str, start_char: int) -> ToolOutcome:
+    """Render a body the ladder read, unless it is a throttle interstitial standing in for it.
+
+    The one seam every successful ``fetch`` return goes through, so no success path can cache
+    or tier an interstitial. The ladder itself is untouched: a throttled plain body still
+    escalates to the rendered rung exactly as a thin one does, and only the outcome the
+    driver receives changes.
+    """
+    phrase = matched_throttle_phrase(text)
+    if phrase is not None:
+        return _throttled_fetch_outcome(url, text, phrase, method=method)
+    return _render_fetch_outcome(url, text, links, method=method, start_char=start_char)
 
 
 def _empty_fetch_outcome(url: str) -> ToolOutcome:
@@ -529,21 +572,21 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
     if plain.status not in ("ok", "empty"):
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="error")
     if plain.status == "ok" and not plain.escalate_rendered:
-        return _render_fetch_outcome(url, plain.text, plain.links, method="plain", start_char=start_char)
+        return _read_content_outcome(url, plain.text, plain.links, method="plain", start_char=start_char)
 
     rendered = await _try_rendered_fetch(plain.url)
     if rendered is not None:
         if rendered.method == "document_needed":
             return await read_document(rendered.url, _generic_document_ask(question_topic))
         if rendered.status == "ok" and rendered.text:
-            return _render_fetch_outcome(url, rendered.text, rendered.links, method="rendered", start_char=start_char)
+            return _read_content_outcome(url, rendered.text, rendered.links, method="rendered", start_char=start_char)
     # Rendered was unavailable, errored, or itself extracted nothing. Fall back to
     # plain ONLY when the plain fetch actually read (thin-but-real) content; a plain
     # fetch that produced nothing has no content to hand back and must not be
     # laundered as a successful "plain"/"ok" retrieval (the companiesmarketcap.com
     # js-wall failure: an unread page stamped `fetched` and superseded the briefing).
     if plain.status == "ok":
-        return _render_fetch_outcome(url, plain.text, plain.links, method="plain", start_char=start_char)
+        return _read_content_outcome(url, plain.text, plain.links, method="plain", start_char=start_char)
     return _empty_fetch_outcome(plain.url)
 
 

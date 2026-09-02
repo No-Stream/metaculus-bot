@@ -13,6 +13,7 @@ import pytest
 from playwright.async_api import Error as _PlaywrightError
 
 from metaculus_bot.research import providers as research_providers
+from metaculus_bot.research.agentic import fetch_outcomes
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
 
@@ -1353,6 +1354,219 @@ def test_empty_method_maps_to_no_tier() -> None:
     "empty" method itself maps to no tier — the guard is doubly deterministic."""
     assert _method_to_tier("empty") is None
     assert _method_to_tier("plain") == "fetched"
+
+
+# Verbatim, from the q45191 run's archived transcript
+# (backtests/research_archive/latest/45191.json -> gap_fill_v2.transcript, the tool result
+# the driver read at step 11 and again from cache at step 23). 304 chars, HTTP 200,
+# status="ok", method="rendered": ogimet.com's throttle interstitial standing in for the
+# 2022-08-31 daily summary the loop asked for.
+_OGIMET_THROTTLE_BODY = (
+    "| Professional information about meteorological conditions in the world |  |  | \n"
+    "| WEATHER MODEL FORECAST METEOGRAMS INDEXES UNDECODED REPORTS TEXT INFORMATION BUFR "
+    "REPORTS GRAPHIC INFORMATION OTHER Advertisements | gsynext: Limit for old data queries "
+    "exceeded. Permitted a query per 20 seconds per IP |\n"
+)
+
+
+def _plain_result(text: str, *, escalate_rendered: bool = False, url: str = "https://www.ogimet.com/summary") -> Any:
+    return SimpleNamespace(
+        status="ok", method="plain", text=text, links=[], url=url, escalate_rendered=escalate_rendered
+    )
+
+
+class TestThrottleInterstitialIsNotASuccess:
+    """A host that throttles us answers 200 with a sentence instead of the page.
+
+    q45191 (2026-08-10): three parallel ogimet.com fetches tripped that host's one-query-per-
+    20-seconds rule, two came back as the interstitial under ``status: ok``, the window cache
+    stored it, and the driver's own retry of the same URL was served the stored copy
+    (``method: cache``) — so the retry it correctly made could not have succeeded. The
+    exact-date reference class it published came to 4 years instead of 6, and the forecast
+    under-committed to the state it had already named as the winner.
+
+    The fix belongs on the tool, not in the prompt: that run's own pending lead reads
+    "Ogimet rate-limited further historical August 31 queries (2022 and 2023)", so the driver
+    had already diagnosed the throttle and still had no way back to the page.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_rendered_interstitial_is_throttled_not_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The receipt's exact ladder path: the plain rung read too little and escalated, and
+        # the rendered rung returned the interstitial.
+        monkeypatch.setattr(
+            agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result("nav only", escalate_rendered=True))
+        )
+        monkeypatch.setattr(
+            agentic_tools,
+            "_try_rendered_fetch",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    status="ok",
+                    method="rendered",
+                    text=_OGIMET_THROTTLE_BODY,
+                    links=[],
+                    url="https://www.ogimet.com/summary",
+                )
+            ),
+        )
+
+        outcome = await agentic_tools.fetch("https://www.ogimet.com/summary")
+
+        assert outcome.status == "throttled"
+        assert outcome.method == "throttled"
+        # The interstitial text itself must not reach the driver as content.
+        assert "Limit for old data queries exceeded" not in outcome.content_markdown
+        # What the driver is told to do instead: retry later, and do not read the refusal as
+        # the fact being unavailable (the null-result reading that cost q44799).
+        assert "again later in the run" in outcome.content_markdown
+        assert "do NOT read it as evidence that the fact is unavailable" in outcome.content_markdown
+
+    @pytest.mark.asyncio
+    async def test_a_plain_interstitial_is_throttled_without_a_rendered_hop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same body arriving on the plain rung with enough chars not to escalate.
+        rendered = AsyncMock()
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result(_OGIMET_THROTTLE_BODY)))
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+
+        outcome = await agentic_tools.fetch("https://www.ogimet.com/summary")
+
+        assert outcome.status == "throttled"
+        rendered.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_interstitial_is_never_cached_so_the_retry_refetches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The half of the fix q45191 turned on: the driver's retry must be a real request."""
+        fetch_plain = AsyncMock(return_value=_plain_result(_OGIMET_THROTTLE_BODY))
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", fetch_plain)
+
+        first = await agentic_tools.fetch("https://www.ogimet.com/summary")
+        assert first.status == "throttled"
+        assert agentic_tools._FETCH_TEXT_CACHE == {}
+
+        # The host has since let us through: the retry gets the page, not the stored refusal.
+        fetch_plain.return_value = _plain_result("31/08/2022  41.1  Phoenix Sky Harbor")
+        second = await agentic_tools.fetch("https://www.ogimet.com/summary")
+
+        assert fetch_plain.await_count == 2
+        assert second.status == "ok"
+        assert second.method == "plain"
+        assert "Phoenix Sky Harbor" in second.content_markdown
+
+    @pytest.mark.asyncio
+    async def test_a_short_legitimate_page_is_still_a_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Under the char cap but with no throttle phrase: real content, cached as before.
+
+        The size half of the rule is what keeps this safe — a one-line official statement is
+        the shape ``_plain_html_outcome`` deliberately keeps as "ok", and demoting it would
+        cost more than the throttle it is trying to catch.
+        """
+        body = "The Ministry confirmed the vote will be held on 12 October 2026."
+        assert len(body) < fetch_outcomes.FETCH_THROTTLE_PAGE_MAX_CHARS
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result(body)))
+
+        outcome = await agentic_tools.fetch("https://example.gov/statement")
+
+        assert outcome.status == "ok"
+        assert outcome.method == "plain"
+        assert outcome.content_markdown == body
+        assert agentic_tools._FETCH_TEXT_CACHE["https://example.gov/statement"] == body
+
+    @pytest.mark.asyncio
+    async def test_a_long_page_about_rate_limits_is_still_a_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The phrase half alone would demote a page that merely discusses throttling."""
+        body = "This API returns 429 Too Many Requests once you exceed the rate limit. " * 40
+        assert len(body) > fetch_outcomes.FETCH_THROTTLE_PAGE_MAX_CHARS
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result(body)))
+
+        outcome = await agentic_tools.fetch("https://example.com/api-docs")
+
+        assert outcome.status == "ok"
+        assert outcome.method == "plain"
+
+    @pytest.mark.asyncio
+    async def test_a_throttled_fetch_earns_no_verification_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End-to-end through the loop's real stamping helper: an interstitial can never be
+        stamped ``fetched``, so a "correction" resting on it cannot supersede the briefing."""
+        url = "https://www.ogimet.com/summary"
+        monkeypatch.setattr(
+            agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result(_OGIMET_THROTTLE_BODY, url=url))
+        )
+
+        outcome = await agentic_tools.fetch(url)
+
+        assert _harvest_verification_tiers("fetch", {"url": url}, outcome) == {}
+
+    def test_throttled_method_maps_to_no_tier(self) -> None:
+        # Belt-and-suspenders, exactly as for "empty": even if a future edit let
+        # status=="ok" through, the method itself grants nothing.
+        assert _method_to_tier("throttled") is None
+
+    @pytest.mark.asyncio
+    async def test_the_marker_names_the_rule_that_fired(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One greppable WARN per throttled fetch: without it the event has no trace at all,
+        and ``phrase``/``chars`` are what let a prod fire be graded true or false positive."""
+        monkeypatch.setattr(
+            agentic_tools,
+            "_fetch_plain",
+            AsyncMock(return_value=_plain_result(_OGIMET_THROTTLE_BODY, url="https://www.ogimet.com/summary")),
+        )
+
+        with caplog.at_level(logging.WARNING, logger=agentic_tools.__name__):
+            await agentic_tools.fetch("https://www.ogimet.com/summary")
+
+        # 303, not the archived body's 304: `chars` is the whitespace-stripped length the rule
+        # actually measured against the cap, so the field and the comparison can never disagree.
+        assert (
+            "AGENTIC_FETCH_THROTTLED: url=https://www.ogimet.com/summary method=plain chars=303 phrase=query per"
+            in caplog.text
+        )
+
+
+class TestMatchedThrottlePhrase:
+    """The predicate itself, anchored on the receipt and on the shapes it must not claim."""
+
+    def test_the_q45191_body_matches_on_the_hosts_own_wording(self) -> None:
+        assert fetch_outcomes.matched_throttle_phrase(_OGIMET_THROTTLE_BODY) == "query per"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "429 Too Many Requests",
+            "Rate limit exceeded. Retry after 30 seconds.",
+            "You have made too many requests; please slow down.",
+            "Limit: 60 queries per minute per API key.",
+        ],
+    )
+    def test_common_interstitial_wordings_match(self, body: str) -> None:
+        assert fetch_outcomes.matched_throttle_phrase(body) is not None
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "",
+            "   \n  ",
+            # "rate" alone is not the rule: the phrases are anchored on throttle idiom.
+            "The unemployment rate fell to 4.1% in August.",
+            "Growth is expected to slow down through 2027.",
+            "The limit of the sequence exceeded every earlier bound.",
+        ],
+    )
+    def test_ordinary_prose_does_not_trip_the_rule(self, body: str) -> None:
+        assert fetch_outcomes.matched_throttle_phrase(body) is None
+
+    def test_a_body_over_the_cap_is_a_page_whatever_it_says(self) -> None:
+        # An interstitial is a sentence. A long body carrying the same words is a page about
+        # throttling, and demoting it would discard content we really did read.
+        body = "Rate limit exceeded. " * 200
+        assert len(body) > fetch_outcomes.FETCH_THROTTLE_PAGE_MAX_CHARS
+        assert fetch_outcomes.matched_throttle_phrase(body) is None
 
 
 @pytest.mark.asyncio
