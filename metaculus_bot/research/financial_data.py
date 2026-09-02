@@ -30,7 +30,8 @@ from metaculus_bot.constants import (
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.currency_pegs import peg_disclosure_lines, peg_for_ticker
-from metaculus_bot.research.fred_rendering import _fetch_fred_data, _fetch_fred_data_ceiling
+from metaculus_bot.research.fred_rendering import UnknownFredSeries, _fetch_fred_data, _fetch_fred_data_ceiling
+from metaculus_bot.research.fx_identifiers import fx_no_data_disclosure, is_fx_identifier
 from metaculus_bot.research.noise_flag import noise_flag_line, screen_for_quote_noise
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -246,6 +247,20 @@ def extract_financial_identifiers_from_criteria(text: str) -> dict[str, list[str
     return {"tickers": tickers, "fred_series": fred_series}
 
 
+# Exchange-rate routing rule, interpolated into CLASSIFIER_PROMPT below.
+#
+# The reference tables carry NO exchange-rate FRED series at all and only three currency crosses, so
+# on a question about any other currency the classifier had nothing to route to and invented an id:
+# q45363 got `DEXBOUS`, which does not exist on FRED, with no Yahoo cross beside it, and therefore no
+# financial block at all on a currency question (see fx_identifiers for the full receipt). Naming
+# Yahoo's two FX spellings and forbidding an unsourced FRED FX id is the fix at the cause, because the
+# currency's ISO code is not recoverable downstream: FRED's country codes are not ISO currency codes,
+# and the `BO` in `DEXBOUS` is a country rather than a currency, so the classifier is the only step in
+# the pipeline that can name the pair.
+_FX_ROUTING_RULE = """EXCHANGE-RATE QUESTIONS: route these to a Yahoo FX ticker, never to a FRED series unless the resolution criteria name one by URL. Yahoo serves every cross in two spellings that mean opposite directions: USD<ISO>=X (equivalently <ISO>=X) quotes units of the foreign currency per US dollar, and <ISO>USD=X quotes US dollars per unit of it. Emit the spelling that matches how the question quotes the rate - a question asking how many bolivianos one US dollar buys is USDBOB=X, a question asking the dollar value of one boliviano is BOBUSD=X. This holds for every currency, including ones absent from the reference table above.
+
+NEVER invent a FRED series ID. Emit only IDs listed in the reference table above, or ones a URL in the resolution criteria names explicitly."""
+
 # Built from _TICKER_GROUPS / _FRED_GROUPS so the prompt's reference table and the
 # KNOWN_* allowlist share one source of truth (the f-string-injected blocks carry no
 # `{...}` of their own; the trailing {question_text}/{resolution_criteria}/{fine_print}
@@ -263,6 +278,8 @@ REFERENCE TABLE of common tickers and FRED series:
 
 FRED series:
 {_build_fred_reference_lines()}
+
+{_FX_ROUTING_RULE}
 
 Only output YES if there are specific tickers or FRED series that would provide useful data.
 If the question is about general economic trends without specific measurable indicators, output NO.
@@ -720,6 +737,9 @@ def _resolve_fetch_as_of(question: MetaculusQuestion, *, is_benchmarking: bool) 
     return open_time
 
 
+FRED_SKIPPED_NO_KEY_TOKEN = "skipped(no_fred_api_key)"  # noqa: S105  # diagnostics source token, not a credential
+
+
 def _build_financial_fetch_jobs(
     tickers: list[str],
     fred_series: list[str],
@@ -727,12 +747,18 @@ def _build_financial_fetch_jobs(
     as_of: datetime,
     is_benchmarking: bool,
     resolving_fred_series: frozenset[str] = frozenset(),
-) -> list[tuple[str, asyncio.Task]]:
+) -> tuple[list[tuple[str, asyncio.Task]], dict[str, str]]:
     """Spawn one fetch task per identifier, each paired with the ticker/FRED id it fetches.
 
     ``resolving_fred_series`` holds the UPPER-CASED ids the resolution criteria cited by URL
     — the series a question actually grades against — which is what earns the extra
     first-release/vintage fetch on the live path.
+
+    Returns ``(jobs, not_fetched)``, where ``not_fetched`` maps every identifier that never
+    became a job to its ``details["sources"]`` loss token. Only the missing-``FRED_API_KEY``
+    case populates it today, and it exists because a skipped series used to leave NO source
+    token at all: N requested series vanished from the diagnostics map, so the line read as
+    fully healthy while nothing had been fetched for them.
     """
     jobs: list[tuple[str, asyncio.Task]] = [
         (
@@ -750,7 +776,7 @@ def _build_financial_fetch_jobs(
             (series_id, asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data_ceiling, series_id, as_of)))
             for series_id in fred_series
         )
-        return jobs
+        return (jobs, {})
     fred_api_key = os.getenv(FRED_API_KEY_ENV)
     if fred_api_key:
         jobs.extend(
@@ -769,7 +795,8 @@ def _build_financial_fetch_jobs(
         )
     elif fred_series:
         logger.info(f"FRED_API_KEY not set, skipping {len(fred_series)} FRED series fetches")
-    return jobs
+        return (jobs, dict.fromkeys(fred_series, FRED_SKIPPED_NO_KEY_TOKEN))
+    return (jobs, {})
 
 
 async def _gather_financial_results(jobs: list[tuple[str, asyncio.Task]]) -> tuple[list[str], dict[str, str]]:
@@ -778,11 +805,19 @@ async def _gather_financial_results(jobs: list[tuple[str, asyncio.Task]]) -> tup
     Per-identifier outcome for the diagnostics block: a requested ticker/FRED
     series that errored or returned no data is a lost source, so a partial
     financial fetch stays visible even when other identifiers succeed.
+
+    A FRED id that does not exist gets its own ``unknown_series`` token rather than the generic
+    ``error``: it means an id was hallucinated (or a resolution URL is dead), which is a defect to
+    chase, while ``error`` is an upstream failure to retry. The WARN naming the id was already
+    emitted at the fetch site, so nothing is logged again here.
     """
     results = await asyncio.gather(*(task for _, task in jobs), return_exceptions=True)
     non_empty_results: list[str] = []
     sources: dict[str, str] = {}
     for (identifier, _), result in zip(jobs, results, strict=True):
+        if isinstance(result, UnknownFredSeries):
+            sources[identifier] = "unknown_series"
+            continue
         if isinstance(result, Exception):
             logger.warning(f"Financial data fetch task failed: {result}")
             sources[identifier] = "error"
@@ -886,25 +921,58 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         # a valid-but-unlisted series shouldn't be dropped, just made visible.
         unknown = _flag_unknown_classifier_ids(classifier_tickers, classifier_fred, extracted)
 
-        jobs = _build_financial_fetch_jobs(
+        jobs, not_fetched = _build_financial_fetch_jobs(
             tickers,
             fred_series,
             as_of=as_of,
             is_benchmarking=is_benchmarking,
             resolving_fred_series=frozenset(sid.upper() for sid in extracted["fred_series"]),
         )
-        if not jobs:
-            return ""
 
         non_empty_results, sources = await _gather_financial_results(jobs)
-        record_provider_detail(qid, "financial_data", {"sources": sources})
-
-        if not non_empty_results:
-            return ""
-
-        return "\n\n".join(non_empty_results) + _build_routing_marker(fred_series, tickers, extracted, unknown)
+        sources.update(not_fetched)
+        return _assemble_financial_output(
+            non_empty_results,
+            sources,
+            qid=qid,
+            marker=_build_routing_marker(fred_series, tickers, extracted, unknown),
+        )
 
     return _fetch
+
+
+def _assemble_financial_output(
+    non_empty_results: list[str],
+    sources: dict[str, str],
+    *,
+    qid: int | None,
+    marker: str,
+) -> str:
+    """Join the fetched blocks, or fall back to the exchange-rate no-data disclosure, and record detail.
+
+    The disclosure fires only when EVERY identifier came back empty and at least one of them named an
+    exchange rate. It is deliberately NOT a generic "no financial data found" sentence: prose standing
+    in for a provider's absent output is the AskNews ``No articles were found`` anti-pattern, which
+    turns a measurable ``empty`` into a ``chars > 0`` ``ok`` that every downstream empty guard reads as
+    success. Scoped this way it says which identifiers were tried and why each carried nothing, so a
+    forecaster on a currency question can tell "we looked and this pair is not quoted anywhere" from
+    "no financial angle was detected" -- the distinction q45363 could not make. The residual cost is
+    that ``providers_succeeded`` counts a disclosure-only render as a success; ``sources=0/N`` plus the
+    ``fx_no_data_disclosure`` count, recorded on every path so a 0 means the check ran, keep it
+    identifiable in the archive.
+    """
+    disclosure = (
+        ""
+        if non_empty_results
+        else fx_no_data_disclosure({i: token for i, token in sources.items() if is_fx_identifier(i)})
+    )
+    record_provider_detail(
+        qid,
+        "financial_data",
+        {"sources": sources, "counts": {"fx_no_data_disclosure": 1 if disclosure else 0}},
+    )
+    body = "\n\n".join(non_empty_results) if non_empty_results else disclosure
+    return body + marker if body else ""
 
 
 def _flag_unknown_classifier_ids(

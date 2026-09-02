@@ -630,6 +630,31 @@ MARKER_SPECS: list[MarkerSpec] = [
         ),
     ),
     MarkerSpec(
+        "fred_unknown_series",
+        # A FRED series id that does not exist, as FRED itself reports it (``400 "The series does
+        # not exist"``, surfaced by fredapi as a ``ValueError`` carrying that body). Emitted by
+        # ``fred_rendering._fetch_fred_data`` on the live path only; the keyless benchmarking
+        # fetcher cannot tell a bad id from a vintage predating the series, so it stays silent
+        # rather than guessing.
+        #
+        # NOT alertable: a hallucinated id is the classifier's habit, not a bot crash, and the
+        # provider degrades to whatever its other identifiers returned. What the marker buys is
+        # the incidence — q45363 lost its whole financial block to ``DEXBOUS`` with only the
+        # ambiguous ``DEXBOUS:empty`` source token to show for it, which reads identically to a
+        # live series with no observations.
+        #
+        # ``proposed_by`` splits the two causes, which want different responses: ``classifier``
+        # means an LLM invented the id (the prompt's FX routing rule is the fix point), while
+        # ``resolution_url`` means the QUESTION's own resolution criteria link a dead FRED page,
+        # which is a fact about the question rather than about us.
+        #
+        # No question ref: the fetch runs in a per-identifier ``to_thread`` worker with no
+        # question in scope, the same limitation its ``financial_stale_latest`` /
+        # ``financial_noise_flag`` siblings carry, so one question can fire several lines and
+        # ``qid_kind`` stays None.
+        re.compile(r"FRED_UNKNOWN_SERIES:\s*series_id=(?P<series_id>\S+)\s+proposed_by=(?P<proposed_by>\S+)"),
+    ),
+    MarkerSpec(
         "resolution_source_fetch",
         # One line per FETCHED URL, emitted at the per-question aggregation point in the
         # provider (that is where the question id exists — threading it down through the

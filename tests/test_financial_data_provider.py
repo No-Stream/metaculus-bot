@@ -22,6 +22,7 @@ from metaculus_bot.research.financial_data import (
     _PERIOD_TARGET_DAYS,
     CLASSIFIER_PROMPT,
     FRED_LABELS,
+    FRED_SKIPPED_NO_KEY_TOKEN,
     KNOWN_FRED_SERIES,
     KNOWN_TICKERS,
     TICKER_LABELS,
@@ -32,6 +33,7 @@ from metaculus_bot.research.financial_data import (
     financial_data_provider,
 )
 from metaculus_bot.research.fred_rendering import _fetch_fred_data_ceiling
+from metaculus_bot.research.fx_identifiers import FX_NO_DATA_HEADER
 from metaculus_bot.research.noise_flag import NoiseScreen, noise_flag_line, screen_for_quote_noise
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
@@ -1280,6 +1282,155 @@ class TestDeterministicRouting:
 
         assert result == ""
         assert "financial_routing" not in result
+
+
+# ---------------------------------------------------------------------------
+# Exchange-rate routing: hallucinated FRED ids, the Yahoo cross, and the disclosure
+# ---------------------------------------------------------------------------
+
+
+class TestExchangeRateRouting:
+    """q45363 published with no financial block at all on a currency question.
+
+    The classifier proposed the FRED series ``DEXBOUS``, which does not exist -- FRED carries no
+    Bolivia daily FX series -- and named no Yahoo cross beside it, so the forecasters got no level
+    and no realized volatility on an exchange-rate question. The verification pass measured what
+    that cost: a member sized off the resolving series' own 30-print volatility would have scored
+    +55.35 spot peer alone, better than every member that actually ran.
+
+    Three things have to hold. A nonexistent id is distinguishable from a live-but-empty series;
+    the Yahoo cross the prompt now asks for renders on its own when FRED has nothing; and a pair
+    NEITHER vendor serves says so once instead of leaving the section absent.
+    """
+
+    FRED_400 = ValueError("The series does not exist.")
+
+    @staticmethod
+    def _fx_question(qid: int) -> MagicMock:
+        question = _make_q("What will be the Boliviano-USD exchange rate on August 31, 2026?")
+        question.id_of_question = qid
+        return question
+
+    @staticmethod
+    async def _run(question: MagicMock, classifier_response: str, yahoo: dict[str, str]) -> str:
+        """Run the provider with a canned classification, a stubbed Yahoo, and a dead FRED."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = classifier_response
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch(
+                "metaculus_bot.research.financial_data._fetch_yfinance_data",
+                side_effect=lambda ticker, **_: yahoo.get(ticker, ""),
+            ),
+            patch("metaculus_bot.research.fred_rendering.Fred") as mock_fred_class,
+        ):
+            mock_fred_class.return_value.get_series.side_effect = TestExchangeRateRouting.FRED_400
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setenv("FRED_API_KEY", "fake_key")
+            try:
+                return await financial_data_provider()(question)
+            finally:
+                monkeypatch.undo()
+
+    @pytest.mark.asyncio
+    async def test_a_hallucinated_fred_id_gets_its_own_token_and_the_yahoo_cross_still_renders(self) -> None:
+        """The realized q45363 shape, with the fix in place: FRED is dead, Yahoo carries the pair."""
+        question = self._fx_question(45363)
+
+        result = await self._run(
+            question,
+            "FINANCIAL: YES\nTICKERS: USDBOB=X\nFRED_SERIES: DEXBOUS",
+            {"USDBOB=X": "### USDBOB=X\n- Latest price: 11.62 (as of 2026-08-14)"},
+        )
+
+        assert "### USDBOB=X" in result
+        assert "Latest price: 11.62" in result
+        detail = pop_provider_detail(question.id_of_question, "financial_data")
+        # `unknown_series`, not `empty`: the id does not exist, which is a defect to chase rather
+        # than a live source with no observations in the window.
+        assert detail["sources"]["DEXBOUS"] == "unknown_series"
+        assert _is_lost_source(detail["sources"]["DEXBOUS"])
+        assert detail["sources"]["USDBOB=X"] == "ok"
+        assert detail["counts"]["fx_no_data_disclosure"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_pair_neither_vendor_serves_says_so_once(self) -> None:
+        question = self._fx_question(45364)
+
+        result = await self._run(question, "FINANCIAL: YES\nTICKERS: USDBOB=X\nFRED_SERIES: DEXBOUS", yahoo={})
+
+        assert FX_NO_DATA_HEADER in result
+        assert "`DEXBOUS` (FRED reports no such series)" in result
+        assert "`USDBOB=X` (the vendor returned no history)" in result
+        # The routing marker rides along, so the disclosure path is as auditable as a data path.
+        assert "<!-- financial_routing:" in result
+        detail = pop_provider_detail(question.id_of_question, "financial_data")
+        assert detail["counts"]["fx_no_data_disclosure"] == 1
+        assert detail["sources"] == {"USDBOB=X": "empty", "DEXBOUS": "unknown_series"}
+
+    @pytest.mark.asyncio
+    async def test_a_fred_only_currency_question_still_discloses(self) -> None:
+        """The literal q45363 classification: one bogus FX series, no ticker at all."""
+        question = self._fx_question(45365)
+
+        result = await self._run(question, "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: DEXBOUS", yahoo={})
+
+        assert FX_NO_DATA_HEADER in result
+        assert "`DEXBOUS` (FRED reports no such series)" in result
+
+    @pytest.mark.asyncio
+    async def test_a_non_currency_question_with_nothing_to_render_stays_silent(self) -> None:
+        """The disclosure must NOT generalize into a "no financial data found" sentence.
+
+        Prose standing in for a provider's absent output is the AskNews ``No articles were found``
+        anti-pattern: it turns a measurable ``empty`` into a ``chars > 0`` ``ok`` that every
+        downstream empty guard reads as success. Only an EXCHANGE-RATE identifier earns a line.
+        """
+        question = _make_q("Will Apple stock exceed $200 by end of 2026?")
+        question.id_of_question = 45366
+
+        result = await self._run(question, "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: NOTASERIES", yahoo={})
+
+        assert result == ""
+        detail = pop_provider_detail(question.id_of_question, "financial_data")
+        assert detail["counts"]["fx_no_data_disclosure"] == 0
+        assert detail["sources"] == {"AAPL": "empty", "NOTASERIES": "unknown_series"}
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_fred_series_is_recorded_as_a_lost_source(self) -> None:
+        """Without ``FRED_API_KEY`` the series never becomes a job, and used to leave NO token —
+        so N requested series vanished from the source map and the line read as fully healthy."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: UNRATE"
+        question = _make_q("Will Apple stock rise and unemployment fall?")
+        question.id_of_question = 45367
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch(
+                "metaculus_bot.research.financial_data._fetch_yfinance_data",
+                side_effect=lambda ticker, **_: f"### {ticker}\n- Latest price: 190",
+            ),
+        ):
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.delenv("FRED_API_KEY", raising=False)
+            try:
+                result = await financial_data_provider()(question)
+            finally:
+                monkeypatch.undo()
+
+        assert "### AAPL" in result
+        sources = pop_provider_detail(question.id_of_question, "financial_data")["sources"]
+        assert sources["UNRATE"] == FRED_SKIPPED_NO_KEY_TOKEN
+        assert _is_lost_source(sources["UNRATE"])
+
+    def test_the_prompt_routes_exchange_rates_to_a_yahoo_cross(self) -> None:
+        """The cause of q45363 was a reference table with no FX coverage at all, so the classifier
+        had nothing to route to and invented an id. The routing rule is the fix at that cause."""
+        assert "USD<ISO>=X" in CLASSIFIER_PROMPT
+        assert "<ISO>USD=X" in CLASSIFIER_PROMPT
+        assert "NEVER invent a FRED series ID" in CLASSIFIER_PROMPT
 
 
 # ---------------------------------------------------------------------------

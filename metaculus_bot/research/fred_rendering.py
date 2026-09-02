@@ -30,6 +30,41 @@ from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+class UnknownFredSeries(Exception):
+    """FRED answered that the requested series id does not exist.
+
+    Its own outcome rather than the generic soft-fail ``""`` because a nonexistent id is a DEFECT --
+    an LLM-hallucinated or mistyped series -- while an empty series is a live source that simply has
+    no observations in the window, and the two were indistinguishable in the diagnostics ``empty``
+    token. q45363 is the realized case: the classifier proposed ``DEXBOUS``, FRED answered
+    ``400 "The series does not exist"``, and the entire financial block vanished from a currency
+    question leaving ``DEXBOUS:empty`` as the only trace.
+
+    Raised out of the fetch rather than returned because ``financial_data._gather_financial_results``
+    already routes a fetch task's exception into the per-identifier source map, so the exception IS
+    the channel that reaches the diagnostics line without changing the fetchers' ``-> str`` contract.
+    """
+
+    def __init__(self, series_id: str) -> None:
+        super().__init__(f"FRED has no series {series_id!r}")
+        self.series_id = series_id
+
+
+# FRED's own 400 body for an id it does not carry, observed live 2026-09-01 while verifying q45363
+# (``series?series_id=DEXBOUS`` -> ``400 "The series does not exist."``, with ``DEXBZUS`` resolving as
+# the control). ``fredapi`` surfaces that body verbatim: ``Fred.__fetch_data`` catches the
+# ``HTTPError``, parses the response, and re-raises ``ValueError(root.get("message"))``. The phrase is
+# therefore the only evidence available, matched case-insensitively as a substring. Every other
+# failure -- transport, quota, a malformed response -- stays the generic soft-fail, because
+# attributing one of those to a bad id would be a guess.
+_UNKNOWN_SERIES_PHRASE = "does not exist"
+
+
+def is_unknown_fred_series_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is FRED reporting that the requested series id does not exist."""
+    return isinstance(exc, ValueError) and _UNKNOWN_SERIES_PHRASE in str(exc).lower()
+
+
 def _pct_clause(change: float, base: float) -> str:
     """`` (+1.23%)`` for a percent change off ``base``, or "" when there is no percent.
 
@@ -233,7 +268,13 @@ def _fetch_fred_data(series_id: str, api_key: str, *, is_resolving_source: bool 
     resolution criteria, not merely named by the classifier). Those get the extra
     first-release/vintage fetch, since the revision channel only matters for the series the
     question grades against, and every extra identifier would otherwise cost another HTTP
-    round trip inside this thread.
+    round trip inside this thread. It also names the PROPOSER on the unknown-series warning
+    below, since a dead FRED link in a question's own resolution criteria is a different fact
+    from a series the classifier invented.
+
+    Raises ``UnknownFredSeries`` when FRED reports the id does not exist -- the one failure that
+    does not soft-fail to ``""``, so the caller can record it as its own loss token instead of as
+    a live-but-empty series.
     """
     try:
         fred = Fred(api_key=api_key)
@@ -275,7 +316,14 @@ def _fetch_fred_data(series_id: str, api_key: str, *, is_resolving_source: bool 
 
         return _render_fred_series(series_id, data, title, first_releases=first_releases)
 
-    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # provider soft-fail boundary, logged
+    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # provider soft-fail boundary, logged
+        if is_unknown_fred_series_error(exc):
+            logger.warning(
+                "FRED_UNKNOWN_SERIES: series_id=%s proposed_by=%s",
+                series_id,
+                "resolution_url" if is_resolving_source else "classifier",
+            )
+            raise UnknownFredSeries(series_id) from exc
         logger.warning(f"FRED fetch failed for {series_id=}", exc_info=True)
         return ""
 
