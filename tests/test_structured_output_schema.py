@@ -556,15 +556,18 @@ class TestRemainingWindowDaysTelemetryField:
         assert block.remaining_window_days is None
 
     def test_numeric_schema_still_forbids_the_key(self) -> None:
-        """The field ships on the binary and MC schemas only. Numeric prompts do not ask
-        for it, so on a numeric block it is an unexpected key and extra="forbid" applies
-        — asserted so a later prompt edit that adds it there fails loudly here."""
-        with pytest.raises(ValidationError):
-            NumericStructured(
-                question_type="numeric",
-                declared_percentiles={0.1: 1.0, 0.5: 2.0, 0.9: 3.0},
-                remaining_window_days=45,  # type: ignore[call-arg]
-            )
+        """The field ships on the binary and MC schemas only, and the numeric prompt is
+        deliberately not asked for it: on a numeric block the key is unexpected and
+        extra="forbid" drops the whole block. Pinned on the real parse path, and against
+        the same payload without the key, so a prompt edit that starts asking numeric
+        forecasters for it fails loudly here rather than in prod."""
+        percentiles = {"0.1": 1.0, "0.5": 2.0, "0.9": 3.0}
+        without_key = json.dumps({"question_type": "numeric", "declared_percentiles": percentiles})
+        with_key = json.dumps(
+            {"question_type": "numeric", "declared_percentiles": percentiles, "remaining_window_days": 45}
+        )
+        assert isinstance(parse_structured_block(f"```json\n{without_key}\n```", "numeric"), NumericStructured)
+        assert parse_structured_block(f"```json\n{with_key}\n```", "numeric") is None
 
     @pytest.mark.parametrize(
         ("declared", "expected"),
