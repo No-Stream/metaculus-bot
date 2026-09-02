@@ -19,12 +19,15 @@ import pytest
 
 from metaculus_bot.research.financial_data import financial_data_provider
 from metaculus_bot.research.fred_rendering import (
+    UnknownFredSeries,
     _fetch_fred_data,
     _fetch_fred_data_ceiling,
     _format_fred_change,
     _format_fred_value,
     _render_fred_series,
+    is_unknown_fred_series_error,
 )
+from scripts.telemetry.markers import MARKER_SPECS
 from tests.financial_fakes import _BENCH_OPEN_TIME, _make_q, _monthly_fred
 
 
@@ -59,6 +62,73 @@ class TestFetchFredData:
             result = _fetch_fred_data("INVALID", "fake_api_key")
 
         assert result == ""
+
+
+class TestUnknownFredSeries:
+    """A series id FRED says does not exist is its own outcome, not a soft-failed empty.
+
+    q45363 (the Boliviano-USD rate) lost its entire financial block to the hallucinated id
+    ``DEXBOUS``, and the only trace was the diagnostics token ``DEXBOUS:empty`` — byte-identical
+    to a live series that happens to hold no observations in the window. fredapi surfaces FRED's
+    own 400 body as ``ValueError(message)``, so that phrase is the evidence, and everything else
+    keeps soft-failing rather than being attributed to a bad id on a guess.
+    """
+
+    # FRED's own 400 body, read off a live request for the hallucinated id q45363 published on.
+    FRED_400_MESSAGE: ClassVar[str] = "The series does not exist."
+
+    def test_the_fred_400_message_classifies_as_an_unknown_series(self) -> None:
+        assert is_unknown_fred_series_error(ValueError(self.FRED_400_MESSAGE))
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ValueError("Bad Request. The value for variable api_key is not registered."),
+            URLError("connection reset"),
+            ParseError("not xml"),
+            Exception("The series does not exist."),  # right words, wrong type — fredapi raises ValueError
+        ],
+    )
+    def test_every_other_failure_stays_a_generic_soft_fail(self, exc: Exception) -> None:
+        assert not is_unknown_fred_series_error(exc)
+
+    @pytest.mark.parametrize(
+        ("is_resolving_source", "expected_proposer"),
+        [(False, "classifier"), (True, "resolution_url")],
+    )
+    def test_the_fetch_raises_and_warns_naming_the_id_and_its_proposer(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        is_resolving_source: bool,
+        expected_proposer: str,
+    ) -> None:
+        with (
+            patch("metaculus_bot.research.fred_rendering.Fred") as mock_fred_class,
+            caplog.at_level("WARNING"),
+        ):
+            mock_fred_class.return_value.get_series.side_effect = ValueError(self.FRED_400_MESSAGE)
+
+            with pytest.raises(UnknownFredSeries) as excinfo:
+                _fetch_fred_data("DEXBOUS", "fake_api_key", is_resolving_source=is_resolving_source)
+
+        assert excinfo.value.series_id == "DEXBOUS"
+        assert f"FRED_UNKNOWN_SERIES: series_id=DEXBOUS proposed_by={expected_proposer}" in caplog.text
+
+    def test_the_warning_parses_under_its_marker_spec(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The archive harvests this line, so its shape is pinned to the registry regex."""
+        with (
+            patch("metaculus_bot.research.fred_rendering.Fred") as mock_fred_class,
+            caplog.at_level("WARNING"),
+        ):
+            mock_fred_class.return_value.get_series.side_effect = ValueError(self.FRED_400_MESSAGE)
+            with pytest.raises(UnknownFredSeries):
+                _fetch_fred_data("DEXBOUS", "fake_api_key")
+
+        spec = next(s for s in MARKER_SPECS if s.name == "fred_unknown_series")
+        match = spec.regex.search(caplog.text)
+        assert match is not None
+        assert match.group("series_id") == "DEXBOUS"
+        assert match.group("proposed_by") == "classifier"
 
 
 class TestRenderFredSeriesYoY:
