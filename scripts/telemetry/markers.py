@@ -126,9 +126,10 @@ framework logs only ``Posted comment on post N``, never the comment body). They
 are therefore almost never present in run logs — their durable source is the
 comment itself, which ``metaculus_bot.performance_analysis`` already parses. Their
 specs live here so the parser stays complete if a run ever does log a comment
-body, and because STACKER_OUTCOME/TOOLS_USED/ANCHOR/CLAUSE are all dormant in prod
-anyway (stacking + probabilistic-tools disabled). Don't read their absence from
-the telemetry archive as signal.
+body, and because STACKER_OUTCOME/STACKER_SKIP_REASON/TOOLS_USED are all dormant in
+prod anyway (stacking + probabilistic-tools disabled). Don't read their absence from
+the telemetry archive as signal. (The ANCHOR_OVERSHOOT_PP / CLAUSE_PRODUCT_DIVERGENCE_PP
+specs were deleted 2026-09-02 with the fields that fed them; both had 0 archived rows.)
 
 The parser matches on the marker TOKEN via ``re.search``, so it is agnostic to the
 log-line prefix (the prod ``%(asctime)s - %(name)s - %(levelname)s - %(message)s``
