@@ -251,7 +251,7 @@ def _mc_options_line(options: Sequence[str] | None) -> str:
 # The bullet is the policy plus its dash, so the operator-confirmed text is byte-identical
 # on the surface it was confirmed against. Restating it per prompt is what let the two
 # Perplexity sites keep the retired blanket "consider all relevant prediction markets" ask
-# for a release after this one was narrowed.
+# after this one was narrowed, until a review caught them.
 OUTSIDE_VENUE_MARKET_ODDS_POLICY = (
     "Market-implied or crowd odds from sources OTHER than Polymarket, Kalshi, Manifold, or PredictIt "
     "(e.g. Metaculus, Good Judgment Open, CME FedWatch, bookmakers) — always name the market and the date "

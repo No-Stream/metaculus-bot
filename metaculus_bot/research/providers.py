@@ -426,8 +426,8 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
         # The same narrowed policy `web_research_prompt` carries, interpolated rather than
         # restated: this provider is the PRIMARY whenever AskNews credentials are absent, so a
         # second copy of the market-odds ask is a live policy that drifts (it carried the retired
-        # blanket "consider all relevant prediction markets" version for a release after the
-        # first-pass prompt was narrowed to the venues the live snapshot does not cover).
+        # blanket "consider all relevant prediction markets" version after the first-pass prompt
+        # was narrowed to the venues the live snapshot does not cover).
         prediction_markets_instruction = (
             "" if is_benchmarking else f"In addition to news, cover: {OUTSIDE_VENUE_MARKET_ODDS_POLICY}\n"
         )

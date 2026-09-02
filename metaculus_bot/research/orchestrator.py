@@ -585,8 +585,8 @@ class ResearchOrchestrator:
 
         # Same narrowed market-odds policy as `web_research_prompt` and the direct-Perplexity
         # provider, interpolated from the one definition in `prompts` rather than restated —
-        # this prompt carried the retired blanket "briefly research prediction markets" ask for
-        # a release after that policy was narrowed to the venues the live snapshot cannot cover.
+        # this prompt carried the retired blanket "briefly research prediction markets" ask after
+        # that policy was narrowed to the venues the live snapshot cannot cover.
         # The no-speculation tail is this prompt's own and stays: it is an anti-fabrication rule
         # about an empty result, not a second opinion on which venues to read.
         prediction_markets_instruction = (
