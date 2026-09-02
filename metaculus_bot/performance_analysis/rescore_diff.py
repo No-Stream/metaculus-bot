@@ -59,9 +59,11 @@ RESOLUTION_FIELDS: tuple[str, ...] = ("resolution_raw", "resolution_parsed")
 
 PLATFORM_SCORE_BLOCK = "metaculus_scores"
 
-# Recomputation/serialization wiggle versus a genuinely different value, matching
-# ``collector._RESCORE_ATOL``: the platform's own scores round-trip through JSON exactly,
-# and the real q44798 gaps were whole points.
+# Recomputation/serialization wiggle versus a genuinely different value. The platform's own
+# scores round-trip through JSON exactly and our scorer reproduces them to ~1e-14, while the
+# real gaps this exists to catch are whole points (the known-stale q44798 gaps start at 0.6).
+# ``collector.rescore_records`` imports this rather than keeping its own copy, so the
+# "changed" threshold is the same number on both sides of a round comparison.
 RESCORE_ATOL: float = 1e-6
 
 
