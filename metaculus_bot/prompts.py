@@ -824,7 +824,6 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             0a) Resolution check
                • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
-               • Before marking the resolution condition "already met", verify the triggering evidence post-dates the question's open timestamp (shown above). Historical events pre-dating the open date generally do NOT resolve a forward-looking question YES — e.g., a 1945 detonation does not resolve "Will a nuclear detonation occur in a Japanese city by 2030?" that opened in 2024. If the resolution criteria explicitly count pre-open events, say so explicitly.
 
             0b) Resolution decomposition (multi-part questions only)
                • If the resolution criteria contain multiple independently-testable conditions (e.g. "X is available AND the provider is Y" or "an event occurs AND it is formally confirmed by the named source AND it falls within the question window"), write the criteria as a Boolean product: "Yes iff A × B × C × ... = 1", naming each factor.
@@ -870,24 +869,19 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Red-team both: attack assumptions, data gaps, and causal claims.
 
             5b) Conjunctive criteria pricing (multi-part questions only — skip if you wrote "single-condition, decomposition skipped" in 0b)
-               • NOW price the clauses you listed in 0b, informed by the evidence review and red-team above. Write a small table: one row per resolution clause (e.g. formal instrument? in-window? threshold met? listed by named source?) with its own probability, then the product of the rows.
-               • Reconcile your final forecast against the product in one line. If you disagree with the product, you have exactly three valid moves: revise the clause probabilities themselves and recompute; name a specific dependence between clauses (e.g. "clauses A and B are positively correlated, so the independent product underestimates") and quantify its effect; or realize the decomposition itself was wrong — revise the clause decomposition from 0b, then re-derive the clause probabilities and the product. Any override that is none of these is not valid — all hedging and adjustment must operate through the clauses, their dependence, or a corrected decomposition, not around them. If none applies, stay at the product.
+               • NOW price the clauses you listed in 0b, informed by the evidence review and red-team above. Write a small table: one row per resolution clause (e.g. formal instrument? in-window? threshold met? listed by named source?) with its own probability, then the product of the rows. On a multi-clause question this product is the number the "Anchor on your math" check in step 6 anchors to, because it is the more specific computation.
+               • Reconcile your final forecast against the product in one line. If you disagree with it, you have exactly three valid moves: revise the clause probabilities themselves and recompute; name a specific dependence between clauses (e.g. "A and B are positively correlated, so the independent product underestimates") and quantify its effect; or revise the clause decomposition from 0b and re-derive the product. Nothing else is a valid override — all hedging and adjustment must operate through the clauses, their dependence, or a corrected decomposition, not around them, so the criteria stay consumed as constraints rather than argued around. If none applies, stay at the product.
 
             6) Final rationale and calibration — integrate outside→inside view
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
                • Question-specific base rate: the relevant base rate is the historical frequency for questions LIKE THIS ONE (e.g., "how often do German federal elections return X"), not a generic "most things don't happen" prior.
-               • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
-               • Small-delta check: would a ±10% change still be coherent with the rationale? Why?
+               • Odds and delta check: translate your probability to odds (90% = 9:1, 99% = 99:1) — does it feel right, and would a ±10-point shift still be coherent with the rationale?
                • Trajectory check: consider whether the "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion" (e.g., a deadline arriving, a trend continuing, a process completing). Justify predictions that diverge from the most likely trajectory.
                • Anchor on your math: if you computed a probability from data (base rate, frequency, z-score, rate extrapolation, probability union, clause product), your final answer should stay close to that number; a move of more than about 15 points needs a named, specific piece of new evidence. "I'll hedge to 30% because this is a novel situation" is NOT a valid adjustment — either your base rate was wrong (redo the calculation with different inputs) or the base rate stands with minor refinement.
 
-            ── Brief checklist (keep concise) ───────────────────────────────
-            • Paraphrase the resolution criteria (<30 words).
-            • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
-            • State the outside-view base rate you anchored to.
-            • Consistency line: "X out of 100 times, [criteria] happens." Sensible?
-            • Top 3-5 evidence items + quick factual validity check.
-            • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
+            7) Final checks
+               • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
+               • Consistency line: "X out of 100 times, [criteria] happens." Sensible?
 
             ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
             This block is the ONLY authoritative source of your forecast — a
@@ -917,8 +911,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
     return clean_indents(
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
-        Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid
-        over-confidence and make sure your probabilities sum to **100%**.
+        Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid over-confidence.
         Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
         training that the research reports don't cover, you may rely on it. You are not required to ground every claim
         in the research; just be clear when you're drawing on your own knowledge versus the research.
@@ -1004,22 +997,14 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         (8) Final rationale and calibration — integrate outside→inside view
             • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
-            • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
-            • Small-delta check: would ±10% on the leading options remain coherent with your reasoning?
+            • Odds and delta check: translate the leading option's probability to odds (90% = 9:1) — does it feel right, and would ±10 points on the leading options still be coherent with your reasoning?
             • Blind-spot consideration: if the resolution is unexpected, what would likely be the reason, and how should that affect confidence spreads?
             • Anchor on your math: if you computed probabilities from data (base rate, frequency, etc.), your final answers should stay close to those numbers; a move of more than about 15 points on an option needs a named, specific piece of new evidence, not vibe.
             • Calibration audit: if one option is genuinely dominant, commit to it — don't flatten a well-supported favorite out of general conservatism; under-committing to strong favorites costs points. Hedge by keeping honest probability on plausible residual outcomes ("Other", "no decision", "none of the above", record-extreme buckets) — that is where surprises actually land — not by spreading mass across the board.
-            Remember:
-            • Use integers 1%-99% (no 0 % or 100 %).
-            • They must sum to 100 %.
 
-        ── Brief checklist (keep concise) ───────────────────────────────────
-        • Paraphrase options & resolution criteria (<30 words).
-        • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
-        • State the outside-view distribution used as anchor.
-        • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
-        • Top 3-5 evidence items + quick factual validity check.
-        • Blind-spot statement.
+        (9) Final checks
+            • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
+            • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
 
         [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]

@@ -216,12 +216,18 @@ class TestForecastingWindowAnchor:
         assert "days from now" in result
         assert "BEFORE the open date" in result
 
-    def test_binary_phase0_reinforcement_present(self) -> None:
-        """The Phase 0 resolution check must remind the model about the open timestamp."""
+    def test_binary_pre_open_rule_is_stated_twice_not_three_times(self) -> None:
+        """The pre-open footgun has cost the bot badly, so the rule is deliberately stated
+        TWICE: the forecasting-window line ("events before the open date do NOT resolve YES")
+        and the status-quo derivation's demand to name the specific POST-OPEN event. The third
+        statement, a 447-char 0a restatement with the 1945-detonation worked example, was
+        retired as pure repetition (its receipt is the window line's own docstring)."""
         result = binary_prompt(_binary_q(), research="r")
-        assert "open timestamp" in result
-        assert "1945" in result  # the worked example
-        assert "pre-dating the open date" in result
+        assert "BEFORE the open date" in result
+        assert "POST-OPEN event" in result
+        assert "1945" not in result
+        assert "pre-dating the open date" not in result
+        assert "open timestamp" not in result
 
     def test_binary_asserts_on_missing_open_time(self) -> None:
         """Missing timestamps are a data bug, not a graceful-degrade path."""
@@ -1250,7 +1256,9 @@ class TestConjunctiveCriteriaPricing:
         87% via 'season-specific upward adjustment'). Any deviation from the
         product must operate through the clause probabilities themselves, a
         named clause dependence, or a corrected clause decomposition; overrides
-        that route around the clauses are explicitly forbidden."""
+        that route around the clauses are explicitly forbidden. Kept through the
+        2026-09 de-bloat by operator decision, with its reason attached: the
+        criteria stay consumed as constraints."""
         prompt = binary_prompt(_binary_q(), research="r")
         lowered = " ".join(prompt.lower().split())
         assert "you have exactly three valid moves" in lowered
@@ -1262,7 +1270,92 @@ class TestConjunctiveCriteriaPricing:
             "all hedging and adjustment must operate through the clauses, their dependence, or a corrected "
             "decomposition, not around them" in lowered
         )
+        assert "so the criteria stay consumed as constraints" in lowered
         assert "if none applies, stay at the product" in lowered
+
+    def test_clause_product_is_named_as_the_anchor_on_multi_clause_questions(self) -> None:
+        """Three rules used to say how the final number may differ from a computed one and
+        none said WHICH computation anchors when a Step-2 base rate and a 5b clause product
+        both exist. One sentence where the product is computed now says: the product, because
+        it is the more specific computation; the three valid moves are the ways to leave it."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        lowered = " ".join(prompt.lower().split())
+        assert 'this product is the number the "anchor on your math" check in step 6 anchors to' in lowered
+        assert "because it is the more specific computation" in lowered
+        # The anchor bullet names the product among the computations it covers.
+        assert "clause product" in lowered
+        # And the sentence sits in 5b, before the reconciliation bullet.
+        assert prompt.index("more specific computation") < prompt.index("exactly three valid moves")
+
+
+class TestTemplateStatesEachCheckOnce:
+    """The binary and MC templates said several things twice: an odds check and a small-delta
+    check that both asked how a ±10% shift would sit; a trailing "Brief checklist" whose items
+    re-asked for outputs the template had already produced (0b paraphrases the criteria, step 2
+    states the base rate, step 4 lists the evidence, step 5 red-teams). The two checklist items
+    with no template twin, the bait-and-switch check and the consistency line, moved INTO the
+    template as its final numbered step: an instruction that shapes the answer's structure
+    belongs in the template, not in a post-hoc reminder. MC also carried three statements of
+    "sum to 100%", two of them in integer percent while the schema demands decimals summing to
+    1.0; the schema line is the one the parser reads, so it is the one that stays."""
+
+    @staticmethod
+    def _flat(prompt: str) -> str:
+        return " ".join(prompt.lower().split())
+
+    def _binary(self) -> str:
+        return binary_prompt(_binary_q(), research="r")
+
+    def _mc(self) -> str:
+        return multiple_choice_prompt(_mc_q(), research="r")
+
+    def _numeric(self) -> str:
+        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+
+    def test_final_checks_is_the_last_template_step_in_every_base_prompt(self) -> None:
+        for prompt in (self._binary(), self._mc()):
+            flat = self._flat(prompt)
+            assert flat.count("bait-and-switch check") == 1
+            assert "brief checklist" not in flat
+            # Retired checklist echoes of template outputs.
+            assert "paraphrase the resolution criteria" not in flat
+            assert "paraphrase options" not in flat
+            assert "top 3-5 evidence items" not in flat
+            assert "top 3 to 5 evidence items" not in flat
+            assert "blind-spot scenario most likely" not in flat
+            assert "blind-spot statement" not in flat
+            assert "state the outside-view base rate you anchored to" not in flat
+            assert "state the outside-view distribution used as anchor" not in flat
+            assert "state the outside view baseline used" not in flat
+            # Placement: inside the template, after the final-rationale step, before the block.
+            final_checks_at = prompt.index("Final checks")
+            assert prompt.index("Final rationale") < final_checks_at < prompt.index("STRUCTURED FORECAST")
+
+    def test_binary_final_checks_keep_the_consistency_line(self) -> None:
+        flat = self._flat(self._binary())
+        assert 'consistency line: "x out of 100 times, [criteria] happens." sensible?' in flat
+
+    def test_mc_final_checks_keep_the_consistency_line(self) -> None:
+        flat = self._flat(self._mc())
+        assert "most likely: __; least likely: __; coherent with rationale?" in flat
+
+    def test_odds_and_delta_are_one_check(self) -> None:
+        for prompt in (self._binary(), self._mc()):
+            flat = self._flat(prompt)
+            assert flat.count("odds and delta check") == 1
+            assert "odds check:" not in flat
+            assert "small-delta check" not in flat
+            assert "9:1" in flat
+
+    def test_mc_states_the_sum_constraint_once_in_decimals(self) -> None:
+        prompt = self._mc()
+        flat = self._flat(prompt)
+        assert "sum to 1.0" in flat
+        assert "sum to 100" not in flat
+        assert "use integers" not in flat
+        assert "remember:" not in flat
+        # The every-option requirement is extraction-critical and stays.
+        assert "you must assign a probability (1-99%) to every single option" in flat
 
 
 class TestResolutionMetricEcho:
