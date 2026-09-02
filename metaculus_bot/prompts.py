@@ -568,23 +568,6 @@ _REMAINING_EXPOSURE_SENTENCE = (
 )
 
 
-# The gap the qid 45215 miss needed and no bundle held: a training-data fact about how an
-# institutional rule last cashed out in practice (nobody asked how the electoral threshold
-# applied at the last election). Analyzer-only, since it directs a search slot, which the
-# forecaster prompts cannot do; worded to earn a slot only where such a rule exists so it
-# does not fight the same prompt's "DO NOT invent gaps" discipline. Pre-indented to 8
-# spaces to match the analyzer prompt's own baseline.
-_LAST_REAL_USE_GAP_RULE = """
-        LAST REAL APPLICATION OF THE RULE. When the question resolves through a
-        discontinuous institutional rule applied by a body — an electoral threshold, a
-        quota, an allocation formula, a cut-off score — one gap must ask how that rule
-        actually applied at its most recent real application, as a realized count or
-        outcome. This is about the institution's rule, not about the question's own
-        resolution threshold. Like every gap above it earns a slot only when such a rule
-        is actually in play; do not invent one where the question resolves on a plain
-        measurement."""
-
-
 # The three READING rules for the rendered market table that its own legend does not carry.
 # The legend (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`, printed beside the table)
 # owns NOTATION: the liquidity labels and `no-liquidity-data`, the evidential row order, the
@@ -1565,10 +1548,12 @@ def gap_fill_analyzer_prompt(
 ) -> str:
     """Prompt for a cheap model to identify factual gaps in the first-pass research.
 
-    Returns a JSON list of gap objects (or empty list). Quality over quantity:
-    most questions have 0-2 meaningful gaps; at most ``max_gaps``. ``options`` is the MC
-    ballot (see ``_mc_options_line``) — a gap like "no coverage of candidate X" is only
-    findable when the analyzer knows the candidates.
+    Returns a JSON list of gap objects (or empty list), at most ``max_gaps``, ordered most
+    forecast-moving first (the cap truncates, so order is the ranking). The analyzer fills
+    its slots whatever it is told — 55-77% of archived records sit at the cap — so the prompt
+    spends its words on WHICH gaps earn a slot rather than on how many to return. ``options``
+    is the MC ballot (see ``_mc_options_line``) — a gap like "no coverage of candidate X" is
+    only findable when the analyzer knows the candidates.
     """
     benchmarking_warning = _benchmarking_warning("gap_flagging") if is_benchmarking else ""
     resolution_block = (resolution_criteria or "(none provided)").strip()
@@ -1580,9 +1565,9 @@ def gap_fill_analyzer_prompt(
         on a question. Your job: identify up to {max_gaps} specific factual gaps where
         additional targeted search would meaningfully improve the forecast.{benchmarking_warning}
 
-        Be thorough but SELECTIVE. Only flag a gap if resolving it would change how a
-        superforecaster reasons about the question. Most questions have 0-2 real gaps;
-        a few have 3-5. DO NOT invent gaps for completeness.
+        Only flag a gap if resolving it would change how a superforecaster reasons about the
+        question. DO NOT invent gaps for completeness: each gap is a paid search, and a slot
+        spent on a gap that would not move the forecast is a slot not spent on one that would.
 
         Gap types to look for:
 
@@ -1599,6 +1584,10 @@ def gap_fill_analyzer_prompt(
            not fetch a tiebreaker.
         6. Missing base rate / reference class — the question asks about a class of
            event but first pass gives anecdotes rather than historical frequency data.
+           Includes, where the question resolves through an institutional rule (an
+           electoral threshold, a quota, an allocation formula, a cut-off score), how that
+           rule actually applied at its most recent real application, as a realized count
+           or outcome — a different fact from the question's own resolution threshold.
         7. Missing expert opinion — first pass asserts a claim that should have a
            named expert or institution behind it but does not cite one.
         8. Stale first-pass info — first pass appears drawn from training data rather
@@ -1606,22 +1595,18 @@ def gap_fill_analyzer_prompt(
         9. Missing counter-evidence — first pass is one-sided; a "consider the
            opposite" search would strengthen the forecast.
 
-        ANSWERABLE NOW. Every gap must be answerable from sources that exist today.
-        When the question resolves off a live data source — a tracker, index, polling or
-        rate average, counter, league table, or dashboard — at least ONE gap must ask what
-        that source reads NOW, in the present tense ("what value does <tracker> currently
-        display for <series>, and when was it last updated?"). ALREADY ANSWERED COUNTS AS
-        ANSWERED: if the first pass already states that source's current reading with the
-        date it was read, that requirement is met and no slot should be spent re-fetching a
-        value the briefing holds — spend it on something the briefing lacks. Re-asking for
-        that reading earns a slot only when the stated reading carries no as-of date, or is
-        older than the source's own update cadence (a daily average quoted from last month).
-        Never phrase a gap as that source's value on the resolution date ("what will
-        <tracker> show on <date>"): no search can answer it, the resolver comes back "that
-        date has not occurred yet", and the slot is spent for nothing. If a candidate gap
-        can only be answered by a future observation, rewrite it as the present-tense
-        observable or drop it.
-{_LAST_REAL_USE_GAP_RULE}
+        ANSWERABLE NOW. Every gap must be answerable from sources that exist today. When
+        the question resolves off a live data source — a tracker, index, polling or rate
+        average, counter, league table, or dashboard — at least ONE gap must ask what that
+        source reads NOW, in the present tense ("what does <tracker> currently display for
+        <series>, and when was it last updated?"), because the current reading is the single
+        fact that most often decides these questions. A first pass that already states the
+        source's current reading WITH its as-of date counts as answered: spend the slot on
+        something the briefing lacks, and re-ask only if the stated reading is undated or
+        older than the source's own update cadence. Never phrase a gap as that source's
+        value on the resolution date ("what will <tracker> show on <date>"): no search can
+        answer it and the slot is spent for nothing. If a candidate gap can only be answered
+        by a future observation, rewrite it as the present-tense observable or drop it.
 
         NULL RESULTS ARE SEARCH OUTCOMES. Where the first pass says it searched and
         found nothing ("no record found", "no authoritative source located"), treat that
@@ -1630,11 +1615,9 @@ def gap_fill_analyzer_prompt(
         that would hold it — name that source in the search query — and to establish what
         its silence there would and would not show.
 
-        ORDER THE GAPS BY DECISION-RELEVANCE, most forecast-moving first. Before you
-        finalize the list, compare the candidate gaps against each other and rank
-        them: the gap whose resolution would most change a superforecaster's answer
-        goes first, the least impactful last. The list ORDER is the ranking — do NOT
-        add rank fields or scores; keep the schema exactly as below.
+        Order the gaps most forecast-moving first; the list ORDER is the ranking, so the
+        trailing slot holds the gap that would change the answer least. Do NOT add rank
+        fields or scores; keep the schema exactly as below.
 
         Output STRICT JSON, nothing else, matching this schema exactly:
 

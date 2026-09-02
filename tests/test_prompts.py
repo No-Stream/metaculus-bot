@@ -880,11 +880,49 @@ class TestPresentTenseInstrumentGaps:
         pass is roughly 44% of research spend. The carve-out also keeps the block from
         fighting the prompt's own "DO NOT invent gaps" discipline."""
         lowered = " ".join(self._analyzer().lower().split())
-        assert "if the first pass already states that source's current reading with the date it was read" in lowered
-        assert "no slot should be spent re-fetching a value the briefing holds" in lowered
-        # The two conditions that still earn a verify-style gap.
-        assert "carries no as-of date" in lowered
-        assert "older than the source's own update cadence" in lowered
+        assert "already states the source's current reading with its as-of date counts as answered" in lowered
+        assert "spend the slot on something the briefing lacks" in lowered
+        # The two conditions that still earn a verify-style gap, in one clause.
+        assert "re-ask only if the stated reading is undated or older than the source's own update cadence" in lowered
+
+    def test_analyzer_states_the_present_tense_mandate_with_its_reason(self) -> None:
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "the current reading is the single fact that most often decides these questions" in lowered
+
+
+class TestGapFillAnalyzerSlotDiscipline:
+    """The analyzer fills every slot whatever it is told: 55-77% of archived records sit at
+    the cap and only 8 of 308 returned one or two gaps, so the old "Most questions have 0-2
+    real gaps; a few have 3-5" was behaviourally dead and "3-5" was stale against
+    GAP_FILL_MAX_GAPS = 4. What earns its place is the discipline with its reason (each gap
+    is a paid search) and the ordering contract the cap relies on (order is the ranking, no
+    rank fields). Receipt: scratch/prompt_bloat_audit_2026-09-02.md section 8."""
+
+    def _analyzer(self) -> str:
+        return gap_fill_analyzer_prompt(
+            "Will X happen?",
+            "Resolves YES if X.",
+            "fp",
+            "First pass.",
+            is_benchmarking=False,
+            max_gaps=4,
+        )
+
+    def test_gap_counts_are_gone_and_the_discipline_keeps_its_reason(self) -> None:
+        flat = " ".join(self._analyzer().lower().split())
+        assert "most questions have 0-2" not in flat
+        assert "a few have 3-5" not in flat
+        assert "be thorough but selective" not in flat
+        assert "do not invent gaps for completeness" in flat
+        assert "each gap is a paid search" in flat
+
+    def test_ordering_contract_is_two_sentences(self) -> None:
+        flat = " ".join(self._analyzer().lower().split())
+        assert "order the gaps most forecast-moving first" in flat
+        assert "the list order is the ranking" in flat
+        assert "do not add rank fields or scores" in flat
+        assert "compare the candidate gaps against each other" not in flat
+        assert "order the gaps by decision-relevance" not in flat
 
 
 class TestNullResultReadingClause:
@@ -1106,10 +1144,17 @@ class TestOutsideViewRubricRules:
         assert self._ANCHOR_SIZE not in flat
 
 
-class TestLastRealApplicationGap:
+class TestLastRealApplicationClause:
     """qid 45215: the question turned on how an electoral threshold cashed out at the
     last real election, a training-data fact no research bundle held and no gap asked
-    for. Analyzer-only — it directs a search slot, which a forecaster prompt cannot."""
+    for. Analyzer-only — it directs a search slot, which a forecaster prompt cannot.
+
+    It shipped as a standalone block whose "one gap MUST ask" mandate pre-committed a paid
+    slot; since the analyzer fills every slot regardless, a mandate does not add spend, it
+    DISPLACES other gaps, and a second mandate beside ANSWERABLE NOW's pre-committed half
+    the slots on a question with both a live instrument and an institutional rule. The gap
+    type is right, so it now lives as a candidate clause inside gap type 6 (base rate /
+    reference class), where the analyzer weighs it against the other gap types."""
 
     def _analyzer(self) -> str:
         return gap_fill_analyzer_prompt(
@@ -1120,36 +1165,39 @@ class TestLastRealApplicationGap:
             is_benchmarking=False,
         )
 
-    def test_analyzer_requires_a_last_real_application_gap(self) -> None:
-        flat = " ".join(self._analyzer().lower().split())
-        assert "last real application of the rule" in flat
-        assert "discontinuous institutional rule applied by a body" in flat
-        assert "at its most recent real application" in flat
+    def test_last_real_application_is_a_candidate_inside_gap_type_six(self) -> None:
+        prompt = self._analyzer()
+        flat = " ".join(prompt.lower().split())
+        assert "how that rule actually applied at its most recent real application" in flat
         assert "as a realized count or outcome" in flat
+        assert "an electoral threshold, a quota, an allocation formula, a cut-off score" in flat
+        # Inside type 6, between the base-rate item and the expert-opinion item.
+        type_six_at = flat.index("6. missing base rate / reference class")
+        type_seven_at = flat.index("7. missing expert opinion")
+        assert type_six_at < flat.index("most recent real application") < type_seven_at
 
-    def test_analyzer_separates_the_institution_rule_from_the_question_threshold(self) -> None:
+    def test_clause_separates_the_institution_rule_from_the_question_threshold(self) -> None:
         """The gap is about how the BODY applies its own rule, not a restatement of the
         question's resolution threshold, which the analyzer already has in front of it."""
         flat = " ".join(self._analyzer().lower().split())
-        assert "not about the question's own resolution threshold" in flat
+        assert "a different fact from the question's own resolution threshold" in flat
 
-    def test_rule_does_not_override_the_do_not_invent_gaps_discipline(self) -> None:
-        flat = " ".join(self._analyzer().lower().split())
-        assert "do not invent gaps" in flat
-        assert "only when such a rule is actually in play" in flat
-
-    def test_rule_sits_with_the_answerable_now_block(self) -> None:
+    def test_the_standalone_mandate_is_gone(self) -> None:
         prompt = self._analyzer()
-        assert prompt.index("ANSWERABLE NOW") < prompt.index("LAST REAL APPLICATION OF THE RULE")
+        assert "LAST REAL APPLICATION OF THE RULE" not in prompt
+        flat = " ".join(prompt.lower().split())
+        assert "one gap must ask how that rule" not in flat
+        # ANSWERABLE NOW keeps the one slot mandate the prompt still carries.
+        assert flat.count("must ask") == 1
 
-    def test_forecaster_prompts_do_not_carry_the_gap_rule(self) -> None:
+    def test_forecaster_prompts_do_not_carry_the_gap_clause(self) -> None:
         """Scope guard: this one is an instruction to the gap AUDITOR."""
         for prompt in (
             binary_prompt(_binary_q(), research="r"),
             multiple_choice_prompt(_mc_q(), research="r"),
             numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"),
         ):
-            assert "LAST REAL APPLICATION OF THE RULE" not in prompt
+            assert "most recent real application" not in prompt
 
 
 class TestMcExampleBlockEscaping:
