@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import socket as _socket
 import time
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
+from html import escape as html_escape
 from typing import Any
 from unittest.mock import MagicMock
 from urllib.parse import urlparse
@@ -26,9 +28,10 @@ from urllib.parse import urlparse
 import aiohttp
 import pytest
 
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import resolution_chart_data, resolution_source
 from metaculus_bot.research.http_fetch import FilteringResolver
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
+from metaculus_bot.research.resolution_chart_data import CHART_DATA_LEAD, render_inline_chart_data
 from metaculus_bot.research.resolution_source import (
     FetchResult,
     _fetch_one,
@@ -41,8 +44,8 @@ from metaculus_bot.research.resolution_source import (
     is_metaculus_self_ref,
     is_yahoo_ticker_url,
     looks_like_csv_rows,
-    looks_like_embed_shell,
     looks_like_js_wall,
+    looks_like_page_chrome,
     resolution_source_provider,
     select_fetchable_urls,
     strip_html_tags,
@@ -272,6 +275,51 @@ def _embed_shell_page(embed_markup: str) -> bytes:
 @pytest.fixture
 def infogram_shell_html() -> bytes:
     return _embed_shell_page(_INFOGRAM_EMBED_MARKUP)
+
+
+def _prose_page(paragraph: str) -> bytes:
+    """An article page whose extraction is exactly ``paragraph`` — used to sit either
+    side of the chrome floor without depending on how trafilatura treats chrome."""
+    return (
+        "<!doctype html><html><head><title>Report</title></head><body>"
+        "<nav>Home | About</nav>"
+        f"<article><p>{paragraph}</p></article>"
+        "<footer>&copy; 2026</footer></body></html>"
+    ).encode()
+
+
+def _escape_config(config: dict[str, Any]) -> str:
+    """A chart config as it appears inside a double-quoted ``data-chart`` attribute."""
+    return html_escape(json.dumps(config), quote=True)
+
+
+# The real q43949 markup, shortened: Drupal's Charts module renders the config into a
+# `data-chart` attribute on the container div, HTML-escaped. Categories and series name
+# are verbatim from the 2026-05-24 Wayback snapshot; the annual data is its last three
+# points (2024 / 2025 / 2026), 2026 = 1,240 being the pre-forecast live count.
+_IOM_CHART_CONFIG: dict[str, Any] = {
+    "chart": {"type": "column"},
+    "title": {"text": ""},
+    "xAxis": [{"categories": ["2024", "2025", "2026"]}],
+    "series": [{"name": "Total Number of Dead and Missing", "data": [2573, 2185, 1240]}],
+}
+
+_IOM_PROSE = (
+    "Migration across the Mediterranean: context in brief. Routes shift with weather, "
+    "patrol posture and departure conditions, and the figures below are compiled from "
+    "survivor testimony, coast guard reports and press accounts. " + "Context continues. " * 10
+)
+
+
+def _iom_shaped_page(prose: str = _IOM_PROSE, config: dict[str, Any] | None = None) -> bytes:
+    """Prose plus one inline Highcharts config, the shape trafilatura drops entirely."""
+    payload = _escape_config(_IOM_CHART_CONFIG if config is None else config)
+    return (
+        "<!doctype html><html><head><title>Missing Migrants</title></head><body>"
+        f"<article><h1>Mediterranean</h1><p>{prose}</p>"
+        f'<div data-drupal-selector-chart="dead-and-missing" class="charts-highchart chart" data-chart="{payload}">'
+        "</div></article></body></html>"
+    ).encode()
 
 
 @pytest.fixture
@@ -610,17 +658,17 @@ class TestFormatResolutionSections:
         ]
         out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         assert out  # no longer empty
-        assert "2 resolution source(s) could not be fetched" in out
+        assert "2 resolution source(s) yielded no usable content" in out
         assert "a.com: blocked" in out
         assert "b.com: js_wall" in out
-        assert "the resolving page was unreachable; weight other evidence accordingly" in out
+        assert "nothing from the cited resolving page(s) is in this bundle; weight other evidence accordingly" in out
         # Body only — the orchestrator prepends the "## Resolution Source Snapshot" header.
         assert "## Resolution Source Snapshot" not in out
 
     def test_an_empty_body_result_no_longer_suppresses_the_all_failed_notice(self):
         """The render half of the empty-200 defect. While an empty body counted as `success`, ONE
         such result put the section on the success path: it rendered an empty `### <url>` block
-        under the primary-grading-evidence caveat, and the "resolving page was unreachable" notice
+        under the primary-grading-evidence caveat, and the all-failed "yielded no usable content" notice
         — the whole point of which is to tell the forecaster to weight other evidence — was
         withheld for the sibling URLs that genuinely failed."""
         results = [
@@ -636,9 +684,9 @@ class TestFormatResolutionSections:
 
         out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
 
-        assert "2 resolution source(s) could not be fetched" in out
+        assert "2 resolution source(s) yielded no usable content" in out
         assert "empty.example.com: empty_body" in out
-        assert "the resolving page was unreachable" in out
+        assert "nothing from the cited resolving page(s) is in this bundle" in out
         assert "primary grading evidence" not in out
         assert "### https://empty.example.com/x" not in out
 
@@ -668,9 +716,9 @@ class TestFormatResolutionSections:
         assert "primary grading evidence" in out
         # Terse note about the failed source appended.
         assert "bad.com: blocked" in out
-        assert "could not be fetched" in out
+        assert "other cited resolution source(s) yielded no usable content" in out
         # The success path must not carry the all-failed sentence.
-        assert "the resolving page was unreachable" not in out
+        assert "nothing from the cited resolving page(s) is in this bundle" not in out
 
     def test_success_rendering_includes_url_and_date(self):
         results = [
@@ -891,7 +939,7 @@ class TestFetchOne:
         """`read_body_capped` returns `b""` for an empty body and the only guard was `is None`, so
         an empty 200 shipped as `success` with `text=""`. Three things followed: an empty `###
         <url>` section rendered under the "primary grading evidence" caveat, that one result
-        suppressed the "resolving page was unreachable" notice for every OTHER failed URL, and
+        suppressed the all-failed "yielded no usable content" notice for every OTHER failed URL, and
         provider diagnostics reported `ok` — indistinguishable from a real fetch."""
         session = FakeSession({"https://empty.example.com/x": FakeResponse(200, body=body, content_type=content_type)})
 
@@ -1000,21 +1048,31 @@ class TestEmbedShapedPages:
         result = await _fetch_one(session, "https://tracker.example.com/senate", {})
 
         assert result.status == "no_resolving_content"
+        assert result.status_reason == "embed_shell"
         assert result.http_status == 200  # the fetch itself succeeded; the CONTENT did not arrive
         assert result.text == ""
         assert result.unreadable_embeds == ["infogram"]
 
-    async def test_the_same_thin_page_without_the_embed_stays_a_success(self):
-        """The embed is the discriminator, not the length. Identical chrome with the embed
-        markup swapped for an inert div extracts the same 167 chars and still publishes —
-        so `no_resolving_content` is not a raised JS-wall floor in disguise."""
+    async def test_the_same_thin_page_without_an_embed_is_withheld_as_a_thin_page(self):
+        """The FLOOR is the discriminator; the embed only says where the content went.
+
+        This test asserted the opposite when the verdict shipped — identical chrome with
+        the embed markup swapped for an inert div extracted the same 167 chars and still
+        published. The 2026-09-01 round found five content-free `success` renders and not
+        one of them named a provider (q45088's 127-char SPA tab list, q45215's 385 chars
+        of Kazakh region names), so the gate was withholding one shape of chrome and
+        publishing the other.
+        """
         session = FakeSession(
             {"https://plain.example.com/p": FakeResponse(200, body=_embed_shell_page("<div>chart goes here</div>"))}
         )
 
         result = await _fetch_one(session, "https://plain.example.com/p", {})
 
-        assert result.status == "success"
+        assert result.status == "no_resolving_content"
+        assert result.status_reason == "thin_page"
+        assert result.http_status == 200  # the fetch itself succeeded; the CONTENT did not arrive
+        assert result.text == ""
         assert result.unreadable_embeds == []
 
     async def test_prose_plus_an_unreadable_embed_keeps_the_prose_and_discloses_the_gap(
@@ -1084,7 +1142,7 @@ class TestEmbedShapedPages:
             )
             for i, size in enumerate(filler_sizes)
         ]
-        embed_text = resolution_source._page_text_with_embed_disclosure(
+        embed_text = resolution_source._page_text_with_leads(
             "lorem ipsum " * (per_url // 2), "https://tracker.example.com/senate", ["infogram"]
         )
         embed = FetchResult(
@@ -1114,12 +1172,12 @@ class TestEmbedShapedPages:
         assert result.unreadable_embeds == []
         assert "cannot read" not in result.text
 
-    def test_the_shell_floor_sits_above_the_js_wall_floor(self):
+    def test_the_chrome_floor_sits_above_the_js_wall_floor(self):
         # Both floors read module globals so tests can retune them; the ordering is what
-        # makes the embed verdict strictly more specific than the JS-wall one.
-        assert looks_like_embed_shell("x" * 300) is True
+        # keeps `js_wall` its own population instead of a subset the chrome floor swallowed.
+        assert looks_like_page_chrome("x" * 300) is True
         assert looks_like_js_wall("x" * 300) is False
-        assert looks_like_embed_shell("x" * 500) is False
+        assert looks_like_page_chrome("x" * 500) is False
 
     def test_a_no_resolving_content_result_is_a_loss_token_not_ok(self):
         """The diagnostics half: as `success` this reported `ok`, so the provider block read
@@ -1165,6 +1223,219 @@ class TestEmbedShapedPages:
             http_status=200,
             content_type="text/html",
         )
+
+    async def test_a_page_just_above_the_chrome_floor_still_publishes(self):
+        """The elbow, from both sides. The archive census puts the shortest extraction
+        that carries the resolving content at exactly 401 chars
+        (myfloridaelections.com's election-date table), so the floor has to withhold at
+        399 and publish at 401 or it is throwing away terse-but-real data tables."""
+        floor = resolution_source.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
+        # Trafilatura keeps the <article> paragraph verbatim, so the extraction length is
+        # the paragraph length; "ab " * n is a word-shaped filler it does not collapse.
+        above = _prose_page("ab " * ((floor + 40) // 3))
+        below = _prose_page("ab " * ((floor - 40) // 3))
+        session = FakeSession(
+            {"https://a.example.com/p": FakeResponse(200, body=above)}
+            | {"https://b.example.com/p": FakeResponse(200, body=below)}
+        )
+
+        long_result = await _fetch_one(session, "https://a.example.com/p", {})
+        short_result = await _fetch_one(session, "https://b.example.com/p", {})
+
+        assert len(long_result.text.strip()) >= floor
+        assert long_result.status == "success"
+        assert short_result.status == "no_resolving_content"
+        assert short_result.status_reason == "thin_page"
+
+
+class TestInlineChartData:
+    """qid 43949 (IOM Missing Migrants). The resolving page fetches 200 through the repo's
+    own Tier-1 path and trafilatura extracts ~80k chars of incident rows and prose carrying
+    none of `1342` / `Total Dead and Missing` / `2026`, because the annual series lives in a
+    `data-chart` attribute. A Wayback snapshot 25 days BEFORE that forecast carries the same
+    markup with 2026 = 1,240; the published forecast sat ~340 above the true level."""
+
+    async def test_a_prose_page_gets_its_chart_series_rendered_and_stays_a_success(self):
+        session = FakeSession({"https://iom.example.com/med": FakeResponse(200, body=_iom_shaped_page())})
+
+        result = await _fetch_one(session, "https://iom.example.com/med", {})
+
+        assert result.status == "success"
+        # The resolving figure, which the prose does not carry.
+        assert "2026=1240" in result.text
+        assert "Total Number of Dead and Missing: 2024=2573, 2025=2185, 2026=1240" in result.text
+        # The chart block LEADS, so it is the last thing any downstream trim reaches.
+        assert result.text.startswith(CHART_DATA_LEAD)
+        # And the page's own prose is still there under it.
+        assert "context in brief" in result.text
+
+    async def test_a_chart_only_page_is_rescued_from_the_chrome_floor(self):
+        """The two fixes meet here: without the chart rung this page is 60 chars of chrome
+        and gets withheld as `thin_page`; with it, the numbers we recovered ARE the content."""
+        session = FakeSession(
+            {"https://iom.example.com/bare": FakeResponse(200, body=_iom_shaped_page(prose="Mediterranean."))}
+        )
+
+        result = await _fetch_one(session, "https://iom.example.com/bare", {})
+
+        assert result.status == "success"
+        assert result.status_reason is None
+        assert "2026=1240" in result.text
+
+    async def test_a_malformed_chart_payload_is_ignored_rather_than_raising(self):
+        # A truncated attribute (`{"series":[{"name":}]`) is what a mid-response cut or a
+        # non-JSON JS literal looks like. It must cost the page nothing: the prose still
+        # publishes, with no chart block and no exception out of the provider.
+        body = (
+            "<!doctype html><html><body><article><h1>Counts</h1><p>"
+            "Background prose long enough to clear the chrome floor on its own. " * 8 + "</p>"
+            '<div class="charts-highchart" data-chart="{&quot;series&quot;:[{&quot;name&quot;:}]"></div>'
+            "</article></body></html>"
+        ).encode()
+        session = FakeSession({"https://broken.example.com/p": FakeResponse(200, body=body)})
+
+        result = await _fetch_one(session, "https://broken.example.com/p", {})
+
+        assert result.status == "success"
+        assert CHART_DATA_LEAD not in result.text
+        assert "Background prose long enough" in result.text
+
+    def test_a_config_with_no_parseable_series_renders_nothing(self):
+        for html_text in (
+            "",
+            "<div>no charts here at all</div>",
+            '<div data-chart="{}"></div>',
+            '<div data-chart="{&quot;series&quot;:[]}"></div>',
+            # A series whose data is callbacks / labels rather than numbers.
+            '<div data-chart="{&quot;series&quot;:[{&quot;data&quot;:[&quot;n/a&quot;,null]}]}"></div>',
+            # Valid JSON that is not an object.
+            '<div data-chart="[1,2,3]"></div>',
+        ):
+            assert render_inline_chart_data(html_text) == ""
+
+    def test_the_script_call_form_is_read_when_its_argument_is_json(self):
+        html_text = (
+            "<script>Highcharts.chart('container', "
+            '{"title":{"text":"Weekly rate"},'
+            '"xAxis":{"categories":["W1","W2"]},'
+            '"series":[{"name":"Rate","data":[1.5,2.25]}]}'
+            ");</script>"
+        )
+
+        out = render_inline_chart_data(html_text)
+
+        assert "Chart 1 — Weekly rate" in out
+        assert "Rate: W1=1.5, W2=2.25" in out
+
+    def test_a_brace_inside_a_string_does_not_close_the_config_early(self):
+        html_text = (
+            '<script>new Highcharts.Chart({"title":{"text":"Deaths {2014-2026}"},'
+            '"series":[{"name":"Total","data":[7]}]});</script>'
+        )
+
+        assert "Total: 7" in render_inline_chart_data(html_text)
+
+    def test_point_object_and_pair_shapes_carry_their_own_labels(self):
+        html_text = (
+            '<div data-chart="'
+            + _escape_config(
+                {
+                    "series": [
+                        {"name": "Named", "data": [{"name": "Jan", "y": 4}, {"name": "Feb", "y": 5}]},
+                        {"name": "Paired", "data": [["Q1", 10], ["Q2", 11.5]]},
+                    ]
+                }
+            )
+            + '"></div>'
+        )
+
+        out = render_inline_chart_data(html_text)
+
+        assert "Named: Jan=4, Feb=5" in out
+        assert "Paired: Q1=10, Q2=11.5" in out
+
+    def test_a_declared_datetime_axis_renders_dates_not_epoch_millis(self):
+        # Highcharts defines a datetime axis in ms since the epoch, UTC. Without the
+        # conversion a tracker's own daily series renders `1756771200000=42`, which is
+        # the shape most likely to matter rendered as noise.
+        html_text = (
+            '<div data-chart="'
+            + _escape_config(
+                {
+                    "xAxis": {"type": "datetime"},
+                    "series": [{"name": "Daily", "data": [[1788220800000, 41], [1788307200000, 42]]}],
+                }
+            )
+            + '"></div>'
+        )
+
+        assert "Daily: 2026-09-01=41, 2026-09-02=42" in render_inline_chart_data(html_text)
+
+    def test_a_numeric_x_axis_without_the_datetime_declaration_is_left_alone(self):
+        # The conversion is keyed on the axis's own declaration, never on the magnitude
+        # of the x values, so a chart plotting a large quantity on x is not re-dated.
+        html_text = '<div data-chart="' + _escape_config({"series": [{"data": [[1788220800000, 41]]}]}) + '"></div>'
+
+        out = render_inline_chart_data(html_text)
+
+        assert "1788220800000=41" in out
+        assert "2026-" not in out
+
+    def test_long_series_keep_the_newest_points_and_say_so(self):
+        # The resolving value is the newest one, so the window is taken from the END.
+        n = resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_POINTS + 5
+        html_text = (
+            '<div data-chart="'
+            + _escape_config(
+                {
+                    "xAxis": [{"categories": [f"m{i}" for i in range(n)]}],
+                    "series": [{"name": "Monthly", "data": list(range(n))}],
+                }
+            )
+            + '"></div>'
+        )
+
+        out = render_inline_chart_data(html_text)
+
+        assert f"(last {resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_POINTS} of {n} points)" in out
+        assert f"m{n - 1}={n - 1}" in out
+        assert "m0=0" not in out
+
+    def test_the_block_is_bounded_and_drops_whole_charts(self):
+        # A half-rendered row reads like a complete series, so charts are dropped whole
+        # and the omitted count is stated. The bound has to hold including that note.
+        big = _escape_config(
+            {
+                "xAxis": [{"categories": [f"category-label-{i}" for i in range(16)]}],
+                "series": [{"name": f"series-{s}", "data": [1000000 + i for i in range(16)]} for s in range(4)],
+            }
+        )
+        html_text = "".join(f'<div data-chart="{big}"></div>' for _ in range(4))
+
+        out = render_inline_chart_data(html_text)
+
+        assert len(out) <= resolution_chart_data.RESOLUTION_SOURCE_CHART_BLOCK_MAX_CHARS
+        assert "further chart(s) on this page omitted — chart-data budget" in out
+
+    def test_at_most_max_charts_are_rendered(self):
+        one = _escape_config({"series": [{"name": "S", "data": [1]}]})
+        html_text = "".join(f'<div data-chart="{one}"></div>' for _ in range(8))
+
+        out = render_inline_chart_data(html_text)
+
+        assert out.count("\nChart ") == resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_CHARTS
+
+    async def test_the_chart_block_is_budgeted_inside_the_per_url_cap(self, monkeypatch):
+        # Same rule as the embed disclosure: leads come OUT of the per-URL cap, never on
+        # top of it, so the aggregate section budget's arithmetic still holds.
+        cap = 400
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        session = FakeSession({"https://iom.example.com/med": FakeResponse(200, body=_iom_shaped_page())})
+
+        result = await _fetch_one(session, "https://iom.example.com/med", {})
+
+        assert result.status == "success"
+        assert len(result.text) <= cap
 
 
 class TestResolutionSourceFetchMarker:
@@ -1213,6 +1484,30 @@ class TestResolutionSourceFetchMarker:
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.racetothewh.com/senate/26 "
             "status=ok http=200 embeds=infogram"
+        ]
+
+    async def test_the_marker_names_which_rule_withheld_the_page(self, infogram_shell_html, monkeypatch, caplog):
+        """`no_resolving_content` has two rules behind it and the status alone cannot say
+        which fired. `reason` is what keeps the embed-gated population (queryable since
+        2026-08) separable from the thin-page one the ungated floor added."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                "https://tracker.example.com/senate": FakeResponse(200, body=infogram_shell_html),
+                "https://data.example.com/": FakeResponse(200, body=_embed_shell_page("<div>tabs</div>")),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="See https://tracker.example.com/senate and https://data.example.com/")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://tracker.example.com/senate "
+            "status=no_resolving_content http=200 embeds=infogram reason=embed_shell",
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://data.example.com/ "
+            "status=no_resolving_content http=200 embeds=none reason=thin_page",
         ]
 
     async def test_a_fetch_that_never_got_a_response_reports_http_n_a(self, monkeypatch, caplog):
@@ -1438,7 +1733,7 @@ class TestResolutionSourceProvider:
         provider = resolution_source_provider(is_benchmarking=False)
         out = await provider(_mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading."))
         assert "www.bls.gov: blocked" in out
-        assert "the resolving page was unreachable; weight other evidence accordingly" in out
+        assert "nothing from the cited resolving page(s) is in this bundle; weight other evidence accordingly" in out
 
     async def test_benchmarking_disables_even_when_all_fetches_fail(self, monkeypatch):
         # The leakage guard fires before format_resolution_sections, so the new

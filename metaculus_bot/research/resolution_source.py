@@ -20,14 +20,27 @@ Sites behind JS walls / heavy anti-bot remain deferred (see `FetchStatus` —
 `blocked` / `js_wall` / `no_resolving_content` results are retained in the
 returned list as that seam).
 
-A page whose numbers live in a third-party data embed we have no route to
-(Infogram / Flourish / Tableau) is handled two ways, by how much page text
-came back: an embed SHELL — extraction below
-`RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS`, i.e. chrome around the embed — is
-withheld as `no_resolving_content`, while a page that also carried real prose
-keeps it and gets a one-line disclosure that the embedded figures are not in
-that text (qids 44554/44556, whose tracker rendered 2.9k chars of forecast
-background as "primary grading evidence" with zero polling numbers in it).
+A 200-OK page whose extraction is under `RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS`
+is page CHROME and is withheld as `no_resolving_content` rather than published as
+grading evidence. `status_reason` says which shape: `embed_shell` when the raw
+HTML names a routeless data embed (Infogram / Flourish / Tableau), so we know the
+numbers exist and we have no route to them (qids 44554/44556, whose tracker
+rendered 2.9k chars of forecast background as "primary grading evidence" with
+zero polling numbers in it); `thin_page` otherwise (q45088's 127-char SPA tab
+list, q45215's 385 chars of region names — five such renders in the 2026-09-01
+round, none naming a provider, which is why the floor is no longer gated on one).
+A page ABOVE the floor keeps its text, plus a one-line disclosure where an embed
+hid figures from it.
+
+Inline chart configs are read straight out of the page we already hold
+(`resolution_chart_data.render_inline_chart_data`): a Highcharts `data-chart`
+attribute or `Highcharts.chart(...)` call carries its series as JSON, which
+trafilatura drops at every setting. Zero LLM calls, no second request. It runs on
+every HTML page, not only thin ones, because q43949's resolving page extracted
+~80k chars of prose carrying none of the resolving figures while its annual
+series — ending in the live count the question was graded on — sat in the
+attribute. Chart data counts as CONTENT, so it also rescues a page the chrome
+floor would otherwise withhold.
 
 Tier 2 (2026-08, qids 44858/44841): when a fetched page's RAW HTML embeds a
 Datawrapper chart, fetch that chart's live "Get the data" CSV — poll trackers
@@ -116,6 +129,7 @@ from metaculus_bot.research.resolution_body_text import (
     _truncate_with_marker,
     strip_html_tags,
 )
+from metaculus_bot.research.resolution_chart_data import render_inline_chart_data
 from metaculus_bot.research.resolution_fetch_result import (
     _NON_OK_FETCH_STATUS,
     FetchResult,
@@ -314,15 +328,30 @@ def looks_like_js_wall(text: str) -> bool:
     return len(text.strip()) < RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
 
 
-def looks_like_embed_shell(text: str) -> bool:
-    """True when an extraction is too thin to be anything but scaffolding around an embed.
+def looks_like_page_chrome(text: str) -> bool:
+    """True when an extraction is too thin to be anything but chrome around the content.
 
-    Only consulted for pages that DO reference a routeless data embed, because the
-    threshold sits well above the JS-wall floor and would otherwise withhold terse
-    real pages. See the constant for the archive calibration; trafilatura's own
-    precision filter drops most embed credit blocks ("Created with Infogram" and
-    friends), so the char floor carries this on its own and no boilerplate-pattern
-    list is needed.
+    The floor is what the ``no_resolving_content`` verdict rests on; a named embed
+    provider only says WHERE the content went (`embed_shell` vs `thin_page`). It
+    was gated on a named provider when it shipped, which withheld one shape of
+    chrome and published the other: the 2026-09-01 round's five content-free
+    `success` renders named no provider between them.
+
+    Calibration re-checked for the ungated rule against the same census (89
+    `resolution_source` archive records, 68 cited successes, 2026-09-02): 8 sit
+    under 400 chars and all 8 are chrome — a 127-char SPA tab list
+    (data.wastewaterscan.org, twice), 385 chars of Kazakh region names
+    (election.gov.kz), AP's org boilerplate (355), an ABS release-date list with no
+    figure (344), a mass-shooting tracker's "about the data" note (262), a
+    Portuguese feedback-form blurb (157), and a clinicaltrials.gov data-element
+    pointer (111). The shortest carrying the resolving content is still exactly
+    401 (myfloridaelections.com's election-date table), so 400 remains the observed
+    elbow and the floor stays deliberately below it: a page above it keeps its text
+    and, where an embed hid figures, gets the disclosure note instead.
+
+    Trafilatura's own precision filter drops most embed credit blocks ("Created
+    with Infogram" and friends), so the char floor carries this on its own and no
+    boilerplate-pattern list is needed.
     """
     return len(text.strip()) < RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
 
@@ -342,28 +371,38 @@ def _unreadable_embed_disclosure(providers: list[str]) -> str:
     )
 
 
-def _page_text_with_embed_disclosure(extracted: str, url: str, providers: list[str]) -> str:
-    """Per-URL-capped page text, LED by the unreadable-embed disclosure.
+def _page_text_with_leads(extracted: str, url: str, providers: list[str], chart_block: str = "") -> str:
+    """Per-URL-capped page text, LED by the chart-data block and the embed disclosure.
 
-    The disclosure leads (exactly like the Tier-2 dataset lead) because every
-    truncator on this text is head-preserving, so anything at the tail is the
-    first thing a later trim discards. As a trailer it survived the per-URL
-    truncation here but not the aggregate `_budgeted_success_sections` cut, which
-    re-truncates an over-budget body through `_truncate_with_marker` — on prod
-    constants (5 x 6000 per-URL against an 18000 total) a fourth Infogram page
-    rendered under the "primary grading evidence" caption with the disclosure
-    gone and only a generic truncation marker left, which is the q44554/44556
-    failure this disclosure exists to prevent. Leading it also puts the caveat
-    ahead of the text it qualifies, which is why the wording says "below".
+    Both leads lead (exactly like the Tier-2 dataset lead) because every truncator
+    on this text is head-preserving, so anything at the tail is the first thing a
+    later trim discards. As a trailer the disclosure survived the per-URL truncation
+    here but not the aggregate `_budgeted_success_sections` cut, which re-truncates
+    an over-budget body through `_truncate_with_marker` — on prod constants (5 x
+    6000 per-URL against an 18000 total) a fourth Infogram page rendered under the
+    "primary grading evidence" caption with the disclosure gone and only a generic
+    truncation marker left, which is the q44554/44556 failure the disclosure exists
+    to prevent. Leading it also puts the caveat ahead of the text it qualifies,
+    which is why the wording says "below".
 
-    The disclosure is budgeted out of the cap rather than added on top, so the
-    per-URL bound the section budget relies on still holds.
+    Chart data goes ABOVE the disclosure: on a page whose prose carries none of the
+    resolving figures (q43949) it is the only resolving content in the section, so
+    it must be the last thing any trim reaches, and the disclosure then still sits
+    immediately above the prose it qualifies.
+
+    Both leads are budgeted out of the cap rather than added on top, so the per-URL
+    bound the section budget relies on still holds — including in the pathological
+    case where the leads alone exceed the cap (a test can tune the cap below the
+    chart block's own).
     """
-    if not providers:
+    leads = [lead for lead in (chart_block, _unreadable_embed_disclosure(providers) if providers else "") if lead]
+    if not leads:
         return _truncate_with_marker(extracted, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
-    disclosure = _unreadable_embed_disclosure(providers)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(disclosure) - 2
-    return f"{disclosure}\n\n{_truncate_with_marker(extracted, body_cap, url)}"
+    lead_text = "\n\n".join(leads)
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead_text) - 2
+    if body_cap <= 0 or not extracted.strip():
+        return _truncate_with_marker(lead_text, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
+    return f"{lead_text}\n\n{_truncate_with_marker(extracted, body_cap, url)}"
 
 
 def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -> tuple[list[str], int]:
@@ -432,7 +471,7 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
     CITED resolution source, and its most common non-success — ``stale_data``,
     the freshness guard refusing to serve months-old data as live — is not a
     fetch failure at all, so datasets never ride the "cited resolution source(s)
-    could not be fetched" notices and get their own withheld line instead.
+    yielded no usable content" notices and get their own withheld line instead.
     """
     if not results:
         return ""
@@ -454,9 +493,14 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
 
     if not successes:
         n = len(cited_failures)
+        # "yielded no usable content", not "could not be fetched / was unreachable":
+        # `no_resolving_content` and `empty_body` are pages that ANSWERED 200 and carried
+        # nothing, and telling a forecaster the source was unreachable misstates the null
+        # they have to weigh — "the tracker was down" and "the tracker has no reading" are
+        # different pieces of evidence. The per-domain status token says which it was.
         notice = (
-            f"[{n} resolution source(s) could not be fetched: {_render_fetch_failures(cited_failures)}] — "
-            f"the resolving page was unreachable; weight other evidence accordingly."
+            f"[{n} resolution source(s) yielded no usable content: {_render_fetch_failures(cited_failures)}] — "
+            f"nothing from the cited resolving page(s) is in this bundle; weight other evidence accordingly."
         )
         if dataset_nonsuccesses:
             notice += "\n\n" + _dataset_withheld_note()
@@ -472,7 +516,7 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
         rendered += f"\n\n[{dropped} additional source(s) omitted — section budget]"
     if cited_failures:
         rendered += (
-            f"\n\n[Note: {len(cited_failures)} other cited resolution source(s) could not be fetched: "
+            f"\n\n[Note: {len(cited_failures)} other cited resolution source(s) yielded no usable content: "
             f"{_render_fetch_failures(cited_failures)} — weight accordingly.]"
         )
     if dataset_nonsuccesses:
@@ -613,7 +657,24 @@ def _resolution_status_outcome(status: int, current_url: str, content_type: str)
 
 
 async def _resolution_html_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult:
-    """Trafilatura extraction plus the embed-shell and JS-wall checks, carrying embeds along."""
+    """Trafilatura extraction plus the inline-chart rung and the chrome / JS-wall checks.
+
+    Order of the three verdicts, and why:
+
+    1. CONTENT is extracted text OR chart data read out of the raw HTML. The chart
+       rung runs on every HTML page, not only thin ones, because q43949's page
+       extracted ~80k chars of prose with none of the resolving figures in it — a
+       thin-only gate would miss the record the rung exists for.
+    2. With no content, a named routeless embed makes it `embed_shell`, an
+       extraction under the JS-wall floor makes it `js_wall`, and anything else
+       under the chrome floor makes it `thin_page`. The `js_wall` check keeps its
+       exact old meaning and its position between the two, so the generalised
+       chrome floor cannot swallow the JS-wall population.
+    3. Chart data therefore rescues a page the chrome floor would have withheld —
+       including a JS-walled one, where the config in the raw HTML is precisely the
+       data the wall was hiding. That is the one place the `js_wall` outcome moves,
+       and it moves only when we actually recovered the numbers.
+    """
     status = resp.status
     netloc = urlparse(current_url).netloc
     body = await read_body_capped(
@@ -641,40 +702,60 @@ async def _resolution_html_outcome(resp: Any, current_url: str, content_type: st
     charts = extract_datawrapper_charts(html_text)
     unreadable_embeds = unreadable_data_embed_providers(html_text)
     extracted = await asyncio.to_thread(_extract_main_text, body, current_url)
-    # Embed-shell verdict FIRST, and it is the more specific one: a page whose
-    # numbers sit in a routeless embed and whose extraction is chrome tells us
-    # where the content is, which `js_wall` ("needs JS for anything") does not.
-    # Datawrapper is exempt from the embed scan (it has the Tier-2 hop), so a
-    # walled tracker still comes back `js_wall` and still hops.
-    if unreadable_embeds and looks_like_embed_shell(extracted or ""):
+    # In a thread for the same reason the extraction is: it is sync CPU work (one
+    # regex sweep plus a `json.loads` per config) over a body up to the 5 MiB
+    # response cap, and blocking the loop here would stall every sibling fetch.
+    # Measured 22 ms on the 1.1 MB q43949 page, but the bound is the page, not that
+    # sample. The Datawrapper / embed scans above are single regex searches and stay
+    # inline.
+    chart_block = await asyncio.to_thread(render_inline_chart_data, html_text)
+    if looks_like_page_chrome(extracted or "") and not chart_block:
+        # No content anywhere. Which of the three withholds applies is a disclosure
+        # question, not a routing one — all three retain the result as the Tier-2
+        # escalation seam and none of them render.
+        if unreadable_embeds:
+            # More specific than the others: a page whose numbers sit in a routeless
+            # embed tells us WHERE the content is. Datawrapper is exempt from the
+            # embed scan (it has the Tier-2 hop), so a walled tracker still comes
+            # back `js_wall` below and still hops.
+            return FetchResult(
+                url=current_url,
+                status="no_resolving_content",
+                text="",
+                http_status=status,
+                content_type=content_type or None,
+                status_reason="embed_shell",
+                datawrapper_charts=charts,
+                unreadable_embeds=unreadable_embeds,
+            )
+        # An empty extraction on a 200 OK is a JS-wall (SPA that rendered
+        # client-side, cookie/consent gate, etc.) — exactly the Tier-2 candidate
+        # signal. Treat identically to short-but-nonempty extractions. A walled page
+        # still exposes its embeds, so the charts ride along.
+        if extracted is None or looks_like_js_wall(extracted):
+            return FetchResult(
+                url=current_url,
+                status="js_wall",
+                text="",
+                http_status=status,
+                content_type=content_type or None,
+                datawrapper_charts=charts,
+                unreadable_embeds=unreadable_embeds,
+            )
         return FetchResult(
             url=current_url,
             status="no_resolving_content",
             text="",
             http_status=status,
             content_type=content_type or None,
-            datawrapper_charts=charts,
-            unreadable_embeds=unreadable_embeds,
-        )
-    # An empty extraction on a 200 OK is a JS-wall (SPA that
-    # rendered client-side, cookie/consent gate, etc.) —
-    # exactly the Tier-2 candidate signal. Treat identically
-    # to short-but-nonempty extractions. A walled page still
-    # exposes its embeds, so the charts ride along.
-    if extracted is None or looks_like_js_wall(extracted):
-        return FetchResult(
-            url=current_url,
-            status="js_wall",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
+            status_reason="thin_page",
             datawrapper_charts=charts,
             unreadable_embeds=unreadable_embeds,
         )
     return FetchResult(
         url=current_url,
         status="success",
-        text=_page_text_with_embed_disclosure(extracted, current_url, unreadable_embeds),
+        text=_page_text_with_leads(extracted or "", current_url, unreadable_embeds, chart_block),
         http_status=status,
         content_type=content_type or None,
         datawrapper_charts=charts,
@@ -1225,12 +1306,19 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     ``FetchStatus``) and ``embeds`` names the routeless data-embed providers found in
     the page's raw HTML, which is what makes an unreadable-embed page queryable even
     when its prose made it a success.
+
+    ``reason`` is appended only where the status alone is ambiguous — today that is
+    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page``. Appended rather than
+    always emitted so every line the archive already holds stays byte-identical and
+    the field's absence keeps meaning "no reason applies", not "old record".
     """
     for r in results:
+        reason = f" reason={r.status_reason}" if r.status_reason else ""
         logger.info(
             f"RESOLUTION_SOURCE_FETCH: question={qid} url={r.url} status={fetch_outcome_token(r)} "
             f"http={r.http_status if r.http_status is not None else 'n/a'} "
             f"embeds={','.join(r.unreadable_embeds) if r.unreadable_embeds else 'none'}"
+            f"{reason}"
         )
 
 

@@ -550,19 +550,50 @@ RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = (
 )
 RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
 RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
-# An extraction at or above the JS-wall floor can still be pure page chrome when the
-# page's numbers live in a third-party data embed our fetch has no route to (Infogram /
-# Flourish / Tableau — see `unreadable_data_embed_providers`). Below this many extracted
-# chars, such a page is an embed SHELL and is withheld as `no_resolving_content` instead
-# of rendered as grading evidence. Calibrated on the 89 archived resolution_source
-# records (2026-09-01): every archived success under 400 chars is site chrome — region
-# selectors (data.wastewaterscan.org, 127), a feedback-form blurb (camara.leg.br, 157),
-# org boilerplate (apnews.com, 355) — and the SHORTEST archived extraction that actually
-# carries the resolving content is 401 (myfloridaelections.com's election-date table).
-# So this is the observed elbow, and it stays deliberately below it: an embed-carrying
-# page above the floor keeps its text and gets the disclosure note instead, because
+# An extraction at or above the JS-wall floor can still be pure page chrome: a tab list,
+# a region selector, a feedback-form blurb, an "about the data" note. Below this many
+# extracted chars a 200-OK page is withheld as `no_resolving_content` rather than rendered
+# as grading evidence, whatever became of the content — `status_reason` records whether a
+# routeless data embed was named (`embed_shell`, Infogram / Flourish / Tableau, see
+# `unreadable_data_embed_providers`) or not (`thin_page`). The floor was gated on a named
+# provider when it shipped for qids 44554/44556, which withheld one shape of chrome and
+# published the other: the 2026-09-01 round found five content-free `success` renders and
+# not one of them named a provider.
+# Calibrated on the 89 archived resolution_source records, re-checked for the ungated rule
+# 2026-09-02: of 68 cited successes, 8 sit under 400 chars and all 8 are chrome — region
+# selectors (data.wastewaterscan.org, 127, twice), Kazakh region names (election.gov.kz,
+# 385), AP org boilerplate (355), an ABS release-date list with no figure (344), a tracker's
+# "about the data" note (262), a feedback-form blurb (camara.leg.br, 157), a
+# clinicaltrials.gov data-element pointer (111) — and the SHORTEST archived extraction that
+# actually carries the resolving content is 401 (myfloridaelections.com's election-date
+# table). So this is the observed elbow, and it stays deliberately below it: a page above
+# the floor keeps its text (plus the embed disclosure where one applies), because
 # withholding a terse-but-real data table costs more than leaving one shell visible.
 RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
+# --- Inline chart configs (Highcharts), read straight out of the page we already hold ---
+# qid 43949: the resolving IOM page fetched 200 and extracted ~80k chars of incident rows
+# and prose carrying none of the resolving figures, because the annual series lives in
+# `<div class="charts-highchart" data-chart="{...}">`. `research/resolution_chart_data.py`
+# unescapes and json.loads that config — zero LLM calls, no second request. Charts are read
+# on EVERY fetched HTML page, not only thin ones, because that page's prose was far above
+# the shell floor and a thin-only gate would miss the record the rung exists for.
+RESOLUTION_SOURCE_CHART_MAX_CHARTS: int = (
+    3  # the resolving chart is ~first in document order (IOM page carries 5), same assumption the Datawrapper hop makes
+)
+RESOLUTION_SOURCE_CHART_MAX_SERIES: int = 4  # IOM's widest chart is 3 series (Undetermined / Female / Male)
+# Points per series, kept from the END (the resolving value is the newest one). 16 keeps a
+# full annual series intact — IOM's is 13 points, 2014..2026 — while bounding its 149-point
+# monthly sibling to roughly the last year and a half.
+RESOLUTION_SOURCE_CHART_MAX_POINTS: int = 16
+# Hard cap on the whole rendered block, budgeted out of (never added on top of) the 6,000-char
+# per-URL page cap, so chart data can never evict more than a third of a cited page's text.
+# Measured: the IOM page's three readable charts render in ~700 chars together.
+RESOLUTION_SOURCE_CHART_BLOCK_MAX_CHARS: int = 2000
+# Configs examined per page before the scan stops, and the per-config char bound (which also
+# bounds the brace scan for the inline-script form). Both exist so a page with hundreds of
+# `data-chart` attributes, or one unclosed brace, costs a fixed amount of work.
+RESOLUTION_SOURCE_CHART_MAX_CANDIDATES: int = 20
+RESOLUTION_SOURCE_CHART_MAX_CONFIG_CHARS: int = 200_000
 # --- Datawrapper second hop (Tier 2) ---
 # Poll-tracker pages lock their resolving daily series inside Datawrapper
 # iframes that trafilatura drops (qids 44858/44841). The hop fetches the
