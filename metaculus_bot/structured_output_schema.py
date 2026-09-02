@@ -148,13 +148,13 @@ class ScenarioBranch(BaseModel):
 
 
 class BaseRateAnchor(BaseModel):
-    """The forecaster's stated outside-view base-rate range (telemetry only).
+    """The forecaster's stated outside-view base-rate range (archived blocks only).
 
-    Consumed by the anchor-overshoot telemetry in ``tool_runner``: the signed
-    pp distance of the declared posterior outside [low, high]. Never used to
-    clamp or mutate a forecast — the 2026-07 residual experiments showed
-    anchor-guard clamping sign-flips across eras, while overshoot >15pp
-    monotonically degrades Brier, so we measure and log only.
+    Prompted 2026-07-08 to 2026-09-02 and read by an anchor-overshoot telemetry line
+    that was deleted with it; it never clamped or mutated a forecast (the 2026-07
+    residual experiments buried the anchor-guard clamp for sign-flipping across eras).
+    Retained so the 49 published comments carrying the field still strict-parse in
+    ``performance_analysis``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -170,10 +170,12 @@ class BaseRateAnchor(BaseModel):
 
 
 class CriteriaClause(BaseModel):
-    """One priced resolution clause from the conjunctive-criteria table (telemetry only).
+    """One priced resolution clause from the conjunctive-criteria table (archived blocks only).
 
-    The product of clause probabilities is compared against the declared
-    posterior by ``tool_runner``; divergence is logged, never enforced.
+    Same history as ``BaseRateAnchor``: prompted 2026-07-08 to 2026-09-02, read only by a
+    clause-product divergence line that is gone, retained for the 12 published comments
+    that carry it. The clause-pricing REASONING stays in the binary prompt's step 5b —
+    what went is the JSON echo of the table.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -215,8 +217,12 @@ class BinaryStructured(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
     posterior_prob: float = Field(ge=0.0, le=1.0)
-    # Telemetry-only optional fields (2026-07-08): stated outside-view range and
-    # priced resolution clauses. Old blocks without them must keep parsing.
+    # ARCHIVED BLOCKS ONLY: the stated outside-view range and priced resolution
+    # clauses (2026-07-08). No longer prompted since 2026-09-02 — the block is written
+    # after the forecast is fixed, so both slots only re-keyed prose we already have, and
+    # their only reader was telemetry behind a flag every prod workflow pins off. The
+    # fields stay optional and tolerant because 49 + 12 published comments carry them and
+    # performance_analysis strict-parses those blocks.
     base_rate_anchor: BaseRateAnchor | None = None
     criteria_clauses: list[CriteriaClause] = Field(default_factory=list)
 
@@ -616,8 +622,10 @@ def _retry_without_binary_telemetry(
 ) -> StructuredBlock | None:
     """Re-validate a failed BINARY block with only the telemetry fields dropped.
 
-    Strip-and-retry for malformed BINARY telemetry (2026-07-08). The ``base_rate_anchor``
-    and ``criteria_clauses`` fields are TELEMETRY ONLY — nothing in the pipeline reads them
+    Strip-and-retry for malformed BINARY telemetry (2026-07-08). Since 2026-09-02 the
+    prompt no longer asks for either field, so on a fresh forecast this never fires; it
+    survives for archived blocks and for a model that emits one from habit. The
+    ``base_rate_anchor`` and ``criteria_clauses`` fields are TELEMETRY ONLY — nothing reads them
     to clamp or mutate a forecast. But without this, a malformed anchor / clauses payload
     (canonical failure modes: ``criteria_clauses: null`` even though the prompt says "omit";
     a reversed ``{low > high}`` anchor) would make us drop the ENTIRE block — including a

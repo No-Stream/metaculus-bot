@@ -279,9 +279,7 @@ def download_and_harvest(
 # Markers that live in the PUBLISHED comment, not stdout/stderr (see markers.py
 # docstring) — the framework logs only "Posted comment on post N", never the body,
 # so these ~never appear in run logs. A zero count here is expected, not a miss.
-_COMMENT_ONLY_MARKERS: frozenset[str] = frozenset(
-    {"stacker_outcome", "tools_used", "anchor_overshoot_pp", "clause_product_divergence_pp"}
-)
+_COMMENT_ONLY_MARKERS: frozenset[str] = frozenset({"stacker_outcome", "tools_used"})
 
 
 def _report(totals: dict[str, int], runs: list[HarvestedRun], expired_count: int) -> None:

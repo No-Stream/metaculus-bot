@@ -14,9 +14,8 @@ tests loudly instead of silently dropping records from the archive:
 * MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
 * RESOLUTION_SOURCE_FETCH -> metaculus_bot/research/resolution_source.py:_log_fetch_outcome_markers
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
-* STACKER_OUTCOME/TOOLS_USED/ANCHOR_OVERSHOOT_PP/CLAUSE_PRODUCT_DIVERGENCE_PP
-  -> metaculus_bot/comment/markers.py (HTML-comment markers; see module docstring
-     in markers.py for why they rarely appear in run logs).
+* STACKER_OUTCOME/TOOLS_USED -> metaculus_bot/comment/markers.py (HTML-comment
+  markers; see module docstring in markers.py for why they rarely appear in run logs).
 """
 
 import json
@@ -1284,16 +1283,6 @@ class TestHtmlCommentMarkers:
         rec = _parse_one("<!-- TOOLS_USED=false -->")
         assert rec["marker"] == "tools_used"
         assert rec["value"] is False
-
-    def test_anchor_overshoot(self):
-        rec = _parse_one("<!-- ANCHOR_OVERSHOOT_PP=+16.2 -->")
-        assert rec["marker"] == "anchor_overshoot_pp"
-        assert rec["pp"] == 16.2
-
-    def test_clause_divergence(self):
-        rec = _parse_one("<!-- CLAUSE_PRODUCT_DIVERGENCE_PP=-4.0 -->")
-        assert rec["marker"] == "clause_product_divergence_pp"
-        assert rec["pp"] == -4.0
 
 
 class TestQidKindAcrossMarkers:

@@ -27,10 +27,8 @@ from metaculus_bot.tool_runner import (
     aggregate_binary_values,
     aggregate_mc_values,
     aggregate_numeric_values,
-    anchor_overshoot_pp,
     build_cross_model_aggregation,
     cdf_at_threshold_for_forecaster,
-    clause_product_divergence_pp,
     run_tools_for_forecaster,
 )
 
@@ -312,144 +310,6 @@ class TestRunToolsBinary:
         match = re.search(r"P\(event in remaining \| none yet\) = (0\.\d+)", result)
         assert match is not None, result
         assert 0.99 < float(match.group(1)) < 1.0
-
-
-# ---------------------------------------------------------------------------
-# Anchor + clause telemetry (2026-07-08) — TELEMETRY ONLY, no forecast mutation
-# ---------------------------------------------------------------------------
-
-
-class TestAnchorOvershootMath:
-    def test_inside_anchor_range_is_zero(self):
-        assert anchor_overshoot_pp(0.25, 0.15, 0.35) == 0.0
-
-    def test_at_boundaries_is_zero(self):
-        assert anchor_overshoot_pp(0.15, 0.15, 0.35) == 0.0
-        assert anchor_overshoot_pp(0.35, 0.15, 0.35) == 0.0
-
-    def test_overshoot_above_is_positive_pp(self):
-        assert anchor_overshoot_pp(0.55, 0.15, 0.35) == pytest.approx(20.0)
-
-    def test_undershoot_below_is_negative_pp(self):
-        assert anchor_overshoot_pp(0.05, 0.15, 0.35) == pytest.approx(-10.0)
-
-    def test_degenerate_point_anchor(self):
-        assert anchor_overshoot_pp(0.30, 0.30, 0.30) == 0.0
-        assert anchor_overshoot_pp(0.45, 0.30, 0.30) == pytest.approx(15.0)
-
-
-class TestClauseProductMath:
-    def test_product_and_divergence(self):
-        product, divergence = clause_product_divergence_pp(0.87, [0.9, 0.95, 0.96])
-        assert product == pytest.approx(0.9 * 0.95 * 0.96)
-        assert divergence == pytest.approx((0.87 - 0.9 * 0.95 * 0.96) * 100.0)
-
-    def test_posterior_below_product_is_negative(self):
-        product, divergence = clause_product_divergence_pp(0.3, [0.8, 0.7])
-        assert product == pytest.approx(0.56)
-        assert divergence == pytest.approx(-26.0)
-
-    def test_single_clause(self):
-        product, divergence = clause_product_divergence_pp(0.5, [0.5])
-        assert product == pytest.approx(0.5)
-        assert divergence == 0.0
-
-
-class TestAnchorAndClauseTelemetryLines:
-    """Wiring: blocks carrying the optional telemetry fields produce neutral
-    measurement lines + machine-readable markers in the Computed quantities
-    output. Blocks without them (back-compat) produce no telemetry lines."""
-
-    def test_anchor_line_emitted_with_marker(self):
-        payload = _binary_payload(base_rate_anchor={"low": 0.15, "high": 0.35}, posterior_prob=0.55)
-        result = run_tools_for_forecaster(
-            question=_make_binary_question(),
-            rationale=_wrap_json(payload),
-            forecaster_id="m",
-        )
-        assert "Anchor telemetry" in result
-        assert "declared 55% vs stated anchor 15-35%" in result
-        assert "overshoot +20.0pp" in result
-        assert "<!-- ANCHOR_OVERSHOOT_PP=+20.0 -->" in result
-
-    def test_anchor_inside_range_reports_zero_overshoot(self):
-        payload = _binary_payload(base_rate_anchor={"low": 0.15, "high": 0.35}, posterior_prob=0.28)
-        result = run_tools_for_forecaster(
-            question=_make_binary_question(),
-            rationale=_wrap_json(payload),
-            forecaster_id="m",
-        )
-        assert "overshoot +0.0pp" in result
-        assert "<!-- ANCHOR_OVERSHOOT_PP=+0.0 -->" in result
-
-    def test_large_overshoot_logs_warning_but_stays_neutral(self, caplog):
-        payload = _binary_payload(base_rate_anchor={"low": 0.10, "high": 0.20}, posterior_prob=0.55)
-        with caplog.at_level(logging.WARNING):
-            result = run_tools_for_forecaster(
-                question=_make_binary_question(),
-                rationale=_wrap_json(payload),
-                forecaster_id="m",
-            )
-        assert any("ANCHOR_OVERSHOOT" in rec.message for rec in caplog.records)
-        # The comment-facing line stays neutral — no clamp language, no directive.
-        assert "clamp" not in result.lower()
-        assert "overshoot +35.0pp" in result
-
-    def test_clause_product_line_emitted_with_marker(self):
-        payload = _binary_payload(
-            criteria_clauses=[
-                {"name": "formal instrument", "prob": 0.9},
-                {"name": "in-window", "prob": 0.8},
-            ],
-            posterior_prob=0.8,
-        )
-        result = run_tools_for_forecaster(
-            question=_make_binary_question(),
-            rationale=_wrap_json(payload),
-            forecaster_id="m",
-        )
-        assert "Clause-product telemetry" in result
-        assert "product 0.720" in result
-        assert "divergence +8.0pp" in result
-        assert "<!-- CLAUSE_PRODUCT_DIVERGENCE_PP=+8.0 -->" in result
-
-    def test_block_without_telemetry_fields_emits_no_telemetry_lines(self):
-        # Back-compat: the standard payload (no anchor, no clauses) must not
-        # grow telemetry lines.
-        result = run_tools_for_forecaster(
-            question=_make_binary_question(),
-            rationale=_wrap_json(_binary_payload()),
-            forecaster_id="m",
-        )
-        assert "Anchor telemetry" not in result
-        assert "Clause-product telemetry" not in result
-        assert "ANCHOR_OVERSHOOT_PP" not in result
-        assert "CLAUSE_PRODUCT_DIVERGENCE_PP" not in result
-
-    def test_markers_parse_back_out_with_collector_regexes(self):
-        """Producer/consumer round-trip: the residual-analysis regexes in
-        comment.markers must extract the values the runner emitted."""
-        from metaculus_bot.comment.markers import (
-            ANCHOR_OVERSHOOT_MARKER_RE,
-            CLAUSE_DIVERGENCE_MARKER_RE,
-        )
-
-        payload = _binary_payload(
-            base_rate_anchor={"low": 0.15, "high": 0.35},
-            criteria_clauses=[{"name": "a", "prob": 0.5}, {"name": "b", "prob": 0.5}],
-            posterior_prob=0.55,
-        )
-        result = run_tools_for_forecaster(
-            question=_make_binary_question(),
-            rationale=_wrap_json(payload),
-            forecaster_id="m",
-        )
-        anchor_match = ANCHOR_OVERSHOOT_MARKER_RE.search(result)
-        clause_match = CLAUSE_DIVERGENCE_MARKER_RE.search(result)
-        assert anchor_match is not None
-        assert float(anchor_match.group(1)) == pytest.approx(20.0)
-        assert clause_match is not None
-        assert float(clause_match.group(1)) == pytest.approx((0.55 - 0.25) * 100.0)
 
 
 # ---------------------------------------------------------------------------

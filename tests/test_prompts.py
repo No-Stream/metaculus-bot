@@ -1462,7 +1462,7 @@ class TestStructuredForecastExampleBlocks:
 
     # Retired 2026-09-02: each was read only by dormant telemetry, and every one of them
     # asked the model for post-hoc admin rather than for its forecast.
-    _RETIRED_KEYS = ("remaining_window_days",)
+    _RETIRED_KEYS = ("remaining_window_days", "base_rate_anchor", "criteria_clauses")
 
     @pytest.mark.parametrize("build_prompt", _EXAMPLE_BLOCK_BUILDERS)
     def test_example_block_parses(self, build_prompt: Callable[[], str]) -> None:

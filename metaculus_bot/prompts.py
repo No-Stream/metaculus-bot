@@ -918,15 +918,11 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             ```json
             {{
               "question_type": "binary",
-              "posterior_prob": 0.28,
-              "base_rate_anchor": {{"low": 0.15, "high": 0.35}},
-              "criteria_clauses": [{{"name": "formal instrument signed", "prob": 0.6}}, {{"name": "in-window", "prob": 0.8}}]
+              "posterior_prob": 0.28
             }}
             ```
 
             `posterior_prob`: ALWAYS populate as a decimal in [0,1] (e.g., 0.28 for 28%).
-            `base_rate_anchor`: populate with the outside-view base-rate range you stated in PHASE 1 (as decimals, 0-1). Omit only if you truly stated no outside-view range.
-            `criteria_clauses`: populate from your conjunctive criteria pricing table in 5b (one entry per clause, probs as decimals). Omit for single-condition questions.
 
             The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
             """

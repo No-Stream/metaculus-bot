@@ -116,46 +116,6 @@ TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Per-forecaster anchor / clause telemetry markers (2026-07-08). Emitted by
-# ``tool_runner._run_binary_tools`` inside each forecaster's "## Computed
-# quantities" block, which is gated behind the ``PROBABILISTIC_TOOLS_ENABLED``
-# env flag: ``run_tools_for_forecaster`` returns an empty string when the
-# flag is false-y (see ``tool_runner.py``). All three prod workflows pin the
-# flag to ``'false'``
-# (``.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml``),
-# so these HTML-comment markers are currently DORMANT in published prod
-# comments. NOTE: the ``base_rate_anchor`` / ``criteria_clauses`` fields are
-# live in the binary prompt (authored ``30bca2f`` 2026-07-08, live on main
-# 2026-07-11T16:37Z in merge ``642b027`` — the merge date is the one to split a
-# replay on, per AGENTS.md era-bucketing) — they land unconditionally in every
-# prod binary comment's STRUCTURED FORECAST block.
-# The COMPUTED markers below (``ANCHOR_OVERSHOOT_PP`` /
-# ``CLAUSE_PRODUCT_DIVERGENCE_PP``) are dormant only because they emit from
-# ``tool_runner``, which is gated behind ``PROBABILISTIC_TOOLS_ENABLED`` (all
-# three prod workflows pin it to ``'false'``). While the flag is off, the
-# overshoot / divergence math is trivially replayable offline from the raw
-# JSON; the markers become the primary channel if it is ever flipped on.
-# (An earlier note here wrongly claimed the elicitation was retired in
-# Workstream C2 — that retirement covered the prior/base_rate/hazard/evidence/
-# scenario tier-2 fields; the anchor/clause fields shipped the next day as a
-# separate, still-live channel. The "0/2203 archived rows" reading was a
-# data-window artifact: the archive ended 2026-07-01, before both the authoring
-# and the merge date, so the argument holds on either.)
-# TELEMETRY ONLY either way: nothing in the pipeline reads these
-# back to clamp or mutate a forecast.
-ANCHOR_OVERSHOOT_MARKER_PREFIX: str = "ANCHOR_OVERSHOOT_PP"
-CLAUSE_DIVERGENCE_MARKER_PREFIX: str = "CLAUSE_PRODUCT_DIVERGENCE_PP"
-
-ANCHOR_OVERSHOOT_MARKER_RE: re.Pattern[str] = re.compile(
-    r"<!--\s*ANCHOR_OVERSHOOT_PP=([+-]?\d+(?:\.\d+)?)\s*-->",
-    re.IGNORECASE,
-)
-CLAUSE_DIVERGENCE_MARKER_RE: re.Pattern[str] = re.compile(
-    r"<!--\s*CLAUSE_PRODUCT_DIVERGENCE_PP=([+-]?\d+(?:\.\d+)?)\s*-->",
-    re.IGNORECASE,
-)
-
-
 # Ensemble-size disclosure marker. Injected into every published comment by
 # ``build_unified_explanation``. Records how many forecasters CONTRIBUTED (== the
 # number of ``*Forecaster N*`` summary bullets) out of how many were CONFIGURED
@@ -176,16 +136,6 @@ FORECASTERS_USED_MARKER_RE: re.Pattern[str] = re.compile(
 def format_forecasters_used_marker(n_used: int, n_configured: int) -> str:
     """Render the ensemble-size marker: n contributed of N configured (``n/N``)."""
     return f"<!-- {FORECASTERS_USED_MARKER_PREFIX}={n_used}/{n_configured} -->"
-
-
-def format_anchor_overshoot_marker(overshoot_pp: float) -> str:
-    """Render the per-forecaster anchor-overshoot marker (signed, 1 decimal)."""
-    return f"<!-- {ANCHOR_OVERSHOOT_MARKER_PREFIX}={overshoot_pp:+.1f} -->"
-
-
-def format_clause_divergence_marker(divergence_pp: float) -> str:
-    """Render the per-forecaster clause-product-divergence marker (signed, 1 decimal)."""
-    return f"<!-- {CLAUSE_DIVERGENCE_MARKER_PREFIX}={divergence_pp:+.1f} -->"
 
 
 # Section headers emitted by ``metaculus_bot.stacking.combine_stacker_and_base_reasoning``
@@ -274,12 +224,6 @@ assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_TRUE) is not None, (
 assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_FALSE) is not None, (
     f"TOOLS_USED_MARKER_RE does not match TOOLS_USED_MARKER_FALSE={TOOLS_USED_MARKER_FALSE!r}"
 )
-assert ANCHOR_OVERSHOOT_MARKER_RE.search(format_anchor_overshoot_marker(16.2)) is not None, (
-    "ANCHOR_OVERSHOOT_MARKER_RE does not match its own formatter output"
-)
-assert CLAUSE_DIVERGENCE_MARKER_RE.search(format_clause_divergence_marker(-4.0)) is not None, (
-    "CLAUSE_DIVERGENCE_MARKER_RE does not match its own formatter output"
-)
 _forecasters_used_match = FORECASTERS_USED_MARKER_RE.search(format_forecasters_used_marker(2, 3))
 assert _forecasters_used_match is not None, "FORECASTERS_USED_MARKER_RE does not match its own formatter output"
 assert _forecasters_used_match.group(1) == "2", (
@@ -297,11 +241,7 @@ assert STACKED_BASE_REASONING_HEADER.startswith("## "), (
 )
 
 __all__ = [
-    "ANCHOR_OVERSHOOT_MARKER_PREFIX",
-    "ANCHOR_OVERSHOOT_MARKER_RE",
     "BASE_MODEL_SUBBLOCK_SPLIT_RE",
-    "CLAUSE_DIVERGENCE_MARKER_PREFIX",
-    "CLAUSE_DIVERGENCE_MARKER_RE",
     "FORECASTERS_USED_MARKER_PREFIX",
     "FORECASTERS_USED_MARKER_RE",
     "HISTORICAL_STACKER_META_HEADER",
@@ -323,8 +263,6 @@ __all__ = [
     "TOOLS_USED_MARKER_FALSE",
     "TOOLS_USED_MARKER_RE",
     "TOOLS_USED_MARKER_TRUE",
-    "format_anchor_overshoot_marker",
-    "format_clause_divergence_marker",
     "format_forecasters_used_marker",
     "format_stacker_skip_reason_marker",
 ]

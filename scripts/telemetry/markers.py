@@ -118,8 +118,7 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   variant is the 2026-08-25 addition that keeps a healthy run in the census)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_ROLE_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
   (``CREDIT_ROLE_SPEND`` is per-RUN, per-(role, key): where the run's OpenRouter dollars went)
-* ``STACKER_OUTCOME`` / ``STACKER_SKIP_REASON`` / ``TOOLS_USED`` /
-  ``ANCHOR_OVERSHOOT_PP`` / ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
+* ``STACKER_OUTCOME`` / ``STACKER_SKIP_REASON`` / ``TOOLS_USED`` — ``metaculus_bot/comment/markers.py``
 
 NOTE ON THE HTML-COMMENT MARKERS: the ones on that last line are ``<!-- ... -->``
 markers injected into the *published Metaculus comment*, not logged to stdout/stderr (the
@@ -1146,14 +1145,6 @@ MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "forecasters_used",
         re.compile(r"<!--\s*FORECASTERS_USED=(?P<used>\d+)/(?P<configured>\d+)\s*-->", re.IGNORECASE),
-    ),
-    MarkerSpec(
-        "anchor_overshoot_pp",
-        re.compile(r"<!--\s*ANCHOR_OVERSHOOT_PP=(?P<pp>[+-]?\d+(?:\.\d+)?)\s*-->", re.IGNORECASE),
-    ),
-    MarkerSpec(
-        "clause_product_divergence_pp",
-        re.compile(r"<!--\s*CLAUSE_PRODUCT_DIVERGENCE_PP=(?P<pp>[+-]?\d+(?:\.\d+)?)\s*-->", re.IGNORECASE),
     ),
 ]
 
