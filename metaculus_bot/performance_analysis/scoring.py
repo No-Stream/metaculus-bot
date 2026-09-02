@@ -6,7 +6,10 @@ continue to work without modification.
 
 ``spot_peer_delta`` rides along for the same reason: a residual round prices its
 counterfactuals from this module, and the halving of a continuous peer delta is the one
-piece of the convention rounds have got wrong (see its docstring).
+piece of the convention rounds have got wrong (see its docstring). Both halves of the type
+split come with it — ``CONTINUOUS_QUESTION_TYPES`` and ``UNHALVED_QUESTION_TYPES`` — so a
+round script asking "does this type get halved" reads the answer from one import rather
+than hand-writing a type tuple.
 """
 
 from metaculus_bot.scoring_common import (  # noqa: F401
@@ -15,6 +18,7 @@ from metaculus_bot.scoring_common import (  # noqa: F401
     CONTINUOUS_QUESTION_TYPES,
     PROB_CLAMP_MAX,
     PROB_CLAMP_MIN,
+    UNHALVED_QUESTION_TYPES,
     binary_log_score,
     brier_score,
     clamp_prob,
