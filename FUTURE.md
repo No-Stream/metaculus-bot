@@ -1017,7 +1017,7 @@ cannot tell a current read from a remembered one.
 
 **Status and the honest discount.** Unshipped, and until 2026-09-02 also untracked, which is why
 this entry exists. The RENDER side is now half-covered: `bc9d9ad` dates every rendered latest value
-and flags staleness, and the 2026-09-01 bundle added vintage / as-of bullets to
+and flags staleness, and the 2026-09 bundle added vintage / as-of bullets to
 `web_research_prompt` asking research output to carry the publication date of dated claims. That
 weakens the prompt-side case without retiring it, because those changes make the dates AVAILABLE to
 a forecaster without making a forecaster state which one it used. Not a fitted layer, so no
@@ -1033,7 +1033,8 @@ is unmeasured until the fall cup resolves.
 This is the sibling half of the tail-consistency check above, and unlike that half it has been
 measured and does not survive. The proposal was: flag or correct a binary forecast whose published
 probability sits outside the member's own declared `base_rate_anchor` range, on the theory that
-leaving your own stated anchor is an internal contradiction. Three findings kill it.
+leaving your own stated anchor is an internal contradiction. Three findings kill it, and a fourth
+fact retires the input: the 2026-09 bundle removes `base_rate_anchor` from the prompt.
 
 **The premise is not a contradiction.** The prompt defines `base_rate_anchor` as the outside-view
 range stated in Phase 1 and `posterior_prob` as the post-update posterior, so publishing outside
@@ -1065,10 +1066,15 @@ ways: q42304 would have gained +144 from keeping its anchor, q39747 (the US bail
 would have lost 170, because there the members' 0.10 anchor was wrong and their 0.55 publish was
 right.
 
-**What to do instead.** Nothing automated. `_ANCHOR_CONSISTENCY_RULE` (shipped in the 2026-09
-bundle) already asks a member to state its outside-view number and to name the specific evidence
-when it lands more than about 15 points away; the audit endorses exactly that and warns against
-strengthening it into a clamp or a shrink. The one cheap thing worth continuing is the control:
+**What to do instead.** Nothing automated, and the elicitation this check reads is itself going
+away. The 2026-09 bundle asks a member to state its outside-view number and to name the specific
+evidence when the final probability lands more than about 15 points off it, as one clause on the
+existing "anchor on your math" bullet rather than as a standalone rule; the audit endorses exactly
+that and warns against strengthening it into a clamp or a shrink. The same bundle removes
+`base_rate_anchor` from the block (Item D of
+`scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md`), so from that merge on
+there is no machine-readable anchor to compare a publish against at all, and reviving the screen
+would mean re-adding the field first. The one cheap thing worth continuing is the control:
 hand-run the single anchor-versus-published comparison on any new binary MISS dossier and record
 which side it fires on, because the resolved-fire cell is n=3 and every one of them is hit-side.
 Never propose it as a screen or a guard. Note also that any June-era hand-run of this check is
@@ -1494,10 +1500,11 @@ residual + competitor analysis") is frozen where it stands: about 40 triple-era 
 carry the field against a threshold of 50, and only 21 of their 119 blocks had resolved as of
 2026-08-31.
 Reviving any of this now means re-adding the elicitation first, which is a prompt change and a
-config-era boundary, so it is a decision rather than a wait. `remaining_window_days` /
-`WINDOW_DECLARED`, shipped on the morning of 2026-09-02, is retired by the same item on the same
-day for the same reason; it never appears in this file, so there is nothing else here to update.
-The evidence below is kept because it is what stops the idea being re-proposed from memory.
+config-era boundary, so it is a decision rather than a wait. The `remaining_window_days` field and
+its `WINDOW_DECLARED` marker, which shipped earlier on 2026-09-02, are retired by the same item on
+the same day, on the grounds that its own instruction made it telemetry-only; they never appear
+in this file, so there is nothing else here to update. The evidence below is kept because it is
+what stops the idea being re-proposed from memory.
 (`scratch/residual_2026-08-31/dim_ghosts-guards.md` §3b-3c for the archived counts;
 `scratch/residual_2026-09-01/FOLLOWUP_LEDGER.md` row 29.)
 
