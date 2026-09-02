@@ -26,7 +26,6 @@ import pandas as pd
 from metaculus_bot.constants import (
     FINANCIAL_VARIANCE_RATIO_FLOOR,
     FINANCIAL_VARIANCE_RATIO_LAG,
-    FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
     TS_ANCHOR_LOOKBACK_YEARS,
     TS_ANCHOR_MONTHLY_TABLE_ROWS,
     TS_ANCHOR_NATIVE_TABLE_ROWS,
@@ -34,6 +33,7 @@ from metaculus_bot.constants import (
     TS_ANCHOR_SPREAD_LOOKBACK_YEARS,
     TS_ANCHOR_WEEKLY_TABLE_ROWS,
 )
+from metaculus_bot.research.noise_flag import noise_flag_line, screen_for_quote_noise
 from metaculus_bot.research.ts_estimators import (
     MONTHLY_CLOCK,
     Freq,
@@ -46,10 +46,8 @@ from metaculus_bot.research.ts_estimators import (
     annualized_realized_vol_pct,
     clock_matches_cadence,
     horizon_steps,
-    multi_period_annualized_vol_pct,
     series_clock,
     stale_latest_age_days,
-    variance_ratio,
 )
 from metaculus_bot.research.ts_routing import Derivation, _Route
 
@@ -93,12 +91,26 @@ def _today_utc() -> date:
 
 
 def _fmt(v: float) -> str:
-    """Sensible sig figs: thousands-separated for large magnitudes, 4 sig figs otherwise."""
-    a = abs(float(v))
-    if a >= 10000:
-        return f"{v:,.0f}"
-    if a >= 100:
-        return f"{v:,.1f}"
+    """Published precision on levels, thousands-separated, 4 significant figures below 100.
+
+    Fixed-point above 100 with trailing zeros stripped. The old `:,.1f` rounded a Case-Shiller
+    level of 331.893 to "331.9" on a question with 0.02-point buckets, and `:,.0f` above 10,000
+    dropped an index level's decimals entirely — the same `.4g`-class defect fixed at the FRED
+    render sites, in the other renderer of the same series (both providers append
+    unconditionally, so one bundle stated two different values for one observation).
+
+    Capped at three decimals rather than ``fred_rendering._format_fred_value``'s six because
+    this formatter also renders the empirical P10/P50/P90 band, where six decimals on an
+    estimate would be fabricated precision; three is enough to carry a level's published digits
+    (and the band's quantiles, which a forecaster sizes an interval from, are worth up to 0.05
+    index points — roughly 1-2 buckets on the questions this feeds). Below 100 stays `:.4g` so a
+    small month-over-month % change or a percentage-point spread band keeps its significant
+    figures instead of rounding to "0.000".
+    """
+    if abs(float(v)) >= 100:
+        # rstrip("0") halts at the ".", so an integer's own zeros are never eaten
+        # (1200.0 -> "1,200"); the same idiom _format_fred_value uses.
+        return f"{v:,.3f}".rstrip("0").rstrip(".")
     return f"{v:.4g}"
 
 
@@ -228,7 +240,7 @@ def _fifty_two_week_line(series: pd.Series, ceiling: date, last: float) -> str:
     return f"- {label}: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"  # noqa: RUF001  # en dash is deliberate range typography in rendered research
 
 
-def _realized_vol_lines(series: pd.Series, clock: SeriesClock) -> list[str]:
+def _realized_vol_lines(series: pd.Series, clock: SeriesClock, *, symbol: str) -> list[str]:
     """Annualized realized volatility over the last ``REALIZED_VOL_WINDOW`` observations,
     plus the vendor-noise flag when the series' variance ratio trips the screen.
 
@@ -241,10 +253,11 @@ def _realized_vol_lines(series: pd.Series, clock: SeriesClock) -> list[str]:
     the same reason: 30 rows is six calendar weeks on an exchange-traded series, so calling it
     "30-day" was a row count masquerading as a calendar window.
 
-    The noise screen is the same estimator and the same ``FINANCIAL_VARIANCE_RATIO_*``
-    thresholds ``financial_data`` uses, because this is the other place the bot annualizes
-    ONE-day returns for a forecaster: q44797's pegged cross would render an equally inflated
-    figure here, and the anchor can route to any URL-cited Yahoo ticker. The BANDS above it
+    The noise screen is ``research.noise_flag``, shared verbatim with ``financial_data``
+    (same estimator, same ``FINANCIAL_VARIANCE_RATIO_*`` thresholds, same telemetry line),
+    because this is the other place the bot annualizes ONE-day returns for a forecaster:
+    q44797's pegged cross would render an equally inflated figure here, and the anchor can
+    route to any URL-cited Yahoo ticker. Only the sentence is local. The BANDS above it
     are structurally immune — they are empirical h-step change quantiles at h of tens of
     observations, where independent quote noise contributes ~2/h of the variance — so the
     flag says so rather than casting doubt on the whole section.
@@ -255,17 +268,10 @@ def _realized_vol_lines(series: pd.Series, clock: SeriesClock) -> list[str]:
     if annualized is None:
         return []
     vol_line = f"- {REALIZED_VOL_WINDOW}-{clock.step_unit} annualized realized volatility: {annualized:.1f}%"
-    noise_ratio = variance_ratio(
-        series, lag=FINANCIAL_VARIANCE_RATIO_LAG, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS
-    )
-    if noise_ratio is None or noise_ratio >= FINANCIAL_VARIANCE_RATIO_FLOOR:
+    screen = screen_for_quote_noise(series, periods_per_year=clock.periods_per_year)
+    if screen is None:
         return [vol_line]
-    robust_vol = multi_period_annualized_vol_pct(
-        series,
-        lag=FINANCIAL_VARIANCE_RATIO_LAG,
-        periods_per_year=clock.periods_per_year,
-        min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
-    )
+    robust_vol = screen.robust_vol_pct
     robust_clause = (
         ""
         if robust_vol is None
@@ -274,14 +280,13 @@ def _realized_vol_lines(series: pd.Series, clock: SeriesClock) -> list[str]:
             f"reversing component cancels, the volatility is {robust_vol:.1f}%."
         )
     )
-    logger.info(
-        f"FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag={FINANCIAL_VARIANCE_RATIO_LAG} "
-        f"vr={noise_ratio:.3f} floor={FINANCIAL_VARIANCE_RATIO_FLOOR} short_vol={annualized:.1f} "
-        f"robust_vol={robust_vol if robust_vol is None else round(robust_vol, 1)}"
-    )
+    # No long-horizon window on this surface — the anchor renders one volatility, so the
+    # shared line's long_vol reads None here (`surface` is what tells that apart from a
+    # yfinance series too short to hold one).
+    logger.info(noise_flag_line(screen, surface="ts_anchor", symbol=symbol, short_vol=annualized, long_vol=None))
     return [
         f"{vol_line} — noise-suspect",
-        f"- ⚠ Vendor-noise flag: variance ratio VR({FINANCIAL_VARIANCE_RATIO_LAG}) = {noise_ratio:.2f} over this "
+        f"- ⚠ Vendor-noise flag: variance ratio VR({FINANCIAL_VARIANCE_RATIO_LAG}) = {screen.ratio:.2f} over this "
         f"series' history. A random walk reads ~1.0; below {FINANCIAL_VARIANCE_RATIO_FLOOR:.2f} most of each "
         "step's move is reversed the next, which inflates any volatility computed from one-step returns."
         f"{robust_clause} The change band above is unaffected — it is built from multi-observation changes, over "
@@ -472,7 +477,7 @@ def _render_single(
     parts.extend(band_lines)
 
     if clock.freq == "daily" and use_log:
-        parts.extend(_realized_vol_lines(derived, clock))
+        parts.extend(_realized_vol_lines(derived, clock, symbol=route.spec.series_id))
 
     parts.append(f"\n_{PROVENANCE_FOOTER}_")
     return "\n".join(parts), band

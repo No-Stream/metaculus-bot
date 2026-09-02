@@ -602,20 +602,31 @@ MARKER_SPECS: list[MarkerSpec] = [
         # provider's full held history; a random walk reads ~1.0 and the flag fires below
         # ``floor``. ``robust_vol`` is the volatility measured on overlapping ``vr_lag``-step
         # returns (the flagged block's headline figure) and reads "None" when the estimator
-        # refused the sample. ``long_vol`` is an OPTIONAL group: only the financial_data
-        # surface holds a long window to compare against, so the ts_anchor line goes straight
-        # from ``short_vol`` to ``robust_vol``. A non-participating group still lands in the
-        # record, so a ts_anchor row reads ``long_vol`` as None exactly as a financial_data
-        # row whose long window was unavailable does — read ``surface`` to tell "this emitter
-        # has no long window" from "this series was too short for one".
+        # refused the sample. ``long_vol`` is the long-horizon one-day-return volatility and
+        # reads "None" on the ts_anchor surface, which computes no long window at all, exactly
+        # as it does on a yfinance series too short to hold one — read ``surface`` to tell
+        # those apart. Every field is REQUIRED: one shared emitter
+        # (``research/noise_flag.py`` ``noise_flag_line``) means one shape, so a future field
+        # reorder harvests as a clean zero rather than recording None for a value that WAS
+        # emitted, which an optional group in the middle of same-shaped ``\S+`` fields does.
+        #
+        # ``symbol`` is the ticker or FRED series id the flagged volatility was computed on,
+        # in the same field position its stale-latest sibling carries it. It is REQUIRED, not
+        # optional-wrapped: the marker ships in the same diff as this spec, so no archived
+        # record predates the field. Without it every record was anonymous, and the fan-out is
+        # one thread per ticker up to MAX_FINANCIAL_IDENTIFIERS with nondeterministic line
+        # order, so two flagged tickers in one run were byte-identical apart from ``seq`` — no
+        # join to the stale-latest record for the same series, and no way to tell a pegged-cross
+        # true positive from a `^GSPC` false positive at n=1.
         #
         # No question ref: like its stale-latest sibling the flag is per-IDENTIFIER (one
         # question can fire several) and neither call site has the question in scope, so
         # qid_kind stays None.
         re.compile(
-            r"FINANCIAL_NOISE_FLAG:\s*surface=(?P<surface>\S+)\s+vr_lag=(?P<vr_lag>\S+)"
-            r"\s+vr=(?P<vr>\S+)\s+floor=(?P<floor>\S+)\s+short_vol=(?P<short_vol>\S+)"
-            r"(?:\s+long_vol=(?P<long_vol>\S+))?\s+robust_vol=(?P<robust_vol>\S+)"
+            r"FINANCIAL_NOISE_FLAG:\s*surface=(?P<surface>\S+)\s+symbol=(?P<symbol>\S+)"
+            r"\s+vr_lag=(?P<vr_lag>\S+)\s+vr=(?P<vr>\S+)\s+floor=(?P<floor>\S+)"
+            r"\s+short_vol=(?P<short_vol>\S+)\s+long_vol=(?P<long_vol>\S+)"
+            r"\s+robust_vol=(?P<robust_vol>\S+)"
         ),
     ),
     MarkerSpec(

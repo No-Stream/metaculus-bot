@@ -689,15 +689,20 @@ how that gets measured instead of re-run offline.
 density, which on a 24/7 series drew a 62-step band under a 90-day label. Detail in the resolved
 entry "financial_data / ts-anchor: calendar time converted on a hardcoded trading-day density".
 
-**LOW — `ts_render._fmt` is the last `.4g`-class precision sibling (added 2026-09-01).** The
-2026-09-01 bundle replaced `:.4g` at the five FRED render sites (a Case-Shiller print of 331.893 was
-rendering as "331.9" on a question whose displayed range was four index points wide), but the
-anchor section's own formatter still renders anything between 100 and 10,000 at ONE decimal and
-drops decimals entirely above that. It was left alone because it needs a taste call: `_fmt` formats
-both resolving LEVELS, where full precision is clearly right, and P10/P50/P90 BAND estimates, where
-one decimal is arguably honest about an estimate's precision. So the likely fix is a separate level
-formatter at the "latest value" and history-table call sites rather than a global change. The
-anchor's tests assert structure rather than exact numbers, so the churn is small either way.
+**`ts_render._fmt` swept 2026-09-01, same branch (added 2026-09-01, SHIPPED).** The bundle replaced
+`:.4g` at the five FRED render sites (a Case-Shiller print of 331.893 was rendering as "331.9" on a
+question whose displayed range was four index points wide) but left the anchor section's own
+formatter rendering anything between 100 and 10,000 at ONE decimal, and dropping decimals entirely
+above that — so one bundle stated two different values for one observation in two adjacent sections
+(both providers append unconditionally, and q44944's archived record carries both). `_fmt` is now
+fixed-point up to three decimals above 100 with trailing zeros stripped, `:.4g` below.
+
+The taste call this entry flagged went the OTHER way than the entry proposed. The entry argued for a
+separate level formatter at the "latest value" and history-table sites only, leaving P10/P50/P90
+BAND estimates at one decimal as honest about an estimate's precision. The global three-decimal cap
+shipped instead, because the band quantiles are exactly what a forecaster sizes an interval from and
+one decimal costs up to 0.05 index points there, roughly 1-2 buckets on these questions. Three
+rather than `_format_fred_value`'s six keeps six-decimal fabricated precision off an estimate.
 
 ### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-21 (added 2026-07-16)
 

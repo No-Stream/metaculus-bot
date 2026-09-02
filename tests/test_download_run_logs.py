@@ -55,11 +55,12 @@ THIN_PUBLISH_FLOOR_LINE = (
     "2026-09-01 12:00:05,000 - metaculus_bot.aggregation_pipeline - WARNING - "
     "THIN_PUBLISH_FLOOR: question=44874 raw=0.0300 clamped=0.0500 survivors=1"
 )
-# The ts_anchor surface of the vendor-noise flag: the emitter with NO long_vol field, which is
-# the shape whose optional group has to survive the whole durable path.
+# The ts_anchor surface of the vendor-noise flag: the surface with no long volatility window,
+# so its `long_vol=None` has to survive the whole durable path as a null rather than a zero.
 FINANCIAL_NOISE_FLAG_LINE = (
     "2026-09-01 12:00:00,000 - metaculus_bot.research.ts_render - INFO - "
-    "FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag=5 vr=0.412 floor=0.6 short_vol=14.6 robust_vol=9.4"
+    "FINANCIAL_NOISE_FLAG: surface=ts_anchor symbol=CSUSHPISA vr_lag=5 vr=0.412 floor=0.6 "
+    "short_vol=14.6 long_vol=None robust_vol=9.4"
 )
 MARKET_TIER_CAPPED_LINE = (
     "2026-09-01 12:00:00,000 - metaculus_bot.research.prediction_market - INFO - "
@@ -294,9 +295,12 @@ class TestNewMarkerSpecsReachTheArchive:
 
         noise = load_marker_records(archive_dir, "financial_noise_flag")
         assert len(noise) == 1
-        # The three fields a noise-incidence cut reads. `long_vol` is absent from the
-        # ts_anchor emitter, so it must arrive as a null rather than sinking the record.
+        # The fields a noise-incidence cut reads, `symbol` included — without it two flagged
+        # identifiers in one run are one indistinguishable pair of records. The ts_anchor
+        # surface computes no long window, so its `long_vol` must arrive as a null rather than
+        # a fabricated 0.0.
         assert noise[0]["surface"] == "ts_anchor"
+        assert noise[0]["symbol"] == "CSUSHPISA"
         assert noise[0]["robust_vol"] == 9.4
         assert noise[0]["long_vol"] is None
 

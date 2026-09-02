@@ -902,18 +902,20 @@ class TestFinancialStaleLatest:
         assert "qid_kind" not in rec
 
 
-# Copied from the two emitting format strings (financial_data.py:_volatility_lines and
-# ts_render.py:_realized_vol_lines). The two surfaces differ by one field: only
-# financial_data holds a long volatility window to print alongside the 30-row one.
+# Copied from the one emitting format string (research/noise_flag.py:noise_flag_line, called
+# by financial_data.py:_volatility_lines and ts_render.py:_realized_vol_lines). One shape for
+# both surfaces: only financial_data computes a long volatility window, so `long_vol` reads
+# None on the anchor surface exactly as it does on a series too short to hold one.
 FINANCIAL_NOISE_FLAG_YFINANCE_LINE = (
-    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data vr_lag=5 vr=0.369 floor=0.6 "
+    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data symbol=USDSZL=X vr_lag=5 vr=0.369 floor=0.6 "
     "short_vol=17.9 long_vol=15.2 robust_vol=10.8"
 )
 FINANCIAL_NOISE_FLAG_TS_ANCHOR_LINE = (
-    PFX + "FINANCIAL_NOISE_FLAG: surface=ts_anchor vr_lag=5 vr=0.412 floor=0.6 short_vol=14.6 robust_vol=9.4"
+    PFX + "FINANCIAL_NOISE_FLAG: surface=ts_anchor symbol=CSUSHPISA vr_lag=5 vr=0.412 floor=0.6 "
+    "short_vol=14.6 long_vol=None robust_vol=9.4"
 )
 FINANCIAL_NOISE_FLAG_NO_ESTIMATES_LINE = (
-    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data vr_lag=5 vr=0.369 floor=0.6 "
+    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data symbol=USDSZL=X vr_lag=5 vr=0.369 floor=0.6 "
     "short_vol=17.9 long_vol=None robust_vol=None"
 )
 
@@ -931,6 +933,9 @@ class TestFinancialNoiseFlag:
         rec = _parse_one(FINANCIAL_NOISE_FLAG_YFINANCE_LINE)
         assert rec["marker"] == "financial_noise_flag"
         assert rec["surface"] == "financial_data"
+        # The ticker the flagged volatility was computed on: without it two flagged
+        # identifiers in one run harvest as byte-identical anonymous records.
+        assert rec["symbol"] == "USDSZL=X"
         assert rec["vr_lag"] == 5
         assert rec["vr"] == 0.369
         assert rec["floor"] == 0.6
@@ -938,11 +943,14 @@ class TestFinancialNoiseFlag:
         assert rec["long_vol"] == 15.2
         assert rec["robust_vol"] == 10.8
 
-    def test_ts_anchor_surface_omits_the_long_window(self):
-        # The ts_anchor emitter prints no long_vol at all, so the optional group does not
-        # participate and the field reads None rather than dropping the whole record.
+    def test_ts_anchor_surface_reads_none_for_the_long_window(self):
+        # The anchor renders one volatility and computes no long window, so `long_vol` reads
+        # None there. Same field set as the yfinance surface, which is what lets the spec
+        # require every group: `surface` is what tells "this emitter has no long window" from
+        # "this series was too short for one".
         rec = _parse_one(FINANCIAL_NOISE_FLAG_TS_ANCHOR_LINE)
         assert rec["surface"] == "ts_anchor"
+        assert rec["symbol"] == "CSUSHPISA"
         assert rec["short_vol"] == 14.6
         assert rec["robust_vol"] == 9.4
         assert rec["long_vol"] is None
