@@ -243,13 +243,23 @@ def _mc_options_line(options: Sequence[str] | None) -> str:
 # on q45401, the Metaculus crowd on q20683). Hence narrowed rather than removed.
 # Wording confirmed verbatim by the operator 2026-09-01; receipts in
 # scratch/residual_2026-08-31/market_odds_coverage.md.
-_OUTSIDE_VENUE_MARKET_ODDS_BULLET = (
-    "- Market-implied or crowd odds from sources OTHER than Polymarket, Kalshi, Manifold, or PredictIt "
+#
+# Split in two so the policy has exactly ONE definition across prompts that format it
+# differently: `web_research_prompt` wants a FOCUS AREAS bullet, and the two Perplexity
+# prompts are unbulleted prose whose whole body is one `clean_indents` block, where an
+# interpolated line starting at column 0 would defeat the dedent for the entire prompt.
+# The bullet is the policy plus its dash, so the operator-confirmed text is byte-identical
+# on the surface it was confirmed against. Restating it per prompt is what let the two
+# Perplexity sites keep the retired blanket "consider all relevant prediction markets" ask
+# after this one was narrowed, until a review caught them.
+OUTSIDE_VENUE_MARKET_ODDS_POLICY = (
+    "Market-implied or crowd odds from sources OTHER than Polymarket, Kalshi, Manifold, or PredictIt "
     "(e.g. Metaculus, Good Judgment Open, CME FedWatch, bookmakers) — always name the market and the date "
     "you observed the price. Do NOT report Polymarket/Kalshi/Manifold/PredictIt prices from search results: "
     "a dedicated live snapshot of those venues is provided separately, and search-indexed copies of their "
     "prices are usually days stale."
 )
+_OUTSIDE_VENUE_MARKET_ODDS_BULLET = f"- {OUTSIDE_VENUE_MARKET_ODDS_POLICY}"
 
 
 # Citation instruction for the Gemini grounding provider. The SDK returns grounding
@@ -489,6 +499,11 @@ _SOURCE_PROVENANCE_LADDER = """
                  (C) aggregators, advocacy or partisan outlets, and translated or single-outlet reports —
                      use the underlying cited facts, not their framing or causal narrative;
                  (D) anonymous, social, rumor, or untraceable AI-generated summaries — suggestive only.
+               • `[unverified attribution]` stands where a source tag would be: the research pipeline
+                 could not match the outlet the text named against its own retrieval record, so the tag
+                 and its tier were removed together. The claim itself may still be correct, and nothing
+                 in the sentence was changed — treat it as untiered, unattributed evidence rather than as
+                 a named outlet's authority, and do not read it as a low tier either.
                • Weigh motivation, not just authority: discount claims that serve the speaker's interest (hype,
                  marketing, sponsor optimism). Treat a statement AGAINST the speaker's interest — a company tempering
                  its own timeline, an on-record denial of a favorable rumor — as strong evidence.
@@ -1618,11 +1633,17 @@ def gap_fill_analyzer_prompt(
         When the question resolves off a live data source — a tracker, index, polling or
         rate average, counter, league table, or dashboard — at least ONE gap must ask what
         that source reads NOW, in the present tense ("what value does <tracker> currently
-        display for <series>, and when was it last updated?"). Never phrase a gap as that
-        source's value on the resolution date ("what will <tracker> show on <date>"): no
-        search can answer it, the resolver comes back "that date has not occurred yet",
-        and the slot is spent for nothing. If a candidate gap can only be answered by a
-        future observation, rewrite it as the present-tense observable or drop it.
+        display for <series>, and when was it last updated?"). ALREADY ANSWERED COUNTS AS
+        ANSWERED: if the first pass already states that source's current reading with the
+        date it was read, that requirement is met and no slot should be spent re-fetching a
+        value the briefing holds — spend it on something the briefing lacks. Re-asking for
+        that reading earns a slot only when the stated reading carries no as-of date, or is
+        older than the source's own update cadence (a daily average quoted from last month).
+        Never phrase a gap as that source's value on the resolution date ("what will
+        <tracker> show on <date>"): no search can answer it, the resolver comes back "that
+        date has not occurred yet", and the slot is spent for nothing. If a candidate gap
+        can only be answered by a future observation, rewrite it as the present-tense
+        observable or drop it.
 
         NULL RESULTS ARE SEARCH OUTCOMES. Where the first pass says it searched and
         found nothing ("no record found", "no authoritative source located"), treat that

@@ -255,6 +255,11 @@ name-abbreviates-outlet (`WaPo` / washingtonpost.com), domain-abbreviates-name
 provenance while a false keep leaves one tag standing. A response whose chunks
 carry no renderable label is skipped rather than blanket-marked: with no evidence
 base, a rewrite would dress our own render failure as the model's embellishment.
+The token is defined where the forecaster reads it: `prompts._SOURCE_PROVENANCE_LADDER`
+carries one bullet saying the pipeline could not match the named outlet against its
+own retrieval record, that the claim itself may still be correct, and that the
+evidence is untiered rather than low-tier. Without that, the ladder tells the model
+to weight by tier while a token it has never seen stands where the tier was.
 Per-response counts ride `GEMINI_UNSUPPORTED_ATTRIBUTION` (only when non-zero)
 and the provider-diagnostics `unsupported_attributions` count (always, so a zero
 is a measurement); nothing keys on either. The diagnostics line carries its
@@ -397,8 +402,12 @@ Four stages per question:
    POSITION: `cap_stale_top_tier` refuses `same_quantity_same_date` on a row whose close
    date precedes the question's own `open_time` by more than
    `MARKET_STALENESS_TIER_CAP_DAYS`, capping the grade one rung to
-   `same_quantity_other_cut` and writing a `tier_cap_note` that names the gap and the
-   tier the ranker asked for. It is disclosure rather than a drop (the row keeps its
+   `same_quantity_other_cut` and writing a `tier_cap_note` that states the demotion and
+   its arithmetic (`demoted from same-date: closed 162d before the question opened`, a
+   shape the rendered legend defines; it does not restate the withdrawn grade, which the
+   note's presence already implies because only the top tier is ever capped). It shares the
+   `why` cell's per-row character budget with the ranker's phrase rather than riding on top
+   of it, so a capped row costs the section nothing. It is disclosure rather than a drop (the row keeps its
    rank, its price and its rules bullet), because a wrongly excluded market is evidence
    the forecaster never sees. It fires on nothing in the archived corpus, so read it as a
    guard on a claim a long-closed market cannot make rather than as a measured fix: only 9

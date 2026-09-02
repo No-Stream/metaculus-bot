@@ -69,7 +69,8 @@ STRONG_TIERS: frozenset[str] = frozenset(TIERS[:2])  # HARNESS-SCAN-EXEMPT-subsa
 # 60 days is deliberately far past any plausible same-window market and nowhere near the offender:
 # the point is to catch the EGREGIOUS case without second-guessing the ranker on a question whose
 # window genuinely straddles a nearby close. The cap costs the row nothing else — it keeps its rank,
-# its price and its rules text, and gains a note saying what the ranker said (`cap_stale_top_tier`).
+# its price and its rules text, and gains a note stating the demotion (`cap_stale_top_tier`), which
+# shares the `why` cell's phrase budget rather than widening the rendered section.
 MARKET_STALENESS_TIER_CAP_DAYS = 60
 
 # Per-row phrase cap. The label is one glanceable phrase a forecaster prompt can weight, not
@@ -524,13 +525,23 @@ def _tier_cap_note(row: MarketMatch, question_opened: datetime) -> str:
 
     Split out so ``cap_stale_top_tier`` stays one comprehension: the decision and the sentence that
     explains it are the same fact, and computing them apart is how the two drift.
+
+    The wording states the demotion ONCE and does not repeat the withdrawn grade as a grade. It
+    used to read "stale: closed 162d before the question opened (ranker said
+    same_quantity_same_date)", which put the vocabulary word `same_quantity_same_date` at the end
+    of a cell inside a table whose preamble tells the forecaster to anchor on a same-date market's
+    price — the one reading the cap exists to withdraw, restated last, immediately before the
+    ranker's own same-date phrase. Nothing is lost from the archive: only the top tier is ever
+    capped, so the note's presence names the grade the ranker gave, and `relevance_label` still
+    carries the model's phrase verbatim. `demoted from same-date:` is the shape the rendered
+    legend defines (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`); change one and change both.
     """
     if row.relation_tier != TIERS[0] or row.close_time is None:
         return ""
     stale_days = (question_opened - _as_utc(row.close_time)).days
     if stale_days <= MARKET_STALENESS_TIER_CAP_DAYS:
         return ""
-    return f"stale: closed {stale_days}d before the question opened (ranker said {TIERS[0]})"
+    return f"demoted from same-date: closed {stale_days}d before the question opened"
 
 
 def cap_stale_top_tier(rows: Sequence[MarketMatch], *, question_open_time: datetime | None) -> list[MarketMatch]:
@@ -538,8 +549,8 @@ def cap_stale_top_tier(rows: Sequence[MarketMatch], *, question_open_time: datet
 
     DISCLOSURE, not a drop, and the distinction is the whole design. The row keeps its rank, its
     price, its liquidity cells and its rules bullet; what changes is one rung of its relation grade
-    plus a ``tier_cap_note`` saying what the ranker said, so a forecaster reading the table sees
-    both the demotion and the judgment it overrode. Dropping the row instead would delete evidence
+    plus a ``tier_cap_note`` stating the demotion and its arithmetic, so a forecaster reading the
+    table sees that a grade was withdrawn and why. Dropping the row instead would delete evidence
     on the recall-first side of a tradeoff this pipeline has measured (a wrongly excluded market is
     evidence the forecaster never sees), and silently rewriting the tier would hide a disagreement
     between our arithmetic and the model's reading.

@@ -50,6 +50,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.credit_telemetry import llm_call_metadata, plain_llm_key_alias
 from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
 from metaculus_bot.llm_retry import invoke_with_transient_retry
+from metaculus_bot.prompts import OUTSIDE_VENUE_MARKET_ODDS_POLICY
 from metaculus_bot.research import degradation_views
 from metaculus_bot.research.asknews_summarization import summarize_asknews
 from metaculus_bot.research.gap_fill_stages import run_gap_fill_passes
@@ -582,12 +583,18 @@ class ResearchOrchestrator:
     async def _call_perplexity(self, question: MetaculusQuestion | str, use_open_router: bool = True) -> str:
         question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
 
+        # Same narrowed market-odds policy as `web_research_prompt` and the direct-Perplexity
+        # provider, interpolated from the one definition in `prompts` rather than restated —
+        # this prompt carried the retired blanket "briefly research prediction markets" ask after
+        # that policy was narrowed to the venues the live snapshot cannot cover.
+        # The no-speculation tail is this prompt's own and stays: it is an anti-fabrication rule
+        # about an empty result, not a second opinion on which venues to read.
         prediction_markets_instruction = (
             ""
             if self._is_benchmarking
             else (
-                "In addition to news, briefly research prediction markets that are relevant to the question. "
-                "(If there are no relevant prediction markets, simply skip reporting on this and "
+                f"In addition to news, cover: {OUTSIDE_VENUE_MARKET_ODDS_POLICY} "
+                "(If there are no relevant markets of that kind, simply skip reporting on this and "
                 "DO NOT speculate what they would say.)"
             )
         )

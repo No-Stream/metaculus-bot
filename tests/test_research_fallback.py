@@ -11,6 +11,7 @@ from metaculus_bot.constants import (
     PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER,
     PERPLEXITY_WALL_TIMEOUT,
 )
+from metaculus_bot.prompts import OUTSIDE_VENUE_MARKET_ODDS_POLICY
 from metaculus_bot.research import orchestrator, providers
 
 
@@ -245,3 +246,101 @@ class TestPerplexityModelIsOneConstant:
             await bot._research._call_perplexity(question.question_text, use_open_router=use_open_router)
 
         assert captured["llm_kwargs"]["model"] == expected_model
+
+
+class TestPerplexityMarketOddsPolicy:
+    """Both Perplexity prompts must carry the SAME narrowed market-odds ask the first-pass
+    web-research prompt does, from the one definition in ``prompts``.
+
+    The narrowing (2026-09-01, operator-confirmed wording) points research AWAY from
+    Polymarket / Kalshi / Manifold / PredictIt, because the live snapshot covers those four and
+    the only measured harm from searching them was stale prices contradicting correct snapshot
+    rows. It landed on ``web_research_prompt`` alone; these two sites kept asking for "all
+    relevant prediction markets" afterwards. Dormant in prod, where AskNews credentials are
+    always present and Perplexity never runs — but Perplexity IS the primary provider the moment
+    they are absent, which is exactly when nobody is watching the prompt.
+    """
+
+    @staticmethod
+    def _capture_prompt(captured: dict):
+        def _factory(**_kwargs):
+            async def _invoke(prompt: str) -> str:
+                captured["prompt"] = prompt
+                return "perplexity prose"
+
+            llm = MagicMock()
+            llm.invoke = _invoke
+            return llm
+
+        return _factory
+
+    @staticmethod
+    async def _passthrough(make_awaitable, **_kwargs):
+        return await make_awaitable()
+
+    async def _provider_prompt(self, question, *, is_benchmarking: bool) -> str:
+        captured: dict = {}
+        with (
+            patch.object(providers, "GeneralLlm", self._capture_prompt(captured)),
+            patch.object(providers, "invoke_with_transient_retry", self._passthrough),
+        ):
+            await providers._perplexity_provider(is_benchmarking=is_benchmarking)(question)
+        return captured["prompt"]
+
+    async def _orchestrator_prompt(self, question, base_llms, *, is_benchmarking: bool) -> str:
+        bot = TemplateForecaster(
+            llms=base_llms,
+            aggregation_strategy=AggregationStrategy.MEAN,
+            is_benchmarking=is_benchmarking,
+        )
+        captured: dict = {}
+        with (
+            patch.object(orchestrator, "GeneralLlm", self._capture_prompt(captured)),
+            patch.object(orchestrator, "invoke_with_transient_retry", self._passthrough),
+        ):
+            await bot._research._call_perplexity(question.question_text)
+        return captured["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_provider_factory_site_carries_the_shared_policy(self, question):
+        prompt = await self._provider_prompt(question, is_benchmarking=False)
+
+        assert OUTSIDE_VENUE_MARKET_ODDS_POLICY in prompt
+        assert "consider all relevant prediction markets" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_site_carries_the_shared_policy(self, question, base_llms):
+        prompt = await self._orchestrator_prompt(question, base_llms, is_benchmarking=False)
+
+        assert OUTSIDE_VENUE_MARKET_ODDS_POLICY in prompt
+        assert "briefly research prediction markets" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_the_orchestrator_keeps_its_no_speculation_tail(self, question, base_llms):
+        """Its own anti-fabrication rule about an EMPTY result, not a second market policy: an
+        empty answer has to read as empty rather than as invented odds."""
+        prompt = await self._orchestrator_prompt(question, base_llms, is_benchmarking=False)
+
+        assert "DO NOT speculate what they would say" in prompt
+
+    @pytest.mark.asyncio
+    async def test_benchmarking_keeps_market_talk_out_of_both_prompts(self, question, base_llms):
+        """The leakage carve-out is unchanged by the narrowing: a backtest sees no market ask at
+        all, on either route."""
+        provider_prompt = await self._provider_prompt(question, is_benchmarking=True)
+        orchestrator_prompt = await self._orchestrator_prompt(question, base_llms, is_benchmarking=True)
+
+        for prompt in (provider_prompt, orchestrator_prompt):
+            assert OUTSIDE_VENUE_MARKET_ODDS_POLICY not in prompt
+            assert "Market-implied or crowd odds" not in prompt
+            assert "prediction market" not in prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_the_clean_indents_block_still_dedents(self, question, base_llms):
+        """The reason the policy is interpolated as a one-line sentence rather than as the FOCUS
+        AREAS bullet: the orchestrator's prompt body is one ``clean_indents`` block, and an
+        interpolated value carrying a newline would put a column-0 line into it and leave every
+        other line indented by 12 spaces."""
+        prompt = await self._orchestrator_prompt(question, base_llms, is_benchmarking=False)
+
+        assert not any(line.startswith(" ") for line in prompt.split("\n")), prompt

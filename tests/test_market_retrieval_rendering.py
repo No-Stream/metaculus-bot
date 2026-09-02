@@ -32,6 +32,7 @@ from metaculus_bot.research.market_retrieval.ranking import (
     TIER_UNSPECIFIED,
     TIERS,
     WHY_CHARS,
+    cap_stale_top_tier,
 )
 from metaculus_bot.research.market_retrieval.rendering import (
     CHILD_ROW_MARKER,
@@ -71,37 +72,46 @@ _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 # slate whose closes have all passed.
 #
 # MAXED: 8 rows with every field simultaneously at its cap, EVERY row multi-outcome, every one of
-# its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too. Measured at 10,878 chars against the shipped
-# constants (`MAX_CHILD_ROWS_PER_SNAPSHOT` = 14 full sub-rows plus the 1,400-char ladder section
-# allowance — rendering.py's own comment explains why 14 beat the design's gridded 16), and the
-# all-open ladder fixture at 10,914, so the slack is 136 and this budget has genuinely stopped
-# being a formality. Naming every outcome instead of cutting the tail is what spent it; the
-# legend's added sentences are the rest.
+# its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too, and every row DEMOTED by the staleness cap.
+# Measured at 11,049 chars against the shipped constants (`MAX_CHILD_ROWS_PER_SNAPSHOT` = 14 full
+# sub-rows plus the 1,400-char ladder section allowance — rendering.py's own comment explains why 14
+# beat the design's gridded 16), and the all-open ladder fixture at 11,085, so the slack is 65 and
+# this budget has genuinely stopped being a formality. Naming every outcome instead of cutting the
+# tail is what spent it; the legend's added sentences are the rest.
 #
-# Re-derived 10,600 -> 11,050 for the staleness disclosure, and that purchase is worth
-# stating in full because it is the tightest this section has ever been. It bought two things: +295
-# fixed legend chars for the close-is-not-settlement caveat and the new cell shape, and +242 on this
-# fixture for `(Nd ago)` on all 22 dated rows. The ceiling above it is
-# `RESEARCH_SECTION_CHAR_LIMIT / 4` = 11,249, asserted below, so the remaining structural headroom
-# is 199 characters — the next thing that widens this section cannot be paid for out of slack and
-# has to either cut prose or re-derive the quarter-limit relationship itself.
-MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 11_050
+# Re-derived twice, and both purchases are worth stating in full because this is the tightest
+# section in the bundle. 10,600 -> 11,050 for the staleness disclosure: +295 fixed legend chars for
+# the close-is-not-settlement caveat and the new cell shape, plus +242 on this fixture for `(Nd ago)`
+# on all 22 dated rows. 11,050 -> 11,150 for the demotion note's legend sentence, at +171 fixed
+# chars, which is the whole of the second purchase: the note itself now shares the `WHY_CHARS` phrase
+# budget (`rendering._why_cell`), so demoting all 8 rows of this fixture costs zero characters, which
+# is what makes this budget a bound on capped slates at all. While the note was exempt from that
+# budget, three capped rows on a real maxed slate crossed the 11,050 figure and five crossed the
+# ceiling, and no fixture here set a note, so nothing could see it.
+#
+# The ceiling above this budget is `RESEARCH_SECTION_CHAR_LIMIT / 4` = 11,249, asserted below, so 99
+# characters of structural headroom remain (164 from the measured worst case). The next thing that
+# widens this section has to cut prose or re-derive the quarter-limit relationship itself; there is
+# no longer a third purchase available out of slack.
+MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 11_150
 
 # REALISTIC: 8 rows of content shaped like live payloads rather than chosen — what a real question
-# renders. Measured at 8,036 chars (7,794 before the staleness suffix), ~450 BELOW the
+# renders. Measured at 8,207 chars (7,794 before the staleness suffix), ~450 BELOW the
 # pre-completeness-change figure: a four-outcome family names all four either way, and the lower
 # full-row cap moves two of them from a full sub-row into the ladder. 8,050 -> 8,150 for the
 # staleness disclosure: the measured figure still fit the old budget with 14 chars to spare, which is
-# a coincidence rather than headroom.
-MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_150
+# a coincidence rather than headroom. 8,150 -> 8,300 for the demotion note's legend sentence, which
+# is fixed overhead every snapshot pays whether or not any row is demoted — no realistic row is (the
+# cap fires on zero rows across the archived corpus), so the row half of this figure is unchanged.
+MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_300
 
 # Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
-# 2,624 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
+# 2,795 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
 # the only part with no data to justify it — the whole-snapshot budget has slack that would
-# otherwise absorb an added paragraph unnoticed. At 2,624 of 2,700 this is still the tightest
+# otherwise absorb an added paragraph unnoticed. At 2,795 of 2,850 this is still the tightest
 # budget in the file, which is the point: the next legend sentence has to earn a re-derivation.
 #
-# Re-derived three times, and every purchase is on the record. From 1,700 to 1,850: a `prob` cell may hold
+# Re-derived four times, and every purchase is on the record. From 1,700 to 1,850: a `prob` cell may hold
 # a scalar market's value, and a forecaster told to anchor on that column needs the legend to say so.
 # From 1,850 to 2,400: the ladder row and the `LO-HI` quote-range cell are two new cell shapes, and
 # the legend's contract is that it names every shape a cell can hold — an unexplained `+8 settled at
@@ -113,8 +123,11 @@ MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_150
 # 2,400 -> 2,700 (measured 2,624): the column was never explained at all, its date is the venue's
 # TRADING close rather than its settlement date (a median +317 days apart on the Kalshi rows this bot
 # has rendered), and it can now carry a `(Nd ago)` suffix. A forecaster instructed to verify each
-# market's resolution date was checking against a date that means something else.
-MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 2_700
+# market's resolution date was checking against a date that means something else. The last is the
+# demotion note, at 2,700 -> 2,850 (+171, measured 2,795): `demoted from same-date:` is a shape the
+# `why` cell can hold, and an undefined one sits on the single row in the slate whose grade we
+# overruled, in a table whose preamble calls a same-date market extremely strong evidence.
+MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 2_850
 
 # The instant the budget fixtures date their rows against: past every close date any of them carries,
 # so every dated row renders its `(Nd ago)` suffix and the char budgets bound the worst case rather
@@ -172,6 +185,17 @@ def _row(
         scalar_estimate=scalar,
         tier_cap_note=cap_note,
     )
+
+
+# The demotion note a capped row actually carries, GENERATED by the real ranking pass rather than
+# copied from it: the renderer's fixtures and budgets are all keyed on this string's shape, and a
+# reworded note would otherwise leave every one of them asserting a shape prod no longer writes.
+# The instants are q45163's, the case the cap was built for: a market that stopped trading roughly
+# five months before the question opened.
+_CAP_NOTE = cap_stale_top_tier(
+    [_row(tier=TIERS[0], close=datetime(2026, 2, 27, tzinfo=UTC))],
+    question_open_time=datetime(2026, 8, 9, 9, 0, tzinfo=UTC),
+)[0].tier_cap_note
 
 
 def _table_rows(text: str) -> list[dict[str, str]]:
@@ -593,28 +617,53 @@ class TestTierCapNote:
     def test_a_capped_row_shows_the_note_ahead_of_the_rankers_own_phrase(self) -> None:
         """Both halves are load-bearing: the note is the disagreement between our arithmetic and the
         model's grade, and the phrase is what the model said about the row we overruled."""
-        row = _row(tier="same_quantity_other_cut", why="conditional country market", cap_note="stale: closed 163d")
+        row = _row(tier="same_quantity_other_cut", why="conditional country market", cap_note=_CAP_NOTE)
 
         cells = _table_rows(render_snapshot(MarketSnapshot([row])))[0]
 
-        assert cells["why"] == "stale: closed 163d. conditional country market"
+        assert cells["why"] == f"{_CAP_NOTE}. conditional country market"
         assert cells["relation"] == "same_quantity_other_cut", "the tier cell stays a vocabulary word"
 
-    def test_the_note_is_not_truncated_away_by_a_maxed_out_why_phrase(self) -> None:
-        """`WHY_CHARS` caps the ranker's phrase, not the note: a demoted tier with its reason
-        truncated off reads as an ordinary grade."""
-        note = "stale: closed 163d before the question opened (ranker said same_quantity_same_date)"
-        row = _row(tier="same_quantity_other_cut", why="W" * (WHY_CHARS * 2), cap_note=note)
+    def test_the_note_survives_a_maxed_out_why_phrase_and_the_cell_stays_in_budget(self) -> None:
+        """The note takes priority INSIDE `WHY_CHARS` rather than riding on top of it.
+
+        Priority, because a demoted tier whose reason was truncated off reads as an ordinary grade.
+        Inside the budget, because the section's char budgets are measured on a slate whose every
+        cell is at its cap, so a note exempt from `WHY_CHARS` was a per-row cost those budgets never
+        saw: three capped rows on the maxed slate crossed the whole-section budget.
+        """
+        row = _row(tier="same_quantity_other_cut", why="W" * (WHY_CHARS * 2), cap_note=_CAP_NOTE)
 
         cells = _table_rows(render_snapshot(MarketSnapshot([row])))[0]
 
-        assert cells["why"].startswith(note)
-        assert cells["why"].count("W") == WHY_CHARS
+        assert cells["why"].startswith(_CAP_NOTE)
+        assert len(cells["why"]) == WHY_CHARS, "note + join + phrase lands exactly at the cap"
+        assert cells["why"].count("W") == WHY_CHARS - len(_CAP_NOTE) - 2, "the phrase yields the note's share"
+
+    def test_a_pathologically_long_note_cannot_widen_the_cell(self) -> None:
+        """`_tier_cap_note` writes ~62 characters, so this is a bound rather than a case: whatever
+        the note grows into, the cell a forecaster reads stays one `WHY_CHARS` phrase."""
+        row = _row(tier="same_quantity_other_cut", why="W" * WHY_CHARS, cap_note="N" * (WHY_CHARS * 3))
+
+        cells = _table_rows(render_snapshot(MarketSnapshot([row])))[0]
+
+        assert len(cells["why"]) == WHY_CHARS
+        assert "W" not in cells["why"], "the note alone fills the budget; there is no room to append"
 
     def test_a_note_with_no_ranker_phrase_still_renders(self) -> None:
-        row = _row(tier="same_quantity_other_cut", why="", cap_note="stale: closed 163d")
+        row = _row(tier="same_quantity_other_cut", why="", cap_note=_CAP_NOTE)
 
-        assert _table_rows(render_snapshot(MarketSnapshot([row])))[0]["why"] == "stale: closed 163d"
+        assert _table_rows(render_snapshot(MarketSnapshot([row])))[0]["why"] == _CAP_NOTE
+
+    def test_the_note_does_not_restate_the_withdrawn_grade_as_a_grade(self) -> None:
+        """The note used to end "(ranker said same_quantity_same_date)", putting the vocabulary word
+        the cap just withdrew at the end of a cell, inside a table whose preamble tells the
+        forecaster to anchor on a same-date market's price — and immediately ahead of the ranker's
+        own same-date phrase. The demotion is stated once, in prose, and the grade the ranker gave
+        is still recoverable: only the top tier is ever capped, so the note's presence names it."""
+        assert "ranker said" not in _CAP_NOTE
+        assert "same_quantity_same_date" not in _CAP_NOTE
+        assert _CAP_NOTE.startswith("demoted from same-date:")
 
     def test_an_uncapped_row_is_unchanged(self) -> None:
         cells = _table_rows(render_snapshot(MarketSnapshot([_row(tier="weak", why="loose correlate")])))[0]
@@ -691,6 +740,21 @@ class TestLegend:
         assert "on Kalshi the two are months apart" in MARKET_SIGNAL_LEGEND
         assert "never read it as this market's resolution date" in MARKET_SIGNAL_LEGEND
 
+    def test_the_legend_defines_the_demotion_note(self) -> None:
+        """The legend's standing contract is that every shape a cell can hold is named, and the
+        demotion note is a shape the `why` cell can hold. Unexplained, a forecaster reading
+        `demoted from same-date:` has to guess whether the row was downgraded, mislabelled, or
+        simply annotated — on the one row in the slate whose grade we overruled, in a table whose
+        preamble tells them a same-date market is extremely strong evidence."""
+        assert "`demoted from same-date:`" in MARKET_SIGNAL_LEGEND
+        assert "our arithmetic withdrew the ranker's top grade" in MARKET_SIGNAL_LEGEND
+        assert "background evidence, not an anchor" in MARKET_SIGNAL_LEGEND
+
+    def test_the_legend_defines_the_note_prefix_the_ranking_pass_actually_writes(self) -> None:
+        """Pinned against the generated note rather than a copy of it: a reworded note that left the
+        legend behind would define a shape no row carries and leave the real one undefined."""
+        assert _CAP_NOTE.split(":")[0] in MARKET_SIGNAL_LEGEND
+
     def test_the_legend_explains_the_staleness_suffix(self) -> None:
         """The legend's standing contract is that every shape a cell can hold is named, and this one
         also has to carry the reading the cell deliberately does not claim — a soft-closed Manifold
@@ -729,9 +793,16 @@ class TestRenderBudget:
     RAW_BULLET_BODY_MAX_CHARS cannot bloat the section silently.
     """
 
-    def _maxed_rows(self) -> list[MarketMatch]:
+    def _maxed_rows(self, *, cap_note: str = _CAP_NOTE) -> list[MarketMatch]:
         """Eight rows with every field simultaneously at its cap, every one of them multi-outcome
-        with a full complement of maxed sub-rows — a bound, not a forecast."""
+        with a full complement of maxed sub-rows — a bound, not a forecast.
+
+        Every row is DEMOTED as well, which is the shape the budgets could not see while the
+        demotion note was exempt from `WHY_CHARS`: the fixture set no note, so three capped rows on
+        a real maxed slate would have crossed the whole-section budget with every assertion here
+        still green. `cap_note=""` is the uncapped comparison, used to pin that the note now costs
+        the section nothing (the rows are already graded tier 2, which is what a demoted row is).
+        """
         maxed_child = MarketChild(
             title="C" * CHILD_TITLE_MAX_CHARS,
             implied_prob_yes=0.4237,
@@ -753,6 +824,7 @@ class TestRenderBudget:
                 close=datetime(2026, 12, 31, tzinfo=UTC),
                 resolved=index % 2 == 0,
                 children=tuple(maxed_child for _ in range(MAX_CHILD_ROWS_PER_MARKET)),
+                cap_note=cap_note,
             )
             for index in range(RENDER_BUDGET)
         ]
@@ -760,7 +832,11 @@ class TestRenderBudget:
     def _realistic_rows(self) -> list[MarketMatch]:
         """Eight realistic rows, each a strike family with four outcomes — the shape a real slate
         takes, since 86.5% of the Kalshi catalogue is multi-strike. Outcome labels and prices are
-        real ones from the committed venue fixtures."""
+        real ones from the committed venue fixtures.
+
+        Deliberately carries NO demotion note, unlike the two maxed slates: the staleness cap fires
+        on zero rows across the whole archived corpus, so a capped row is not what a real slate
+        looks like. The bound is the maxed fixtures' job."""
         outcomes = tuple(
             MarketChild(
                 title=title,
@@ -790,9 +866,9 @@ class TestRenderBudget:
             for _ in range(RENDER_BUDGET)
         ]
 
-    def _maxed_open_priced_rows(self) -> list[MarketMatch]:
+    def _maxed_open_priced_rows(self, *, cap_note: str = _CAP_NOTE) -> list[MarketMatch]:
         """The adversarial slate for the LADDER: 8 rows x 10 OPEN, distinctly-priced, maxed-title
-        outcomes.
+        outcomes, every one of them demoted.
 
         ``_maxed_rows`` cannot stress the ladder's expensive path, because its children are all
         SETTLED and all identical — settled outcomes collapse at compaction stage 2 into one short
@@ -822,6 +898,7 @@ class TestRenderBudget:
                     )
                     for index in range(MAX_CHILD_ROWS_PER_MARKET)
                 ),
+                cap_note=cap_note,
             )
             for _ in range(RENDER_BUDGET)
         ]
@@ -866,6 +943,23 @@ class TestRenderBudget:
 
         assert len(rendered) < MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET
 
+    def test_demoting_every_row_costs_the_section_nothing(self) -> None:
+        """The property that makes the maxed budget a bound on CAPPED slates: the demotion note
+        shares one `WHY_CHARS` budget with the ranker's phrase, so a slate where all 8 rows are
+        demoted renders exactly as wide as one where none is.
+
+        Asserted rather than assumed because the alternative shape shipped first: while the note
+        rode on top of `WHY_CHARS`, each capped row cost ~60 characters no budget here had ever
+        measured — the fixtures set no note, so the guard was blind to the case by construction."""
+        capped = render_snapshot(MarketSnapshot(matches=self._maxed_rows(), forecast_time=_BUDGET_FORECAST_TIME))
+        uncapped = render_snapshot(
+            MarketSnapshot(matches=self._maxed_rows(cap_note=""), forecast_time=_BUDGET_FORECAST_TIME)
+        )
+
+        assert len(capped) == len(uncapped)
+        assert _CAP_NOTE in capped, "the fixture has to actually carry the note for this to mean anything"
+        assert _CAP_NOTE not in uncapped
+
     def test_the_fixed_prose_overhead_is_budgeted_separately(self) -> None:
         """Prose has no data to justify it, so it gets the tight budget. Without this, the
         whole-snapshot slack would absorb an added paragraph unnoticed."""
@@ -881,12 +975,13 @@ class TestRenderBudget:
         its siblings rather than itself.
 
         The margin is no longer comfortable, and that is worth knowing rather than smoothing over:
-        the sub-row expansion took the maxed render from 56% of the quarter-limit to 90%, and the
-        staleness disclosure took it to 97% (10,878 of 11,249), so this assertion has stopped being
-        a formality. The next thing that widens the section cannot be paid for out of slack: it has
-        to cut prose or re-derive this relationship, and 199 characters is what the BUDGET has left
-        against the quarter-limit. The realistic figure (8,036 of 11,249, or 71%) is where the real
-        headroom lives.
+        the sub-row expansion took the maxed render from 56% of the quarter-limit to 90%, the
+        staleness disclosure took it to 97%, and the demotion note's legend sentence to 99% (11,085
+        of 11,249 on the ladder fixture), so this assertion has stopped being a formality. The next
+        thing that widens the section cannot be paid for out of slack: it has to cut prose or
+        re-derive this relationship, and 99 characters is what the BUDGET has left against the
+        quarter-limit. The realistic figure (8,207 of 11,249, or 73%) is where the real headroom
+        lives.
         """
         rendered = render_snapshot(MarketSnapshot(matches=self._maxed_rows(), forecast_time=_BUDGET_FORECAST_TIME))
 

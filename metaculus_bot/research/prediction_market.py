@@ -307,11 +307,18 @@ async def _rank_pool(question: Any, pool: generation.PoolResult) -> tuple[list[M
             f"detail=falling back to retrieval order; {exc}"
         )
         return ranking.fail_open_slate(pool.candidates), f"error({type(exc).__name__})", "failopen", len(prompt)
+    # Read directly, not through getattr-with-a-default: both fields are declared on
+    # MetaculusQuestion, and a default would turn a future rename into a cap that silently
+    # never fires again on a surface that already fires on zero archived rows. A question
+    # whose `open_time` is genuinely None is still handled — `cap_stale_top_tier` no-ops on
+    # it, which is the replay-tool case. The `getattr` above and elsewhere in this module
+    # are the module's older convention on a `question: Any` parameter; sweeping them is
+    # tracked separately, so the two shapes sit side by side here on purpose.
     ranked_rows = ranking.cap_stale_top_tier(
         ranking.apply_picks(pool.candidates, picks),
-        question_open_time=getattr(question, "open_time", None),
+        question_open_time=question.open_time,
     )
-    _log_tier_caps(getattr(question, "id_of_question", None), ranked_rows)
+    _log_tier_caps(question.id_of_question, ranked_rows)
     return ranked_rows, f"ok({len(picks)})", "ranked", len(prompt)
 
 
