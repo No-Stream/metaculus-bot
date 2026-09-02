@@ -1474,6 +1474,27 @@ class TestRescoreRecords:
         assert unscoreable_mc["mc_log_score"] == -1.0
 
 
+def _binary_post(post_id: int, question_id: int) -> dict:
+    """One resolved binary post in the shape ``fetch_resolved_questions`` returns."""
+    return {
+        "id": post_id,
+        "title": f"Q{post_id}",
+        "question": {
+            "id": question_id,
+            "type": "binary",
+            "resolution": "yes",
+            "my_forecasts": {"latest": {"forecast_values": [0.3, 0.7], "score_data": {}}},
+            "scaling": {},
+            "options": None,
+            "open_lower_bound": False,
+            "open_upper_bound": False,
+            "nr_forecasters": 5,
+            "title": f"Q{post_id}",
+        },
+        "projects": {},
+    }
+
+
 class TestBuildPerformanceDatasetResearchTags:
     """The dataset the analysis reads must arrive with the treatment tags stamped.
 
@@ -1482,25 +1503,6 @@ class TestBuildPerformanceDatasetResearchTags:
     suite, and every treated/untreated calibration cut reads these fields off the
     built dataset.
     """
-
-    def _post(self, post_id: int, question_id: int) -> dict:
-        return {
-            "id": post_id,
-            "title": f"Q{post_id}",
-            "question": {
-                "id": question_id,
-                "type": "binary",
-                "resolution": "yes",
-                "my_forecasts": {"latest": {"forecast_values": [0.3, 0.7], "score_data": {}}},
-                "scaling": {},
-                "options": None,
-                "open_lower_bound": False,
-                "open_upper_bound": False,
-                "nr_forecasters": 5,
-                "title": f"Q{post_id}",
-            },
-            "projects": {},
-        }
 
     def test_records_carry_tags_from_the_archive_dir(self, tmp_path: Path, monkeypatch):
         (tmp_path / "11.json").write_text(
@@ -1512,7 +1514,7 @@ class TestBuildPerformanceDatasetResearchTags:
                 }
             )
         )
-        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [self._post(1, 11)])
+        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(1, 11)])
         monkeypatch.setattr(
             collector,
             "fetch_bot_comments",
@@ -1530,7 +1532,7 @@ class TestBuildPerformanceDatasetResearchTags:
     def test_question_without_an_archive_record_gets_none_not_false(self, tmp_path: Path, monkeypatch):
         # Absence of evidence is not an untreated record: a missing archive file (or a
         # whole missing archive) must never look like a measured False in the cuts.
-        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [self._post(2, 22)])
+        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(2, 22)])
         monkeypatch.setattr(collector, "fetch_bot_comments", lambda author_id, token: [])
 
         records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
@@ -1538,6 +1540,44 @@ class TestBuildPerformanceDatasetResearchTags:
         assert records[0]["anchor_present"] is None
         assert records[0]["gfv2_present"] is None
         assert records[0]["anchor_confidence"] is None
+
+
+class TestBuildPerformanceDatasetPriorDiff:
+    """``prior_records=`` must actually reach the re-resolution diff.
+
+    Same rule as the sibling class above: the call inside ``build_performance_dataset`` is a
+    single line, so unit-testing ``diff_platform_rescores`` alone leaves the pass-through
+    deletable with a green suite. It is the live-pull half of the q44798 detector, where
+    Metaculus edits a resolution in place and no timestamp moves.
+    """
+
+    def _fetchers(self, monkeypatch, post: dict) -> None:
+        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [post])
+        monkeypatch.setattr(collector, "fetch_bot_comments", lambda author_id, token: [])
+
+    def test_a_moved_resolution_is_tagged_on_the_built_records(self, tmp_path: Path, monkeypatch):
+        self._fetchers(monkeypatch, _binary_post(3, 33))
+        prior = [{"post_id": 3, "question_id": 33, "resolution_raw": "no", "resolution_parsed": False}]
+
+        records = build_performance_dataset(
+            tournament="t", token="fake", research_archive_dir=tmp_path, prior_records=prior
+        )
+
+        assert records[0]["platform_rescored"] is True
+        assert "resolution_raw" in records[0]["platform_rescored_fields"]
+        assert records[0]["prior_resolution"] == "no"
+
+    def test_no_prior_leaves_the_tags_none_not_false(self, tmp_path: Path, monkeypatch):
+        # "Not compared" and "compared, nothing moved" are different facts; a default build
+        # must produce the first, or every downstream cut reads silence as stability. The
+        # keys are absent rather than explicitly None on this path, which is the same "not
+        # compared" answer to every reader (the diff and the renderer both use ``.get``).
+        self._fetchers(monkeypatch, _binary_post(4, 44))
+
+        records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
+
+        assert records[0].get("platform_rescored") is None
+        assert records[0].get("platform_rescored_fields") is None
 
 
 class TestPackageExports:

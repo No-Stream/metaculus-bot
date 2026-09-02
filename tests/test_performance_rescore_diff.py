@@ -7,11 +7,14 @@ record's spot peer went +5.41 -> -5.42 between two consecutive rounds and nothin
 so the round's published tables for that question were stale. A value-level diff of the two
 pulls is the only thing that catches it.
 
-Fully offline: these are pure dict-to-dict comparisons, no API and no disk.
+Fully offline: the comparison tests are pure dict-to-dict, and the CLI class at the bottom
+patches both dataset loads, so nothing here touches the API or the disk.
 """
 
 import logging
+from unittest.mock import patch
 
+from metaculus_bot.performance_analysis import cli as perf_cli
 from metaculus_bot.performance_analysis.rescore_diff import (
     RESCORE_ATOL,
     diff_platform_rescores,
@@ -236,3 +239,56 @@ class TestRenderRescoreSummary:
         text = "\n".join(render_rescore_summary([_record()]))
 
         assert "0 of 1 record(s) matched a prior pull" in text
+        assert "Prior-round tables remain current" not in text
+        assert "Nothing was compared" in text
+
+    def test_a_prior_sharing_no_key_renders_as_uncompared_not_as_clean(self):
+        """The operator-reachable arm: --prior from another round or tournament.
+
+        Every record diffs to "no prior existed", which is a measurement failure and reads
+        identically to a clean diff on the rescored count alone.
+        """
+        new = [_record()]
+        diff_platform_rescores([_record(question_id=1, post_id=2)], new)
+
+        text = "\n".join(render_rescore_summary(new))
+
+        assert "0 of 1 record(s) matched a prior pull" in text
+        assert "Prior-round tables remain current" not in text
+        assert "Nothing was compared" in text
+
+
+class TestPerformanceCliPriorWiring:
+    """The ``--prior`` operator surface, end to end through the CLI.
+
+    Every piece of this (the argparse flag, the cached-path diff call, the
+    ``prior_records=`` pass-through, the printed summary) was deletable with a green suite
+    before this class existed: two review lenses removed the whole surface and 6751 tests
+    still passed. The cached path is the one an operator actually runs after the fact, when a
+    re-resolution is suspected and a second API pull is not wanted.
+    """
+
+    def test_the_cached_prior_path_diffs_and_prints_the_move(self, capsys):
+        # load_dataset is called for --prior first, then for --cached (cli.main's order).
+        prior = [_record()]
+        new = [_record(resolution_raw="82", resolution_parsed=82.0, spot_peer=-5.4190)]
+
+        with (
+            patch.object(perf_cli, "load_dataset", side_effect=[prior, new]),
+            patch.object(perf_cli, "generate_report", return_value=""),
+        ):
+            perf_cli.main(["--cached", "new.json", "--prior", "old.json"])
+
+        text = capsys.readouterr().out
+        assert "1 of 1 record(s) matched a prior pull" in text
+        assert "q44798 (post 44645) resolution_raw: '80' -> '82'" in text
+        assert new[0]["platform_rescored"] is True
+
+    def test_without_a_prior_the_cli_prints_no_rescore_summary(self, capsys):
+        with (
+            patch.object(perf_cli, "load_dataset", return_value=[_record()]),
+            patch.object(perf_cli, "generate_report", return_value=""),
+        ):
+            perf_cli.main(["--cached", "new.json"])
+
+        assert "Platform re-resolution diff" not in capsys.readouterr().out
