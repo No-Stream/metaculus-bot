@@ -24,15 +24,16 @@ from datetime import UTC, datetime
 
 import pytest
 import requests
+from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot import api_preflight
 from metaculus_bot.constants import FALL_CUP_SLUG, METACULUS_CUP_ID, TOURNAMENT_ID
+from metaculus_bot.performance_analysis.collector import questions_on_post
 from scripts import supply_probe
 from scripts.supply_probe import (
     SlugSupply,
     fetch_posts_by_status,
     probe_slugs,
-    questions_on_post,
     render_report,
     summarize_slug_supply,
 )
@@ -66,6 +67,11 @@ def _group_post(post_id: int, questions: list[dict], *, title: str = "A group?")
 
 
 class TestQuestionsOnPost:
+    """The shared unwrapping, which lives in ``performance_analysis.collector`` — the probe
+    reads the same posts list the scoring pull does, so both count questions one way. These
+    cases were written against the probe's own former copy and are the only coverage the
+    helper has, so they stay here rather than moving with it."""
+
     def test_single_question_post(self):
         post = _post(101, _question(1))
         assert [q["id"] for q in questions_on_post(post)] == [1]
@@ -251,6 +257,101 @@ class TestRenderReport:
         assert "HTTP 404" in text
 
 
+class TestRateLimitRetry:
+    """``_get_json``'s 429 handling, driven over a fake ``requests.get``.
+
+    Every other test in this file monkeypatches ``_get_json`` away, so nothing exercised the
+    retry itself — and this is the one path the probe was built around: the posts endpoint
+    rate-limits hard right after a full performance pull, and an unretried 429 turns a live
+    slug into an error row that reads exactly like a dead one.
+    """
+
+    def _install_responses(self, monkeypatch, statuses: list[int], payload: dict | None = None):
+        """Serve one canned response per call; collect the calls and the sleeps."""
+        calls: list[dict] = []
+        sleeps: list[float] = []
+        served = iter(statuses)
+
+        def _fake_get(url, *, headers, params, timeout):
+            calls.append({"url": url, "headers": headers, "params": dict(params), "timeout": timeout})
+            response = requests.Response()
+            response.status_code = next(served)
+            response.url = url
+            response.encoding = "utf-8"
+            response._content = json.dumps(payload if payload is not None else {"results": []}).encode()
+            return response
+
+        monkeypatch.setattr(supply_probe.requests, "get", _fake_get)
+        monkeypatch.setattr(supply_probe.time, "sleep", sleeps.append)
+        return calls, sleeps
+
+    def test_a_429_is_retried_and_the_next_attempt_is_returned(self, monkeypatch):
+        payload = {"results": [_post(801, _question(81))]}
+        calls, sleeps = self._install_responses(monkeypatch, [429, 200], payload=payload)
+
+        data = supply_probe._get_json({"tournaments": "slug", "statuses": "closed"}, "token")
+
+        assert data == payload
+        assert len(calls) == 2, "the rate-limited attempt must be retried, not surfaced"
+        assert sleeps == [supply_probe.RETRY_BACKOFF_SECS]
+        assert calls[0]["headers"] == {"Authorization": "Token token"}
+        assert calls[0]["timeout"] == supply_probe.REQUEST_TIMEOUT_SECS
+
+    def test_the_backoff_grows_one_multiple_per_attempt_and_none_follows_the_last(self, monkeypatch):
+        # Linear, not exponential, and deliberately so: the endpoint recovers in seconds and
+        # the probe pages several slugs. The absent trailing sleep is the point of the
+        # arithmetic — waiting after the final attempt would delay a failure nobody retries.
+        calls, sleeps = self._install_responses(monkeypatch, [429] * supply_probe.MAX_RETRIES)
+
+        with pytest.raises(requests.RequestException):
+            supply_probe._get_json({"tournaments": "slug", "statuses": "closed"}, "token")
+
+        assert len(calls) == supply_probe.MAX_RETRIES
+        assert sleeps == [
+            supply_probe.RETRY_BACKOFF_SECS * (attempt + 1) for attempt in range(supply_probe.MAX_RETRIES - 1)
+        ]
+
+    def test_exhausted_retries_raise_a_requests_exception_naming_the_cause(self, monkeypatch):
+        # requests.RequestException specifically, because that is the only class probe_slugs
+        # catches: anything else aborts the whole survey instead of filing one error row.
+        self._install_responses(monkeypatch, [429] * supply_probe.MAX_RETRIES)
+
+        with pytest.raises(requests.RequestException) as excinfo:
+            supply_probe._get_json({"tournaments": "slug", "statuses": "closed"}, "token")
+
+        assert "429" in str(excinfo.value)
+        assert "retries exhausted" in str(excinfo.value), (
+            "the exhausted path must say six attempts were rate-limited, not report one unlucky request"
+        )
+
+    def test_a_non_429_error_status_is_not_retried(self, monkeypatch):
+        # A 404 slug is the expected case here (the bare `metaculus-cup` slug 404s today), and
+        # retrying it six times with backoff would stall the survey on every dead slug.
+        calls, sleeps = self._install_responses(monkeypatch, [404])
+
+        with pytest.raises(requests.HTTPError):
+            supply_probe._get_json({"tournaments": "metaculus-cup", "statuses": "closed"}, "token")
+
+        assert len(calls) == 1
+        assert sleeps == []
+
+    def test_a_rate_limited_slug_becomes_an_error_row_and_the_survey_continues(self, monkeypatch):
+        """The end-to-end reason the exception class matters: exhaustion inside a slug has to
+        surface as that slug's error row, with every later slug still surveyed."""
+        payload = {"results": [_post(802, _question(82, scheduled="2026-08-14T00:00:00Z"))]}
+        first_slug_statuses = [429] * supply_probe.MAX_RETRIES
+        self._install_responses(monkeypatch, [*first_slug_statuses, 200], payload=payload)
+
+        supplies = probe_slugs(["rate-limited-slug", "summer-futureeval-2026"], ("closed",), "token", now=NOW)
+
+        assert [supply.slug for supply in supplies] == ["rate-limited-slug", "summer-futureeval-2026"]
+        assert supplies[0].error is not None
+        assert "retries exhausted" in supplies[0].error
+        assert supplies[0].status_counts == ()
+        assert supplies[1].error is None
+        assert [row.question_id for row in supplies[1].backlog] == [82]
+
+
 class TestFetchPaging:
     """Paging stops on a short page: the tournament-filtered list gives no usable count."""
 
@@ -407,4 +508,19 @@ class TestDefaults:
     def test_probe_url_shares_the_host_the_preflight_vets(self):
         # The identity guard's promise is that the vetted host is the host the token goes
         # to, so a hardcoded probe URL would quietly break it under a base-URL override.
-        assert api_preflight.PREFLIGHT_URL.startswith(supply_probe.POSTS_URL)
+        assert api_preflight.preflight_url().startswith(supply_probe.POSTS_URL)
+
+    def test_an_override_loaded_from_a_dotenv_file_moves_both_urls_together(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure this pair is built to exclude: vetting one host and sending the token
+        to another. It was live until 2026-09 — `api_preflight` bound its URL as a module
+        constant, so an override arriving with the .env files (nothing loads `.env.local` at
+        import time) moved POSTS_URL and left the vetted host at www.metaculus.com. Simulated
+        here by setting the variable AFTER both modules are imported, which is exactly what a
+        late dotenv load looks like from the modules' point of view."""
+        monkeypatch.setenv("METACULUS_API_BASE_URL", "https://staging.example.invalid/api")
+        posts_url = f"{MetaculusClient().base_url}/posts/"
+
+        assert posts_url.startswith("https://staging.example.invalid/api")
+        assert api_preflight.preflight_url().startswith(posts_url)

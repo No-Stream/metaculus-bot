@@ -8,8 +8,10 @@ import json
 import logging
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -237,13 +239,19 @@ def _comment_signals(comment: dict | None, post_id: int) -> _CommentSignals:
     )
 
 
-def _questions_on_post(post_data: dict) -> list[dict]:
-    """The post's question dicts — a group's members, or its single question."""
+def questions_on_post(post_data: Mapping[str, Any]) -> list[dict]:
+    """The post's question dicts — a group's members, or its single question.
+
+    Empty for a post carrying neither (tournaments hold notebook posts too). Public
+    because every consumer of the Metaculus posts list needs this same unwrapping and
+    `scripts/supply_probe.py` had grown its own copy; one shared reading keeps a probe's
+    question counts comparable with the scoring pull's.
+    """
     group = post_data.get("group_of_questions")
     if group is not None:
-        return group.get("questions", [])
-    q = post_data.get("question")
-    return [q] if q is not None else []
+        return list(group.get("questions") or [])
+    question = post_data.get("question")
+    return [question] if isinstance(question, dict) else []
 
 
 def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict]:
@@ -256,7 +264,7 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
         logger.info(f"  Skipping PRACTICE post {post_id}: {title_preview}")
         return []
 
-    questions = _questions_on_post(post_data)
+    questions = questions_on_post(post_data)
     if not questions:
         logger.warning(f"  Post {post_id} has no question data")
         return []

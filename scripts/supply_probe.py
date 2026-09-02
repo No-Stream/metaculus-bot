@@ -57,13 +57,21 @@ from forecasting_tools.helpers.metaculus_client import MetaculusClient
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import FALL_CUP_SLUG, METACULUS_CUP_ID, TOURNAMENT_ID
+
+# The scoring pull's own post-unwrapping, shared rather than re-derived: both read the same
+# posts list, and a probe that counted questions differently from the pull it exists to
+# project would be answering a subtly different question.
+from metaculus_bot.performance_analysis.collector import questions_on_post
 from metaculus_bot.time_utils import _as_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
 # Read off the client rather than hardcoded, so the host this probe sends the token to is
-# the same host `verify_metaculus_api_identity` vetted (it derives its preflight URL the
-# same way, and both honor a METACULUS_API_BASE_URL override).
+# the same host `verify_metaculus_api_identity` vetted (it derives its preflight URL the same
+# way). Both honor a METACULUS_API_BASE_URL override, including one set in a .env file: this
+# assignment runs after the imports above, and importing `metaculus_bot.constants` is what
+# loads .env / .env.local, while the preflight resolves its own URL per call for the same
+# reason (see `api_preflight.preflight_url`).
 POSTS_URL = f"{MetaculusClient().base_url}/posts/"
 
 # The three statuses the receipts exercised. `closed` is the whole point of the utility;
@@ -137,18 +145,6 @@ class SlugSupply:
     def worst_overdue_days(self) -> float:
         """Overdue margin of the worst backlog question; 0.0 when nothing is overdue."""
         return self.backlog[0].overdue_days if self.backlog else 0.0
-
-
-def questions_on_post(post: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Every forecastable question on a post: the single question, or a group's members.
-
-    Empty for a post that carries neither (tournaments hold notebook posts too).
-    """
-    question = post.get("question")
-    if isinstance(question, dict):
-        return [question]
-    group = post.get("group_of_questions") or {}
-    return list(group.get("questions") or [])
 
 
 def _question_is_resolved(question: Mapping[str, Any], post_status: str) -> bool:
@@ -273,17 +269,22 @@ def _get_json(params: dict[str, str | int], token: str) -> dict:
     scoped to the scoring pull (three retries, and a ``RuntimeError`` when they run out),
     while this probe pages several slugs in one pass and soft-fails per slug — so an
     exhausted retry has to arrive as a ``requests`` exception for the per-slug handler.
+
+    The exhausted 429 breaks out and raises the descriptive error below. It used to fall
+    through to ``raise_for_status`` on the last attempt, which made that raise unreachable
+    and reported six rate-limited attempts as one unlucky request.
     """
     headers = {"Authorization": f"Token {token}"}
     for attempt in range(MAX_RETRIES):
         response = requests.get(POSTS_URL, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECS)
-        if response.status_code == 429 and attempt < MAX_RETRIES - 1:
-            wait = RETRY_BACKOFF_SECS * (attempt + 1)
-            logger.warning(f"Rate limited (429); retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
-            time.sleep(wait)
-            continue
-        response.raise_for_status()
-        return response.json()
+        if response.status_code != 429:
+            response.raise_for_status()
+            return response.json()
+        if attempt == MAX_RETRIES - 1:
+            break
+        wait = RETRY_BACKOFF_SECS * (attempt + 1)
+        logger.warning(f"Rate limited (429); retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
+        time.sleep(wait)
     raise requests.HTTPError(f"429 rate limit: retries exhausted after {MAX_RETRIES} attempts")
 
 

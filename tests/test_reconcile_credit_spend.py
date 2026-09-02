@@ -12,9 +12,12 @@ These tests pin that arithmetic on synthetic records shaped exactly like
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from scripts.reconcile_credit_spend import aggregate_roles, reconcile, role_spend_by_run
+from scripts import reconcile_credit_spend as rcs
+from scripts.reconcile_credit_spend import RunSpend, aggregate_roles, reconcile, role_spend_by_run
 
 
 def _snapshot(run_id: str, phase: str, usage: float | None, *, ts: str, key: str = "personal") -> dict:
@@ -182,3 +185,96 @@ class TestRoleLedgerReconciliation:
         (total,) = aggregate_roles(records)
         assert total.usd == pytest.approx(0.03)
         assert total.calls == 2
+
+
+class TestPrintedTotalsAndCoverage:
+    """The `--roles` display arithmetic, where two adjacent "totals" and a coverage ratio can
+    be read as the same quantity when they are not.
+
+    The fixture is built so the pre-fix code printed ratios ABOVE 100%: the trailing run has
+    no successor, so its settled spend is unknown and the settled total cannot include it,
+    while the marker sum and the role-ledger sum both did. That is a display bug, but the
+    display is the whole product here, and a coverage figure over 100% reads as "the ledger
+    found money the balance did not" rather than "these two numbers cover different runs".
+    """
+
+    def _rows(self) -> list[RunSpend]:
+        """Three runs: A and B settle against their successors at 0.30 each, C is final.
+
+        C's own within-run marker is large (1.00), which is what used to inflate every ratio
+        whose denominator had to leave C out.
+        """
+        records = (
+            _run("A", 100.00, 100.10, hour=1) + _run("B", 100.30, 100.40, hour=2) + _run("C", 100.60, 101.60, hour=3)
+        )
+        return reconcile(records, "personal")
+
+    def _role_records(self) -> list[dict]:
+        """Personal-key rows on all three runs, plus one donated row so the table's grand
+        total is a different number from the personal key's."""
+        return [
+            _role_row("A", "forecaster:openai", "personal", usd=0.30, calls=2),
+            _role_row("B", "forecaster:openai", "personal", usd=0.30, calls=2),
+            _role_row("C", "forecaster:openai", "personal", usd=0.90, calls=2),
+            _role_row("B", "parser", "donated", usd=0.05, calls=4),
+        ]
+
+    def test_settled_totals_name_their_run_set_and_the_ratio_uses_it(self, capsys) -> None:
+        """Capture is 0.20 of marker spend over the 2 settled runs, not 1.20 over all three."""
+        rows = self._rows()
+
+        cohort = rcs._print_key_totals(rows)
+        out = capsys.readouterr().out
+
+        assert cohort.run_ids == {"A", "B"}, "the final run has no successor, so it is not settled"
+        assert cohort.usd == pytest.approx(0.60)
+        assert "marker-reported total: $1.20  (all 3 runs)" in out
+        assert "settled total:         $0.60  (the 2 runs with a successor)" in out
+        assert "marker captured:       33% of settled spend (the 2 runs with a successor)" in out
+
+    def test_role_coverage_shares_the_settled_run_set_with_its_denominator(self, capsys) -> None:
+        """The ledger total over every selected run stays visible — it is the honest per-key
+        figure — but the ratio beside it is 0.60/0.60, not 1.50/0.60."""
+        rows = self._rows()
+        role_records = self._role_records()
+        role_totals = role_spend_by_run(role_records, "personal")
+
+        cohort = rcs._print_key_totals(rows)
+        capsys.readouterr()
+        rcs._print_role_summary(role_records, role_totals, rows=rows, key="personal", settled=cohort)
+        out = capsys.readouterr().out
+
+        assert "role-ledger total (personal, all 3 runs): $1.5000" in out
+        assert "role ledger covers:    100% of settled spend (the 2 runs with a successor)" in out
+
+    def test_no_printed_coverage_percentage_exceeds_100(self, capsys) -> None:
+        """The regression guard in one line: every ratio's numerator and denominator are summed
+        over the same runs, so nothing in this fixture can read over 100%."""
+        rows = self._rows()
+        role_records = self._role_records()
+
+        cohort = rcs._print_key_totals(rows)
+        rcs._print_role_summary(
+            role_records,
+            role_spend_by_run(role_records, "personal"),
+            rows=rows,
+            key="personal",
+            settled=cohort,
+        )
+        out = capsys.readouterr().out
+
+        percentages = [int(match) for match in re.findall(r"(\d+)% of settled spend", out)]
+        assert percentages, "the coverage lines must have printed"
+        assert max(percentages) <= 100, out
+
+    def test_the_role_table_total_is_labelled_as_spanning_both_keys(self, capsys) -> None:
+        """It sits one line under a key-filtered total and its `share` column is a fraction of
+        it, so two lines reading plain "total" would be two different numbers: the donated
+        parser row belongs in the grand total and not in the personal key's."""
+        role_records = self._role_records()
+
+        rcs._print_role_table(role_records, {"A", "B", "C"})
+        out = capsys.readouterr().out
+
+        assert "total (all keys, costed)" in out
+        assert "1.5500" in out, "the grand total spans the donated row too"

@@ -30,16 +30,27 @@ from metaculus_bot.constants import EXTREME_CALL_HIGH, EXTREME_CALL_LOW
 from metaculus_bot.extreme_call import format_extreme_call_markers
 from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from scripts.telemetry.markers import MARKER_SPECS
 from tests.conftest import make_mock_general_llm, make_mock_numeric_question
 
 QID = 44874  # the question the finding is built on: a lone 0.03 on a YES resolution
 
+_EXTREME_CALL_SPEC = next(spec for spec in MARKER_SPECS if spec.name == "extreme_call")
 
-def _fields(line: str) -> dict[str, str]:
-    """Split one marker line's ``key=value`` tail into a dict (prefix dropped)."""
-    head, _, tail = line.partition(": ")
-    assert head == "EXTREME_CALL", f"unexpected marker head: {head!r}"
-    return dict(token.split("=", 1) for token in tail.split())
+
+def _fields(line: str) -> dict[str, Any]:
+    """One marker line's fields, read the way the telemetry harvester reads them.
+
+    Parsed through the marker's own ``MarkerSpec`` regex rather than a generic
+    ``key=value`` split, so the field ORDER is pinned here too: the regex spells the
+    sequence out literally, and a reordered emitter would harvest zero records while a
+    split-on-whitespace dict stayed happily green. Every assertion in this file therefore
+    fails next to the emitter rather than only in tests/test_telemetry_markers.py, whose
+    inputs are hand-typed literals no emitter produces.
+    """
+    match = _EXTREME_CALL_SPEC.regex.search(line)
+    assert match is not None, f"line does not match the extreme_call MarkerSpec regex: {line!r}"
+    return match.groupdict()
 
 
 class TestExtremeBandEdges:

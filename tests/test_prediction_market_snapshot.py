@@ -16,6 +16,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import patch
@@ -27,8 +28,13 @@ from metaculus_bot.prompts import binary_prompt
 from metaculus_bot.research import prediction_market as pmp
 from metaculus_bot.research.market_retrieval import generation
 from metaculus_bot.research.market_retrieval.queries import dedupe_queries, strip_dates_and_numbers
-from metaculus_bot.research.market_retrieval.ranking import DEGRADED_RANKING_MARKER, RENDER_BUDGET
+from metaculus_bot.research.market_retrieval.ranking import (
+    DEGRADED_RANKING_MARKER,
+    RENDER_BUDGET,
+    cap_stale_top_tier,
+)
 from metaculus_bot.research.prediction_market import format_snapshot_for_research
+from scripts.telemetry.markers import MARKER_SPECS
 from tests import market_retrieval_fakes as _fakes
 from tests.market_retrieval_fakes import AUTHOR_JSON as _AUTHOR_JSON
 from tests.market_retrieval_fakes import CANDIDATE_LINE_RE as _CANDIDATE_LINE_RE
@@ -69,6 +75,21 @@ def _rank_first_as(*, tier: str, why: str) -> Callable[[str], str]:
         return json.dumps([{**pick, "tier": tier, "why": why} for pick in picks])
 
     return _rank
+
+
+def _tier_capped_fields(line: str) -> dict[str, Any]:
+    """One MARKET_TIER_CAPPED line's fields, read the way the telemetry harvester reads them.
+
+    Through the marker's own ``MarkerSpec`` regex rather than substring checks, so the field
+    ORDER is pinned next to the emitter: the regex spells the sequence out literally, and a
+    reordered emitter would harvest zero records. That failure is invisible from the parser
+    side for this marker in particular — it fires on none of the 102 archived snapshots, so an
+    empty harvest is indistinguishable from a broken regex.
+    """
+    spec = next(spec for spec in MARKER_SPECS if spec.name == "market_tier_capped")
+    match = spec.regex.search(line)
+    assert match is not None, f"line does not match the market_tier_capped MarkerSpec regex: {line!r}"
+    return match.groupdict()
 
 
 def _table_row_by_platform(rendered: str, platform: str) -> dict[str, str]:
@@ -193,8 +214,12 @@ class TestFetchMarketSnapshot:
 
         capped = [message for message in caplog.messages if message.startswith("MARKET_TIER_CAPPED:")]
         assert len(capped) == 1
-        assert "rows=1" in capped[0]
-        assert f"question={mock_question.id_of_question}" in capped[0]
+        assert row.rank is not None, "the ranker must have stamped a rank for the capped= entry to name"
+        assert _tier_capped_fields(capped[0]) == {
+            "question": str(mock_question.id_of_question),
+            "rows": "1",
+            "capped": f"manifold@{row.rank}",
+        }
 
     @pytest.mark.asyncio
     async def test_a_market_closing_after_the_question_opened_keeps_its_grade_and_logs_nothing(
@@ -215,6 +240,40 @@ class TestFetchMarketSnapshot:
         assert row.relation_tier == "same_quantity_same_date"
         assert row.tier_cap_note == ""
         assert not [message for message in caplog.messages if message.startswith("MARKET_TIER_CAPPED:")]
+
+    def test_two_capped_rows_are_listed_in_one_spaceless_comma_joined_field(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`capped=` is a `venue@rank` list the harvester takes whole with `\\S+`, so a space
+        anywhere in the join would truncate the field and silently drop every entry past the
+        first. Only a multi-row cap can show that, and the fixture pipeline caps at most one row
+        (the cap fires on nothing in the archived corpus at all), so the real staleness pass and
+        the real emitter are driven directly over two tier-1 rows that closed before the question
+        opened."""
+        stale_rows = [
+            replace(
+                _row("Manifold market", platform="manifold", tier="same_quantity_same_date"),
+                rank=0,
+                close_time=datetime(2026, 6, 22, tzinfo=UTC),
+            ),
+            replace(
+                _row("Kalshi market", platform="kalshi", tier="same_quantity_same_date"),
+                rank=2,
+                close_time=datetime(2026, 5, 1, tzinfo=UTC),
+            ),
+        ]
+        capped_rows = cap_stale_top_tier(stale_rows, question_open_time=datetime(2026, 12, 1, tzinfo=UTC))
+        assert all(row.tier_cap_note for row in capped_rows), "both rows must actually be capped"
+
+        with caplog.at_level(logging.INFO):
+            pmp._log_tier_caps(45163, capped_rows)
+
+        (line,) = [message for message in caplog.messages if message.startswith("MARKET_TIER_CAPPED:")]
+        assert _tier_capped_fields(line) == {
+            "question": "45163",
+            "rows": "2",
+            "capped": "manifold@0,kalshi@2",
+        }
 
     @pytest.mark.asyncio
     async def test_an_empty_ranking_is_a_valid_answer_and_not_a_degradation(self, mock_question, kalshi_events_payload):

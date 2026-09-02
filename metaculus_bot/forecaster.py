@@ -880,9 +880,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # _make_prediction) rather than self._forecaster_llms, because the roster
         # lists CONFIGURED models and the survivors are a subset — reporting the
         # roster here would relabel a degraded run as full.
-        survivor_models = sorted(
-            filter(None, (extract_model_display_name_from_reasoning(pred.reasoning) for pred in valid_predictions))
-        )
+        #
+        # Derived once, positionally, and reused by the EXTREME_CALL block below: the two
+        # lines have to stay joinable on the model field, so reading the prefix twice would
+        # let a future change to one reading drift from the other. This list keeps the
+        # per-prediction None (rendered "unknown" there); the log line drops and sorts it.
+        survivor_names = [extract_model_display_name_from_reasoning(pred.reasoning) for pred in valid_predictions]
+        survivor_models = sorted(filter(None, survivor_names))
         logger.info(
             "FORECASTERS_SURVIVED: question=%s survived=%d/%d models=%s",
             qid_for_log,
@@ -909,11 +913,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             for marker in format_extreme_call_markers(
                 qid_for_log,
                 [
-                    (
-                        extract_model_display_name_from_reasoning(pred.reasoning),
-                        cast(float, pred.prediction_value),
-                    )
-                    for pred in valid_predictions
+                    (name, cast(float, pred.prediction_value))
+                    for name, pred in zip(survivor_names, valid_predictions, strict=True)
                 ],
             ):
                 logger.info(marker)

@@ -86,7 +86,8 @@ Free / safe — run freely:
   (`sync_research`, `sync_telemetry`, `sync_raw_research`, `download_*`,
   `backfill_*`), the `performance_analysis` package, `make score_ghosts` (its
   `--tournament` pull is Metaculus-only), `make close_margin_watch`,
-  `make ablation_score`, `make benchmark_display` (views old runs). These hit only
+  `make ablation_score`, `make supply_probe` (pages the Metaculus posts list per
+  tournament slug), `make benchmark_display` (views old runs). These hit only
   the Metaculus API and GitHub artifacts.
 - `make check_credits` — reads both OpenRouter key balances.
 
