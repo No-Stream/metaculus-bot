@@ -159,6 +159,14 @@ under its role (`forecaster:<vendor>`, `native_search`, `gap_fill_resolver`, `pa
 re-add off those rows, not off this paragraph. A re-add must clear both the score bar above *and*
 justify the cost it brings back.
 
+**Coverage caveat on those role rows (added 2026-09-01, forge F1/R18).** The same bundle bounded
+litellm's end-of-run callback drain at `LITELLM_CALLBACK_DRAIN_TIMEOUT_S` (10 s) so telemetry can
+never hold a finished run hostage, and a drain that times out logs a
+`LITELLM_CALLBACK_DRAIN_TIMEOUT` WARN saying in as many words that the `CREDIT_ROLE_SPEND` ledger
+under-counts that run's last completions. That WARN is deliberately not a harvested MarkerSpec, so
+the one thing that would explain a low `reconcile_credit_spend.py --roles` coverage ratio is
+invisible in the telemetry archive. Register it if a coverage ratio is ever puzzling.
+
 **Discrete-calibration note (2026-08-24).** The post-fix (`9f1175c`) discrete cohort has ZERO
 max-step-bug exposure by composition: all four resolved triple-era discretes are fine-grid
 percent/spread questions, and re-introducing the legacy 0.2 cap changes their CDFs by exactly
@@ -855,6 +863,17 @@ resolutions (late September / early October), not ~09-01 (which buys only ~7).
    field. Adding `outcomeType: BINARY` would give that row a price where several tests currently
    expect none, so the fixture and those expectations have to move together — which is why it was
    left alone during a parallel fan-out that had other agents in the same file.
+7. **LOW — the narrowed market-odds research bullet claims a snapshot that can be missing (added
+   2026-09-01, forge R24).** `_OUTSIDE_VENUE_MARKET_ODDS_BULLET` (`prompts.py`, shipped by the
+   bundle's item 5) tells the search providers not to report Polymarket/Kalshi/Manifold/PredictIt
+   prices because "a dedicated live snapshot of those venues is provided separately", which is true
+   whenever the prediction-market provider works and false on any question where it fails — now the
+   only way that snapshot goes missing, since the flag is on in every prod workflow. Left alone
+   because gating the sentence on the flag cures only the never-happens disabled case, and the
+   item's own receipt (`scratch/residual_2026-08-31/market_odds_coverage.md`) measured
+   search-indexed covered-venue prices as net harmful in the ranked era (one content-redundant
+   retrieval against three stale prices that contradicted correct live snapshot rows), so
+   re-inviting them on a provider failure is not obviously an improvement over saying nothing.
 
 ### Sentinel-value sweep leftovers: three deliberate deferrals (added 2026-08-26)
 
@@ -893,6 +912,15 @@ wave): the agentic `_fetch_plain` textual allowlist (`text/plain`, `text/csv`,
 `application/json` — unchanged since 56c0d2f) refuses FRED's fredgraph CSVs, which are served
 as `Content-Type: application/csv`, with a clean "Unsupported content type" error, so such URLs
 ride the fetch ladder's later rungs. One allowlist entry if agentic FRED reads ever matter.
+
+A fifth, from the 2026-09 bundle's forge pass (added 2026-09-01, forge R8): `getattr(question,
+"<attr>", None)` on attributes that always exist on `MetaculusQuestion` is licensed by the
+`question: Any` typing rather than by any field that can actually be absent, and the forge pass
+counted about 30 such sites across `metaculus_bot/research/` (a raw grep for `getattr(question, `
+there returns 51, the difference being genuinely type-specific attributes like `open_upper_bound`
+and `options`). The two guarding the new staleness tier cap were fixed inside the bundle; the rest
+is one mechanical sweep and deserves its own PR, because the MagicMock question fixtures several
+research tests build will need explicit attributes once those defaults stop covering for them.
 
 ### Deterministic tail-consistency check on the numeric structured block (added 2026-08-24)
 
@@ -1001,6 +1029,21 @@ Follow-ups:
    names the real status token beside it and the instruction to the forecaster is unchanged, so this
    is wording, not a defect. The fix is per-status phrasing in that one render string; it was left
    alone in the 2026-09-01 bundle rather than reworking shared render wording under an unrelated item.
+5. **The 45 s wall-clock timeout throws away work that already succeeded (added 2026-09-01, forge
+   R3; SKIPPED by operator decision — do not implement without them).** The provider's `_fetch`
+   wraps `fetch_resolution_sources` in a single
+   `asyncio.wait_for(..., RESOLUTION_SOURCE_WALL_TIMEOUT)` and returns `""` on timeout, and that
+   return happens BEFORE `_log_fetch_outcome_markers`, `record_raw_research`,
+   `record_provider_detail` and `format_resolution_sections`. So an overrun loses every per-URL
+   `RESOLUTION_SOURCE_FETCH` marker, the diagnostics source map, the raw-archive payload AND the
+   page text the URLs that did finish had already produced — the run cannot tell afterwards which
+   sources it nearly had. The minimal fix bounds the page gather internally the way the Datawrapper
+   hop already self-bounds: cancel the stragglers, materialise the unfinished URLs as `error` or a
+   new status token, return partial results. Note that this also starts rendering partial snapshots
+   where today nothing renders, i.e. a forecaster-visible change on a timing path, and timing and
+   fallback paths in this pipeline have cost real questions before (q45085). Blast radius is
+   unmeasured, so size it first:
+   `rg --no-ignore 'wall-clock timeout' backtests/telemetry_archive/`.
 
 ### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
 
@@ -1316,6 +1359,22 @@ them OUT of feature work, land as their own PRs.
   would have edited a shared file mid-fan-out — so the consolidation is this follow-up: one public
   helper in a shared module, parameterized on retry budget and raising `requests` exceptions, with
   all three call sites repointed.
+- **Split `tests/test_telemetry_markers.py` by marker family, and re-measure this list first (added
+  2026-09-01, forge R7).** That file is **2,283** lines and each marker family's tests are already
+  independent, so splitting it is mechanical the next time anything touches it. The sizes in the
+  first bullet are all pre-`276ecf2` (2026-08-27, "split the six monolith modules"), which closed
+  more than it recorded: `ablation/cli.py` is **972** not 2,206, `agentic/loop.py` **683** not 1,684,
+  `agentic/tools.py` **624** not 1,047, `parsing.py` **432** not 1,135. Meanwhile `prompts.py` grew
+  to **1,691** and `resolution_source.py` to **1,294**, and three files over the ceiling are listed
+  nowhere: `research/financial_data.py` **1,365**, this test file, and `tests/test_agentic_tools.py`
+  **2,021**.
+- **Dedupe the peg anchor when two tickers share one (added 2026-09-01, forge R15).** The bundle's
+  peg-anchor block is decided per ticker inside `_fetch_yfinance_data`
+  (`research/financial_data.py`), so a question naming two pegged crosses that share an anchor
+  (SZL and LSL both anchor on `ZAR=X`) or naming the anchor itself beside a pegged cross renders
+  that anchor block twice, at the cost of one extra yfinance call (free, and the render is the
+  actual cost). Skipped as a corner case; the fix is a dedupe in the job builder, natural to do
+  when the peg table moves out to its own `currency_pegs.py` per the split above.
 
 ## Medium-term (requires more exploration)
 

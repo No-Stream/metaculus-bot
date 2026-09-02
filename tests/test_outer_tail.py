@@ -117,6 +117,8 @@ class TestStarvedOuterTail:
         reading = _high_side(_rig_count_record(band_bin_multiple=1.12))
         assert reading.verdict is OuterTailVerdict.STARVED
         assert reading.starved
+        assert reading.members_used == 3
+        assert reading.members_dropped == 0
         assert reading.declared_percentile == 99.0
         assert reading.declared_value == pytest.approx(603.0)
         assert reading.bound_value == pytest.approx(630.5)
@@ -321,3 +323,148 @@ class TestStarvedOuterTail:
         assert high["declared_value"] == pytest.approx(603.0)
         assert high["flat_zone_log_score"] < -215.0
         assert payload["verdict_counts"]["starved"] == 1
+
+
+class TestAnchorMemberCensus:
+    """Who set the anchor, disclosed.
+
+    The band the verdict is measured against starts at the members' shared outer anchor, and
+    that anchor is a median over the members whose curve survived parsing. A partial loss
+    therefore MOVES the boundary, so every reading states how many members it used and how many
+    it dropped rather than reporting a boundary of unstated provenance.
+    """
+
+    def test_an_unparseable_member_is_counted_and_the_anchor_moves(self):
+        # Archived per-model pairs come out of comment prose, so a garbled percentile label is a
+        # real shape: `float("p99")` raises and the whole curve leaves the median. The two
+        # survivors declared p99 at 603 and 606, so the anchor is their 604.5 — not the 603 all
+        # three would have produced.
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "model-0": [["p99", 602.0], [50.0, 586.0], [1.0, 566.0]],
+            "model-1": [[1.0, 568.0], [50.0, 586.0], [99.0, 603.0]],
+            "model-2": [[1.0, 570.0], [50.0, 586.0], [99.0, 606.0]],
+        }
+        reading = _high_side(record)
+        assert reading.verdict is OuterTailVerdict.STARVED
+        assert reading.members_used == 2
+        assert reading.members_dropped == 1
+        assert reading.declared_percentile == 99.0
+        assert reading.declared_value == pytest.approx(604.5)
+
+    def test_a_truncated_pair_is_counted_the_same_way(self):
+        # The other malformed shape: a percentile line cut before its value arrives as a
+        # one-element pair, which indexes out of range.
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "model-0": [[1.0, 566.0], [50.0, 586.0], [99.0]],
+            "model-1": [[1.0, 568.0], [50.0, 586.0], [99.0, 603.0]],
+            "model-2": [[1.0, 570.0], [50.0, 586.0], [99.0, 606.0]],
+        }
+        reading = _high_side(record)
+        assert reading.members_used == 2
+        assert reading.members_dropped == 1
+        assert reading.declared_value == pytest.approx(604.5)
+
+    def test_a_curve_with_one_label_cannot_set_an_anchor_and_is_counted(self):
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "model-0": [[99.0, 602.0]],
+            "model-1": [[1.0, 568.0], [50.0, 586.0], [99.0, 603.0]],
+            "model-2": [[1.0, 570.0], [50.0, 586.0], [99.0, 606.0]],
+        }
+        reading = _high_side(record)
+        assert reading.members_used == 2
+        assert reading.members_dropped == 1
+        assert reading.declared_value == pytest.approx(604.5)
+
+    def test_an_anonymous_bucket_beside_named_members_is_counted_as_dropped(self):
+        # The only cause that actually fires on the archived cohort: 12 members over 12 records,
+        # 6 of them partial losses. The exclusion is deliberate — a positional `Forecaster N`
+        # bucket can hold the stacker's aggregate — but it moves the anchor exactly as a parse
+        # failure does, so it is disclosed the same way.
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "Forecaster 1": [[1.0, 560.0], [50.0, 586.0], [99.0, 628.0]],
+            "model-1": [[1.0, 568.0], [50.0, 586.0], [99.0, 603.0]],
+            "model-2": [[1.0, 570.0], [50.0, 586.0], [99.0, 606.0]],
+        }
+        reading = _high_side(record)
+        assert reading.members_used == 2
+        assert reading.members_dropped == 1
+        # 628 would have dragged the median to 606; the anchor is the two named members' 604.5.
+        assert reading.declared_value == pytest.approx(604.5)
+
+    def test_an_intact_set_reports_no_drops(self):
+        for reading in measure_outer_tails(_rig_count_record(band_bin_multiple=1.12)):
+            assert reading.members_used == 3
+            assert reading.members_dropped == 0
+
+    def test_the_census_totals_the_records_members_on_every_verdict(self):
+        # used + dropped is the record's member count, which makes the pair checkable rather
+        # than indicative — including on the unmeasurable verdicts, where the members were
+        # inspected and simply could not produce a shared extreme anchor.
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "model-0": [[10.0, 575.0], [50.0, 586.0]],
+            "model-1": [[50.0, 586.0], [99.0, 603.0]],
+            "Forecaster 3": [[1.0, 560.0], [99.0, 628.0]],
+        }
+        reading = _high_side(record)
+        assert reading.verdict is OuterTailVerdict.ANCHOR_NOT_EXTREME
+        assert reading.members_used == 2
+        assert reading.members_dropped == 1
+
+    def test_a_side_that_never_inspected_members_reports_neither_count(self):
+        # NO_USABLE_CDF precedes the member read, so an empty census would claim a measurement
+        # that was never taken. None says "not inspected"; 0 would say "inspected, found none".
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["scaling"] = {}
+        for reading in measure_outer_tails(record):
+            assert reading.verdict is OuterTailVerdict.NO_USABLE_CDF
+            assert reading.members_used is None
+            assert reading.members_dropped is None
+
+    def test_a_record_with_no_members_at_all_reports_an_empty_census(self):
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {}
+        reading = _high_side(record)
+        assert reading.verdict is OuterTailVerdict.NO_MEMBER_CURVE
+        assert reading.members_used == 0
+        assert reading.members_dropped == 0
+
+    def test_the_flagged_row_states_the_census(self):
+        record = _rig_count_record(band_bin_multiple=1.12)
+        record["per_model_numeric_percentiles"] = {
+            "Forecaster 1": [[1.0, 560.0], [50.0, 586.0], [99.0, 628.0]],
+            "model-1": [[1.0, 568.0], [50.0, 586.0], [99.0, 603.0]],
+            "model-2": [[1.0, 570.0], [50.0, 586.0], [99.0, 606.0]],
+        }
+        md = render_starved_outer_tails(scan_outer_tails([record]))
+        assert "| members (used/dropped) |" in md
+        assert "| 2/1 |" in md
+        # Per SIDE, and said so: the one dropped member is counted on both of the record's open
+        # bounds, which a bare "2 members dropped" would read as two distinct members.
+        assert "Dropped an anchor member on 2 of 2 scanned side(s) (2 member-drop(s) in total" in md
+
+    def test_the_section_says_so_when_no_member_was_dropped(self):
+        md = render_starved_outer_tails(scan_outer_tails([_rig_count_record(band_bin_multiple=1.12)]))
+        assert "Dropped an anchor member on no side." in md
+        assert "| 3/0 |" in md
+
+    def test_the_json_dump_carries_the_census_on_unflagged_sides_too(self, tmp_path):
+        healthy = _rig_count_record(band_bin_multiple=6.0, question_id=44182)
+        healthy["per_model_numeric_percentiles"] = {
+            "Forecaster 1": [[1.0, 560.0], [50.0, 586.0], [99.0, 628.0]],
+            "model-1": [[1.0, 568.0], [50.0, 586.0], [99.0, 603.0]],
+            "model-2": [[1.0, 570.0], [50.0, 586.0], [99.0, 606.0]],
+        }
+        data = tmp_path / "data.json"
+        data.write_text(json.dumps([healthy]))
+        out_json = tmp_path / "starved.json"
+        main(["--cached", str(data), "--output-starved-json", str(out_json)])
+        payload = json.loads(out_json.read_text())
+        [high] = [row for row in payload["readings"] if row["side"] == "high"]
+        assert high["verdict"] == "healthy"
+        assert high["members_used"] == 2
+        assert high["members_dropped"] == 1
