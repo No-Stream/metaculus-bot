@@ -125,23 +125,34 @@ def _candidate_configs(html_text: str) -> list[str]:
     Attribute form leads because it is the receipt-backed one and it is always
     valid JSON; a page carrying both would otherwise have its readable configs
     crowded out of the candidate budget by unparseable script literals.
+
+    ``RESOLUTION_SOURCE_CHART_MAX_CANDIDATES`` bounds the sites EXAMINED rather
+    than the configs kept, and one counter spans both loops. Counting kept configs
+    bounded nothing on the script form: a ``Highcharts.chart(`` whose braces never
+    close appends no candidate, so every such site on the page paid its own
+    ``_balanced_object`` scan and the page's cost was sites x the config-char
+    bound. An examined site now costs its bounded scan once and then retires
+    budget like any other.
     """
     candidates: list[str] = []
+    examined = 0
     for match in _DATA_CHART_RE.finditer(html_text):
+        examined += 1
         raw = match.group(1) if match.group(1) is not None else match.group(2)
         if raw:
             candidates.append(html_entities.unescape(raw))
-        if len(candidates) >= RESOLUTION_SOURCE_CHART_MAX_CANDIDATES:
+        if examined >= RESOLUTION_SOURCE_CHART_MAX_CANDIDATES:
             return candidates
     for match in _HIGHCHARTS_CALL_RE.finditer(html_text):
+        if examined >= RESOLUTION_SOURCE_CHART_MAX_CANDIDATES:
+            break
+        examined += 1
         brace = html_text.find("{", match.end())
         if brace == -1:
             continue
         obj = _balanced_object(html_text, brace)
         if obj:
             candidates.append(obj)
-        if len(candidates) >= RESOLUTION_SOURCE_CHART_MAX_CANDIDATES:
-            break
     return candidates
 
 
@@ -346,22 +357,27 @@ def render_inline_chart_data(html_text: str) -> str:
         - len(_omitted_charts_note(RESOLUTION_SOURCE_CHART_MAX_CANDIDATES))
     )
     blocks: list[str] = []
-    dropped_for_budget = 0
+    omitted_charts = 0
     used = 0
     for raw in _candidate_configs(html_text):
-        if len(blocks) >= RESOLUTION_SOURCE_CHART_MAX_CHARTS:
-            break
         block = _render_config(raw, len(blocks) + 1)
         if block is None:
             continue
-        if used + len(block) + 1 > budget:
-            dropped_for_budget += 1
+        # The chart cap counts as an omission, exactly like the char budget: both
+        # leave a readable chart off the page, and a silent `break` here made the
+        # docstring's "the omitted count is stated" false on the common shape (a
+        # page with more readable charts than the cap) and made the count
+        # UNDER-state on a page whose over-budget chart came first. Only readable
+        # configs are counted — a config we could not parse was never a chart we
+        # left out.
+        if len(blocks) >= RESOLUTION_SOURCE_CHART_MAX_CHARTS or used + len(block) + 1 > budget:
+            omitted_charts += 1
             continue
         blocks.append(block)
         used += len(block) + 1
     if not blocks:
         return ""
     parts = [CHART_DATA_LEAD, *blocks]
-    if dropped_for_budget:
-        parts.append(_omitted_charts_note(dropped_for_budget))
+    if omitted_charts:
+        parts.append(_omitted_charts_note(omitted_charts))
     return "\n".join(parts)
