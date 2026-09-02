@@ -423,9 +423,19 @@ class TestCapStaleTopTier:
         row = self._capped_row()
 
         assert row.relation_tier == "same_quantity_other_cut"
-        assert (
-            row.tier_cap_note == "stale: closed 163d before the question opened (ranker said same_quantity_same_date)"
-        )
+        assert row.tier_cap_note == "demoted from same-date: closed 163d before the question opened"
+
+    def test_the_note_states_the_demotion_once_and_not_the_withdrawn_grade(self) -> None:
+        """The note used to close with "(ranker said same_quantity_same_date)", which restated the
+        vocabulary word the cap had just withdrawn at the end of a rendered cell — in a table whose
+        preamble tells the forecaster to anchor on a same-date market's price, and directly ahead of
+        the ranker's own same-date phrase in the same cell. The grade stays recoverable without it:
+        only the top tier is ever capped, so a note at all means the ranker said tier 1."""
+        note = self._capped_row().tier_cap_note
+
+        assert TIERS[0] not in note
+        assert "ranker said" not in note
+        assert note.startswith("demoted from same-date:"), "the shape the rendered legend defines"
 
     def test_the_demoted_row_keeps_its_rank_price_and_the_rankers_own_phrase(self) -> None:
         """Disclosure, not a drop: the note is additive and nothing else about the row moves. The

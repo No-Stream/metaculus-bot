@@ -180,14 +180,15 @@ class TestFetchMarketSnapshot:
 
         row = next(match for match in snapshot.matches if match.platform == "manifold")
         assert row.relation_tier == "same_quantity_other_cut", "the top tier is refused, one rung only"
-        assert row.tier_cap_note == (
-            "stale: closed 162d before the question opened (ranker said same_quantity_same_date)"
-        )
+        assert row.tier_cap_note == "demoted from same-date: closed 162d before the question opened"
         assert row.relevance_label == "same window", "the ranker's own phrase is left verbatim"
 
-        cells = _table_row_by_platform(format_snapshot_for_research(snapshot), "manifold")
+        rendered = format_snapshot_for_research(snapshot)
+        cells = _table_row_by_platform(rendered, "manifold")
         assert cells["relation"] == "same_quantity_other_cut"
-        assert cells["why"].startswith("stale: closed 162d before the question opened")
+        assert cells["why"].startswith("demoted from same-date: closed 162d before the question opened")
+        # The forecaster-facing half of the note: the legend has to define the shape the cell holds.
+        assert "`demoted from same-date:`" in rendered
         assert re.fullmatch(r"2026-06-22 \(\d+d ago\)", cells["close"]), cells["close"]
         assert cells["status"] == "open", "the soft-close row still reads open — the cue is the close cell"
 

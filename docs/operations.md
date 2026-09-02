@@ -1031,8 +1031,9 @@ fires only when the deterministic staleness pass refuses a row the top relation 
 — the ranker graded a market that stopped trading more than
 `MARKET_STALENESS_TIER_CAP_DAYS` (60, in `market_retrieval/ranking.py`) before the
 question opened as `same_quantity_same_date`. The row keeps its rank, price and
-liquidity cells; what it gains is a note in the `why` cell saying what the ranker
-said. Silence is the normal case, and the cap fires on nothing in the 102 archived
+liquidity cells; what it gains is a note in the `why` cell stating the demotion and
+its arithmetic (`demoted from same-date: closed 162d before the question opened`).
+Silence is the normal case, and the cap fires on nothing in the 102 archived
 snapshots, so a first line in a run log IS the finding. The demotion also rides the
 archived snapshot as `MarketMatch.tier_cap_note`, so its incidence is answerable
 offline; this line is the prod-log half and the one that survives a run whose

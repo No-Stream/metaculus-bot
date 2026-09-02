@@ -220,16 +220,22 @@ class TestArchiveRoundTrip:
         words (`STRONG_TIERS` membership picks the rendered preamble and every tier-conditioned
         residual cut tests the cell by equality), so the demotion's reason lives in its own field —
         which also keeps `relevance_label` the model's verbatim phrase, and therefore keeps "what the
-        ranker said about a row our arithmetic overruled" recoverable from the archive."""
+        ranker said about a row our arithmetic overruled" recoverable from the archive.
+
+        The note no longer spells out the withdrawn grade (it read "(ranker said
+        same_quantity_same_date)" until the wording was cut back for the rendered cell), and the
+        grade is still recoverable from these three fields: only the top tier is ever capped, so a
+        non-empty `tier_cap_note` beside a `same_quantity_other_cut` grade says the ranker said
+        `same_quantity_same_date` and our arithmetic refused it."""
         match = _positional_row()
         match.relation_tier = "same_quantity_other_cut"
         match.relevance_label = "conditional country market"
-        match.tier_cap_note = "stale: closed 163d before the question opened (ranker said same_quantity_same_date)"
+        match.tier_cap_note = "demoted from same-date: closed 163d before the question opened"
 
         row = json.loads(json.dumps(dataclasses.asdict(MarketSnapshot(matches=[match])), default=str))["matches"][0]
         assert row["relation_tier"] == "same_quantity_other_cut"
         assert row["relevance_label"] == "conditional country market"
-        assert "ranker said same_quantity_same_date" in row["tier_cap_note"]
+        assert row["tier_cap_note"] == "demoted from same-date: closed 163d before the question opened"
 
     def test_the_snapshots_forecast_time_survives_the_archive(self):
         """It is what the render dates its staleness disclosures against, so a replay that could not
