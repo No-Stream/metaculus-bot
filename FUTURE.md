@@ -947,28 +947,25 @@ de-skewing every member to a symmetric normal at its own declared p50 and 10–9
 crowd, from arithmetic the models had already done.
 (`scratch/residual_2026-08-24/dossiers/44453_dossier.md` + `44453_verification.md` C1.)
 
-### Gap-fill v2 throttle handling: the two halves the q45191 fix deliberately left (added 2026-09-02)
+### Gap-fill v2 throttle handling: the request-spacing half the q45191 fix left (added 2026-09-02)
 
 The fix that shipped makes a host's rate-limit interstitial a `status=throttled` failure that is
 never cached, so the driver's retry of a throttled URL is a real request
 (`research/agentic/fetch_outcomes.py` + `tools.py`; receipt:
-`scratch/residual_2026-09-01/dossiers/45191_verification.md`). Two adjacent things were left alone
-on purpose, both because they touch timing or dispatch rather than detection:
+`scratch/residual_2026-09-01/dossiers/45191_verification.md`). The duplicate-call note that
+contradicted that retry has since been fixed as well, and needed no per-URL outcome memory:
+`dispatch._append_tool_messages` discards a throttled call's `(tool, normalized-args)` key from
+`state.seen_tool_calls` at emission, so the identical retry is neither counted in `dup_tool_calls`
+nor told "its result will not have changed", while `max_tool_calls` still caps a throttle spin.
+One adjacent thing is still left alone on purpose, because it touches timing rather than detection:
 
-1. **No request SPACING.** Same-host fetches already serialize on the per-host `Semaphore(1)` v2
-   shares with Tier-1 (`tools._host_gate`), but Ogimet asked for 20 s BETWEEN queries and nothing
-   waits. So a parallel same-host batch still trips a spacing rule; it is now disclosed and
-   retryable instead of silently wrong. Adding a per-host minimum interval means new sleep/deadline
-   logic on the path the wall deadline already governs, which is the highest-risk surface in this
-   package. If it is ever wanted, the cheap version is a per-host "next allowed at" timestamp
-   consulted inside the existing gate, and it needs its own review pass.
-2. **The duplicate-call note contradicts a throttle retry.** `dispatch._DUPLICATE_CALL_WARNING`
-   appends "this exact tool call was already made earlier in this run — its result will not have
-   changed. Vary the query/URL or move on." to any repeat call. After the fix the retry DOES return
-   the page, so the driver gets the content, but it is told the opposite in the same message.
-   Suppressing the note for a URL whose prior outcome was `throttled` needs per-URL outcome memory
-   in `_LoopState`, and the note's wording is shared with every other duplicate, so it is a
-   dispatch-side change rather than a one-line edit.
+**No request SPACING.** Same-host fetches already serialize on the per-host `Semaphore(1)` v2
+shares with Tier-1 (`tools._host_gate`), but Ogimet asked for 20 s BETWEEN queries and nothing
+waits. So a parallel same-host batch still trips a spacing rule; it is now disclosed and retryable
+instead of silently wrong. Adding a per-host minimum interval means new sleep/deadline logic on the
+path the wall deadline already governs, which is the highest-risk surface in this package. If it is
+ever wanted, the cheap version is a per-host "next allowed at" timestamp consulted inside the
+existing gate, and it needs its own review pass.
 
 Also unhandled, and cheaper to leave: `read_document` (rung 3, Gemini `url_context`) applies no
 throttle check, so an interstitial the reader summarises would still come back as a document read.
