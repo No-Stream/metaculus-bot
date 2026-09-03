@@ -114,6 +114,7 @@ class TestEveryJobIsCapped:
         assert _ALL_WORKFLOWS == [
             ".github/workflows/ci.yaml",
             ".github/workflows/claude.yml",
+            ".github/workflows/fetch_diagnostic.yaml",
             ".github/workflows/run_bot_on_metaculus_cup.yaml",
             ".github/workflows/run_bot_on_minibench.yaml",
             ".github/workflows/run_bot_on_tournament.yaml",
@@ -226,6 +227,10 @@ class TestRunBotCapRespectsTheBotsOwnContract:
 class TestNonBotWorkflowCapsStayInBand:
     """ci.yaml and claude.yml were swept as the same defect class, so pin their sizing.
 
+    fetch_diagnostic.yaml (the operator-run egress probe) joins the same band: it is
+    workflow_dispatch-only and holds no key, but it does hold the concurrency group while
+    it makes ~30 sequential network requests, so an uncapped hang there costs the same.
+
     ``TestEveryJobIsCapped`` only asks whether a cap EXISTS, which a revert to GitHub's
     360-minute default satisfies with one keystroke. These are the workflows nobody
     watches — a required check spinning for six hours, on a workflow that holds a paid
@@ -246,4 +251,8 @@ class TestNonBotWorkflowCapsStayInBand:
     def test_the_non_bot_set_is_what_we_think_it_is(self) -> None:
         # Complement of the pinned full set: a new non-bot workflow lands in the band
         # check above rather than escaping both parametrizations.
-        assert _NON_BOT_WORKFLOWS == [".github/workflows/ci.yaml", ".github/workflows/claude.yml"]
+        assert _NON_BOT_WORKFLOWS == [
+            ".github/workflows/ci.yaml",
+            ".github/workflows/claude.yml",
+            ".github/workflows/fetch_diagnostic.yaml",
+        ]

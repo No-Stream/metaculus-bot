@@ -307,7 +307,15 @@ extend_exclude = [
 #     research/agentic/tools.py.
 # Declaring either directly would add a second version constraint on a package those
 # dependencies already resolve, for no gain in availability.
-DEP003 = ["urllib3", "httpx"]
+#   curl_cffi <- yfinance. The one importer is scripts/probes/fetch_diagnostic.py, the
+#     operator-run egress diagnostic, and it imports inside a try/except ImportError. That
+#     probe needs a real Chrome TLS/HTTP2 fingerprint to tell "this runner's fingerprint is
+#     being scored" from "this runner's egress IP is blocked", which is a debugging need and
+#     must not put a package into the bot's runtime deps; its workflow supplies it with
+#     `uv run --with curl_cffi`, and the probe degrades to "impersonation rung unavailable"
+#     when the import fails, so it does not rely on yfinance's transitive copy either. The
+#     cost of this entry is that a future prod import of curl_cffi would go unflagged.
+DEP003 = ["urllib3", "httpx", "curl_cffi"]
 # DEP004 — dev dependency imported by the shipped package. matplotlib plotting is
 # optional at both call sites and neither is reachable on a live bot run:
 #   calibration/fit_platt_cli.py imports it inside try/except ImportError and returns a
