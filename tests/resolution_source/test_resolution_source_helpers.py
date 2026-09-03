@@ -97,6 +97,91 @@ class TestExtractSourceUrls:
         assert urls[-1] == "https://example9.com/x"
 
 
+class TestUrlParensBelongToTheUrl:
+    """Parens inside a cited URL — the 2026-09-03 measured 404 pair.
+
+    Both regexes used to end a URL at the first `)`, so a Wikipedia-style path lost its
+    closing paren and, when Metaculus had escaped the parens, kept a trailing backslash
+    instead. The archived instances: `…/wiki/Nuri_\\(rocket\\)` fetched as
+    `…/wiki/Nuri_(rocket\\` and was archived `not_found`, where the repaired URL returns
+    200 with 16,753 chars; a Ballotpedia primary page lost the closing paren that was its
+    last character. So `)` is a delimiter only when it closes nothing inside the URL.
+    """
+
+    # Verbatim from the archived resolution criteria (the escapes are Metaculus's own).
+    ARCHIVED_ESCAPED_WIKIPEDIA = r"https://en.wikipedia.org/wiki/Nuri_\(rocket\)"
+    # The second archived instance's tail on a placeholder path: parens unescaped, and the
+    # closing paren is the URL's last character — the position the old class always dropped.
+    BALLOTPEDIA_SHAPE = "https://ballotpedia.org/An_election_(August_18_Republican_primary)"
+
+    def test_the_archived_escaped_wikipedia_url_survives_whole(self):
+        text = f"This question resolves per {self.ARCHIVED_ESCAPED_WIKIPEDIA} as of the close date."
+        assert extract_source_urls(text) == ["https://en.wikipedia.org/wiki/Nuri_(rocket)"]
+
+    def test_a_trailing_backslash_never_survives(self):
+        """The 404 was caused by the backslash, not the missing paren: `_TRAILING_PUNCT`
+        does not contain `\\`, so a URL cut mid-escape kept it and no later stage removed it."""
+        texts = [
+            f"See {self.ARCHIVED_ESCAPED_WIKIPEDIA}.",
+            r"See https://example.com/foo\ then more prose.",
+            r"Escaped period at the end: https://example\.com/foo\.",
+            r"Wrapped in escaped prose parens \(https://example.com/x\) as cited.",
+        ]
+        for text in texts:
+            for url in extract_source_urls(text):
+                assert "\\" not in url, text
+
+    def test_balanced_unescaped_parens_are_part_of_the_url(self):
+        text = f"Resolution source: {self.BALLOTPEDIA_SHAPE}"
+        assert extract_source_urls(text) == [self.BALLOTPEDIA_SHAPE]
+
+    def test_a_url_inside_prose_parens_drops_the_prose_paren(self):
+        # The `)` closes the prose `(`, not anything inside the URL, so it is a delimiter.
+        assert extract_source_urls("(see https://example.com/x)") == ["https://example.com/x"]
+        assert extract_source_urls(r"(see https://example.com/x\)") == ["https://example.com/x"]
+
+    def test_prose_parens_around_a_url_that_has_its_own_parens(self):
+        # Both rules at once: the inner pair stays, the outer prose paren goes.
+        text = f"({self.BALLOTPEDIA_SHAPE})"
+        assert extract_source_urls(text) == [self.BALLOTPEDIA_SHAPE]
+
+    def test_markdown_link_keeps_inner_parens_and_loses_its_own(self):
+        assert extract_source_urls("[Nuri](https://en.wikipedia.org/wiki/Nuri_(rocket))") == [
+            "https://en.wikipedia.org/wiki/Nuri_(rocket)"
+        ]
+        assert extract_source_urls(r"[Nuri](https://en.wikipedia.org/wiki/Nuri_\(rocket\))") == [
+            "https://en.wikipedia.org/wiki/Nuri_(rocket)"
+        ]
+
+    def test_an_unbalanced_markdown_link_yields_one_untruncated_url(self):
+        """A malformed link (`(` opened, never closed inside) must not ALSO produce the
+        truncated markdown capture — that would burn a second fetch slot on a broken URL.
+        The markdown regex requires balance for exactly this reason."""
+        assert extract_source_urls("[a](https://example.com/p_(q)") == ["https://example.com/p_(q)"]
+
+    def test_two_adjacent_markdown_links_with_no_space_between_them(self):
+        # The delimiter is structural, not greedy-to-the-last-paren: a greedy URL body
+        # would swallow `),[b](` and yield one garbage URL.
+        assert extract_source_urls("[a](https://a.example.com/1),[b](https://b.example.com/2)") == [
+            "https://a.example.com/1",
+            "https://b.example.com/2",
+        ]
+
+    def test_an_unbalanced_open_paren_does_not_truncate_a_bare_url(self):
+        # No closing paren exists anywhere, so the `(` cannot be a delimiter.
+        assert extract_source_urls("Details: https://example.com/a(b — as cited") == ["https://example.com/a(b"]
+
+    def test_a_long_paren_run_matches_in_linear_time(self):
+        """The URL body is an alternation under a star, which is the shape that goes
+        exponential when two branches can match the same text. They can't here (a `(`
+        starts a balanced group or is a literal, and the group's body excludes parens),
+        and this pins that."""
+        text = "https://example.com/" + "(a" * 400 + " and prose"
+        start = time.monotonic()
+        extract_source_urls(text)
+        assert time.monotonic() - start < 1.0
+
+
 class TestSkipPredicates:
     def test_is_metaculus_self_ref(self):
         assert is_metaculus_self_ref("https://metaculus.com/q/12345") is True
