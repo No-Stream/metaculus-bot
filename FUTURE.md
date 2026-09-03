@@ -2595,3 +2595,16 @@ live-API audit of surfacing crowd-signal informativeness in research packets.
 Meta-Analysis`, `## Meta-Analysis`, `# Meta-Analysis and Synthesis`) plus the tri-state + legacy markers.
 Unlocked the May 2026 stacker treatment-effect estimate (`analysis_stacking_historical_treatment.md`) —
 first measurable signal (n=8 stacker-ran, −0.090 Brier vs counterfactual, P(helped)=89.8%).
+
+### GitHub-runner egress reputation is the dominant cause of resolution-source 403s (added 2026-09-03; LOW priority by operator decision)
+
+The archived `blocked` fetches on bls.gov, cdc.gov and fsis.usda.gov (Akamai edges) do NOT
+reproduce from the operator's laptop or EC2 box with the bot's own aiohttp session and headers;
+only the GitHub Actions runner gets 403 (`scratch/fetch_ladder_2026-09-03/replay_report.md`,
+plan `scratch_docs_and_planning/fetch_ladder_plan_2026-09-03.md`). The free GHA diagnostic in
+that plan's step 0 decides whether TLS impersonation helps from the runner. If it does not, the
+only structural fix is an egress that is not a GitHub runner (an HTTP proxy on the operator's EC2
+box, or a self-hosted runner). Operator 2026-09-03: "probably too complicated" — park here; the
+Wayback and url_context rungs cover the class in the meantime. The same runner-side cause is
+consistent with GitHub cron gaps (q45092 forfeited 2026-09-01: the 00:05Z fire saw 0 questions
+and the next fire was 04:55Z, past a 2.8-hour window).
