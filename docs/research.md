@@ -561,10 +561,14 @@ before a forecast that landed about 340 too high. Because chart data counts as c
 it also rescues a page the chrome floor would otherwise withhold.
 
 Every fetched URL emits one harvested `RESOLUTION_SOURCE_FETCH` line (status, HTTP
-code, any routeless embed providers, and `reason` where the status alone is ambiguous),
-so per-domain fetch health is a query against the telemetry archive instead of a
-re-scrape of run logs that expire from GHA at 90 days. See "Reading run logs" in
-`docs/operations.md` for the field meanings.
+code, any routeless embed providers, `reason` where the status alone is ambiguous, and
+`route` naming which rung of the escalation ladder produced the outcome), so per-domain
+fetch health is a query against the telemetry archive instead of a re-scrape of run logs
+that expire from GHA at 90 days. Because that line carries only the FINAL outcome per
+URL, each escalated rung additionally emits `RESOLUTION_SOURCE_ESCALATION` with the
+status that triggered it, the rung tried, what came back, and the wall-clock the rung
+cost — which is what makes "does this rung rescue anything, and is it worth its latency"
+answerable. See "Reading run logs" in `docs/operations.md` for the field meanings.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window).
