@@ -184,6 +184,35 @@ def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Cal
     raise ValueError(f"Invalid run mode: {run_mode}")
 
 
+def persisted_tournament_id(run_mode: RunMode) -> str:
+    """The tournament label this run's research records are archived under.
+
+    Pure, and keyed on the run mode rather than pinned to ``TOURNAMENT_ID``, because
+    ``ResearchPersistenceWriter`` stamps ``tournament_id`` on every record and residual
+    analysis buckets and joins on it. A cup run labelled with the BOT tournament's slug
+    files cup questions inside the tournament's config eras and inside the supply probe's
+    per-slug rows, which is a silent data-corruption bug rather than a cosmetic one: the
+    label is the only thing on the record that says which competition the question came
+    from, since ``run_mode`` distinguishes the pipeline and not the object.
+
+    ``test_questions`` deliberately keeps ``TOURNAMENT_ID``. The evergreen example set
+    belongs to no tournament, so no label is right; it is ``run_mode`` that separates those
+    records, and re-labelling them now would make the archive's existing test-run records
+    incomparable with future ones for no gain.
+
+    Raises on an unknown mode for the same reason ``_question_source`` does: a mode added
+    to ``RunMode`` without a decision here should fail loudly at startup rather than
+    mislabel a whole run's archive.
+    """
+    if run_mode in ("tournament", "test_questions"):
+        return TOURNAMENT_ID
+    if run_mode == "minibench":
+        return str(MetaculusApi.CURRENT_MINIBENCH_ID)
+    if run_mode in ("quarterly_cup", "metaculus_cup"):
+        return METACULUS_CUP_ID
+    raise ValueError(f"Invalid run mode: {run_mode}")
+
+
 def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
     """Forecast one run mode's questions, on one event loop, with the callback drain.
 
@@ -219,7 +248,7 @@ def main() -> None:
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,
-            tournament_id=str(TOURNAMENT_ID),
+            tournament_id=persisted_tournament_id(run_mode),
             run_id=os.environ.get("GITHUB_RUN_ID", "local"),
         )
         research_sink = research_writer.record
