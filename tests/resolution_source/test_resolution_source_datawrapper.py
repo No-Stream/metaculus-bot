@@ -13,7 +13,11 @@ properties:
   (``stale_data``) instead of being served as live,
 - CSV truncation keeps the MOST RECENT rows (the tail), not the head.
 
-Network plumbing (FakeSession / FakeResponse) is shared with the Tier-1 suite.
+Lives in the ``tests/resolution_source/`` package so the directory conftest's autouse DNS
+stub covers it: every hostname here is a reserved ``example.com`` name with no real DNS, and
+without the stub the SSRF preflight classifies every fetch ``ssrf_blocked``. Network plumbing
+(``FakeSession`` / ``FakeResponse``), the question builder and the Infogram embed literal are
+shared with the Tier-1 suite via ``tests/resolution_source_fakes.py``.
 """
 
 from __future__ import annotations
@@ -22,7 +26,6 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
-from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
@@ -38,24 +41,16 @@ from metaculus_bot.research.resolution_source import (
     format_resolution_sections,
     resolution_source_provider,
 )
-from tests.resolution_source_fakes import FakeResponse, FakeSession
+from tests.resolution_source_fakes import (
+    _INFOGRAM_EMBED_DIV,
+    FakeResponse,
+    FakeSession,
+    _mock_question,
+)
 
 PAGE_URL = "https://tracker.example.com/polls"
 CHART_ID = "T3st1"
 DATASET_URL = f"https://static.dwcdn.net/data/{CHART_ID}.csv"
-
-
-@pytest.fixture(autouse=True)
-def _stub_public_dns(monkeypatch):
-    """Same rationale as the Tier-1 suite: test hostnames have no real DNS, so
-    the SSRF preflight would classify everything ``ssrf_blocked`` without a
-    public-IP stub (autouse fixtures don't cross module boundaries)."""
-
-    def _sync_ainfo(host, port, *args, **kwargs):
-        del host, port, args, kwargs
-        return [(0, 0, 0, "", ("8.8.8.8", 0))]
-
-    monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _sync_ainfo)
 
 
 def _http_date(dt: datetime) -> str:
@@ -105,7 +100,7 @@ def _embed_shell_page_with_datawrapper(chart_id: str) -> bytes:
     return (
         "<!doctype html><html><head><title>Tracker</title></head><body>"
         "<article><h1>Poll tracker</h1>"
-        '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive"></div>'
+        f"{_INFOGRAM_EMBED_DIV}"
         f'<div id="datawrapper-iframe" data-attrs="{{&quot;url&quot;:&quot;'
         f"https://datawrapper.dwcdn.net/{chart_id}/11/&quot;,"
         f'&quot;title&quot;:&quot;Tracker chart {chart_id}&quot;}}"></div>'
@@ -128,7 +123,7 @@ def _prose_page_with_both_embeds(chart_id: str) -> bytes:
         "the conflict, while about 59 percent oppose it. The chart below is "
         "updated whenever new qualifying polls are released, and the modeled "
         "average weights each pollster by sample size and track record.</p>"
-        '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive"></div>'
+        f"{_INFOGRAM_EMBED_DIV}"
         f'<div id="datawrapper-iframe" data-attrs="{{&quot;url&quot;:&quot;'
         f"https://datawrapper.dwcdn.net/{chart_id}/11/&quot;,"
         f'&quot;title&quot;:&quot;Tracker chart {chart_id}&quot;}}"></div>'
@@ -576,7 +571,7 @@ class TestDatawrapperHop:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
 
         # The hop's own bound fired, so Tier-1 survives the hanging CDN fetch.
@@ -602,7 +597,7 @@ class TestDatawrapperHop:
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
         with caplog.at_level(logging.WARNING):
-            q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+            q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
             out = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert f"### {PAGE_URL}" in out
@@ -885,16 +880,6 @@ class TestDatasetMarkupStripping:
         assert result.text.endswith(_csv_body(20).strip())
 
 
-def _mock_question(criteria: str) -> MagicMock:
-    q = MagicMock()
-    q.resolution_criteria = criteria
-    q.fine_print = ""
-    q.id_of_question = 998
-    q.question_text = "tracker question"
-    q.page_url = "https://metaculus.com/q/998"
-    return q
-
-
 class TestEmbedShellPageStillHops:
     """The two tiers are independent verdicts. A page whose own text is embed chrome is
     withheld (`no_resolving_content`), and that must not touch the Datawrapper hop the
@@ -956,7 +941,7 @@ class TestEmbedShellPageStillHops:
             }
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
             await resolution_source_provider(is_benchmarking=False)(q)
@@ -978,7 +963,7 @@ class TestProviderEndToEnd:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL} — the CSV under the chart.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL} — the CSV under the chart.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert f"### {PAGE_URL}" in out
@@ -1007,7 +992,7 @@ class TestProviderEndToEnd:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert "day-0019" not in out  # the stale CSV never reaches a forecaster
@@ -1028,7 +1013,7 @@ class TestProviderEndToEnd:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         await resolution_source_provider(is_benchmarking=False)(q)
 
         sources = pop_provider_detail(q.id_of_question, "resolution_source")["sources"]
@@ -1071,7 +1056,7 @@ class TestProviderEndToEnd:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=True)(q)
         assert out == ""
         assert session.requested == []  # leakage guard fires before any fetch

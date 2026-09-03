@@ -1631,8 +1631,10 @@ them OUT of feature work, land as their own PRs.
   `test_resolution_source_fetch.py` (1,070) and `test_resolution_source_provider_gating.py` (424),
   with the fake aiohttp session and the HTML page builders in `tests/resolution_source_fakes.py`
   (266) and the autouse DNS stub plus the page fixtures in the package's own `conftest.py`, following
-  the `tests/ablation/` precedent. Same 147 tests, none rewritten. `tests/test_resolution_source_datawrapper.py`
-  imported the fakes out of the old module and now imports them from the fakes module. Everything
+  the `tests/ablation/` precedent. Same 147 tests, none rewritten. The Tier-2 Datawrapper suite MOVED
+  into that package too (`tests/resolution_source/test_resolution_source_datawrapper.py`), dropping its
+  own copy of the autouse DNS stub, its own question builder and a twice-inlined Infogram embed literal
+  in favour of the conftest's and the fakes module's; same collected count. Everything
   else on this list grew again: `tests/test_telemetry_markers.py` **2,428**,
   `tests/test_agentic_tools.py` **2,235**, `prompts.py` **1,805**, `resolution_source.py` **1,382**,
   `research/financial_data.py` **1,033** (down, after `currency_pegs.py` and `fred_rendering.py`

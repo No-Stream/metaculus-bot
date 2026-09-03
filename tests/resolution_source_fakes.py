@@ -161,6 +161,13 @@ class _TrackingResponse:
 
 # Infogram's own published embed code (container div + async loader + credit
 # block), the shape racetothewh.com/senate/26 used on qids 44554/44556.
+# The bare Infogram div: the class and data-id an ``unreadable_data_embed_providers`` scan
+# keys on, with none of the loader chrome. Kept as its own constant rather than sliced out of
+# the full markup below, because the loader's visible anchor text ("NE - Osborn v. Ricketts",
+# "Infogram") is extractable, and a page fixture measured against a character floor must not
+# silently gain it.
+_INFOGRAM_EMBED_DIV = '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive"></div>'
+
 _INFOGRAM_EMBED_MARKUP = (
     '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive" '
     'data-title="NE - Osborn v. Ricketts"></div>'
