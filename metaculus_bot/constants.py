@@ -723,10 +723,18 @@ GOOGLE_API_KEY_ENV: str = "GOOGLE_API_KEY"
 # DONATED_KEY_BLOCKED_GOOGLE_MODELS blocklist (no donated attempt, no 429) pending
 # the Metaculus-side BYOK fix — see TODO(gemini-3.1-pro-donated) in fallback_openrouter.
 GEMINI_USE_DONATED_OPENROUTER_KEY_ENV: str = "GEMINI_USE_DONATED_OPENROUTER_KEY"
-# Gemini 3 Flash preview model with grounding support. Requires billing enabled
-# on the Google AI Studio project to unlock; falls back to gemini-2.5-flash on
-# free tier if needed. Override via GEMINI_SEARCH_MODEL env var.
-GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3-flash-preview"
+# Grounded-search model, verified live on the native google-genai SDK 2026-09-03
+# (scripts/probes/gemini_verify.py, three calls): the response reported
+# model_version gemini-3.8-flash, the google_search tool returned grounding chunks
+# with a web search query, thinking_level was accepted, and url_context retrieved a
+# robots-allowed host. Grounding still needs billing enabled on the Google AI Studio
+# project. Price (ai.google.dev, read 2026-09-03): $0.75 in / $3.75 out per 1M through
+# 2026-12-31, then $1.50 / $7.50 — against $0.50 / $3.00 for the gemini-3-flash-preview
+# this replaced, which is now labelled a legacy preview. Override via the
+# GEMINI_SEARCH_MODEL env var; the old note that a free-tier project can point that at
+# gemini-2.5-flash holds only with the thinking_level caveat below read first, since the
+# 2.5 line takes a thinking_budget and would reject the request as it is built today.
+GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3.8-flash"
 # No temperature / top_p / max_tokens overrides — use google-genai SDK defaults.
 # Gemini 3 Flash is a thinking model; Google's defaults are tuned for it and
 # capping either caused silent truncations in the past.
@@ -853,15 +861,19 @@ GAP_FILL_V2_ENABLED_ENV: str = "GAP_FILL_V2_ENABLED"
 # OpenRouter key.
 GAP_FILL_V2_DRIVER_MODEL: str = os.getenv("GAP_FILL_V2_DRIVER_MODEL") or "openai/gpt-5.6-terra"
 GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "low"
-# read_document backend model on the NATIVE google-genai path (tools.py
-# _run_document_read_sync). CAUTION: this id is UNVERIFIED on the native
-# AI Studio API until the paid smoke test — the repo's verified-model notes
-# ("gemini-3.5-flash works") all refer to the OpenRouter slug route, which maps
-# ids differently; the only id verified on the native SDK here is
-# GEMINI_SEARCH_DEFAULT_MODEL ("gemini-3-flash-preview"). A wrong id soft-fails
-# read_document (model-not-found -> error outcome), silently disabling the
-# directed-reading rung.
-GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.5-flash"
+# read_document backend model on the NATIVE google-genai path
+# (research/agentic/tool_backends.py _run_document_read_sync). Verified live on that
+# SDK 2026-09-03 (scripts/probes/gemini_verify.py): url_context retrieval succeeded on
+# a robots-allowed host and thinking_level was accepted, so the old "this id is
+# UNVERIFIED on the native AI Studio API" caution is retired. It is the same id the
+# grounded-search provider runs, at $0.75 in / $3.75 out per 1M through 2026-12-31 then
+# $1.50 / $7.50 (ai.google.dev, read 2026-09-03), against $1.50 / $9.00 for the
+# gemini-3.5-flash it replaces. A wrong id still soft-fails read_document
+# (model-not-found -> error outcome), silently disabling the directed-reading rung.
+# url_context is also robots-gated, which is a separate cause of the same symptom: the
+# same probe got URL_RETRIEVAL_STATUS_ERROR on a host whose robots.txt disallows
+# Google-Extended, so a refusal can be the host's policy rather than a bad id.
+GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.8-flash"
 # Parallel tool calls each count against the cap; steps are where latency
 # lives, so batching is encouraged rather than rationed. Raised with the W2
 # ambition floor (2026-07-21): v2 runs 41-60s of the GAP_FILL_V2_WALL_DEADLINE
