@@ -941,11 +941,13 @@ resolutions (late September / early October), not ~09-01 (which buys only ~7).
    retrieval against three stale prices that contradicted correct live snapshot rows), so
    re-inviting them on a provider failure is not obviously an improvement over saying nothing.
 
-### Sentinel-value sweep leftovers: three deliberate deferrals (added 2026-08-26)
+### Sentinel-value sweep leftovers: deliberate deferrals (added 2026-08-26)
 
 The 2026-08-25/26 sentinel-value work (`scratch/residual_2026-08-24/sentinel_value_audit.md`)
 closed all 7 HIGH findings, the MEDs and every LOW. Three items were deferred ON PURPOSE, each
-because the honest fix is a new decision rather than a correction:
+because the honest fix is a new decision rather than a correction. Later rounds appended their own
+deferrals below the numbered three, so the heading carries no count: the section holds six items and
+the prose below names each one's position.
 
 1. **A confident DISCRETE point mass is now WITHHELD, and building the spike is the faithful
    third option.** `sanitize_percentiles` no longer cluster-spreads a whole-set epsilon collapse,
@@ -1538,19 +1540,23 @@ boundary for any replay that splits on the telemetry's presence)
 plus `PREDICTION_MARKETS_ENABLED: 'true'` make future guard replays exact rather than parser-based. No
 code on the roadmap; passive. Note, superseded 2026-09-02 by Item D: the computed
 `ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP` markers and the
-`_anchor_and_clause_telemetry_lines` helper that emitted them are DELETED (see the "Removed
-2026-09-02" note in `tool_runner.py`'s module docstring), and the binary prompt no longer asks for
+`_anchor_and_clause_telemetry_lines` helper that emitted them are DELETED (`tool_runner.py`'s module
+docstring records which of its dispatch is unreachable as a result), and the binary prompt no longer asks for
 `base_rate_anchor` / `criteria_clauses`, so no new raw JSON lands at all. The Pydantic fields stay
 optional so archived blocks still strict-parse; the overshoot/divergence math is replayable offline
 only over the blocks already in the archive.
 
-Two free checks next residual session: (1) **structured-JSON presence rate per forecaster** — grep the
-archive for the raw JSON keys, confirm every slot emits them; (2) **does the spring overshoot pattern
-reproduce on the current roster?** — if the confident-overshoot cluster (42024 / 42304 / 41800 analogues)
-doesn't appear post-`30bca2f`, the prompt fixes sufficed and all three guard-revival conditions become
-moot. `clause_product_divergence_pp` (published vs the model's own priced clause product) is the first
-trigger keying on divergence-from-own-math — the conditionality the three tested guards failed to achieve.
-Watch, don't act.
+Two free checks were the plan while the elicitation was live, and NEITHER can accrue any further, so
+they are recorded here as closed rather than as work: (1) the structured-JSON presence rate per
+forecaster, grepping the archive for the raw JSON keys to confirm every slot emitted them; (2) whether
+the spring confident-overshoot cluster (42024 / 42304 / 41800 analogues) reproduced on the roster after
+`30bca2f`, which would have settled all three guard-revival conditions at once. The elicitation ran from
+the 2026-07-11 merge (`642b027`) to the 2026-09 bundle's merge, so the archive closes at about 40
+triple-era binaries, and both checks are replayable offline over exactly those blocks and no more.
+`clause_product_divergence_pp` was the intended first trigger keying on divergence-from-own-math, the
+conditionality the three tested guards failed to achieve; that helper and both computed markers were
+deleted with the fields, so reviving any of this means re-adding the elicitation first, which is a prompt
+change and a config-era boundary.
 
 MC [0-5%) low bucket — **measured NULL 2026-08-24; do not re-open as a gap.** Exact cluster-correct
 test over the whole archive: 61 questions supply 117 in-band options carrying **2.83 expected

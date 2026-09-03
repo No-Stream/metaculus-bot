@@ -32,13 +32,14 @@ data.
 Scope note: ``DiscreteCountStructured`` (schema) is intentionally not
 dispatched here — discrete-count tools are phase-3 work.
 
-Removed 2026-09-02: the anchor / clause telemetry lines (``anchor_overshoot_pp``,
-``clause_product_divergence_pp`` and their ``ANCHOR_OVERSHOOT_PP`` /
-``CLAUSE_PRODUCT_DIVERGENCE_PP`` comment markers). The binary prompt no longer
-asks for ``base_rate_anchor`` / ``criteria_clauses``, so there is nothing left to
-measure; the schema fields stay optional for archived blocks. Both markers had 0
-harvested rows because the only emitter is behind
-``PROBABILISTIC_TOOLS_ENABLED``, which every prod workflow pins to ``'false'``.
+Some of this dispatch is unreachable on a FRESH forecast, because the prompts stopped
+eliciting the block fields it reads. The binary anchor / clause telemetry lines are gone
+outright. ``_run_mc_tools``'s declared-Other line and its Dirichlet-with-Other branch both
+key on ``other_mass`` / ``concentration``, which the MC prompt no longer asks for, so they
+fire only on an archived block or on a model emitting the field from habit; turning
+``PROBABILISTIC_TOOLS_ENABLED`` on today would produce binary lines and no MC ones. The
+schema fields stay optional so archived blocks still parse. Why those fields were retired,
+and what reviving any of it would cost, is in FUTURE.md and AGENTS.md rather than here.
 """
 
 from __future__ import annotations
