@@ -1048,8 +1048,13 @@ class TestOutsideViewRubricRules:
         # Folded INTO the conditional-hazard bullet, which is the same rule for recurring events.
         flat = self._flat(prompt)
         bullet_at = flat.index(self._EXPOSURE_KEY)
-        assert "no event in the t days already elapsed" in flat[bullet_at : bullet_at + 900]
-        assert "non-recurring, conditional-hazard skipped" in flat[bullet_at : bullet_at + 900]
+        window = flat[bullet_at : bullet_at + 900]
+        # The check keeps its label: without it the trailing skip token names something the
+        # bullet never introduced, and "Otherwise write ..." reads as scoping over the
+        # exposure sentence, which applies to every rate-based question and is never skipped.
+        assert "conditional-hazard check: for a recurring event with a history of inter-arrival gaps" in window
+        assert "no event in the t days already elapsed" in window
+        assert "non-recurring, conditional-hazard skipped" in window
 
     def test_multiple_choice_prompt_states_remaining_exposure_once(self) -> None:
         self._assert_remaining_exposure_once(self._mc())

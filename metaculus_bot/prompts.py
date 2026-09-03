@@ -882,7 +882,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i) — union only over paths that cannot be the same event, since an overlapping term double-counts it). A rough quantitative estimate from data is more reliable than an intuitive guess.
                • {
             _REMAINING_EXPOSURE_SENTENCE
-        } For a recurring event with a history of inter-arrival gaps, fit a simple model to the gaps (exponential with mean = average gap, or the observed gaps as an empirical distribution), compute P(event by deadline | no event in the T days already elapsed), and show the number. Otherwise write "non-recurring, conditional-hazard skipped".
+        } Conditional-hazard check: for a recurring event with a history of inter-arrival gaps, fit a simple model to the gaps (exponential with mean = average gap, or the observed gaps as an empirical distribution), compute P(event by deadline | no event in the T days already elapsed), and show the number. Otherwise write "non-recurring, conditional-hazard skipped".
 {_COUNT_IN_PERIOD_REFERENCE_CLASS}
 {_SOFT_CLOCK_RULE}
 {_HISTORY_DISCHARGED_RULE}
