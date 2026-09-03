@@ -582,7 +582,7 @@ _ARIA_ROLE_TAGS: dict[str, str] = {
 # them, routinely do. Single quantifier, so no backtracking cliff either (the measured
 # 3.4 s-at-200-KiB shape in `resolution_body_text` needed two).
 _ARIA_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>")
-_ARIA_ROLE_ATTR_RE = re.compile(r"""\brole\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
+_ARIA_ROLE_ATTR_RE = re.compile(r"""(?:^|\s)role\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
 # Tags that never close, so they must not go on the nesting stack.
 _VOID_HTML_TAGS: frozenset[str] = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
