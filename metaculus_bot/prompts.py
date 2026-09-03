@@ -551,6 +551,59 @@ _COUNT_IN_PERIOD_REFERENCE_CLASS = """
                  about the pipeline and updates that rate; it does not replace it."""
 
 
+# The soft-clock rule: a target date the responsible actor is not BOUND to is evidence that
+# a target exists, not that it will hold. The 2026-09-02 failure-mode audit
+# (scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md, lens A) found the shape on 52 of
+# 815 STRICT records (6.4%; 8.3% of binaries; coder kappa 0.74): on "will X happen before D"
+# questions whose only route to X was an ANNOUNCED target date, members decomposed
+# P(target lands in window) x P(X | target) and set the first term near 1 because the target
+# had been announced. On the 37 flagged binaries the bot published a mean 0.44 for events that
+# happened 3 times (8%); 13 records above 0.5 resolved NO and none went the other way; flagged
+# records score 18.7 spot-peer points worse (95% CI 5.9 to 33.4) and are wrong-sided 40% of
+# the time against 18%. Soft targets WITHOUT the decomposition move score fine (+13.6) and
+# deadline questions in general are calibrated (0.25 published, 0.25 realized), so the rule
+# names the MOVE, not the question shape, and it is roster-wide (every vendor biased up 0.27
+# to 0.47 on the shape, within 0.06 of zero off it). Receipts: qids 43837 (a Fall tournament
+# start read off the Summer close), 44424 (an announced summit that slipped twice), 44557 (a
+# "planned August" launch off a partner page and a Wikipedia infobox); the contrast is 45217,
+# where a statutory clock existed, members computed the date and scored +45. The "measured
+# record of meeting" carve-out is load-bearing: on qid 42305 a weekly bulletin with a measured
+# 1-to-3-week publication lag WAS a binding clock in practice and a near-1 timing term was
+# right. Binary + MC only (the numeric prompt anchors on a range, not a probability); no
+# structured-block field, since the number belongs in the rationale and the block is written
+# after the forecast is fixed. Supersedes `_REMAINING_EXPOSURE_RULE` and
+# `_ANCHOR_CONSISTENCY_RULE`, the two 2026-09-02 rules the fix plan's Item B removed. Same
+# >= 15-space pre-indent contract as _COUNT_IN_PERIOD_REFERENCE_CLASS.
+_SOFT_CLOCK_RULE = """
+               • A target date the responsible actor has not bound itself to — no statute, no contract, no
+                 published schedule it has a measured record of meeting — is evidence that a target EXISTS,
+                 not that it will hold. Price the probability that the target lands inside the question
+                 window as its own number, derived from that actor's record of slips and scrubs for this
+                 kind of event; an announcement, plan, tracker page or partner page does not raise it. Where
+                 a binding clock exists, compute the date from it and say which clock. (Announced-but-unbound
+                 dates are the bot's most consistent miss: forecasts averaged 44% on events that happened 8% of
+                 the time.)"""
+
+
+# History repeats past an acknowledged regime change (the same audit's lens C): a member
+# writes down a historical cadence, names in the SAME rationale a reason it has been
+# discharged (its driver was met, the deadline passed, the rule changed), and keeps the old
+# cadence as its central estimate anyway. 12.1% of coded rationales; about 7 spot-peer points
+# per flagged record (95% CI 2.7 to 12.2); the pattern failed in 83% of fires and in 13 of 13
+# on the live triple. Coder agreement was 0.59 and the label is partly hindsight-contaminated,
+# so read those numbers as upper bounds. Conditional on the member's OWN written
+# acknowledgment, so it cannot fire on a question where nothing has changed, and shipped only
+# once `_ANCHOR_CONSISTENCY_RULE`'s "do not move off your number when history counsels
+# caution" was gone, since the two pulled opposite ways. Shipped on the fix plan's
+# recommendation (section 6) with the operator's final say pending: one constant, one test
+# class, reversible. Binary + MC only. Same pre-indent contract as the rule above.
+_HISTORY_DISCHARGED_RULE = """
+               • If your own analysis names a reason the historical cadence has been discharged (its driver was
+                 met, the deadline passed, the rule changed), that cadence is a bound on your estimate, not its
+                 centre; state the post-change estimate and what it rests on (the old cadence held in 0 of 13
+                 recent cases where it was kept as the centre)."""
+
+
 # Apply the rate to the exposure that is LEFT. On qid 43837 six members applied a monthly
 # announcement rate across the FULL question window when 16 days had already elapsed
 # event-free (then OR-ed it with a scheduled path the rate already covered, which the
@@ -831,6 +884,8 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             _REMAINING_EXPOSURE_SENTENCE
         } For a recurring event with a history of inter-arrival gaps, fit a simple model to the gaps (exponential with mean = average gap, or the observed gaps as an empirical distribution), compute P(event by deadline | no event in the T days already elapsed), and show the number. Otherwise write "non-recurring, conditional-hazard skipped".
 {_COUNT_IN_PERIOD_REFERENCE_CLASS}
+{_SOFT_CLOCK_RULE}
+{_HISTORY_DISCHARGED_RULE}
 
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
@@ -954,6 +1009,8 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
             • Outside-view distribution over options; discuss the historical rate of upsets/unexpected outcomes in this domain and how that affects the distribution.
             • {_REMAINING_EXPOSURE_SENTENCE}
 {_COUNT_IN_PERIOD_REFERENCE_CLASS}
+{_SOFT_CLOCK_RULE}
+{_HISTORY_DISCHARGED_RULE}
 
         (3) Timeframe reasoning
             • Time to resolution; describe how halving/doubling the timeline might reshape the distribution.

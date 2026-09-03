@@ -18,7 +18,9 @@ import pytest
 
 from metaculus_bot.prompts import (
     _AUTO_ANNOTATED_CITATION_CLAUSE,
+    _HISTORY_DISCHARGED_RULE,
     _OUTSIDE_VENUE_MARKET_ODDS_BULLET,
+    _SOFT_CLOCK_RULE,
     _SOURCE_TIER_TAG_INSTRUCTION,
     MARKET_SNAPSHOT_SECTION_HEADER,
     TS_ANCHOR_SECTION_HEADER,
@@ -1142,6 +1144,183 @@ class TestOutsideViewRubricRules:
         flat = self._flat(self._numeric())
         assert self._EXPOSURE_KEY not in flat
         assert self._ANCHOR_SIZE not in flat
+
+
+class TestSoftClockAndHistoryDischargedRules:
+    """The two Phase 1 rules the 2026-09-02 failure-mode audit produced
+    (scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md; Items A and C of
+    scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md).
+
+    `_SOFT_CLOCK_RULE` (lens A, the announced-but-unscheduled event). On "will X happen before
+    D" questions whose only route to X is a target date the responsible actor has ANNOUNCED but
+    is not BOUND to, members decomposed P(target lands in window) x P(X | target) and set the
+    first term near 1 because the target had been announced. 52 of 815 STRICT records (6.4%;
+    8.3% of binaries; coder kappa 0.74); on the 37 flagged binaries the bot published a mean 0.44
+    for events that happened 8% of the time, 13 records above 0.5 resolved NO and none went the
+    other way, and flagged records score 18.7 spot-peer points worse (95% CI 5.9 to 33.4).
+    Receipts 43837 / 44424 / 44557; the contrast is 45217, where a statutory clock existed,
+    members computed the date and scored +45. The "measured record of meeting" carve-out is
+    load-bearing: on qid 42305 a weekly bulletin with a measured publication lag WAS a binding
+    clock and a near-1 timing term was right. It supersedes the two 2026-09-02 rules Item B
+    retired, and it deliberately adds no structured-block field.
+
+    `_HISTORY_DISCHARGED_RULE` (lens C, history repeats past an acknowledged change). A member
+    names a reason the historical cadence has been discharged and keeps it as the centre anyway:
+    12.1% of rationales, about 7 spot per flagged record (95% CI 2.7 to 12.2), the pattern failed
+    in 13 of 13 live-triple fires; coder agreement 0.59 and partly hindsight-contaminated, so
+    upper bounds. Shipped on the plan's recommendation with the operator's final say pending.
+
+    Both ship to binary and MC only and sit in Phase 1 beside the reference-class bullets."""
+
+    _RUBRIC = "Strong: multiple independent sources"
+    _COUNT_IN_PERIOD = "For questions asking how many events"
+    _SOFT_CLOCK_OPENER = "A target date the responsible actor has not bound itself to"
+    _HISTORY_OPENER = "If your own analysis names a reason the historical cadence has been discharged"
+
+    @staticmethod
+    def _flat(text: str) -> str:
+        # Collapse whitespace: the constants are pre-indented for clean_indents, so assertions
+        # must not depend on where the lines wrap.
+        return " ".join(text.lower().split())
+
+    def _binary(self) -> str:
+        return binary_prompt(_binary_q(), research="r")
+
+    def _mc(self) -> str:
+        return multiple_choice_prompt(_mc_q(), research="r")
+
+    def _numeric(self) -> str:
+        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+
+    def _stacked(self) -> list[str]:
+        return [
+            stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
+            stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"]),
+            stacking_numeric_prompt(
+                _numeric_q(),
+                research="r",
+                base_predictions=["a1", "a2"],
+                lower_bound_message="lbm",
+                upper_bound_message="ubm",
+            ),
+        ]
+
+    def _assert_verbatim_once(self, prompt: str, constant: str) -> None:
+        flat_prompt = self._flat(prompt)
+        flat_constant = self._flat(constant)
+        assert flat_constant in flat_prompt, "the rule must land verbatim (modulo line wrapping)"
+        assert flat_prompt.count(flat_constant) == 1, "the rule must be stated exactly once"
+
+    # -- presence, verbatim, once (binary and MC) -----------------------------
+
+    def test_binary_prompt_carries_the_soft_clock_rule_verbatim(self) -> None:
+        self._assert_verbatim_once(self._binary(), _SOFT_CLOCK_RULE)
+
+    def test_multiple_choice_prompt_carries_the_soft_clock_rule_verbatim(self) -> None:
+        self._assert_verbatim_once(self._mc(), _SOFT_CLOCK_RULE)
+
+    def test_binary_prompt_carries_the_history_discharged_rule_verbatim(self) -> None:
+        self._assert_verbatim_once(self._binary(), _HISTORY_DISCHARGED_RULE)
+
+    def test_multiple_choice_prompt_carries_the_history_discharged_rule_verbatim(self) -> None:
+        self._assert_verbatim_once(self._mc(), _HISTORY_DISCHARGED_RULE)
+
+    # -- wording pins: each load-bearing clause, by name ----------------------
+
+    def test_soft_clock_rule_keeps_every_load_bearing_clause(self) -> None:
+        """Each clause earns its place: the carve-out keeps a measured cadence (q42305) from
+        being read as soft; "as its own number" is the move the audit measured; the list of
+        things that do NOT raise it is the q44557 / q43837 evidence class; "say which clock"
+        is what q45217's members did; the parenthetical is the receipt (principle 3 of the fix
+        plan: a receipted rule carries its reason)."""
+        flat = self._flat(_SOFT_CLOCK_RULE)
+        assert "no statute, no contract, no published schedule it has a measured record of meeting" in flat
+        assert "is evidence that a target exists, not that it will hold" in flat
+        assert "price the probability that the target lands inside the question window as its own number" in flat
+        assert "derived from that actor's record of slips and scrubs for this kind of event" in flat
+        assert "an announcement, plan, tracker page or partner page does not raise it" in flat
+        assert "where a binding clock exists, compute the date from it and say which clock" in flat
+        assert "forecasts averaged 44% on events that happened 8% of the time" in flat
+
+    def test_history_discharged_rule_is_conditional_on_the_members_own_acknowledgment(self) -> None:
+        """The condition is the member's OWN written acknowledgment, so the rule cannot fire on
+        a question where nothing has changed; and the cadence becomes a BOUND, not a centre,
+        which is the whole correction. The receipt rides as a short parenthetical."""
+        flat = self._flat(_HISTORY_DISCHARGED_RULE)
+        assert flat.startswith("• if your own analysis names a reason the historical cadence has been discharged")
+        assert "(its driver was met, the deadline passed, the rule changed)" in flat
+        assert "that cadence is a bound on your estimate, not its centre" in flat
+        assert "state the post-change estimate and what it rests on" in flat
+        assert "held in 0 of 13 recent cases" in flat
+
+    def test_rules_do_not_revive_the_retired_anchor_consistency_wording(self) -> None:
+        """Item B retired "do not move off your number when history counsels caution" because it
+        pulled against exactly this correction; the two new rules must not smuggle it back."""
+        for prompt in (self._binary(), self._mc()):
+            flat = self._flat(prompt)
+            assert "history counsels caution" not in flat
+            assert "do not move off your own number on a general feeling" not in flat
+
+    # -- placement: Phase 1, after the reference-class bullets, before the rubric ----
+
+    @pytest.mark.parametrize(
+        ("build", "timeframe_step"),
+        [
+            pytest.param(lambda self: self._binary(), "3) Timeframe reasoning", id="binary"),
+            pytest.param(lambda self: self._mc(), "(3) Timeframe reasoning", id="multiple_choice"),
+        ],
+    )
+    def test_rules_sit_in_the_reference_class_step_of_phase_1(self, build, timeframe_step: str) -> None:
+        """Both rules are about how to read a base rate you just computed, so they land inside
+        the reference-class step (after `_COUNT_IN_PERIOD_REFERENCE_CLASS`, before the timeframe
+        step), inside PHASE 1 and before the Strong/Moderate/Weak evidence rubric in PHASE 2.
+        Soft-clock first, history-discharged directly after it."""
+        prompt = build(self)
+        phase1_at = prompt.index("PHASE 1: OUTSIDE VIEW")
+        count_at = prompt.index(self._COUNT_IN_PERIOD)
+        soft_clock_at = prompt.index(self._SOFT_CLOCK_OPENER)
+        history_at = prompt.index(self._HISTORY_OPENER)
+        timeframe_at = prompt.index(timeframe_step)
+        rubric_at = prompt.index(self._RUBRIC)
+        phase2_at = prompt.index("PHASE 2: INSIDE VIEW UPDATE")
+        assert phase1_at < count_at < soft_clock_at < history_at < timeframe_at < phase2_at < rubric_at
+
+    # -- scope: not numeric, not stacking, no block field ---------------------------
+
+    def test_numeric_prompt_does_not_carry_the_rules(self) -> None:
+        """Both rules are worded in probabilities over an event-by-deadline question; the
+        numeric prompt anchors on a range and gets neither."""
+        flat = self._flat(self._numeric())
+        assert self._flat(self._SOFT_CLOCK_OPENER) not in flat
+        assert self._flat(self._HISTORY_OPENER) not in flat
+        assert "measured record of meeting" not in flat
+        assert "historical cadence has been discharged" not in flat
+
+    def test_stacking_prompts_do_not_carry_the_rules(self) -> None:
+        """Same scope guard as every other base-prompt rule: stacking is prod-disabled."""
+        for prompt in self._stacked():
+            flat = self._flat(prompt)
+            assert self._flat(self._SOFT_CLOCK_OPENER) not in flat
+            assert self._flat(self._HISTORY_OPENER) not in flat
+            assert "measured record of meeting" not in flat
+            assert "historical cadence has been discharged" not in flat
+
+    def test_rules_add_no_structured_block_field(self) -> None:
+        """The schema audit rejected a `target_holds_probability` / `clock_type` slot: the block
+        is written after the forecast is fixed, so a field there cannot scaffold the reasoning,
+        and the number lives in the rationale. The example blocks stay exactly the forecast."""
+        assert set(json.loads(_extract_last_json_block(self._binary()))) == {"question_type", "posterior_prob"}
+        assert set(json.loads(_extract_last_json_block(self._mc()))) == {"question_type", "option_probs"}
+        for constant in (_SOFT_CLOCK_RULE, _HISTORY_DISCHARGED_RULE):
+            assert "target_holds_probability" not in constant
+            assert "clock_type" not in constant
+
+    def test_rules_keep_the_base_prompts_mode_agnostic(self) -> None:
+        """The benchmarking leakage guard lives on the research side; the forecaster prompts stay
+        mode-agnostic, so neither rule may name a market venue or crowd source."""
+        for constant in (_SOFT_CLOCK_RULE, _HISTORY_DISCHARGED_RULE):
+            for venue in ("Polymarket", "Kalshi", "Manifold", "PredictIt", "Metaculus", "CME FedWatch"):
+                assert venue not in constant
 
 
 class TestLastRealApplicationClause:
