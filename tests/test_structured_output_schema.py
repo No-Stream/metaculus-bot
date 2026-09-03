@@ -6,18 +6,21 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
+    _NUMERIC_OUTCOME_TYPES,
     BaseRateAnchor,
     BinaryStructured,
     CriteriaClause,
     DiscreteCountStructured,
     EvidenceItem,
     MultipleChoiceStructured,
+    NumericOutcomeType,
     NumericStructured,
     ScenarioBranch,
     StatedBaseRate,
@@ -28,6 +31,7 @@ from metaculus_bot.structured_output_schema import (
     extract_json_block_candidates,
     iter_balanced_braces,
     parse_structured_block,
+    parse_structured_payload,
 )
 from metaculus_bot.tool_runner import _aggregate_binary_lines, _parse_all_blocks
 
@@ -490,6 +494,40 @@ class TestNumericStructuredHappyPath:
         # signal, not noise.
         assert any(repr(declared) in rec.getMessage() for rec in caplog.records)
 
+    @pytest.mark.parametrize(
+        ("log_failures", "expected_level"),
+        [(True, logging.WARNING), (False, logging.DEBUG)],
+    )
+    def test_the_stray_spelling_line_respects_the_log_failures_contract(
+        self, caplog: pytest.LogCaptureFixture, log_failures: bool, expected_level: int
+    ) -> None:
+        """``parse_structured_payload(..., log_failures=False)`` promises no scary WARNING about
+        a candidate it is about to discard, and this validator logs from inside the model where
+        it cannot see the flag. The flag rides down as validation context. Without it a
+        misspelling warned on every silently-probed candidate, on superseded draft blocks, and
+        twice per numeric forecast on the publish path, about a block that publishes fine."""
+        payload = (
+            '{"question_type": "numeric", "outcome_type": "integer",'
+            ' "declared_percentiles": {"0.1": 10.0, "0.5": 50.0, "0.9": 90.0}}'
+        )
+        with caplog.at_level(logging.DEBUG, logger="metaculus_bot.structured_output_schema"):
+            parsed = parse_structured_payload(payload, "numeric", log_failures=log_failures)
+
+        assert isinstance(parsed, NumericStructured)
+        assert parsed.outcome_type is None
+        stray_lines = [r for r in caplog.records if "Unrecognised outcome_type" in r.getMessage()]
+        assert len(stray_lines) == 1
+        assert stray_lines[0].levelno == expected_level
+        # The raw value rides the line at either level: that is what makes it a prompt signal.
+        assert "'integer'" in stray_lines[0].getMessage()
+
+    def test_the_accepted_outcome_types_are_derived_from_the_literal(self) -> None:
+        """One vocabulary, one definition. A restated copy fails asymmetrically: a third outcome
+        type would pass the annotation and then be silently nulled by the lenient validator."""
+        assert set(get_args(NumericOutcomeType)) == set(_NUMERIC_OUTCOME_TYPES)
+        annotation = NumericStructured.model_fields["outcome_type"].annotation
+        assert NumericOutcomeType in get_args(annotation)
+
     def test_accepts_extra_percentiles(self) -> None:
         n = NumericStructured(
             question_type="numeric",
@@ -885,6 +923,27 @@ class TestMultipleChoiceOptionProbs:
             other_mass=declared,  # type: ignore[arg-type]  # the point is a value the schema must tolerate
         )
         assert block.other_mass is None
+
+    @pytest.mark.parametrize("field", ["concentration", "other_mass"])
+    def test_an_integer_literal_too_large_for_a_float_reads_as_absent(self, field: str) -> None:
+        """The lenient contract is "unusable reads as absent", and it has to hold for EVERY
+        unusable input, including one that breaks the conversion itself.
+
+        ``json.loads`` decodes an integer literal of any length into an arbitrary-precision int,
+        and ``float()`` past about 308 digits raises OverflowError. Pydantic converts only
+        ValueError and AssertionError into a ValidationError, so before the guard this escaped
+        ``model_validate`` and ``parse_structured_payload`` (which catches ValidationError only)
+        and crashed the caller, which is strictly worse than the strict code it replaced: that
+        produced a clean rejection the ladder could fall through on.
+        """
+        payload = {
+            "question_type": "multiple_choice",
+            "option_probs": {"A": 0.5, "B": 0.5},
+            field: int("9" * 400),
+        }
+        block = MultipleChoiceStructured.model_validate(payload)
+        assert getattr(block, field) is None
+        assert block.option_probs == {"A": 0.5, "B": 0.5}
 
     def test_a_usable_other_mass_still_round_trips(self) -> None:
         block = MultipleChoiceStructured(
