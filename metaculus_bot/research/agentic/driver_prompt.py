@@ -247,9 +247,14 @@ SupportedQuestion = BinaryQuestion | MultipleChoiceQuestion | NumericQuestion
 # Fills the template builders' research slot. Everything else in the skeleton
 # (units, bounds, options, resolution criteria) is the question's REAL values.
 # It carries MARKET_SNAPSHOT_SECTION_HEADER because the panel's market-reading clause is
-# gated on that header being present in the research: prod emits the header on every
-# question, so without it here the skeleton would drop a clause every real panel prompt
-# carries.
+# gated on that header being present in the research. Prod emits the header on effectively
+# every question: the provider omits it only on an empty pool, a soft-fail, a flag-off run
+# or benchmarking, measured present on 59 of the 60 newest archived artifact records. So
+# without it here the skeleton would drop a clause almost every real panel prompt carries.
+# Deliberately NOT extended to TS_ANCHOR_SECTION_HEADER, whose incidence runs the other way
+# (5 of 322 artifact records, 0 of the newest 30): hardcoding that one would manufacture a
+# divergence on ~98% of numeric prompts to close one on ~2%, and the numeric template already
+# names the anchor section in its resolution-metric bullets.
 _TEMPLATE_RESEARCH_PLACEHOLDER = (
     "[research placeholder — the actual briefing is in the 'Current briefing' section of this message]"
     f"\n\n{MARKET_SNAPSHOT_SECTION_HEADER}\n"
