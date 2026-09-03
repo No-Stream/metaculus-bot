@@ -1267,6 +1267,34 @@ Follow-ups:
    fallback paths in this pipeline have cost real questions before (q45085). Blast radius is
    unmeasured, so size it first:
    `rg --no-ignore 'wall-clock timeout' backtests/telemetry_archive/`.
+   **The 2026-09-03 fetch-ladder bundle added an amplifier this item did not have when it was
+   written (forge R4, F61/F39/F35; still SKIPPED, still the operator's call).** The per-host
+   politeness map moved from a fresh dict per provider call to the loop-wide
+   `http_fetch.host_semaphores()`, so same-host requests now serialize ACROSS the
+   `DEFAULT_MAX_CONCURRENT_RESEARCH = 6` questions researching at once rather than only within one
+   question. Each hold covers the GET, the body read and the trafilatura extraction (and, until the
+   F45 PDF-parse split lands, the PDF parse), the acquire wait is unbounded, and each request may
+   take `RESOLUTION_SOURCE_HTTP_TIMEOUT = 20.0` — so six questions citing one slow host (the
+   worked cases q44873/q44874 both cite cdc.gov) can queue past the 45 s wall, at which point the
+   question that lost the queue discards every page it had ALREADY fetched, not just the contended
+   one. The archived timings say the tail is real rather than hypothetical: all-fail p50 0.3 s, but
+   3 of 23 ran the full 20 s. Nothing measured this interaction when the map was widened; the
+   politeness argument for widening it is unaffected. Three remedies, all the operator's to pick:
+   the partial harvest this item already describes; or a budget-bounded acquire — wrap the whole
+   hop in `asyncio.timeout(ctx.rung_budget_s())` while KEEPING `async with sem`, so a queued
+   question gives up its turn instead of the wall taking the section (the reviewers flagged this as
+   new timeout policy on a surface reserved on 2026-09-01, and a hand-rolled acquire/release on a
+   process-wide permit risks a leak or a double release, which is why it is not "strictly safer");
+   or pure instrumentation, a WARN when the acquire wait exceeds a few seconds, which measures the
+   contention without changing any timing. A `Semaphore(2)` per host is NOT an option — it trades
+   the politeness the widening bought for a bound it does not actually give.
+   **Merging Tier-1's host map with gap-fill v2's own map waits on this.** v2 keeps its own
+   module-global map (`research/agentic/tools.py`) and shares only the helper, so today a Tier-1
+   fetch and a v2 fetch can hit one host at once — but v2's rendered rung holds its host gate
+   across a Chromium launch of up to 35 s, and merging the maps would put that hold in front of a
+   Tier-1 fetch whose 45 s wall discards finished pages. So the merge needs either the bounded
+   acquire or the wall-degradation fix above landed first, and it needs the resulting queueing
+   measured rather than assumed.
 6. **MEDIUM: trafilatura silently drops MediaWiki collapsible boxes, and the surviving text can
    read as the inverse of the truth (verified 2026-08-24 on q44870; tracked here 2026-09-02).** On
    an English Wikipedia endorsements page the box renders as

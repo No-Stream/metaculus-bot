@@ -327,3 +327,42 @@ class TestScheduledBotCadence:
                     "and one set of shared research quotas, not a queue"
                 )
                 minutes[minute] = rel_path
+
+
+class TestFetchDiagnosticCannotSpend:
+    """The one non-bot workflow anybody may dispatch is exempt from the cost gate for a reason.
+
+    ``fetch_diagnostic.yaml`` is on the FREE side of AGENTS.md's cost gate only because it is
+    structurally incapable of spending: it holds no secret, so it cannot call an LLM, reach a
+    paid research provider or publish to Metaculus, and it is ``workflow_dispatch``-only, so it
+    fires only when somebody chooses to fire it. Both facts were stated in a YAML comment and
+    asserted nowhere, so a later edit adding ``env: OPENROUTER_API_KEY: ${{ secrets... }}`` or a
+    ``schedule:`` cron would pass every other test in this module while turning a free,
+    anyone-can-dispatch job into one that spends the operator's credits on a timer.
+    """
+
+    rel_path = ".github/workflows/fetch_diagnostic.yaml"
+
+    def test_no_secret_reaches_the_job(self) -> None:
+        # Raw text, not the parsed tree: a secret can arrive as job env, step env, a `with:`
+        # input, an inline expression in a `run:` line or a reusable-workflow `secrets:` block,
+        # and only the source text catches all of them.
+        raw = (_REPO_ROOT / self.rel_path).read_text()
+        assert "secrets." not in raw, (
+            f"{self.rel_path} now references a secret. Its inability to spend is exactly what "
+            "puts it on the free side of the cost gate (AGENTS.md) and lets anyone dispatch it; "
+            "a workflow that holds a key belongs in the paid list with the operator's sign-off"
+        )
+
+    def test_it_fires_only_on_an_explicit_dispatch(self) -> None:
+        # `on` is YAML 1.1 truthy, so safe_load keys the trigger block under the bool True, not
+        # under the string "on" — hence the parse here rather than the module's `_workflow` helper,
+        # whose dict[str, Any] signature cannot be indexed by a bool.
+        parsed: Any = yaml.safe_load((_REPO_ROOT / self.rel_path).read_text())
+        triggers: Any = parsed.get("on", parsed.get(True))
+        assert triggers, f"{self.rel_path} declares no trigger block at all"
+        assert sorted(triggers) == ["workflow_dispatch"], (
+            f"{self.rel_path} triggers on {sorted(triggers)}. A `schedule:` or `push:` here would "
+            "run federal-host probes from the runner IP on somebody else's cadence; every fire of "
+            "this workflow is meant to be a deliberate choice"
+        )

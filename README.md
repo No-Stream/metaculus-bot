@@ -15,7 +15,7 @@ What's inside:
 - **Two gap-fill research passes.** After the first research round, the bot looks for missing facts. v1 (`research/targeted.py`) has an analyzer LLM list up to `GAP_FILL_MAX_GAPS` factual gaps and resolves each with a parallel web search. v2 (`research/agentic/`) runs an agentic tool loop: a driver LLM searches, fetches, and reads documents until it has what it needs, then appends a citation-only findings block. Both passes are on in production.
 - **Numeric CDF pipeline.** Each forecaster declares the canonical percentile set (`STANDARD_PERCENTILES` in `metaculus_bot/numeric/config.py`); the bot turns them into a PCHIP CDF on the `PCHIP_CDF_POINTS` grid and enforces Metaculus's constraints (min/max step per bin, bound pinning, strictly increasing).
 - **Backtest-first benchmarking.** Scores the bot's predictions against real question resolutions on binary, numeric, and multiple-choice questions (`backtest.py`).
-- **Credit telemetry.** Logs OpenRouter balance and spend per run, and flags when the shared donated key drops below a refill floor (`metaculus_bot/credit_telemetry.py`, `make check_credits`).
+- **Credit telemetry.** Logs OpenRouter balance and spend per run, and flags when the shared donated key drops below an early-warning floor (`metaculus_bot/credit_telemetry.py`, `make check_credits`).
 
 ## Quick Start
 

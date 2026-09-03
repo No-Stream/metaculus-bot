@@ -680,7 +680,14 @@ RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS: float = 30.0  # freshness bound on t
 # extracted and passage-selected locally, and a model call is spent only on a document we
 # cannot read at all.
 DOCUMENT_TEXT_MAX_PAGES: int = 400  # ~2x the 220-page document behind the measurement, so a normal government report reads whole while a 4,000-page appendix dump stays bounded
-DOCUMENT_TEXT_MAX_SECONDS: float = 20.0  # ~4x the measured 5.3 s for 220 pages; matches RESOLUTION_SOURCE_HTTP_TIMEOUT, so parsing a document costs no more of the research phase than fetching it did
+# ~4x the measured 5.3 s for 220 pages; matches RESOLUTION_SOURCE_HTTP_TIMEOUT, so parsing a
+# document costs no more of the research phase than fetching it did. This is a BETWEEN-PAGES
+# CHECKPOINT, not an elapsed bound: `_read_pages` tests it only after each page returns, so a
+# single page can overrun it and no page is ever interrupted mid-parse (the extraction runs in a
+# thread that cannot be cancelled). What bounds one page is the decoded-bytes-per-stream cap set
+# at import in `research/document_text.py`, which turns a page whose content stream decompresses
+# past the cap into that page's `''` rather than an unbounded parse.
+DOCUMENT_TEXT_MAX_SECONDS: float = 20.0
 DOCUMENT_TEXT_PDF_MAX_BYTES: int = (
     40 * 1024 * 1024
 )  # ~6x the measured 6.7 MB file; above this the parse is not worth a research phase, and the bytes are refused before pypdf allocates
@@ -761,9 +768,10 @@ GEMINI_SEARCH_TIMEOUT: int = 360
 # in the 2026-09 spend reconstruction were thinking tokens, and this is a retrieval
 # + summarise task rather than a reasoning one. Only the LEVEL is set — the
 # no-max_tokens rule above still holds, because capping output on a thinking model
-# is what caused the silent truncations. NOTE thinking_level is the Gemini 3 knob; the
-# 2.5 line takes a thinking_budget instead, so the GEMINI_SEARCH_MODEL escape hatch to
-# gemini-2.5-flash mentioned above needs this revisited rather than merely re-pointed.
+# is what caused the silent truncations. Re-pointing GEMINI_SEARCH_MODEL at the 2.5
+# line therefore also means editing the gemini_thinking_config(...) call in
+# research/gemini_search.py to send a thinking_budget (1-24,576 on 2.5 Flash) or no
+# thinking_config at all; there is deliberately no model-family gate in code.
 GEMINI_SEARCH_THINKING_LEVEL: str = "medium"
 # Client-side PER-ATTEMPT HTTP timeout (ms) and attempt count (including the first)
 # for the grounded-search client. The SDK retries nothing by default, so a fast

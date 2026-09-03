@@ -1128,21 +1128,6 @@ the telemetry markers:
   nothing becomes distinguishable from one that never fires, and where the latency case
   for keeping a rung on a question under a close-derived time budget gets made.
   Harvested as `resolution_source_escalation`.
-- `GEMINI_USAGE: role=... model=... prompt_tokens=... tool_use_prompt_tokens=...
-  candidates_tokens=... thoughts_tokens=... total_tokens=... search_queries=...
-  [question=...]` — per-call google-genai token and grounded-query accounting, written
-  by both Gemini surfaces: grounded search (`research/gemini_search.py`, `role` =
-  `grounded_search`) and gap-fill v2's `read_document`
-  (`research/agentic/tool_backends.py`, `role` = `read_document`). Neither surface bills
-  through OpenRouter, so neither shows up in `CREDIT_ROLE_SPEND`, and before this marker
-  the whole Google AI Studio side of a run's spend was invisible to the archive. That
-  side is metered against a monthly grounded-prompt allowance per project and billed per
-  QUERY on overage, which makes `search_queries` the billable unit and makes any feature
-  that multiplies grounded calls a re-run of the spring-2026 billing arc. Every token
-  field can read `n/a`: the SDK reports each `usage_metadata` field independently, and a
-  count it never sent harvests as null rather than as a measured zero. `question` is
-  present on the grounded-search line and absent on `read_document`, which runs as a
-  per-URL tool with no question in scope. Harvested as `gemini_usage`.
 - `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]` — a WARN, one per
   gap-fill v2 `read_document` call whose `url_context` retrieval brought back nothing,
   so the answer would have been unsourced recall and the `fetched` verification tier is
@@ -1179,13 +1164,27 @@ the telemetry markers:
   (`research/gemini_usage.py`), called from `gemini_search.py` (`grounded_search`, before
   any formatting branch, so an ungrounded-and-suppressed response still records what it
   cost) and `research/agentic/tool_backends.py` (`read_document`, which carries no question
-  id, hence the trailing field's absence there). `model` is the response's own
-  `model_version` where it reported one and the configured id otherwise. Any count Google
+  id, hence the trailing field's absence there). Neither surface bills through OpenRouter,
+  so neither shows up in `CREDIT_ROLE_SPEND`, and before this marker the whole Google AI
+  Studio side of a run's spend was invisible to the archive. That side is metered against a
+  monthly grounded-prompt allowance per project and billed per QUERY on overage, which makes
+  `search_queries` the billable unit and any feature that multiplies grounded calls a re-run
+  of the spring-2026 billing arc. `model` is the response's own `model_version` where it
+  reported one and the configured id otherwise. Any count Google
   did not report reads `n/a` rather than 0, since `thoughts_tokens=0` is a real reading;
-  `search_queries` is a genuine 0 when the search tool issued none. `thoughts_tokens` is
-  the field worth watching — 71% of grounded-search output tokens were thinking before the
+  `search_queries` is the exception and reads a genuine 0 when the search tool issued none
+  (an absent `web_search_queries` list IS a count of none), `n/a` only when the grounding
+  metadata could not be walked — so separate the two surfaces on `role`, never on this
+  field. **The ledger covers COMPLETED responses only.** `log_gemini_usage` runs after the
+  SDK returns, so a call that timed out or raised billed unknown tokens and emitted no row —
+  14 of 154 archived `read_document` calls (9.1%) hit that handler. A spend total from these
+  rows is a LOWER bound, biased toward undercounting the largest calls; the denominator is
+  `provider_results['gemini_search'].status` per question plus `research_provider_failures`,
+  never this marker's row count. `thoughts_tokens` is the field worth watching — 71% of
+  grounded-search output tokens were thinking before the
   explicit levels (`GEMINI_SEARCH_THINKING_LEVEL`, `GAP_FILL_V2_READER_THINKING_LEVEL`) were
-  set. Nothing about this is alertable; it is spend accounting, not degradation.
+  set. Nothing about this is alertable; it is spend accounting, not degradation. Harvested as
+  `gemini_usage`.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH`
   — credit telemetry, described above. `CREDIT_FLOOR_BREACH` fires whatever the
   credit-alert window says, so a breach on a GREEN run means a suppression window

@@ -1182,8 +1182,19 @@ MARKER_SPECS: list[MarkerSpec] = [
         # Every token field can read ``n/a``: the SDK's usage_metadata fields are individually
         # optional, and a missing count must harvest as None rather than as a measured zero,
         # which is exactly what the ``n/a`` sentinel does through ``coerce_value``.
-        # ``search_queries`` is the grounded-query count (the billable unit on overage) and is
-        # ``n/a`` on the read_document surface, which issues no search.
+        # ``search_queries`` is the grounded-query count (the billable unit on overage). On the
+        # read_document surface it reads a genuine ``0``, NOT ``n/a``: the SDK omits
+        # ``web_search_queries`` when the search tool issued none, and an absent list IS a count
+        # of none, which is the honest reading for a url_context-only read. It reads ``n/a`` only
+        # when the grounding metadata could not be walked at all. So a spend query filters the
+        # two surfaces on ``role``, never on 0-versus-n/a in this field.
+        #
+        # The ledger covers COMPLETED responses only. ``log_gemini_usage`` runs after the SDK
+        # returns, so a Gemini call that timed out or raised billed unknown tokens and emitted no
+        # row — 14 of 154 archived read_document calls (9.1%) hit that handler. A spend total from
+        # these rows is therefore a LOWER bound, biased toward undercounting the largest calls;
+        # the denominator is ``provider_results['gemini_search'].status`` per question plus
+        # ``research_provider_failures``, never this marker's row count.
         #
         # ``question`` is OPTIONAL and last: the grounded-search call site has the question in
         # scope and passes ``question.id_of_question`` (hence ``qid_kind``, matching its

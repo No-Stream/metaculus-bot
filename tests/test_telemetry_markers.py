@@ -162,8 +162,9 @@ CREDIT_SPEND_UNSETTLED_SOURCE_LINE = (
 )
 CREDIT_FLOOR_BREACH_LINE = (
     PFX_WARN + "CREDIT_FLOOR_BREACH: key=donated remaining=45.00 floor=50.00 — donated OpenRouter "
-    "balance needs a top-up; run completed normally. cli.main logs the resulting "
-    "exit decision (non-zero unless credit alerting is currently suppressed)."
+    "balance is below the early-warning floor, so ask Metaculus for a top-up before it runs dry; "
+    "the key is not necessarily empty and the run completed normally. cli.main logs the exit "
+    "decision unless a higher-priority degradation alert exits first."
 )
 
 _META = {
@@ -2498,7 +2499,7 @@ GEMINI_USAGE_GROUNDED_LINE = (
 GEMINI_USAGE_READ_DOCUMENT_LINE = (
     PFX + "GEMINI_USAGE: role=read_document model=gemini-3.5-flash prompt_tokens=214 "
     "tool_use_prompt_tokens=n/a candidates_tokens=1877 thoughts_tokens=n/a total_tokens=2091 "
-    "search_queries=n/a"
+    "search_queries=0"
 )
 
 
@@ -2543,10 +2544,15 @@ class TestGeminiUsage:
         rec = _parse_one(GEMINI_USAGE_READ_DOCUMENT_LINE)
         assert rec["tool_use_prompt_tokens"] is None
         assert rec["thoughts_tokens"] is None
-        # read_document issues no search at all, which is different from searching zero times.
-        assert rec["search_queries"] is None
+        # search_queries is the exception, and deliberately so: the SDK omits web_search_queries
+        # when the search tool issued none, so an absent list IS a count of none and the emitter
+        # renders a real 0 (gemini_usage._render_search_queries). n/a on THIS field means only
+        # that the grounding metadata could not be walked, which the all-nulls case below pins.
+        assert rec["search_queries"] == 0
 
     def test_a_wholly_unreported_usage_block_harvests_all_nulls(self):
+        # The n/a path for search_queries specifically: the emitter renders it only when the
+        # grounding metadata could not be walked, never merely because no search was issued.
         rec = _parse_one(
             PFX + "GEMINI_USAGE: role=grounded_search model=gemini-3.5-flash prompt_tokens=n/a "
             "tool_use_prompt_tokens=n/a candidates_tokens=n/a thoughts_tokens=n/a total_tokens=n/a "

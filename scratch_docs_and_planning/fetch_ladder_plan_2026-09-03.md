@@ -136,7 +136,14 @@ Ordering notes that come from measurement, not taste:
 - **Rung 4 is rung 5 plus bookkeeping, not a static rung.** Harvest JSON XHR endpoints during a
   render and cache per domain so later questions on the same source skip to the API. A static
   page-source grep finds almost nothing.
-- **Every rung switches off on the time budget's fast path**, per `design:427-432`.
+- **Every rung switches off on the time budget's fast path**, per `design:427-432` — but the
+  gate binds from Phase 3 on, not from Phase 1. Phase 1's rungs (meta-refresh, local PDF) are
+  each self-bounded inside the unchanged 45 s provider wall and run concurrently with the primary
+  provider, so gating them saves no phase time and only discards resolution ground truth on the
+  thin-window questions that need it most — the same measured argument `_select_research_providers`
+  states in its own docstring for not shedding this provider on the fast path at all. The gate
+  lands with the first EXPENSIVE rung: Phase 3's rendered rung and Phase 4's paid url_context.
+  So Phase 1 deliberately threads no fast-path state through `resolution_source_provider`.
 
 Cumulative rescue over the 22 URLs that still fail from the laptop, in the order B → D → C → E → F
 as the replay measured it: 5, then 6, then 9, then 17, then 18, leaving 4. Of those 4, only two
@@ -447,7 +454,9 @@ wait-condition fix, the process-global per-host gate, the two free url_context h
 Phase 2, after step 0 — impersonation rung if validated, or the egress decision if not.
 
 Phase 3 — Wayback with unwrap guard and age disclosure; Tier-1 rendered rung; derived-API
-registry with XHR-harvested endpoints.
+registry with XHR-harvested endpoints. This is also where the fast-path gate lands, since the
+rendered rung is the first rung expensive enough for gating it to save any phase time (see the
+ladder note above).
 
 Phase 4 — url_context last, behind its flag and the robots pre-check, with per-route caveats.
 
