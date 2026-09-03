@@ -8,9 +8,9 @@ composes these into the capped fetch list (the cap lives there because the test
 suites patch it on that module), and ``market_retrieval.settlement_join`` reuses
 the extractor plus the self-ref predicate for the Kalshi settlement-source join.
 
-Split out of ``research.resolution_source`` so the markdown-escape, trailing-
-punctuation and dedup rules — each of which came from a measured live failure —
-can be read and tested without the fetch machinery around them.
+Split out of ``research.resolution_source`` so the markdown-escape, paren-balance,
+trailing-punctuation and dedup rules — each of which came from a measured live
+failure — can be read and tested without the fetch machinery around them.
 """
 
 from __future__ import annotations
@@ -20,16 +20,49 @@ from urllib.parse import urlparse
 
 # Metaculus-injected markdown escapes: `\_`, `\.`, `\&`, `\-`, `\#`, `\(`, `\)`.
 # FINDINGS: 3.4% of URLs carry these; one flips 404→success once unescaped.
-_MARKDOWN_ESCAPE_RE = re.compile(r"\\([_&.\-#()])")
+_MARKDOWN_ESCAPED_CHARS = r"_&.\-#()"
+_MARKDOWN_ESCAPE_RE = re.compile(rf"\\([{_MARKDOWN_ESCAPED_CHARS}])")
 
-# Markdown link: [label](https://...) — capture only the URL.
-_MARKDOWN_LINK_URL_RE = re.compile(r"\[[^\]]*\]\((https?://[^)\s]+)\)")
+# A URL body is a run of atoms; both URL regexes below are built from these, so
+# they agree about where a URL ends. Three atom kinds, tried in this order:
+#   1. A markdown escape — exactly the set `strip_markdown_escapes` removes, so
+#      the matcher and the unescaper can never disagree about what is an escape.
+#      An escaped paren must NOT end the URL: Metaculus renders
+#      `…/wiki/Nuri_\(rocket\)`, and stopping at the `\)` yielded
+#      `…/wiki/Nuri_(rocket\` — a 404 whose trailing backslash survived both the
+#      punctuation strip and the unescape (measured 2026-09-03; the repaired URL
+#      returns 200 with 16,753 chars).
+#   2. A balanced `(…)` pair — Wikipedia/Ballotpedia style `…_(rocket)`,
+#      `…_(August_18_Republican_primary)`. That closing paren is part of the URL,
+#      and dropping it 404s the same way (the second archived instance).
+#   3. Any other character except whitespace, the common closers, and a LONE
+#      `)` — a `)` that closes nothing opened inside the URL is prose
+#      punctuation (`(see https://example.com/x)`), so it ends the match.
+# `_URL_ATOM` adds a fourth, lowest-priority alternative for a lone `(`, so an
+# unbalanced open paren doesn't truncate a bare URL that never had a closing one.
+# The markdown-link form uses `_BALANCED_URL_ATOM` instead — see below.
+_ESCAPE_ATOM = rf"\\[{_MARKDOWN_ESCAPED_CHARS}]"
+_PLAIN_URL_CHAR = r"[^\s()\\<>\"'\]]"
+_BALANCED_PARENS = rf"\((?:{_ESCAPE_ATOM}|{_PLAIN_URL_CHAR})*\)"
+_BALANCED_URL_ATOM = rf"(?:{_ESCAPE_ATOM}|{_BALANCED_PARENS}|{_PLAIN_URL_CHAR})"
+_URL_ATOM = rf"(?:{_BALANCED_URL_ATOM}|\()"
 
-# Bare URL — stops at whitespace and common closers.
-_BARE_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
+# Markdown link: [label](https://...) — capture only the URL. The atoms stop at
+# a lone `)`, so the link's own closing paren is the one `\)` consumes while an
+# inner `(x)` pair stays inside the capture. The lone-`(` atom is deliberately
+# excluded here: inside `(…)` delimiters an unbalanced open paren is not a
+# markdown link at all, and allowing it lets the regex backtrack into a
+# truncated capture (`[a](https://x.test/p_(q)` → `…/p_(q`) that then rides
+# alongside the bare-URL match as a second, broken fetch target.
+_MARKDOWN_LINK_URL_RE = re.compile(rf"\[[^\]]*\]\((https?://{_BALANCED_URL_ATOM}*)\)")
 
-# Trailing punctuation to strip from an extracted URL.
-_TRAILING_PUNCT = ".,;:)]}>\"'"
+# Bare URL — stops at whitespace, common closers and unbalanced parens.
+_BARE_URL_RE = re.compile(rf"https?://{_URL_ATOM}*")
+
+# Trailing punctuation to strip from an extracted URL. `)` is NOT here: whether a
+# trailing paren belongs to the URL depends on balance, handled separately by
+# `_trim_trailing_delimiters`.
+_TRAILING_PUNCT = ".,;:]}>\"'"
 
 
 def strip_markdown_escapes(url: str) -> str:
@@ -37,12 +70,45 @@ def strip_markdown_escapes(url: str) -> str:
     return _MARKDOWN_ESCAPE_RE.sub(r"\1", url)
 
 
-def extract_source_urls(text: str) -> list[str]:
-    """Extract http(s) URLs from ``text``.
+def _closes_inner_paren(url: str) -> bool:
+    """True when ``url``'s final ``)`` closes a ``(`` opened inside ``url``."""
+    depth = 0
+    for char in url[:-1]:
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+    return depth > 0
 
-    Handles markdown links ``[label](https://…)`` and bare URLs. Strips trailing
-    punctuation, applies backslash-unescape, dedupes preserving order (case-
-    insensitive scheme+host; exact path and query — query params stay in the
+
+def _trim_trailing_delimiters(url: str) -> str:
+    """Strip sentence punctuation the URL picked up from the surrounding prose.
+
+    Runs AFTER the unescape so escaped and unescaped parens are judged by one
+    rule: a trailing ``)`` is kept only when it closes a ``(`` from inside the
+    URL, and dropped otherwise (a URL wrapped in escaped prose parens,
+    ``\\(https://x.test/y\\)``, unescapes to a trailing unmatched paren). A
+    trailing backslash is always dropped — it is never part of a live URL, and
+    letting one survive is what produced the measured 404.
+    """
+    while url:
+        if url[-1] == ")":
+            if _closes_inner_paren(url):
+                break
+        elif url[-1] not in _TRAILING_PUNCT and url[-1] != "\\":
+            break
+        url = url[:-1]
+    return url
+
+
+def extract_source_urls(text: str) -> list[str]:
+    r"""Extract http(s) URLs from ``text``.
+
+    Handles markdown links ``[label](https://…)`` and bare URLs, including parens
+    that belong to the URL — escaped (``…/Nuri_\(rocket\)``) or balanced
+    (``…/Nuri_(rocket)``). Applies backslash-unescape, then strips trailing
+    punctuation, then dedupes preserving order (case-insensitive scheme+host;
+    exact path and query — query params stay in the
     key because we may need them, e.g. for FRED graph_id; fragments are
     excluded because they're never sent over HTTP). Returns the FULL deduped
     list — the ``RESOLUTION_SOURCE_MAX_URLS`` cap is applied downstream by
@@ -69,11 +135,10 @@ def extract_source_urls(text: str) -> list[str]:
 
     cleaned: list[str] = []
     for _pos, raw in positioned:
-        u = raw
-        # Strip trailing punctuation (may repeat: "foo.,").
-        while u and u[-1] in _TRAILING_PUNCT:
-            u = u[:-1]
-        u = strip_markdown_escapes(u)
+        # Unescape BEFORE trimming so one paren rule covers both `\)` and `)`,
+        # and so an escaped trailing period (`…foo\.`) cannot leave a backslash
+        # behind as the last character.
+        u = _trim_trailing_delimiters(strip_markdown_escapes(raw))
         if not u.lower().startswith(("http://", "https://")):
             continue
         cleaned.append(u)
