@@ -826,7 +826,7 @@ class TestSourceProvenanceLadder:
         self._assert_ladder_present(result)
 
     def test_numeric_status_quo_derivation_is_the_one_anchor_to_latest_statement(self) -> None:
-        """The numeric prompt used to tell the model five times how to pick a centre: the
+        """The numeric prompt used to tell the model five times how to pick a center: the
         step-0 status-quo derivation, a step-1 "centered near this value" push, a step-3
         "status-quo outcome" line, step-3 trend continuation and a step-7 trajectory check.
         One anchor statement (step 0, which already says to move off the latest measurement
@@ -1170,7 +1170,7 @@ class TestSoftClockAndHistoryDischargedRules:
     retired, and it deliberately adds no structured-block field.
 
     `_HISTORY_DISCHARGED_RULE` (lens C, history repeats past an acknowledged change). A member
-    names a reason the historical cadence has been discharged and keeps it as the centre anyway:
+    names a reason the historical cadence has been discharged and keeps it as the center anyway:
     12.1% of rationales, about 7 spot per flagged record (95% CI 2.7 to 12.2), the pattern failed
     in 13 of 13 live-triple fires; coder agreement 0.59 and partly hindsight-contaminated, so
     upper bounds. Shipped on the plan's recommendation with the operator's final say pending.
@@ -1249,12 +1249,12 @@ class TestSoftClockAndHistoryDischargedRules:
 
     def test_history_discharged_rule_is_conditional_on_the_members_own_acknowledgment(self) -> None:
         """The condition is the member's OWN written acknowledgment, so the rule cannot fire on
-        a question where nothing has changed; and the cadence becomes a BOUND, not a centre,
+        a question where nothing has changed; and the cadence becomes a BOUND, not a center,
         which is the whole correction. The receipt rides as a short parenthetical."""
         flat = self._flat(_HISTORY_DISCHARGED_RULE)
         assert flat.startswith("• if your own analysis names a reason the historical cadence has been discharged")
         assert "(its driver was met, the deadline passed, the rule changed)" in flat
-        assert "that cadence is a bound on your estimate, not its centre" in flat
+        assert "that cadence is a bound on your estimate, not its center" in flat
         assert "state the post-change estimate and what it rests on" in flat
         assert "held in 0 of 13 recent cases" in flat
 

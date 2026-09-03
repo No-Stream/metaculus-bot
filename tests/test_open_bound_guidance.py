@@ -199,7 +199,7 @@ class TestNumericPromptDisplaysNominalBounds:
         nothing parsed, and the preamble carried a separate 567-char calibration paragraph. The
         operator's intent is real and now lives in ONE template step, "Forecastability and
         width": decide whether the quantity is forecastable from current information or close to
-        a random walk, and if near-unforecastable centre on the current value with a width taken
+        a random walk, and if near-unforecastable center on the current value with a width taken
         from realized variability. It absorbs the calibration paragraph's kernel, keeps the
         even-handed wording the 2026-07 width audit settled on (no directional push toward wide
         or narrow), and asks for no output line; the preamble shrinks to a pointer."""
@@ -217,7 +217,7 @@ class TestNumericPromptDisplaysNominalBounds:
         # The decision the step asks for, and what to do at the unforecastable end.
         assert "how forecastable this quantity is from current information" in collapsed
         assert "close to a random walk" in collapsed
-        assert "centre on the current value" in collapsed
+        assert "center on the current value" in collapsed
         assert "realized variability" in collapsed
         assert "do not expect movement you cannot source" in collapsed
         # The calibration paragraph's even-handed kernel, stated once.

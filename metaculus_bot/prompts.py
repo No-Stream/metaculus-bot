@@ -600,8 +600,8 @@ _SOFT_CLOCK_RULE = """
 _HISTORY_DISCHARGED_RULE = """
                • If your own analysis names a reason the historical cadence has been discharged (its driver was
                  met, the deadline passed, the rule changed), that cadence is a bound on your estimate, not its
-                 centre; state the post-change estimate and what it rests on (the old cadence held in 0 of 13
-                 recent cases where it was kept as the centre)."""
+                 center; state the post-change estimate and what it rests on (the old cadence held in 0 of 13
+                 recent cases where it was kept as the center)."""
 
 
 # Apply the rate to the exposure that is LEFT. On qid 43837 six members applied a monthly
@@ -1191,7 +1191,7 @@ def numeric_prompt(
             - Question-specific base rate: anchor on the historical frequency, trend, or variance for THIS specific indicator (e.g., "how much has this index moved in prior analogous windows"), not a generic "things are usually stable" or "things are usually volatile" prior.
 
         (8) Forecastability and width
-            - Decide how forecastable this quantity is from current information on this horizon. An administered or slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely predictable from its latest value and historical variance: anchor tightly on recent observations. A traded price, a volatile count or a novel metric on a short horizon is close to a random walk: centre on the current value, take the width from its realized variability over comparable windows, and do not expect movement you cannot source to a named cause.
+            - Decide how forecastable this quantity is from current information on this horizon. An administered or slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely predictable from its latest value and historical variance: anchor tightly on recent observations. A traded price, a volatile count or a novel metric on a short horizon is close to a random walk: center on the current value, take the width from its realized variability over comparable windows, and do not expect movement you cannot source to a named cause.
             - Match your interval width to what your reasoning actually supports, and do not pad or sharpen out of a generic disposition. Log score punishes a narrow interval that misses far more than a wide one that covers, but a wide interval on a predictable quantity also bleeds points.
             - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution.
 
