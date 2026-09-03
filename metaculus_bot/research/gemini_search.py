@@ -23,7 +23,10 @@ from google.genai import types as genai_types
 
 from metaculus_bot.constants import (
     GEMINI_SEARCH_DEFAULT_MODEL,
+    GEMINI_SEARCH_HTTP_ATTEMPTS,
+    GEMINI_SEARCH_HTTP_TIMEOUT_MS,
     GEMINI_SEARCH_MODEL_ENV,
+    GEMINI_SEARCH_THINKING_LEVEL,
     GEMINI_SEARCH_TIMEOUT,
     GOOGLE_API_KEY_ENV,
 )
@@ -35,6 +38,8 @@ from metaculus_bot.research.bracket_groups import (
     rebuild_group,
 )
 from metaculus_bot.research.gemini_attribution import rewrite_unsupported_attributions
+from metaculus_bot.research.gemini_client_config import build_gemini_http_options, gemini_thinking_config
+from metaculus_bot.research.gemini_usage import log_gemini_usage
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
@@ -65,8 +70,18 @@ def _cached_client_for_key(api_key: str) -> genai.Client:
     lets TLS connections and HTTP/2 multiplexing be reused across the ~thousands
     of calls the Gemini provider + gap-fill make per round. Keyed on api_key so
     a rotated key (rare) produces a fresh client.
+
+    The retry ladder rides on the CLIENT rather than the per-request options because the
+    SDK builds its tenacity retryer once at construction from
+    ``http_options.retry_options``; a bare client stops after one attempt (see
+    ``research/gemini_client_config``).
     """
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options=build_gemini_http_options(
+            timeout_ms=GEMINI_SEARCH_HTTP_TIMEOUT_MS, attempts=GEMINI_SEARCH_HTTP_ATTEMPTS
+        ),
+    )
 
 
 def build_gemini_client() -> genai.Client:
@@ -429,7 +444,14 @@ async def invoke_gemini_grounded(
     if include_url_context:
         tools.append({"url_context": {}})
 
-    config = genai_types.GenerateContentConfig(tools=tools)
+    # Thinking level is set explicitly rather than left at the model's default (HIGH on
+    # gemini-3-flash-preview), which was most of this provider's token bill; see
+    # GEMINI_SEARCH_THINKING_LEVEL. Still no max_tokens — capping output on a thinking
+    # model truncates.
+    config = genai_types.GenerateContentConfig(
+        tools=tools,
+        thinking_config=gemini_thinking_config(GEMINI_SEARCH_THINKING_LEVEL),
+    )
 
     logger.info(f"GeminiSearch: calling {model} with grounding")
     try:
@@ -440,6 +462,17 @@ async def invoke_gemini_grounded(
     except TimeoutError:
         logger.warning(f"GeminiSearch: {model} timed out after {GEMINI_SEARCH_TIMEOUT}s")
         raise
+
+    # Before any formatting branch, so the tokens are recorded on the suppressed-response
+    # paths too: an ungrounded response we refuse to publish was billed exactly like a
+    # useful one, and a spend line that only covers the responses we kept would understate
+    # the bill by precisely the wasted calls.
+    log_gemini_usage(
+        response,
+        role="grounded_search",
+        model=model,
+        question=str(qid) if qid is not None else None,
+    )
 
     # Capture the raw SDK response (text + grounding metadata: the actual Google
     # queries and sources) before formatting drops most of it.

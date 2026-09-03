@@ -660,6 +660,46 @@ GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3-flash-preview"
 # Gap-fill runs overlapped with forecaster LLM calls, so higher timeout adds
 # zero wall-clock cost. Observed p99 of non-AFC calls ≈ 52s.
 GEMINI_SEARCH_TIMEOUT: int = 360
+# Thinking level for the grounded-search call, set EXPLICITLY (operator decision
+# 2026-09-03) rather than left at the model's default, which for
+# gemini-3-flash-preview is HIGH: 71% of the grounded-search output tokens measured
+# in the 2026-09 spend reconstruction were thinking tokens, and this is a retrieval
+# + summarise task rather than a reasoning one. Only the LEVEL is set — the
+# no-max_tokens rule above still holds, because capping output on a thinking model
+# is what caused the silent truncations. NOTE thinking_level is the Gemini 3 knob; the
+# 2.5 line takes a thinking_budget instead, so the GEMINI_SEARCH_MODEL escape hatch to
+# gemini-2.5-flash mentioned above needs this revisited rather than merely re-pointed.
+GEMINI_SEARCH_THINKING_LEVEL: str = "medium"
+# Client-side PER-ATTEMPT HTTP timeout (ms) and attempt count (including the first)
+# for the grounded-search client. The SDK retries nothing by default, so a fast
+# transient — the 503 UNAVAILABLE that killed two production calls — used to lose the
+# whole provider; one retry recovers it.
+#
+# Worst-case arithmetic. The hard bound is UNCHANGED: the outer
+# ``asyncio.wait_for(..., GEMINI_SEARCH_TIMEOUT)`` in ``research/gemini_search.py``
+# still cancels the whole call at 360s, and it genuinely can (an async coroutine,
+# unlike read_document's thread). So the nominal product 350 + <=2 (one jittered retry
+# sleep) + 350 never elapses: a first attempt that HANGS eats the window and the outer
+# wait_for fires exactly as it does today, while a retry only completes when the first
+# attempt failed FAST, which is the recovery case this exists for.
+#
+# Why the per-attempt cap is not sized so the PRODUCT fits under 360s: that would need
+# <=176s per attempt, and the comment above records legitimate AFC chains at 150-200s
+# ("180s was too tight — observed timeouts"). Shrinking the per-attempt allowance would
+# newly fail calls that succeed today, which is the one thing a timeout change here
+# must not do. 350s instead sits just under the outer deadline, so nothing a single
+# attempt can do today is cut short.
+GEMINI_SEARCH_HTTP_TIMEOUT_MS: int = 350_000
+GEMINI_SEARCH_HTTP_ATTEMPTS: int = 2
+# Same two settings for gap-fill v2's read_document backend, whose thinking level is a
+# tier lower (operator decision 2026-09-03): quoting a fetched document back is the
+# least reasoning-heavy of the Gemini calls. The reader's per-attempt TIMEOUT is not a
+# constant here because it is DERIVED from the total in-thread budget
+# (``_READ_DOCUMENT_HTTP_TIMEOUT_MS`` in ``research/agentic/tool_backends.py``, where the
+# arithmetic lives): that call runs under ``asyncio.to_thread``, so its outer wait_for
+# cannot cancel it and the retry has to fit INSIDE today's budget rather than beside it.
+GAP_FILL_V2_READER_THINKING_LEVEL: str = "low"
+GAP_FILL_V2_READER_HTTP_ATTEMPTS: int = 2
 
 # --- Second-pass gap-fill ---
 # After first-pass research completes, a cheap analyzer identifies up to

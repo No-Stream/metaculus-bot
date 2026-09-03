@@ -608,7 +608,7 @@ async def read_document(url: str, ask: str) -> ToolOutcome:
     if not os.getenv(GOOGLE_API_KEY_ENV):
         return _format_fetch_error(f"Google API key is not configured; set {GOOGLE_API_KEY_ENV}.", method="document")
     try:
-        text, n_url_success = await asyncio.wait_for(
+        text, n_url_success, statuses = await asyncio.wait_for(
             asyncio.to_thread(_run_document_read_sync, url, ask), timeout=_READ_DOCUMENT_TIMEOUT_S
         )
     except TimeoutError:
@@ -617,8 +617,11 @@ async def read_document(url: str, ask: str) -> ToolOutcome:
         return _format_fetch_error(f"Document read failed: {type(exc).__name__}: {exc}", method="document")
     if n_url_success == 0:
         # Greppable, mirroring gemini_search's GEMINI_UNGROUNDED_SUPPRESSED so the rate is
-        # measurable from the archived run logs.
-        logger.warning(f"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url={url}")
+        # measurable from the archived run logs. ``statuses`` carries every reported
+        # url_retrieval_status: a refused fetch, a retrieval timeout and a url_context tool
+        # that never ran all read as zero successes, and only the status names separate them.
+        # ``none`` means the SDK attached no url_metadata entry at all.
+        logger.warning(f"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url={url} statuses={','.join(statuses) or 'none'}")
         return _format_fetch_error(
             f"Document read retrieved no URL content: Gemini's url_context tool fetched nothing from {url}, "
             "so any answer would be unsourced recall rather than a read of the document.",

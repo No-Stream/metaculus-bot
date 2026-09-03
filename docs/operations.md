@@ -1020,6 +1020,21 @@ the telemetry markers:
   tells two flagged identifiers in one run apart and joins a noise-flag record to the
   stale-latest record for the same series. Informational and NOT alertable — it
   describes the vendor's data, not a bot defect.
+- `GEMINI_USAGE: role=grounded_search|read_document model=... prompt_tokens=...
+  tool_use_prompt_tokens=... candidates_tokens=... thoughts_tokens=... total_tokens=...
+  search_queries=... [question=...]` — one line per response from the two paths that call
+  Google natively rather than through OpenRouter, so their spend on the operator's personal
+  AI Studio key is readable from a run log. Emitted by `log_gemini_usage`
+  (`research/gemini_usage.py`), called from `gemini_search.py` (`grounded_search`, before
+  any formatting branch, so an ungrounded-and-suppressed response still records what it
+  cost) and `research/agentic/tool_backends.py` (`read_document`, which carries no question
+  id, hence the trailing field's absence there). `model` is the response's own
+  `model_version` where it reported one and the configured id otherwise. Any count Google
+  did not report reads `n/a` rather than 0, since `thoughts_tokens=0` is a real reading;
+  `search_queries` is a genuine 0 when the search tool issued none. `thoughts_tokens` is
+  the field worth watching — 71% of grounded-search output tokens were thinking before the
+  explicit levels (`GEMINI_SEARCH_THINKING_LEVEL`, `GAP_FILL_V2_READER_THINKING_LEVEL`) were
+  set. Nothing about this is alertable; it is spend accounting, not degradation.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH`
   — credit telemetry, described above. `CREDIT_FLOOR_BREACH` keeps firing during
   the credit-alert suppression window, so seeing one on a green run is expected
