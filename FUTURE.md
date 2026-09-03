@@ -55,11 +55,12 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 
 ### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH — operator-confirmed 2026-08-25**)
 
-**Scope, per the operator: the checkpoint is the FULL triple-era read, not numerics alone.** Four
+**Scope, per the operator: the checkpoint is the FULL triple-era read, not numerics alone.** Five
 reads come due at the same checkpoint and share one cohort, so they run together (the fourth added
 by the 2026-08-25 priority audit, when the ghost-scoring entry was demoted to Low and its re-read
-folded in here). Read number 2 has since been answered ahead of the checkpoint and is kept below
-with its receipts, so three remain live:
+folded in here; the fifth on 2026-09-02, for the two prompt rules the next-season bundle adds).
+Read number 2 has since been answered ahead of the checkpoint and is kept below with its receipts,
+so four remain live:
 
 1. **The numeric ensemble delta** — the accepted +3.24 lean toward the retired 6-member roster,
    which is what this entry was originally opened for (detail and decision rule below).
@@ -108,6 +109,20 @@ with its receipts, so three remain live:
    n=12 and joins the same resolutions this cohort waits on, so it rides along rather than being
    scheduled separately; the composition guardrail (most scored ghosts are byte-identical to the
    driver's PRE-research dry run) is in the demoted entry under Low-priority.
+5. **The effect of the two Phase 1 prompt rules the next-season bundle adds**, `_SOFT_CLOCK_RULE`
+   and `_HISTORY_DISCHARGED_RULE` in `metaculus_bot/prompts.py` (Items A and C of
+   `scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md`; live from the
+   bundle merge). Nothing about either can be measured offline, so the first read is the residual
+   round after the fall cup's first resolutions: re-code the live-triple rationales with the
+   audit's lens definitions (the lens list at the top of
+   `scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md`; tables in `STATS.md`) and compare
+   the announced-unscheduled shape's incidence and spot peer against the whole-archive baseline of
+   6.4% of records and minus 18.7 spot (95% CI 5.9 to 33.4 worse), and the history-repeats
+   rationale rate against 12.1%. Two cautions carry over from the audit. The shape fired on 0 of
+   the 30 resolved live-triple records, so there is no pre-bundle live-era rate to compare against
+   and the whole-archive figures are the baseline. And the history-repeats label had coder
+   agreement 0.59 and was partly hindsight-contaminated, so 12.1% is an upper bound and a
+   post-bundle rate should be read as one too, not as a point estimate.
 
 Status: shipped-and-watch. The drop to the latest-per-vendor triple (`gpt-5.6-sol` /
 `claude-opus-4.8` / `gemini-3.1-pro-preview`) shipped accepting a fragile numeric lean toward the
