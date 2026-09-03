@@ -256,3 +256,74 @@ class TestNonBotWorkflowCapsStayInBand:
             ".github/workflows/claude.yml",
             ".github/workflows/fetch_diagnostic.yaml",
         ]
+
+
+class TestScheduledBotCadence:
+    """Every scheduled bot workflow runs hourly, off the hour, and not on top of the others.
+
+    Latency is what the cadence buys. A question the bot never sees before it closes is a
+    forfeit — the 2026-09-01 residual round found six in the triple era — and an hourly run
+    that finds no new question spends nothing, because cli pins
+    ``skip_previously_forecasted_questions`` on for every tournament-shaped mode. The
+    Metaculus Cup workflow sat on ``3 0 */2 * *`` (00:03 every second day) until 2026-09-03,
+    which could leave a cup question unforecast for most of its window.
+
+    Distinct minutes are the second half. The three workflows sit in SEPARATE concurrency
+    groups (``group: ${{ github.workflow }}``), so a shared minute does not queue — it
+    starts two or three full bot runs at once, on the same runner pool and against the same
+    shared AskNews / Gemini / OpenRouter quotas.
+    """
+
+    @staticmethod
+    def _schedule(rel_path: str) -> list[str]:
+        # PyYAML reads YAML 1.1, where the bare key `on` is the BOOLEAN True, so the
+        # triggers block is not under the string "on". Accept either spelling rather than
+        # hardcoding the quirk, in case a workflow ever quotes the key.
+        workflow: Any = _workflow(rel_path)  # Any: the key below is a bool, not a str
+        triggers = workflow.get("on") or workflow.get(True) or {}
+        return [entry["cron"] for entry in triggers.get("schedule", [])]
+
+    @property
+    def scheduled(self) -> dict[str, list[str]]:
+        return {rel: crons for rel in _BOT_WORKFLOWS if (crons := self._schedule(rel))}
+
+    def test_the_scheduled_bot_set_is_what_we_think_it_is(self) -> None:
+        # Derived from the files, then pinned: the two test workflows are dispatch-only
+        # (spending is the operator's choice), and a new cron on one of them would show up
+        # here rather than silently starting to publish on a schedule.
+        assert sorted(self.scheduled) == [
+            ".github/workflows/run_bot_on_metaculus_cup.yaml",
+            ".github/workflows/run_bot_on_minibench.yaml",
+            ".github/workflows/run_bot_on_tournament.yaml",
+        ]
+
+    def test_every_scheduled_bot_workflow_is_hourly_and_off_the_hour(self) -> None:
+        for rel_path, crons in self.scheduled.items():
+            assert len(crons) >= 2, (
+                f"{rel_path}: {len(crons)} cron entry(ies). GitHub silently drops schedules under "
+                "runner load, so the cadence is split across several entries rather than one */N"
+            )
+            for cron in crons:
+                minute, hour, day, month, weekday = cron.split()
+                assert (hour, day, month, weekday) == ("*", "*", "*", "*"), (
+                    f"{rel_path}: cron {cron!r} is not hourly. A question is open for about 180 "
+                    "minutes and a run that finds nothing new costs nothing, so anything coarser "
+                    "than hourly trades forfeits for no saving"
+                )
+                assert minute.isdigit(), f"{rel_path}: cron {cron!r} has a non-literal minute field"
+                assert int(minute) != 0, (
+                    f"{rel_path}: cron {cron!r} fires on the hour, into GitHub's :00 scheduling "
+                    "burst; every other bot workflow deliberately sits off the hour"
+                )
+
+    def test_no_two_scheduled_bot_workflows_share_a_minute(self) -> None:
+        minutes: dict[str, str] = {}
+        for rel_path, crons in sorted(self.scheduled.items()):
+            for cron in crons:
+                minute = cron.split()[0]
+                assert minute not in minutes, (
+                    f"{rel_path} and {minutes[minute]} both fire at :{minute}. They are in separate "
+                    "concurrency groups, so that is two simultaneous bot runs on one runner pool "
+                    "and one set of shared research quotas, not a queue"
+                )
+                minutes[minute] = rel_path

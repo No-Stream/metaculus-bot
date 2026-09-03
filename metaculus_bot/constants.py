@@ -18,15 +18,48 @@ from metaculus_bot.time_utils import _as_utc
 # =============================================================================
 # TOURNAMENT IDs - UPDATE THESE EACH QUARTER/SEASON
 # =============================================================================
-# AI Forecasting Benchmark tournament (bot-only competition)
+# AI Forecasting Benchmark / FutureEval tournament (bot-only competition)
 # Update when new season starts: https://www.metaculus.com/project/aib/
+# Read the object before editing: /api/projects/tournaments/<slug-or-id>/ is the route
+# that serves a project (a bare /api/projects/<id>/ 404s), and TOURNAMENT_END_DATE is its
+# `forecasting_end_date`, not its `close_date` (they differ by two months here).
 TOURNAMENT_ID: str = "summer-futureeval-2026"  # Summer 2026 FutureEval Bot Tournament (project ID: 33022)
-TOURNAMENT_END_DATE: str = "2026-09-06"  # Formal tournament close date
+TOURNAMENT_END_DATE: str = "2026-09-06"  # forecasting_end_date on project 33022 (API-verified 2026-09-03)
 TOURNAMENT_HARD_STOP_WEEKS: int = 2  # ~2 weeks of wiggle room past close before erroring
+# NO fall-2026 successor to summer-futureeval-2026 was published as of 2026-09-03, so
+# these stay on the summer season deliberately rather than being guessed. Evidence, all
+# read-only: /api/projects/tournaments/ listed 193 projects with no fall-2026 bot
+# tournament among them; every project id from 33100 to 33140 was fetched individually and
+# only 33108 (the fall cup) and 33109 (an unrelated question series) exist, so the id
+# space above the summer tournament is empty; the four plausible slugs
+# fall-futureeval-2026 / fall-aib-2026 / futureeval-fall-2026 / aib-fall-2026 all 404; and
+# forecasting-tools 0.2.92 still has CURRENT_AI_COMPETITION_ID == the summer id.
+# Consequence to expect: check_tournament_dates raises TournamentExpiredError from
+# 2026-09-20 (end date + hard stop), which reddens `--mode tournament` runs and the CI
+# freshness test in tests/test_tournament_dates.py. That is the intended reminder, and it
+# does NOT touch the cup — `--mode metaculus_cup` never calls that check.
 
-# Metaculus Cup tournament (human + bot competition)
-# Update when new cup starts: https://www.metaculus.com/tournament/metaculus-cup/
-METACULUS_CUP_ID: str = "metaculus-cup"  # Uses slug, auto-resolves to current cup
+# Metaculus Cup (human + bot competition). This used to hold the undated `metaculus-cup`
+# slug and rely on Metaculus redirecting it to whichever cup was current; Metaculus now
+# REJECTS that slug — the posts list answers HTTP 400 for `tournaments=metaculus-cup`
+# (verified 2026-09-03) — so the constant carries the SEASON's dated slug and has to be
+# re-pointed at each new cup. There is no auto-resolving spelling left.
+#
+# Fall 2026, read straight off /api/projects/tournaments/metaculus-cup-fall-2026/ on
+# 2026-09-03: project id 33108, name "Metaculus Cup Fall 2026", start_date
+# 2026-08-28T12:00:00Z, forecasting_end_date 2027-01-01T00:00:00Z, close_date
+# 2027-01-04T00:00:00Z, score_type peer_tournament, visibility unlisted,
+# bot_leaderboard_status exclude_and_show (bots forecast and are shown, but sit outside
+# the human leaderboard — every recent cup season reads the same, so this is the cup's
+# normal setting), questions_count 0 — the cup was open but had published nothing yet.
+# Slug or numeric id both resolve on that route; the slug is kept because it is what the
+# supply probe's per-slug rows and the research archive's labels read.
+#
+# NOTE for residual analysis: score_type peer_tournament means cup records carry a
+# coverage-scaled peer score and NO spot peer, unlike the bot tournament's
+# spot_peer_tournament. performance_analysis/platform_scores.py already keeps the two in
+# separate sort tiers; don't pool them on one score field.
+METACULUS_CUP_ID: str = "metaculus-cup-fall-2026"
 
 
 def gemini_use_donated_openrouter_key() -> bool:
@@ -102,33 +135,38 @@ def check_tournament_dates(logger: logging.Logger | None = None) -> None:
         )
 
 
-# --- Fall Metaculus Cup reminder (deliberate, dated time bomb) ---
-# The summer season closes on TOURNAMENT_END_DATE (2026-09-06) and the fall cup is the
-# one identified next-season lever. The platform object already exists — slug
-# `metaculus-cup-fall-2026`, project id 33108, start_date 2026-08-28T12:00:00Z,
-# forecasting_end_date 2027-01-01T00:00:00Z (API probe 2026-09-01) — but it held 0 posts,
-# the 'Forecast on Metaculus Cup' workflow is disabled_manually, and the bare
-# `metaculus-cup` slug now 404s, so METACULUS_CUP_ID above no longer auto-resolves and
-# must be pointed at the dated slug (or id 33108) when configuring. The operator expects
-# questions ~2026-09-20 and asked for runs to START ERRORING from FALL_CUP_REMINDER_DATE
-# as the reminder to configure/enable the cup. Flipping FALL_CUP_CONFIGURED to True is
-# the acknowledgment that retires the whole check (and its companion CI time-bomb test
-# in tests/test_tournament_dates.py).
+# --- Cup-season configuration reminder (dated, DISCHARGED for fall 2026, re-armable) ---
+# This was a deliberate time bomb: from FALL_CUP_REMINDER_DATE every run reddened until
+# somebody pointed METACULUS_CUP_ID at the fall cup's dated slug and enabled the
+# 'Forecast on Metaculus Cup' workflow, because the undated `metaculus-cup` slug the
+# constant used to hold had started answering HTTP 400, so a cup run would simply have
+# found no questions.
 #
-# Live window on tournament crons is narrow by design: check_tournament_dates raises
-# TournamentExpiredError from 2026-09-20 (end date + hard stop) anyway, so there this
-# reminder only adds 09-15..09-20 — but it also reddens the cup/minibench crons and any
-# manual or test run after, and the CI test keeps failing regardless of run mode.
-FALL_CUP_SLUG: str = "metaculus-cup-fall-2026"
+# DISCHARGED on 2026-09-03: Metaculus granted $1,500 of API credits for the fall season,
+# METACULUS_CUP_ID above now names project 33108 (metadata verified against the API in
+# the comment there), the cup workflow runs the same hourly split cron the tournament
+# does, and FALL_CUP_CONFIGURED is True — which makes fall_cup_reminder_due() False on
+# every date, so the reminder cannot fire and the companion test in
+# tests/test_tournament_dates.py became a pin that the cup stays configured. The one
+# remaining operator step is enabling the workflow on GitHub (it is `disabled_manually`
+# there, which no file in this repo can change); see docs/operations.md.
+#
+# TO RE-ARM for the next cup (spring 2027): re-date FALL_CUP_REMINDER_DATE to a couple of
+# weeks before that cup opens and set FALL_CUP_CONFIGURED back to False. The names still
+# say FALL because that is the season they were written for and `FALL_CUP_SLUG` is
+# imported elsewhere (scripts/supply_probe.py's default slug list); a re-arm should rename
+# them to the new season and update those imports with it.
+FALL_CUP_SLUG: str = METACULUS_CUP_ID  # one definition, so the probe's slug list and the reminder can't drift
 FALL_CUP_REMINDER_DATE: str = "2026-09-15"
-FALL_CUP_CONFIGURED: bool = False  # flip to True once the fall cup constants + workflow are set up
+FALL_CUP_CONFIGURED: bool = True  # set False to re-arm the reminder for the next cup season
 
 
 def fall_cup_reminder_due(today: date | None = None) -> bool:
-    """Whether the fall-cup configuration reminder should redden runs.
+    """Whether the cup-season configuration reminder should redden runs.
 
-    False before ``FALL_CUP_REMINDER_DATE`` and always False once the operator flips
-    ``FALL_CUP_CONFIGURED``. ``today`` defaults to the system clock read at CALL time,
+    False before ``FALL_CUP_REMINDER_DATE``, and always False while
+    ``FALL_CUP_CONFIGURED`` is True — which it is, so this returns False on every date
+    until somebody re-arms it. ``today`` defaults to the system clock read at CALL time,
     same contract as ``credit_alerts_active`` below: tests inject a fixed date, and a
     long-lived process crosses the date without a redeploy.
     """
@@ -142,19 +180,21 @@ def fall_cup_reminder_due(today: date | None = None) -> bool:
 def check_fall_cup_reminder(logger: logging.Logger | None = None, today: date | None = None) -> bool:
     """Log the loud FALL_CUP_REMINDER line when due; return whether it fired.
 
-    The caller (cli.main) holds the returned bool and exits non-zero at end of run,
-    the same shape as the credit-floor path: forecasting and publishing complete
+    Dormant while ``FALL_CUP_CONFIGURED`` is True (the shipped state since 2026-09-03).
+    When re-armed, the caller (cli.main) holds the returned bool and exits non-zero at end
+    of run, the same shape as the credit-floor path: forecasting and publishing complete
     normally, and the red exit is purely the reminder signal.
     """
     if not fall_cup_reminder_due(today):
         return False
     log = logger or logging.getLogger(__name__)
     log.error(
-        f"FALL_CUP_REMINDER: {FALL_CUP_SLUG} expected to open ~2026-09-20 — enable the "
-        f"'Forecast on Metaculus Cup' workflow and set the season constants "
-        f"(METACULUS_CUP_ID no longer auto-resolves: the bare 'metaculus-cup' slug 404s, "
-        f"point it at {FALL_CUP_SLUG}). Flip FALL_CUP_CONFIGURED=True in constants.py to "
-        f"retire this reminder. This run will exit non-zero as the reminder signal."
+        f"FALL_CUP_REMINDER: the Metaculus Cup season constants look unconfigured. "
+        f"METACULUS_CUP_ID still points at {FALL_CUP_SLUG} — re-point it at the new season's "
+        f"DATED slug (there is no auto-resolving 'metaculus-cup' spelling left; Metaculus "
+        f"answers HTTP 400 for that one) and enable the 'Forecast on Metaculus Cup' workflow "
+        f"on GitHub. Flip FALL_CUP_CONFIGURED=True in constants.py to retire this reminder. "
+        f"This run will exit non-zero as the reminder signal."
     )
     return True
 

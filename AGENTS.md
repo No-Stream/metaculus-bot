@@ -62,10 +62,18 @@ Paid / external-effecting — ask before each:
   does and publish to Metaculus. `test_bot_basic.yaml` (one numeric question,
   ~$2.60) and `test_bot.yaml` are `workflow_dispatch`-only, so they fire when
   somebody chooses to fire them — that choice is the operator's. The three
-  `run_bot_on_*.yaml` prod workflows are additionally on `schedule:` crons. **Only `run_bot_on_tournament.yaml` actually runs**: the minibench and Metaculus Cup workflows are
-  `disabled_manually` on GitHub by operator design and have NEVER been enabled (confirmed 2026-09-03), so a
-  supply-probe row saying minibench has 60 closed questions with zero bot forecasts is expected, not a forfeit
-  or a token problem. Do not ask the operator about it again.
+  `run_bot_on_*.yaml` prod workflows are additionally on `schedule:` crons.
+  **`run_bot_on_minibench.yaml` is `disabled_manually` on GitHub by operator design and has
+  NEVER been enabled** (confirmed 2026-09-03), so a supply-probe row saying minibench has 60
+  closed questions with zero bot forecasts is expected, not a forfeit or a token problem. Do
+  not ask the operator about it again. **The Metaculus Cup workflow is being ENABLED for the
+  fall 2026 season** — Metaculus granted $1,500 of API credits on 2026-09-03 so the bot can
+  compete in both the fall cup and the fall bot tournament, and the repo-side configuration
+  landed the same day (`METACULUS_CUP_ID` = `metaculus-cup-fall-2026`, hourly cron, full env
+  parity with the tournament workflow). Until the operator flips it on in the GitHub UI after
+  merge it is still `disabled_manually` and still fires nothing, so a cup supply-probe row
+  with no bot forecasts stays expected in the meantime; `docs/operations.md` "Fall 2026
+  season" tracks what landed and what is left.
   Never dispatch one, and never edit a `schedule:` block or a research/model flag
   in a way that adds runs or raises per-run cost, without the operator's say-so.
   (`gh` needs `--repo No-Stream/metaculus-bot` here: `origin` is the fork,

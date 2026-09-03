@@ -51,7 +51,34 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 > entry, and answered/shipped items moved to "Resolved / shipped" near the bottom rather than being
 > deleted. Note that the round's two largest *measured* levers sit in Near-term, not here: the
 > deterministic numeric tail-consistency check (+11.93 baseline pts on the q44453 cohort) and the
-> gap-fill v2 office-holder precedent rule (~+31 spot-peer pts on q44210).
+> gap-fill v2 office-holder precedent rule (~+31 spot-peer pts on q44210). The fall-2026 season
+> entry added 2026-09-03 below is an operator ACTION rather than an improvement lever, so it is
+> outside that count.
+
+### Fall 2026 season: the cup is configured, the bot tournament has no successor yet (added 2026-09-03, **operator action**)
+
+Metaculus granted $1,500 of API credits on 2026-09-03 for the bot to compete in both the fall
+Metaculus Cup and the fall bot tournament. The cup side is done in the repo: `METACULUS_CUP_ID` holds
+`metaculus-cup-fall-2026` (project 33108, forecasting through 2027-01-01, API-verified), the cup
+workflow is at full env parity with the tournament workflow and runs hourly at :13/:33/:53,
+`FALL_CUP_CONFIGURED` is True so the dated reminder is discharged, and research records are labelled
+by run mode so cup runs no longer archive under the bot tournament's slug. **Two things are still
+open, both the operator's.**
+
+1. **Enable `run_bot_on_metaculus_cup.yaml` on GitHub.** It is `disabled_manually` there, which no
+   merge can change, so the crons fire nothing until it is switched on. There is no repo-side
+   warning for this state; the way to notice is a supply-probe row showing cup questions with no bot
+   forecasts.
+2. **No successor to `summer-futureeval-2026` was published as of 2026-09-03** (id space above the
+   summer tournament empty, four plausible slugs 404, forecasting-tools still pointing
+   `CURRENT_AI_COMPETITION_ID` at summer), so `TOURNAMENT_ID` deliberately stays on the summer season
+   rather than being guessed. **From 2026-09-20** (`TOURNAMENT_END_DATE` plus
+   `TOURNAMENT_HARD_STOP_WEEKS`) `check_tournament_dates` raises, which reddens `--mode tournament`
+   runs and the CI freshness test in `tests/test_tournament_dates.py`. That is the intended reminder,
+   it does not touch the cup (cup mode never calls the check), and the fix when a fall bot tournament
+   appears is to point the constants at it. `make supply_probe` is the free watch: it takes its
+   default slugs from these constants and a dead slug renders as one error row without stopping the
+   other rows. Details and receipts: `docs/operations.md` "Fall 2026 season".
 
 ### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH — operator-confirmed 2026-08-25**)
 
@@ -1572,12 +1599,17 @@ cohort reads **35 questions, expected 26.11, observed 30, exact p = 0.1624**, wi
 needed for exact p<0.05 now **57**, i.e. **short by 22 questions, not the 9 the 2026-08-24 reading
 implied**. The item moved AWAY from the gate rather than merely failing to move: the three new
 top-band ballots hit 2 of 3 against the cohort's own 0.857 realised rate, which lowers the effect
-size and raises the required n. **There is no accrual path inside summer-futureeval-2026.** The
-latest scored MC submission anywhere is 2026-08-15, the tournament closes 2026-09-06, and
-`metaculus-cup-fall-2026` existed but held no posts as of 2026-09-01. So this is not "nine
-questions away", it is a watch item with no remaining supply, to be revisited only if a successor
-tournament opens. The 1% floor stays (operator 2026-07-09: sub-1% headroom ~+0.01 nats/question vs
-parser/clamp regression risk — not worth it).
+size and raises the required n. **There is no accrual path inside summer-futureeval-2026** — the
+latest scored MC submission anywhere is 2026-08-15 and the tournament closes 2026-09-06 — **but
+there is one now outside it.** Updated 2026-09-03: the fall Metaculus Cup is configured
+(`METACULUS_CUP_ID` = `metaculus-cup-fall-2026`, project 33108, forecasting through 2027-01-01) and
+its workflow runs hourly, so cup MC ballots start accruing once the operator enables that workflow
+on GitHub and the cup publishes its first questions (it held 0 as of 2026-09-03). Two caveats before
+counting on it: cup questions are drawn for humans rather than for a bot benchmark, so the MC mix
+may differ from the tournament's, and no successor to `summer-futureeval-2026` existed on 2026-09-03,
+so the tournament side stays closed until one opens. Treat 22 more questions as reachable over the
+fall rather than as arriving on a schedule. The 1% floor stays (operator 2026-07-09: sub-1% headroom
+~+0.01 nats/question vs parser/clamp regression risk — not worth it).
 (`scratch/residual_2026-08-24/dim_binary-mc-calibration.md` §3–4;
 `scratch/residual_2026-09-01/dim_binary-mc-calibration.md` §5.3 and ledger row 11.)
 

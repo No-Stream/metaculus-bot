@@ -37,18 +37,21 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm
 import pytest
+from forecasting_tools import MetaculusApi
 
-from metaculus_bot.cli import RunMode, _forecast_with_callback_drain, _run_forecasts
+from metaculus_bot.cli import RunMode, _forecast_with_callback_drain, _run_forecasts, persisted_tournament_id
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
+    METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
     PROVIDER_DEGRADATION_SUPPRESSED_UNTIL,
+    TOURNAMENT_ID,
     credit_alerts_active,
 )
 from metaculus_bot.credit_telemetry import DonatedKeyState, RoleSpendTracker, reset_donated_key_state_cache
@@ -131,6 +134,7 @@ def _cli_main_test_mode(
     fall_cup_reminder: bool = False,
     today: date | None = None,
     stub_bot: MagicMock | None = None,
+    mode: str = "test_questions",
 ) -> Iterator[MagicMock]:
     """Run ``cli.main`` with all external dependencies stubbed; yields the
     CreditTelemetry stub for call assertions.
@@ -152,6 +156,11 @@ def _cli_main_test_mode(
     ``alertable_count`` COMPUTED through the real property chain rather than
     pinned to a literal (see ``_bot_with_real_alertable_count``). ``alertable_count``
     is ignored when it is supplied.
+
+    ``mode`` is the ``--mode`` value put on the pinned argv. It defaults to
+    ``test_questions`` because that is the cheapest path through ``_question_source``;
+    the run-mode-dependent tests (the research archive's ``tournament_id`` label) pass
+    the mode they are about.
     """
     if stub_bot is None:
         stub_bot = MagicMock()
@@ -170,7 +179,7 @@ def _cli_main_test_mode(
     )
 
     argv_backup = sys.argv
-    sys.argv = ["cli", "--mode", "test_questions"]
+    sys.argv = ["cli", "--mode", mode]
     try:
         with (
             pinned_clock,
@@ -617,6 +626,78 @@ class TestCliResearchFlush:
 
         assert forecaster_class.call_args.kwargs["research_sink"] is None
         assert not (tmp_path / "research_outputs").exists()
+
+
+class TestPersistedTournamentId:
+    """The research archive's ``tournament_id`` label follows the RUN MODE.
+
+    Until 2026-09-03 cli stamped ``TOURNAMENT_ID`` on every record whatever mode was
+    running, so enabling the Metaculus Cup workflow would have filed cup questions under
+    the bot tournament's slug — inside its config-era buckets and inside the supply probe's
+    per-slug rows. That is silent data corruption, not a cosmetic label: nothing else on the
+    record says which competition a question came from, since ``run_mode`` names the
+    pipeline rather than the object.
+    """
+
+    EXPECTED_LABEL: ClassVar[dict[str, str]] = {
+        "tournament": TOURNAMENT_ID,
+        "minibench": str(MetaculusApi.CURRENT_MINIBENCH_ID),
+        "quarterly_cup": METACULUS_CUP_ID,
+        "metaculus_cup": METACULUS_CUP_ID,
+        # No label is right for the evergreen example set (it belongs to no tournament);
+        # this one is retained so the archive's existing test-run records stay comparable.
+        "test_questions": TOURNAMENT_ID,
+    }
+
+    def test_every_run_mode_has_a_decided_label(self) -> None:
+        # Derived from RunMode itself, so a mode added to the Literal without a decision
+        # here fails this test instead of quietly inheriting the tournament's slug.
+        assert set(get_args(RunMode)) == set(self.EXPECTED_LABEL)
+
+    @pytest.mark.parametrize(("run_mode", "expected"), sorted(EXPECTED_LABEL.items()))
+    def test_label_per_run_mode(self, run_mode: RunMode, expected: str) -> None:
+        assert persisted_tournament_id(run_mode) == expected
+
+    def test_the_cup_and_the_bot_tournament_do_not_share_a_label(self) -> None:
+        # The whole point: these two must be distinguishable in the archive.
+        assert persisted_tournament_id("metaculus_cup") != persisted_tournament_id("tournament")
+
+    def test_an_unknown_mode_raises_rather_than_mislabelling(self) -> None:
+        with pytest.raises(ValueError, match="Invalid run mode"):
+            persisted_tournament_id("world_cup")  # type: ignore[arg-type]  # deliberately outside RunMode
+
+    def test_a_cup_run_archives_its_records_under_the_cup_slug(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end through cli's own writer, not just the helper: mode -> label -> JSONL."""
+        monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
+        monkeypatch.chdir(tmp_path)  # writer.flush() writes research_outputs/ under CWD
+
+        forecaster_class = MagicMock()
+        forecaster_class.return_value.alertable_count = 0
+
+        def _record_then_return(*_args: object, **_kwargs: object) -> list[object]:
+            forecaster_class.call_args.kwargs["research_sink"](
+                qid=45500,
+                page_url="https://www.metaculus.com/questions/45500/",
+                question_text="A fall cup question?",
+                research_text="## News Articles (AskNews)\nResearch for 45500.",
+                providers_used=["asknews"],
+                gap_fill_used=False,
+            )
+            return []
+
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="metaculus_cup"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)),
+        ):
+            cli_main()
+
+        written = sorted((tmp_path / "research_outputs").glob("research_*.jsonl"))
+        assert len(written) == 1, f"expected exactly one flushed JSONL, got {written}"
+        records = [json.loads(line) for line in written[0].read_text().strip().splitlines()]
+        assert [(r["run_mode"], r["tournament_id"]) for r in records] == [("metaculus_cup", METACULUS_CUP_ID)]
 
 
 class TestCliCreditAlertSuppression:

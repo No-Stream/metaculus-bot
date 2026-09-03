@@ -3,7 +3,21 @@ name: Forecast on Metaculus Cup
 on:
   workflow_dispatch:
   schedule:
-    - cron: "3 0 */2 * *" # runs at 00:03 every 2 days (off-the-hour to dodge :00 burst)
+    # Split across multiple cron entries to avoid GitHub Actions silently dropping
+    # */N schedules under runner load. Offsets staggered off the tournament workflow's
+    # :03/:23/:43 and minibench's :08/:38 to spread runner pickup — the workflows sit in
+    # separate concurrency groups, so identical minutes would put two full bot runs on the
+    # runners and on the shared AskNews / Gemini / OpenRouter quotas at the same instant.
+    # Make sure to skip already forecasted questions!
+    #
+    # Hourly since 2026-09-03, same cadence as the tournament: a run that finds no new
+    # question makes no LLM call and costs nothing (cli pins
+    # skip_previously_forecasted_questions on for every tournament-shaped mode), so the
+    # cadence buys open-to-forecast latency for free. The every-2-days entry it replaced
+    # could leave a cup question unforecast for most of its window.
+    - cron: "13 * * * *" # every hour at :13
+    - cron: "33 * * * *" # every hour at :33
+    - cron: "53 * * * *" # every hour at :53
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -143,9 +157,10 @@ jobs:
           # benchmarks show value from structured-declaration math.
           PROBABILISTIC_TOOLS_ENABLED: 'false'
           PROBABILISTIC_TOOLS_TYPES: 'binary,multiple_choice'
-          # Prediction-market snapshot provider: Polymarket + Kalshi + Manifold.
-          # is_benchmarking=False in the prod path (this workflow), so the
-          # provider's own benchmarking guard doesn't suppress it here.
+          # Prediction-market snapshot provider: queries Polymarket, Kalshi,
+          # Manifold concurrently and aggregates into research blurb. Hard-
+          # disabled under is_benchmarking=True to prevent backtest leakage
+          # (the prod path is_benchmarking=False, so this fires here).
           PREDICTION_MARKETS_ENABLED: 'true'
           # Tier-1 resolution-source fetcher (plain HTTP + trafilatura, no LLM calls).
           # Validated via live test_bot run 2026-07-10.
@@ -157,11 +172,13 @@ jobs:
           # TS anchor chart image side-channel (vision message to base models).
           # OFF pending the text-vs-image A/B (see FUTURE.md "TS anchor chart image").
           TS_ANCHOR_CHART_ENABLED: 'false'
-          # Stacking disabled on all types (ablation: stacker <= median on binary,
-          # hurts numeric CRPS; stacker base model is a weak binary forecaster).
+          # Disable stacking on all types. n=88 ablation: stacker hurts numeric CRPS
+          # and is <= median on binary; 2026-05-29 peer recompute found the stacker's
+          # own model (claude-opus-4.5) is one of the weakest base binary forecasters.
           NUMERIC_STACKING_ENABLED: 'false'
           BINARY_STACKING_ENABLED: 'false'
           MC_STACKING_ENABLED: 'false'
+          # Suppress openai-agents trace-export background thread (unused).
           OPENAI_AGENTS_DISABLE_TRACING: 'true'
           # Persist research outputs as JSONL for offline backtest replay.
           PERSIST_RESEARCH_ENABLED: 'true'

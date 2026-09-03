@@ -102,8 +102,18 @@ session does not run them — it proposes, the operator runs and decides.
   else that shifts the forecast distribution, before the first question — never
   mid-window (`FUTURE.md`, "FREEZE the triple").
 - **Refresh the tournament constants** (`TOURNAMENT_ID`, the date checks in
-  `constants.py`) and flip the fall-cup reminder off once configured
+  `constants.py`) and flip the cup reminder off once configured
   (`FALL_CUP_CONFIGURED`), or every scheduled run reddens on the reminder.
+  `TOURNAMENT_END_DATE` is the project's `forecasting_end_date`, not its
+  `close_date` — on `summer-futureeval-2026` those sit two months apart.
+- **Read the project object before editing a slug, and note the route.** A project
+  is served at `/api/projects/tournaments/<slug-or-id>/`; a bare
+  `/api/projects/<id>/` 404s for every id, which reads exactly like "this project
+  does not exist" rather than like a wrong route. Slug and numeric id both resolve
+  on the working route. The list endpoint `/api/projects/tournaments/` omits
+  anything whose `visibility` is `unlisted`, which is the state a new season sits
+  in before its first question, so ABSENCE from that list is not evidence a
+  project does not exist — fetch the candidate directly, or walk the id space.
 - **Take a question-supply census with `make supply_probe`.** It counts posts and
   questions at each status per tournament slug, and unlike the two scratch probes
   it replaces it counts post status `closed` — closed to forecasting but not yet
@@ -133,6 +143,77 @@ session does not run them — it proposes, the operator runs and decides.
   report normally, which makes this the cheapest way to watch for the fall cup
   opening: the `metaculus-cup-fall-2026` row goes from zero posts to non-zero on
   the day it does.
+
+### Fall 2026 season: what was done on 2026-09-03, and what is left
+
+Metaculus granted $1,500 of API credits for the bot to compete in both the fall
+Metaculus Cup and the fall bot tournament. Landed in the repo:
+
+- `METACULUS_CUP_ID` now holds `metaculus-cup-fall-2026`. It used to hold the
+  undated `metaculus-cup` slug and rely on Metaculus redirecting it; Metaculus
+  rejects that slug now (the posts list answers HTTP 400 for
+  `tournaments=metaculus-cup`, re-verified 2026-09-03 with `make supply_probe`), so
+  a cup run under it would have found no questions and forfeited the season with
+  nothing in the log saying why. Verified read-only against
+  `/api/projects/tournaments/metaculus-cup-fall-2026/`: project id 33108, name
+  "Metaculus Cup Fall 2026", `start_date` 2026-08-28T12:00:00Z,
+  `forecasting_end_date` 2027-01-01T00:00:00Z, `close_date` 2027-01-04T00:00:00Z,
+  `score_type` `peer_tournament`, `visibility` `unlisted`,
+  `bot_leaderboard_status` `exclude_and_show`, `questions_count` 0. The cup is
+  open but had published nothing yet, and bots forecast on it outside the human
+  leaderboard — `exclude_and_show` is what every recent cup season carries (fall
+  2025, spring 2026 and summer 2026 read identically), so it is the cup's normal
+  setting rather than anything fall-specific. `visibility` reads `unlisted` where
+  those older seasons read `normal`, which is the pre-first-question state.
+  **One analysis consequence: the cup scores on `peer_tournament`, not
+  `spot_peer_tournament` like the bot tournament.** Cup records therefore carry a
+  coverage-scaled `peer_score` and no spot peer, so they cannot be pooled with
+  tournament records on one score field. `performance_analysis/platform_scores.py`
+  already handles that — `RankingScore.tier` keeps spot-scored and peer-only records
+  in separate sort tiers — but any new cut written over fall data has to respect it.
+- `FALL_CUP_CONFIGURED` is True, so the dated reminder that would have reddened
+  every run from 2026-09-15 is discharged, and its CI time bomb in
+  `tests/test_tournament_dates.py` is now a pin that the cup stays pointed at a
+  dated slug. Re-arming it for the spring 2027 cup means re-dating
+  `FALL_CUP_REMINDER_DATE` and setting the flag back to False.
+- `run_bot_on_metaculus_cup.yaml` is at full parity with
+  `run_bot_on_tournament.yaml` — same env block, step caps, Playwright install and
+  artifact upload — and moved from `3 0 */2 * *` (00:03 every second day) to
+  hourly at :13/:33/:53. Hourly costs nothing when nothing is new, because
+  `skip_previously_forecasted_questions` is on, and it removes most of the
+  open-to-forecast latency that forfeited six triple-era questions. The minutes
+  are staggered off the tournament's :03/:23/:43 and minibench's :08/:38 because
+  the three workflows are in separate concurrency groups, so a shared minute means
+  simultaneous runs rather than a queue.
+- Research records are labelled by run mode (`cli.persisted_tournament_id`), so
+  cup runs archive under the cup slug instead of the bot tournament's.
+
+One adjacent thing the grant settles: the credit-alert suppression expires on
+`CREDIT_ALERT_RESUME_DATE` (2026-09-10), after which a donated-key balance below
+`OPENROUTER_CREDIT_FLOOR_USD` ($1.00) exits every run non-zero — which, on an
+hourly cup cron, would mean an hourly red check. `make check_credits` on
+2026-09-03 reads the donated key at **$1,449.19 remaining of a $2,300 limit**, so
+alerting resuming is the correct behaviour rather than a new source of red runs,
+and the suppression can be left to expire on its own.
+
+Still the operator's, and not doable from a merge:
+
+- **Enable the workflow on GitHub.** `run_bot_on_metaculus_cup.yaml` is
+  `disabled_manually` there, which no file in this repo can change, so the crons
+  above do not fire until it is enabled. Nothing in the repo will warn about this;
+  the way to notice is a supply-probe row showing cup questions with no bot
+  forecasts.
+- **The fall bot tournament does not exist yet.** No successor to
+  `summer-futureeval-2026` had been published as of 2026-09-03 (the id space above
+  the summer tournament is empty, the four plausible slugs 404, and
+  forecasting-tools still points `CURRENT_AI_COMPETITION_ID` at the summer id), so
+  `TOURNAMENT_ID` stays on the summer season deliberately rather than being
+  guessed. Consequence: from 2026-09-20 (`TOURNAMENT_END_DATE` plus
+  `TOURNAMENT_HARD_STOP_WEEKS`) `check_tournament_dates` raises and both
+  `--mode tournament` runs and the CI freshness test go red. That is the intended
+  reminder, and it does not touch the cup — the cup mode never calls that check.
+  The cheapest watch is `make supply_probe`: re-run it, and when a fall bot
+  tournament appears, point the constants at it.
 
 ## API keys and the shared-vs-personal key model
 
@@ -275,7 +356,7 @@ retention.
 |---|---|---|---|
 | `run_bot_on_tournament.yaml` | cron at :03/:23/:43 hourly, plus manual | `tournament` | Forecasts new questions in the current AI benchmark tournament (`TOURNAMENT_ID` in `constants.py`); publishes to Metaculus |
 | `run_bot_on_minibench.yaml` | cron at :08/:38 hourly, plus manual | `minibench` | Forecasts the current MiniBench question set; publishes |
-| `run_bot_on_metaculus_cup.yaml` | cron 00:03 every 2 days, plus manual | `metaculus_cup` | Forecasts open Metaculus Cup questions (human + bot competition); publishes |
+| `run_bot_on_metaculus_cup.yaml` | cron at :13/:33/:53 hourly, plus manual | `metaculus_cup` | Forecasts open Metaculus Cup questions (`METACULUS_CUP_ID` in `constants.py`, the season's dated slug); publishes |
 | `test_bot.yaml` | manual only (`workflow_dispatch`) | `test_questions` | Runs a fixed handful of example questions end-to-end in prod mode; publishes comments |
 | `test_bot_basic.yaml` | manual only (`workflow_dispatch`) | `test_questions` | One-question smoke test; publishes one comment. See below |
 
