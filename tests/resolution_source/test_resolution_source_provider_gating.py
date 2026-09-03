@@ -121,7 +121,12 @@ class TestResolutionSourceProvider:
         # diagnostics line (so a healthy provider's line is byte-identical to what it was
         # before the ladder existed) while the archive keeps it, which is what makes "the
         # rung ran and never fired" distinguishable from "this record predates the rung".
-        assert detail["counts"] == {"meta_refresh_hops": 0, "pdf_documents_read": 0, "rung_budget_skips": 0}
+        assert detail["counts"] == {
+            "meta_refresh_hops": 0,
+            "pdf_documents_read": 0,
+            "rung_budget_skips": 0,
+            "pdf_contention_skips": 0,
+        }
         assert _counts_suffix(detail) == ""
 
     def test_duplicate_domains_keep_both_outcomes(self):

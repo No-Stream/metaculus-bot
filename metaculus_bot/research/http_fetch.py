@@ -216,6 +216,53 @@ def reset_host_semaphores() -> None:
     _HOST_SEMAPHORE_LOOP = None
 
 
+# ---------------------------------------------------------------------------
+# Shared PDF-parse gate (at most two documents parsing at once, loop-wide)
+# ---------------------------------------------------------------------------
+#
+# Every route that parses a fetched document contends here — the Tier-1 resolution-source
+# rung and the gap-fill v2 local-document ladder — because the bound has to hold across
+# them, not inside each. The rationale is the one `agentic/local_document.py` states for
+# its own cap verbatim: pypdf decodes every content stream, so a parse is CPU-bound AND
+# holds its body for the duration; a Tier-1 fan-out is up to RESOLUTION_SOURCE_MAX_URLS
+# per question across DEFAULT_MAX_CONCURRENT_RESEARCH questions, so unbounded that is
+# ~30 bodies of up to DOCUMENT_TEXT_PDF_MAX_BYTES plus their parse arenas — a MemoryError
+# no soft-fail boundary catches. Two slots covers a real burst while bounding the peak,
+# and measurement says more would not buy throughput anyway: pypdf is pure Python, so six
+# concurrent parses of a 220-page document took 10.20 s against 1.66 s solo (6.13x on a
+# 10-core machine) while starving the loop that every other provider's I/O runs on.
+#
+# Deliberately hardcoded rather than a constants.py entry: it is a property of pypdf and
+# the default ThreadPoolExecutor's width, not a tuning knob anyone should reach for
+# without re-measuring the numbers above.
+_PDF_PARSE_SLOTS = 2
+_PDF_PARSE_SEMAPHORE: asyncio.Semaphore | None = None
+_PDF_PARSE_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def pdf_parse_semaphore() -> asyncio.Semaphore:
+    """The shared ``Semaphore(2)`` bounding concurrent document parses on the running loop.
+
+    Loop-scoped for the same reason :func:`host_semaphores` is: an ``asyncio.Semaphore``
+    binds to the loop that first blocks on it and raises from any other, so a second
+    ``asyncio.run`` in one process (a backtest's question loop, the test suite) would
+    otherwise crash on contention.
+    """
+    global _PDF_PARSE_SEMAPHORE, _PDF_PARSE_SEMAPHORE_LOOP  # noqa: PLW0603  # module-level cache of the loop's gate
+    loop = asyncio.get_running_loop()
+    if _PDF_PARSE_SEMAPHORE is None or loop is not _PDF_PARSE_SEMAPHORE_LOOP:
+        _PDF_PARSE_SEMAPHORE = asyncio.Semaphore(_PDF_PARSE_SLOTS)
+        _PDF_PARSE_SEMAPHORE_LOOP = loop
+    return _PDF_PARSE_SEMAPHORE
+
+
+def reset_pdf_parse_semaphore() -> None:
+    """Drop the cached parse gate. For tests, so one test's held slot can't gate another's."""
+    global _PDF_PARSE_SEMAPHORE, _PDF_PARSE_SEMAPHORE_LOOP  # noqa: PLW0603  # paired with pdf_parse_semaphore's cache
+    _PDF_PARSE_SEMAPHORE = None
+    _PDF_PARSE_SEMAPHORE_LOOP = None
+
+
 def semaphore_for_host(url: str, sems: dict[str, asyncio.Semaphore]) -> asyncio.Semaphore:
     """Get-or-create the ``Semaphore(1)`` gating requests to ``url``'s netloc.
 

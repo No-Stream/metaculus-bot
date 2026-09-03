@@ -619,6 +619,15 @@ RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host se
 # table). So this is the observed elbow, and it stays deliberately below it: a page above
 # the floor keeps its text (plus the embed disclosure where one applies), because
 # withholding a terse-but-real data table costs more than leaving one shell visible.
+# UNMOVED but re-read 2026-09-03, when `_extract_main_text` dropped `favor_precision=True`:
+# that census was measured on the precision extractor, and dropping the flag only ever
+# LENGTHENS an extraction, so the floor now binds on strictly fewer pages. Live over 149
+# archived HTML URLs, 10 crossed the floor upward and 9 of them carry the resolving content
+# (funding tables, two Yahoo history tables, a market's own resolution rules); the tenth is
+# a JS flight board whose column headers plus disclaimer now total 644, i.e. one shell
+# published where one was withheld. Left where it is: the elbow it was fitted to is a
+# property of what chrome weighs, not of the extractor, and refitting it against a
+# recall-era census is its own measurement.
 RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
 # --- Inline chart configs (Highcharts), read straight out of the page we already hold ---
 # qid 43949: the resolving IOM page fetched 200 and extracted ~80k chars of incident rows

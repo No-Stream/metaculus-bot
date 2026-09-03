@@ -154,6 +154,7 @@ from metaculus_bot.research.http_fetch import (
     host_semaphores,
     meta_refresh_target,
     parse_http_last_modified,
+    pdf_parse_semaphore,
     read_body_capped,
     rewrite_aria_tables,
     semaphore_for_host,
@@ -576,13 +577,21 @@ def _extract_main_text(body: bytes | str, url: str) -> str | None:
     Takes bytes (the response body, letting trafilatura detect the encoding) or text
     (a body this module already decoded and rewrote — see :func:`_extract_page_text`).
 
+    Runs at trafilatura's DEFAULT recall. ``favor_precision=True`` shipped here until
+    2026-09-03 and was the single largest source of withheld-but-readable pages: measured
+    over 97 archived resolution-source URLs it lost text on some pages and gained it on
+    none, and three pages it pruned below the floors (kasa.go.kr 78 chars against 6,567,
+    two tracxn pages) were classified `js_wall` and published to nobody. Precision exists
+    to suppress boilerplate, which is a real cost on a section captioned primary grading
+    evidence, so ``include_comments=False`` stays and the biggest gainers were read by hand
+    for chrome before this flipped — the gains were article bodies and data tables.
+
     Returns None on empty/failed extraction so callers can classify.
     """
     try:
         out = trafilatura.extract(
             body,
             url=url,
-            favor_precision=True,
             include_comments=False,
             include_tables=True,
             output_format="txt",
@@ -1062,6 +1071,16 @@ async def _resolution_pdf_outcome(
     remaining budget capped at ``DOCUMENT_TEXT_MAX_SECONDS``, so a 900-page document
     comes back partial-and-labelled rather than taking the outer wall down with every
     sibling page that already succeeded.
+
+    The parse itself contends for :func:`http_fetch.pdf_parse_semaphore`, the loop-wide
+    2-slot gate this route shares with the gap-fill v2 local-document ladder — the bound
+    has to hold across the two routes, not inside each, because a Tier-1 fan-out alone is
+    up to ``RESOLUTION_SOURCE_MAX_URLS`` documents per question across
+    ``DEFAULT_MAX_CONCURRENT_RESEARCH`` questions. The wait is bounded by the remaining
+    budget less the floor and degrades to the same leave-it-unread skip, since queueing
+    until the outer wall fires would discard every sibling page that already succeeded.
+    Only the parse is gated; the body read is not, because the response is already open
+    and holding it there is what the gate exists to avoid.
     """
     status = resp.status
     netloc = urlparse(current_url).netloc
@@ -1105,15 +1124,56 @@ async def _resolution_pdf_outcome(
             http_status=status,
             content_type=content_type or None,
         )
-    attempt = ctx.start_rung("pdf_local", from_status, current_url)
-    # CPU-bound (pypdf decodes every content stream), so never inline on the loop.
-    pdf = await asyncio.to_thread(
-        extract_pdf_text,
-        body,
-        max_pages=DOCUMENT_TEXT_MAX_PAGES,
-        max_seconds=min(DOCUMENT_TEXT_MAX_SECONDS, budget_s),
-    )
-    attempt.wall_s = max(0.0, time.monotonic() - attempt.started_at)
+    gate = pdf_parse_semaphore()
+    try:
+        # Bounded, not a bare acquire: queueing behind two other documents until the outer
+        # wall fires would discard every sibling page this question already fetched, which
+        # costs strictly more than leaving one document unread. Leaving the floor unspent
+        # means a slot won at the last moment still has time to parse something.
+        await asyncio.wait_for(gate.acquire(), timeout=max(0.0, budget_s - RESOLUTION_SOURCE_PDF_MIN_BUDGET_S))
+    except TimeoutError:
+        logger.warning(
+            "resolution_source: skipping the local PDF read for %s — no parse slot within %.1fs of wall budget",
+            netloc,
+            budget_s,
+        )
+        ctx.skip_rung("pdf_local", from_status, current_url, "parse_contention")
+        return FetchResult(
+            url=current_url,
+            status="unsupported_type",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    try:
+        # Re-read after the wait: the queue itself consumed budget, and `max_seconds` is
+        # wall-clock, so a stale figure would hand pypdf a bound that already expired.
+        budget_s = ctx.rung_budget_s()
+        if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
+            logger.warning(
+                "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left after queueing",
+                netloc,
+                budget_s,
+            )
+            ctx.skip_rung("pdf_local", from_status, current_url, "wall_budget")
+            return FetchResult(
+                url=current_url,
+                status="unsupported_type",
+                text="",
+                http_status=status,
+                content_type=content_type or None,
+            )
+        attempt = ctx.start_rung("pdf_local", from_status, current_url)
+        # CPU-bound (pypdf decodes every content stream), so never inline on the loop.
+        pdf = await asyncio.to_thread(
+            extract_pdf_text,
+            body,
+            max_pages=DOCUMENT_TEXT_MAX_PAGES,
+            max_seconds=min(DOCUMENT_TEXT_MAX_SECONDS, budget_s),
+        )
+        attempt.wall_s = max(0.0, time.monotonic() - attempt.started_at)
+    finally:
+        gate.release()
     if not has_text_layer(pdf):
         reason = _pdf_unreadable_reason(pdf)
         logger.warning(
@@ -1726,6 +1786,10 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         "meta_refresh_hops": sum(1 for attempt in fired if attempt.rung == "meta_refresh"),
         "pdf_documents_read": sum(1 for attempt in fired if attempt.rung == "pdf_local"),
         "rung_budget_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wall_budget"),
+        # Its own count rather than folded into the budget skips: a document left unread
+        # because two others were already parsing says the 2-slot gate is the binding
+        # constraint, which is a different thing to fix than a question that ran late.
+        "pdf_contention_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "parse_contention"),
     }
 
 

@@ -586,10 +586,12 @@ class TestAriaTableRewrite:
     """The stat block that is a table in every way except its tag names.
 
     cdc.gov's outbreak pages build their case/hospitalization/death block out of
-    `<div role="table">` and friends. That is valid accessible markup and completely
-    invisible to trafilatura, which kept whichever values happened to sit inside a `<p>`,
-    dropped the rest, and rendered the survivors with no labels — so a cyclosporiasis
-    question graded on the hospitalization count got a bare "17,180 / 2" and no 922.
+    `<div role="table">` and friends. That is valid accessible markup and no table at all to
+    trafilatura, which renders the block as a whitespace blob of labels and values on
+    separate lines — so a cyclosporiasis question graded on the hospitalization count is
+    handed digits whose pairing with their labels rests on tab runs. (Under the
+    `favor_precision=True` call this module shipped until 2026-09-03 it was worse: the 922
+    was dropped outright.)
     """
 
     def test_the_hospitalization_count_arrives_with_its_label(self):
@@ -600,7 +602,7 @@ class TestAriaTableRewrite:
 
         assert before is not None
         assert after is not None
-        assert "922" not in before, "the pre-rewrite behaviour this rung exists for"
+        assert "| Hospitalizations | 922 |" not in before, "the pre-rewrite behaviour this rung exists for"
         assert "| Hospitalizations | 922 |" in after
         # Every row survives, labelled — including the two whose values were bare text.
         assert "| Laboratory-confirmed cases | 17,180 |" in after

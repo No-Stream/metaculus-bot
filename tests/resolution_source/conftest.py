@@ -12,22 +12,25 @@ from __future__ import annotations
 import pytest
 
 from metaculus_bot.research import resolution_source
-from metaculus_bot.research.http_fetch import reset_host_semaphores
+from metaculus_bot.research.http_fetch import reset_host_semaphores, reset_pdf_parse_semaphore
 from tests.resolution_source_fakes import _INFOGRAM_EMBED_MARKUP, _embed_shell_page
 
 
 @pytest.fixture(autouse=True)
-def _reset_host_gate():
-    """Drop the process-global per-host semaphore map around every test.
+def _reset_shared_gates():
+    """Drop the loop-wide per-host semaphore map and the PDF-parse gate around every test.
 
-    The map deliberately outlives one provider call (that is what makes politeness hold
-    across concurrent questions), so without this a semaphore one test left contended
-    would gate another, and a serialization assertion would pass or fail on test order.
-    It self-heals across event loops too, but resetting is cheap and states the intent.
+    Both deliberately outlive one provider call (that is what makes politeness and the
+    parse bound hold across concurrent questions), so without this a permit one test left
+    held would gate another, and a serialization assertion would pass or fail on test
+    order. They self-heal across event loops too, but resetting is cheap and states the
+    intent.
     """
     reset_host_semaphores()
+    reset_pdf_parse_semaphore()
     yield
     reset_host_semaphores()
+    reset_pdf_parse_semaphore()
 
 
 @pytest.fixture(autouse=True)

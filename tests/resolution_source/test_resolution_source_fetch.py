@@ -20,7 +20,7 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import resolution_chart_data, resolution_source
-from metaculus_bot.research.http_fetch import host_semaphores
+from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_chart_data import CHART_DATA_LEAD, render_inline_chart_data
 from metaculus_bot.research.resolution_source import (
@@ -28,6 +28,7 @@ from metaculus_bot.research.resolution_source import (
     FetchResult,
     _fetch_one,
     _fetch_result_sources,
+    _rung_counts,
     _unreadable_embed_disclosure,
     fetch_resolution_sources,
     format_resolution_sections,
@@ -991,7 +992,12 @@ class TestResolutionSourceFetchMarker:
         ]
         assert not [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
-        assert counts == {"meta_refresh_hops": 0, "pdf_documents_read": 0, "rung_budget_skips": 1}
+        assert counts == {
+            "meta_refresh_hops": 0,
+            "pdf_documents_read": 0,
+            "rung_budget_skips": 1,
+            "pdf_contention_skips": 0,
+        }
 
 
 class TestFetchResolutionSources:
@@ -1392,6 +1398,84 @@ class TestLocalPdfReading:
         assert result.status == "success"
         assert "No passage in this document matched the query" in result.text
         assert "922" not in result.text
+
+
+class TestPdfParseGate:
+    """At most two documents parse at once, loop-wide.
+
+    pypdf decodes every content stream, so a parse is CPU-bound and holds its body for the
+    duration. A Tier-1 fan-out alone is up to RESOLUTION_SOURCE_MAX_URLS documents per
+    question across DEFAULT_MAX_CONCURRENT_RESEARCH questions, and the same gate is shared
+    with the gap-fill v2 local-document ladder because the bound has to hold across both."""
+
+    _PAGES: ClassVar[list[list[str]]] = [
+        ["Annual Surveillance Summary", "Contents: methods, tables, appendix"],
+        ["Hospitalizations reported: 922", "Deaths reported: 2"],
+    ]
+
+    def _session(self, url: str) -> FakeSession:
+        return FakeSession({url: FakeResponse(200, body=build_text_pdf(self._PAGES), content_type="application/pdf")})
+
+    async def test_no_more_than_two_documents_parse_at_once(self, monkeypatch):
+        in_flight = 0
+        peak = 0
+        real_extract = resolution_source.extract_pdf_text
+
+        def counting_extract(body: bytes, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                time.sleep(0.05)
+                return real_extract(body, **kwargs)
+            finally:
+                in_flight -= 1
+
+        monkeypatch.setattr(resolution_source, "extract_pdf_text", counting_extract)
+        hosts = [f"https://h{i}.example.com/report.pdf" for i in range(5)]
+
+        results = await asyncio.gather(
+            *(_fetch_one(self._session(url), url, {}, FetchContext(query="hospitalizations")) for url in hosts)
+        )
+
+        assert peak <= 2, f"the gate admitted {peak} concurrent parses"
+        assert [r.status for r in results] == ["success"] * 5, "the bound queues parses, it does not drop them"
+
+    async def test_a_parse_that_cannot_win_a_slot_inside_the_budget_is_skipped(self, monkeypatch, caplog):
+        """Queueing behind other documents until the outer wall fires would discard every
+        sibling page this question already fetched, which costs more than one unread doc."""
+        gate = None
+
+        async def hold_the_gate():
+            nonlocal gate
+            gate = pdf_parse_semaphore()
+            await gate.acquire()
+            await gate.acquire()
+
+        await hold_the_gate()
+        # Budget just above the floor, so the bounded acquire gives up almost immediately.
+        spent = FetchContext(
+            query="hospitalizations",
+            started=time.monotonic()
+            - (
+                resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
+                - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+                - resolution_source.RESOLUTION_SOURCE_PDF_MIN_BUDGET_S
+                - 0.05
+            ),
+        )
+        url = "https://busy.example.com/report.pdf"
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(self._session(url), url, {}, spent)
+
+        assert result.status == "unsupported_type"
+        assert [a.skipped_reason for a in result.rung_attempts] == ["parse_contention"]
+        assert any("no parse slot" in m for m in caplog.messages)
+        assert _rung_counts([result])["pdf_contention_skips"] == 1
+        assert gate is not None
+        gate.release()
+        gate.release()
 
 
 class TestSharedHostGate:
