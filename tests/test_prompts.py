@@ -1622,6 +1622,71 @@ class TestTemplateStatesEachCheckOnce:
         assert "you must assign a probability (1-99%) to every single option" in flat
 
 
+class TestKeptScaffoldingBullets:
+    """Six bullets the 2026-09-02 de-bloat deliberately KEPT as reasoning scaffolding but
+    that no other test named, so a later cut could have taken any of them and stayed green.
+    AGENTS.md claims every surviving rule has a presence pin on its wording; these are the
+    pins that make that claim true. Each phrase is the bullet's own opening clause, so a
+    reword lands here rather than in a vague substring."""
+
+    @staticmethod
+    def _flat(prompt: str) -> str:
+        return " ".join(prompt.lower().split())
+
+    def _binary(self) -> str:
+        return binary_prompt(_binary_q(), research="r")
+
+    def _mc(self) -> str:
+        return multiple_choice_prompt(_mc_q(), research="r")
+
+    def _numeric(self) -> str:
+        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+
+    def test_binary_worked_examples_keep_their_reason(self) -> None:
+        """Step 0b's meta-justification is an operator keep: it tells the model WHY it is
+        writing two worked examples, which is what stops them becoming a paraphrase."""
+        assert (
+            "this is mechanical bait-and-switch protection: it forces the resolution criteria to be "
+            "consumed as structured constraints rather than treated as a prose paraphrase" in self._flat(self._binary())
+        )
+
+    def test_binary_and_numeric_keep_the_question_specific_base_rate_bullet(self) -> None:
+        assert (
+            "question-specific base rate: the relevant base rate is the historical frequency for questions "
+            "like this one" in self._flat(self._binary())
+        )
+        assert (
+            "question-specific base rate: anchor on the historical frequency, trend, or variance for this "
+            "specific indicator" in self._flat(self._numeric())
+        )
+
+    def test_binary_keeps_the_trajectory_check(self) -> None:
+        """Kept in binary and removed from numeric, where it restated step-3 trend
+        continuation. The numeric absence is pinned by
+        test_numeric_status_quo_derivation_is_the_one_anchor_to_latest_statement."""
+        flat = self._flat(self._binary())
+        assert (
+            'trajectory check: consider whether the "status quo" means "nothing changes" or '
+            '"the current trajectory reaches its natural conclusion"' in flat
+        )
+        assert "justify predictions that diverge from the most likely trajectory" in flat
+
+    def test_mc_keeps_the_blind_spot_and_calibration_audit_bullets(self) -> None:
+        flat = self._flat(self._mc())
+        assert (
+            "blind-spot consideration: if the resolution is unexpected, what would likely be the reason, "
+            "and how should that affect confidence spreads?" in flat
+        )
+        assert "calibration audit: if one option is genuinely dominant, commit to it" in flat
+
+    def test_numeric_keeps_the_small_delta_check(self) -> None:
+        """Numeric's own delta check survives the binary/MC odds-and-delta merge: there is no
+        odds check on a distribution question for it to merge with."""
+        assert "small delta check: would +/- 10 percent on key percentiles still fit the reasoning?" in self._flat(
+            self._numeric()
+        )
+
+
 class TestResolutionMetricEcho:
     """PHASE 0 resolution-metric echo: when the resolution criteria name an
     official statistical series, force the forecaster to name the exact
