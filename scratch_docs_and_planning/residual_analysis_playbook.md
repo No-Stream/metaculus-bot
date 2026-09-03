@@ -69,6 +69,11 @@ The standing set, each reconciling explicitly with the prior round's same-named 
 - ghosts + guards (score_ghosts, structured-JSON presence)
 - cross-tournament / category
 - consensus-miss mode statistics (see Phase 4 rules)
+- clip-threshold sweep (`performance_analysis.clip_threshold`; STRICT run `--exclude-qids
+  known_bug,degraded_run,partial_degraded` plus one unfiltered): each candidate binary/MC floor in spot
+  peer over `all` / `last_N` / `last_90d` / `current_clamp_regime` / `triple_era` and the disjoint `era_*`
+  slices; a floor fitted on older records must carry into the window (a fit that moves nothing is
+  vacuous, not a pass); a candidate looser than the in-force clamp is CENSORED, read `cen` / `cen_m` bounds
 
 ## Phase 4 — Per-question tracing (the centerpiece; often the highest-value output)
 

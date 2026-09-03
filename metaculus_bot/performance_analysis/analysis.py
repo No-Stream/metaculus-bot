@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import numpy as np
-from scipy.stats import spearmanr
+from scipy.stats import beta, spearmanr
 
 from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
@@ -486,11 +486,32 @@ def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: f
     return float(np.interp(resolution, vals, pcts))
 
 
+def jeffreys_ci(k: int, n: int, cl: float = 0.95) -> tuple[float, float, float]:
+    """Beta-Binomial posterior mean + equal-tailed CI under a Jeffreys(0.5, 0.5) prior.
+
+    The one implementation for every ``k of n`` rate this package prints (the width monitor's
+    coverage columns, the clip sweep's extreme-bin and insurance intervals), so the prior and
+    the tail convention cannot drift between two residual tables. Mirrors ``bb`` in
+    mc_numeric_calibration.py.
+    """
+    a = 0.5 + k
+    b = 0.5 + (n - k)
+    mean = a / (a + b)
+    lo = float(beta.ppf((1 - cl) / 2, a, b))
+    hi = float(beta.ppf(1 - (1 - cl) / 2, a, b))
+    return mean, lo, hi
+
+
 # ``b4e9df0`` — the merge that landed the july15 bundle on main. THE single source of
 # truth for this era boundary across the package: width_monitor's ``TS_ANCHOR_ENABLE``
 # aliases it, and every screen gated on the bundle's contents keys on it. Era
 # boundaries are merge-to-main COMMITTER timestamps, never authoring dates.
 B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
+
+# 0e85e1b: numeric k_tail 1.25 -> 1.0 AND the binary clamp [0.01, 0.99] -> [0.02, 0.98].
+WIDENING_FLIP_MERGED_AT = datetime(2026, 5, 18, 17, 21, 19, tzinfo=UTC)
+# 325b1b0 (ft 0.2.54 -> 0.2.92): the MC option clamp [0.005, 0.995] -> [0.01, 0.99].
+FT_0292_MERGED_AT = datetime(2026, 7, 24, 19, 16, 26, tzinfo=UTC)
 
 # ``9f1175c`` (grid-scaled max-step for discrete CDF resampling) rode that merge.
 # Before this instant a flat 0.2 per-bin cap applied at EVERY grid size; after it,

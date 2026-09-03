@@ -39,7 +39,7 @@ from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.llm_retry import TRANSIENT_RETRY_MAX_ELAPSED_S
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
-from metaculus_bot.value_extraction import ExtractionOutcome
+from metaculus_bot.value_extraction import ExtractionOutcome, McForecast
 
 
 @pytest.fixture
@@ -88,12 +88,18 @@ def _binary_outcome(value: float) -> ExtractionOutcome[float]:
     return ExtractionOutcome(value=value, rung="block", block_present=True)
 
 
-def _mc_outcome(pol: PredictedOptionList) -> ExtractionOutcome[PredictedOptionList]:
-    return ExtractionOutcome(value=pol, rung="block", block_present=True)
+def _mc_outcome(pol: PredictedOptionList) -> ExtractionOutcome[McForecast]:
+    return ExtractionOutcome(
+        value=McForecast(pol, [o.probability for o in pol.predicted_options]), rung="block", block_present=True
+    )
 
 
 def _make_option_list(options: list[tuple[str, float]]) -> PredictedOptionList:
     return PredictedOptionList(predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in options])
+
+
+def _member_forecast_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("MEMBER_FORECAST:")]
 
 
 _STANDARD_PERCENTILES: list[Percentile] = [
@@ -129,8 +135,12 @@ class TestRunBinaryForecast:
         assert result.reasoning == reasoning_text
 
     @pytest.mark.asyncio
-    async def test_clamps_below_minimum(self, binary_question, forecaster_llm, parser_llm) -> None:
-        """Values below BINARY_PROB_MIN are clamped up."""
+    async def test_clamps_below_minimum(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Values below BINARY_PROB_MIN are clamped up, and the MEMBER_FORECAST line
+        keeps the pre-clamp value beside the published one."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
         with (
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="Very unlikely")),
@@ -142,10 +152,17 @@ class TestRunBinaryForecast:
             result = await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
 
         assert result.prediction_value == BINARY_PROB_MIN
+        assert _member_forecast_lines(caplog) == [
+            f"MEMBER_FORECAST: question=1001 model=test-forecaster role=member qtype=binary "
+            f"raw=0.001 published={BINARY_PROB_MIN}"
+        ]
 
     @pytest.mark.asyncio
-    async def test_clamps_above_maximum(self, binary_question, forecaster_llm, parser_llm) -> None:
-        """Values above BINARY_PROB_MAX are clamped down."""
+    async def test_clamps_above_maximum(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Values above BINARY_PROB_MAX are clamped down, with the raw value on the marker."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
         with (
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="Nearly certain")),
@@ -157,6 +174,10 @@ class TestRunBinaryForecast:
             result = await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
 
         assert result.prediction_value == BINARY_PROB_MAX
+        assert _member_forecast_lines(caplog) == [
+            f"MEMBER_FORECAST: question=1001 model=test-forecaster role=member qtype=binary "
+            f"raw=0.999 published={BINARY_PROB_MAX}"
+        ]
 
     @pytest.mark.asyncio
     async def test_extraction_rung_logged_via_real_ladder(

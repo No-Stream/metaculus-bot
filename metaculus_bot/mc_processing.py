@@ -17,18 +17,46 @@ _ZERO_MASS_MESSAGE = (
     "MC option probabilities carry no mass across {n} options after clamping; refusing to impute a uniform ballot"
 )
 
+# Slack on the ``n * lo > 1.0`` degenerate test so an exactly feasible ballot never trips it on rounding.
+FLOOR_FEASIBILITY_ATOL: float = 1e-12
 
-def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
-    """Clamp probabilities into ``[MC_PROB_MIN, MC_PROB_MAX]`` and renormalize to sum 1.
 
-    **In-bounds output is guaranteed only when ``n * MC_PROB_MIN < 1.0``** (n <= 100 at the
-    0.01 floor). Above that no in-bounds sum-1 solution exists — 101 options each at least
-    0.01 already exceed 1 — so the degenerate branch below returns a plain
-    clamp-then-renormalize whose values sit BELOW ``MC_PROB_MIN`` (verified: 200 uniform
-    options come back at 0.005 apiece; 100 uniform come back at exactly 0.01, so the
-    boundary for the uniform case is n > 100, not n >= 100). ft's validator then moves
-    them, which is the correct behavior — there is nothing better to return — but it is
-    not the unconditional guarantee this docstring used to claim.
+def clamp_and_renormalize_probs(
+    probabilities: Sequence[float],
+    *,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> list[float]:
+    """Clamp probabilities into ``[lo, hi]`` and renormalize to sum 1.
+
+    ``lo``/``hi`` default to the live ``MC_PROB_MIN``/``MC_PROB_MAX``, so every pipeline
+    caller behaves exactly as it did before the kwargs existed. They are read through a
+    ``None`` sentinel rather than as literal parameter defaults on purpose: a default value
+    binds at function-definition time, which would silently break the monkeypatch surface
+    the suite uses to pin the floor-is-zero behaviour, and would freeze the clamp against a
+    later change to the constant. The kwargs exist for the offline clip-threshold sweep
+    (``performance_analysis.clip_threshold``), which reprices archived ballots at candidate
+    floors; nothing in the live pipeline passes them.
+
+    **In-bounds output is guaranteed only when ``n * lo <= 1.0``** (n <= 100 at the 0.01
+    floor; n <= 10 at a 0.10 sweep floor). Above that no in-bounds sum-1 solution exists —
+    101 options each at least 0.01 already exceed 1 — so the degenerate branch below returns
+    a plain clamp-then-renormalize whose values sit BELOW ``lo`` (verified: 200 uniform
+    options come back at 0.005 apiece). AT the boundary (``n * lo == 1.0``) the unique
+    in-bounds solution is the uniform vector and the normal path converges to it; the guard
+    is a strict comparison for that reason. It used to be ``>=``, which sent an exactly
+    feasible ballot down the degenerate branch and returned sub-floor values: dead at the
+    live 0.01 floor (a 100-option ballot never happens) but live for the sweep, where
+    ``10 * 0.10 == 1.0`` exactly and the archive holds 10-option ballots. The one
+    behaviour delta from that change is at n = 100 with a concentrated ballot, which now
+    returns the uniform 0.01 rather than a sub-floor vector ft's validator would have
+    rejected. The ceiling side has the mirror-image precondition, ``n * hi >= 1.0`` and
+    ``lo < hi``; neither is validated (no caller can pass a violating pair — the live
+    pipeline passes no kwargs and the sweep passes ``lo = c <= 0.10`` with ``hi = 1 - c``),
+    and a violating pair returns a clamped vector that does not sum to 1 rather than
+    raising. ft's validator then moves sub-floor values, which is the correct behavior —
+    there is nothing better to return — but it is not the unconditional guarantee this
+    docstring used to claim.
 
     Callers construct ``PredictedOptionList`` from the result; ft 0.2.92's validator
     re-clamps to ``[0.01, 0.99]`` + renormalizes + raises when any option moves > 0.05,
@@ -53,45 +81,44 @@ def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
     offending options at their bound and rescaling only the still-free mass, iterating
     until the invariant holds.
     """
+    floor = MC_PROB_MIN if lo is None else lo
+    ceiling = MC_PROB_MAX if hi is None else hi
     n = len(probabilities)
     if n == 0:
         return []
-    # Degenerate: the floor alone cannot fit under a unit sum (>= 100 options at a 0.01
-    # floor). No in-bounds sum-1 solution exists; fall back to a single clamp+renorm,
-    # which at least keeps sum ~= 1 for the upstream sum gate.
-    if n * MC_PROB_MIN >= 1.0:
-        # Entering this branch requires MC_PROB_MIN > 0, so every clamped value is at
-        # least that floor and the total is positive by construction — no zero-total
-        # case to guard (it used to return [1/n] * n here).
-        clamped_degenerate = [max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for p in probabilities]
+    # Degenerate (> 100 options at a 0.01 floor): no in-bounds sum-1 solution, so keep sum ~= 1.
+    if n * floor > 1.0 + FLOOR_FEASIBILITY_ATOL:
+        # floor > 0 here, so the total is positive by construction (it used to return [1/n] * n).
+        clamped_degenerate = [max(floor, min(ceiling, p)) for p in probabilities]
         total_degenerate = sum(clamped_degenerate)
         return [p / total_degenerate for p in clamped_degenerate]
 
-    probs = [max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for p in probabilities]
+    probs = [max(floor, min(ceiling, p)) for p in probabilities]
     total = sum(probs)
     if total <= 0:
         raise ValueError(_ZERO_MASS_MESSAGE.format(n=n))
     probs = [p / total for p in probs]
 
-    return _repair_bound_violations(probs)
+    return _repair_bound_violations(probs, floor, ceiling)
 
 
-def _repair_bound_violations(probs: list[float]) -> list[float]:
+def _repair_bound_violations(probs: list[float], floor: float, ceiling: float) -> list[float]:
     """Pin out-of-bounds options at their bound and rescale only the still-free mass.
 
     Iterates because pinning changes the free budget, which can push a previously in-bounds
     option out. Mutates and returns ``probs``; the caller has already clamped + renormalized
     once, so this only fires when the naive divide dragged a floored option back under
-    ``MC_PROB_MIN``.
+    ``floor``. The bounds arrive as arguments rather than being read off the module globals
+    so a caller sweeping candidate floors gets the same repair the live clamp gets.
     """
     n = len(probs)
     pinned = [False] * n
     for _ in range(n):
-        violators = [i for i in range(n) if not pinned[i] and not (MC_PROB_MIN <= probs[i] <= MC_PROB_MAX)]
+        violators = [i for i in range(n) if not pinned[i] and not (floor <= probs[i] <= ceiling)]
         if not violators:
             break
         for i in violators:
-            probs[i] = MC_PROB_MIN if probs[i] < MC_PROB_MIN else MC_PROB_MAX
+            probs[i] = floor if probs[i] < floor else ceiling
             pinned[i] = True
         free = [i for i in range(n) if not pinned[i]]
         if not free:
@@ -100,15 +127,15 @@ def _repair_bound_violations(probs: list[float]) -> list[float]:
         free_sum = sum(probs[i] for i in free)
         if budget <= 0:
             for i in free:
-                probs[i] = MC_PROB_MIN
+                probs[i] = floor
         elif free_sum > 0:
             scale = budget / free_sum
             for i in free:
                 probs[i] *= scale
         else:
             # Free mass to distribute but every free option is exactly 0 — impossible
-            # while MC_PROB_MIN > 0 floors them. Splitting the budget evenly here would
-            # invent a sub-ballot; see _ZERO_MASS_MESSAGE.
+            # while the floor is > 0. Splitting the budget evenly here would invent a
+            # sub-ballot; see _ZERO_MASS_MESSAGE.
             raise ValueError(_ZERO_MASS_MESSAGE.format(n=n))
     return probs
 
@@ -126,6 +153,30 @@ def _normalize_name(name: str) -> str:
         # fallback: remove first word
         return " ".join(stripped.split(" ")[1:]).strip().lower()
     return stripped.lower()
+
+
+def accumulate_declared_option_probs(
+    raw_options: Sequence[OptionProbability],
+    allowed_options: Sequence[str],
+) -> list[tuple[str, float]]:
+    """``(canonical_option, summed_probability)`` pairs in ``allowed_options`` order, UNCLAMPED.
+
+    The one place loosely parsed MC options are matched onto a question's option set:
+    names are matched through ``_normalize_name`` on BOTH sides (it strips a leading
+    "Option " token, so a canonical option literally named "Option A" must be keyed the
+    same way its parsed spelling arrives, or it never matches), duplicates are summed, and
+    unmatched options are skipped. ``build_mc_prediction`` clamps these pairs into a
+    constructible ``PredictedOptionList``; the extraction ladder reads the same pairs for
+    the MEMBER_FORECAST marker's pre-clamp ``raw`` vector, so the two line up index for
+    index by construction rather than by parallel code.
+    """
+    allowed_norm_to_canonical = {_normalize_name(opt): opt for opt in allowed_options}
+    accum: dict[str, float] = {}
+    for item in raw_options:
+        canonical = allowed_norm_to_canonical.get(_normalize_name(item.option_name))
+        if canonical is not None:
+            accum[canonical] = accum.get(canonical, 0.0) + float(item.probability)
+    return [(name, accum[name]) for name in allowed_options if name in accum]
 
 
 def build_mc_prediction(
@@ -151,25 +202,7 @@ def build_mc_prediction(
       typed failure, so the forecaster is dropped and attributed like any other
       extraction failure.
     """
-    # Map normalized allowed names to canonical. Both sides must normalize the
-    # SAME way: incoming items run through _normalize_name (which strips a leading
-    # "Option " token), so the allowed lookup must too — otherwise a canonical
-    # option literally named "Option A" is keyed "option a" here but arrives as
-    # "a", never matches, and gets silently dropped into the even-distribution
-    # fallback (a fabricated uniform forecast). Keying by _normalize_name makes
-    # the match symmetric.
-    allowed_norm_to_canonical = {_normalize_name(opt): opt for opt in allowed_options}
-
-    # Aggregate by canonical option name
-    accum: dict[str, float] = {}
-    for item in raw_options:
-        norm = _normalize_name(item.option_name)
-        if norm in allowed_norm_to_canonical:
-            canonical = allowed_norm_to_canonical[norm]
-            accum[canonical] = accum.get(canonical, 0.0) + float(item.probability)
-
-    # Create list in allowed order, skipping truly missing options
-    pairs: list[tuple[str, float]] = [(name, accum[name]) for name in allowed_options if name in accum]
+    pairs = accumulate_declared_option_probs(raw_options, allowed_options)
 
     if not pairs:
         raise ValueError(
@@ -188,4 +221,4 @@ def build_mc_prediction(
     )
 
 
-__all__ = ["build_mc_prediction", "clamp_and_renormalize_probs"]
+__all__ = ["accumulate_declared_option_probs", "build_mc_prediction", "clamp_and_renormalize_probs"]

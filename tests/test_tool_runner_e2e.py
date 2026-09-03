@@ -42,10 +42,8 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.tool_runner import FEATURE_FLAG_ENV
-from metaculus_bot.value_extraction import ExtractionOutcome
+from metaculus_bot.value_extraction import ExtractionOutcome, McForecast
 from tests.conftest import make_mock_numeric_question
-
-_ = ExtractionOutcome  # imported for use in _PromptCapture.extract_outcome below
 
 # ---------------------------------------------------------------------------
 # Common fixtures: bots and questions
@@ -215,7 +213,11 @@ class _PromptCapture:
         self.parser_response = parser_response
         self.prompts: list[str] = []
 
-    async def stacker_invoke(self, prompt: str) -> str:
+    async def stacker_invoke(self, prompt: str, system_prompt: str | None = None) -> str:
+        """Patched over ``GeneralLlm.invoke`` at class level, so it must carry ft 0.2.92's
+        ``(prompt, system_prompt)`` signature: the fallback stacker is a ``FallbackOpenRouterLlm``
+        whose own ``invoke`` calls ``super().invoke(prompt, system_prompt)``, and a one-argument
+        double made that leg die with a TypeError before it could capture anything."""
         await asyncio.sleep(0)
         self.prompts.append(prompt)
         return self.stacker_response
@@ -240,7 +242,25 @@ class _PromptCapture:
         value = self.parser_response
         if isinstance(value, BinaryPrediction):
             value = float(value.prediction_in_decimal)
+        if isinstance(value, PredictedOptionList):
+            # extract_mc returns the list PAIRED with the declared vector (McForecast); a bare
+            # list here made run_stacking_mc fail and the ladder fall through to MEDIAN while
+            # the prompt these tests assert on had already been captured.
+            value = McForecast(value, [o.probability for o in value.predicted_options])
         return ExtractionOutcome(value=value, rung="block", block_present=True)
+
+
+def _assert_primary_stacker_fired(bot: TemplateForecaster, question: Any) -> None:
+    """Pin that the stacker path these tests claim to exercise actually ran to completion.
+
+    The pipeline's fallback ladder swallows ANY primary-stacker failure and degrades to the
+    fallback LLM and then to MEDIAN, while the prompt the tests assert on is captured before
+    the failure, so a broken seam in the double passes silently (the MC double did exactly
+    that when the ladder's MC outcome grew a second field). ``outcomes`` records which rung
+    produced the aggregate.
+    """
+    qid = question.id_of_question
+    assert bot._stacker_outcome.get(qid) == "primary", bot._stacker_outcome
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +309,7 @@ class TestBinaryStackingCrossModelAggregation:
 
         assert isinstance(aggregated, float)
         assert len(capture.prompts) == 1
+        _assert_primary_stacker_fired(bot, question)
         prompt = capture.prompts[0]
 
         # Cross-model section must land before "Multiple Expert Analyses".
@@ -351,6 +372,7 @@ class TestBinaryStackingCrossModelAggregation:
                 or None,
             )
 
+        _assert_primary_stacker_fired(bot, question)
         assert "Cross-model aggregation (deterministic math)" in capture.prompts[0]
         assert "Pools over 3 forecasters" in capture.prompts[0]
 
@@ -470,6 +492,7 @@ class TestNumericStackingCrossModelAggregation:
                 or None,
             )
 
+        _assert_primary_stacker_fired(bot, question)
         prompt = capture.prompts[0]
         assert "Cross-model aggregation (deterministic math)" in prompt
         # Numeric aggregation should surface the medians line and family hints.
@@ -536,6 +559,8 @@ class TestMcStackingCrossModelAggregation:
                 or None,
             )
 
+        _assert_primary_stacker_fired(bot, question)
+        assert len(capture.prompts) == 1, "a second prompt means the fallback stacker was invoked"
         prompt = capture.prompts[0]
         assert "Cross-model aggregation (deterministic math)" in prompt
         # MC aggregation surfaces the linear-pool top-3.

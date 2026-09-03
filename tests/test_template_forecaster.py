@@ -18,7 +18,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.research import timeseries_anchor as ts_anchor
-from metaculus_bot.value_extraction import ExtractionOutcome
+from metaculus_bot.value_extraction import ExtractionOutcome, McForecast
 
 
 def _stub_open_time() -> datetime:
@@ -342,8 +342,12 @@ async def test_run_forecast_on_multiple_choice_uses_provided_llm(mock_metaculus_
         ]
     )
 
-    async def _fake_extract(*_args, **_kwargs) -> ExtractionOutcome[PredictedOptionList]:
-        return ExtractionOutcome(value=fake_pol, rung="block", block_present=True)
+    async def _fake_extract(*_args, **_kwargs) -> ExtractionOutcome[McForecast]:
+        return ExtractionOutcome(
+            value=McForecast(fake_pol, [o.probability for o in fake_pol.predicted_options]),
+            rung="block",
+            block_present=True,
+        )
 
     with patch("metaculus_bot.forecaster_runners.extract_mc", side_effect=_fake_extract) as mock_extract:
         result = await bot._run_forecast_on_multiple_choice(mock_metaculus_question, "some research", mock_general_llm)

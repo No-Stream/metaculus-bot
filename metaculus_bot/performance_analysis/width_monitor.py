@@ -65,15 +65,16 @@ import logging
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 import numpy as np
-from scipy import stats
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.performance_analysis.analysis import (
     B4E9DF0_MERGED_AT,
+    WIDENING_FLIP_MERGED_AT,
     PitReading,
+    jeffreys_ci,
     out_of_range_pit_reading,
     pit_band_count,
     pit_on_grid,
@@ -85,6 +86,7 @@ from metaculus_bot.performance_analysis.cohorts import (
     parse_exclude_qids,
 )
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
+from metaculus_bot.performance_analysis.markdown import markdown_table
 from metaculus_bot.performance_analysis.outer_tail import render_starved_outer_tails, scan_outer_tails
 from metaculus_bot.performance_analysis.scaling import NUMERIC_TYPES, cdf_and_grid
 from metaculus_bot.time_utils import parse_iso_utc
@@ -132,7 +134,9 @@ class Era:
 # there. A branch can sit for days, and keying on the authoring date files every
 # run in that gap under the wrong config. Re-derive with
 # `TZ=UTC git log -1 --date=iso-local --format='%h %cd' <merge-sha>`.
-WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=UTC)  # 0e85e1b: k_tail 1.25 -> 1.0
+# 0e85e1b: k_tail 1.25 -> 1.0 — aliased for the same reason TS_ANCHOR_ENABLE below is, so
+# this boundary and the clip sweep's binary clamp regime can never disagree.
+WIDENING_FLIP = WIDENING_FLIP_MERGED_AT
 # b4e9df0 (july15 bundle) — aliased so this boundary and the max-step clamp screen's
 # era gate can never disagree; the timestamp's single home is analysis.py.
 TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
@@ -171,17 +175,6 @@ def assign_era(record: dict, eras: list[Era]) -> str:
         if era.contains(dt):
             return era.label
     return NO_TIMESTAMP_LABEL
-
-
-def jeffreys_ci(k: int, n: int, cl: float = 0.95) -> tuple[float, float, float]:
-    """Beta-Binomial posterior mean + equal-tailed CI under a Jeffreys(0.5, 0.5)
-    prior. Mirrors ``bb`` in mc_numeric_calibration.py."""
-    a = 0.5 + k
-    b = 0.5 + (n - k)
-    mean = a / (a + b)
-    lo = float(stats.beta.ppf((1 - cl) / 2, a, b))
-    hi = float(stats.beta.ppf(1 - (1 - cl) / 2, a, b))
-    return mean, lo, hi
 
 
 def compute_pit(record: dict) -> float | None:
@@ -583,13 +576,24 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "denominators can differ. No midpoint is imputed."
     )
     lines.append("")
-    header = (
-        "| era | n | excl | n_eff | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
-        "| PIT std | mean PIT | med rel width (n) | band_miss (lo/hi) | OOB lo/hi | set-valued (pt n) |"
-    )
-    sep = "|" + "|".join(["---"] * (header.count("|") - 1)) + "|"
-    lines.append(header)
-    lines.append(sep)
+    header = [
+        "era",
+        "n",
+        "excl",
+        "n_eff",
+        "cov80 [95% CI]",
+        "cov50 [95% CI]",
+        "cov@10",
+        "cov@50",
+        "cov@90",
+        "PIT std",
+        "mean PIT",
+        "med rel width (n)",
+        "band_miss (lo/hi)",
+        "OOB lo/hi",
+        "set-valued (pt n)",
+    ]
+    rows: list[list[str]] = []
     for m in metrics:
         rel = f"{m.median_rel_width:.3f} ({m.n_width})" if m.median_rel_width is not None else f"n/a ({m.n_width})"
 
@@ -614,7 +618,8 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
             f"{m.n_oob_low}/{m.n_oob_high}",
             f"{m.n_oob_interval} ({m.n_point})",
         ]
-        lines.append("| " + " | ".join(cells) + " |")
+        rows.append(cells)
+    lines += markdown_table(header, rows)
     return "\n".join(lines)
 
 

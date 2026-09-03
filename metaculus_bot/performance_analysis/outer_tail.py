@@ -19,6 +19,7 @@ from enum import StrEnum
 
 import numpy as np
 
+from metaculus_bot.performance_analysis.markdown import markdown_table
 from metaculus_bot.performance_analysis.parsing import declared_anchors, is_anonymous_model_key
 from metaculus_bot.performance_analysis.scaling import NUMERIC_TYPES, cdf_and_grid, grid_zero_point
 from metaculus_bot.performance_analysis.scoring import numeric_log_score
@@ -529,33 +530,37 @@ def render_starved_outer_tails(
         lines.append("")
         return "\n".join(lines)
 
-    header = (
-        "| question | side | declared p | declared value | members (used/dropped) | displayed "
-        "bound | tail mass | bins | mean bin / min step | beyond bound | flat-zone log score "
-        "| title |"
-    )
-    lines.append(header)
-    lines.append("|" + "|".join(["---"] * (header.count("|") - 1)) + "|")
-    for r in scan.starved:
-        lines.append(
-            "| "
-            + " | ".join(
-                [
-                    str(r.question_id),
-                    r.side,
-                    _fmt_measured(r.declared_percentile, "g"),
-                    _fmt_measured(r.declared_value, ".6g"),
-                    _fmt_members(r),
-                    _fmt_measured(r.bound_value, ".6g"),
-                    _fmt_measured(r.tail_mass, ".4f"),
-                    str(r.band_bins),
-                    _fmt_measured(r.floor_multiple, ".2f"),
-                    _fmt_measured(r.beyond_bound_mass, ".4f"),
-                    _fmt_measured(r.flat_zone_log_score, ".1f"),
-                    r.title[:60],
-                ]
-            )
-            + " |"
-        )
+    header = [
+        "question",
+        "side",
+        "declared p",
+        "declared value",
+        "members (used/dropped)",
+        "displayed bound",
+        "tail mass",
+        "bins",
+        "mean bin / min step",
+        "beyond bound",
+        "flat-zone log score",
+        "title",
+    ]
+    rows = [
+        [
+            str(r.question_id),
+            r.side,
+            _fmt_measured(r.declared_percentile, "g"),
+            _fmt_measured(r.declared_value, ".6g"),
+            _fmt_members(r),
+            _fmt_measured(r.bound_value, ".6g"),
+            _fmt_measured(r.tail_mass, ".4f"),
+            str(r.band_bins),
+            _fmt_measured(r.floor_multiple, ".2f"),
+            _fmt_measured(r.beyond_bound_mass, ".4f"),
+            _fmt_measured(r.flat_zone_log_score, ".1f"),
+            r.title[:60],
+        ]
+        for r in scan.starved
+    ]
+    lines += markdown_table(header, rows)
     lines.append("")
     return "\n".join(lines)

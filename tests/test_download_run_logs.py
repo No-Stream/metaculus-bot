@@ -14,6 +14,11 @@ from pathlib import Path
 
 import scripts.download_run_logs as dl
 import scripts.gha_artifacts as gha
+from metaculus_bot.member_forecast import (
+    MEMBER_FORECAST_ROLE_MEMBER,
+    MEMBER_FORECAST_ROLE_STACKER,
+    format_member_forecast_marker,
+)
 from scripts.download_run_logs import (
     RUN_LOG_ARTIFACT_PREFIXES,
     filter_run_log_artifacts,
@@ -329,6 +334,98 @@ class TestNewMarkerSpecsReachTheArchive:
         assert archived[0]["tagged"] == 2
         assert archived[0]["unsupported"] == 1
         assert archived[0]["labels"] == 7
+
+    def test_member_forecast_lines_from_the_real_formatter_round_trip_to_jsonl(self, tmp_path: Path):
+        """The half of the MEMBER_FORECAST end-to-end gate that closes offline.
+
+        Lines built by the REAL formatter (``format_member_forecast_marker``), one per question
+        type and both roles, written as a run log the way the workflow tees stdout, go through
+        ``harvest_run_logs_from_dir`` and ``merge_and_write`` and come back with ``raw`` /
+        ``published`` as VERBATIM JSON literals that ``json.loads`` to the values the formatter
+        was handed — the archive's contract for the one marker that carries a member's value on
+        every question. The other half, that the next real bot run's ``run_logs`` artifact
+        carries the lines at all, needs a live run and is the operator's to confirm.
+        """
+        binary_raw, binary_published = 0.005, 0.02
+        mc_raw, mc_published = [0.9, 0.005, 0.095], [0.891, 0.01, 0.099]
+        numeric_raw = [[0.025, 9.2], [0.05, 9.6], [0.5, 12.1]]
+        numeric_published = [[0.025, 9.2], [0.05, 9.6], [0.5, 12.100000001]]
+        runner_prefix = "2026-09-02 14:23:01,123 - metaculus_bot.forecaster_runners - INFO - "
+        pipeline_prefix = "2026-09-02 14:23:02,000 - metaculus_bot.aggregation_pipeline - INFO - "
+        lines = [
+            runner_prefix
+            + format_member_forecast_marker(
+                question_id=44874,
+                model="openrouter/google/gemini-3.1-pro-preview",
+                role=MEMBER_FORECAST_ROLE_MEMBER,
+                qtype="binary",
+                raw=binary_raw,
+                published=binary_published,
+            ),
+            runner_prefix
+            + format_member_forecast_marker(
+                question_id=45189,
+                model="openrouter/openai/gpt-5.6-sol",
+                role=MEMBER_FORECAST_ROLE_MEMBER,
+                qtype="multiple_choice",
+                raw=mc_raw,
+                published=mc_published,
+            ),
+            pipeline_prefix
+            + format_member_forecast_marker(
+                question_id=45065,
+                model="openrouter/anthropic/claude-opus-4.8",
+                role=MEMBER_FORECAST_ROLE_STACKER,
+                qtype="numeric",
+                raw=numeric_raw,
+                published=numeric_published,
+            ),
+        ]
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text("\n".join([EXTRACTION_LINE, *lines]) + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="903", workflow="tournament", artifact="research-903", run_date="2026-09-02T00:00:00Z"
+        )
+        assert run is not None
+        assert len(run.records["extraction_rung"]) == 1, "the neighbouring marker must still parse beside the new one"
+
+        archive_dir = tmp_path / "archive"
+        assert merge_and_write(archive_dir, [run])["member_forecast"] == 3
+        archived = load_marker_records(archive_dir, "member_forecast")
+        by_qtype = {rec["qtype"]: rec for rec in archived}
+        assert set(by_qtype) == {"binary", "multiple_choice", "numeric"}
+        for rec in archived:
+            assert rec["run_id"] == "903"
+            assert rec["qid_kind"] == "question_id"
+            # Verbatim strings in the archive, never coerced: a consumer json.loads them whatever
+            # the type, instead of a binary float beside two stringified vectors.
+            assert type(rec["raw"]) is str
+            assert type(rec["published"]) is str
+
+        binary = by_qtype["binary"]
+        assert (binary["qid"], binary["role"], binary["model"]) == (
+            44874,
+            "member",
+            "openrouter/google/gemini-3.1-pro-preview",
+        )
+        assert json.loads(binary["raw"]) == binary_raw
+        assert json.loads(binary["published"]) == binary_published
+
+        mc = by_qtype["multiple_choice"]
+        assert (mc["qid"], mc["role"]) == (45189, "member")
+        assert json.loads(mc["raw"]) == mc_raw
+        assert json.loads(mc["published"]) == mc_published
+
+        numeric = by_qtype["numeric"]
+        assert (numeric["qid"], numeric["role"], numeric["model"]) == (
+            45065,
+            "stacker",
+            "openrouter/anthropic/claude-opus-4.8",
+        )
+        assert json.loads(numeric["raw"]) == numeric_raw
+        assert json.loads(numeric["published"]) == numeric_published
 
 
 class TestDownloadTimeoutResilience:

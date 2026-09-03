@@ -1500,6 +1500,70 @@ class TestExtremeCall:
         assert rec["model"] == "unknown"
 
 
+# Verbatim from metaculus_bot/member_forecast.py:format_member_forecast_marker — one line
+# per forecast VALUE that leaves a runner, raw and published as compact JSON literals.
+MEMBER_FORECAST_BINARY_LINE = (
+    PFX + "MEMBER_FORECAST: question=44874 model=openrouter/google/gemini-3.1-pro-preview role=member qtype=binary "
+    "raw=0.005 published=0.02"
+)
+MEMBER_FORECAST_MC_LINE = (
+    PFX + "MEMBER_FORECAST: question=45189 model=openrouter/openai/gpt-5.6-sol role=member qtype=multiple_choice "
+    "raw=[0.9,0.005,0.095] published=[0.891,0.01,0.099]"
+)
+MEMBER_FORECAST_NUMERIC_STACKER_LINE = (
+    PFX + "MEMBER_FORECAST: question=45065 model=openrouter/anthropic/claude-opus-4.8 role=stacker qtype=numeric "
+    "raw=[[0.025,9.2],[0.05,9.6],[0.5,12.1]] published=[[0.025,9.2],[0.05,9.6],[0.5,12.100000001]]"
+)
+
+
+class TestMemberForecast:
+    """The one marker that carries a member's forecast VALUE on every question.
+
+    Before it (2026-09-02) the raw value lived only inside the published comment's fenced
+    block, which is middle-trimmed and only present since 2026-05: the clip-threshold
+    re-read recovered a raw binary probability for 74 of 451 resolved binaries. The two
+    JSON fields are kept VERBATIM (the spec's ``raw_fields``) so a consumer ``json.loads``
+    them whatever the type, rather than a binary line coercing to a float while the
+    vectors stay strings.
+    """
+
+    def test_binary_fields_stay_json_literals(self):
+        rec = _parse_one(MEMBER_FORECAST_BINARY_LINE)
+        assert rec["marker"] == "member_forecast"
+        assert rec["model"] == "openrouter/google/gemini-3.1-pro-preview"
+        assert rec["role"] == "member"
+        assert rec["qtype"] == "binary"
+        assert rec["raw"] == "0.005"
+        assert rec["published"] == "0.02"
+        assert json.loads(rec["raw"]) == 0.005
+
+    def test_mc_vector_survives_whole(self):
+        # Compact JSON carries no whitespace, so ``\S+`` takes the whole array and the
+        # generic comma-splitting key=value pattern never sees it.
+        rec = _parse_one(MEMBER_FORECAST_MC_LINE)
+        assert json.loads(rec["raw"]) == [0.9, 0.005, 0.095]
+        assert json.loads(rec["published"]) == [0.891, 0.01, 0.099]
+
+    def test_numeric_stacker_pairs_and_role(self):
+        rec = _parse_one(MEMBER_FORECAST_NUMERIC_STACKER_LINE)
+        assert rec["role"] == "stacker"
+        assert rec["qtype"] == "numeric"
+        assert json.loads(rec["raw"]) == [[0.025, 9.2], [0.05, 9.6], [0.5, 12.1]]
+        assert json.loads(rec["published"])[2] == [0.5, 12.100000001]
+
+    def test_question_ref_is_a_question_id(self):
+        # Every emitter passes question.id_of_question, the same space as extraction_rung
+        # and forecasters_survived, so the per-member join is free.
+        rec = _parse_one(MEMBER_FORECAST_BINARY_LINE)
+        assert rec["qid"] == 44874
+        assert rec["qid_kind"] == "question_id"
+
+    def test_does_not_collide_with_the_thin_publish_floor_raw_field(self):
+        # Both specs spell a field ``raw``; the per-spec raw_fields keeps this one verbatim
+        # without turning the floor marker's float into a string.
+        assert _parse_one(THIN_PUBLISH_FLOOR_LOW_LINE)["raw"] == 0.03
+
+
 # Verbatim from metaculus_bot/aggregation_pipeline.py:_floor_single_survivor_binary —
 # the single-survivor binary publish floor, logged at WARNING from the base-combine
 # re-entry only when the lone value actually moved.

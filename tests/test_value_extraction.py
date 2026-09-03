@@ -101,7 +101,7 @@ class TestRungBlock:
             outcome = await extract_mc(rationale_with(VALID_MC_BLOCK), OPTIONS, PARSER_LLM)
         assert outcome.rung == "block"
         assert outcome.block_present is True
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert set(probs) == set(OPTIONS)
         assert probs["Option A"] == pytest.approx(0.5, abs=0.02)
         llm.assert_not_awaited()
@@ -169,7 +169,7 @@ class TestRungRepair:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(rationale_with(broken), OPTIONS, PARSER_LLM)
         assert outcome.rung == "repair"
-        assert {o.option_name for o in outcome.value.predicted_options} == set(OPTIONS)
+        assert {o.option_name for o in outcome.value.option_list.predicted_options} == set(OPTIONS)
         llm.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -269,7 +269,7 @@ class TestFinalBlockPrecedence:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
         assert outcome.rung == "repair"
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert probs["Option C"] == pytest.approx(0.7, abs=0.02)  # the final block's answer
         llm.assert_not_awaited()
 
@@ -323,7 +323,7 @@ class TestFinalBlockPrecedence:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
         assert outcome.rung == "block"
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert probs["Option A"] == pytest.approx(0.5, abs=0.02)
         llm.assert_not_awaited()
 
@@ -342,7 +342,7 @@ class TestFinalBlockPrecedence:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
         assert outcome.rung == "block"
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert probs["Option C"] == pytest.approx(0.7, abs=0.02)
         llm.assert_not_awaited()
 
@@ -414,7 +414,7 @@ class TestRungLlm:
             outcome = await extract_mc("no block here at all", OPTIONS, PARSER_LLM)
         assert outcome.rung == "llm"
         assert calls == [PredictedOptionList, list[OptionProbability]]
-        assert {o.option_name for o in outcome.value.predicted_options} == set(OPTIONS)
+        assert {o.option_name for o in outcome.value.option_list.predicted_options} == set(OPTIONS)
 
     @pytest.mark.asyncio
     async def test_llm_out_of_contract_value_rejected(self) -> None:
@@ -641,7 +641,7 @@ class TestMcCanonicalization:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(rationale_with(sloppy), OPTIONS, PARSER_LLM)
         assert outcome.rung == "block"
-        names = [o.option_name for o in outcome.value.predicted_options]
+        names = [o.option_name for o in outcome.value.option_list.predicted_options]
         assert names == OPTIONS  # canonical spellings, allowed order
         llm.assert_not_awaited()
 
@@ -744,6 +744,6 @@ class TestPropertyContract:
                 outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
             except ValueExtractionError:
                 return
-        assert {o.option_name for o in outcome.value.predicted_options} == set(OPTIONS)
-        total = sum(o.probability for o in outcome.value.predicted_options)
+        assert {o.option_name for o in outcome.value.option_list.predicted_options} == set(OPTIONS)
+        total = sum(o.probability for o in outcome.value.option_list.predicted_options)
         assert total == pytest.approx(1.0, abs=0.02)

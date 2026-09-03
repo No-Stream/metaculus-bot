@@ -29,6 +29,12 @@ from pydantic import ValidationError
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER_SOFT_DEADLINE
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_retry import invoke_with_broad_retry
+from metaculus_bot.member_forecast import (
+    MEMBER_FORECAST_ROLE_MEMBER,
+    format_member_forecast_marker,
+    option_vector,
+    percentile_pairs,
+)
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
 from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
@@ -153,6 +159,16 @@ async def run_binary_forecast(
     )
 
     decimal_pred = max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, outcome.value))
+    logger.info(
+        format_member_forecast_marker(
+            question_id=question.id_of_question,
+            model=forecaster_llm.model,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype="binary",
+            raw=outcome.value,
+            published=decimal_pred,
+        )
+    )
 
     logger.info(f"Forecasted URL {question.page_url} with prediction: {decimal_pred}")
     return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
@@ -192,11 +208,21 @@ async def run_mc_forecast(
         question_id=question.id_of_question,
         model_name=forecaster_llm.model,
     )
-    predicted_option_list = outcome.value
+    predicted_option_list = outcome.value.option_list
     try:
         predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
     except ValueError as e:
         logger.warning(f"MC clamp/renormalize failed, using raw predictions: {e}")
+    logger.info(
+        format_member_forecast_marker(
+            question_id=question.id_of_question,
+            model=forecaster_llm.model,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype="multiple_choice",
+            raw=outcome.value.declared_probs,  # the list is clamped on construction; see McForecast
+            published=option_vector(predicted_option_list),
+        )
+    )
 
     logger.info(f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}")
     return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
@@ -299,6 +325,16 @@ def _build_guarded_numeric_distribution(
     """
     sanitized_percentiles, zero_point = sanitize_percentiles(
         declared_percentiles, question, model_name=forecaster_llm.model
+    )
+    logger.info(
+        format_member_forecast_marker(
+            question_id=question.id_of_question,
+            model=forecaster_llm.model,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype="numeric",
+            raw=percentile_pairs(declared_percentiles),
+            published=percentile_pairs(sanitized_percentiles),
+        )
     )
 
     prediction = build_numeric_distribution(

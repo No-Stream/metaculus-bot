@@ -1581,6 +1581,68 @@ parser/clamp regression risk — not worth it).
 (`scratch/residual_2026-08-24/dim_binary-mc-calibration.md` §3–4;
 `scratch/residual_2026-09-01/dim_binary-mc-calibration.md` §5.3 and ledger row 11.)
 
+### Clip-threshold sweep: the binary and MC floors are priced, neither moves (added 2026-09-02, standing residual dim, operator decides)
+
+**The question.** The bot clamps every published probability (binary members into
+`[BINARY_PROB_MIN, BINARY_PROB_MAX]` = [0.02, 0.98] before the median, MC option vectors into
+`[MC_PROB_MIN, MC_PROB_MAX]` = [0.01, 0.99] then renormalised) and nobody had priced those floors. The
+operator asked for a repeatable pass: over every resolved binary and MC question, what floor would have
+maximised spot peer, and does the answer hold across lookback windows? It is now a tracked module,
+`metaculus_bot/performance_analysis/clip_threshold.py`, and a standing Phase 3 dimension of the residual
+playbook; the 2026-09-02 write-up is `scratch/residual_2026-09-01/clip_threshold/dim_clip-threshold.md`
+(with `sweep_strict.md`, `sweep_all.md`, `RECONCILIATION.md` and three refutation passes beside it).
+
+**Dated result (2026-09-02, STRICT cohort = 447 binary / 97 MC, excluding `known_bug`,
+`degraded_run`, `partial_degraded`).**
+
+- The live clamp has bound NO binary publish since it went live: the 70 strict binaries published after
+  the 2026-05-18 widening flip span 0.034 to 0.925, zero at or below 0.02, zero at or above 0.98. The
+  MC floor has bound one option (q45088). So for the live config the clip question is moot in both
+  directions until the ensemble prices below 0.034 again.
+- Raising the binary floor loses in every window and every era: c = 0.05 costs 217.48 spot-peer points
+  pooled (81 records moved, 0 resolving on the clipped side), of which 214.76 is the retired pre-flip
+  regime, 1.05 the post-flip era and 1.67 the triple era; the live-regime figure is 2.72 over 70
+  records (0.039 per question), and that, not the pooled 0.4865 per question, is the decision number.
+  Spot peer is proper, so a calibrated forecaster loses 91.19 of the 217.48 to the clip by construction;
+  the floor pays only if the sub-c band is under-priced, and its break-even hit rate (3.08% at
+  c = 0.05) sits above the Jeffreys upper bound on 0 of 81 (3.0%). 94 publishes at or below 5% produced
+  0 YES against 2.60 expected under the bot's own prices.
+- An MC floor is a tax on every question: c = 0.05 moves 68 of 97 records, 67 of them losing with the
+  resolving option never lifted (renormalisation drag off the top option), 3.53 points per question
+  (95% CI 2.40 to 4.71) and era-stable (3.40 / 3.94 / 3.21 across the three eras).
+- Loosening is censored, not measured: a record published at its in-force floor destroyed the raw
+  member value. Below 0.01 the maximally generous bound is +8.56 over 447 binaries under the
+  published-value rule and +10.91 under the member-level rule (28 records had a clamped member in a
+  median position), all pre-flip; +0.50 over 97 MC questions, and unshippable under forecasting-tools
+  0.2.92 anyway. The one MEASURED comparison runs the other way: today's 0.02 floor priced on the 23
+  pre-flip publishes below it costs 20.31 points, 23 of 23 resolving NO, era-confounded and not a live
+  lever.
+- Every out-of-sample fit returns the do-nothing candidate, so the era test is vacuous rather than
+  passed; the out-of-bag value of "pick the best floor, then apply it" is 0 to minus 0.25 per question
+  in every strict window. Ceiling-only tightening reads +39.70 at c = 0.05 pooled, all of it q42024
+  (pre-flip, 0.97, resolved NO, one of the spring miss cluster the killed YES-side shrink was fitted
+  on), every interval straddling zero, no triple-era record reaching 0.90: **do not pursue**, it is the
+  hard-clip form of the layer killed on 2026-07-08.
+- The only pro-tightening row in either cohort is unfiltered and is one record: q44874, a dry-donated-
+  key publish at 0.03 on a single surviving forecaster that resolved YES, worth +120.40 at c = 0.10 on
+  its own (triple era +107.91 in-window, minus 0.55 per question out of bag). The single-survivor publish
+  floor `[THIN_PUBLISH_BINARY_FLOOR, THIN_PUBLISH_BINARY_CEIL]` = [0.05, 0.95] on this branch fires on
+  exactly that shape: +51.08 over the 4 genuine k=1 publishes in the archive (all in
+  `DEGRADED_RUN_QIDS`), zero on the other three, forward price about minus 2 per future k=1 publish at
+  0.03 that resolves NO.
+
+**Decision status: operator decides; the data supports leaving both floors where they are.** Nothing
+supports tightening either floor (proper-score loss everywhere, no under-priced band), nothing can
+measure loosening on the live roster, and the one shape that ever read pro-tightening already has its
+instrument. Two judgment calls are the operator's: whether the widening flip's binary half (0.01 to
+0.02) is worth revisiting given the +20.31 measured on pre-flip records (it cannot matter until a
+post-flip publish comes within 0.014 of the floor), and whether the MC headroom figure this entry
+supersedes is the one the repo keeps. **Reconciliation with the 2026-07-09 MC decision above:** same
+verdict, independently reached, but the sweep's measured bound (+0.50 total, about +0.005 per question)
+supersedes that entry's "about +0.01 nats/question" estimate (0.01 nats is 1 spot-peer point, so about
++97 over this cohort), two orders of magnitude apart in the same direction. Re-run each round with the
+two commands in the dim doc; the first line to read is the header's live-regime line.
+
 ### File splits + shared fetch-primitive promotion (added 2026-07-18, low, standalone PRs)
 
 Structure findings from the branch-review forge + structure reviewers

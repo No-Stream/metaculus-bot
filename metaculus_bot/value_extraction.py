@@ -41,8 +41,9 @@ telemetry supersedes the deleted shadow-divergence comparison): watch for
 ``rung=llm`` salvages and ``block_present=False`` as the drift signal.
 
 Callers keep their post-processing contracts: binary output is the RAW
-pre-clamp decimal; MC output is the pre-``clamp_and_renormalize_mc`` option
-list; numeric output feeds ``sanitize_percentiles`` unchanged.
+pre-clamp decimal; MC output is a ``McForecast`` pairing the
+pre-``clamp_and_renormalize_mc`` option list with the probabilities as declared;
+numeric output feeds ``sanitize_percentiles`` unchanged.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ import logging
 import math
 import re
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Literal
@@ -63,8 +64,13 @@ from json_repair import repair_json
 from pydantic import ValidationError
 
 from metaculus_bot.exceptions import ValueExtractionError
-from metaculus_bot.mc_processing import build_mc_prediction, clamp_and_renormalize_probs
+from metaculus_bot.mc_processing import (
+    accumulate_declared_option_probs,
+    build_mc_prediction,
+    clamp_and_renormalize_probs,
+)
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.question_types import QuestionType
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
@@ -82,7 +88,6 @@ from metaculus_bot.structured_parse import parse_structured
 logger = logging.getLogger(__name__)
 
 Rung = Literal["block", "repair", "llm"]
-QuestionTypeStr = Literal["binary", "numeric", "multiple_choice"]
 
 # How far back from the rationale tail the unfenced-JSON rescue scans. The
 # block is prompted to be the LAST output, so a lost fence still leaves the
@@ -177,7 +182,7 @@ class _DeterministicHit[T]:
 
 
 def _log_extraction(
-    qtype: QuestionTypeStr,
+    qtype: QuestionType,
     rung: Rung,
     *,
     block_present: bool,
@@ -197,7 +202,7 @@ def _log_extraction(
 def _try_candidate[T](
     candidate: str,
     *,
-    qtype: QuestionTypeStr,
+    qtype: QuestionType,
     convert_block: Callable[[StructuredBlock], T],
     validate: Callable[[T], T],
     try_strict: bool,
@@ -268,7 +273,7 @@ def _try_candidate[T](
 async def _run_ladder[T](
     *,
     text: str,
-    qtype: QuestionTypeStr,
+    qtype: QuestionType,
     convert_block: Callable[[StructuredBlock], T],
     validate: Callable[[T], T],
     llm_extract: Callable[[], Awaitable[T]],
@@ -494,8 +499,33 @@ async def extract_numeric(
 # ---------------------------------------------------------------------------
 
 
-def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], PredictedOptionList]:
-    def _mc_from_block(block: StructuredBlock) -> PredictedOptionList:
+@dataclass
+class McForecast:
+    """A multiple-choice extraction: the constructible option list beside the probabilities as declared.
+
+    ``option_list`` is the pre-``clamp_and_renormalize_mc`` ``PredictedOptionList`` the
+    runner publishes from. ``declared_probs`` is the SAME options' probabilities as the
+    block or the parser declared them, in ``question.options`` order, BEFORE the
+    pre-construction ``clamp_and_renormalize_probs`` (which exists so ft 0.2.92's
+    ``PredictedOptionList`` validator is a no-op). The list can never carry them, since it
+    is clamped on construction, and they are what the MEMBER_FORECAST marker's ``raw``
+    field records. Every rung of ``extract_mc`` produces both halves from one ordered
+    source, so they align index for index by construction.
+    """
+
+    option_list: PredictedOptionList
+    declared_probs: list[float]
+
+
+def _parsed_mc_forecast(raw_options: Sequence[OptionProbability], options: Sequence[str]) -> McForecast:
+    """The LLM rung's product: ``build_mc_prediction``'s clamped list beside the SAME
+    accumulated pairs unclamped, so the declared vector aligns with it by construction."""
+    declared = [prob for _, prob in accumulate_declared_option_probs(raw_options, options)]
+    return McForecast(build_mc_prediction(raw_options, options), declared)
+
+
+def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], McForecast]:
+    def _mc_from_block(block: StructuredBlock) -> McForecast:
         if not isinstance(block, MultipleChoiceStructured):
             raise ValueError(f"expected multiple_choice block, got {type(block).__name__}")
         # Match each block key to a canonical option by case/whitespace-insensitive
@@ -519,19 +549,22 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], Predi
         if total <= 0:
             raise ValueError(f"block option probabilities sum to {total}")
         ordered = [(name, matched[name]) for name in options if name in matched]
-        clamped = clamp_and_renormalize_probs([prob for _, prob in ordered])
-        return PredictedOptionList(
+        declared = [prob for _, prob in ordered]
+        clamped = clamp_and_renormalize_probs(declared)
+        option_list = PredictedOptionList(
             predicted_options=[
                 PredictedOption(option_name=name, probability=prob)
                 for (name, _), prob in zip(ordered, clamped, strict=True)
             ]
         )
+        return McForecast(option_list, declared)
 
     return _mc_from_block
 
 
-def _make_validate_mc(options: list[str]) -> Callable[[PredictedOptionList], PredictedOptionList]:
-    def _validate_mc(pol: PredictedOptionList) -> PredictedOptionList:
+def _make_validate_mc(options: list[str]) -> Callable[[McForecast], McForecast]:
+    def _validate_mc(forecast: McForecast) -> McForecast:
+        pol = forecast.option_list
         names = [o.option_name for o in pol.predicted_options]
         if set(names) != set(options):
             raise ValueError(f"option set mismatch: got {names}, expected {options}")
@@ -541,7 +574,7 @@ def _make_validate_mc(options: list[str]) -> Callable[[PredictedOptionList], Pre
         total = sum(o.probability for o in pol.predicted_options)
         if abs(total - 1.0) > _MC_OPTION_PROB_SUM_TOLERANCE:
             raise ValueError(f"option probabilities sum to {total}, outside 1.0 ± {_MC_OPTION_PROB_SUM_TOLERANCE}")
-        return pol
+        return forecast
 
     return _validate_mc
 
@@ -554,11 +587,12 @@ async def extract_mc(
     prompt_notes: str = "",
     question_id: int | None = None,
     model_name: str = "",
-) -> ExtractionOutcome[PredictedOptionList]:
-    """Extract a PredictedOptionList mapped onto ``options`` (pre-``clamp_and_renormalize_mc``)."""
+) -> ExtractionOutcome[McForecast]:
+    """Extract the option list mapped onto ``options`` (pre-``clamp_and_renormalize_mc``) beside
+    the probabilities as declared; see ``McForecast``."""
     options = list(options)
 
-    async def _llm() -> PredictedOptionList:
+    async def _llm() -> McForecast:
         # Mirror the pre-ladder two-stage tolerant parse: strict
         # PredictedOptionList first, then the loose list[OptionProbability]
         # form. BOTH sub-paths route through build_mc_prediction so parser
@@ -573,13 +607,16 @@ async def extract_mc(
                 OptionProbability(option_name=o.option_name, probability=o.probability)
                 for o in strict.predicted_options
             ]
-            return build_mc_prediction(as_raw, options)
+            # On this strict sub-path ``strict`` is an ft model, already clamped on construction,
+            # so the declared vector is the parser's output AFTER that clamp; only the tolerant
+            # list[OptionProbability] fallback below carries a genuinely pre-clamp vector.
+            return _parsed_mc_forecast(as_raw, options)
         except (ValidationError, ValueError) as exc:
             logger.warning("Primary MC parse failed in llm rung, using tolerant fallback: %s", exc)
             raw: list[OptionProbability] = await parse_structured(
                 text, list[OptionProbability], parser_llm, prompt_notes=prompt_notes
             )
-            return build_mc_prediction(raw, options)
+            return _parsed_mc_forecast(raw, options)
 
     return await _run_ladder(
         text=text,
@@ -594,6 +631,7 @@ async def extract_mc(
 
 __all__ = [
     "ExtractionOutcome",
+    "McForecast",
     "Rung",
     "extract_binary",
     "extract_mc",

@@ -36,6 +36,7 @@ from metaculus_bot.aggregation_strategies import (
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
+from metaculus_bot.member_forecast import MEMBER_FORECAST_ROLE_STACKER, format_member_forecast_marker, percentile_pairs
 from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages
@@ -198,6 +199,16 @@ class AggregationPipeline:
         self.meta_reasoning[qid] = meta_text
 
         percentile_list, zero_point = sanitize_percentiles(list(perc_list), question, model_name=stacker_llm.model)
+        logger.info(
+            format_member_forecast_marker(
+                question_id=qid,
+                model=stacker_llm.model,
+                role=MEMBER_FORECAST_ROLE_STACKER,
+                qtype="numeric",
+                raw=percentile_pairs(perc_list),
+                published=percentile_pairs(percentile_list),
+            )
+        )
 
         mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
         if mismatch:

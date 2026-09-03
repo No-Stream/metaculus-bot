@@ -10,7 +10,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from main import TemplateForecaster
 from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
-from metaculus_bot.value_extraction import ExtractionOutcome
+from metaculus_bot.value_extraction import ExtractionOutcome, McForecast
 
 
 def _stub_open_time() -> datetime:
@@ -166,7 +166,9 @@ async def test_parser_llm_used_for_structured_output():
         pol = PredictedOptionList(
             predicted_options=[PredictedOption(option_name=name, probability=1.0 / len(options)) for name in options]
         )
-        return ExtractionOutcome(value=pol, rung="block", block_present=True)
+        return ExtractionOutcome(
+            value=McForecast(pol, [o.probability for o in pol.predicted_options]), rung="block", block_present=True
+        )
 
     async def _fake_extract_numeric(text, parser_llm, **kwargs):
         # extract_numeric signature: (text, parser_llm, *, ...)
@@ -274,7 +276,9 @@ async def test_mc_additional_instructions_include_options():
                 PredictedOption(option_name="Beta", probability=0.5),
             ]
         )
-        return ExtractionOutcome(value=pol, rung="block", block_present=True)
+        return ExtractionOutcome(
+            value=McForecast(pol, [o.probability for o in pol.predicted_options]), rung="block", block_present=True
+        )
 
     with patch("metaculus_bot.forecaster_runners.extract_mc", _fake_extract_mc):
         await bot._run_forecast_on_multiple_choice(q, "", llm)

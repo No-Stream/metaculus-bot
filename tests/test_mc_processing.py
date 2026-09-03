@@ -16,7 +16,11 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
 from metaculus_bot.exceptions import ValueExtractionError
-from metaculus_bot.mc_processing import build_mc_prediction, clamp_and_renormalize_probs
+from metaculus_bot.mc_processing import (
+    accumulate_declared_option_probs,
+    build_mc_prediction,
+    clamp_and_renormalize_probs,
+)
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.value_extraction import extract_mc
 
@@ -121,7 +125,7 @@ class TestExtractionLadderDropsInsteadOfImputing:
         with patch("metaculus_bot.value_extraction.parse_structured", new=llm):
             outcome = await extract_mc("no block here", OPTIONS, MagicMock())
         assert outcome.rung == "llm"
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert probs["Alpha"] == pytest.approx(0.4, abs=0.02)
 
 
@@ -143,3 +147,31 @@ class TestClampAndRenormalize:
         monkeypatch.setattr("metaculus_bot.mc_processing.MC_PROB_MIN", 0.0)
         with pytest.raises(ValueError, match="carry no mass"):
             clamp_and_renormalize_probs([0.0, 0.0, 0.0])
+
+
+class TestAccumulateDeclaredOptionProbs:
+    """The shared accumulation behind build_mc_prediction and the ladder's declared vector."""
+
+    def test_pairs_are_canonical_ordered_summed_and_unclamped(self):
+        raw = [
+            OptionProbability(option_name="option b", probability=0.001),
+            OptionProbability(option_name="Option A", probability=0.6),
+            OptionProbability(option_name="A", probability=0.3),
+            OptionProbability(option_name="Zed", probability=0.099),
+        ]
+        pairs = accumulate_declared_option_probs(raw, ["A", "B", "C"])
+
+        assert pairs == [("A", pytest.approx(0.9)), ("B", 0.001)]
+
+    def test_build_mc_prediction_is_the_same_pairs_clamped(self):
+        raw = [
+            OptionProbability(option_name="A", probability=0.995),
+            OptionProbability(option_name="B", probability=0.003),
+            OptionProbability(option_name="C", probability=0.002),
+        ]
+        options = ["A", "B", "C"]
+        pairs = accumulate_declared_option_probs(raw, options)
+        pol = build_mc_prediction(raw, options)
+
+        assert [o.option_name for o in pol.predicted_options] == [name for name, _ in pairs]
+        assert [o.probability for o in pol.predicted_options] == clamp_and_renormalize_probs([p for _, p in pairs])

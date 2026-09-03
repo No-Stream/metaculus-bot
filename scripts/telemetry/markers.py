@@ -27,6 +27,12 @@ against the ACTUAL emitted format strings (the source of truth):
   ``_research_and_make_predictions`` (per-QUESTION positive survivor count; the
   drop marker above is silent on a healthy question, and its comment-side twin
   ``FORECASTERS_USED`` never reaches stdout)
+* ``MEMBER_FORECAST``   — ``metaculus_bot/member_forecast.py`` ``format_member_forecast_marker``,
+  emitted from ``forecaster_runners.py`` (each member, all three types), ``stacking.py``
+  (stacker binary / MC) and ``aggregation_pipeline.py`` (stacker numeric): per-VALUE
+  record of what the ladder extracted and what the runner handed on, both as compact
+  JSON. The one marker that carries a member's forecast value on every question; before
+  it the raw value lived only in the trim-lossy published comment
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
   ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
@@ -197,11 +203,17 @@ class MarkerSpec:
     ref (the credit markers). It is stamped onto every harvested record so a
     residual join knows how to translate a query into the record's id space instead
     of guessing (see the module docstring + ``performance_analysis.id_mapping``).
+
+    ``raw_fields`` names fields of THIS spec kept verbatim rather than coerced, on top of
+    the global ``_RAW_FIELDS``. That set is keyed by field name alone, so adding a name
+    there changes its meaning on every spec that uses it (``thin_publish_floor.raw`` is a
+    float, ``member_forecast.raw`` a JSON literal); a per-spec set keeps the two apart.
     """
 
     name: str
     regex: re.Pattern[str]
     qid_kind: str | None = None
+    raw_fields: frozenset[str] = frozenset()
 
 
 def coerce_value(raw: str | None) -> object:
@@ -801,6 +813,37 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # same id space as forecasters_survived / extreme_call
     ),
     MarkerSpec(
+        "member_forecast",
+        # Per-VALUE record of every forecast that leaves a runner
+        # (metaculus_bot/member_forecast.py format_member_forecast_marker): ``raw`` is what
+        # the extraction ladder read off the rationale, ``published`` what the runner
+        # returned after its clamp (binary), clamp-and-renormalise (MC) or sanitise
+        # (numeric). ``role`` is ``member`` for an ensemble forecaster and ``stacker`` for
+        # the meta-forecaster, whose numeric line is emitted by aggregation_pipeline.py
+        # where its percentiles are sanitised.
+        #
+        # This is the only marker that carries a member's VALUE on every question. Before
+        # it (2026-09-02) the raw value existed solely inside the published comment's
+        # per-rationale fenced block — middle-trimmed at COMMENT_CHAR_LIMIT, only present
+        # since 2026-05, and recoverable for 74 of 451 resolved binaries when the
+        # clip-threshold re-read needed it. EXTREME_CALL's ``p`` covers only members past
+        # the extreme band and THIN_PUBLISH_FLOOR only the lone-survivor case.
+        #
+        # ``raw`` and ``published`` are compact JSON literals with NO whitespace (a float,
+        # ``[p1,p2,...]`` in question.options order, or ``[[percentile,value],...]`` with
+        # the percentile as a decimal), so ``\S+`` takes each whole; they are in this
+        # spec's ``raw_fields`` so the archive holds them verbatim and a consumer always
+        # ``json.loads`` — otherwise a binary line would coerce to a float while the MC
+        # and numeric vectors stayed strings. ``model`` is ``.+?`` like extraction_rung's,
+        # since the same ``forecaster_llm.model`` feeds both.
+        re.compile(
+            r"MEMBER_FORECAST:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)\s+role=(?P<role>\S+)"
+            r"\s+qtype=(?P<qtype>\S+)\s+raw=(?P<raw>\S+)\s+published=(?P<published>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # every emitter passes question.id_of_question
+        raw_fields=frozenset({"raw", "published"}),
+    ),
+    MarkerSpec(
         "degradation_counters",
         # The per-run summary that DECIDES CI COLOR (cli.py exits non-zero on a
         # positive alertable_count), emitted by forecaster.py's forecast_questions.
@@ -1177,7 +1220,7 @@ def _build_record(
             for key, value in _KV_PAIR_RE.findall(raw or ""):
                 record[key] = coerce_value(value)
             continue
-        record[field] = raw if field in _RAW_FIELDS else coerce_value(raw)
+        record[field] = raw if (field in _RAW_FIELDS or field in spec.raw_fields) else coerce_value(raw)
     if "question" in record:
         record["qid"] = qid_from_ref(record["question"])
         # ``qid_kind`` names which Metaculus id space ``qid`` lives in, so a residual

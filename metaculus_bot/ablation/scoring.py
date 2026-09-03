@@ -32,6 +32,7 @@ from metaculus_bot.backtest.scoring import (
     numeric_crps_from_report,
     numeric_log_score_from_report,
 )
+from metaculus_bot.bootstrap import bootstrap_means, bootstrap_medians
 from metaculus_bot.scoring_common import PROB_CLAMP_MIN, binary_log_score, brier_score
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -169,9 +170,7 @@ def bootstrap_median_ci(
     if n < BOOTSTRAP_MIN_N:
         return (median, median, median)
 
-    rng = np.random.default_rng(seed)
-    indices = rng.integers(0, n, size=(n_bootstrap, n))
-    boot_medians = np.median(arr[indices], axis=1)
+    boot_medians = bootstrap_medians(arr, n_bootstrap=n_bootstrap, seed=seed)
 
     lo = float(np.percentile(boot_medians, 100 * alpha / 2))
     hi = float(np.percentile(boot_medians, 100 * (1 - alpha / 2)))
@@ -575,9 +574,7 @@ def bootstrap_mean_ci(
     if n < BOOTSTRAP_MIN_N:
         return (mean, mean, mean)
 
-    rng = np.random.default_rng(seed)
-    indices = rng.integers(0, n, size=(n_bootstrap, n))
-    boot_means = arr[indices].mean(axis=1)
+    boot_means = bootstrap_means(arr, n_bootstrap=n_bootstrap, seed=seed)
 
     lo = float(np.percentile(boot_means, 100 * alpha / 2))
     hi = float(np.percentile(boot_means, 100 * (1 - alpha / 2)))

@@ -908,6 +908,22 @@ the telemetry markers:
   — one line per forecast value extraction. Watch for `rung=llm` (LLM salvage
   fired) and `block_present=false` (a forecaster stopped emitting a well-formed
   structured block). Emitted by `_log_extraction` in `value_extraction.py`.
+- `MEMBER_FORECAST: question=... model=... role=member|stacker qtype=... raw=... published=...`
+  — one line per forecast VALUE that leaves a runner, for every ensemble member and
+  for the stacker. `raw` is what the extraction ladder read off the rationale before
+  any clamp, renormalise or sanitise; `published` is what the runner handed on.
+  Both are whitespace-free JSON literals, so `json.loads` them whatever the type:
+  binary a probability each (`raw=0.005 published=0.02`), multiple choice the
+  option-probability vector in `question.options` order (`raw=[0.9,0.005,0.095]`),
+  numeric the declared `[percentile, value]` pairs with the percentile as the
+  block's decimal (`raw=[[0.025,9.2],...]`) and `published` the post-sanitise list.
+  The numeric line precedes the unit-mismatch guard, so a withheld member still
+  leaves its raw declaration (the drop is in `FORECASTER_DROPS`). Emitted by
+  `forecaster_runners.py` (members), `stacking.py` (stacker binary / MC) and
+  `aggregation_pipeline.py` (stacker numeric, where its percentiles are sanitised);
+  formatter in `member_forecast.py`. Added 2026-09-02 because no marker carried a
+  member's value on every question and the published comment, the only other
+  writer, is middle-trimmed and carries the block only since 2026-05.
 - `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... ...` — a
   forecaster put enough mass on the terminal displayed bin of an open-bound
   numeric question, without declaring any percentile beyond the edge, to trip

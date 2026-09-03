@@ -29,7 +29,7 @@ from metaculus_bot.prompts import (
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
-from metaculus_bot.value_extraction import ExtractionOutcome
+from metaculus_bot.value_extraction import ExtractionOutcome, McForecast
 from tests.conftest import make_mock_numeric_question
 
 # _forecasting_window_str asserts on open_time / scheduled_resolution_time;
@@ -176,9 +176,11 @@ def _make_binary_extract(value: float):
 
 
 def _make_mc_extract(pol: PredictedOptionList):
-    async def _fake(*_args, **_kwargs) -> ExtractionOutcome[PredictedOptionList]:
+    async def _fake(*_args, **_kwargs) -> ExtractionOutcome[McForecast]:
         await asyncio.sleep(0)
-        return ExtractionOutcome(value=pol, rung="block", block_present=True)
+        return ExtractionOutcome(
+            value=McForecast(pol, [o.probability for o in pol.predicted_options]), rung="block", block_present=True
+        )
 
     return _fake
 
