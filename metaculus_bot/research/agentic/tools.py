@@ -8,11 +8,15 @@ order the driver sees.
 
 Support pieces live next door: ``tool_descriptions`` (driver-facing text + JSON schemas),
 ``tool_backends`` (the AskNews / Exa / Gemini calls and their result formatting),
-``fetch_outcomes`` (classifying one plain HTTP response). The seams the suite monkeypatches
+``fetch_outcomes`` (classifying one plain HTTP response), ``local_document`` (the local PDF
+rung, the run's document cache, and the passage digest ``read_document`` serves).
+
+The seams the suite monkeypatches
 — ``_read_response_body``, ``_fetch_plain``, ``_try_rendered_fetch``, ``_resolve_pinned_host``,
-``_run_document_read_sync``, ``read_document``, ``_READ_DOCUMENT_TIMEOUT_S``,
-``_RENDERED_FETCH_GLOBAL_SEMAPHORE`` — are attributes of THIS module and are resolved here at
-call time, so their callers stay here even where the callee moved out.
+``_acquire_local_document``, ``_run_document_read_sync``, ``read_document``,
+``_READ_DOCUMENT_TIMEOUT_S``, ``_RENDERED_FETCH_GLOBAL_SEMAPHORE`` — are attributes of THIS
+module and are resolved here at call time, so their callers stay here even where the callee
+moved out.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import ipaddress
 import logging
 import os
 from collections import OrderedDict
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 
@@ -32,21 +37,28 @@ from metaculus_bot.constants import (
     ASKNEWS_CLIENT_ID_ENV,
     ASKNEWS_MAX_TRIES,  # noqa: F401  # re-export: see ASKNEWS_BACKOFF_SECS above
     ASKNEWS_SECRET_ENV,
+    DOCUMENT_DIGEST_TOP_K,
+    DOCUMENT_TEXT_PDF_MAX_BYTES,
     EXA_API_KEY_ENV,
     GOOGLE_API_KEY_ENV,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.agentic import local_document
 from metaculus_bot.research.agentic.fetch_outcomes import (
-    _DOCUMENT_NEEDED_MSG,
     _HTML_CONTENT_TYPE_TOKENS,
-    _RETRYABLE_FETCH_BLOCK_STATUSES,
+    _RETRYABLE_FETCH_BLOCK_STATUSES,  # noqa: F401  # re-export: the suite parametrizes the blocked-status set off this module
     _TEXTUAL_CONTENT_TYPE_TOKENS,
+    DOCUMENT_NEEDED_METHOD,
     PlainFetchResult,
     _body_is_document,
     _content_type_is_document,
+    _content_type_is_image,
+    _content_type_is_pdf,
+    _document_needed_result,
     _extract_links_from_html,
     _fetch_plain_url_block,
+    _non_ok_status_result,
     _plain_html_outcome,
     _plain_redirect_outcome,
     _plain_textual_outcome,
@@ -70,6 +82,7 @@ from metaculus_bot.research.agentic.tool_descriptions import (
     SEARCH_WEB_DESCRIPTION,
 )
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
+from metaculus_bot.research.document_text import is_pdf_body
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     MAX_REDIRECTS,
@@ -83,7 +96,21 @@ logger = logging.getLogger(__name__)
 _FETCH_WINDOW_CHARS = 8000
 _FETCH_CACHE_MAX_ENTRIES = 50
 _RENDERED_FETCH_TIMEOUT_MS = 35_000
+# Fixed settle after the DOM is ready, in place of waiting for network idle. Measured
+# 2026-09-03: 4 of the replay's 10 render rescues came from pages where ``page.goto`` raised
+# TimeoutError with the DOM fully rendered (both ballotpedia questions, both fts.unocha.org
+# summaries) - network idle never arrives on a page carrying a long-poll widget or an
+# analytics beacon, so waiting for it discarded content Chromium already had. The worst case
+# is unchanged rather than longer: the goto budget below is the 35 s cap MINUS this settle.
+_RENDERED_SETTLE_MS = 2_000
 _READ_DOCUMENT_TIMEOUT_S = 60.0
+# read_document is acquisition-first, so its budget holds two rungs: the free local ladder,
+# then the paid reader on what the total leaves it. The ToolSpec ceiling stays 70 s (see
+# build_gap_fill_tools) and so does the loop's wall discipline: 25 + 40 = 65, plus 5 s of
+# margin. The paid reader keeps its whole 60 s whenever acquisition failed fast, which is the
+# common case for the URLs that reach it (archived all-fail p50 0.3 s).
+_LOCAL_DOCUMENT_BUDGET_S = 25.0
+_READ_DOCUMENT_TOTAL_BUDGET_S = 65.0
 # Process-global cap on concurrent headless Chromium launches. Module-level, so
 # the bound spans all questions running under the orchestrator's Semaphore(6):
 # each Chromium is ~100-300MB, the driver's parallel_tool_calls can request many
@@ -216,8 +243,36 @@ def _warn_playwright_unavailable_once(exc: BaseException) -> None:
     logger.warning("agentic fetch rendered rung unavailable: %s: %s", type(exc).__name__, exc)
 
 
-async def _read_response_body(resp: aiohttp.ClientResponse, label: str) -> bytes | None:
-    return await read_body_capped(resp, max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES, label=label)
+async def _read_response_body(
+    resp: aiohttp.ClientResponse, label: str, *, max_bytes: int = RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
+) -> bytes | None:
+    """The response body up to ``max_bytes``, or None past it.
+
+    The cap is a parameter because a declared PDF is read under the document cap rather than
+    the page cap: the 6.7 MB report local extraction reads in 5.3 s is over the page cap, and
+    refusing it here would send the one document the local rung exists for to the paid reader
+    (which returned nothing for that file).
+    """
+    return await read_body_capped(resp, max_bytes=max_bytes, label=label)
+
+
+def _body_too_large_result(current_url: str, content_type: str, *, declared_pdf: bool) -> PlainFetchResult:
+    """The result for a body past its cap — which cap it was decides what the driver is told.
+
+    A declared document gets its own method and message: it was too big to read locally AND
+    too big to be worth having a model retrieve, so read_document reports the same rather than
+    paying a reader for bytes we just refused. Anything else keeps the generic size error.
+    """
+    if declared_pdf:
+        return local_document.oversize_result(current_url, content_type)
+    return PlainFetchResult(
+        status="error",
+        method="plain",
+        text="Fetch body exceeded the size limit.",
+        links=[],
+        url=current_url,
+        content_type=content_type or None,
+    )
 
 
 async def _plain_response_outcome(resp: aiohttp.ClientResponse, current_url: str) -> PlainFetchResult | str:
@@ -226,52 +281,27 @@ async def _plain_response_outcome(resp: aiohttp.ClientResponse, current_url: str
     content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
     if status in REDIRECT_STATUSES:
         return await _plain_redirect_outcome(resp, current_url, content_type)
-    if status in _RETRYABLE_FETCH_BLOCK_STATUSES:
-        return PlainFetchResult(
-            status="blocked",
-            method="plain",
-            text=f"Fetch blocked with HTTP {status}.",
-            links=[],
-            url=current_url,
-            content_type=content_type or None,
-        )
-    if status != 200:
-        return PlainFetchResult(
-            status="error",
-            method="plain",
-            text=f"Fetch failed with HTTP {status}.",
-            links=[],
-            url=current_url,
-            content_type=content_type or None,
-        )
-    if _content_type_is_document(content_type):
-        return PlainFetchResult(
-            status="ok",
-            method="document_needed",
-            text=_DOCUMENT_NEEDED_MSG,
-            links=[],
-            url=current_url,
-            content_type=content_type or None,
-        )
-    body = await _read_response_body(resp, f"agentic fetch {urlparse(current_url).netloc}")
+    non_ok = _non_ok_status_result(status, current_url, content_type)
+    if non_ok is not None:
+        return non_ok
+    if _content_type_is_image(content_type):
+        # An image is the one document shape with no text a local rung could read, so its bytes
+        # buy nothing and it keeps the pre-read escalation to the paid reader. A PDF no longer
+        # takes this exit: its bytes are exactly what the local rung needs.
+        return _document_needed_result(current_url, content_type)
+    declared_pdf = _content_type_is_pdf(content_type)
+    body = await _read_response_body(
+        resp,
+        f"agentic fetch {urlparse(current_url).netloc}",
+        max_bytes=DOCUMENT_TEXT_PDF_MAX_BYTES if declared_pdf else RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+    )
     if body is None:
-        return PlainFetchResult(
-            status="error",
-            method="plain",
-            text="Fetch body exceeded the size limit.",
-            links=[],
-            url=current_url,
-            content_type=content_type or None,
-        )
+        return _body_too_large_result(current_url, content_type, declared_pdf=declared_pdf)
+    if declared_pdf or is_pdf_body(body):
+        # Local extraction first, whether the header said PDF or only the magic bytes did.
+        return await local_document.pdf_fetch_result(body, url=current_url, content_type=content_type)
     if _body_is_document(body):
-        return PlainFetchResult(
-            status="ok",
-            method="document_needed",
-            text=_DOCUMENT_NEEDED_MSG,
-            links=[],
-            url=current_url,
-            content_type=content_type or None,
-        )
+        return _document_needed_result(current_url, content_type)
 
     # Charset-honoring decode (BOM > declared charset > UTF-8), not a
     # forced UTF-8 read: a windows-1252 or UTF-16 body decoded that way
@@ -404,6 +434,40 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
     return host, vetted_ip
 
 
+async def _navigate_and_read_dom(page: Any, url: str, playwright_error: type[BaseException]) -> tuple[str, str]:
+    """Navigate to ``url``, let it settle, and return ``(content_type, html)``.
+
+    Two changes from the original ``networkidle`` navigation, both measured 2026-09-03. The
+    wait condition is ``domcontentloaded`` plus a fixed settle, because network idle never
+    arrives on a page carrying a long-poll widget or an analytics beacon. And a goto failure is
+    SALVAGED rather than treated as a dead rung: Playwright's ``TimeoutError`` subclasses
+    ``Error``, and a timed-out goto routinely leaves a fully rendered DOM behind — 4 of the
+    replay's 10 render rescues came from exactly that (both ballotpedia questions, both
+    fts.unocha.org summaries). A genuine navigation error lands here too and salvages an empty
+    ``about:blank``, which reaches the ladder as the same "rendered read nothing" as before.
+
+    The worst case is unchanged rather than longer: the goto budget is
+    ``_RENDERED_FETCH_TIMEOUT_MS`` MINUS the settle, so goto (33 s) plus settle (2 s) still
+    tops out at the same 35 s cap, and on the common path DOM-ready returns far sooner than
+    network idle did. ``playwright_error`` is passed in because the class comes from the
+    function-scoped optional import in the caller.
+    """
+    try:
+        response = await page.goto(
+            url, wait_until="domcontentloaded", timeout=_RENDERED_FETCH_TIMEOUT_MS - _RENDERED_SETTLE_MS
+        )
+    except playwright_error as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # the salvage above: Playwright's own Error class, passed in from the optional import
+        logger.debug("agentic rendered fetch goto failed, salvaging DOM: %s: %s", type(exc).__name__, exc)
+        response = None
+    await page.wait_for_timeout(_RENDERED_SETTLE_MS)
+    content_type = (
+        (response.headers.get("content-type") or "").lower()
+        if response is not None and hasattr(response, "headers")
+        else ""
+    )
+    return content_type, await page.content()
+
+
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     try:
         from playwright.async_api import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
@@ -474,22 +538,9 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
             await context.route("**/*", _guard_route)
             page = await context.new_page()
             try:
-                response = await page.goto(url, wait_until="networkidle", timeout=_RENDERED_FETCH_TIMEOUT_MS)
-                content_type = (
-                    (response.headers.get("content-type") or "").lower()
-                    if response is not None and hasattr(response, "headers")
-                    else ""
-                )
+                content_type, html = await _navigate_and_read_dom(page, url, PlaywrightError)
                 if _content_type_is_document(content_type):
-                    return PlainFetchResult(
-                        status="ok",
-                        method="document_needed",
-                        text="This URL is a PDF or image — use read_document(url, ask) to read it.",
-                        links=[],
-                        url=url,
-                        content_type=content_type or None,
-                    )
-                html = await page.content()
+                    return _document_needed_result(url, content_type)
                 body = html.encode("utf-8", errors="replace")
                 extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, url)
                 links = _extract_links_from_html(html, url)
@@ -556,6 +607,124 @@ def _generic_document_ask(question_topic: str) -> str:
     return f"Extract the main content relevant to: {question_topic}"
 
 
+def _pdf_local_outcome(url: str, plain: PlainFetchResult, *, start_char: int) -> ToolOutcome:
+    """Serve a locally extracted PDF, then hold it for the rest of the run.
+
+    The text goes through the same window/cache path an HTML page does, so ``start_char``
+    paginates a 220-page report exactly as it paginates a long article. The parse is also
+    re-keyed under the URL the driver asked for: the extraction cached it under the final hop,
+    and a later ``read_document`` on the original URL would otherwise refetch and reparse it.
+    """
+    pdf = local_document.cached_document(plain.url)
+    if pdf is not None:
+        local_document.cache_document(url, pdf)
+    local_document.log_local_document_read(
+        url,
+        method=local_document.PDF_LOCAL_METHOD,
+        chars=len(plain.text),
+        pages=None if pdf is None else pdf.pages_read,
+        passages=None,
+    )
+    return _read_content_outcome(url, plain.text, plain.links, method=plain.method, start_char=start_char)
+
+
+def _held_from_result(url: str, result: PlainFetchResult) -> local_document.HeldDocument:
+    """What one ladder rung's result leaves us holding for ``url``.
+
+    A parse from the local PDF rung wins over the flat text, because its page offsets are what
+    make a digest's ``[p.N]`` labels exact; a scan is still held (page structure, no text), so
+    the caller knows the free route is exhausted rather than untried. Text we do hold is cached
+    for the run, so a later paginated ``fetch`` of the same URL is free.
+    """
+    if result.method == local_document.OVERSIZE_DOCUMENT_METHOD:
+        return local_document.HeldDocument(oversize=True)
+    pdf = local_document.cached_document(result.url)
+    if pdf is not None:
+        held = local_document.held_pdf(pdf)
+    elif result.status == "ok" and result.method != DOCUMENT_NEEDED_METHOD:
+        held = local_document.HeldDocument(text=result.text.strip())
+    else:
+        # A document_needed result is "ok" and carries a placeholder sentence telling the driver
+        # to use read_document. Reading that as the page's text would hand the digest our own
+        # instruction to itself, so it holds nothing, exactly like a failed rung.
+        return local_document.HeldDocument()
+    if held.has_text and matched_throttle_phrase(held.text) is not None:
+        # A rate-limit interstitial is not the document (q45191). Hold nothing, so the paid
+        # reader — which dials from Gemini's address rather than ours — gets its turn.
+        return local_document.HeldDocument()
+    if held.has_text:
+        _cache_fetch_result(url, held.text, result.links)
+    return held
+
+
+async def _run_local_document_ladder(url: str) -> local_document.HeldDocument:
+    """The free rungs ``fetch`` runs, plain then rendered, for a document read.
+
+    Escalation follows ``fetch``'s own rule rather than a looser one: a page whose plain text is
+    thin enough to look like a JavaScript shell goes to the browser even though we hold
+    something, because digesting 100 chars of navigation chrome would answer the ask out of
+    furniture. A parse ends the ladder either way — a scan is as far as the free route reaches,
+    and that is worth knowing rather than re-fetching.
+    """
+    plain = await _fetch_plain(url)
+    held = _held_from_result(url, plain)
+    if held.oversize or held.pdf is not None or plain.method == DOCUMENT_NEEDED_METHOD:
+        # A parse, a refusal, or a document no local rung can read: an image, or a PDF with no
+        # text layer (whose parse the cache already holds). A browser reads neither, so the free
+        # ladder ends here rather than spending a Chromium launch to learn that again.
+        return held
+    if held.has_text and not plain.escalate_rendered:
+        return held
+    if plain.status in ("ok", "empty"):
+        rendered = await _try_rendered_fetch(plain.url)
+        if rendered is not None:
+            rendered_held = _held_from_result(url, rendered)
+            if rendered_held.has_text:
+                return rendered_held
+    return held
+
+
+async def _acquire_local_document(url: str) -> local_document.HeldDocument:
+    """What the free ladder holds for ``url``: something already read this run, or a fresh try.
+
+    Bounded by ``_LOCAL_DOCUMENT_BUDGET_S`` so a slow host cannot spend the paid reader's
+    budget as well as its own; on expiry we hold nothing and the reader gets its turn. The
+    cancelled work includes at most one in-flight extraction thread, which finishes and drops
+    its result (a thread cannot be cancelled) inside its own ``max_seconds``.
+    """
+    cached_pdf = local_document.cached_document(url)
+    if cached_pdf is not None:
+        return local_document.held_pdf(cached_pdf)
+    cached_text = _FETCH_TEXT_CACHE.get(url)
+    if cached_text is not None:
+        _FETCH_TEXT_CACHE.move_to_end(url)
+        return local_document.HeldDocument(text=cached_text)
+    try:
+        return await asyncio.wait_for(_run_local_document_ladder(url), timeout=_LOCAL_DOCUMENT_BUDGET_S)
+    except TimeoutError:
+        logger.info(
+            "agentic read_document local acquisition exceeded %.0fs, falling back to the reader: %s",
+            _LOCAL_DOCUMENT_BUDGET_S,
+            urlparse(url).netloc,
+        )
+        return local_document.HeldDocument()
+
+
+def _local_digest_outcome(url: str, ask: str, held: local_document.HeldDocument) -> ToolOutcome:
+    """Answer the ask from text we hold, deterministically and for free."""
+    digest = local_document.digest_held(
+        held, ask=ask, top_k=DOCUMENT_DIGEST_TOP_K, max_chars=_FETCH_WINDOW_CHARS, source_url=url
+    )
+    local_document.log_local_document_read(
+        url,
+        method=local_document.DIGEST_LOCAL_METHOD,
+        chars=len(held.text),
+        pages=None if held.pdf is None else held.pdf.pages_read,
+        passages=digest.passages,
+    )
+    return ToolOutcome(content_markdown=digest.block, method=local_document.DIGEST_LOCAL_METHOD)
+
+
 async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> ToolOutcome:
     cached = _fetch_from_cache(url, start_char)
     if cached is not None:
@@ -564,19 +733,28 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
     plain = await _fetch_plain(url)
     if plain.status == "blocked":
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="blocked")
-    if plain.method == "document_needed":
-        # Rung 3: auto-escalate PDFs/images to the read_document backend so the
-        # driver keeps its "handled automatically" contract without spending a
-        # second tool call. read_document stays separately exposed for directed asks.
+    if plain.method == local_document.PDF_LOCAL_METHOD:
+        return _pdf_local_outcome(url, plain, start_char=start_char)
+    if plain.method == DOCUMENT_NEEDED_METHOD:
+        # Auto-escalate to the read_document backend so the driver keeps its "handled
+        # automatically" contract without spending a second tool call. What reaches here is an
+        # image, or a PDF the local rung already proved has no text layer - its parse is
+        # cached, so the escalation costs neither a second request nor a second parse.
         return await read_document(plain.url, _generic_document_ask(question_topic))
     if plain.status not in ("ok", "empty"):
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="error")
     if plain.status == "ok" and not plain.escalate_rendered:
-        return _read_content_outcome(url, plain.text, plain.links, method="plain", start_char=start_char)
+        return _read_content_outcome(url, plain.text, plain.links, method=plain.method, start_char=start_char)
+    return await _rendered_escalation_outcome(url, plain, start_char=start_char, question_topic=question_topic)
 
+
+async def _rendered_escalation_outcome(
+    url: str, plain: PlainFetchResult, *, start_char: int, question_topic: str
+) -> ToolOutcome:
+    """The ladder's last rungs: headless Chromium, then whatever the plain rung really read."""
     rendered = await _try_rendered_fetch(plain.url)
     if rendered is not None:
-        if rendered.method == "document_needed":
+        if rendered.method == DOCUMENT_NEEDED_METHOD:
             return await read_document(rendered.url, _generic_document_ask(question_topic))
         if rendered.status == "ok" and rendered.text:
             return _read_content_outcome(url, rendered.text, rendered.links, method="rendered", start_char=start_char)
@@ -586,30 +764,50 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
     # laundered as a successful "plain"/"ok" retrieval (the companiesmarketcap.com
     # js-wall failure: an unread page stamped `fetched` and superseded the briefing).
     if plain.status == "ok":
-        return _read_content_outcome(url, plain.text, plain.links, method="plain", start_char=start_char)
+        return _read_content_outcome(url, plain.text, plain.links, method=plain.method, start_char=start_char)
     return _empty_fetch_outcome(plain.url)
 
 
 async def read_document(url: str, ask: str) -> ToolOutcome:
-    """Read a document via Gemini url_context, granting the ``fetched`` tier only on a real read.
+    """Answer ``ask`` about ``url``: from the page's own text where we can get it, else Gemini.
 
-    ``method="document"`` maps to the ``fetched`` tier (``loop._METHOD_TO_TIER``), which is
-    the highest authority the artifact renderer has: only a ``fetched`` discrepancy enters
-    the SUPERSEDE block that tells every forecaster to override the briefing. So a
-    fluent-but-ungrounded answer here is the Q38195 failure mode with a bigger blast
-    radius, and the quote check can't catch it — it is deliberately WARN-only for this
-    tool (paraphrase and ellipsis-joined quotes make a hard gate too false-positive-prone).
+    Acquisition-first. The free ladder runs before anything is spent (this run's cache, then
+    the plain and rendered rungs ``fetch`` uses), and any text it holds is answered with a
+    deterministic BM25 passage digest — ``method="digest_local"``. The paid ``url_context``
+    read happens only when the ladder holds nothing: a host that refuses us, a page with no
+    text at all, or a PDF with no text layer. Measured 2026-09-03, that is two of 47 archived
+    fetch failures, against 191 reader calls over the 2026 summer season.
 
-    Hence the retrieval-count guard below, mirroring the grounded-chunk floor
-    ``gemini_search`` already applies: zero successful url_context retrievals withholds the
-    tier exactly like the empty-text guard does, rather than laundering parametric recall
-    as a primary-source read.
+    The retrieval-count guard on the paid rung stays exactly as it was, because it is what
+    keeps that rung honest: ``method="document"`` maps to the ``fetched`` tier
+    (``provenance._METHOD_TO_TIER``), the highest authority the artifact renderer has — only a
+    ``fetched`` discrepancy enters the SUPERSEDE block that tells every forecaster to override
+    the briefing. A fluent-but-ungrounded answer there is the Q38195 failure mode with a bigger
+    blast radius, and the quote check cannot catch it (WARN-only for this tool, since
+    paraphrase and ellipsis-joined quotes make a hard gate too false-positive-prone). So zero
+    successful url_context retrievals withholds the tier, mirroring the grounded-chunk floor
+    ``gemini_search`` applies. The local methods earn the same tier for the opposite reason:
+    the bytes are the host's own, decoded rather than described.
     """
+    started = monotonic()
+    held = await _acquire_local_document(url)
+    if held.oversize:
+        return _format_fetch_error(local_document.oversize_message(url), method=local_document.OVERSIZE_DOCUMENT_METHOD)
+    if held.has_text or local_document.exceeds_url_context_size_gate(held.text):
+        # The size gate rides the same branch as the text it guards, so the two can never
+        # disagree: a document we hold is served from the digest whatever its size, and the
+        # biggest are the clearest case — the nine archived documents past the gate carried 67%
+        # of the season's reader tokens and the largest of them returned nothing for the money.
+        return _local_digest_outcome(url, ask, held)
     if not os.getenv(GOOGLE_API_KEY_ENV):
         return _format_fetch_error(f"Google API key is not configured; set {GOOGLE_API_KEY_ENV}.", method="document")
     try:
+        # The reader gets what the total budget has left, so a long acquisition shortens the
+        # paid attempt instead of overrunning the tool's ceiling. Acquisition is itself capped
+        # at _LOCAL_DOCUMENT_BUDGET_S, so this is never below 40 s.
         text, n_url_success, statuses = await asyncio.wait_for(
-            asyncio.to_thread(_run_document_read_sync, url, ask), timeout=_READ_DOCUMENT_TIMEOUT_S
+            asyncio.to_thread(_run_document_read_sync, url, ask),
+            timeout=min(_READ_DOCUMENT_TIMEOUT_S, _READ_DOCUMENT_TOTAL_BUDGET_S - (monotonic() - started)),
         )
     except TimeoutError:
         return _format_fetch_error("Document read timed out.", method="document")
@@ -665,6 +863,9 @@ def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
             description=READ_DOCUMENT_DESCRIPTION,
             parameters=_READ_DOCUMENT_PARAMETERS,
             handler=read_document,
+            # UNCHANGED at 70 even though the handler now runs a free local ladder before the
+            # paid read: the two share _READ_DOCUMENT_TOTAL_BUDGET_S (65) and 70 stays at
+            # GAP_FILL_V2_CONCLUDE_THRESHOLD, so the loop's wall discipline is untouched.
             timeout_s=70,
         ),
     ]

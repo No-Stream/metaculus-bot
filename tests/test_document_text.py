@@ -28,6 +28,8 @@ from metaculus_bot.research.document_text import (
     DEFAULT_WINDOW_CHARS,
     TEXT_LAYER_MIN_CHARS,
     PdfText,
+    digest_pdf,
+    digest_text,
     extract_pdf_text,
     has_text_layer,
     is_pdf_body,
@@ -603,3 +605,97 @@ class TestRenderDocumentDigest:
         assert is_pdf_body(data)
         assert pdf.outline == (("Cover", 1), ("Ridership", 2))
         assert "[p.2] The shuttle carried 47 passengers" in digest
+
+
+class TestDigestCounts:
+    """``digest_pdf`` / ``digest_text``: the same block, plus how many passages it carries.
+
+    The count is what says whether a digest ANSWERED the ask — zero passages means the document
+    does not discuss it, which in the block itself reads exactly like a successful read. The
+    gap-fill v2 loop logs it per document, so a caller that only wants the text keeps using
+    ``render_document_digest``.
+    """
+
+    URL = "https://example.gov/report.pdf"
+
+    def _pdf(self) -> PdfText:
+        pages = (
+            "Chapter 1. The programme was announced in March.",
+            "The shuttle carried 47 passengers on its final approach.",
+        )
+        return PdfText(len(pages), len(pages), pages, "", ())
+
+    def test_render_document_digest_is_the_digest_block(self) -> None:
+        kwargs = {"query": "passengers", "top_k": 2, "max_chars": 4000, "source_url": self.URL}
+        assert render_document_digest(self._pdf(), **kwargs) == digest_pdf(self._pdf(), **kwargs).block
+
+    def test_pdf_digest_counts_its_passages(self) -> None:
+        digest = digest_pdf(self._pdf(), query="passengers shuttle", top_k=2, max_chars=4000, source_url=self.URL)
+
+        assert digest.passages == 1
+        assert "[p.2] The shuttle carried 47 passengers" in digest.block
+
+    def test_a_query_nothing_matches_counts_zero(self) -> None:
+        digest = digest_pdf(self._pdf(), query="hydroelectric turbine", top_k=3, max_chars=4000, source_url=self.URL)
+
+        assert digest.passages == 0
+        assert "No passage in this document matched the query" in digest.block
+
+    def test_an_unreadable_document_counts_zero(self) -> None:
+        digest = digest_pdf(
+            PdfText(0, 0, (), "", (), unreadable_reason="encrypted"),
+            query="anything",
+            top_k=3,
+            max_chars=2000,
+            source_url=self.URL,
+        )
+
+        assert digest.passages == 0
+        assert "could not be parsed (encrypted)" in digest.block
+
+
+class TestFlatTextDigest:
+    """``digest_text``: the same shape for a document held as text rather than as pages.
+
+    A fetched web page has no pages to number, so its passages carry no ``[p.N]`` claim — the
+    one thing that must not be invented, since a forecaster may cite it.
+    """
+
+    URL = "https://example.gov/tracker"
+
+    TEXT = (
+        "Methodology notes on seasonal adjustment.\n\n"
+        "The unemployment rate stood at 4.1 percent in May 2026.\n\n"
+        "Contact details for the statistics office.\n\n"
+    )
+
+    def test_it_selects_and_labels_without_page_numbers(self) -> None:
+        digest = digest_text(self.TEXT, query="unemployment rate May", top_k=2, max_chars=4000, source_url=self.URL)
+
+        assert digest.passages >= 1
+        assert "4.1 percent in May 2026" in digest.block
+        assert "[passage]" in digest.block
+        assert "[p." not in digest.block, "a page-less document must not claim a page"
+
+    def test_the_header_states_the_size_and_the_source(self) -> None:
+        digest = digest_text(self.TEXT, query="unemployment", top_k=1, max_chars=4000, source_url=self.URL)
+
+        assert digest.block.startswith(f"Document: {self.URL}")
+        assert f"{len(self.TEXT)} chars of text, no page structure" in digest.block
+
+    def test_no_match_says_so_rather_than_returning_the_top_of_the_page(self) -> None:
+        digest = digest_text(self.TEXT, query="hydroelectric turbine", top_k=3, max_chars=4000, source_url=self.URL)
+
+        assert digest.passages == 0
+        assert "No passage in this document matched the query" in digest.block
+        assert "Methodology notes" not in digest.block
+
+    def test_it_truncates_with_the_same_disclosed_marker(self) -> None:
+        digest = digest_text(self.TEXT * 40, query="unemployment rate", top_k=6, max_chars=400, source_url=self.URL)
+
+        assert len(digest.block) <= 400
+        assert "[digest truncated at 400 chars]" in digest.block
+
+    def test_it_is_deterministic(self) -> None:
+        kwargs = {"query": "unemployment rate", "top_k": 3, "max_chars": 4000, "source_url": self.URL}
+        assert digest_text(self.TEXT, **kwargs) == digest_text(self.TEXT, **kwargs)

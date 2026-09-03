@@ -118,17 +118,26 @@ and turns a breach into an error `ToolOutcome` rather than a crash.
   outbound links. This is an auto-escalating ladder (detailed below), so the
   driver is told not to avoid a URL because of its format. Supports windowed
   reads: over-cap content is truncated with a `start_char=N` marker, and
-  continuations are served from cache. Its `ToolSpec` timeout leaves headroom
-  above its own fetch budget for the rung-3 document auto-escalation.
-- **`read_document`** — ask a specific question of a specific document. Gemini
-  reads the URL directly via the `url_context` tool on the native `google-genai`
-  SDK, handling PDFs, images, and JS pages. Slower and costlier than `fetch`, so
-  it is for targeted extraction from long or complex documents, or as a fallback
-  when `fetch` was blocked. Requires a precise `ask`. Its deadlines nest: the
-  `ToolSpec` timeout sits above Gemini's own read timeout
-  (`_READ_DOCUMENT_TIMEOUT_S` in `tools.py`), which in turn sits above the HTTP
-  timeout handed to the SDK, so the innermost one fires first and the driver gets
-  a clean error outcome instead of a tool-level kill.
+  continuations are served from cache — a PDF is read here too, in full text, and
+  paginates the same way. Its `ToolSpec` timeout leaves headroom above its own
+  fetch budget for the document auto-escalation on the last rung.
+- **`read_document`** — ask a specific question of a specific document, and get
+  back the passages of it that bear on the ask. Acquisition-first: it runs the
+  free rungs (this run's cache, then plain HTTP and headless Chromium) and
+  answers from the page's own text with a deterministic BM25 passage digest
+  (`method=digest_local`), and only where it can hold no text at all does Gemini
+  read the URL through the `url_context` tool on the native `google-genai` SDK
+  (`method=document`). So it is for targeted extraction from long or complex
+  documents and as a fallback when `fetch` was blocked, and the paid half of it
+  is now reserved for hosts our own client cannot read — measured 2026-09-03,
+  two of 47 archived fetch failures. Requires a precise `ask`: it is what selects
+  the passages. Its deadlines nest: the `ToolSpec` timeout sits above a total
+  budget the two rungs share (`_READ_DOCUMENT_TOTAL_BUDGET_S`), which caps local
+  acquisition at `_LOCAL_DOCUMENT_BUDGET_S` and hands the reader whatever is
+  left, itself bounded by Gemini's own read timeout
+  (`_READ_DOCUMENT_TIMEOUT_S`), which sits above the HTTP timeout handed to the
+  SDK — so the innermost one fires first and the driver gets a clean error
+  outcome instead of a tool-level kill.
 
 ### The fetch ladder
 
@@ -141,16 +150,33 @@ escalates when the lighter one comes up short:
    SSRF-hardened: a `is_public_http_url` preflight, a connect-time filtering
    resolver, and a bounded manual redirect loop that re-guards every hop.
    Trafilatura extracts the main text.
-3. **Headless Chromium** (`_try_rendered_fetch`). If plain extraction returns
+3. **Local PDF extraction** (`local_document.pdf_fetch_result`). A body that is
+   a PDF — by content type or by magic bytes — is decoded with pypdf in a worker
+   thread and served as its own full text (`method=pdf_local`), which paginates
+   through `start_char` exactly as a long HTML page does. This is why the capped
+   body read now happens BEFORE the document check: the classifier used to decide
+   a PDF was unreadable without looking at a single byte of it. Measured
+   2026-09-03, pypdf pulled 833,450 chars out of a 6.7 MB 220-page report in
+   5.3 s while the paid reader returned nothing for the same file, so a declared
+   PDF is read under the larger `DOCUMENT_TEXT_PDF_MAX_BYTES` cap; a body past
+   even that is reported as `oversize_document` rather than escalated, since a
+   document too big to read locally is also too big to be worth having a model
+   retrieve. The parse is held for the run, so pagination and a later
+   `read_document` on the same URL neither refetch nor reparse.
+4. **Headless Chromium** (`_try_rendered_fetch`). If plain extraction returns
    too little text (below `GAP_FILL_V2_MIN_CONTENT_CHARS`), the ladder re-fetches
-   with Playwright's headless Chromium to run JavaScript. The
-   SSRF guard is re-applied to every request Chromium makes. If Playwright isn't
-   installed, this rung logs a one-time warning and the plain result stands.
-4. **read_document.** If the URL turns out to be a PDF or an image (by content
-   type or by magic bytes), `fetch` auto-escalates to the `read_document`
-   backend so the driver keeps its "handled automatically" promise without
-   spending a second tool call. The `method` field on the result tells the
-   driver which rung actually served it.
+   with Playwright's headless Chromium to run JavaScript. It waits for
+   DOM-ready plus a fixed settle rather than for network idle, and salvages
+   `page.content()` when the navigation itself times out: 4 of the 10 render
+   rescues in the 2026-09-03 replay came from pages whose DOM was complete when
+   `page.goto` raised. The rung's 35 s ceiling is unchanged — the settle comes
+   out of the goto budget. The SSRF guard is re-applied to every request Chromium
+   makes. If Playwright isn't installed, this rung logs a one-time warning and
+   the plain result stands.
+5. **read_document.** If the URL turns out to be an image, or a PDF with no text
+   layer at all, `fetch` auto-escalates to `read_document` so the driver keeps
+   its "handled automatically" promise without spending a second tool call. The
+   `method` field on the result tells the driver which rung actually served it.
 
 ## The output artifact
 
@@ -310,6 +336,22 @@ was a true throttle or the rule over-reaching. Receipt: q45191, where two thrott
 ogimet.com fetches reached the driver as successful ones and its own retry was served the
 cached refusal.
 
+A second event outside the counters is a document read for free, which is what the
+local-document rung exists to produce:
+
+```
+AGENTIC_FETCH_LOCAL_DOC: url=... method=pdf_local|digest_local chars=... pages=... passages=...
+```
+
+as an INFO from `local_document.py`, harvested as `agentic_fetch_local_doc` and likewise
+without a `question=`. `pdf_local` is a `fetch` serving a PDF's own extracted text, which
+paginates like a long page and therefore selects nothing (`passages=n/a`); `digest_local` is a
+`read_document` answering the ask from BM25-selected passages of text we hold, where
+`passages=0` is the reading that matters — the document does not discuss what was asked, which
+in the block itself reads exactly like a successful read. `chars` is the text we HELD, not the
+window handed to the driver, so it is comparable across both routes and against
+`URL_CONTEXT_SIZE_GATE_TOKENS` (chars / 4).
+
 For a richer trace, the seam accepts an `archive_sink` callback. When the loop
 actually ran, the orchestrator captures `{transcript, telemetry}` through it and
 writes it into the research archive (`persistence.py`), including empty-findings
@@ -330,6 +372,7 @@ level up:
 | `agentic/gates.py` | The W1 plan gate's nudge and gap coercion, the W2 conclude gate, the W3 `source_url` check, and W4 tier stamping plus idempotent findings banking. |
 | `agentic/dispatch.py` | One assistant turn's tool calls in, one tool message each out: batch admission (plan gate, call budget, duplicate detection), provenance absorption, and the tool-message/rejection rendering. |
 | `agentic/tools.py` | `build_gap_fill_tools` and the four tool handlers, including the escalating fetch ladder and its SSRF hardening. |
+| `agentic/local_document.py` | The local PDF rung, the run's held-parse cache, the passage digest `read_document` serves, the url_context size gate, and the `AGENTIC_FETCH_LOCAL_DOC` marker. |
 | `agentic/driver_prompt.py` | The three prompt builders: `build_system_prompt`, `build_user_brief`, `build_ghost_prompt`, plus the `SupportedQuestion` type. |
 | `agentic/artifact.py` | `render_findings` (the output section) and `detachment_lint`. |
 | `agentic/types.py` | The dataclasses and Pydantic models: `ToolOutcome`, `ToolSpec`, `Finding`, `GhostForecast`, `LoopConfig`, `LoopTelemetry`, `LoopResult`. |

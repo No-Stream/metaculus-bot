@@ -983,6 +983,19 @@ the telemetry markers:
   `_throttled_fetch_outcome` in `research/agentic/tools.py`; harvested as
   `agentic_fetch_throttled`. Receipt: q45191, where two throttled ogimet.com fetches reached
   the driver as successful ones and the driver's own retry was served the cached refusal.
+- `AGENTIC_FETCH_LOCAL_DOC: url=... method=pdf_local|digest_local chars=... pages=...
+  passages=...` — an INFO, one per document the gap-fill v2 ladder read without paying a
+  Gemini `url_context` call for it. `pdf_local` is a `fetch` serving a PDF's own extracted
+  text (which paginates, so it selects nothing and `passages` is `n/a`); `digest_local` is a
+  `read_document` answering the ask from BM25-selected passages of text we hold, where
+  `passages=0` is the reading that matters — the document does not discuss what was asked,
+  which in the block itself reads exactly like a successful read. `chars` is the text HELD,
+  not the window handed to the driver, so it is comparable across both routes and against
+  `URL_CONTEXT_SIZE_GATE_TOKENS` (chars / 4), and `pages` is `n/a` for a page with no page
+  structure. Emitted by `log_local_document_read` in
+  `research/agentic/local_document.py`; harvested as `agentic_fetch_local_doc`. This is how
+  the local-first rung is measured at all: before it every PDF the driver met went to a paid
+  reader, 191 calls over the 2026 summer season, and the only trace of one was the spend.
 - `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=... [reason=...]
   [route=...]` — one line per URL the resolution-source provider fetched, emitted by
   `_log_fetch_outcome_markers` in `research/resolution_source.py`. `status` is `ok`
