@@ -1336,8 +1336,7 @@ class TestLastRealApplicationClause:
         )
 
     def test_last_real_application_is_a_candidate_inside_gap_type_six(self) -> None:
-        prompt = self._analyzer()
-        flat = " ".join(prompt.lower().split())
+        flat = _flat(self._analyzer())
         assert "how that rule actually applied at its most recent real application" in flat
         assert "as a realized count or outcome" in flat
         assert "an electoral threshold, a quota, an allocation formula, a cut-off score" in flat
@@ -1349,8 +1348,17 @@ class TestLastRealApplicationClause:
     def test_clause_separates_the_institution_rule_from_the_question_threshold(self) -> None:
         """The gap is about how the BODY applies its own rule, not a restatement of the
         question's resolution threshold, which the analyzer already has in front of it."""
-        flat = " ".join(self._analyzer().lower().split())
+        flat = _flat(self._analyzer())
         assert "a different fact from the question's own resolution threshold" in flat
+
+    def test_the_clause_keeps_its_scope_limiter(self) -> None:
+        """The condition is what stops the clause fighting the same prompt's "DO NOT invent
+        gaps" discipline: it earns a paid slot only where a discontinuous institutional rule is
+        actually in play. Without this pin a reword could keep the examples and the realized-count
+        wording, drop the condition, and stay green while the clause started firing on every
+        question with a number in it."""
+        flat = _flat(self._analyzer())
+        assert "where the question resolves through an institutional rule" in flat
 
     def test_the_standalone_mandate_is_gone(self) -> None:
         prompt = self._analyzer()
