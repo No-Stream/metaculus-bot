@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import socket
 import sys
@@ -12,17 +13,24 @@ import aiohttp
 import pytest
 from google.genai import types as genai_types
 from playwright.async_api import Error as _PlaywrightError
+from playwright.async_api import TimeoutError as _PlaywrightTimeoutError
+from pypdf import PdfWriter
 
 from metaculus_bot.constants import (
+    DOCUMENT_DIGEST_TOP_K,
+    DOCUMENT_TEXT_PDF_MAX_BYTES,
     GAP_FILL_V2_READER_HTTP_ATTEMPTS,
     GAP_FILL_V2_READER_MODEL,
     GAP_FILL_V2_READER_THINKING_LEVEL,
+    URL_CONTEXT_SIZE_GATE_TOKENS,
 )
 from metaculus_bot.research import providers as research_providers
-from metaculus_bot.research.agentic import fetch_outcomes, tool_backends
+from metaculus_bot.research.agentic import fetch_outcomes, local_document, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
+from metaculus_bot.research.document_text import extract_pdf_text
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
+from tests.test_document_text import build_text_pdf
 
 
 class _FakeResponse:
@@ -61,8 +69,43 @@ class _FakeSession:
         return self._responses[0]
 
 
+# Every rendered-rung fake page appends its settle here, so a test can assert the DOM-ready
+# wait actually happened without any of them sleeping.
+settles: list[float] = []
+
+
+def _scanned_pdf() -> bytes:
+    """A structurally valid PDF with a page and no text layer at all — a scan."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def _serve_pdf(monkeypatch: pytest.MonkeyPatch, body: bytes, *, content_type: str = "application/pdf") -> AsyncMock:
+    """Wire the plain rung to answer one request with ``body`` under ``content_type``.
+
+    Patches ``_read_response_body`` rather than teaching the fake response object to stream,
+    because the cap that read runs under is the thing the PDF rung changes and each test wants
+    to state the body it is classifying, not the transport. Returns that spy, which is how a
+    test counts requests: one request has to serve both a paginated fetch and a later digest.
+    """
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": content_type}))
+    read_body = AsyncMock(return_value=body)
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", read_body)
+    return read_body
+
+
 @pytest.fixture(autouse=True)
 def _reset_tool_state() -> None:
+    settles.clear()
+    # Run-scoped state of the local-document rung: held parses, and its own launch cap (fresh
+    # per test for the same loop-binding reason as the rendered semaphore below).
+    local_document.clear_document_cache()
+    local_document._EXTRACT_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
     agentic_tools._FETCH_TEXT_CACHE.clear()
     agentic_tools._FETCH_LINKS_CACHE.clear()
     agentic_tools._FETCH_HOST_SEMAPHORES.clear()
@@ -506,10 +549,9 @@ async def test_fetch_thin_content_escalates_to_rendered(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_fetch_pdf_content_type_auto_escalates_to_document(monkeypatch: pytest.MonkeyPatch) -> None:
-    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+async def test_fetch_scanned_pdf_escalates_to_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PDF with no text layer is the paid reader's one remaining job on this rung."""
+    _serve_pdf(monkeypatch, _scanned_pdf())
     read_document = AsyncMock(
         return_value=agentic_tools.ToolOutcome(content_markdown="Extracted PDF content.", method="document")
     )
@@ -525,9 +567,7 @@ async def test_fetch_pdf_content_type_auto_escalates_to_document(monkeypatch: py
 
 @pytest.mark.asyncio
 async def test_fetch_document_escalation_generic_ask_contains_topic(monkeypatch: pytest.MonkeyPatch) -> None:
-    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    _serve_pdf(monkeypatch, _scanned_pdf())
     read_document = AsyncMock(
         return_value=agentic_tools.ToolOutcome(content_markdown="Extracted PDF content.", method="document")
     )
@@ -731,7 +771,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
     monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
 
-    async def blocking_read(resp: object, label: str) -> bytes:
+    async def blocking_read(resp: object, label: str, *, max_bytes: int = 0) -> bytes:
         events.append("plain_read_started")
         await release_plain.wait()
         events.append("plain_read_finished")
@@ -747,6 +787,9 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     class FakePage:
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def wait_for_timeout(self, ms: float) -> None:
+            settles.append(ms)
 
         async def content(self) -> str:
             return "<html><body><p>rendered body</p></body></html>"
@@ -863,6 +906,9 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
     class FakePage:
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def wait_for_timeout(self, ms: float) -> None:
+            settles.append(ms)
 
         async def content(self) -> str:
             return "<html><body><p>rendered body</p></body></html>"
@@ -1096,30 +1142,48 @@ class TestFetchPlainTerminalStatuses:
         assert result.text == "Fetch failed with HTTP 503."
 
     @pytest.mark.asyncio
-    async def test_pdf_content_type_asks_for_read_document(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    async def test_pdf_with_a_text_layer_is_read_locally(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The rung the whole change exists for: a declared PDF is decoded, not escalated."""
+        _serve_pdf(
+            monkeypatch,
+            build_text_pdf([["The unemployment rate was 4.1 percent in May 2026, revised from 4.0 percent."]]),
+        )
 
         result = await agentic_tools._fetch_plain("https://example.com/report.pdf")
+
+        assert result.status == "ok"
+        assert result.method == "pdf_local"
+        assert "The unemployment rate was 4.1 percent in May 2026" in result.text
+        # Never escalated to the rendered rung: a browser has nothing to add to a decoded PDF,
+        # and a short-but-real document is a complete read.
+        assert result.escalate_rendered is False
+
+    @pytest.mark.asyncio
+    async def test_scanned_pdf_asks_for_read_document(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No text layer is the one PDF shape a model still has to read."""
+        _serve_pdf(monkeypatch, _scanned_pdf())
+
+        result = await agentic_tools._fetch_plain("https://example.com/scan.pdf")
 
         assert result.status == "ok"
         assert result.method == "document_needed"
         assert "read_document" in result.text
 
     @pytest.mark.asyncio
-    async def test_pdf_magic_bytes_behind_html_content_type_ask_for_read_document(
+    async def test_pdf_magic_bytes_behind_html_content_type_are_read_locally(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A mislabeled body is classified off its bytes, not its Content-Type."""
-        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
-        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"%PDF-1.7\nbinary"))
+        _serve_pdf(
+            monkeypatch,
+            build_text_pdf([["Mislabeled as HTML, but its bytes are a readable PDF document."]]),
+            content_type="text/html",
+        )
 
         result = await agentic_tools._fetch_plain("https://example.com/mislabeled")
 
-        assert result.method == "document_needed"
+        assert result.method == "pdf_local"
+        assert "Mislabeled as HTML" in result.text
 
     @pytest.mark.asyncio
     async def test_oversized_body_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1590,9 +1654,14 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     class FakePage:
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             assert url == "https://example.com/page"
-            assert wait_until == "networkidle"
-            assert timeout == 35_000
+            assert wait_until == "domcontentloaded"
+            # The settle is taken OUT of the goto budget, so the rung's 35 s ceiling is
+            # unchanged rather than lengthened by the wait that replaced networkidle.
+            assert timeout == agentic_tools._RENDERED_FETCH_TIMEOUT_MS - agentic_tools._RENDERED_SETTLE_MS
             return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def wait_for_timeout(self, ms: float) -> None:
+            settles.append(ms)
 
         async def content(self) -> str:
             return '<html><body><a href="/next">Next</a><p>Rendered body</p></body></html>'
@@ -1681,6 +1750,9 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     class FakePage:
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def wait_for_timeout(self, ms: float) -> None:
+            settles.append(ms)
 
         async def content(self) -> str:
             return "<html><body><p>rendered body</p></body></html>"
@@ -1796,6 +1868,9 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
             private_route = FakeRoute("http://169.254.169.254/latest/meta-data/")
             await guard(private_route, private_route.request)
             return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def wait_for_timeout(self, ms: float) -> None:
+            settles.append(ms)
 
         async def content(self) -> str:
             return "<html><body><p>public content only</p></body></html>"
@@ -2005,6 +2080,9 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
             return SimpleNamespace(headers={"content-type": "text/html"})
 
+        async def wait_for_timeout(self, ms: float) -> None:
+            settles.append(ms)
+
         async def content(self) -> str:
             return "<html><body><p>Rendered body</p></body></html>"
 
@@ -2062,7 +2140,19 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     assert launch_args[0] == ["--host-resolver-rules=MAP example.com 93.184.216.34"]
 
 
+@pytest.fixture
+def _no_local_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``read_document``'s acquisition-first ladder hold nothing for the URL.
+
+    ``read_document`` runs the free rungs (cache, plain, rendered) before it pays, so every test
+    below about the PAID url_context rung has to say the free ones came back empty — otherwise
+    the handler would dial the network instead of reaching the code under test.
+    """
+    monkeypatch.setattr(agentic_tools, "_acquire_local_document", AsyncMock(return_value=local_document.HeldDocument()))
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_local_document")
 async def test_read_document_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOOGLE_API_KEY", "key")
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
@@ -2080,6 +2170,7 @@ async def test_read_document_happy_path(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_local_document")
 async def test_read_document_genai_client_uses_bounded_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fix 2 (genai half): the genai Client is built with a client-side timeout
     (ms) <= the read_document internal deadline, so a hung endpoint returns the
@@ -2112,6 +2203,7 @@ async def test_read_document_genai_client_uses_bounded_timeout(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_local_document")
 async def test_read_document_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOOGLE_API_KEY", "key")
     monkeypatch.setattr(agentic_tools, "_READ_DOCUMENT_TIMEOUT_S", 0.01)
@@ -2134,6 +2226,7 @@ async def test_read_document_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_local_document")
 async def test_read_document_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
@@ -2171,6 +2264,7 @@ class TestReadDocumentRequiresRealRetrieval:
     """
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_no_local_document")
     async def test_all_retrievals_failed_withholds_the_fetched_tier(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -2201,6 +2295,7 @@ class TestReadDocumentRequiresRealRetrieval:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_no_local_document")
     async def test_no_url_context_metadata_at_all_withholds_the_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # url_context never reported back (tool didn't run / SDK attached nothing). Zero
         # successful retrievals either way, so the tier is withheld the same.
@@ -2219,6 +2314,7 @@ class TestReadDocumentRequiresRealRetrieval:
         assert outcome.status != "ok"
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_no_local_document")
     async def test_one_success_among_failures_still_counts_as_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The guard is "did ANY retrieval land", matching gemini_search's grounded-chunk
         # floor. A partially-failed multi-URL read still rests on real retrieved content.
@@ -2248,6 +2344,7 @@ class TestReadDocumentRequiresRealRetrieval:
         assert _method_to_tier("document") == "fetched"
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_no_local_document")
     async def test_the_suppression_warn_names_the_retrieval_statuses(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -2282,6 +2379,7 @@ class TestReadDocumentRequiresRealRetrieval:
         ) in caplog.text
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_no_local_document")
     async def test_the_suppression_warn_reads_none_when_nothing_was_reported(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -2415,3 +2513,444 @@ class TestReadDocumentClientConfig:
             "search_queries=0"
         ) in caplog.text
         assert "question=" not in caplog.text, "the document reader holds no question id to carry"
+
+
+# ---------------------------------------------------------------------------
+# The local-document rung (2026-09-03). A PDF is decoded and passage-selected from bytes we
+# already hold, and the paid Gemini url_context reader is spent only on a document we cannot
+# read at all: measured over the 2026 summer season, that was 191 reader calls, nine documents
+# over 100k tokens carried 67% of the retrieved tokens, and on the one file where both routes
+# were tried local pypdf pulled 833,450 chars in 5.3 s while the paid read returned nothing.
+# ---------------------------------------------------------------------------
+
+
+def _long_pdf() -> bytes:
+    """A PDF whose text runs past one fetch window, so pagination is exercised for real."""
+    line = "The reported unemployment rate for May 2026 was 4.1 percent, revised from 4.0 percent. "
+    return build_text_pdf([[line] * 60, [line] * 60])
+
+
+def _no_paid_reader(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Replace the paid url_context backend with a spy that must not be called."""
+    reader = MagicMock(side_effect=AssertionError("the paid reader must not run for a document we hold"))
+    monkeypatch.setattr(agentic_tools, "_run_document_read_sync", reader)
+    return reader
+
+
+class TestLocalPdfRung:
+    @pytest.mark.asyncio
+    async def test_a_pdf_with_a_text_layer_is_served_locally_and_paginates(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        read_body = _serve_pdf(monkeypatch, _long_pdf())
+        read_document = AsyncMock()
+        monkeypatch.setattr(agentic_tools, "read_document", read_document)
+
+        with caplog.at_level(logging.INFO, logger=local_document.__name__):
+            first = await agentic_tools.fetch("https://example.gov/report.pdf")
+
+        assert first.method == "pdf_local"
+        assert _method_to_tier(first.method) == "fetched", "we decoded the bytes the host served"
+        assert "unemployment rate for May 2026" in first.content_markdown
+        assert first.truncated is True, "a document past one window paginates like a long page"
+        read_document.assert_not_awaited()
+        assert "AGENTIC_FETCH_LOCAL_DOC: url=https://example.gov/report.pdf method=pdf_local" in caplog.text
+        assert "pages=2 passages=n/a" in caplog.text, "a pdf_local fetch serves the text and selects nothing"
+
+        # The continuation is served from the run cache: no second request, no second parse.
+        second = await agentic_tools.fetch("https://example.gov/report.pdf", agentic_tools._FETCH_WINDOW_CHARS)
+        assert second.method == "cache"
+        assert read_body.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_scanned_pdfs_escalation_neither_refetches_nor_reparses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The parse that proved there is no text layer is held, so escalating costs one request."""
+        read_body = _serve_pdf(monkeypatch, _scanned_pdf())
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(
+            agentic_tools, "_run_document_read_sync", MagicMock(return_value=("Model read.", 1, ["SUCCESS"]))
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+        outcome = await agentic_tools.fetch("https://example.gov/scan.pdf")
+
+        assert outcome.method == "document"
+        assert read_body.await_count == 1, "the escalation reuses the held parse"
+
+    @pytest.mark.asyncio
+    async def test_a_document_over_the_byte_cap_reports_rather_than_escalating(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Too big to read locally is also too big to be worth having a model retrieve."""
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=None))
+        reader = _no_paid_reader(monkeypatch)
+
+        outcome = await agentic_tools.fetch("https://example.gov/huge.pdf")
+
+        assert outcome.status == "error"
+        assert outcome.method == "oversize_document"
+        assert _method_to_tier(outcome.method) is None, "nothing was read, so no tier"
+        assert "too large to read" in outcome.content_markdown.lower()
+        reader.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_declared_pdf_body_is_read_under_the_document_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The 6.7 MB report local extraction reads in 5.3 s is over the ordinary page cap."""
+        read_body = _serve_pdf(monkeypatch, build_text_pdf([["Long enough to count as a real text layer here."]]))
+
+        await agentic_tools._fetch_plain("https://example.gov/report.pdf")
+
+        assert read_body.await_args is not None
+        assert read_body.await_args.kwargs["max_bytes"] == DOCUMENT_TEXT_PDF_MAX_BYTES
+
+    def test_the_held_parse_cache_is_run_scoped_state_the_suite_resets(self) -> None:
+        # The autouse fixture calls exactly this, which is what keeps one test's held document
+        # out of the next one's ladder.
+        pdf = extract_pdf_text(_scanned_pdf(), max_pages=5, max_seconds=5.0)
+        local_document.cache_document("https://example.gov/a.pdf", pdf)
+        assert local_document.cached_document("https://example.gov/a.pdf") is not None
+
+        local_document.clear_document_cache()
+        assert local_document.cached_document("https://example.gov/a.pdf") is None
+
+
+class TestReadDocumentAcquiresBeforePaying:
+    """``read_document`` answers from the page's own text wherever it can get it.
+
+    Its old shape sent every ask straight to a paid Gemini ``url_context`` call. Now the free
+    rungs run first and their text is answered with a deterministic BM25 passage digest; the
+    paid read is what a host that refuses us, or a document with no text layer, still needs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_fetchable_page_is_digested_with_no_model_call(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        page_text = (
+            "Background on the tracker.\n\n"
+            "The unemployment rate stood at 4.1 percent in May 2026.\n\n"
+            "Unrelated methodology notes about seasonal adjustment.\n\n"
+        ) * 3
+        monkeypatch.setattr(
+            agentic_tools,
+            "_fetch_plain",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    status="ok",
+                    method="plain",
+                    text=page_text,
+                    links=[],
+                    url="https://example.gov/tracker",
+                    escalate_rendered=False,
+                )
+            ),
+        )
+        reader = _no_paid_reader(monkeypatch)
+        # No Google key at all: the local digest is free and must not depend on one.
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+        with caplog.at_level(logging.INFO, logger=local_document.__name__):
+            outcome = await agentic_tools.read_document("https://example.gov/tracker", "unemployment rate May 2026")
+
+        assert outcome.method == "digest_local"
+        assert _method_to_tier(outcome.method) == "fetched"
+        assert "4.1 percent in May 2026" in outcome.content_markdown
+        assert "Most relevant passages for: unemployment rate May 2026" in outcome.content_markdown
+        assert "[passage]" in outcome.content_markdown, "a page has no page numbers to claim"
+        reader.assert_not_called()
+        assert "method=digest_local" in caplog.text
+        assert "pages=n/a" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_pdf_digest_carries_page_numbers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Page attribution is why a held parse beats the flat text: a cited page must be true."""
+        _serve_pdf(monkeypatch, _long_pdf())
+        _no_paid_reader(monkeypatch)
+
+        outcome = await agentic_tools.read_document("https://example.gov/report.pdf", "unemployment rate revised")
+
+        assert outcome.method == "digest_local"
+        assert "[p.1]" in outcome.content_markdown or "[p.2]" in outcome.content_markdown
+
+    @pytest.mark.asyncio
+    async def test_text_a_fetch_already_read_is_digested_without_refetching(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        read_body = _serve_pdf(monkeypatch, _long_pdf())
+        await agentic_tools.fetch("https://example.gov/report.pdf")
+        _no_paid_reader(monkeypatch)
+
+        outcome = await agentic_tools.read_document("https://example.gov/report.pdf", "unemployment rate revised")
+
+        assert outcome.method == "digest_local"
+        assert read_body.await_count == 1, "one request served both tools"
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_url_still_reaches_the_paid_reader(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The reader's remaining job: a host our own client cannot read from at all."""
+        monkeypatch.setattr(
+            agentic_tools,
+            "_fetch_plain",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    status="blocked",
+                    method="plain",
+                    text="Fetch blocked with HTTP 403.",
+                    links=[],
+                    url="https://sagaftra.org/contract",
+                    escalate_rendered=False,
+                )
+            ),
+        )
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(
+            agentic_tools,
+            "_run_document_read_sync",
+            MagicMock(return_value=("The contract states a 3.5 percent increase.", 1, ["SUCCESS"])),
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+        outcome = await agentic_tools.read_document("https://sagaftra.org/contract", "what increase is stated?")
+
+        assert outcome.method == "document"
+        assert outcome.content_markdown == "The contract states a 3.5 percent increase."
+
+    @pytest.mark.asyncio
+    async def test_a_throttle_interstitial_is_never_digested(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """q45191 again: a rate-limit sentence under HTTP 200 is not the document.
+
+        Digesting it would put the host's refusal in front of the driver as the page's content.
+        The paid reader dials from Gemini's address rather than ours, so it is the right next
+        rung for exactly this case.
+        """
+        monkeypatch.setattr(
+            agentic_tools,
+            "_fetch_plain",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    status="ok",
+                    method="plain",
+                    text="Limit for old data queries exceeded. Permitted a query per 20 seconds per IP",
+                    links=[],
+                    url="https://www.ogimet.com/summary",
+                    escalate_rendered=False,
+                )
+            ),
+        )
+        # The interstitial leaves us holding nothing, so the ladder tries the browser next; it
+        # is the plain rung's classification that is under test here.
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(
+            agentic_tools, "_run_document_read_sync", MagicMock(return_value=("Model read.", 1, ["SUCCESS"]))
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+        outcome = await agentic_tools.read_document("https://www.ogimet.com/summary", "the 2022-08-31 maximum")
+
+        assert outcome.method == "document"
+        assert "Limit for old data queries" not in outcome.content_markdown
+
+    @pytest.mark.asyncio
+    async def test_an_image_is_not_digested_from_its_own_placeholder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``document_needed`` result is "ok" and carries our own instruction as its text.
+
+        Digesting that would answer the ask out of the sentence telling the driver to call this
+        very tool. An image also ends the free ladder: no browser reads one either, so the rung
+        must not spend a Chromium launch to find that out.
+        """
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "image/png"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        rendered = AsyncMock()
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(
+            agentic_tools, "_run_document_read_sync", MagicMock(return_value=("The chart shows 41.", 1, ["SUCCESS"]))
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+        outcome = await agentic_tools.read_document("https://example.gov/chart.png", "what does the chart show?")
+
+        assert outcome.method == "document"
+        assert outcome.content_markdown == "The chart shows 41."
+        rendered.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_oversize_document_is_reported_rather_than_paid_for(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            agentic_tools,
+            "_fetch_plain",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    status="error",
+                    method="oversize_document",
+                    text=local_document.oversize_message("https://example.gov/huge.pdf"),
+                    links=[],
+                    url="https://example.gov/huge.pdf",
+                    escalate_rendered=False,
+                )
+            ),
+        )
+        reader = _no_paid_reader(monkeypatch)
+
+        outcome = await agentic_tools.read_document("https://example.gov/huge.pdf", "anything")
+
+        assert outcome.method == "oversize_document"
+        assert "too large to read" in outcome.content_markdown.lower()
+        reader.assert_not_called()
+
+
+class TestUrlContextSizeGate:
+    """A document we hold is never sent to the paid reader, and the biggest are the clearest case.
+
+    The gate rides the same branch as the text it guards, so the two cannot disagree. It is
+    there because the nine archived documents past it carried 67% of the season's reader tokens
+    and the largest of them returned nothing at all for the money.
+    """
+
+    def test_the_gate_reads_chars_over_four_as_tokens(self) -> None:
+        at_bound = "x" * (URL_CONTEXT_SIZE_GATE_TOKENS * 4)
+        assert local_document.exceeds_url_context_size_gate(at_bound) is False
+        assert local_document.exceeds_url_context_size_gate(at_bound + "xxxx") is True
+        assert local_document.exceeds_url_context_size_gate("") is False
+
+    @pytest.mark.asyncio
+    async def test_a_huge_held_document_is_served_locally(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        held = local_document.HeldDocument(text="revision " * (URL_CONTEXT_SIZE_GATE_TOKENS + 10))
+        assert local_document.exceeds_url_context_size_gate(held.text)
+        monkeypatch.setattr(agentic_tools, "_acquire_local_document", AsyncMock(return_value=held))
+        reader = _no_paid_reader(monkeypatch)
+
+        outcome = await agentic_tools.read_document("https://example.gov/833k.pdf", "revision")
+
+        assert outcome.method == "digest_local"
+        assert len(outcome.content_markdown) <= agentic_tools._FETCH_WINDOW_CHARS
+        reader.assert_not_called()
+
+    def test_the_digest_width_is_the_configured_one(self) -> None:
+        # The digest's width is a knob in constants.py, not a literal at the call site.
+        digest = local_document.digest_held(
+            local_document.HeldDocument(text="\n\n".join(f"paragraph {i} about revisions. " * 30 for i in range(20))),
+            ask="revisions",
+            top_k=DOCUMENT_DIGEST_TOP_K,
+            max_chars=8000,
+            source_url="https://example.gov/a",
+        )
+        assert digest.passages == DOCUMENT_DIGEST_TOP_K
+
+
+class TestRenderedRungSalvagesATimedOutNavigation:
+    """The wait-condition fix (2026-09-03), measured on the 47-URL replay.
+
+    ``page.goto(wait_until="networkidle")`` never returns on a page carrying a long-poll widget
+    or an analytics beacon, and its TimeoutError used to discard the rung: 4 of the replay's 10
+    render rescues came from pages whose DOM was complete anyway (both ballotpedia questions,
+    both fts.unocha.org summaries). The rung now waits for DOM-ready plus a fixed settle and
+    salvages ``page.content()`` when the navigation itself fails.
+    """
+
+    @staticmethod
+    def _wire_playwright(monkeypatch: pytest.MonkeyPatch, page: object) -> None:
+        class FakeContext:
+            async def route(self, pattern: str, handler) -> None:
+                return None
+
+            async def unroute_all(self, *, behavior: str | None = None) -> None:
+                return None
+
+            async def new_page(self) -> object:
+                return page
+
+            async def close(self) -> None:
+                return None
+
+        class FakeBrowser:
+            async def new_context(self, **kwargs) -> FakeContext:
+                return FakeContext()
+
+            async def close(self) -> None:
+                return None
+
+        class FakeChromium:
+            async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
+                return FakeBrowser()
+
+        class FakePlaywrightManager:
+            chromium = FakeChromium()
+
+            async def __aenter__(self) -> FakePlaywrightManager:
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        monkeypatch.setattr(
+            agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+        )
+        monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setitem(
+            sys.modules,
+            "playwright.async_api",
+            SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_goto_timeout_still_returns_the_rendered_dom(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class TimingOutPage:
+            async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:  # noqa: ASYNC109  # mirrors Playwright API
+                raise _PlaywrightTimeoutError("Timeout 33000ms exceeded.")
+
+            async def wait_for_timeout(self, ms: float) -> None:
+                settles.append(ms)
+
+            async def content(self) -> str:
+                return "<html><body><p>The tracker reports 41 cases this week.</p></body></html>"
+
+        self._wire_playwright(monkeypatch, TimingOutPage())
+        monkeypatch.setattr(
+            "metaculus_bot.research.resolution_source._extract_main_text",
+            MagicMock(return_value="The tracker reports 41 cases this week."),
+        )
+
+        result = await agentic_tools._try_rendered_fetch("https://ballotpedia.org/race")
+
+        assert result is not None, "a timed-out goto with a complete DOM is a rescue, not a dead rung"
+        assert result.status == "ok"
+        assert result.method == "rendered"
+        assert result.text == "The tracker reports 41 cases this week."
+        assert settles == [agentic_tools._RENDERED_SETTLE_MS]
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_error_with_no_dom_reads_as_rendered_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A genuine navigation failure salvages an empty about:blank, which is the same
+        "rendered read nothing" outcome the rung produced before, so the ladder falls through
+        exactly as it did."""
+
+        class FailingPage:
+            async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:  # noqa: ASYNC109  # mirrors Playwright API
+                raise _PlaywrightError("net::ERR_NAME_NOT_RESOLVED")
+
+            async def wait_for_timeout(self, ms: float) -> None:
+                settles.append(ms)
+
+            async def content(self) -> str:
+                return "<html><head></head><body></body></html>"
+
+        self._wire_playwright(monkeypatch, FailingPage())
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
+
+        result = await agentic_tools._try_rendered_fetch("https://example.com/gone")
+
+        assert result is not None
+        assert result.status == "error"
+        assert result.method == "rendered"
+        assert result.text == ""

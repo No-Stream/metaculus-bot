@@ -142,12 +142,21 @@ def _extract_links_from_html(html: str, base_url: str) -> list[str]:
 
 
 def _content_type_is_document(content_type: str | None) -> bool:
+    return _content_type_is_pdf(content_type) or _content_type_is_image(content_type)
+
+
+def _content_type_is_pdf(content_type: str | None) -> bool:
+    """True for a declared PDF, which the ladder reads locally rather than escalating."""
     if not content_type:
         return False
-    lowered = content_type.lower()
-    if any(token in lowered for token in _PDF_CONTENT_TYPE_TOKENS):
-        return True
-    return any(lowered.startswith(prefix) for prefix in _IMAGE_CONTENT_TYPE_PREFIXES)
+    return any(token in content_type.lower() for token in _PDF_CONTENT_TYPE_TOKENS)
+
+
+def _content_type_is_image(content_type: str | None) -> bool:
+    """True for a declared image: the one document shape with no text a local rung could read."""
+    if not content_type:
+        return False
+    return content_type.lower().startswith(_IMAGE_CONTENT_TYPE_PREFIXES)
 
 
 def _body_is_document(body: bytes) -> bool:
@@ -157,7 +166,29 @@ def _body_is_document(body: bytes) -> bool:
     return stripped.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a"))
 
 
+# Named rather than spelled at each site: three rungs produce this method and two consumers
+# branch on it, and one of them (the local-document ladder) is WRONG if it ever treats the
+# placeholder message below as the document's text.
+DOCUMENT_NEEDED_METHOD = "document_needed"
 _DOCUMENT_NEEDED_MSG = "This URL is a PDF or image — use read_document(url, ask) to read it."
+
+
+def _document_needed_result(current_url: str, content_type: str) -> PlainFetchResult:
+    """The escalate-to-a-document-read outcome, for the three rungs that can reach it.
+
+    ``status="ok"`` with a method the tier map does not carry: nothing has been read yet, so
+    this can never be stamped ``fetched``, but it is not a failure either — the fetch handler
+    reads the method and escalates.
+    """
+    return PlainFetchResult(
+        status="ok",
+        method=DOCUMENT_NEEDED_METHOD,
+        text=_DOCUMENT_NEEDED_MSG,
+        links=[],
+        url=current_url,
+        content_type=content_type or None,
+    )
+
 
 _METACULUS_FETCH_BLOCK_MSG = (
     "Metaculus pages are already reflected in the question brief; do not fetch metaculus.com URLs."
@@ -184,6 +215,33 @@ def _fetch_plain_url_block(url: str) -> PlainFetchResult | None:
             text=_METACULUS_FETCH_BLOCK_MSG,
             links=[],
             url=url,
+        )
+    return None
+
+
+def _non_ok_status_result(status: int, current_url: str, content_type: str) -> PlainFetchResult | None:
+    """The terminal result for a non-200, non-redirect response, or None for a 200.
+
+    Split from the dispatcher so the body-shape rungs below it read as one sequence rather
+    than as the tail of a status ladder.
+    """
+    if status in _RETRYABLE_FETCH_BLOCK_STATUSES:
+        return PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text=f"Fetch blocked with HTTP {status}.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+        )
+    if status != 200:
+        return PlainFetchResult(
+            status="error",
+            method="plain",
+            text=f"Fetch failed with HTTP {status}.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
         )
     return None
 

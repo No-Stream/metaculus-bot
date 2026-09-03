@@ -18,6 +18,10 @@ against the ACTUAL emitted format strings (the source of truth):
   ``_throttled_fetch_outcome`` (per-FETCH: a host answered the gap-fill v2 ladder with a
   rate-limit interstitial under HTTP 200. Silent before this spec, and silent in the worst
   way — the interstitial reached the driver as a successful fetch and was cached)
+* ``AGENTIC_FETCH_LOCAL_DOC`` — ``metaculus_bot/research/agentic/local_document.py``
+  ``log_local_document_read`` (per-DOCUMENT: the gap-fill v2 ladder read a document
+  locally instead of paying a Gemini ``url_context`` call for it — a PDF's extracted
+  text on a ``fetch``, or a BM25 passage digest on a ``read_document``)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
 * ``FORECASTER_DROPS`` — ``metaculus_bot/drop_telemetry.py`` ``emit_drop_telemetry``
   (per-RUN summary: which models dropped and why)
@@ -377,6 +381,29 @@ MARKER_SPECS: list[MarkerSpec] = [
         re.compile(
             r"AGENTIC_FETCH_THROTTLED:\s*url=(?P<url>\S+)\s+method=(?P<method>\S+)"
             r"\s+chars=(?P<chars>\S+)\s+phrase=(?P<phrase>.*)"
+        ),
+    ),
+    MarkerSpec(
+        "agentic_fetch_local_doc",
+        # Per-DOCUMENT: the gap-fill v2 ladder read a document without paying for it
+        # (research/agentic/local_document.py:log_local_document_read). Registered because it
+        # is how the whole local-first change gets measured: before it, every PDF the driver
+        # met went to a paid Gemini url_context read, and the only trace of one was the spend.
+        # `method` separates the two local routes — `pdf_local` is a fetch serving a PDF's
+        # extracted text (which paginates, so it selects nothing), `digest_local` is a
+        # read_document answering an ask from BM25-selected passages of text we hold.
+        #
+        # `chars` is the local text HELD, not the window or digest block handed to the driver,
+        # so one figure is comparable across both routes and against URL_CONTEXT_SIZE_GATE_TOKENS
+        # (chars / 4). `pages` is n/a for a page with no page structure; `passages` is n/a on a
+        # pdf_local line and, on a digest_local one, is the field that says whether the digest
+        # actually answered — 0 means the document does not discuss what was asked, which reads
+        # in the block itself as an ordinary successful read. No `question=`: the tool handlers
+        # run below the loop's log_prefix and have no question id, exactly like the throttle
+        # marker above, so a join goes through the run id.
+        re.compile(
+            r"AGENTIC_FETCH_LOCAL_DOC:\s*url=(?P<url>\S+)\s+method=(?P<method>\S+)"
+            r"\s+chars=(?P<chars>\S+)\s+pages=(?P<pages>\S+)\s+passages=(?P<passages>\S+)"
         ),
     ),
     MarkerSpec(

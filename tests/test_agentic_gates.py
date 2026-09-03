@@ -2001,6 +2001,47 @@ class TestConcludeGate:
         assert result.telemetry.concluded_early is True
 
     @pytest.mark.asyncio
+    async def test_locally_read_documents_clear_the_fetch_floor(self) -> None:
+        """A document read from bytes we hold counts toward the floor like any other retrieval.
+
+        The floor counts fetched-tier URLs, so the local rung's two methods have to be in
+        ``provenance._METHOD_TO_TIER`` or a run that read two primary-source PDFs without
+        spending a model call would be told it never fetched anything and be sent back out.
+        """
+
+        async def fetch(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="the report's own text", method="pdf_local")
+
+        async def read_document(**_: Any) -> ToolOutcome:
+            return ToolOutcome(content_markdown="[p.4] the passage asked for", method="digest_local")
+
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}, {"id": "g2", "question": "q2?"}])]
+                ),
+                _response(
+                    tool_calls=[
+                        _tool_call("f1", "fetch", {"url": "https://a.example/report.pdf"}),
+                        _tool_call("r1", "read_document", {"url": "https://b.example/filing.pdf", "ask": "revenue?"}),
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("c1", "conclude", {"gap_accounting": _accounting("g1", "g2")})]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("fetch", fetch), _tool_spec("read_document", read_document)],
+            _config(max_steps=6, max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 0
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
     async def test_must_conclude_bypasses_gate(self) -> None:
         """Budget exhaustion (_must_conclude) overrides the gate: a conclude with
         no gap_accounting at all is accepted, and the rejection counter stays 0."""

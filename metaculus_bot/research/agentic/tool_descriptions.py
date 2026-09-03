@@ -34,11 +34,12 @@ FETCH_DESCRIPTION = (
     "Fetch a URL and return its main content as concise markdown, plus a list of\n"
     "outbound links. Handles ordinary pages, JavaScript-heavy pages, PDFs, and\n"
     "images automatically (the result's `method` field tells you how it was\n"
-    "read) — do NOT avoid a URL because of its format. Content over the size cap\n"
-    "is truncated, ending with `[truncated at N of M chars — call again with\n"
-    "start_char=N]`; pass start_char to read the next window (continuations are\n"
-    "served from cache — they are cheap and do not refetch). Links in the result\n"
-    "are leads you can fetch next.\n"
+    "read) — do NOT avoid a URL because of its format. A PDF is read here, in\n"
+    "full text, with `method=pdf_local`, and paginates exactly like a long HTML\n"
+    "page. Content over the size cap is truncated, ending with `[truncated at N\n"
+    "of M chars — call again with start_char=N]`; pass start_char to read the\n"
+    "next window (continuations are served from cache — they are cheap and do not\n"
+    "refetch). Links in the result are leads you can fetch next.\n"
     "Use read_document instead only when you need a specific question answered\n"
     "from inside a long/complex document.\n"
     "Do NOT fetch metaculus.com URLs — the question brief already reflects them.\n"
@@ -47,11 +48,16 @@ FETCH_DESCRIPTION = (
 )
 
 READ_DOCUMENT_DESCRIPTION = (
-    "Ask a specific question of a specific document (Gemini reads the URL —\n"
-    "handles PDFs, images, and JS pages natively). Slower and costlier than\n"
-    "fetch: use it when you need targeted extraction from a long or complex\n"
-    "document, or when fetch returned status=blocked/js_wall/error for a URL you\n"
-    "still need. Always pass a precise `ask`.\n"
+    "Ask a specific question of a specific document, and get back the passages of\n"
+    "it that bear on your `ask`, quoted verbatim with page numbers where the\n"
+    "document has pages (`method=digest_local`). Use it for targeted extraction\n"
+    "from a long or complex document — a 200-page report, a filing, a big CSV —\n"
+    "and for a URL where fetch returned status=blocked/js_wall/error and you\n"
+    "still need the content: this tool fetches the page itself, and where it\n"
+    "cannot, a model reads the URL for you instead (`method=document`, slower).\n"
+    "A digest with no matching passage means the document does not discuss what\n"
+    "you asked, not that the read failed — try a different ask or another source.\n"
+    "Always pass a precise `ask`: it is what selects the passages.\n"
     'Example: read_document(url="https://example.gov/report-q2.pdf",\n'
     '                       ask="What is the reported unemployment rate for May 2026, and what revision to April is stated?")'
 )

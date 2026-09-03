@@ -456,6 +456,65 @@ class TestAgenticFetchThrottled:
         assert rec["chars"] == 42
 
 
+# Copied from the one emitting format string
+# (research/agentic/local_document.py:log_local_document_read). The pdf_local figures are the
+# 2026-09-03 measurement this rung was built on: pypdf pulled 833,450 chars out of the 220-page
+# 6.7 MB International AI Safety Report in 5.3 s while the paid reader returned nothing for the
+# same file. `passages` is n/a there because a pdf_local fetch serves the text itself and
+# selects nothing; the digest_local line below is where the count carries information.
+AGENTIC_FETCH_LOCAL_DOC_PDF_LINE = (
+    PFX + "AGENTIC_FETCH_LOCAL_DOC: url=https://internationalaisafetyreport.org/report.pdf "
+    "method=pdf_local chars=833450 pages=220 passages=n/a"
+)
+AGENTIC_FETCH_LOCAL_DOC_DIGEST_LINE = (
+    PFX + "AGENTIC_FETCH_LOCAL_DOC: url=https://example.gov/tracker method=digest_local "
+    "chars=41200 pages=n/a passages=6"
+)
+
+
+class TestAgenticFetchLocalDoc:
+    """Per-document record of a read the ladder did for free.
+
+    Worth a spec because it is how the local-first rung gets measured at all: before it, every
+    PDF the gap-fill v2 driver met went to a paid Gemini url_context read and the only trace of
+    one was the month's spend. The two methods are different reads — a fetch serving a PDF's
+    extracted text, and a read_document answering an ask from selected passages — so the rate
+    of each, and the digest's passage count, are what say whether the free route is working.
+    """
+
+    def test_pdf_fields(self):
+        rec = _parse_one(AGENTIC_FETCH_LOCAL_DOC_PDF_LINE)
+        assert rec["marker"] == "agentic_fetch_local_doc"
+        assert rec["url"] == "https://internationalaisafetyreport.org/report.pdf"
+        assert rec["method"] == "pdf_local"
+        assert rec["chars"] == 833450
+        assert rec["pages"] == 220
+        # A pdf_local fetch serves the text and selects nothing, so there is no count to give.
+        assert rec["passages"] is None
+
+    def test_digest_fields(self):
+        rec = _parse_one(AGENTIC_FETCH_LOCAL_DOC_DIGEST_LINE)
+        assert rec["method"] == "digest_local"
+        assert rec["chars"] == 41200
+        # An HTML page has no pages to number; the passage count is the digest's own answer.
+        assert rec["pages"] is None
+        assert rec["passages"] == 6
+
+    def test_zero_passages_is_recorded_not_dropped(self):
+        # The reading that matters most: the digest ran and the document does not discuss what
+        # was asked. In the block itself that reads like any other successful read, so a 0 here
+        # must survive as 0 rather than as "no data".
+        rec = _parse_one(
+            PFX + "AGENTIC_FETCH_LOCAL_DOC: url=https://x.test/a method=digest_local chars=900 pages=3 passages=0"
+        )
+        assert rec["passages"] == 0
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(AGENTIC_FETCH_LOCAL_DOC_PDF_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+
 class TestOpenBoundPiling:
     def test_fields(self):
         rec = _parse_one(OPEN_BOUND_PILING_LINE)

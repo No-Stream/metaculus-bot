@@ -128,6 +128,20 @@ class Passage:
     page: int | None
 
 
+@dataclass(frozen=True)
+class DocumentDigest:
+    """A rendered digest block plus how many passages it carries.
+
+    The count rides along because it is the only thing that says whether a digest ANSWERED
+    the ask: zero passages means the document does not discuss what was asked, which reads
+    identically to a successful read in the block itself (the "no passage matched" sentence)
+    and is what the gap-fill v2 loop's ``AGENTIC_FETCH_LOCAL_DOC`` marker reports.
+    """
+
+    block: str
+    passages: int
+
+
 def is_pdf_body(body: bytes) -> bool:
     """True when these bytes are a PDF, by the ``%PDF-`` header the format mandates.
 
@@ -249,6 +263,11 @@ def select_passages(
 
 
 def render_document_digest(pdf: PdfText, *, query: str, top_k: int, max_chars: int, source_url: str) -> str:
+    """:func:`digest_pdf`'s block, for a caller that needs only the text."""
+    return digest_pdf(pdf, query=query, top_k=top_k, max_chars=max_chars, source_url=source_url).block
+
+
+def digest_pdf(pdf: PdfText, *, query: str, top_k: int, max_chars: int, source_url: str) -> DocumentDigest:
     """The forecaster/driver-facing block for one document: what it is, then what it says.
 
     Deterministic and I/O-free, so the same ``PdfText`` always renders the same block. The
@@ -264,17 +283,32 @@ def render_document_digest(pdf: PdfText, *, query: str, top_k: int, max_chars: i
     sections = [_digest_header(pdf, source_url=source_url)]
     if pdf.unreadable_reason:
         sections.append(f"The document could not be parsed ({pdf.unreadable_reason}); no text was extracted.")
-        return _truncate_digest("\n\n".join(sections), max_chars)
+        return DocumentDigest(block=_truncate_digest("\n\n".join(sections), max_chars), passages=0)
 
     sections.extend(_digest_outline(pdf.outline))
     text, page_breaks = joined_page_text(pdf)
     if not text.strip():
         sections.append("No extractable text layer: the pages carry images rather than text.")
-        return _truncate_digest("\n\n".join(sections), max_chars)
+        return DocumentDigest(block=_truncate_digest("\n\n".join(sections), max_chars), passages=0)
 
     passages = select_passages(text, query, top_k=top_k, page_breaks=page_breaks)
     sections.append(_digest_passages(passages, query=query))
-    return _truncate_digest("\n\n".join(sections), max_chars)
+    return DocumentDigest(block=_truncate_digest("\n\n".join(sections), max_chars), passages=len(passages))
+
+
+def digest_text(text: str, *, query: str, top_k: int, max_chars: int, source_url: str) -> DocumentDigest:
+    """The same digest for a document held as flat text — a fetched web page, not a PDF.
+
+    Page-less by construction, so its passages carry no ``[p.N]`` label and the header states
+    a char count instead of a page count. Everything else is :func:`digest_pdf`'s — the BM25
+    selection, the no-match sentence, the truncation marker — so the two shapes read the same
+    way to whoever consumes them, which is what lets one caller serve a PDF and an HTML page
+    through one code path.
+    """
+    header = f"Document: {source_url}\n{len(text)} chars of text, no page structure"
+    passages = select_passages(text, query, top_k=top_k)
+    block = _truncate_digest("\n\n".join([header, _digest_passages(passages, query=query)]), max_chars)
+    return DocumentDigest(block=block, passages=len(passages))
 
 
 # --- PDF reading -------------------------------------------------------------------------
@@ -607,7 +641,9 @@ def _digest_passages(passages: list[Passage], *, query: str) -> str:
     if not passages:
         return f"No passage in this document matched the query: {query}"
     header = f"Most relevant passages for: {query}"
-    body = [f"[p.{p.page}] {p.text}" if p.page is not None else f"[p.?] {p.text}" for p in passages]
+    # A page-less passage is labelled "[passage]" rather than "[p.?]": the flat-text digest has
+    # no pages to number at all, and "?" would read as a page we failed to identify.
+    body = [f"[p.{p.page}] {p.text}" if p.page is not None else f"[passage] {p.text}" for p in passages]
     return "\n\n".join([header, *body])
 
 

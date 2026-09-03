@@ -1046,7 +1046,10 @@ class TestHarvestVerificationTiers:
     def test_fetched_class_methods_tier_argument_urls_fetched(self) -> None:
         from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
 
-        for method in ("document", "rendered", "plain", "cache"):
+        # pdf_local and digest_local belong in this class because both mean we decoded the bytes
+        # the host served (pypdf text, then a deterministic passage selection), which is a
+        # stronger claim than "document" — a model's reading of a URL we never saw ourselves.
+        for method in ("document", "rendered", "plain", "cache", "pdf_local", "digest_local"):
             tiers = _harvest_verification_tiers(
                 "fetch",
                 {"url": "https://x.example/a"},
