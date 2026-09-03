@@ -866,11 +866,14 @@ in writing — so the binding constraint had moved to RENDERING. Status of the f
    P(>70% of the vote) = 0.58 verbatim. Replayed over the 42 archived ranked-era snapshots:
    individually-named outcomes 792 → 1,572 of 1,839, families naming under 0.95 of their own summed
    open price 60 → 6, fabricated prices rendered 59 → 0.
-2. ~~**One relation-vs-liquidity precedence sentence in the prompt**~~ — **SHIPPED** in `4e342da`
-   (`_MARKET_RELATION_WEIGHTING_SENTENCE`, `prompts.py`): when the relation and liquidity labels
+2. ~~**One relation-vs-liquidity precedence sentence in the prompt**~~ — **SHIPPED** in `4e342da`,
+   and now rule 2 of `_MARKET_READING_RULES` (`prompts.py`): when the relation and liquidity labels
    disagree the liquidity warning governs the price, so an other-cut extrapolation from a thin
    strike widens rather than shifts. q45189's anchor strike had $1,377 of volume, all three
-   forecasters called it thin, and all three resolved the conflict in favour of relation.
+   forecasters called it thin, and all three resolved the conflict in favour of relation. The
+   constant it shipped as, `_MARKET_RELATION_WEIGHTING_SENTENCE`, was cut on 2026-09-02 to its
+   three policy clauses because the other 1,908 chars re-taught the notation the rendered table's
+   own legend already defines (audit `scratch/prompt_bloat_audit_2026-09-02.md`, item R1).
 3. **Staleness guard on tier grading — SHIPPED NARROW 2026-09-01, one operator decision left.**
    `ranking.cap_stale_top_tier` now demotes a row graded `same_quantity_same_date` exactly one rung
    when its close precedes the question's `open_time` by more than `MARKET_STALENESS_TIER_CAP_DAYS`
@@ -1528,10 +1531,13 @@ Shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` + `criteria_clauses`
 authored 2026-07-08, live on main 2026-07-11T16:37Z in merge `642b027` — that merge date is the era
 boundary for any replay that splits on the telemetry's presence)
 plus `PREDICTION_MARKETS_ENABLED: 'true'` make future guard replays exact rather than parser-based. No
-code on the roadmap; passive. Note: the computed `ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP`
-markers emit only from `tool_runner` (gated behind `PROBABILISTIC_TOOLS_ENABLED`, off in prod) so they're
-DORMANT; the raw `base_rate_anchor` / `criteria_clauses` JSON lands unconditionally and the
-overshoot/divergence math is trivially replayable offline from it.
+code on the roadmap; passive. Note, superseded 2026-09-02 by Item D: the computed
+`ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP` markers and the
+`_anchor_and_clause_telemetry_lines` helper that emitted them are DELETED (see the "Removed
+2026-09-02" note in `tool_runner.py`'s module docstring), and the binary prompt no longer asks for
+`base_rate_anchor` / `criteria_clauses`, so no new raw JSON lands at all. The Pydantic fields stay
+optional so archived blocks still strict-parse; the overshoot/divergence math is replayable offline
+only over the blocks already in the archive.
 
 Two free checks next residual session: (1) **structured-JSON presence rate per forecaster** — grep the
 archive for the raw JSON keys, confirm every slot emits them; (2) **does the spring overshoot pattern
