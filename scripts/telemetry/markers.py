@@ -106,6 +106,21 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   free-text log lines and the comment's provider-diagnostics block, so a cut like
   "cdc.gov is 0 successes in 1,069 fetch records" meant re-scraping GHA logs that
   expire at 90 days)
+* ``RESOLUTION_SOURCE_ESCALATION`` — ``metaculus_bot/research/resolution_source.py``
+  (per-ESCALATED URL: a Tier-1 fetch the direct route could not read, which rung of
+  the escalation ladder was tried, what came back, and how long the rung cost. Its
+  sibling ``RESOLUTION_SOURCE_FETCH`` records the FINAL outcome per URL and so is
+  silent on the path taken to it, which is what decides whether a rung earns its
+  latency)
+* ``GEMINI_USAGE`` — ``metaculus_bot/research/gemini_search.py`` and
+  ``metaculus_bot/research/agentic/tool_backends.py`` (per-CALL google-genai token
+  and grounded-query accounting for both Gemini surfaces: grounded search and
+  gap-fill v2's ``read_document``. Neither bills through OpenRouter, so neither
+  appears in ``CREDIT_ROLE_SPEND`` — before this marker the Google AI Studio side of
+  a run's spend was unmeasurable from the archive, and the monthly grounded-prompt
+  allowance is what a feature multiplying grounded calls eats. ``role`` is the
+  surface; the ``question=`` ref is optional because ``read_document`` runs below the
+  loop's log prefix with no question in scope)
 * ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
   ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
   whether it counted toward the exit code)
@@ -720,10 +735,46 @@ MARKER_SPECS: list[MarkerSpec] = [
         # on a named provider. The provider appends it only where it applies, so the group
         # is optional in BOTH directions — absent on every line the archive already holds,
         # and absent on a fresh line whose status carries no reason.
+        #
+        # ``route`` (optional) names which rung of the escalation ladder produced the
+        # recorded outcome — ``direct`` for the plain fetch, and ``meta_refresh`` /
+        # ``impersonate`` / ``pdf_local`` / ``derived_api`` / ``rendered`` / ``wayback`` /
+        # ``url_context`` for an escalated one. Without it a rescued page is indistinguishable
+        # from one the direct route read, so "what did the ladder actually buy" is not a query.
+        # BOTH optional groups are keyed and at the TAIL, in that order: an optional group
+        # sitting BETWEEN same-shaped ``\S+`` fields silently records None for a value that
+        # WAS emitted, and a keyed tail group cannot mis-claim its neighbour's value, so a
+        # line carrying ``route`` but no ``reason`` parses correctly.
         re.compile(
             r"RESOLUTION_SOURCE_FETCH:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
             r"\s+status=(?P<status>\S+)\s+http=(?P<http>\S+)\s+embeds=(?P<embeds>\S+)"
-            r"(?:\s+reason=(?P<reason>\S+))?"
+            r"(?:\s+reason=(?P<reason>\S+))?(?:\s+route=(?P<route>\S+))?"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "resolution_source_escalation",
+        # One line per ESCALATED URL-rung attempt: the direct fetch could not read the page,
+        # so the ladder tried a heavier route. Its sibling ``resolution_source_fetch`` records
+        # only the FINAL per-URL outcome, so on its own it cannot say whether a rung rescued
+        # the page, how many rungs were spent, or what the attempt cost — ``wall_s`` is the
+        # field that decides whether a rung earns its place on a question under a close-derived
+        # time budget.
+        #
+        # ``from_status`` is the verbatim ``FetchStatus`` that triggered the escalation (the
+        # unreadable-page family: ``blocked`` / ``js_wall`` / ``no_resolving_content``), so the
+        # trigger population is queryable without joining back to the fetch marker. ``rung``
+        # names the route tried and ``outcome`` what came back, which keeps a rung that fires
+        # often but rescues nothing distinguishable from one that never fires at all.
+        #
+        # The token cannot collide with ``RESOLUTION_SOURCE_FETCH``: both specs match on their
+        # own full marker word plus the colon, and neither word is a prefix of the other, so
+        # the one-marker-per-line ``break`` in ``parse_log_text`` cannot mis-route either line
+        # whichever order they sit in.
+        re.compile(
+            r"RESOLUTION_SOURCE_ESCALATION:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
+            r"\s+from_status=(?P<from_status>\S+)\s+rung=(?P<rung>\S+)\s+outcome=(?P<outcome>\S+)"
+            r"\s+wall_s=(?P<wall_s>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),
@@ -1090,6 +1141,39 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
     ),
     MarkerSpec(
+        "gemini_usage",
+        # Per-CALL google-genai accounting for BOTH Gemini surfaces: grounded search
+        # (research/gemini_search.py) and gap-fill v2's read_document
+        # (research/agentic/tool_backends.py). Neither routes through OpenRouter, so neither
+        # shows up in CREDIT_ROLE_SPEND and the whole Google AI Studio side of a run's spend
+        # was unmeasurable from the archive — which matters because grounding is metered
+        # against a monthly grounded-prompt allowance per project, billed per QUERY on
+        # overage, and any feature that multiplies grounded calls re-eats that pool (the
+        # spring-2026 billing arc). ``role`` names the surface, so the two are separable
+        # without keying on the model.
+        #
+        # Every token field can read ``n/a``: the SDK's usage_metadata fields are individually
+        # optional, and a missing count must harvest as None rather than as a measured zero,
+        # which is exactly what the ``n/a`` sentinel does through ``coerce_value``.
+        # ``search_queries`` is the grounded-query count (the billable unit on overage) and is
+        # ``n/a`` on the read_document surface, which issues no search.
+        #
+        # ``question`` is OPTIONAL and last: the grounded-search call site has the question in
+        # scope and passes ``question.id_of_question`` (hence ``qid_kind``, matching its
+        # ``gemini_grounding_density`` sibling), while read_document runs as a per-URL tool
+        # below the loop's log prefix with no question at all. A keyed tail group is what lets
+        # one spec serve both without recording None for a field that WAS emitted.
+        re.compile(
+            r"GEMINI_USAGE:\s*role=(?P<role>\S+)\s+model=(?P<model>\S+)"
+            r"\s+prompt_tokens=(?P<prompt_tokens>\S+)"
+            r"\s+tool_use_prompt_tokens=(?P<tool_use_prompt_tokens>\S+)"
+            r"\s+candidates_tokens=(?P<candidates_tokens>\S+)"
+            r"\s+thoughts_tokens=(?P<thoughts_tokens>\S+)\s+total_tokens=(?P<total_tokens>\S+)"
+            r"\s+search_queries=(?P<search_queries>\S+)(?:\s+question=(?P<question>\S+))?"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
+    ),
+    MarkerSpec(
         "agentic_document_ungrounded_suppressed",
         # The read_document twin of GEMINI_UNGROUNDED_SUPPRESSED (research/agentic/tools.py
         # read_document): Gemini's url_context tool retrieved nothing, so the answer would
@@ -1097,8 +1181,15 @@ MARKER_SPECS: list[MarkerSpec] = [
         # measuring separately because a "fetched" document discrepancy is the only kind
         # that enters the artifact's SUPERSEDE block, i.e. the one that tells every
         # forecaster to override the briefing. Carries no question id — read_document is a
-        # per-URL tool with no question in scope — so the URL is the only field.
-        re.compile(r"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED:\s*url=(?P<url>\S+)"),
+        # per-URL tool with no question in scope — so the URL was for a long time its only field.
+        #
+        # ``statuses`` (optional) is the comma-joined list of url_context retrieval statuses the
+        # SDK reported for that call, or the ``none`` sentinel when it reported none at all
+        # (which harvests as None, the same reading an archived pre-field line gets). It splits
+        # the two causes a bare suppression cannot: the tool tried and the fetch failed for a
+        # nameable reason, versus the tool never retrieved anything to report on. Optional and
+        # at the tail so every line the archive already holds parses byte-identically.
+        re.compile(r"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED:\s*url=(?P<url>\S+)(?:\s+statuses=(?P<statuses>\S+))?"),
     ),
     MarkerSpec(
         "gap_fill_analyzer_failed",

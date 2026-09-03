@@ -13,6 +13,9 @@ tests loudly instead of silently dropping records from the archive:
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
 * MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
 * RESOLUTION_SOURCE_FETCH -> metaculus_bot/research/resolution_source.py:_log_fetch_outcome_markers
+* RESOLUTION_SOURCE_ESCALATION -> metaculus_bot/research/resolution_source.py (per escalated rung)
+* GEMINI_USAGE       -> metaculus_bot/research/gemini_search.py and
+  metaculus_bot/research/agentic/tool_backends.py (one emitter shape, two surfaces)
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
 * STACKER_OUTCOME/TOOLS_USED -> metaculus_bot/comment/markers.py (HTML-comment
   markers; see module docstring in markers.py for why they rarely appear in run logs).
@@ -1062,6 +1065,17 @@ RESOLUTION_SOURCE_FETCH_DATASET_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44841 url=https://static.dwcdn.net/data/kSCt4.csv "
     "status=ok http=200 embeds=none"
 )
+# The `route` tail names which rung of the escalation ladder produced the outcome. It is
+# keyed and last, so all four presence combinations of the two optional tails parse: neither
+# (every archived line), reason only, route only, and both.
+RESOLUTION_SOURCE_FETCH_ROUTE_ONLY_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
+    "status=ok http=200 embeds=none route=wayback"
+)
+RESOLUTION_SOURCE_FETCH_REASON_AND_ROUTE_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44556 url=https://tracker.example.com/senate "
+    "status=no_resolving_content http=200 embeds=infogram reason=embed_shell route=rendered"
+)
 
 
 class TestResolutionSourceFetch:
@@ -1130,6 +1144,87 @@ class TestResolutionSourceFetch:
         rec = _parse_one(RESOLUTION_SOURCE_FETCH_DATASET_LINE)
         assert rec["url"] == "https://static.dwcdn.net/data/kSCt4.csv"
         assert rec["status"] == "ok"
+
+    def test_route_names_the_ladder_rung_that_produced_the_outcome(self):
+        # A page the direct fetch could not read and an escalated rung rescued reads `ok` on
+        # this marker either way, so without `route` "what did the ladder buy" is not a query.
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_ROUTE_ONLY_LINE)
+        assert rec["status"] == "ok"
+        assert rec["route"] == "wayback"
+        # `route` present with `reason` absent is the combination a middle-positioned optional
+        # group would break: it would swallow the route value into the reason field.
+        assert rec["reason"] is None
+
+    def test_both_optional_tails_parse_together(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_REASON_AND_ROUTE_LINE)
+        assert rec["status"] == "no_resolving_content"
+        assert rec["reason"] == "embed_shell"
+        assert rec["route"] == "rendered"
+
+    def test_lines_without_a_route_still_parse_and_harvest_it_as_none(self):
+        # Every line the archive already holds predates the field, and a direct fetch on a
+        # provider that has not been taught the ladder omits it too.
+        for line in (
+            RESOLUTION_SOURCE_FETCH_OK_LINE,
+            RESOLUTION_SOURCE_FETCH_NO_CONTENT_LINE,
+            RESOLUTION_SOURCE_FETCH_DATASET_LINE,
+        ):
+            assert _parse_one(line).get("route") is None
+
+
+# Copied from the emitting format string (resolution_source.py). One line per ESCALATED rung:
+# the direct route could not read the page, so a heavier rung was tried. The fetch marker above
+# records only the FINAL per-URL outcome, so it is silent on the path taken and on its cost.
+RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE = (
+    PFX + "RESOLUTION_SOURCE_ESCALATION: question=44556 url=https://tracker.example.com/senate "
+    "from_status=js_wall rung=rendered outcome=success wall_s=12.44"
+)
+RESOLUTION_SOURCE_ESCALATION_FAILED_LINE = (
+    PFX + "RESOLUTION_SOURCE_ESCALATION: question=44211 url=https://www.cbp.gov/newsroom/stats "
+    "from_status=blocked rung=impersonate outcome=blocked wall_s=3.07"
+)
+
+
+class TestResolutionSourceEscalation:
+    """Per-rung escalation attempts, harvested.
+
+    A rung that fires often and rescues nothing has to be distinguishable from one that never
+    fires at all, and `wall_s` is what decides whether a rung earns its latency on a question
+    running under a close-derived time budget.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE)
+        assert rec["marker"] == "resolution_source_escalation"
+        assert rec["url"] == "https://tracker.example.com/senate"
+        # The verbatim FetchStatus that triggered the escalation, so the trigger population is
+        # queryable without joining back to the fetch marker.
+        assert rec["from_status"] == "js_wall"
+        assert rec["rung"] == "rendered"
+        assert rec["outcome"] == "success"
+        assert rec["wall_s"] == 12.44
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE)
+        # resolution_source.py emits question.id_of_question, same as its fetch sibling.
+        assert rec["qid"] == 44556
+        assert rec["qid_kind"] == "question_id"
+
+    def test_a_rung_that_rescued_nothing_is_still_recorded(self):
+        rec = _parse_one(RESOLUTION_SOURCE_ESCALATION_FAILED_LINE)
+        assert rec["rung"] == "impersonate"
+        assert rec["outcome"] == "blocked"
+        assert rec["wall_s"] == 3.07
+
+    def test_does_not_collide_with_the_fetch_marker(self):
+        # Both tokens start RESOLUTION_SOURCE_, and resolution_source_fetch sits EARLIER in
+        # MARKER_SPECS, so under the one-marker-per-line break a loose prefix match there would
+        # have swallowed every escalation line.
+        harvested = parse_log_text(
+            RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE + "\n" + RESOLUTION_SOURCE_FETCH_OK_LINE + "\n", **_META
+        )
+        assert len(harvested["resolution_source_escalation"]) == 1
+        assert len(harvested["resolution_source_fetch"]) == 1
 
 
 class TestCredit:
@@ -2332,11 +2427,121 @@ class TestGeminiUnsupportedAttribution:
         assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
 
 
+# Copied from the shared emitting format string, which both Gemini surfaces write:
+# metaculus_bot/research/gemini_search.py (grounded search, question in scope) and
+# metaculus_bot/research/agentic/tool_backends.py (gap-fill v2's read_document, no question).
+# Neither surface bills through OpenRouter, so neither appears in CREDIT_ROLE_SPEND.
+GEMINI_USAGE_GROUNDED_LINE = (
+    PFX + "GEMINI_USAGE: role=grounded_search model=gemini-3.5-flash prompt_tokens=1420 "
+    "tool_use_prompt_tokens=8305 candidates_tokens=2011 thoughts_tokens=944 total_tokens=12680 "
+    "search_queries=3 question=44944"
+)
+GEMINI_USAGE_READ_DOCUMENT_LINE = (
+    PFX + "GEMINI_USAGE: role=read_document model=gemini-3.5-flash prompt_tokens=214 "
+    "tool_use_prompt_tokens=n/a candidates_tokens=1877 thoughts_tokens=n/a total_tokens=2091 "
+    "search_queries=n/a"
+)
+
+
+class TestGeminiUsage:
+    """The Google AI Studio side of a run's spend.
+
+    Grounding is metered against a monthly grounded-prompt allowance per project and billed per
+    QUERY on overage, so `search_queries` is the billable unit and any feature that multiplies
+    grounded calls re-eats the same pool. Before this marker none of it was in the archive.
+    """
+
+    def test_grounded_search_fields(self):
+        rec = _parse_one(GEMINI_USAGE_GROUNDED_LINE)
+        assert rec["marker"] == "gemini_usage"
+        assert rec["role"] == "grounded_search"
+        assert rec["model"] == "gemini-3.5-flash"
+        assert rec["prompt_tokens"] == 1420
+        assert rec["tool_use_prompt_tokens"] == 8305
+        assert rec["candidates_tokens"] == 2011
+        assert rec["thoughts_tokens"] == 944
+        assert rec["total_tokens"] == 12680
+        assert rec["search_queries"] == 3
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GEMINI_USAGE_GROUNDED_LINE)
+        # gemini_search.py passes question.id_of_question, same as its density sibling.
+        assert rec["qid"] == 44944
+        assert rec["qid_kind"] == "question_id"
+
+    def test_read_document_omits_the_question_and_still_parses(self):
+        # read_document is a per-URL tool running below the loop's log prefix with no question
+        # in scope, so the keyed tail group is what lets one spec serve both surfaces.
+        rec = _parse_one(GEMINI_USAGE_READ_DOCUMENT_LINE)
+        assert rec["role"] == "read_document"
+        assert rec["qid"] is None
+        assert rec["prompt_tokens"] == 214
+        assert rec["total_tokens"] == 2091
+
+    def test_absent_counts_harvest_as_none_not_as_zero(self):
+        # Every usage_metadata field is individually optional on the SDK response, and a count
+        # the API never reported must not read as a measured zero.
+        rec = _parse_one(GEMINI_USAGE_READ_DOCUMENT_LINE)
+        assert rec["tool_use_prompt_tokens"] is None
+        assert rec["thoughts_tokens"] is None
+        # read_document issues no search at all, which is different from searching zero times.
+        assert rec["search_queries"] is None
+
+    def test_a_wholly_unreported_usage_block_harvests_all_nulls(self):
+        rec = _parse_one(
+            PFX + "GEMINI_USAGE: role=grounded_search model=gemini-3.5-flash prompt_tokens=n/a "
+            "tool_use_prompt_tokens=n/a candidates_tokens=n/a thoughts_tokens=n/a total_tokens=n/a "
+            "search_queries=n/a question=None"
+        )
+        assert rec["marker"] == "gemini_usage"
+        assert rec["qid"] is None
+        assert all(
+            rec[field] is None
+            for field in (
+                "prompt_tokens",
+                "tool_use_prompt_tokens",
+                "candidates_tokens",
+                "thoughts_tokens",
+                "total_tokens",
+                "search_queries",
+            )
+        )
+
+    def test_does_not_collide_with_its_gemini_siblings(self):
+        # Four markers now start GEMINI_ and three come out of gemini_search.py, so each spec
+        # must claim only its own line or the archive double-counts.
+        harvested = parse_log_text(
+            "\n".join(
+                [
+                    GEMINI_USAGE_GROUNDED_LINE,
+                    GEMINI_GROUNDING_DENSITY_LINE,
+                    GEMINI_UNSUPPORTED_ATTRIBUTION_LINE,
+                    GEMINI_UNGROUNDED_LINE,
+                ]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["gemini_usage"]) == 1
+        assert len(harvested["gemini_grounding_density"]) == 1
+        assert len(harvested["gemini_unsupported_attribution"]) == 1
+        assert len(harvested["gemini_ungrounded_suppressed"]) == 1
+
+
 # read_document's twin of GEMINI_UNGROUNDED_SUPPRESSED (metaculus_bot/research/agentic/tools.py): Gemini's
 # url_context tool retrieved nothing, so the "fetched" tier is withheld rather than granting a
 # parametric-recall answer the authority to supersede the briefing for every forecaster.
 AGENTIC_DOCUMENT_UNGROUNDED_LINE = (
     PFX_WARN + "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/filing.pdf"
+)
+# The `statuses` tail carries the url_context retrieval statuses the SDK reported for the call,
+# or the `none` sentinel when it reported none at all.
+AGENTIC_DOCUMENT_UNGROUNDED_WITH_STATUSES_LINE = (
+    PFX_WARN + "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/filing.pdf "
+    "statuses=URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+)
+AGENTIC_DOCUMENT_UNGROUNDED_NO_STATUSES_LINE = (
+    PFX_WARN + "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/filing.pdf statuses=none"
 )
 
 
@@ -2345,6 +2550,18 @@ class TestAgenticDocumentUngroundedSuppressed:
         rec = _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_LINE)
         assert rec["marker"] == "agentic_document_ungrounded_suppressed"
         assert rec["url"] == "https://example.com/filing.pdf"
+
+    def test_statuses_split_a_failed_retrieval_from_no_retrieval_at_all(self):
+        # A bare suppression cannot say which happened; the SDK's own status names can.
+        rec = _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_WITH_STATUSES_LINE)
+        assert rec["url"] == "https://example.com/filing.pdf"
+        assert rec["statuses"] == "URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+
+    def test_the_none_sentinel_and_an_archived_line_both_harvest_as_none(self):
+        # Every line the archive already holds predates the field, and `none` means the SDK
+        # reported no statuses — the same reading, which is why the sentinel is used.
+        for line in (AGENTIC_DOCUMENT_UNGROUNDED_LINE, AGENTIC_DOCUMENT_UNGROUNDED_NO_STATUSES_LINE):
+            assert _parse_one(line).get("statuses") is None
 
     def test_does_not_collide_with_the_gemini_search_marker(self):
         # Both markers end in UNGROUNDED_SUPPRESSED; each spec must claim only its own

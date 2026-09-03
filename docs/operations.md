@@ -983,8 +983,8 @@ the telemetry markers:
   `_throttled_fetch_outcome` in `research/agentic/tools.py`; harvested as
   `agentic_fetch_throttled`. Receipt: q45191, where two throttled ogimet.com fetches reached
   the driver as successful ones and the driver's own retry was served the cached refusal.
-- `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=... [reason=...]` —
-  one line per URL the resolution-source provider fetched, emitted by
+- `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=... [reason=...]
+  [route=...]` — one line per URL the resolution-source provider fetched, emitted by
   `_log_fetch_outcome_markers` in `research/resolution_source.py`. `status` is `ok`
   for a success and the verbatim `FetchStatus` otherwise (`blocked`, `js_wall`,
   `no_resolving_content`, `stale_data`, ...); `http` is `n/a` when no response ever
@@ -996,13 +996,57 @@ the telemetry markers:
   and `thin_page` when the extraction was simply under the chrome floor, the
   population the floor gained on 2026-09-02 when it stopped being gated on a named
   provider. Its absence means no reason applies, on a fresh line as much as on an
-  archived one. Tier-2
+  archived one. `route` names which rung of the escalation ladder produced the recorded
+  outcome: `direct` for the plain fetch, and `meta_refresh`, `impersonate`, `pdf_local`,
+  `derived_api`, `rendered`, `wayback` or `url_context` for an escalated one. Without it
+  a rescued page reads exactly like one the direct route managed on its own, so "what
+  did the ladder actually buy" would not be a query. Both optional fields are keyed and
+  sit at the end of the line, so a line carrying `route` and no `reason` parses
+  correctly and every archived line still parses byte-identically. Tier-2
   Datawrapper dataset hops ride the same line and are identifiable by their url
   (`static.dwcdn.net/data/<chart_id>.csv`). This replaced the older free-text
   `resolution_source fetched <netloc> (<status>)` lines rather than joining them, so
   each fetch appears exactly once; the remaining free-text lines are REASON lines (a
   decode score, an unread content-type, an SSRF rejection) carrying what the marker
   cannot.
+- `RESOLUTION_SOURCE_ESCALATION: question=... url=... from_status=... rung=... outcome=...
+  wall_s=...` — one line per escalated rung attempt, emitted by
+  `research/resolution_source.py` when the direct fetch could not read a page and a
+  heavier route was tried. `from_status` is the verbatim `FetchStatus` that triggered
+  the escalation (the unreadable-page family: `blocked`, `js_wall`,
+  `no_resolving_content`), `rung` is the route tried, `outcome` is what came back, and
+  `wall_s` is what that rung cost. The `RESOLUTION_SOURCE_FETCH` line above records only
+  the FINAL outcome per URL, so on its own it cannot say how many rungs were spent or
+  which one rescued the page; this marker is where a rung that fires often and rescues
+  nothing becomes distinguishable from one that never fires, and where the latency case
+  for keeping a rung on a question under a close-derived time budget gets made.
+  Harvested as `resolution_source_escalation`.
+- `GEMINI_USAGE: role=... model=... prompt_tokens=... tool_use_prompt_tokens=...
+  candidates_tokens=... thoughts_tokens=... total_tokens=... search_queries=...
+  [question=...]` — per-call google-genai token and grounded-query accounting, written
+  by both Gemini surfaces: grounded search (`research/gemini_search.py`, `role` =
+  `grounded_search`) and gap-fill v2's `read_document`
+  (`research/agentic/tool_backends.py`, `role` = `read_document`). Neither surface bills
+  through OpenRouter, so neither shows up in `CREDIT_ROLE_SPEND`, and before this marker
+  the whole Google AI Studio side of a run's spend was invisible to the archive. That
+  side is metered against a monthly grounded-prompt allowance per project and billed per
+  QUERY on overage, which makes `search_queries` the billable unit and makes any feature
+  that multiplies grounded calls a re-run of the spring-2026 billing arc. Every token
+  field can read `n/a`: the SDK reports each `usage_metadata` field independently, and a
+  count it never sent harvests as null rather than as a measured zero. `question` is
+  present on the grounded-search line and absent on `read_document`, which runs as a
+  per-URL tool with no question in scope. Harvested as `gemini_usage`.
+- `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]` — a WARN, one per
+  gap-fill v2 `read_document` call whose `url_context` retrieval brought back nothing,
+  so the answer would have been unsourced recall and the `fetched` verification tier is
+  withheld (`research/agentic/tools.py`). Worth watching because a `fetched` document
+  discrepancy is the only kind that enters the findings artifact's SUPERSEDE block, the
+  one that tells every forecaster to override the briefing. `statuses` is the
+  comma-joined list of url_context retrieval statuses the SDK reported for that call, or
+  `none` when it reported none at all, which splits a retrieval that was attempted and
+  failed for a nameable reason from one that never happened. Both `none` and an absent
+  field harvest as null, so an archived pre-field line reads the same way. Harvested as
+  `agentic_document_ungrounded_suppressed`.
 - `FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor symbol=... vr_lag=... vr=...
   floor=... short_vol=... long_vol=... robust_vol=...` — the series behind a rendered
   volatility is noise-dominated: its variance ratio sits below
