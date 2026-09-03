@@ -623,6 +623,27 @@ RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S: float = 2.0
 RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS: int = 3000
 RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS: float = 30.0  # freshness bound on the dataset's Last-Modified vs fetch time. Live trackers republish at least daily; the stale-route failure class this guards against served 5-14 MONTH old snapshots as HTTP 200 (2026-08-24 verifications). Older/undatable data is withheld (stale_data), never served as live.
 
+# --- Local document text (PDFs read with pypdf, `research/document_text.py`) ---
+# Measured 2026-09-03: local pypdf pulled 833,450 chars out of a 6.7 MB 220-page PDF in
+# 5.3 s and the passage the research driver was looking for was in it, while the paid
+# Gemini url_context read of the same file returned nothing. So a PDF we already hold is
+# extracted and passage-selected locally, and a model call is spent only on a document we
+# cannot read at all.
+DOCUMENT_TEXT_MAX_PAGES: int = 400  # ~2x the 220-page document behind the measurement, so a normal government report reads whole while a 4,000-page appendix dump stays bounded
+DOCUMENT_TEXT_MAX_SECONDS: float = 20.0  # ~4x the measured 5.3 s for 220 pages; matches RESOLUTION_SOURCE_HTTP_TIMEOUT, so parsing a document costs no more of the research phase than fetching it did
+DOCUMENT_TEXT_PDF_MAX_BYTES: int = (
+    40 * 1024 * 1024
+)  # ~6x the measured 6.7 MB file; above this the parse is not worth a research phase, and the bytes are refused before pypdf allocates
+DOCUMENT_DIGEST_TOP_K: int = 6  # passages per document: 6 x DOCUMENT_DIGEST_WINDOW_CHARS is ~3.6k chars (~900 tokens), the same order as one cited page under RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+DOCUMENT_DIGEST_WINDOW_CHARS: int = (
+    600  # ~1 paragraph of a report; mirrored as document_text.DEFAULT_WINDOW_CHARS, pinned equal by a test
+)
+# A document we ALREADY hold whose estimated token count (chars / 4) exceeds this is never
+# sent to a paid url_context read — the digest serves it instead. The nine archived documents
+# above this bound carried 67% of all reader tokens, and the 833k-char case above is the shape
+# that spends most: the paid read of it returned nothing, so the spend bought a null answer.
+URL_CONTEXT_SIZE_GATE_TOKENS: int = 100_000
+
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
 # Search results (distinct from OpenRouter's Exa-backed :online plugin). Adds a
