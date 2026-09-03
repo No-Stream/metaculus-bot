@@ -198,9 +198,11 @@ CitationStyle = Literal["markdown", "auto_annotated"]
 
 
 # Source-tier vocabulary for the RESEARCH-side prompts (web research + AskNews
-# summarizer). This is the ONE place the A-D tiers are defined: the forecaster
-# prompts' provenance ladder (``_SOURCE_PROVENANCE_LADDER`` below) names the tag
-# shape and how to use each tier, and relies on the briefing arriving tagged.
+# summarizer). The FULL A-D definitions live here and only here; the forecaster prompts'
+# provenance ladder (``_SOURCE_PROVENANCE_LADDER`` below) names the tag shape, carries a
+# one-clause GLOSS per tier, and relies on the briefing arriving tagged. Re-cutting a tier
+# boundary means editing both, or the forecaster reads the old boundary while the research
+# side tags by the new one.
 # Without research-side tags a C-tier aggregator claim arrives in the briefing
 # looking identical to a B-tier wire fact and the ladder has nothing to weight. Deliberately
 # short — research output is itself an input to further summarization — and
@@ -492,9 +494,11 @@ SUMMARIZER_SOFT_FAIL_BANNER = (
 # clean and just appends the ladder). The A-D tier DEFINITIONS are stated once,
 # in the research-side ``_SOURCE_TIER_TAG_INSTRUCTION`` above, and the briefing
 # arrives carrying the tags (every artifact record since the tagging landed in
-# prod); the ladder names the tag shape and keeps only the two usage clauses the
-# tag instruction does not carry. It used to restate all four definitions, which
-# re-taught the model a vocabulary the text in front of it was already written in.
+# prod); the ladder names the tag shape, keeps the two usage clauses the tag instruction
+# does not carry, and glosses each tier in one clause. It used to restate all four
+# definitions in full, which re-taught the model a vocabulary the text in front of it was
+# already written in. The gloss is not the definition: those live once in
+# ``_SOURCE_TIER_TAG_INSTRUCTION``, and a tier re-cut has to move both.
 # Every line is pre-indented to >= 15 spaces so clean_indents preserves the
 # nesting in all three prompts despite their differing baselines (binary
 # baseline 12, MC/numeric baseline 8).
@@ -627,6 +631,18 @@ _REMAINING_EXPOSURE_SENTENCE = (
     "(a rate spread over the whole window prices time that has already passed)."
 )
 
+# The binary outside-view step's conditional-hazard bullet, which OPENS with the sentence
+# above because the hazard check is that same rule specialised to recurring events. A named
+# constant rather than an inline interpolation: ruff-format split the mid-bullet replacement
+# field across three lines at an indent the surrounding prompt does not use, in the region of
+# this file that gets edited most. The rendered text is unchanged.
+_BINARY_CONDITIONAL_HAZARD_BULLET = (
+    f"{_REMAINING_EXPOSURE_SENTENCE} Conditional-hazard check: for a recurring event with a history of "
+    "inter-arrival gaps, fit a simple model to the gaps (exponential with mean = average gap, or the observed "
+    "gaps as an empirical distribution), compute P(event by deadline | no event in the T days already elapsed), "
+    'and show the number. Otherwise write "non-recurring, conditional-hazard skipped".'
+)
+
 
 # The three READING rules for the rendered market table that its own legend does not carry.
 # The legend (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`, printed beside the table)
@@ -678,8 +694,14 @@ def _strong_evidence_market_clause(
     """Shared "prediction markets are strong evidence" clause for the three forecaster prompts.
 
     Returns ``""`` unless ``research`` carries ``MARKET_SNAPSHOT_SECTION_HEADER`` — the clause
-    is about reading a table, so it renders only when the table does (mirrors the numeric
-    prompt's TS-anchor gate). The framing is identical across binary / MC / numeric; only a few
+    is about reading a table, so it renders only when the table does (the same substring gate
+    the numeric prompt's TS-anchor clause uses). Note the one path where the two come apart: on
+    the provider's DELIBERATE-empty answer the header is present with a single sentence and no
+    table, so the reading rules render while the legend that defines their notation (`↳`
+    sub-rows, `[remaining N]`, the liquidity and relation labels) does not. Left as is on
+    purpose: a second gating condition would silently drop the whole market policy from every
+    prompt that DOES have a table the moment its false negative fired, which is a far worse
+    failure than three rules naming notation an empty section never uses. The framing is identical across binary / MC / numeric; only a few
     type-specific words differ (the signal noun, the anchor verb phrase, the extrapolation
     target, and the projection tail). Centralizing it keeps the strong-evidence framing AND the
     reading rules in sync across all three prompts. Spliced into each prompt's ``clean_indents``
@@ -887,9 +909,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • List plausible reference classes for this question and evaluate suitability.
                • State the outside-view base rate(s) and how you combine them into a baseline probability.
                • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i) — union only over paths that cannot be the same event, since an overlapping term double-counts it). A rough quantitative estimate from data is more reliable than an intuitive guess.
-               • {
-            _REMAINING_EXPOSURE_SENTENCE
-        } Conditional-hazard check: for a recurring event with a history of inter-arrival gaps, fit a simple model to the gaps (exponential with mean = average gap, or the observed gaps as an empirical distribution), compute P(event by deadline | no event in the T days already elapsed), and show the number. Otherwise write "non-recurring, conditional-hazard skipped".
+               • {_BINARY_CONDITIONAL_HAZARD_BULLET}
 {_COUNT_IN_PERIOD_REFERENCE_CLASS}
 {_SOFT_CLOCK_RULE}
 {_HISTORY_DISCHARGED_RULE}
@@ -1083,10 +1103,9 @@ def numeric_prompt(
 ) -> str:
     unit_str = question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
     nom_upper, nom_lower = nominal_bounds(question)
-    # Only surface the anchor guidance when an anchor section is actually in the
-    # research (mirrors how the market clause's advice only bites when a market
-    # snapshot is present, but here we gate the text itself on a cheap substring
-    # check since the anchor provider is off by default).
+    # Only surface the anchor guidance when an anchor section is actually in the research:
+    # the same cheap substring gate ``_strong_evidence_market_clause`` applies to the market
+    # clause, so neither clause spends prompt on a table the forecaster does not have.
     ts_anchor_clause = f"\n        {_ts_anchor_evidence_clause()}" if TS_ANCHOR_SECTION_HEADER in research else ""
     return clean_indents(
         f"""
