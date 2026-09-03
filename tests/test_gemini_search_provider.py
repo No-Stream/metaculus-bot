@@ -4,6 +4,7 @@ These tests mock the google-genai SDK at the module level; no live API calls.
 Patterns mirror ``tests/test_native_search_provider.py``.
 """
 
+import logging
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import cast
@@ -67,6 +68,8 @@ def _make_response(
     supports: list[CannedSupport] | None = None,
     url_metadata: Sequence[object] | None = None,
     web_search_queries: list[str] | None = None,
+    usage_metadata: object | None = None,
+    model_version: str | None = None,
 ) -> SimpleNamespace:
     # ``web_search_queries`` is a declared field on the real SDK GroundingMetadata
     # (Optional[list[str]]); the zero-chunk floor reads it to size its WARN, so the
@@ -81,7 +84,32 @@ def _make_response(
         grounding_metadata=metadata,
         url_context_metadata=url_context_metadata,
     )
-    return SimpleNamespace(text=text, candidates=[candidate])
+    # ``usage_metadata`` / ``model_version`` are declared response-level fields the
+    # GEMINI_USAGE marker reads; both default to None (the SDK's own default) so a test
+    # that doesn't care about spend still hands over an SDK-shaped object.
+    return SimpleNamespace(
+        text=text,
+        candidates=[candidate],
+        usage_metadata=usage_metadata,
+        model_version=model_version,
+    )
+
+
+def _make_usage(
+    prompt: int | None = 1200,
+    tool_use: int | None = 340,
+    candidates: int | None = 900,
+    thoughts: int | None = 2600,
+    total: int | None = 5040,
+) -> SimpleNamespace:
+    """A ``GenerateContentResponseUsageMetadata`` stand-in (every field Optional on the SDK)."""
+    return SimpleNamespace(
+        prompt_token_count=prompt,
+        tool_use_prompt_token_count=tool_use,
+        candidates_token_count=candidates,
+        thoughts_token_count=thoughts,
+        total_token_count=total,
+    )
 
 
 def _make_client_with_response(response: object) -> MagicMock:
@@ -1285,3 +1313,139 @@ class TestParallelProviderSelectionGemini:
 
         provider_names = [name for _, name in providers]
         assert "gemini_search" not in provider_names
+
+
+# ---------------------------------------------------------------------------
+# Client HTTP configuration, thinking level, and the GEMINI_USAGE marker
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiClientConfigAndUsage:
+    """The client is configured, and every response's token spend is recorded.
+
+    Two 2026-09 gaps, fixed together. The client was built bare — no retry options, which
+    in ``google-genai`` means ``stop_after_attempt(1)``, so a transient ``503 UNAVAILABLE``
+    lost the whole Google research leg — and nothing logged what the call cost on the
+    operator's personal AI Studio key, which made Google-side spend reconstructable only
+    from whole archived SDK responses.
+    """
+
+    @pytest.mark.asyncio
+    async def test_client_carries_the_timeout_and_retry_ladder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+        from metaculus_bot.constants import GEMINI_SEARCH_HTTP_ATTEMPTS, GEMINI_SEARCH_HTTP_TIMEOUT_MS
+
+        fake_client = _make_client_with_response(_make_response("research text"))
+
+        with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client) as client_constructor:
+            from metaculus_bot.research.gemini_search import gemini_search_provider
+
+            await gemini_search_provider()(_make_q("Will X happen?"))
+
+        http_options = client_constructor.call_args.kwargs["http_options"]
+        assert http_options.timeout == GEMINI_SEARCH_HTTP_TIMEOUT_MS
+        retry_options = http_options.retry_options
+        assert retry_options is not None, "a bare client retries nothing at all (stop_after_attempt(1))"
+        assert retry_options.attempts == GEMINI_SEARCH_HTTP_ATTEMPTS
+        assert 503 in (retry_options.http_status_codes or []), "503 UNAVAILABLE is the failure this recovers"
+
+    def test_per_attempt_timeout_stays_under_the_outer_deadline(self) -> None:
+        """The outer ``asyncio.wait_for(GEMINI_SEARCH_TIMEOUT)`` must stay the total bound.
+
+        It is what cancels a hung call today, and adding retries must not change that. Since
+        the client timeout is PER ATTEMPT, the invariant is that one attempt cannot outlast
+        the outer deadline — a retry then only completes when the first attempt failed fast
+        (a 503 returns in milliseconds), and a hang still ends at the outer deadline exactly
+        as it does now. Sizing attempts x timeout under 360s instead would need <=176s per
+        attempt, below the 150-200s AFC chains ``GEMINI_SEARCH_TIMEOUT``'s own comment
+        records as legitimate.
+        """
+        from metaculus_bot.constants import GEMINI_SEARCH_HTTP_TIMEOUT_MS, GEMINI_SEARCH_TIMEOUT
+
+        assert GEMINI_SEARCH_HTTP_TIMEOUT_MS / 1000 < GEMINI_SEARCH_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_thinking_level_is_set_explicitly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Left unset, gemini-3-flash-preview thinks at HIGH, which was most of the bill."""
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+        from metaculus_bot.constants import GEMINI_SEARCH_THINKING_LEVEL
+
+        fake_client = _make_client_with_response(_make_response("research text"))
+
+        with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+            from metaculus_bot.research.gemini_search import gemini_search_provider
+
+            await gemini_search_provider()(_make_q("Will X happen?"))
+
+        config = fake_client.aio.models.generate_content.await_args.kwargs["config"]
+        thinking_config = config.thinking_config
+        assert thinking_config is not None
+        # The SDK normalizes the string through its case-insensitive ThinkingLevel enum.
+        assert thinking_config.thinking_level == genai_types.ThinkingLevel(GEMINI_SEARCH_THINKING_LEVEL.upper())
+        # No output cap alongside it: capping tokens on a thinking model truncated silently.
+        assert config.max_output_tokens is None
+
+    @pytest.mark.asyncio
+    async def test_usage_marker_logged_for_a_grounded_response(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+        response = _make_response(
+            "body text",
+            chunks=[CannedWebChunk(uri="https://x", title="Example", domain="example.com")],
+            web_search_queries=["who won"],
+            usage_metadata=_make_usage(),
+            model_version="gemini-3-flash-preview-002",
+        )
+        fake_client = _make_client_with_response(response)
+
+        with (
+            patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+            caplog.at_level(logging.INFO),
+        ):
+            from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+            out = await invoke_gemini_grounded("prompt", qid=44944)
+
+        assert "### Sources" in out
+        assert (
+            "GEMINI_USAGE: role=grounded_search model=gemini-3-flash-preview-002 prompt_tokens=1200 "
+            "tool_use_prompt_tokens=340 candidates_tokens=900 thoughts_tokens=2600 total_tokens=5040 "
+            "search_queries=1 question=44944"
+        ) in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_usage_marker_logged_on_the_ungrounded_suppressed_branch(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A suppressed response was billed exactly like a useful one.
+
+        The grounded-chunk floor throws the text away, so if the marker sat behind the
+        formatting branches the wasted calls — the ones worth knowing the cost of — would be
+        the only ones missing from the spend line.
+        """
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+        response = _make_response(
+            "Ungrounded prose.",
+            chunks=None,
+            supports=None,
+            web_search_queries=[f"query {i}" for i in range(30)],
+            usage_metadata=_make_usage(thoughts=7000, total=9000),
+        )
+        fake_client = _make_client_with_response(response)
+
+        with (
+            patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+            caplog.at_level(logging.INFO),
+        ):
+            from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+            out = await invoke_gemini_grounded("prompt", qid=38195)
+
+        assert out == "", "the ungrounded text is still suppressed"
+        assert "GEMINI_UNGROUNDED_SUPPRESSED" in caplog.text
+        assert "GEMINI_USAGE: role=grounded_search" in caplog.text
+        assert "thoughts_tokens=7000" in caplog.text
+        assert "total_tokens=9000" in caplog.text
+        assert "search_queries=30" in caplog.text
+        assert "question=38195" in caplog.text

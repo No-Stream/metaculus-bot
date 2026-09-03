@@ -10,12 +10,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
+from google.genai import types as genai_types
 from playwright.async_api import Error as _PlaywrightError
 
+from metaculus_bot.constants import (
+    GAP_FILL_V2_READER_HTTP_ATTEMPTS,
+    GAP_FILL_V2_READER_MODEL,
+    GAP_FILL_V2_READER_THINKING_LEVEL,
+)
 from metaculus_bot.research import providers as research_providers
-from metaculus_bot.research.agentic import fetch_outcomes
+from metaculus_bot.research.agentic import fetch_outcomes, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
+from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
 
 
 class _FakeResponse:
@@ -2060,7 +2067,9 @@ async def test_read_document_happy_path(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("GOOGLE_API_KEY", "key")
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
     monkeypatch.setattr(
-        agentic_tools, "_run_document_read_sync", MagicMock(return_value=("Quoted answer with dates.", 1))
+        agentic_tools,
+        "_run_document_read_sync",
+        MagicMock(return_value=("Quoted answer with dates.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])),
     )
 
     outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What does it say?")
@@ -2112,7 +2121,11 @@ async def test_read_document_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         return fn(*args)
 
     monkeypatch.setattr("asyncio.to_thread", slow_to_thread)
-    monkeypatch.setattr(agentic_tools, "_run_document_read_sync", MagicMock(return_value=("late result", 1)))
+    monkeypatch.setattr(
+        agentic_tools,
+        "_run_document_read_sync",
+        MagicMock(return_value=("late result", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])),
+    )
 
     outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What does it say?")
 
@@ -2233,3 +2246,172 @@ class TestReadDocumentRequiresRealRetrieval:
         # If this ever stopped being true the guard above would be defending nothing;
         # pin the coupling that makes it load-bearing.
         assert _method_to_tier("document") == "fetched"
+
+    @pytest.mark.asyncio
+    async def test_the_suppression_warn_names_the_retrieval_statuses(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Zero successes is the same number for several different problems.
+
+        A refused fetch, a retrieval that timed out and a url_context tool that never ran
+        all read as ``n_url_success == 0``, and the run log used to carry only the URL. The
+        status names are what separate "this host blocked us" from "the tool did not fire".
+        """
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(
+            "google.genai.Client",
+            lambda **_: SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content=lambda **_kw: _document_response(
+                        "Confident recall.",
+                        "URL_RETRIEVAL_STATUS_ERROR",
+                        "URL_RETRIEVAL_STATUS_UNSAFE",
+                    )
+                )
+            ),
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+        with caplog.at_level(logging.WARNING, logger=agentic_tools.__name__):
+            outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What is revenue?")
+
+        assert outcome.status != "ok"
+        assert (
+            "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/file.pdf "
+            "statuses=URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+        ) in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_the_suppression_warn_reads_none_when_nothing_was_reported(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No url_metadata entry at all: the tool never reported back, which is its own case."""
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(
+            "google.genai.Client",
+            lambda **_: SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content=lambda **_kw: SimpleNamespace(text="Confident recall.", candidates=[])
+                )
+            ),
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+        with caplog.at_level(logging.WARNING, logger=agentic_tools.__name__):
+            outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What is revenue?")
+
+        assert outcome.status != "ok"
+        assert "statuses=none" in caplog.text
+
+    def test_the_backend_returns_the_status_names_beside_the_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The 3-tuple is the seam that feeds the WARN above; pin its shape and order."""
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(
+            "google.genai.Client",
+            lambda **_: SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content=lambda **_kw: _document_response(
+                        "Quoted from the filing.",
+                        "URL_RETRIEVAL_STATUS_ERROR",
+                        "URL_RETRIEVAL_STATUS_SUCCESS",
+                    )
+                )
+            ),
+        )
+
+        text, n_success, statuses = tool_backends._run_document_read_sync("https://example.com/f.pdf", "ask")
+
+        assert text == "Quoted from the filing."
+        assert n_success == 1
+        assert statuses == ["URL_RETRIEVAL_STATUS_ERROR", "URL_RETRIEVAL_STATUS_SUCCESS"]
+
+
+class TestReadDocumentClientConfig:
+    """The reader's google-genai client: bounded retries, explicit thinking, logged spend.
+
+    A bare ``genai.Client`` retries NOTHING (``retry_args(None)`` is
+    ``stop_after_attempt(1)``), which is how two production reads died outright on a
+    ``503 UNAVAILABLE``. The retry has to fit inside the existing HTTP budget rather than
+    extend it, because this call runs in a ``to_thread`` worker that ``read_document``'s
+    ``asyncio.wait_for`` cannot cancel — a longer worst case here means a pooled thread
+    pinned for longer.
+    """
+
+    @staticmethod
+    def _capture_client_kwargs(monkeypatch: pytest.MonkeyPatch, response: Any) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+
+        def fake_client(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(models=SimpleNamespace(generate_content=lambda **_kw: response))
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr("google.genai.Client", fake_client)
+        return captured
+
+    def test_retry_ladder_is_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = self._capture_client_kwargs(monkeypatch, _document_response("Quoted answer."))
+
+        tool_backends._run_document_read_sync("https://example.com/f.pdf", "ask")
+
+        retry_options = captured["http_options"].retry_options
+        assert retry_options is not None, "without retry_options the SDK stops after one attempt"
+        assert retry_options.attempts == GAP_FILL_V2_READER_HTTP_ATTEMPTS
+        assert 503 in (retry_options.http_status_codes or []), "503 UNAVAILABLE is the failure this recovers"
+
+    def test_every_attempt_plus_its_backoff_fits_the_existing_budget(self) -> None:
+        """The arithmetic, pinned: the retries must not lengthen the worst case.
+
+        ``_READ_DOCUMENT_HTTP_TIMEOUT_MS`` is the whole in-thread HTTP budget and stays
+        where it was; the attempts divide it after the worst-case backoff sleeps are set
+        aside. Today: 2 x 26_500 + 2_000 = 55_000ms, i.e. exactly the previous single-attempt
+        ceiling, and still inside the 60s ``_READ_DOCUMENT_TIMEOUT_S`` the coroutine waits on.
+        """
+        worst_case_ms = GAP_FILL_V2_READER_HTTP_ATTEMPTS * tool_backends._READ_DOCUMENT_HTTP_PER_ATTEMPT_TIMEOUT_MS
+        worst_case_ms += 1000 * gemini_retry_sleep_allowance_s(GAP_FILL_V2_READER_HTTP_ATTEMPTS)
+
+        assert worst_case_ms <= tool_backends._READ_DOCUMENT_HTTP_TIMEOUT_MS
+        assert worst_case_ms <= agentic_tools._READ_DOCUMENT_TIMEOUT_S * 1000
+
+    def test_thinking_level_is_set_explicitly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Quoting a fetched document back is the least reasoning-heavy Gemini call we make,
+        and an unset level means the model's own default (HIGH on the Gemini 3 flash line)."""
+        captured: dict[str, Any] = {}
+
+        def fake_client(**_kwargs: Any) -> Any:
+            def generate_content(**kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return _document_response("Quoted answer.")
+
+            return SimpleNamespace(models=SimpleNamespace(generate_content=generate_content))
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr("google.genai.Client", fake_client)
+
+        tool_backends._run_document_read_sync("https://example.com/f.pdf", "ask")
+
+        thinking_config = captured["config"].thinking_config
+        assert thinking_config is not None
+        assert thinking_config.thinking_level == genai_types.ThinkingLevel(GAP_FILL_V2_READER_THINKING_LEVEL.upper())
+
+    def test_token_spend_is_logged(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        """This call bills the operator's personal AI Studio key and used to record nothing."""
+        response = _document_response("Quoted answer.")
+        response.usage_metadata = SimpleNamespace(
+            prompt_token_count=8000,
+            tool_use_prompt_token_count=None,
+            candidates_token_count=300,
+            thoughts_token_count=120,
+            total_token_count=8420,
+        )
+        self._capture_client_kwargs(monkeypatch, response)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.gemini_usage"):
+            tool_backends._run_document_read_sync("https://example.com/f.pdf", "ask")
+
+        assert (
+            f"GEMINI_USAGE: role=read_document model={GAP_FILL_V2_READER_MODEL} prompt_tokens=8000 "
+            "tool_use_prompt_tokens=n/a candidates_tokens=300 thoughts_tokens=120 total_tokens=8420 "
+            "search_queries=0"
+        ) in caplog.text
+        assert "question=" not in caplog.text, "the document reader holds no question id to carry"
