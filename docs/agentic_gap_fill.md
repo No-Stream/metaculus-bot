@@ -79,7 +79,11 @@ the full briefing bundle. The template skeleton is the actual `binary_prompt` /
 `multiple_choice_prompt` / `numeric_prompt` output with only the research slot
 replaced by a placeholder. Everything else in it (units, bounds, open/closed
 bound notes, options) is the question's real values, because the dry run and the
-later ghost forecast are only meaningful against the real template.
+later ghost forecast are only meaningful against the real template. The
+placeholder itself carries the prediction-market section header, because the
+panel's market-reading clause renders only when the research carries that header
+and prod emits it on every question; without it the skeleton would show the
+driver a template the panel never actually sees.
 
 **Step 2, research.** The driver pursues its targets with the tools, follows
 leads (a fetched page that references a more authoritative PDF is usually worth

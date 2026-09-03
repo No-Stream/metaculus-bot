@@ -17,8 +17,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
+from metaculus_bot.prompts import MARKET_SNAPSHOT_SECTION_HEADER, binary_prompt
 from metaculus_bot.research.agentic import run_agentic_loop as _real_run_agentic_loop
-from metaculus_bot.research.agentic.driver_prompt import build_system_prompt
+from metaculus_bot.research.agentic.driver_prompt import _template_skeleton, build_system_prompt
 from metaculus_bot.research.agentic.types import LoopTelemetry, ToolOutcome, ToolSpec
 from metaculus_bot.research.agentic_gap_fill import run_gap_fill_v2
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
@@ -480,6 +481,36 @@ class TestDriverSystemPromptSnippetDemotion:
         assert 'A discrepancy sourced only from search snippets will be demoted to "possible corrections"' in collapsed
         assert "will NOT supersede the briefing" in collapsed
         assert "if you intend to contradict the briefing, fetch the primary source first" in collapsed
+
+
+class TestDriverTemplateSkeletonCarriesTheMarketClause:
+    """The skeleton is the panel's real prompt with only the research slot placeholdered, and
+    the driver dry-runs the forecast against it. The market-reading clause is gated on the
+    research carrying MARKET_SNAPSHOT_SECTION_HEADER, so a header-free placeholder silently
+    dropped a clause every prod question's real prompt carries (the provider emits that header
+    whenever it rendered anything, deliberate-empty sentence included). The placeholder now
+    carries the header; these pins keep the two from drifting apart again."""
+
+    _CLAUSE_PHRASE = "the liquidity warning governs"
+
+    def test_binary_skeleton_carries_the_market_reading_rules(self) -> None:
+        skeleton = _template_skeleton(make_real_binary_question())
+        assert MARKET_SNAPSHOT_SECTION_HEADER in skeleton
+        assert self._CLAUSE_PHRASE in skeleton
+
+    def test_mc_and_numeric_skeletons_carry_it_too(self) -> None:
+        for question in (make_real_mc_question(), make_real_numeric_question()):
+            skeleton = _template_skeleton(question)
+            assert MARKET_SNAPSHOT_SECTION_HEADER in skeleton
+            assert self._CLAUSE_PHRASE in skeleton
+
+    def test_a_header_free_render_still_omits_the_clause(self) -> None:
+        """The gate itself is unchanged: research with no market section (a benchmark run, a
+        flag-off run, a soft-failed provider) gets no clause. Pinned here so a future fix to
+        the skeleton cannot be mistaken for the gate having been loosened."""
+        prompt = binary_prompt(make_real_binary_question(), "## News Articles (AskNews)\nSome prose.")
+        assert MARKET_SNAPSHOT_SECTION_HEADER not in prompt
+        assert self._CLAUSE_PHRASE not in prompt
 
 
 @pytest.fixture

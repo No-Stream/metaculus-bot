@@ -21,6 +21,7 @@ from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQue
 
 from metaculus_bot.numeric.utils import bound_messages, nominal_bounds
 from metaculus_bot.prompts import (
+    MARKET_SNAPSHOT_SECTION_HEADER,
     _forecasting_window_str,
     binary_prompt,
     multiple_choice_prompt,
@@ -245,8 +246,14 @@ SupportedQuestion = BinaryQuestion | MultipleChoiceQuestion | NumericQuestion
 
 # Fills the template builders' research slot. Everything else in the skeleton
 # (units, bounds, options, resolution criteria) is the question's REAL values.
+# It carries MARKET_SNAPSHOT_SECTION_HEADER because the panel's market-reading clause is
+# gated on that header being present in the research: prod emits the header on every
+# question, so without it here the skeleton would drop a clause every real panel prompt
+# carries.
 _TEMPLATE_RESEARCH_PLACEHOLDER = (
     "[research placeholder — the actual briefing is in the 'Current briefing' section of this message]"
+    f"\n\n{MARKET_SNAPSHOT_SECTION_HEADER}\n"
+    "[snapshot placeholder — the real snapshot, if this question has one, is in that same section]"
 )
 
 
