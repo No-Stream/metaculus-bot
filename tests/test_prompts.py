@@ -196,6 +196,42 @@ def _numeric_q(**kwargs) -> MagicMock:
     return q
 
 
+def _flat(text: str) -> str:
+    """Lowercase and collapse all whitespace.
+
+    The prompt constants are pre-indented for ``clean_indents``, so an assertion on their
+    wording must not depend on where the lines happen to wrap.
+    """
+    return " ".join(text.lower().split())
+
+
+def _binary_prompt_text() -> str:
+    return binary_prompt(_binary_q(), research="r")
+
+
+def _mc_prompt_text() -> str:
+    return multiple_choice_prompt(_mc_q(), research="r")
+
+
+def _numeric_prompt_text() -> str:
+    return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+
+
+def _stacked_prompt_texts() -> list[str]:
+    """All three stacking prompts, for the scope guard every base-prompt rule carries."""
+    return [
+        stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
+        stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"]),
+        stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        ),
+    ]
+
+
 class TestForecastingWindowAnchor:
     """Every forecasting prompt must surface the open date, today, and
     resolution date so the LLM anchors on the forecasting window and does
@@ -1013,27 +1049,12 @@ class TestOutsideViewRubricRules:
 
     Receipts: scratch/prompt_bloat_audit_2026-09-02.md, scratch/prompt_debloat_2026-09-02/receipts.md."""
 
-    @staticmethod
-    def _flat(prompt: str) -> str:
-        # Collapse whitespace: the constants are pre-indented for clean_indents, so
-        # assertions must not depend on where the lines wrap.
-        return " ".join(prompt.lower().split())
-
-    def _binary(self) -> str:
-        return binary_prompt(_binary_q(), research="r")
-
-    def _mc(self) -> str:
-        return multiple_choice_prompt(_mc_q(), research="r")
-
-    def _numeric(self) -> str:
-        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
-
     # -- remaining exposure (binary, MC): once each --------------------------
 
     _EXPOSURE_KEY = "rates apply to the exposure that remains"
 
     def _assert_remaining_exposure_once(self, prompt: str) -> None:
-        flat = self._flat(prompt)
+        flat = _flat(prompt)
         assert flat.count(self._EXPOSURE_KEY) == 1, "the exposure rule must be stated exactly once"
         assert "apply it from now until the deadline" in flat
         assert "treating the elapsed event-free part of the window as observed" in flat
@@ -1043,10 +1064,10 @@ class TestOutsideViewRubricRules:
         assert "remove that path's own instances from the rate before combining" not in flat
 
     def test_binary_prompt_states_remaining_exposure_once_inside_the_hazard_bullet(self) -> None:
-        prompt = self._binary()
+        prompt = _binary_prompt_text()
         self._assert_remaining_exposure_once(prompt)
         # Folded INTO the conditional-hazard bullet, which is the same rule for recurring events.
-        flat = self._flat(prompt)
+        flat = _flat(prompt)
         bullet_at = flat.index(self._EXPOSURE_KEY)
         window = flat[bullet_at : bullet_at + 900]
         # The check keeps its label: without it the trailing skip token names something the
@@ -1057,23 +1078,23 @@ class TestOutsideViewRubricRules:
         assert "non-recurring, conditional-hazard skipped" in window
 
     def test_multiple_choice_prompt_states_remaining_exposure_once(self) -> None:
-        self._assert_remaining_exposure_once(self._mc())
+        self._assert_remaining_exposure_once(_mc_prompt_text())
 
     def test_binary_union_line_requires_disjoint_paths(self) -> None:
         """The union instruction itself is what invited the qid 43837 double count, so
         the disjointness requirement lives where the union is computed — and only there,
         since MC never computes a union."""
-        flat = self._flat(self._binary())
+        flat = _flat(_binary_prompt_text())
         assert "1 - product of (1-p_i)" in flat
         assert "union only over paths that cannot be the same event" in flat
-        assert "union only over paths" not in self._flat(self._mc())
+        assert "union only over paths" not in _flat(_mc_prompt_text())
 
     # -- anchor adherence (binary, MC): one rule, with a size ----------------
 
     _ANCHOR_SIZE = "more than about 15 points"
 
     def _assert_single_anchor_rule_with_size(self, prompt: str) -> None:
-        flat = self._flat(prompt)
+        flat = _flat(prompt)
         assert "anchor on your math" in flat
         assert flat.count(self._ANCHOR_SIZE) == 1, "the 15-point size belongs to exactly one bullet"
         assert "named, specific" in flat
@@ -1084,30 +1105,30 @@ class TestOutsideViewRubricRules:
         assert "history counsels caution" not in flat
 
     def test_binary_prompt_has_one_anchor_rule_sized_at_15_points(self) -> None:
-        self._assert_single_anchor_rule_with_size(self._binary())
+        self._assert_single_anchor_rule_with_size(_binary_prompt_text())
 
     def test_multiple_choice_prompt_has_one_anchor_rule_sized_at_15_points(self) -> None:
-        self._assert_single_anchor_rule_with_size(self._mc())
+        self._assert_single_anchor_rule_with_size(_mc_prompt_text())
 
     # -- count-in-period reference class (all three types) -----------------
 
     def _assert_count_in_period(self, prompt: str) -> None:
-        flat = self._flat(prompt)
+        flat = _flat(prompt)
         assert "how many events of a kind occur in a period" in flat
         assert "pooled realized rate of that event over the longest comparable history" in flat
         # A known-candidate schedule updates the rate rather than replacing it.
         assert "it does not replace it" in flat
 
     def test_binary_prompt_carries_count_in_period_class(self) -> None:
-        self._assert_count_in_period(self._binary())
+        self._assert_count_in_period(_binary_prompt_text())
 
     def test_multiple_choice_prompt_carries_count_in_period_class(self) -> None:
-        self._assert_count_in_period(self._mc())
+        self._assert_count_in_period(_mc_prompt_text())
 
     def test_numeric_prompt_carries_count_in_period_class(self) -> None:
         """Count questions arrive as all three question types, so this one rule ships to
         the numeric prompt too — unlike the exposure rule, which is probability-shaped."""
-        self._assert_count_in_period(self._numeric())
+        self._assert_count_in_period(_numeric_prompt_text())
 
     # -- placement + scope -------------------------------------------------
 
@@ -1115,7 +1136,7 @@ class TestOutsideViewRubricRules:
         """Both outside-view rules must land inside PHASE 1, before the inside-view update,
         so the model reads them while computing the number. The anchor size rides the
         final-rationale bullet in PHASE 2, where the final number is written."""
-        prompt = self._binary()
+        prompt = _binary_prompt_text()
         phase1_at = prompt.index("PHASE 1: OUTSIDE VIEW")
         phase2_at = prompt.index("PHASE 2: INSIDE VIEW UPDATE")
         for phrase in ("For questions asking how many events", "Rates apply to the exposure that REMAINS"):
@@ -1125,19 +1146,8 @@ class TestOutsideViewRubricRules:
     def test_stacking_prompts_do_not_carry_the_rules(self) -> None:
         """Same scope guard as the null-result clause: base prompts only, since stacking
         is prod-disabled."""
-        stacked = [
-            stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
-            stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"]),
-            stacking_numeric_prompt(
-                _numeric_q(),
-                research="r",
-                base_predictions=["a1", "a2"],
-                lower_bound_message="lbm",
-                upper_bound_message="ubm",
-            ),
-        ]
-        for prompt in stacked:
-            flat = self._flat(prompt)
+        for prompt in _stacked_prompt_texts():
+            flat = _flat(prompt)
             assert self._EXPOSURE_KEY not in flat
             assert self._ANCHOR_SIZE not in flat
             assert "anchor on your math" not in flat
@@ -1146,7 +1156,7 @@ class TestOutsideViewRubricRules:
     def test_numeric_prompt_does_not_carry_the_probability_shaped_rules(self) -> None:
         """Scope: the exposure rule and the 15-point size are worded in probabilities, while
         the numeric prompt anchors on a range. Only the reference-class rule ships there."""
-        flat = self._flat(self._numeric())
+        flat = _flat(_numeric_prompt_text())
         assert self._EXPOSURE_KEY not in flat
         assert self._ANCHOR_SIZE not in flat
 
@@ -1182,53 +1192,25 @@ class TestSoftClockAndHistoryDischargedRules:
     _SOFT_CLOCK_OPENER = "A target date the responsible actor has not bound itself to"
     _HISTORY_OPENER = "If your own analysis names a reason the historical cadence has been discharged"
 
-    @staticmethod
-    def _flat(text: str) -> str:
-        # Collapse whitespace: the constants are pre-indented for clean_indents, so assertions
-        # must not depend on where the lines wrap.
-        return " ".join(text.lower().split())
-
-    def _binary(self) -> str:
-        return binary_prompt(_binary_q(), research="r")
-
-    def _mc(self) -> str:
-        return multiple_choice_prompt(_mc_q(), research="r")
-
-    def _numeric(self) -> str:
-        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
-
-    def _stacked(self) -> list[str]:
-        return [
-            stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
-            stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"]),
-            stacking_numeric_prompt(
-                _numeric_q(),
-                research="r",
-                base_predictions=["a1", "a2"],
-                lower_bound_message="lbm",
-                upper_bound_message="ubm",
-            ),
-        ]
-
     def _assert_verbatim_once(self, prompt: str, constant: str) -> None:
-        flat_prompt = self._flat(prompt)
-        flat_constant = self._flat(constant)
+        flat_prompt = _flat(prompt)
+        flat_constant = _flat(constant)
         assert flat_constant in flat_prompt, "the rule must land verbatim (modulo line wrapping)"
         assert flat_prompt.count(flat_constant) == 1, "the rule must be stated exactly once"
 
     # -- presence, verbatim, once (binary and MC) -----------------------------
 
     def test_binary_prompt_carries_the_soft_clock_rule_verbatim(self) -> None:
-        self._assert_verbatim_once(self._binary(), _SOFT_CLOCK_RULE)
+        self._assert_verbatim_once(_binary_prompt_text(), _SOFT_CLOCK_RULE)
 
     def test_multiple_choice_prompt_carries_the_soft_clock_rule_verbatim(self) -> None:
-        self._assert_verbatim_once(self._mc(), _SOFT_CLOCK_RULE)
+        self._assert_verbatim_once(_mc_prompt_text(), _SOFT_CLOCK_RULE)
 
     def test_binary_prompt_carries_the_history_discharged_rule_verbatim(self) -> None:
-        self._assert_verbatim_once(self._binary(), _HISTORY_DISCHARGED_RULE)
+        self._assert_verbatim_once(_binary_prompt_text(), _HISTORY_DISCHARGED_RULE)
 
     def test_multiple_choice_prompt_carries_the_history_discharged_rule_verbatim(self) -> None:
-        self._assert_verbatim_once(self._mc(), _HISTORY_DISCHARGED_RULE)
+        self._assert_verbatim_once(_mc_prompt_text(), _HISTORY_DISCHARGED_RULE)
 
     # -- wording pins: each load-bearing clause, by name ----------------------
 
@@ -1238,7 +1220,7 @@ class TestSoftClockAndHistoryDischargedRules:
         things that do NOT raise it is the q44557 / q43837 evidence class; "say which clock"
         is what q45217's members did; the parenthetical is the receipt (principle 3 of the fix
         plan: a receipted rule carries its reason)."""
-        flat = self._flat(_SOFT_CLOCK_RULE)
+        flat = _flat(_SOFT_CLOCK_RULE)
         assert "no statute, no contract, no published schedule it has a measured record of meeting" in flat
         assert "is evidence that a target exists, not that it will hold" in flat
         assert "price the probability that the target lands inside the question window as its own number" in flat
@@ -1254,7 +1236,7 @@ class TestSoftClockAndHistoryDischargedRules:
         its own sample: the label had coder agreement 0.59 and partial hindsight contamination, so
         a bare "0 of 13" would read to a forecaster as a law when it is an ordinary draw at the
         17-18% held rate the older era bands show."""
-        flat = self._flat(_HISTORY_DISCHARGED_RULE)
+        flat = _flat(_HISTORY_DISCHARGED_RULE)
         assert flat.startswith("• if your own analysis names a reason the historical cadence has been discharged")
         assert "(its driver was met, the deadline passed, the rule changed)" in flat
         assert "that cadence is a bound on your estimate, not its center" in flat
@@ -1265,8 +1247,8 @@ class TestSoftClockAndHistoryDischargedRules:
     def test_rules_do_not_revive_the_retired_anchor_consistency_wording(self) -> None:
         """Item B retired "do not move off your number when history counsels caution" because it
         pulled against exactly this correction; the two new rules must not smuggle it back."""
-        for prompt in (self._binary(), self._mc()):
-            flat = self._flat(prompt)
+        for prompt in (_binary_prompt_text(), _mc_prompt_text()):
+            flat = _flat(prompt)
             assert "history counsels caution" not in flat
             assert "do not move off your own number on a general feeling" not in flat
 
@@ -1275,8 +1257,8 @@ class TestSoftClockAndHistoryDischargedRules:
     @pytest.mark.parametrize(
         ("build", "timeframe_step"),
         [
-            pytest.param(lambda self: self._binary(), "3) Timeframe reasoning", id="binary"),
-            pytest.param(lambda self: self._mc(), "(3) Timeframe reasoning", id="multiple_choice"),
+            pytest.param(_binary_prompt_text, "3) Timeframe reasoning", id="binary"),
+            pytest.param(_mc_prompt_text, "(3) Timeframe reasoning", id="multiple_choice"),
         ],
     )
     def test_rules_sit_in_the_reference_class_step_of_phase_1(self, build, timeframe_step: str) -> None:
@@ -1284,7 +1266,7 @@ class TestSoftClockAndHistoryDischargedRules:
         the reference-class step (after `_COUNT_IN_PERIOD_REFERENCE_CLASS`, before the timeframe
         step), inside PHASE 1 and before the Strong/Moderate/Weak evidence rubric in PHASE 2.
         Soft-clock first, history-discharged directly after it."""
-        prompt = build(self)
+        prompt = build()
         phase1_at = prompt.index("PHASE 1: OUTSIDE VIEW")
         count_at = prompt.index(self._COUNT_IN_PERIOD)
         soft_clock_at = prompt.index(self._SOFT_CLOCK_OPENER)
@@ -1299,18 +1281,18 @@ class TestSoftClockAndHistoryDischargedRules:
     def test_numeric_prompt_does_not_carry_the_rules(self) -> None:
         """Both rules are worded in probabilities over an event-by-deadline question; the
         numeric prompt anchors on a range and gets neither."""
-        flat = self._flat(self._numeric())
-        assert self._flat(self._SOFT_CLOCK_OPENER) not in flat
-        assert self._flat(self._HISTORY_OPENER) not in flat
+        flat = _flat(_numeric_prompt_text())
+        assert _flat(self._SOFT_CLOCK_OPENER) not in flat
+        assert _flat(self._HISTORY_OPENER) not in flat
         assert "measured record of meeting" not in flat
         assert "historical cadence has been discharged" not in flat
 
     def test_stacking_prompts_do_not_carry_the_rules(self) -> None:
         """Same scope guard as every other base-prompt rule: stacking is prod-disabled."""
-        for prompt in self._stacked():
-            flat = self._flat(prompt)
-            assert self._flat(self._SOFT_CLOCK_OPENER) not in flat
-            assert self._flat(self._HISTORY_OPENER) not in flat
+        for prompt in _stacked_prompt_texts():
+            flat = _flat(prompt)
+            assert _flat(self._SOFT_CLOCK_OPENER) not in flat
+            assert _flat(self._HISTORY_OPENER) not in flat
             assert "measured record of meeting" not in flat
             assert "historical cadence has been discharged" not in flat
 
@@ -1318,8 +1300,8 @@ class TestSoftClockAndHistoryDischargedRules:
         """The schema audit rejected a `target_holds_probability` / `clock_type` slot: the block
         is written after the forecast is fixed, so a field there cannot scaffold the reasoning,
         and the number lives in the rationale. The example blocks stay exactly the forecast."""
-        assert set(json.loads(_extract_last_json_block(self._binary()))) == {"question_type", "posterior_prob"}
-        assert set(json.loads(_extract_last_json_block(self._mc()))) == {"question_type", "option_probs"}
+        assert set(json.loads(_extract_last_json_block(_binary_prompt_text()))) == {"question_type", "posterior_prob"}
+        assert set(json.loads(_extract_last_json_block(_mc_prompt_text()))) == {"question_type", "option_probs"}
         for constant in (_SOFT_CLOCK_RULE, _HISTORY_DISCHARGED_RULE):
             assert "target_holds_probability" not in constant
             assert "clock_type" not in constant
@@ -1547,22 +1529,9 @@ class TestTemplateStatesEachCheckOnce:
     now interpolates MC_PROB_MIN, since a percent-scale option_probs is hard-rejected and drops
     the whole ballot to the paid LLM salvage rung (q44558)."""
 
-    @staticmethod
-    def _flat(prompt: str) -> str:
-        return " ".join(prompt.lower().split())
-
-    def _binary(self) -> str:
-        return binary_prompt(_binary_q(), research="r")
-
-    def _mc(self) -> str:
-        return multiple_choice_prompt(_mc_q(), research="r")
-
-    def _numeric(self) -> str:
-        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
-
     def test_final_checks_is_the_last_template_step_in_every_base_prompt(self) -> None:
-        for prompt in (self._binary(), self._mc(), self._numeric()):
-            flat = self._flat(prompt)
+        for prompt in (_binary_prompt_text(), _mc_prompt_text(), _numeric_prompt_text()):
+            flat = _flat(prompt)
             assert flat.count("bait-and-switch check") == 1
             assert "brief checklist" not in flat
             # Retired checklist echoes of template outputs.
@@ -1581,17 +1550,17 @@ class TestTemplateStatesEachCheckOnce:
             assert flat.index("final rationale") < final_checks_at < flat.index("structured forecast")
 
     def test_binary_final_checks_keep_the_consistency_line(self) -> None:
-        flat = self._flat(self._binary())
+        flat = _flat(_binary_prompt_text())
         assert 'consistency line: "x out of 100 times, [criteria] happens." sensible?' in flat
 
     def test_mc_final_checks_keep_the_consistency_line(self) -> None:
-        flat = self._flat(self._mc())
+        flat = _flat(_mc_prompt_text())
         assert "most likely: __; least likely: __; coherent with rationale?" in flat
 
     def test_numeric_final_checks_keep_units_and_the_percentile_consistency_line(self) -> None:
         """Numeric adds the units bullet: the unit-mismatch guard withholds a forecaster that gets
         the units wrong, so it is the one checklist item with a pipeline consequence."""
-        flat = self._flat(self._numeric())
+        flat = _flat(_numeric_prompt_text())
         final_checks = flat[flat.index("final checks") :]
         assert "units: what are the units of the output values and why?" in final_checks
         assert "which percentile corresponds to the status quo or trend" in final_checks
@@ -1599,7 +1568,7 @@ class TestTemplateStatesEachCheckOnce:
     def test_numeric_step_seven_asks_for_a_central_estimate_not_a_probability(self) -> None:
         """ "My base rate was X% ... moving to Y%" was a probability template copy-pasted onto a
         distribution question (the sibling numeric odds check was cut for the same reason)."""
-        flat = self._flat(self._numeric())
+        flat = _flat(_numeric_prompt_text())
         assert (
             "state your outside-view central estimate and range, then say what the current evidence moved and why"
             in flat
@@ -1610,23 +1579,23 @@ class TestTemplateStatesEachCheckOnce:
     def test_numeric_outcome_type_is_defined_once_in_the_schema_notes(self) -> None:
         """The field was defined three times (step 9, schema notes, example). The schema note is
         the definition; step 9 is a one-line pointer to it."""
-        flat = self._flat(self._numeric())
+        flat = _flat(_numeric_prompt_text())
         assert "outcome type classification" not in flat
         assert flat.count("counts, rankings, number of events") == 1
         assert "record it in `outcome_type`" in flat
         assert "definition in the schema notes" in flat
 
     def test_odds_and_delta_are_one_check(self) -> None:
-        for prompt in (self._binary(), self._mc()):
-            flat = self._flat(prompt)
+        for prompt in (_binary_prompt_text(), _mc_prompt_text()):
+            flat = _flat(prompt)
             assert flat.count("odds and delta check") == 1
             assert "odds check:" not in flat
             assert "small-delta check" not in flat
             assert "9:1" in flat
 
     def test_mc_states_the_sum_constraint_once_in_decimals(self) -> None:
-        prompt = self._mc()
-        flat = self._flat(prompt)
+        prompt = _mc_prompt_text()
+        flat = _flat(prompt)
         assert "sum to 1.0" in flat
         assert "sum to 100" not in flat
         assert "use integers" not in flat
@@ -1646,42 +1615,30 @@ class TestKeptScaffoldingBullets:
     pins that make that claim true. Each phrase is the bullet's own opening clause, so a
     reword lands here rather than in a vague substring."""
 
-    @staticmethod
-    def _flat(prompt: str) -> str:
-        return " ".join(prompt.lower().split())
-
-    def _binary(self) -> str:
-        return binary_prompt(_binary_q(), research="r")
-
-    def _mc(self) -> str:
-        return multiple_choice_prompt(_mc_q(), research="r")
-
-    def _numeric(self) -> str:
-        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
-
     def test_binary_worked_examples_keep_their_reason(self) -> None:
         """Step 0b's meta-justification is an operator keep: it tells the model WHY it is
         writing two worked examples, which is what stops them becoming a paraphrase."""
         assert (
             "this is mechanical bait-and-switch protection: it forces the resolution criteria to be "
-            "consumed as structured constraints rather than treated as a prose paraphrase" in self._flat(self._binary())
+            "consumed as structured constraints rather than treated as a prose paraphrase"
+            in _flat(_binary_prompt_text())
         )
 
     def test_binary_and_numeric_keep_the_question_specific_base_rate_bullet(self) -> None:
         assert (
             "question-specific base rate: the relevant base rate is the historical frequency for questions "
-            "like this one" in self._flat(self._binary())
+            "like this one" in _flat(_binary_prompt_text())
         )
         assert (
             "question-specific base rate: anchor on the historical frequency, trend, or variance for this "
-            "specific indicator" in self._flat(self._numeric())
+            "specific indicator" in _flat(_numeric_prompt_text())
         )
 
     def test_binary_keeps_the_trajectory_check(self) -> None:
         """Kept in binary and removed from numeric, where it restated step-3 trend
         continuation. The numeric absence is pinned by
         test_numeric_status_quo_derivation_is_the_one_anchor_to_latest_statement."""
-        flat = self._flat(self._binary())
+        flat = _flat(_binary_prompt_text())
         assert (
             'trajectory check: consider whether the "status quo" means "nothing changes" or '
             '"the current trajectory reaches its natural conclusion"' in flat
@@ -1689,7 +1646,7 @@ class TestKeptScaffoldingBullets:
         assert "justify predictions that diverge from the most likely trajectory" in flat
 
     def test_mc_keeps_the_blind_spot_and_calibration_audit_bullets(self) -> None:
-        flat = self._flat(self._mc())
+        flat = _flat(_mc_prompt_text())
         assert (
             "blind-spot consideration: if the resolution is unexpected, what would likely be the reason, "
             "and how should that affect confidence spreads?" in flat
@@ -1699,8 +1656,8 @@ class TestKeptScaffoldingBullets:
     def test_numeric_keeps_the_small_delta_check(self) -> None:
         """Numeric's own delta check survives the binary/MC odds-and-delta merge: there is no
         odds check on a distribution question for it to merge with."""
-        assert "small delta check: would +/- 10 percent on key percentiles still fit the reasoning?" in self._flat(
-            self._numeric()
+        assert "small delta check: would +/- 10 percent on key percentiles still fit the reasoning?" in _flat(
+            _numeric_prompt_text()
         )
 
 
@@ -1719,13 +1676,8 @@ class TestResolutionMetricEcho:
     _HEADER = "resolution-metric echo (named-series questions only)"
     _INERT = "no named series, metric echo skipped"
 
-    @staticmethod
-    def _collapsed(prompt: str) -> str:
-        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
-        return " ".join(prompt.lower().split())
-
     def _assert_core_block(self, prompt: str) -> None:
-        c = self._collapsed(prompt)
+        c = _flat(prompt)
         assert self._HEADER in c
         assert "name the exact series that resolves this question" in c
         assert "enumerate the plausible variants" in c
@@ -1739,7 +1691,7 @@ class TestResolutionMetricEcho:
     def test_numeric_prompt_has_metric_echo(self) -> None:
         prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         self._assert_core_block(prompt)
-        c = self._collapsed(prompt)
+        c = _flat(prompt)
         # Numeric reconciles against the displayed range — but NOT as an oracle
         # (the 44211 trap: the true total was the bounds midpoint).
         assert "reconcile each candidate against the displayed range" in c
@@ -1751,7 +1703,7 @@ class TestResolutionMetricEcho:
     def test_binary_prompt_has_metric_echo(self) -> None:
         prompt = binary_prompt(_binary_q(), research="r")
         self._assert_core_block(prompt)
-        c = self._collapsed(prompt)
+        c = _flat(prompt)
         # Binary reconciles against the criteria's threshold/comparison (no displayed range).
         assert "reconcile each candidate against the threshold or comparison" in c
         # Points at the resolution-source snapshot only — the TS anchor is numeric-only.
