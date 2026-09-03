@@ -644,6 +644,22 @@ DOCUMENT_DIGEST_WINDOW_CHARS: int = (
 # that spends most: the paid read of it returned nothing, so the spend bought a null answer.
 URL_CONTEXT_SIZE_GATE_TOKENS: int = 100_000
 
+# --- Resolution-source escalation rungs (free ones: meta-refresh hop, local PDF read) ---
+# Every rung runs INSIDE the unchanged 45 s provider wall, and the outer `asyncio.wait_for`
+# discards every page that already fetched when it fires, so each rung is self-bounding on
+# the same pattern as the Datawrapper hop: wall minus elapsed minus a margin, skipped below
+# a floor, degrading to whatever the direct route already got.
+RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S: float = 2.0  # margin left to the outer wait_for so the rung returns first (the Datawrapper hop keeps its own historically-named twin)
+RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S: float = (
+    3.0  # the hop is one more page GET; same "0-2 s typical" probe basis as the HTTP timeout
+)
+# Floor for the LOCAL pypdf parse, which spends CPU rather than network. It doubles as the
+# minimum `max_seconds` handed to `extract_pdf_text` (the budget is capped at
+# DOCUMENT_TEXT_MAX_SECONDS above it), and 3 s is ~60% of the measured 5.3 s for 220 pages,
+# so a short document still reads whole and a long one comes back partial-but-labelled
+# rather than not at all.
+RESOLUTION_SOURCE_PDF_MIN_BUDGET_S: float = 3.0
+
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
 # Search results (distinct from OpenRouter's Exa-backed :online plugin). Adds a

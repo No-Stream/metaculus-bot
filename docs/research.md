@@ -487,9 +487,46 @@ self-refs, FRED series owned by financial-data, Yahoo `/quote/` pages owned by
 yfinance), and caps at `RESOLUTION_SOURCE_MAX_URLS` *after* the skip filter so
 a run of leading self-refs doesn't starve the real sources. Fetches run in
 parallel with one-request-per-host politeness (a `Semaphore(1)` per netloc, keyed
-per redirect hop). Content is extracted with trafilatura (HTML), or read raw
-(JSON / text / CSV); anything else (PDF, binary, missing Content-Type) is left
-unread.
+per redirect hop, and shared process-wide since 2026-09-03 — with a map per provider
+call, six questions citing one host each held their own semaphore and hit it six times
+at once). Content is extracted with trafilatura (HTML), or read raw (JSON / text /
+CSV). A PDF is read locally with pypdf and rendered as a passage digest (below);
+anything else is left unread as `unsupported_type`.
+
+Two free rungs sit under the HTML path, both reached only when the page carried nothing
+readable. A **meta-refresh hop** follows the redirect no HTTP status announces:
+cdc.gov's surveillance URLs answer 200 with a ~300-byte stub whose only content is
+`<meta http-equiv="refresh" content="0; url=...">`, which the manual redirect loop
+cannot see (no 3xx, no `Location`), so the stub used to be classified a JS wall and the
+resolving page never fetched. The target is returned as the next hop, so it re-enters
+the same classification path and consumes one of the same `MAX_REDIRECTS` slots, and it
+passes exactly the checks a `Location` header does. An **ARIA-table rewrite** runs
+before every extraction: cdc.gov builds its outbreak stat blocks out of
+`<div role="table">` / `role="row"` / `role="cell"`, which is valid accessible markup
+and invisible to trafilatura's table handling — the cyclosporiasis block rendered as a
+bare "17,180 / 2" with no labels and no hospitalization count at all, because 922 sat in
+an unwrapped cell. Rewritten to real table tags, the same page extracts
+`| Hospitalizations | 922 |`. A page with no ARIA role is handed to trafilatura as the
+original bytes, so its extraction is unchanged.
+
+A **cited PDF is now read** rather than dropped: `research/document_text.py` extracts the
+text with pypdf and selects the passages most relevant to the question's title plus its
+resolution criteria (BM25, deterministic, no model call), rendering a digest that states
+how many pages were read and labels each passage with its page. Measured 2026-09-03,
+that path pulled 833,450 chars out of a 6.7 MB 220-page document in 5.3 s with the wanted
+passage in it, while the paid alternative returned nothing for the same file. A body the
+server did not declare as a PDF is still sniffed by its `%PDF-` magic, since several
+government hosts serve documents as `application/octet-stream` — a declared document gets
+the larger `DOCUMENT_TEXT_PDF_MAX_BYTES` cap (the receipt file is over the 5 MiB response
+cap), an undeclared one keeps the smaller one. Bytes we read and could not turn into text
+get their own status, `unreadable_document`, with `status_reason` naming which of
+`no_text_layer` / `encrypted` / `malformed` applies; only the first could ever be rescued
+by a paid document read, which is why it is not folded into `unsupported_type`.
+
+Every rung is self-bounding on the Datawrapper hop's pattern — wall minus elapsed minus a
+margin, skipped below a floor — because the provider's outer `asyncio.wait_for` discards
+every page that already fetched when it fires, so an overrunning rung costs the whole
+question's resolution evidence rather than just its own attempt.
 
 It is **SSRF-hardened** because these URLs are user-authored and fetches run from
 CI: a preflight `is_public_http_url` check rejects private / loopback /
@@ -506,8 +543,9 @@ budget]` when later sections are dropped for length.
 
 The per-URL `FetchStatus` distinguishes two kinds of non-success, and only one is a
 seam. `blocked` / `js_wall` / `no_resolving_content` are pages we could not READ, and
-they remain the target of a future Tier-2 LLM-driven fetch pass. `empty_body` (a 200
-whose body is empty or whitespace-only) and `unsupported_type` (including a body whose
+they remain the target of a future Tier-2 LLM-driven fetch pass, as is the `no_text_layer`
+half of `unreadable_document` (a scan, where a model really is the only route). `empty_body`
+(a 200 whose body is empty or whitespace-only) and `unsupported_type` (including a body whose
 declared charset decodes to mojibake) are bodies that carried no information — refusals
 rather than seams, because there is nothing on the other side to fetch harder. Both
 exist because `status="success"` has to mean CONTENT: as `success`, an empty body

@@ -12,6 +12,7 @@ resolution-source fetcher deliberately does no retries).
 
 from __future__ import annotations
 
+import asyncio
 import codecs
 import html as html_entities
 import ipaddress
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 import aiohttp.abc
@@ -142,6 +144,57 @@ def build_session(
         connector_kwargs["resolver"] = resolver
     connector = aiohttp.TCPConnector(**connector_kwargs)
     return aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# Per-host politeness gate (one in-flight request per netloc)
+# ---------------------------------------------------------------------------
+#
+# The map has to outlive a single provider call. The Tier-1 fetcher used to build a
+# fresh dict per call, so six questions running concurrently each got their own
+# semaphore for the same host and hit it six times at once — the opposite of the
+# politeness the semaphore exists to provide, and a plausible contributor to the 403s
+# the escalation ladder is being built to route around.
+#
+# Scoped to the RUNNING event loop, not to the process: an `asyncio.Semaphore` binds to
+# the loop that first blocks on it and raises from any other, so a second `asyncio.run`
+# in the same process (a backtest question loop, the test suite) would otherwise crash
+# on contention. Clearing on a loop change keeps "shared across every concurrent
+# question", which is what one loop means here, without that hazard.
+_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
+_HOST_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def host_semaphores() -> dict[str, asyncio.Semaphore]:
+    """The shared netloc -> ``Semaphore(1)`` map for the running event loop."""
+    global _HOST_SEMAPHORE_LOOP  # noqa: PLW0603  # module-level cache of the loop the map is bound to
+    loop = asyncio.get_running_loop()
+    if loop is not _HOST_SEMAPHORE_LOOP:
+        _HOST_SEMAPHORES.clear()
+        _HOST_SEMAPHORE_LOOP = loop
+    return _HOST_SEMAPHORES
+
+
+def reset_host_semaphores() -> None:
+    """Drop every cached semaphore. For tests, so one test's gate can't hold another's."""
+    global _HOST_SEMAPHORE_LOOP  # noqa: PLW0603  # paired with host_semaphores' cache
+    _HOST_SEMAPHORES.clear()
+    _HOST_SEMAPHORE_LOOP = None
+
+
+def semaphore_for_host(url: str, sems: dict[str, asyncio.Semaphore]) -> asyncio.Semaphore:
+    """Get-or-create the ``Semaphore(1)`` gating requests to ``url``'s netloc.
+
+    Takes the map explicitly so both callers keep their own scope: Tier-1 passes
+    :func:`host_semaphores` (shared across concurrent questions) and the gap-fill v2
+    loop passes its own module global.
+    """
+    host = urlparse(url).netloc
+    sem = sems.get(host)
+    if sem is None:
+        sem = asyncio.Semaphore(1)
+        sems[host] = sem
+    return sem
 
 
 _READ_CHUNK_BYTES = 65536
@@ -438,6 +491,185 @@ def unreadable_data_embed_providers(html_text: str) -> list[str]:
         if match is not None:
             hits.append((match.start(), provider))
     return [provider for _, provider in sorted(hits)]
+
+
+# ---------------------------------------------------------------------------
+# Meta-refresh redirects (a hop no HTTP status announces)
+# ---------------------------------------------------------------------------
+#
+# cdc.gov's surveillance pages answer 200 with a 234-340 byte stub whose only content is
+# `<meta http-equiv="refresh" content="0; url=...">` pointing at the real page. The
+# manual redirect loop never sees it — there is no 3xx and no `Location` header — so the
+# fetch classified the stub as a JS wall and the resolving numbers were never fetched.
+#
+# The target is returned RAW (not joined against a base) so the caller keeps ownership of
+# resolution and of the SSRF re-guard every derived URL has to pass: this module has no
+# business deciding what is safe to fetch.
+_META_TAG_RE = re.compile(r"<meta\s([^>]*)>", re.IGNORECASE)
+_HTTP_EQUIV_REFRESH_RE = re.compile(r"http-equiv\s*=\s*[\"']?\s*refresh\b", re.IGNORECASE)
+_CONTENT_ATTR_RE = re.compile(r"content\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.IGNORECASE)
+# `content="0; url=/real/page"`, `content='0;URL=…'`, and the unquoted-inner-value form.
+# The delay is deliberately ignored: a long delay is still a redirect, and the pages that
+# use one for a "you are being redirected" interstitial carry no resolving content either.
+_REFRESH_URL_RE = re.compile(r"""\burl\s*=\s*['\"]?([^'\"\s;]+)""", re.IGNORECASE)
+
+
+def meta_refresh_target(html_text: str) -> str | None:
+    """The (possibly relative) URL a ``<meta http-equiv="refresh">`` tag points at, or None.
+
+    Attribute order is not assumed — both ``http-equiv``-first and ``content``-first
+    spellings occur — and HTML entities in the target are unescaped, since a query string
+    written ``&amp;`` in markup has to be dialled as ``&``. The first such tag wins: a page
+    with two conflicting refresh targets has a browser race in it, and taking the first is
+    what a browser does.
+
+    A ``;`` ends the target, which is the delimiter the unquoted ``content=0;url=/p`` form
+    needs; the cost is a target carrying a literal semicolon (``;jsessionid=``), which no
+    observed stub has.
+    """
+    if not html_text:
+        return None
+    for tag in _META_TAG_RE.finditer(html_text):
+        attrs = tag.group(1)
+        if not _HTTP_EQUIV_REFRESH_RE.search(attrs):
+            continue
+        content = _CONTENT_ATTR_RE.search(attrs)
+        if content is None:
+            continue
+        # Unescaped BEFORE the url match, not after: markup writes the target's own
+        # quotes as `&#x27;` and its query separators as `&amp;`, and matching first
+        # would stop at the `;` ending the entity — returning a bare `'` for
+        # `content="0; URL=&#x27;/page&#x27;"` and truncating `?a=1&amp;b=2` at the `&`.
+        value = html_entities.unescape(content.group(1) or content.group(2) or content.group(3) or "")
+        url_match = _REFRESH_URL_RE.search(value)
+        if url_match is None:
+            continue
+        target = url_match.group(1).strip()
+        if target:
+            return target
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ARIA tables (a real table wearing a div costume)
+# ---------------------------------------------------------------------------
+#
+# cdc.gov's outbreak stat blocks are `<div role="table">` / `role="row"` /
+# `role="rowheader"` / `role="cell"`, which is valid accessible markup and completely
+# invisible to trafilatura's table handling: it flattens the block to whichever values
+# happened to sit inside a `<p>` and drops the rest, so the cyclosporiasis page rendered
+# "17,180 / 2 / 48 plus the District of Columbia" with no labels and no hospitalization
+# count at all (922, in a bare `<div role="cell">`). Rewritten to real table tags, the
+# same page extracts "| Hospitalizations | 922 |".
+#
+# `rowgroup` is mapped too even though ARIA-wise it is optional scaffolding: the CDC block
+# has one, and a `<tr>` whose parent is neither `table` nor `tbody` is dropped by lxml's
+# HTML parser, so leaving it a div would defeat the whole rewrite.
+_ARIA_ROLE_TAGS: dict[str, str] = {
+    "table": "table",
+    "grid": "table",
+    "rowgroup": "tbody",
+    "row": "tr",
+    "rowheader": "th",
+    "columnheader": "th",
+    "cell": "td",
+    "gridcell": "td",
+}
+# One `[^>]*` for the attribute region, deliberately not quote-aware: a `>` inside an
+# attribute value truncates our view of that ONE tag (costing at most a rewrite we would
+# have made), whereas a quote-aware form desynchronises for the rest of the document the
+# moment a page carries an unbalanced quote — which real pages, and truncated captures of
+# them, routinely do. Single quantifier, so no backtracking cliff either (the measured
+# 3.4 s-at-200-KiB shape in `resolution_body_text` needed two).
+_ARIA_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>")
+_ARIA_ROLE_ATTR_RE = re.compile(r"""\brole\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
+# Tags that never close, so they must not go on the nesting stack.
+_VOID_HTML_TAGS: frozenset[str] = frozenset(
+    {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+)
+
+
+def rewrite_aria_tables(html_text: str) -> str | None:
+    """``html_text`` with ARIA-table roles rewritten to real table tags, or None.
+
+    None means no role-bearing element was found, which lets the caller hand trafilatura
+    the ORIGINAL bytes — so a page with no ARIA table extracts byte-identically to before
+    this rung existed, and the encoding detection stays trafilatura's job.
+
+    Nesting is tracked with an explicit stack rather than by pairing a tag with the next
+    close of its name: every element in the CDC block is a ``div``, so "the next
+    ``</div>``" is the innermost cell, not the table. A close tag matches the nearest
+    open of the same name and discards whatever was left unclosed above it, which is how
+    the unclosed ``<p>`` inside a cell is absorbed. Anything still open at the end is
+    rewritten WITHOUT a close tag: a truncated capture (and plenty of live HTML) never
+    closes its outer divs, and lxml's recovering parser closes them for us — whereas
+    leaving the outer ``role="table"`` div alone would strand every rewritten ``<tr>``
+    outside a table and lose the block entirely.
+    """
+    if not html_text:
+        return None
+    edits = _aria_table_edits(html_text)
+    if not edits:
+        return None
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, replacement in sorted(edits):
+        pieces.append(html_text[cursor:start])
+        pieces.append(replacement)
+        cursor = end
+    pieces.append(html_text[cursor:])
+    return "".join(pieces)
+
+
+def _aria_role_tag(attrs: str) -> str | None:
+    """The real tag name an element's ``role`` attribute maps to, if any."""
+    role_match = _ARIA_ROLE_ATTR_RE.search(attrs)
+    if role_match is None:
+        return None
+    role = (role_match.group(1) or role_match.group(2) or role_match.group(3) or "").strip().lower()
+    return _ARIA_ROLE_TAGS.get(role)
+
+
+def _aria_table_edits(html_text: str) -> list[tuple[int, int, str]]:
+    """``(start, end, replacement)`` spans rewriting every ARIA-table tag pair."""
+    # (tag name, mapped tag or None, open-tag start, open-tag end)
+    stack: list[tuple[str, str | None, int, int]] = []
+    edits: list[tuple[int, int, str]] = []
+    for tag in _ARIA_TAG_RE.finditer(html_text):
+        name = tag.group(2).lower()
+        if tag.group(1):
+            _close_aria_tag(stack, edits, name, tag)
+            continue
+        attrs = tag.group(3)
+        if name in _VOID_HTML_TAGS or attrs.rstrip().endswith("/"):
+            continue
+        stack.append((name, _aria_role_tag(attrs), tag.start(), tag.end()))
+    edits.extend(
+        (open_start, open_end, f"<{mapped}>") for _name, mapped, open_start, open_end in stack if mapped is not None
+    )
+    return edits
+
+
+def _close_aria_tag(
+    stack: list[tuple[str, str | None, int, int]],
+    edits: list[tuple[int, int, str]],
+    name: str,
+    tag: re.Match[str],
+) -> None:
+    """Pair a close tag with the nearest open of the same name, recording the rewrite.
+
+    Whatever sat above the match was left unclosed (the ``<p>`` inside a CDC cell) and is
+    dropped with it. A close tag matching nothing on the stack is ignored.
+    """
+    for depth in range(len(stack) - 1, -1, -1):
+        if stack[depth][0] != name:
+            continue
+        _, mapped, open_start, open_end = stack[depth]
+        if mapped is not None:
+            edits.append((open_start, open_end, f"<{mapped}>"))
+            edits.append((tag.start(), tag.end(), f"</{mapped}>"))
+        del stack[depth:]
+        return
 
 
 _DATAWRAPPER_CHART_ID_SHAPE = re.compile(r"[A-Za-z0-9]{5}\Z")

@@ -11,14 +11,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 from datetime import UTC, datetime
+from typing import ClassVar
 
 import aiohttp
 import pytest
 
 from metaculus_bot.research import resolution_chart_data, resolution_source
+from metaculus_bot.research.http_fetch import host_semaphores
+from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_chart_data import CHART_DATA_LEAD, render_inline_chart_data
 from metaculus_bot.research.resolution_source import (
+    FetchContext,
     FetchResult,
     _fetch_one,
     _fetch_result_sources,
@@ -35,10 +41,13 @@ from tests.resolution_source_fakes import (
     _embed_shell_page,
     _escape_config,
     _iom_shaped_page,
+    _meta_refresh_stub,
     _mid_band_chart_page,
     _mock_question,
     _prose_page,
+    cdc_aria_stat_block_page,
 )
+from tests.test_document_text import build_text_pdf
 
 
 class TestFetchOne:
@@ -225,24 +234,25 @@ class TestFetchOne:
         assert result.status == "success"
         assert result.text == body.decode("utf-8")
 
-    async def test_pdf_content_type_is_unsupported(self):
-        # PDF: body is NEVER read (per the plan). A read() that raises verifies that.
-        class UnreadableResponse(FakeResponse):
-            async def read(self) -> bytes:
-                raise AssertionError("body must not be read for unsupported types")
-
+    async def test_a_body_that_is_not_a_document_is_still_unsupported_type(self):
+        """The body IS read now (that is how the `%PDF-` magic check works), so what this
+        pins is that reading it did not change the verdict for everything that is not a
+        document. It replaces a pin asserting the body was never read, which was the
+        behaviour that dropped every cited PDF unread."""
         session = FakeSession(
-            {"https://pdf.example.com/doc": UnreadableResponse(200, body=b"", content_type="application/pdf")}
+            {"https://img.example.com/chart.png": FakeResponse(200, body=b"\x89PNG\r\n", content_type="image/png")}
         )
-        result = await _fetch_one(session, "https://pdf.example.com/doc", {})
+        result = await _fetch_one(session, "https://img.example.com/chart.png", {})
         assert result.status == "unsupported_type"
         assert result.text == ""
+        assert result.route == "direct"
 
-    async def test_missing_content_type_is_unsupported_type(self):
-        # INTENDED limitation (F13): a 200 OK served without a Content-Type
-        # header matches no routing prefix and is classified unsupported_type,
-        # body unread — real resolution sources always send Content-Type, and
-        # we deliberately don't content-sniff unknown bodies.
+    async def test_missing_content_type_on_a_non_document_is_unsupported_type(self):
+        # A 200 OK served without a Content-Type header matches no routing prefix and
+        # reaches the document rung, which reads the body, finds no `%PDF-` magic, and
+        # classifies it `unsupported_type` exactly as before. HTML served with no
+        # content type is still not extracted: sniffing is scoped to documents, where
+        # the label is demonstrably unreliable and the payoff is a whole cited source.
         resp = FakeResponse(200, body=b"<html><body>hello there</body></html>")
         del resp.headers["Content-Type"]
         session = FakeSession({"https://noct.example.com/x": resp})
@@ -905,6 +915,84 @@ class TestResolutionSourceFetchMarker:
 
         assert not [m for m in caplog.messages if "resolution_source fetched" in m]
 
+    async def test_a_followed_meta_refresh_names_its_route_and_logs_the_escalation(
+        self, article_html, monkeypatch, caplog
+    ):
+        """`route` is what separates a page a rung rescued from one the direct read got, and
+        the escalation line is the only place the trigger status and the rung's cost appear —
+        the fetch line above it carries the FINAL outcome only."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                "https://cdc.example.com/surveillance": FakeResponse(200, body=_meta_refresh_stub("/data/current")),
+                "https://cdc.example.com/data/current": FakeResponse(200, body=article_html),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="See https://cdc.example.com/surveillance")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/data/current "
+            "status=ok http=200 embeds=none route=meta_refresh"
+        ]
+        escalations = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
+        assert len(escalations) == 1
+        # `url` is the URL the rung was invoked ON — the stub, not the target the fetch line
+        # names — because that is where the ladder engaged and what `from_status` describes.
+        assert re.fullmatch(
+            r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/surveillance "
+            r"from_status=js_wall rung=meta_refresh outcome=success wall_s=\d+\.\d\d",
+            escalations[0],
+        ), escalations[0]
+
+    async def test_a_local_pdf_read_names_its_route(self, monkeypatch, caplog):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        body = build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2 as of August 24"]])
+        session = FakeSession(
+            {"https://cdc.example.com/r.pdf": FakeResponse(200, body=body, content_type="application/pdf")}
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="Resolves per https://cdc.example.com/r.pdf hospitalizations")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/r.pdf "
+            "status=ok http=200 embeds=none route=pdf_local"
+        ]
+        assert re.fullmatch(
+            r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/r\.pdf "
+            r"from_status=unsupported_type rung=pdf_local outcome=success wall_s=\d+\.\d\d",
+            next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
+        )
+
+    async def test_a_skipped_rung_is_counted_but_not_reported_as_an_escalation(self, monkeypatch, caplog):
+        """The marker means "a rung fired". A rung that never ran for want of wall budget
+        rides `details["counts"]` instead, where it stays queryable without inflating the
+        rung's own fire rate."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S", 1_000_000.0)
+        session = FakeSession(
+            {"https://cdc.example.com/surveillance": FakeResponse(200, body=_meta_refresh_stub("/data/current"))}
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="See https://cdc.example.com/surveillance")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/surveillance "
+            "status=js_wall http=200 embeds=none"
+        ]
+        assert not [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
+        counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
+        assert counts == {"meta_refresh_hops": 0, "pdf_documents_read": 0, "rung_budget_skips": 1}
+
 
 class TestFetchResolutionSources:
     async def test_per_host_serialization(self, article_html, monkeypatch):
@@ -1045,3 +1133,292 @@ class TestFetchResolutionSources:
         assert events == ["sibling-settled", "session-closed"]
         assert session.host_inflight["slow.example.com"] == 0
         assert session.closed is True
+
+
+class TestAriaTableRewriteInTheFetch:
+    """The end-to-end half of the ARIA rewrite (helper-level cases live in the helpers
+    module): a real cdc.gov stat block reaches the forecaster with its labels attached."""
+
+    async def test_a_cdc_stat_block_publishes_its_labelled_rows(self):
+        session = FakeSession(
+            {"https://www.cdc.gov/cyclosporiasis/": FakeResponse(200, body=cdc_aria_stat_block_page())}
+        )
+
+        result = await _fetch_one(session, "https://www.cdc.gov/cyclosporiasis/", {})
+
+        assert result.status == "success"
+        assert "| Hospitalizations | 922 |" in result.text
+        assert result.route == "direct", "the rewrite is part of extraction, not a ladder rung"
+
+
+class TestMetaRefreshHop:
+    """The cdc.gov surveillance stub: HTTP 200, ~300 bytes, whose only content is a
+    meta-refresh tag pointing at the page the question actually resolves on. No 3xx and no
+    `Location`, so the manual redirect loop never saw it and the fetch called the stub a JS
+    wall — one of the fetcher's most common silent losses."""
+
+    async def test_the_stub_is_followed_to_the_real_page(self, article_html):
+        session = FakeSession(
+            {
+                "https://cdc.example.com/surveillance": FakeResponse(200, body=_meta_refresh_stub("/data/current")),
+                "https://cdc.example.com/data/current": FakeResponse(200, body=article_html),
+            }
+        )
+
+        result = await _fetch_one(session, "https://cdc.example.com/surveillance", {})
+
+        assert result.status == "success"
+        assert result.route == "meta_refresh"
+        assert "Bureau of Labor Statistics" in result.text
+        assert result.url == "https://cdc.example.com/data/current"
+        assert session.requested == [
+            "https://cdc.example.com/surveillance",
+            "https://cdc.example.com/data/current",
+        ]
+
+    async def test_the_target_is_re_guarded_against_a_private_address(self):
+        """A hop target this module derived is not more trusted than a `Location` header:
+        the same preflight runs on it, so a crafted resolution source cannot reach the
+        instance metadata service through a refresh tag."""
+        session = FakeSession(
+            {
+                "https://evil.example.com/p": FakeResponse(
+                    200, body=_meta_refresh_stub("http://169.254.169.254/latest/meta-data/")
+                )
+            }
+        )
+
+        result = await _fetch_one(session, "https://evil.example.com/p", {})
+
+        assert result.status == "ssrf_blocked"
+        assert result.text == ""
+        assert session.requested == ["https://evil.example.com/p"], "the target was never dialled"
+
+    async def test_a_metaculus_target_is_refused(self):
+        session = FakeSession(
+            {
+                "https://tracker.example.com/p": FakeResponse(
+                    200, body=_meta_refresh_stub("https://www.metaculus.com/questions/999/")
+                )
+            }
+        )
+
+        result = await _fetch_one(session, "https://tracker.example.com/p", {})
+
+        assert result.status == "blocked"
+        assert session.requested == ["https://tracker.example.com/p"]
+
+    async def test_the_hop_consumes_a_redirect_slot(self):
+        """A stub pointing at itself is a refresh loop. It has to be bounded by the same
+        `MAX_REDIRECTS` cap a 3xx chain is, which is the whole reason the rung returns a
+        next-hop URL instead of recursing."""
+        session = FakeSession({"https://loop.example.com/p": FakeResponse(200, body=_meta_refresh_stub("/p"))})
+
+        result = await _fetch_one(session, "https://loop.example.com/p", {})
+
+        assert result.status == "error"
+        assert len(session.requested) == resolution_source.MAX_REDIRECTS + 1
+
+    async def test_a_page_that_already_has_content_is_served_as_is(self, article_html):
+        """Some content-management systems emit a refresh tag beside real content (a
+        canonical-URL nudge). The rung is only reached with nothing readable, so the page
+        we already have is never thrown away for a re-fetch."""
+        with_tag = article_html.replace(
+            b"<body>", b'<body><meta http-equiv="refresh" content="0; url=/somewhere-else">'
+        )
+        session = FakeSession({"https://news.example.com/report": FakeResponse(200, body=with_tag)})
+
+        result = await _fetch_one(session, "https://news.example.com/report", {})
+
+        assert result.status == "success"
+        assert result.route == "direct"
+        assert session.requested == ["https://news.example.com/report"]
+
+    async def test_the_hop_is_skipped_when_the_wall_budget_is_spent(self, caplog):
+        """Self-bounding, because the provider's outer `wait_for` discards every page that
+        already fetched when it fires: with no budget left, the stub's own verdict is worth
+        more than an attempt that could cost the whole question."""
+        session = FakeSession(
+            {"https://cdc.example.com/surveillance": FakeResponse(200, body=_meta_refresh_stub("/data/current"))}
+        )
+        spent = FetchContext(started=time.monotonic() - resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT)
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(session, "https://cdc.example.com/surveillance", {}, spent)
+
+        assert result.status == "js_wall"
+        assert result.route == "direct"
+        assert session.requested == ["https://cdc.example.com/surveillance"]
+        assert [a.skipped_reason for a in result.rung_attempts] == ["wall_budget"]
+        assert any("skipping the meta-refresh hop" in m for m in caplog.messages)
+
+
+class TestLocalPdfReading:
+    """A cited PDF used to be the one resolution source dropped unread. Now it is read with
+    pypdf and rendered as a query-ranked digest — free, deterministic, no second request."""
+
+    _PAGES: ClassVar[list[list[str]]] = [
+        ["Annual Surveillance Summary", "Contents: methods, tables, appendix"],
+        ["Hospitalizations reported: 922", "Deaths reported: 2"],
+    ]
+
+    def _session(self, *, content_type: str = "application/pdf", pages: list[list[str]] | None = None) -> FakeSession:
+        body = build_text_pdf(self._PAGES if pages is None else pages)
+        return FakeSession(
+            {"https://cdc.example.com/report.pdf": FakeResponse(200, body=body, content_type=content_type)}
+        )
+
+    async def test_a_cited_pdf_is_read_and_the_relevant_passage_rendered(self):
+        session = self._session()
+
+        result = await _fetch_one(
+            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations reported")
+        )
+
+        assert result.status == "success"
+        assert result.route == "pdf_local"
+        assert "922" in result.text
+        assert "[p.2]" in result.text, "the passage carries the page a forecaster could cite"
+        assert result.text.startswith("Document: https://cdc.example.com/report.pdf")
+        assert [(a.rung, a.from_status) for a in result.rung_attempts] == [("pdf_local", "unsupported_type")]
+        assert result.rung_attempts[0].wall_s is not None
+
+    async def test_an_undeclared_document_is_sniffed_by_its_magic_bytes(self):
+        """Several government hosts serve their PDFs as `application/octet-stream`, and the
+        header is exactly what the old branch trusted when it dropped them."""
+        session = self._session(content_type="application/octet-stream")
+
+        result = await _fetch_one(
+            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="deaths reported")
+        )
+
+        assert result.status == "success"
+        assert result.route == "pdf_local"
+        assert "Deaths reported: 2" in result.text
+
+    async def test_a_pdf_with_no_text_layer_is_unreadable_rather_than_unsupported(self):
+        """The two statuses answer different questions: `unsupported_type` is a type we do
+        not read, `unreadable_document` is bytes we read and could not turn into text. Only
+        the second is worth a paid document read later, so they must not be the same token."""
+        session = self._session(pages=[["1"]])
+
+        result = await _fetch_one(session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="anything"))
+
+        assert result.status == "unreadable_document"
+        assert result.status_reason == "no_text_layer"
+        assert result.text == ""
+        assert result.route == "pdf_local", "the rung ran; it just found no text"
+
+    async def test_a_malformed_pdf_says_so(self):
+        session = FakeSession(
+            {
+                "https://cdc.example.com/report.pdf": FakeResponse(
+                    200, body=b"%PDF-1.4\nthis is not really a pdf", content_type="application/pdf"
+                )
+            }
+        )
+
+        result = await _fetch_one(session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="anything"))
+
+        assert result.status == "unreadable_document"
+        assert result.status_reason == "malformed"
+
+    async def test_the_digest_is_bounded_by_the_per_url_cap(self, monkeypatch):
+        cap = 300
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        session = self._session(pages=[["Hospitalizations reported: 922 " * 20]])
+
+        result = await _fetch_one(
+            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations")
+        )
+
+        assert result.status == "success"
+        assert len(result.text) <= cap
+        assert "digest truncated at" in result.text
+
+    async def test_a_declared_document_gets_the_document_byte_cap_and_an_undeclared_one_does_not(self, monkeypatch):
+        """The 6.7 MB receipt PDF is over the 5 MiB response cap the text branches use, so a
+        DECLARED document gets the document cap. An undeclared body keeps the smaller one:
+        it is far likelier to be an image than a report, and buffering 40 MiB of it per URL
+        across every concurrent question buys nothing."""
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_MAX_RESPONSE_BYTES", 200)
+        monkeypatch.setattr(resolution_source, "DOCUMENT_TEXT_PDF_MAX_BYTES", 10_000_000)
+
+        declared = await _fetch_one(
+            self._session(), "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations")
+        )
+        undeclared = await _fetch_one(
+            self._session(content_type="application/octet-stream"),
+            "https://cdc.example.com/report.pdf",
+            {},
+            FetchContext(query="hospitalizations"),
+        )
+
+        assert declared.status == "success"
+        assert undeclared.status == "error", "oversize under the general cap, as before"
+
+    async def test_an_oversize_document_is_dropped(self, monkeypatch):
+        monkeypatch.setattr(resolution_source, "DOCUMENT_TEXT_PDF_MAX_BYTES", 100)
+
+        result = await _fetch_one(
+            self._session(), "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations")
+        )
+
+        assert result.status == "error"
+        assert result.text == ""
+
+    async def test_the_read_is_skipped_when_the_wall_budget_is_spent(self, caplog):
+        """The parse is CPU-bound and the outer `wait_for` throws away finished work, so with
+        no budget left the document is left unread rather than risking the whole question."""
+        spent = FetchContext(
+            query="hospitalizations", started=time.monotonic() - resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
+        )
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(self._session(), "https://cdc.example.com/report.pdf", {}, spent)
+
+        assert result.status == "unsupported_type"
+        assert result.route == "direct"
+        assert [a.skipped_reason for a in result.rung_attempts] == ["wall_budget"]
+        assert any("skipping the local PDF read" in m for m in caplog.messages)
+
+    async def test_a_query_no_passage_matches_renders_the_document_without_inventing_relevance(self):
+        session = self._session()
+
+        result = await _fetch_one(
+            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="corn futures settlement")
+        )
+
+        assert result.status == "success"
+        assert "No passage in this document matched the query" in result.text
+        assert "922" not in result.text
+
+
+class TestSharedHostGate:
+    """Politeness has to hold ACROSS questions, not just inside one.
+
+    The map used to be rebuilt per provider call, so six questions citing the same host each
+    held their own `Semaphore(1)` and hit it six times at once — the opposite of what the
+    semaphore is for, on exactly the government hosts that answer our requests with 403."""
+
+    async def test_two_concurrent_provider_calls_serialize_on_one_host(self, article_html, monkeypatch):
+        class SlowReadResponse(FakeResponse):
+            async def read(self) -> bytes:
+                await asyncio.sleep(0.01)
+                return self._body
+
+        session = FakeSession(
+            {
+                "https://a.example.com/one": SlowReadResponse(200, body=article_html, content_type="text/html"),
+                "https://a.example.com/two": SlowReadResponse(200, body=article_html, content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        await asyncio.gather(
+            fetch_resolution_sources(["https://a.example.com/one"]),
+            fetch_resolution_sources(["https://a.example.com/two"]),
+        )
+
+        assert session.host_peak["a.example.com"] == 1
+        assert list(host_semaphores()) == ["a.example.com"], "one gate for the host, not one per call"

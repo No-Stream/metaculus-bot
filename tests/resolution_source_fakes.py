@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Mapping
 from html import escape as html_escape
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 from urllib.parse import urlparse
@@ -267,3 +268,30 @@ def _mock_question(*, resolution_criteria: str = "", fine_print: str = "") -> Ma
     q.question_text = "test question"
     q.page_url = "https://metaculus.com/q/999"
     return q
+
+
+# Real-capture fixtures live beside the tests as files rather than inline strings: their
+# VALUE is that nobody tidied the whitespace or the tag soup, which is exactly what an
+# inline literal invites. Resolved from this file's own location so the path holds
+# wherever the checkout sits (a developer-absolute path is green locally and red in CI).
+_TEST_DATA_DIR = Path(__file__).parent / "data"
+
+# CDC's cyclosporiasis stat block: a real table built out of `<div role="table">`.
+CDC_ARIA_STAT_BLOCK_PATH = _TEST_DATA_DIR / "cdc_aria_stat_block.html"
+
+
+def cdc_aria_stat_block_page() -> bytes:
+    return CDC_ARIA_STAT_BLOCK_PATH.read_bytes()
+
+
+def _meta_refresh_stub(target: str) -> bytes:
+    """The cdc.gov shape: a ~300-byte 200 whose only content is the refresh tag.
+
+    Deliberately under the chrome floor with nothing else in it, because that is what
+    makes the direct read a `js_wall` and the hop the only way to the page.
+    """
+    return (
+        "<!doctype html><html><head><title>Redirecting</title>"
+        f'<meta http-equiv="refresh" content="0; url={target}">'
+        "</head><body></body></html>"
+    ).encode()

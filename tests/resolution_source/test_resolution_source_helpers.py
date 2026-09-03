@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 import pytest
 
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.http_fetch import meta_refresh_target, rewrite_aria_tables
 from metaculus_bot.research.resolution_source import (
     FetchResult,
     extract_source_urls,
@@ -31,6 +32,7 @@ from metaculus_bot.research.resolution_source import (
     strip_markdown_escapes,
     vacuous_body_status,
 )
+from tests.resolution_source_fakes import cdc_aria_stat_block_page
 
 
 class TestStripMarkdownEscapes:
@@ -578,3 +580,118 @@ class TestFormatResolutionSections:
         ]
         out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         assert "omitted" not in out
+
+
+class TestAriaTableRewrite:
+    """The stat block that is a table in every way except its tag names.
+
+    cdc.gov's outbreak pages build their case/hospitalization/death block out of
+    `<div role="table">` and friends. That is valid accessible markup and completely
+    invisible to trafilatura, which kept whichever values happened to sit inside a `<p>`,
+    dropped the rest, and rendered the survivors with no labels — so a cyclosporiasis
+    question graded on the hospitalization count got a bare "17,180 / 2" and no 922.
+    """
+
+    def test_the_hospitalization_count_arrives_with_its_label(self):
+        body = cdc_aria_stat_block_page()
+
+        before = resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+        after = resolution_source._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0)
+
+        assert before is not None
+        assert after is not None
+        assert "922" not in before, "the pre-rewrite behaviour this rung exists for"
+        assert "| Hospitalizations | 922 |" in after
+        # Every row survives, labelled — including the two whose values were bare text.
+        assert "| Laboratory-confirmed cases | 17,180 |" in after
+        assert "| Median age of cases | 46 years (range 1 to 99 years) |" in after
+        # The prose around the block is untouched.
+        assert "linked to iceberg lettuce" in after
+
+    def test_a_page_with_no_aria_table_is_left_alone(self, article_html):
+        """None means "hand trafilatura the original bytes", which is what keeps every page
+        that already worked byte-identical — including its encoding detection."""
+        assert rewrite_aria_tables(article_html.decode()) is None
+
+        assert resolution_source._extract_page_text(
+            article_html.decode(), article_html, "https://news.example.com/report", 0.0
+        ) == resolution_source._extract_main_text(article_html, "https://news.example.com/report")
+
+    def test_an_unclosed_role_element_is_still_rewritten(self):
+        """A truncated capture (and plenty of live HTML) never closes its outer divs. Leaving
+        the `role="table"` div alone would strand the rewritten rows outside a table, and
+        lxml's recovering parser then drops the whole block."""
+        html = '<div role="table"><div role="row"><div role="rowheader">Deaths</div><div role="cell">2</div>'
+
+        out = rewrite_aria_tables(html)
+
+        assert out is not None
+        assert out.startswith("<table><tr><th>Deaths</th><td>2")
+
+    def test_an_unclosed_paragraph_inside_a_cell_does_not_swallow_the_row(self):
+        """The CDC shape: `<div role="cell"><p>17,180</div>`. The close tag pairs with the
+        nearest open of ITS name, so the stray `<p>` is dropped with the cell rather than
+        eating the rest of the block."""
+        html = '<div role="row"><div role="cell"><p>17,180</div><div role="cell">922</div></div>'
+
+        out = rewrite_aria_tables(html)
+
+        assert out == "<tr><td><p>17,180</td><td>922</td></tr>"
+
+    def test_a_stray_close_tag_is_ignored(self):
+        assert rewrite_aria_tables('</div><div role="cell">2</div>') == "</div><td>2</td>"
+
+    def test_roles_are_matched_case_insensitively_and_unquoted(self):
+        assert rewrite_aria_tables("<span ROLE=Cell>2</span>") == "<td>2</td>"
+
+    def test_a_void_element_carrying_a_role_never_joins_the_nesting_stack(self):
+        """A `<br role="cell">` never closes, so pushing it would make every later close tag
+        pair with the wrong element."""
+        assert rewrite_aria_tables('<div role="row"><br role="cell"><div role="cell">2</div></div>') == (
+            '<tr><br role="cell"><td>2</td></tr>'
+        )
+
+
+class TestMetaRefreshTarget:
+    """The redirect no HTTP status announces.
+
+    cdc.gov's surveillance URLs answer 200 with a 234-340 byte stub whose only content is a
+    meta-refresh tag pointing at the real page. The manual redirect loop cannot see it (no
+    3xx, no `Location`), so the fetch classified the stub as a JS wall and the resolving
+    numbers were never fetched.
+    """
+
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            '<meta http-equiv="refresh" content="0; url=/real/page">',
+            "<meta http-equiv='refresh' content='0;URL=/real/page'>",
+            "<meta http-equiv=refresh content=0;url=/real/page>",
+            '<meta content="5; url=/real/page" http-equiv="refresh">',
+            '<meta http-equiv="REFRESH" content="0; URL=&#x27;/real/page&#x27;">',
+        ],
+    )
+    def test_the_target_is_read_from_every_spelling_in_the_wild(self, tag: str):
+        assert meta_refresh_target(f"<html><head>{tag}</head><body></body></html>") == "/real/page"
+
+    def test_entities_in_the_target_are_unescaped(self):
+        html = '<meta http-equiv="refresh" content="0; url=/p?a=1&amp;b=2">'
+
+        assert meta_refresh_target(html) == "/p?a=1&b=2"
+
+    def test_a_refresh_that_only_reloads_the_page_is_not_a_hop(self):
+        """`content="30"` with no url is a self-reload, which is a live-updating page rather
+        than a redirect — following it would just re-fetch what we already have."""
+        assert meta_refresh_target('<meta http-equiv="refresh" content="30">') is None
+
+    def test_an_unrelated_meta_tag_is_not_a_hop(self):
+        assert meta_refresh_target('<meta name="description" content="0; url=/x">') is None
+
+    def test_no_meta_tag_at_all(self):
+        assert meta_refresh_target("<html><body>hello</body></html>") is None
+        assert meta_refresh_target("") is None
+
+    def test_the_first_refresh_tag_wins(self):
+        html = '<meta http-equiv="refresh" content="0; url=/first"><meta http-equiv="refresh" content="0; url=/second">'
+
+        assert meta_refresh_target(html) == "/first"

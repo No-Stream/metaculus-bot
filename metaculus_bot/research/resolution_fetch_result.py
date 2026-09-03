@@ -58,6 +58,13 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 # page needs JS to assemble ANY content, i.e. under the much lower JS-wall floor):
 # here the page answered with prose-shaped chrome, which is why — like `blocked` /
 # `js_wall` — it is a Tier-2 ESCALATION SEAM rather than a refusal.
+#
+# `unreadable_document` is a document we DID read the bytes of and could not turn
+# into text: a scan with no text layer, an encrypted file, or a malformed one
+# (`FetchResult.status_reason` says which). Deliberately NOT `unsupported_type`,
+# which keeps meaning "a content type we do not read at all" — the two answer
+# different questions, and a paid document read is only ever worth spending on
+# this one.
 FetchStatus = Literal[
     "success",
     "blocked",
@@ -69,14 +76,36 @@ FetchStatus = Literal[
     "stale_data",
     "empty_body",
     "no_resolving_content",
+    "unreadable_document",
 ]
 
-# Which rule produced a `no_resolving_content` verdict. A telemetry token like every
-# `FetchStatus`: it rides the `RESOLUTION_SOURCE_FETCH` marker as `reason=`, which is
-# what separates the embed-gated population (queryable since 2026-08) from the
+# Which rule produced a status that has more than one rule behind it. A telemetry token
+# like every `FetchStatus`: it rides the `RESOLUTION_SOURCE_FETCH` marker as `reason=`,
+# which is what separates the embed-gated population (queryable since 2026-08) from the
 # generalised thin-page one, so a later "how often does the floor withhold a page
 # nothing else would have caught?" cut is a query rather than a re-derivation.
-FetchStatusReason = Literal["embed_shell", "thin_page"]
+#
+# `embed_shell` / `thin_page` belong to `no_resolving_content`; `no_text_layer` /
+# `encrypted` / `malformed` to `unreadable_document`, where the split is what says
+# whether a paid document read could ever help (only `no_text_layer` — the other two
+# are bytes no reader gets text out of).
+FetchStatusReason = Literal["embed_shell", "thin_page", "no_text_layer", "encrypted", "malformed"]
+
+# Which rung of the escalation ladder produced a result. The vocabulary is pinned to the
+# `route=` group of the `resolution_source_fetch` marker spec
+# (`scripts/telemetry/markers.py`) — adding a token is fine, renaming one is a breaking
+# telemetry change. `direct` is the plain fetch and is the only value that does NOT ride
+# the marker, so every line the archive already holds stays byte-identical.
+FetchRoute = Literal[
+    "direct",
+    "meta_refresh",
+    "impersonate",
+    "pdf_local",
+    "derived_api",
+    "rendered",
+    "wayback",
+    "url_context",
+]
 
 # HTTP status -> FetchStatus for non-OK terminal responses — the ONE table both the
 # Tier-1 page fetch (_resolution_status_outcome) and the Tier-2 Datawrapper CDN hop
@@ -90,6 +119,44 @@ _NON_OK_FETCH_STATUS: dict[int, FetchStatus] = {
     404: "not_found",
     410: "not_found",
 }
+
+
+@dataclass
+class RungAttempt:
+    """One escalation-rung attempt on one URL: what triggered it, and what it cost.
+
+    Carried on the result rather than logged where it happens, because the
+    ``RESOLUTION_SOURCE_ESCALATION`` marker names the question and the question id only
+    exists at the provider's per-question aggregation point (same reason the fetch
+    marker is emitted there).
+
+    ``from_status`` is the status the DIRECT route would have returned — the trigger
+    population — so the marker answers "how often does this rung fire" without a join.
+    ``url`` is the URL the rung was invoked ON, which for a meta-refresh hop is the stub
+    rather than the page it led to: the stub is the URL the QUESTION cited and the one
+    every earlier fetch record is filed under, so it is what a "which cited sources need
+    this rung" cut has to key on.
+    ``wall_s`` is None until the attempt finishes: a rung whose cost is a local parse
+    knows it immediately, while the meta-refresh hop is only over once the followed
+    request comes back, which happens a layer above where the attempt is created.
+
+    ``skipped_reason`` marks an attempt that never ran (no wall budget left). Those are
+    NOT escalation lines — the marker means "a rung fired" — so they ride the provider's
+    ``details["counts"]`` instead, where a zero renders nothing but survives into the
+    archive.
+    """
+
+    rung: FetchRoute
+    from_status: FetchStatus
+    url: str
+    started_at: float
+    wall_s: float | None = None
+    skipped_reason: str = ""
+
+    def finish(self, now: float) -> None:
+        """Stamp the elapsed wall-clock, unless the rung already measured its own."""
+        if self.wall_s is None:
+            self.wall_s = max(0.0, now - self.started_at)
 
 
 @dataclass
@@ -107,9 +174,15 @@ class FetchResult:
     # the `no_resolving_content` verdict and, on a page that DID carry prose, the
     # disclosure appended to its rendered text.
     unreadable_embeds: list[str] = field(default_factory=list)
-    # Which rule produced the status, where the status alone is ambiguous. Set only
-    # on `no_resolving_content` (`embed_shell` / `thin_page`); None everywhere else.
+    # Which rule produced the status, where the status alone is ambiguous. Set on
+    # `no_resolving_content` (`embed_shell` / `thin_page`) and `unreadable_document`
+    # (`no_text_layer` / `encrypted` / `malformed`); None everywhere else.
     status_reason: FetchStatusReason | None = None
+    # Which rung of the ladder produced this result, and the per-rung attempts behind
+    # it. `direct` plus an empty list is the plain fetch, which is the overwhelming
+    # majority and renders no extra telemetry at all.
+    route: FetchRoute = "direct"
+    rung_attempts: list[RungAttempt] = field(default_factory=list)
     # Provenance for Tier-2 dataset results (None on ordinary page fetches).
     chart_id: str | None = None
     chart_title: str | None = None
@@ -199,7 +272,8 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     A fetched URL normalizes to ``"ok"`` (the shared "contributed" token the
     diagnostics formatter recognizes); every other ``FetchStatus``
     (``blocked`` / ``js_wall`` / ``not_found`` / ``error`` / ``unsupported_type`` /
-    ``ssrf_blocked`` / ``empty_body`` / ``no_resolving_content``) is kept verbatim
+    ``ssrf_blocked`` / ``empty_body`` / ``no_resolving_content`` /
+    ``unreadable_document``) is kept verbatim
     as the loss token so the reason survives into the ``lost=`` segment. Duplicate
     domains are disambiguated with a ``#N`` suffix so no per-URL outcome is silently
     overwritten.

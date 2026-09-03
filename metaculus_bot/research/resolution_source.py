@@ -32,6 +32,22 @@ round, none naming a provider, which is why the floor is no longer gated on one)
 A page ABOVE the floor keeps its text, plus a one-line disclosure where an embed
 hid figures from it.
 
+Three free rungs sit under Tier 1, all deterministic and none of them a model call.
+An ARIA-TABLE REWRITE runs before every extraction (`rewrite_aria_tables`): a
+`<div role="table">` stat block is a real table trafilatura cannot see, and cdc.gov's
+cyclosporiasis block published as an unlabelled "17,180 / 2" with its hospitalization
+count missing entirely. A META-REFRESH HOP follows the redirect no status announces —
+the same host's surveillance URLs answer 200 with a ~300-byte stub carrying only
+`<meta http-equiv="refresh">`, which read as a JS wall — returning the target as the
+next hop so it re-enters this same classification path under the shared `MAX_REDIRECTS`
+cap and the same per-hop SSRF checks. A cited PDF is READ LOCALLY
+(`research/document_text.py`, pypdf + BM25 passage selection against the question's
+title and resolution criteria) instead of being dropped unread; bytes we read and could
+not turn into text are `unreadable_document`, which is a different fact from
+`unsupported_type` and the only one a paid document read could ever rescue. Each rung is
+self-bounding against the provider wall the way the Datawrapper hop is, because the
+outer `asyncio.wait_for` discards every page that already fetched when it fires.
+
 Inline chart configs are read straight out of the page we already hold
 (`resolution_chart_data.render_inline_chart_data`): a Highcharts `data-chart`
 attribute or `Highcharts.chart(...)` call carries its series as JSON, which
@@ -69,7 +85,9 @@ Design anchors:
 - Per-host politeness: one `asyncio.Semaphore(1)` per netloc, acquired around
   each redirect hop's GET and keyed on THAT hop's host — so chains converging
   on one final host still serialize there. Distinct hosts run concurrently up
-  to the connector limit.
+  to the connector limit. The map is PROCESS-WIDE (`http_fetch.host_semaphores`),
+  so the gate holds across the several questions researching at once; it used to
+  be rebuilt per provider call, which gave each question its own gate.
 - Char caps apply to RAW (non-LLM-processed) content only; the LLM-emitted
   research bundle is never truncated (see the resolution-source plan).
 """
@@ -81,6 +99,7 @@ import ipaddress
 import logging
 import socket
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -90,6 +109,10 @@ import trafilatura
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot.constants import (
+    DOCUMENT_DIGEST_TOP_K,
+    DOCUMENT_TEXT_MAX_PAGES,
+    DOCUMENT_TEXT_MAX_SECONDS,
+    DOCUMENT_TEXT_PDF_MAX_BYTES,
     RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
@@ -102,14 +125,25 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_JS_WALL_MIN_CHARS,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     RESOLUTION_SOURCE_MAX_URLS,
+    RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S,
+    RESOLUTION_SOURCE_PDF_MIN_BUDGET_S,
     RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+    RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
     RESOLUTION_SOURCE_WALL_TIMEOUT,
     env_flag_enabled,
 )
+from metaculus_bot.research.document_text import (
+    PdfText,
+    extract_pdf_text,
+    has_text_layer,
+    is_pdf_body,
+    render_document_digest,
+)
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     MAX_REDIRECTS,
+    MAX_UNDECODABLE_CHAR_RATIO,
     REDIRECT_STATUSES,
     DatawrapperChartRef,
     FilteringResolver,
@@ -117,8 +151,12 @@ from metaculus_bot.research.http_fetch import (
     datawrapper_live_data_url,
     decode_text_body,
     extract_datawrapper_charts,
+    host_semaphores,
+    meta_refresh_target,
     parse_http_last_modified,
     read_body_capped,
+    rewrite_aria_tables,
+    semaphore_for_host,
     unreadable_data_embed_providers,
 )
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
@@ -133,7 +171,10 @@ from metaculus_bot.research.resolution_chart_data import render_inline_chart_dat
 from metaculus_bot.research.resolution_fetch_result import (
     _NON_OK_FETCH_STATUS,
     FetchResult,
+    FetchRoute,
     FetchStatus,
+    FetchStatusReason,
+    RungAttempt,
     _fetch_result_sources,
     _render_fetch_failures,
     fetch_outcome_token,
@@ -529,8 +570,11 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
 # ---------------------------------------------------------------------------
 
 
-def _extract_main_text(body: bytes, url: str) -> str | None:
+def _extract_main_text(body: bytes | str, url: str) -> str | None:
     """Trafilatura extraction. Callers wrap in ``await asyncio.to_thread(...)``.
+
+    Takes bytes (the response body, letting trafilatura detect the encoding) or text
+    (a body this module already decoded and rewrote — see :func:`_extract_page_text`).
 
     Returns None on empty/failed extraction so callers can classify.
     """
@@ -581,6 +625,72 @@ def _get_session() -> aiohttp.ClientSession:
 _HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 _RAW_TEXT_CONTENT_TYPES = ("text/plain", "text/csv")
 _JSON_CONTENT_TYPES = ("application/json",)
+_PDF_CONTENT_TYPES = ("application/pdf", "application/x-pdf")
+
+
+@dataclass
+class FetchContext:
+    """Per-URL inputs and rung bookkeeping for one :func:`_fetch_one` call.
+
+    ONE per fetched URL, so ``rungs`` belongs to that URL and can be stamped onto its
+    result; ``query`` and ``started`` are the same values for every URL in a provider
+    call. Every field has a default so the monkeypatched fetch surface can still be
+    driven with three positional arguments, and a default context is simply "no
+    question text, clock starts now" — which gives a direct fetch exactly the behaviour
+    it had before the ladder existed.
+
+    ``query`` is the question's title plus its resolution criteria, and it is what
+    decides WHICH passages of a 220-page PDF a forecaster sees. ``started`` is the
+    provider's own wall-clock origin, so every rung can bound itself against the same
+    45 s the outer ``asyncio.wait_for`` uses.
+    """
+
+    query: str = ""
+    started: float = field(default_factory=time.monotonic)
+    rungs: list[RungAttempt] = field(default_factory=list)
+
+    def rung_budget_s(self) -> float:
+        """Wall-clock seconds a rung may spend before the outer ``wait_for`` fires.
+
+        Same arithmetic as the Datawrapper hop's, and for the same reason: that timeout
+        discards every page that already fetched, so a rung that overruns costs the
+        whole question's resolution evidence rather than just its own attempt.
+        """
+        return RESOLUTION_SOURCE_WALL_TIMEOUT - (time.monotonic() - self.started) - RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+
+    def start_rung(self, rung: FetchRoute, from_status: FetchStatus, url: str) -> RungAttempt:
+        attempt = RungAttempt(rung=rung, from_status=from_status, url=url, started_at=time.monotonic())
+        self.rungs.append(attempt)
+        return attempt
+
+    def skip_rung(self, rung: FetchRoute, from_status: FetchStatus, url: str, reason: str) -> None:
+        self.rungs.append(
+            RungAttempt(
+                rung=rung,
+                from_status=from_status,
+                url=url,
+                started_at=time.monotonic(),
+                wall_s=0.0,
+                skipped_reason=reason,
+            )
+        )
+
+
+def _stamped_with_route(result: FetchResult, ctx: FetchContext) -> FetchResult:
+    """Attach the ladder bookkeeping to a finished result.
+
+    ``route`` is the LAST rung that fired, which is the one that produced this outcome
+    (a meta-refresh hop onto a PDF reads ``pdf_local``: the hop got us the bytes, the
+    local read is what the text came from). Skipped rungs never claim the route.
+    """
+    now = time.monotonic()
+    for attempt in ctx.rungs:
+        attempt.finish(now)
+    result.rung_attempts = list(ctx.rungs)
+    fired: list[FetchRoute] = [attempt.rung for attempt in ctx.rungs if not attempt.skipped_reason]
+    if fired:
+        result.route = fired[-1]
+    return result
 
 
 def _sem_for_host(host_sems: dict[str, asyncio.Semaphore], url: str) -> asyncio.Semaphore:
@@ -588,14 +698,57 @@ def _sem_for_host(host_sems: dict[str, asyncio.Semaphore], url: str) -> asyncio.
 
     Every task in one :func:`fetch_resolution_sources` run shares the same
     ``host_sems`` map, so every request to a given host — original URL or
-    redirect hop — contends on the same semaphore object.
+    redirect hop — contends on the same semaphore object. Since 2026-09-03 that map
+    is :func:`http_fetch.host_semaphores`, shared by every question running
+    concurrently rather than rebuilt per provider call; the parameter stays because
+    the gap-fill v2 loop reaches this function with its own map.
+
+    Kept as a thin wrapper over the shared implementation because the test suites
+    monkeypatch THIS name to observe or replace the gate.
     """
-    host = urlparse(url).netloc
-    sem = host_sems.get(host)
-    if sem is None:
-        sem = asyncio.Semaphore(1)
-        host_sems[host] = sem
-    return sem
+    return semaphore_for_host(url, host_sems)
+
+
+async def _vetted_hop_target(
+    target: str, current_url: str, *, http_status: int, content_type: str, kind: str
+) -> FetchResult | str:
+    """The absolute next URL for a derived hop, or the terminal refusal it earns.
+
+    The ONE place a URL this module derived from a response — a ``Location`` header, a
+    meta-refresh tag — passes the two checks every hop owes: the ``is_public_http_url``
+    preflight (the fast-fail SSRF view; the connect-time resolver stays the real
+    boundary) and the Metaculus self-reference refusal. Shared so a third rung cannot
+    ship with one of them missing, and ``kind`` is only there to say which hop shape a
+    log line came from.
+    """
+    next_url = urljoin(current_url, target)
+    if not await is_public_http_url(next_url):
+        logger.warning(
+            f"resolution_source ssrf_blocked ({kind}): {urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
+        )
+        return FetchResult(
+            url=next_url,
+            status="ssrf_blocked",
+            text="",
+            http_status=http_status,
+            content_type=content_type or None,
+        )
+    if is_metaculus_self_ref(next_url):
+        # The URL pre-filter drops metaculus self-refs, but a redirect (of either
+        # shape) can still land on metaculus.com; don't follow it (no new info,
+        # and keeps our IP off the same host the critical API uses).
+        logger.info(
+            f"resolution_source metaculus_self_ref ({kind}): "
+            f"{urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
+        )
+        return FetchResult(
+            url=next_url,
+            status="blocked",
+            text="",
+            http_status=http_status,
+            content_type=content_type or None,
+        )
+    return next_url
 
 
 async def _resolution_redirect_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult | str:
@@ -612,34 +765,9 @@ async def _resolution_redirect_outcome(resp: Any, current_url: str, content_type
             http_status=status,
             content_type=content_type or None,
         )
-    next_url = urljoin(current_url, location)
-    if not await is_public_http_url(next_url):
-        logger.warning(
-            f"resolution_source ssrf_blocked (redirect): {urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
-        )
-        return FetchResult(
-            url=next_url,
-            status="ssrf_blocked",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-        )
-    if is_metaculus_self_ref(next_url):
-        # The URL pre-filter drops metaculus self-refs, but a 3xx can
-        # still land on metaculus.com; don't follow it (no new info,
-        # and keeps our IP off the same host the critical API uses).
-        logger.info(
-            f"resolution_source metaculus_self_ref (redirect): "
-            f"{urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
-        )
-        return FetchResult(
-            url=next_url,
-            status="blocked",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-        )
-    return next_url
+    return await _vetted_hop_target(
+        location, current_url, http_status=status, content_type=content_type, kind="redirect"
+    )
 
 
 def _resolution_status_outcome(status: int, current_url: str, content_type: str) -> FetchResult | None:
@@ -656,7 +784,93 @@ def _resolution_status_outcome(status: int, current_url: str, content_type: str)
     )
 
 
-async def _resolution_html_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult:
+def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio: float) -> str | None:
+    """Main-text extraction, with ARIA tables rewritten to real ones first.
+
+    Both halves are CPU-bound sync work over a body up to the response cap, so this runs
+    in one ``asyncio.to_thread`` hop rather than two.
+
+    Trafilatura gets the ORIGINAL BYTES in two cases, and in both its extraction is
+    byte-identical to what it was before this rung existed: a page with no ARIA role at
+    all, and a page our own decode mangled. The second is the one that matters —
+    ``decode_text_body`` honours a BOM and the HTTP header's ``charset``, but a page that
+    declares its encoding only in a ``<meta charset>`` decodes as UTF-8 here and comes
+    back as mojibake, while trafilatura reading the bytes would have found the meta
+    declaration. Handing it the rewritten mojibake instead would lose a page we can read
+    today, so above the shared undecodable bound the rewrite is skipped rather than
+    trusted.
+    """
+    rewritten = None if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO else rewrite_aria_tables(html_text)
+    return _extract_main_text(body if rewritten is None else rewritten, url)
+
+
+def _no_content_verdict(
+    extracted: str | None, unreadable_embeds: list[str]
+) -> tuple[FetchStatus, FetchStatusReason | None]:
+    """Which withhold a 200 with no readable content earns, and why.
+
+    Order is load-bearing and unchanged since the chrome floor generalised: a named
+    routeless embed is the most specific thing we can say (`embed_shell` — the numbers
+    exist and we have no route to them), the JS-wall floor keeps its own much lower
+    threshold and its position in the middle so the chrome floor cannot swallow that
+    population, and `thin_page` is everything else under the floor.
+    """
+    if unreadable_embeds:
+        # Datawrapper is exempt from the embed scan (it has the Tier-2 hop), so a
+        # walled tracker still comes back `js_wall` below and still hops.
+        return "no_resolving_content", "embed_shell"
+    if extracted is None or looks_like_js_wall(extracted):
+        # An empty extraction on a 200 OK is a JS-wall (SPA that rendered client-side,
+        # cookie/consent gate, etc.) — exactly the Tier-2 candidate signal. Treated
+        # identically to short-but-nonempty extractions.
+        return "js_wall", None
+    return "no_resolving_content", "thin_page"
+
+
+async def _meta_refresh_hop(
+    html_text: str,
+    current_url: str,
+    ctx: FetchContext,
+    *,
+    from_status: FetchStatus,
+    http_status: int,
+    content_type: str,
+) -> FetchResult | str | None:
+    """Follow a ``<meta http-equiv="refresh">`` stub, or None when there is nothing to follow.
+
+    A hop rather than a terminal result on purpose: the target re-enters the same
+    classification path (chrome floor, JS-wall floor, chart rung, PDF read) and consumes
+    one of ``MAX_REDIRECTS``, so a refresh chain is bounded exactly like a 3xx chain and
+    the meta-refresh check itself works on a body only a later hop could obtain.
+
+    Only reached with no readable content, which is what keeps it off the pages that
+    already worked: a real page that ALSO carries a refresh tag (some CMSs emit one for
+    a canonical URL) is served as-is rather than re-fetched.
+    """
+    target = meta_refresh_target(html_text)
+    if target is None:
+        return None
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the meta-refresh hop for %s — %.1fs of wall budget left",
+            urlparse(current_url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("meta_refresh", from_status, current_url, "wall_budget")
+        return None
+    ctx.start_rung("meta_refresh", from_status, current_url)
+    logger.info(
+        f"resolution_source meta_refresh: {urlparse(current_url).netloc} -> {target} (direct read was {from_status})"
+    )
+    return await _vetted_hop_target(
+        target, current_url, http_status=http_status, content_type=content_type, kind="meta_refresh"
+    )
+
+
+async def _resolution_html_outcome(
+    resp: Any, current_url: str, content_type: str, ctx: FetchContext
+) -> FetchResult | str:
     """Trafilatura extraction plus the inline-chart rung and the chrome / JS-wall checks.
 
     Order of the three verdicts, and why:
@@ -674,6 +888,10 @@ async def _resolution_html_outcome(resp: Any, current_url: str, content_type: st
        including a JS-walled one, where the config in the raw HTML is precisely the
        data the wall was hiding. That is the one place the `js_wall` outcome moves,
        and it moves only when we actually recovered the numbers.
+    4. Only once there is no content anywhere does the meta-refresh rung look for a
+       redirect no HTTP status announced. It returns the target as the next hop, so
+       this function's return type is ``FetchResult | str`` exactly like the redirect
+       dispatcher's.
     """
     status = resp.status
     netloc = urlparse(current_url).netloc
@@ -698,10 +916,10 @@ async def _resolution_html_outcome(resp: Any, current_url: str, content_type: st
     # still findable; the page's main text is trafilatura's to
     # decode, which is why no vacuity check runs on this branch
     # (a thin extraction is classified below instead).
-    html_text = decode_text_body(body, content_type)[0]
+    html_text, undecodable_ratio = decode_text_body(body, content_type)
     charts = extract_datawrapper_charts(html_text)
     unreadable_embeds = unreadable_data_embed_providers(html_text)
-    extracted = await asyncio.to_thread(_extract_main_text, body, current_url)
+    extracted = await asyncio.to_thread(_extract_page_text, html_text, body, current_url, undecodable_ratio)
     # In a thread for the same reason the extraction is: it is sync CPU work (one
     # regex sweep plus a `json.loads` per config) over a body up to the 5 MiB
     # response cap, and blocking the loop here would stall every sibling fetch.
@@ -712,43 +930,26 @@ async def _resolution_html_outcome(resp: Any, current_url: str, content_type: st
     if looks_like_page_chrome(extracted or "") and not chart_block:
         # No content anywhere. Which of the three withholds applies is a disclosure
         # question, not a routing one — all three retain the result as the Tier-2
-        # escalation seam and none of them render.
-        if unreadable_embeds:
-            # More specific than the others: a page whose numbers sit in a routeless
-            # embed tells us WHERE the content is. Datawrapper is exempt from the
-            # embed scan (it has the Tier-2 hop), so a walled tracker still comes
-            # back `js_wall` below and still hops.
-            return FetchResult(
-                url=current_url,
-                status="no_resolving_content",
-                text="",
-                http_status=status,
-                content_type=content_type or None,
-                status_reason="embed_shell",
-                datawrapper_charts=charts,
-                unreadable_embeds=unreadable_embeds,
-            )
-        # An empty extraction on a 200 OK is a JS-wall (SPA that rendered
-        # client-side, cookie/consent gate, etc.) — exactly the Tier-2 candidate
-        # signal. Treat identically to short-but-nonempty extractions. A walled page
-        # still exposes its embeds, so the charts ride along.
-        if extracted is None or looks_like_js_wall(extracted):
-            return FetchResult(
-                url=current_url,
-                status="js_wall",
-                text="",
-                http_status=status,
-                content_type=content_type or None,
-                datawrapper_charts=charts,
-                unreadable_embeds=unreadable_embeds,
-            )
+        # escalation seam and none of them render. A walled page still exposes its
+        # embeds, so the charts ride along on every one of them.
+        verdict, reason = _no_content_verdict(extracted, unreadable_embeds)
+        hop = await _meta_refresh_hop(
+            html_text,
+            current_url,
+            ctx,
+            from_status=verdict,
+            http_status=status,
+            content_type=content_type,
+        )
+        if hop is not None:
+            return hop
         return FetchResult(
             url=current_url,
-            status="no_resolving_content",
+            status=verdict,
             text="",
             http_status=status,
             content_type=content_type or None,
-            status_reason="thin_page",
+            status_reason=reason,
             datawrapper_charts=charts,
             unreadable_embeds=unreadable_embeds,
         )
@@ -814,8 +1015,129 @@ async def _resolution_text_outcome(resp: Any, current_url: str, content_type: st
     )
 
 
-async def _resolution_response_outcome(resp: Any, current_url: str) -> FetchResult | str:
-    """Classify one response: a terminal FetchResult, or the next URL on a vetted 3xx."""
+def _pdf_unreadable_reason(pdf: PdfText) -> FetchStatusReason:
+    """Why a document we read the bytes of yielded no text.
+
+    ``encrypted`` / ``malformed`` come from the parse; ``no_text_layer`` is a document
+    that parsed fine and carries images instead of text, which is the ONE shape a paid
+    document read could still rescue.
+    """
+    if pdf.unreadable_reason == "encrypted":
+        return "encrypted"
+    if pdf.unreadable_reason == "malformed":
+        return "malformed"
+    return "no_text_layer"
+
+
+async def _resolution_pdf_outcome(
+    resp: Any, current_url: str, content_type: str, ctx: FetchContext, *, from_status: FetchStatus
+) -> FetchResult:
+    """Read a PDF we are already holding, locally, and render the query-relevant passages.
+
+    Free and deterministic: pypdf plus BM25 passage selection (``research/document_text``),
+    no model call and no second request. Before this rung a cited PDF was the one
+    resolution source we dropped unread — measured at 833,450 chars in 5.3 s out of the
+    6.7 MB 220-page document behind the constants, with the passage the reader wanted in
+    it, while the paid alternative returned nothing for the same file.
+
+    Byte cap depends on whether the server DECLARED a PDF. A declared one gets
+    ``DOCUMENT_TEXT_PDF_MAX_BYTES``, not the 5 MiB response cap the text branches use,
+    because the receipt file is 6.7 MB and the general cap would refuse exactly the
+    document that motivated the rung. An UNDECLARED body — the sniffed case — keeps the
+    5 MiB cap: it is far more likely to be an image or an archive than a document, and
+    buffering 40 MiB of it per URL across every concurrent question is a memory cost
+    with nothing on the other side. An undeclared PDF above 5 MiB is therefore still
+    lost, which is a deliberate trade rather than an oversight.
+
+    Self-bounding twice over. The parse is skipped outright below
+    ``RESOLUTION_SOURCE_PDF_MIN_BUDGET_S`` of remaining wall (the bytes are still read —
+    that already happened — but the CPU is not spent), and ``max_seconds`` is the
+    remaining budget capped at ``DOCUMENT_TEXT_MAX_SECONDS``, so a 900-page document
+    comes back partial-and-labelled rather than taking the outer wall down with every
+    sibling page that already succeeded.
+    """
+    status = resp.status
+    netloc = urlparse(current_url).netloc
+    declared_pdf = any(ct in content_type for ct in _PDF_CONTENT_TYPES)
+    body = await read_body_capped(
+        resp,
+        max_bytes=DOCUMENT_TEXT_PDF_MAX_BYTES if declared_pdf else RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+        label=f"resolution_source pdf {netloc}",
+    )
+    if body is None:
+        return FetchResult(
+            url=current_url,
+            status="error",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    if not is_pdf_body(body):
+        # Declared a PDF and is not one (or carried no content type and is not one):
+        # unchanged behaviour, minus the assumption that the label was right.
+        logger.info(f"resolution_source {netloc}: body is not a document we can read, ct={content_type!r}")
+        return FetchResult(
+            url=current_url,
+            status="unsupported_type",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left",
+            netloc,
+            budget_s,
+        )
+        ctx.skip_rung("pdf_local", from_status, current_url, "wall_budget")
+        return FetchResult(
+            url=current_url,
+            status="unsupported_type",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+        )
+    attempt = ctx.start_rung("pdf_local", from_status, current_url)
+    # CPU-bound (pypdf decodes every content stream), so never inline on the loop.
+    pdf = await asyncio.to_thread(
+        extract_pdf_text,
+        body,
+        max_pages=DOCUMENT_TEXT_MAX_PAGES,
+        max_seconds=min(DOCUMENT_TEXT_MAX_SECONDS, budget_s),
+    )
+    attempt.wall_s = max(0.0, time.monotonic() - attempt.started_at)
+    if not has_text_layer(pdf):
+        reason = _pdf_unreadable_reason(pdf)
+        logger.warning(
+            f"resolution_source {netloc}: PDF carried no readable text ({reason}, "
+            f"{pdf.page_count} pages, {pdf.pages_read} read)"
+        )
+        return FetchResult(
+            url=current_url,
+            status="unreadable_document",
+            text="",
+            http_status=status,
+            content_type=content_type or None,
+            status_reason=reason,
+        )
+    return FetchResult(
+        url=current_url,
+        status="success",
+        text=render_document_digest(
+            pdf,
+            query=ctx.query,
+            top_k=DOCUMENT_DIGEST_TOP_K,
+            max_chars=RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+            source_url=current_url,
+        ),
+        http_status=status,
+        content_type=content_type or None,
+    )
+
+
+async def _resolution_response_outcome(resp: Any, current_url: str, ctx: FetchContext) -> FetchResult | str:
+    """Classify one response: a terminal FetchResult, or the next URL on a vetted hop."""
     status = resp.status
     content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
 
@@ -829,34 +1151,30 @@ async def _resolution_response_outcome(resp: Any, current_url: str) -> FetchResu
 
     # 200 OK: route on content type.
     if any(ct in content_type for ct in _HTML_CONTENT_TYPES):
-        return await _resolution_html_outcome(resp, current_url, content_type)
+        return await _resolution_html_outcome(resp, current_url, content_type, ctx)
     if any(ct in content_type for ct in _JSON_CONTENT_TYPES) or any(
         ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES
     ):
         return await _resolution_text_outcome(resp, current_url, content_type)
 
-    # Anything else — PDF, images, etc. Do NOT read the body.
-    # INTENDED limitation: a 200 OK with a missing/empty Content-Type header
-    # also lands here (ct='') and is dropped unread. Real resolution sources
-    # send Content-Type; content-sniffing would re-open the don't-read-unknown-
-    # bodies posture for a case that mostly can't happen. The per-URL
-    # FetchStatus is the Tier-2 seam if logs ever show `unsupported_type ct=''`.
-    logger.info(f"resolution_source {urlparse(current_url).netloc}: unread body, ct={content_type!r}")
-    return FetchResult(
-        url=current_url,
-        status="unsupported_type",
-        text="",
-        http_status=status,
-        content_type=content_type or None,
-    )
+    # Everything else routes through the PDF rung, which reads the body and checks the
+    # `%PDF-` magic before deciding anything. That covers a declared `application/pdf`
+    # and the sniffed case: a missing/empty Content-Type header (ct=''), or a document
+    # served as `application/octet-stream`, which is how several government hosts ship
+    # theirs. A body that is not a PDF comes back `unsupported_type` exactly as before —
+    # so the cost of sniffing is one capped read, and the benefit is that a cited PDF is
+    # no longer dropped unread on the strength of a header we cannot rely on.
+    return await _resolution_pdf_outcome(resp, current_url, content_type, ctx, from_status="unsupported_type")
 
 
-async def _fetch_one_hop(session: Any, current_url: str, host_sems: dict[str, asyncio.Semaphore]) -> FetchResult | str:
+async def _fetch_one_hop(
+    session: Any, current_url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | str:
     """ONE GET against ``current_url`` under its host semaphore: terminal result or next URL."""
     async with _sem_for_host(host_sems, current_url):
         try:
             async with session.get(current_url, allow_redirects=False) as resp:
-                return await _resolution_response_outcome(resp, current_url)
+                return await _resolution_response_outcome(resp, current_url, ctx)
         except (TimeoutError, aiohttp.ClientError) as e:
             logger.info(f"resolution_source fetch error for {current_url}: {type(e).__name__}: {e}")
             return FetchResult(
@@ -868,15 +1186,24 @@ async def _fetch_one_hop(session: Any, current_url: str, host_sems: dict[str, as
             )
 
 
-async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaphore]) -> FetchResult:
+async def _fetch_one(
+    session: Any, url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext | None = None
+) -> FetchResult:
     """Fetch a single URL, holding the per-host politeness semaphore hop by hop.
 
     Content-type routing:
-      * HTML → trafilatura extraction (via to_thread) + JS-wall check.
+      * HTML → ARIA-table rewrite + trafilatura extraction (via to_thread), the
+        inline-chart rung, then the chrome / JS-wall checks and the meta-refresh hop.
       * JSON → capped raw body, no pretty-print (the data IS the content).
       * text/plain, text/csv → capped raw body.
-      * anything else (PDF/binary) — including a missing/empty Content-Type
-        header, by design — → ``unsupported_type``, body NOT read.
+      * anything else, including a missing/empty Content-Type header → capped read,
+        then the ``%PDF-`` magic check: a document is read locally and rendered as a
+        query-relevant digest, and anything else is ``unsupported_type`` as before.
+
+    ``ctx`` carries the question text the PDF digest ranks passages against, the
+    wall-clock origin each rung bounds itself with, and the rung attempts stamped onto
+    the returned result. It defaults to a fresh one so the fetch surface can still be
+    driven with three arguments, which is what every existing caller and test does.
 
     Politeness: each hop acquires the semaphore for THAT hop's host around its
     single GET (+ body read on terminal responses) and releases it before
@@ -888,14 +1215,16 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
 
     SSRF guard: rejects non-public URLs (private / loopback / link-local IPs,
     userinfo tricks, non-http(s) schemes) BEFORE any network I/O and again on
-    every redirect Location. The connect-time :class:`FilteringResolver` (see
-    :func:`_get_session`) provides the actual DNS-rebinding boundary; these
-    preflight checks are fast-fail observability so we surface
-    ``ssrf_blocked`` without opening a session. Redirects are followed in-band
-    with a hard ``MAX_REDIRECTS`` cap.
+    every hop target, whether it came from a ``Location`` header or a meta-refresh
+    tag (:func:`_vetted_hop_target` is the one place both are checked). The
+    connect-time :class:`FilteringResolver` (see :func:`_get_session`) provides the
+    actual DNS-rebinding boundary; these preflight checks are fast-fail
+    observability so we surface ``ssrf_blocked`` without opening a session. Hops of
+    both shapes are followed in-band and share the one ``MAX_REDIRECTS`` cap.
 
     No retries (Tier 1 anti-goal). Any aiohttp/asyncio error becomes ``error``.
     """
+    ctx = FetchContext() if ctx is None else ctx
     # Guard the initial URL before any network I/O.
     if not await is_public_http_url(url):
         logger.warning(f"resolution_source ssrf_blocked (initial url): {urlparse(url).netloc}")
@@ -910,24 +1239,27 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
     current_url = url
     # Bounded redirect loop. Each iteration issues ONE GET with
     # allow_redirects=False under the current hop's host semaphore; a redirect
-    # status resolves the Location, re-guards, and loops (each hop releases its
-    # semaphore before the next acquires its own — no nesting, so no
-    # self-deadlock on revisited hosts).
+    # status (or a meta-refresh stub) resolves the next URL, re-guards, and loops
+    # (each hop releases its semaphore before the next acquires its own — no
+    # nesting, so no self-deadlock on revisited hosts).
     # Non-redirect responses fall through to the content-type routing below.
     for _hop in range(MAX_REDIRECTS + 1):
-        outcome = await _fetch_one_hop(session, current_url, host_sems)
+        outcome = await _fetch_one_hop(session, current_url, host_sems, ctx)
         if isinstance(outcome, FetchResult):
-            return outcome
+            return _stamped_with_route(outcome, ctx)
         current_url = outcome
 
     # Fell out of the loop -> exceeded MAX_REDIRECTS.
     logger.info(f"resolution_source redirect chain exceeded {MAX_REDIRECTS} hops (final={current_url})")
-    return FetchResult(
-        url=current_url,
-        status="error",
-        text="",
-        http_status=None,
-        content_type=None,
+    return _stamped_with_route(
+        FetchResult(
+            url=current_url,
+            status="error",
+            text="",
+            http_status=None,
+            content_type=None,
+        ),
+        ctx,
     )
 
 
@@ -1185,17 +1517,25 @@ def _interleave_dataset_results(
     return merged
 
 
-async def fetch_resolution_sources(urls: list[str]) -> list[FetchResult]:
+async def fetch_resolution_sources(urls: list[str], *, query: str = "") -> list[FetchResult]:
     """Fetch each URL under per-netloc Semaphore(1) politeness, then hop to
     the live datasets of any Datawrapper charts the fetched pages embed.
 
+    ``query`` is the question's title plus resolution criteria. It never touches the
+    network; its one job is ranking which passages of a cited PDF a forecaster sees.
+    Empty is legitimate (a caller with no question text in hand) and simply means a
+    document renders its header and outline with no passages.
+
     Distinct hosts run concurrently up to the connector limit; same-host
     requests serialize (politeness — e.g. StatCan asks Crawl-delay: 2). The
-    shared ``host_sems`` map is handed to every ``_fetch_one`` task so each
-    redirect hop contends on ITS host's semaphore — chains from different
-    initial hosts that converge on one final host still serialize there; the
-    Tier-2 dataset fetches contend on the dwcdn host's semaphore the same
-    way. Session is closed in ``finally``.
+    host-semaphore map is now the PROCESS-WIDE one
+    (:func:`http_fetch.host_semaphores`, scoped to the running loop) rather than a
+    fresh dict per call: with one map per call, six questions fetching the same host
+    concurrently each held their own semaphore and hit it six times at once. Every
+    ``_fetch_one`` task shares it, so each hop contends on ITS host's semaphore —
+    chains from different initial hosts that converge on one final host still
+    serialize there; the Tier-2 dataset fetches contend on the dwcdn host's semaphore
+    the same way. Session is closed in ``finally``.
 
     Teardown race guard (F5): the outer factory wraps this call in
     ``asyncio.wait_for``. When the wall-clock timeout fires, wait_for cancels
@@ -1207,14 +1547,19 @@ async def fetch_resolution_sources(urls: list[str]) -> list[FetchResult]:
     — pages and datasets alike — so we can cancel + drain them in a
     ``finally`` before the session closes.
     """
-    host_sems: dict[str, asyncio.Semaphore] = {}
+    host_sems = host_semaphores()
     tasks: list[asyncio.Task[FetchResult]] = []
     started = time.monotonic()
 
     session_cm = _get_session()
     async with session_cm as session:
         try:
-            page_tasks = [asyncio.create_task(_fetch_one(session, u, host_sems)) for u in urls]
+            # One context per URL: the rung attempts belong to that URL's result, while
+            # the query and the wall-clock origin are the same for all of them.
+            page_tasks = [
+                asyncio.create_task(_fetch_one(session, u, host_sems, FetchContext(query=query, started=started)))
+                for u in urls
+            ]
             tasks.extend(page_tasks)
             page_results = list(await asyncio.gather(*page_tasks, return_exceptions=False))
 
@@ -1307,19 +1652,67 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     the page's raw HTML, which is what makes an unreadable-embed page queryable even
     when its prose made it a success.
 
-    ``reason`` is appended only where the status alone is ambiguous — today that is
-    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page``. Appended rather than
-    always emitted so every line the archive already holds stays byte-identical and
-    the field's absence keeps meaning "no reason applies", not "old record".
+    ``reason`` is appended only where the status alone is ambiguous —
+    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page``, and
+    ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs ``malformed``.
+    ``route`` is appended only when a ladder rung produced the outcome. Both are
+    appended rather than always emitted so every line the archive already holds stays
+    byte-identical and an absent field keeps meaning "this does not apply", not "old
+    record"; both sit at the tail in the order the marker spec's optional groups do.
+
+    Each rung that FIRED also gets one ``RESOLUTION_SOURCE_ESCALATION`` line. The
+    fetch line above carries only the final outcome, so on its own it cannot say
+    whether a rung rescued the page or what the attempt cost — and ``wall_s`` is what
+    decides whether a rung earns its latency under a close-derived time budget. The
+    ``url`` on an escalation line is the URL the rung was invoked ON, which for a
+    meta-refresh hop is the stub rather than the target the fetch line names.
     """
     for r in results:
         reason = f" reason={r.status_reason}" if r.status_reason else ""
+        route = f" route={r.route}" if r.route != "direct" else ""
         logger.info(
             f"RESOLUTION_SOURCE_FETCH: question={qid} url={r.url} status={fetch_outcome_token(r)} "
             f"http={r.http_status if r.http_status is not None else 'n/a'} "
             f"embeds={','.join(r.unreadable_embeds) if r.unreadable_embeds else 'none'}"
-            f"{reason}"
+            f"{reason}{route}"
         )
+        for attempt in r.rung_attempts:
+            if attempt.skipped_reason:
+                continue
+            logger.info(
+                f"RESOLUTION_SOURCE_ESCALATION: question={qid} url={attempt.url} "
+                f"from_status={attempt.from_status} rung={attempt.rung} outcome={r.status} "
+                f"wall_s={attempt.wall_s if attempt.wall_s is not None else 0.0:.2f}"
+            )
+
+
+def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
+    """Per-rung attempt counts for ``details["counts"]``.
+
+    Zeroes are kept: they render nothing in the diagnostics line but survive into the
+    archive, which is what makes "the rung existed and never fired" distinguishable
+    from "this record predates the rung".
+    """
+    attempts = [attempt for r in results for attempt in r.rung_attempts]
+    fired = [attempt for attempt in attempts if not attempt.skipped_reason]
+    return {
+        "meta_refresh_hops": sum(1 for attempt in fired if attempt.rung == "meta_refresh"),
+        "pdf_documents_read": sum(1 for attempt in fired if attempt.rung == "pdf_local"),
+        "rung_budget_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wall_budget"),
+    }
+
+
+def _document_query(question: MetaculusQuestion) -> str:
+    """The text a cited document's passages are ranked against.
+
+    Title plus resolution criteria, because those are the two fields that say what the
+    question is graded on — and the ranking is BM25 over the document, so the criteria's
+    own vocabulary ("laboratory-confirmed cases", "final revised estimate") is exactly
+    what should pull the right paragraph out of a 220-page report. Fine print is left
+    out: it is mostly procedural boilerplate about ambiguity and annulment, which would
+    dilute the term set with words no relevant passage contains.
+    """
+    return f"{question.question_text or ''} {question.resolution_criteria or ''}".strip()
 
 
 def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallable:
@@ -1350,7 +1743,7 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
 
         try:
             results = await asyncio.wait_for(
-                fetch_resolution_sources(urls),
+                fetch_resolution_sources(urls, query=_document_query(question)),
                 timeout=RESOLUTION_SOURCE_WALL_TIMEOUT,
             )
         except TimeoutError:
@@ -1376,7 +1769,11 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
         # Per-URL outcome map for the diagnostics block: even when the provider
         # returns a non-empty notice (all URLs failed → status `ok`), this surfaces
         # WHICH sources were lost so the block doesn't read as fully healthy.
-        record_provider_detail(qid, "resolution_source", {"sources": _fetch_result_sources(results)})
+        record_provider_detail(
+            qid,
+            "resolution_source",
+            {"sources": _fetch_result_sources(results), "counts": _rung_counts(results)},
+        )
         return format_resolution_sections(results, datetime.now(UTC))
 
     return _fetch

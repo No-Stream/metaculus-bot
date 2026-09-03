@@ -14,7 +14,7 @@ from typing import Any
 
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import FilteringResolver
-from metaculus_bot.research.provider_diagnostics import pop_provider_detail
+from metaculus_bot.research.provider_diagnostics import _counts_suffix, pop_provider_detail
 from metaculus_bot.research.resolution_source import (
     FetchResult,
     _fetch_one,
@@ -115,7 +115,14 @@ class TestResolutionSourceProvider:
         q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading.")
         await resolution_source_provider(is_benchmarking=False)(q)
 
-        assert pop_provider_detail(q.id_of_question, "resolution_source")["sources"] == {"www.bls.gov": "ok"}
+        detail = pop_provider_detail(q.id_of_question, "resolution_source")
+        assert detail["sources"] == {"www.bls.gov": "ok"}
+        # Every rung count is zero and STAYS in the detail: a zero renders nothing in the
+        # diagnostics line (so a healthy provider's line is byte-identical to what it was
+        # before the ladder existed) while the archive keeps it, which is what makes "the
+        # rung ran and never fired" distinguishable from "this record predates the rung".
+        assert detail["counts"] == {"meta_refresh_hops": 0, "pdf_documents_read": 0, "rung_budget_skips": 0}
+        assert _counts_suffix(detail) == ""
 
     def test_duplicate_domains_keep_both_outcomes(self):
         """Two URLs on the SAME domain are common (a stats site's index + data page).

@@ -12,7 +12,22 @@ from __future__ import annotations
 import pytest
 
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.http_fetch import reset_host_semaphores
 from tests.resolution_source_fakes import _INFOGRAM_EMBED_MARKUP, _embed_shell_page
+
+
+@pytest.fixture(autouse=True)
+def _reset_host_gate():
+    """Drop the process-global per-host semaphore map around every test.
+
+    The map deliberately outlives one provider call (that is what makes politeness hold
+    across concurrent questions), so without this a semaphore one test left contended
+    would gate another, and a serialization assertion would pass or fail on test order.
+    It self-heals across event loops too, but resetting is cheap and states the intent.
+    """
+    reset_host_semaphores()
+    yield
+    reset_host_semaphores()
 
 
 @pytest.fixture(autouse=True)
