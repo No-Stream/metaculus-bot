@@ -1634,7 +1634,12 @@ them OUT of feature work, land as their own PRs.
   the `tests/ablation/` precedent. Same 147 tests, none rewritten. The Tier-2 Datawrapper suite MOVED
   into that package too (`tests/resolution_source/test_resolution_source_datawrapper.py`), dropping its
   own copy of the autouse DNS stub, its own question builder and a twice-inlined Infogram embed literal
-  in favour of the conftest's and the fakes module's; same collected count. Everything
+  in favour of the conftest's and the fakes module's; same collected count. **`tests/test_prompts.py` is
+  also SPLIT** (2026-09-02 forge R11, at 2,192 lines): its three surfaces are now
+  `tests/prompts/test_base_prompt_rules.py`, `test_structured_block.py` and
+  `test_research_clauses.py`, with the question stubs and prompt renderers in
+  `tests/prompt_builders.py`. Same 166 tests, none rewritten, and the package needs no `conftest.py`
+  because nothing in it wants a fixture. Everything
   else on this list grew again: `tests/test_telemetry_markers.py` **2,428**,
   `tests/test_agentic_tools.py` **2,235**, `prompts.py` **1,805**, `resolution_source.py` **1,382**,
   `research/financial_data.py` **1,033** (down, after `currency_pegs.py` and `fred_rendering.py`
