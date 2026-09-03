@@ -1517,15 +1517,16 @@ class TestConjunctiveCriteriaPricing:
         """Three rules used to say how the final number may differ from a computed one and
         none said WHICH computation anchors when a Step-2 base rate and a 5b clause product
         both exist. One sentence where the product is computed now says: the product, because
-        it is the more specific computation; the three valid moves are the ways to leave it."""
+        it is more specific than the step-2 base rate, which is the comparand a bare "more
+        specific" left the model to infer; the three valid moves are the ways to leave it."""
         prompt = binary_prompt(_binary_q(), research="r")
         lowered = " ".join(prompt.lower().split())
         assert 'this product is the number the "anchor on your math" check in step 6 anchors to' in lowered
-        assert "because it is the more specific computation" in lowered
+        assert "because it is more specific than the step-2 base rate" in lowered
         # The anchor bullet names the product among the computations it covers.
         assert "clause product" in lowered
         # And the sentence sits in 5b, before the reconciliation bullet.
-        assert prompt.index("more specific computation") < prompt.index("exactly three valid moves")
+        assert prompt.index("more specific than the step-2 base rate") < prompt.index("exactly three valid moves")
 
 
 class TestTemplateStatesEachCheckOnce:
