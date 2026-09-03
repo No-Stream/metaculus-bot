@@ -20,7 +20,7 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import resolution_chart_data, resolution_source
-from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore
+from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore, semaphore_for_host
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_chart_data import CHART_DATA_LEAD, render_inline_chart_data
 from metaculus_bot.research.resolution_source import (
@@ -1415,6 +1415,35 @@ class TestPdfParseGate:
 
     def _session(self, url: str) -> FakeSession:
         return FakeSession({url: FakeResponse(200, body=build_text_pdf(self._PAGES), content_type="application/pdf")})
+
+    async def test_the_host_gate_is_released_before_the_parse_runs(self, monkeypatch):
+        """The per-host gate is loop-wide, so a parse held inside it blocks every other
+        concurrent question's fetch of that host for the whole parse — and this population
+        is a handful of government hosts, so same-host collisions are the expected case."""
+        url = "https://cdc.example.com/report.pdf"
+        sems = host_semaphores()
+        # Get-or-create up front: the stub reads `.locked()` off this object rather than
+        # looking the map up, because it runs in the parse's worker thread where there is
+        # no running loop — which is itself the point of the split.
+        host_gate = semaphore_for_host(url, sems)
+        locked_during_parse = None
+        real_extract = resolution_source.extract_pdf_text
+
+        def observing_extract(body: bytes, **kwargs):
+            nonlocal locked_during_parse
+            locked_during_parse = host_gate.locked()
+            return real_extract(body, **kwargs)
+
+        monkeypatch.setattr(resolution_source, "extract_pdf_text", observing_extract)
+
+        result = await _fetch_one(self._session(url), url, sems, FetchContext(query="hospitalizations"))
+
+        assert locked_during_parse is False, "the parse ran while the host was still gated"
+        # The rung's own telemetry is unchanged by moving where the parse happens.
+        assert result.status == "success"
+        assert result.route == "pdf_local"
+        assert [(a.rung, a.from_status) for a in result.rung_attempts] == [("pdf_local", "unsupported_type")]
+        assert result.rung_attempts[0].wall_s is not None
 
     async def test_no_more_than_two_documents_parse_at_once(self, monkeypatch):
         in_flight = 0

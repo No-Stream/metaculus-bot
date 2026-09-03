@@ -134,11 +134,12 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.research.document_text import (
+    DocumentDigest,
     PdfText,
+    digest_pdf,
     extract_pdf_text,
     has_text_layer,
     is_pdf_body,
-    render_document_digest,
 )
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
@@ -1045,9 +1046,56 @@ def _pdf_unreadable_reason(pdf: PdfText) -> FetchStatusReason:
     return "no_text_layer"
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingDocument:
+    """A PDF whose bytes we hold and whose parse has not started yet.
+
+    Exists so the parse happens OUTSIDE the per-host politeness semaphore. That map is
+    loop-wide, so a 20 s parse held inside it blocked every other concurrent question's
+    fetch of any URL on that host — and this population is concentrated on a handful of
+    government hosts, so same-host collisions across questions in one round are the
+    expected case. Two questions queued behind one parse of a shared host exhaust their own
+    ``RESOLUTION_SOURCE_WALL_TIMEOUT``, and the outer ``wait_for`` then discards every page
+    they had already fetched.
+    """
+
+    url: str
+    body: bytes
+    http_status: int
+    content_type: str
+    from_status: FetchStatus
+
+
+def _parse_and_digest(
+    body: bytes, *, max_seconds: float, query: str, source_url: str
+) -> tuple[PdfText, DocumentDigest | None]:
+    """pypdf parse plus BM25 passage selection: both CPU-bound, so ONE thread hop, never two.
+
+    The digest is as CPU-bound as the parse and was running inline on the loop two lines
+    below a call carefully threaded for exactly that reason: ``select_passages`` tokenises
+    every window of the joined document and holds a ``Counter`` per window alive at once,
+    measured at 96-235 ms per 400-page document and additive across the six concurrent
+    questions — a stall that lands inside the 2 s ``RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S``
+    and delays every sibling provider's I/O, not just this fetch.
+
+    ``None`` for the digest means the document carried no text layer, which the caller
+    reports rather than digests.
+    """
+    pdf = extract_pdf_text(body, max_pages=DOCUMENT_TEXT_MAX_PAGES, max_seconds=max_seconds)
+    if not has_text_layer(pdf):
+        return pdf, None
+    return pdf, digest_pdf(
+        pdf,
+        query=query,
+        top_k=DOCUMENT_DIGEST_TOP_K,
+        max_chars=RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+        source_url=source_url,
+    )
+
+
 async def _resolution_pdf_outcome(
     resp: Any, current_url: str, content_type: str, ctx: FetchContext, *, from_status: FetchStatus
-) -> FetchResult:
+) -> FetchResult | _PendingDocument:
     """Read a PDF we are already holding, locally, and render the query-relevant passages.
 
     Free and deterministic: pypdf plus BM25 passage selection (``research/document_text``),
@@ -1072,15 +1120,10 @@ async def _resolution_pdf_outcome(
     comes back partial-and-labelled rather than taking the outer wall down with every
     sibling page that already succeeded.
 
-    The parse itself contends for :func:`http_fetch.pdf_parse_semaphore`, the loop-wide
-    2-slot gate this route shares with the gap-fill v2 local-document ladder — the bound
-    has to hold across the two routes, not inside each, because a Tier-1 fan-out alone is
-    up to ``RESOLUTION_SOURCE_MAX_URLS`` documents per question across
-    ``DEFAULT_MAX_CONCURRENT_RESEARCH`` questions. The wait is bounded by the remaining
-    budget less the floor and degrades to the same leave-it-unread skip, since queueing
-    until the outer wall fires would discard every sibling page that already succeeded.
-    Only the parse is gated; the body read is not, because the response is already open
-    and holding it there is what the gate exists to avoid.
+    This half runs INSIDE the response context, so it does only what needs the open
+    response: the capped read, the ``%PDF-`` check and the budget-floor skip. A real
+    document comes back as a :class:`_PendingDocument` and :func:`_finish_document` parses
+    it once the host semaphore has been released.
     """
     status = resp.status
     netloc = urlparse(current_url).netloc
@@ -1109,22 +1152,50 @@ async def _resolution_pdf_outcome(
             http_status=status,
             content_type=content_type or None,
         )
+    pending = _PendingDocument(
+        url=current_url,
+        body=body,
+        http_status=status,
+        content_type=content_type,
+        from_status=from_status,
+    )
     budget_s = ctx.rung_budget_s()
     if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
+        # Checked here, before the response context closes, so a question with no budget
+        # left never even queues for a parse slot it would have to give back.
         logger.warning(
             "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left",
             netloc,
             budget_s,
         )
         ctx.skip_rung("pdf_local", from_status, current_url, "wall_budget")
-        return FetchResult(
-            url=current_url,
-            status="unsupported_type",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-        )
+        return _document_not_parsed(pending)
+    return pending
+
+
+async def _finish_document(pending: _PendingDocument, ctx: FetchContext) -> FetchResult:
+    """Parse a held PDF and render its digest, with no host semaphore and no response held.
+
+    Runs after :func:`_fetch_one_hop` has left both the ``session.get`` context and the
+    per-host gate, which is the whole point: the parse is up to
+    ``min(DOCUMENT_TEXT_MAX_SECONDS, budget)`` of CPU, and holding a loop-wide
+    ``Semaphore(1)`` for a host through it stalls every other concurrent question's fetch of
+    that host (see :class:`_PendingDocument`).
+
+    The parse contends instead for :func:`http_fetch.pdf_parse_semaphore`, the loop-wide
+    2-slot gate this route shares with the gap-fill v2 local-document ladder — the bound has
+    to hold across the two routes, not inside each, because a Tier-1 fan-out alone is up to
+    ``RESOLUTION_SOURCE_MAX_URLS`` documents per question across
+    ``DEFAULT_MAX_CONCURRENT_RESEARCH`` questions. The wait is bounded by the remaining
+    budget less the floor and degrades to the same leave-it-unread skip, since queueing until
+    the outer wall fires would discard every sibling page that already succeeded.
+
+    Never raises: ``extract_pdf_text`` returns a ``PdfText`` carrying ``unreadable_reason``
+    rather than throwing, and the digest is pure.
+    """
+    netloc = urlparse(pending.url).netloc
     gate = pdf_parse_semaphore()
+    budget_s = ctx.rung_budget_s()
     try:
         # Bounded, not a bare acquire: queueing behind two other documents until the outer
         # wall fires would discard every sibling page this question already fetched, which
@@ -1137,14 +1208,8 @@ async def _resolution_pdf_outcome(
             netloc,
             budget_s,
         )
-        ctx.skip_rung("pdf_local", from_status, current_url, "parse_contention")
-        return FetchResult(
-            url=current_url,
-            status="unsupported_type",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-        )
+        ctx.skip_rung("pdf_local", pending.from_status, pending.url, "parse_contention")
+        return _document_not_parsed(pending)
     try:
         # Re-read after the wait: the queue itself consumed budget, and `max_seconds` is
         # wall-clock, so a stale figure would hand pypdf a bound that already expired.
@@ -1155,56 +1220,68 @@ async def _resolution_pdf_outcome(
                 netloc,
                 budget_s,
             )
-            ctx.skip_rung("pdf_local", from_status, current_url, "wall_budget")
-            return FetchResult(
-                url=current_url,
-                status="unsupported_type",
-                text="",
-                http_status=status,
-                content_type=content_type or None,
-            )
-        attempt = ctx.start_rung("pdf_local", from_status, current_url)
-        # CPU-bound (pypdf decodes every content stream), so never inline on the loop.
-        pdf = await asyncio.to_thread(
-            extract_pdf_text,
-            body,
-            max_pages=DOCUMENT_TEXT_MAX_PAGES,
+            ctx.skip_rung("pdf_local", pending.from_status, pending.url, "wall_budget")
+            return _document_not_parsed(pending)
+        attempt = ctx.start_rung("pdf_local", pending.from_status, pending.url)
+        pdf, digest = await asyncio.to_thread(
+            _parse_and_digest,
+            pending.body,
             max_seconds=min(DOCUMENT_TEXT_MAX_SECONDS, budget_s),
+            query=ctx.query,
+            source_url=pending.url,
         )
+        # Stamped inside the gate so wall_s measures the parse this rung actually did, not
+        # the time it spent queueing for a slot.
         attempt.wall_s = max(0.0, time.monotonic() - attempt.started_at)
     finally:
         gate.release()
-    if not has_text_layer(pdf):
+    if digest is None:
         reason = _pdf_unreadable_reason(pdf)
         logger.warning(
             f"resolution_source {netloc}: PDF carried no readable text ({reason}, "
             f"{pdf.page_count} pages, {pdf.pages_read} read)"
         )
         return FetchResult(
-            url=current_url,
+            url=pending.url,
             status="unreadable_document",
             text="",
-            http_status=status,
-            content_type=content_type or None,
+            http_status=pending.http_status,
+            content_type=pending.content_type or None,
             status_reason=reason,
         )
     return FetchResult(
-        url=current_url,
+        url=pending.url,
         status="success",
-        text=render_document_digest(
-            pdf,
-            query=ctx.query,
-            top_k=DOCUMENT_DIGEST_TOP_K,
-            max_chars=RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
-            source_url=current_url,
-        ),
-        http_status=status,
-        content_type=content_type or None,
+        text=digest.block,
+        http_status=pending.http_status,
+        content_type=pending.content_type or None,
     )
 
 
-async def _resolution_response_outcome(resp: Any, current_url: str, ctx: FetchContext) -> FetchResult | str:
-    """Classify one response: a terminal FetchResult, or the next URL on a vetted hop."""
+def _document_not_parsed(pending: _PendingDocument) -> FetchResult:
+    """The result for a document we held and chose not to parse.
+
+    ``unsupported_type`` rather than ``unreadable_document``: nothing read the bytes, so
+    nothing established they carry no text, and only the latter is worth a paid document
+    read later. Which rule declined rides on the rung attempt's ``skipped_reason``.
+    """
+    return FetchResult(
+        url=pending.url,
+        status="unsupported_type",
+        text="",
+        http_status=pending.http_status,
+        content_type=pending.content_type or None,
+    )
+
+
+async def _resolution_response_outcome(
+    resp: Any, current_url: str, ctx: FetchContext
+) -> FetchResult | _PendingDocument | str:
+    """Classify one response: a terminal FetchResult, a held document, or the next hop's URL.
+
+    The :class:`_PendingDocument` case is the PDF branch handing its parse back to the
+    caller to run outside the host semaphore; every other branch is terminal or a hop.
+    """
     status = resp.status
     content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
 
@@ -1252,6 +1329,13 @@ async def _fetch_one_hop(
 
     BOTH ``ClientTimeout`` fields are set because a per-request timeout REPLACES the
     session's wholesale rather than merging with it.
+
+    A cited PDF is the one branch whose work does NOT finish inside the two contexts: it
+    comes back as a :class:`_PendingDocument` and is parsed after both have exited, because
+    that parse is seconds of CPU and the host gate is loop-wide (see
+    :class:`_PendingDocument`). The HTML branch's ``to_thread`` hops still run inside the
+    semaphore — trafilatura on a capped page is short next to the request it follows, and
+    moving it would trade a measured hazard for an unmeasured restructure.
     """
     async with _sem_for_host(host_sems, current_url):
         hop_timeout_s = min(RESOLUTION_SOURCE_HTTP_TIMEOUT, max(ctx.rung_budget_s(), _MIN_HOP_TIMEOUT_S))
@@ -1261,7 +1345,7 @@ async def _fetch_one_hop(
                 allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=hop_timeout_s, sock_read=hop_timeout_s),
             ) as resp:
-                return await _resolution_response_outcome(resp, current_url, ctx)
+                outcome = await _resolution_response_outcome(resp, current_url, ctx)
         except (TimeoutError, aiohttp.ClientError) as e:
             logger.info(f"resolution_source fetch error for {current_url}: {type(e).__name__}: {e}")
             return FetchResult(
@@ -1271,6 +1355,9 @@ async def _fetch_one_hop(
                 http_status=None,
                 content_type=None,
             )
+    if isinstance(outcome, _PendingDocument):
+        return await _finish_document(outcome, ctx)
+    return outcome
 
 
 async def _fetch_one(
@@ -1292,13 +1379,15 @@ async def _fetch_one(
     the returned result. It defaults to a fresh one so the fetch surface can still be
     driven with three arguments, which is what every existing caller and test does.
 
-    Politeness: each hop acquires the semaphore for THAT hop's host around its
-    single GET (+ body read on terminal responses) and releases it before
-    following a redirect. Keying per hop — not on the original URL's host —
-    preserves one-request-per-host when chains from different initial hosts
-    converge on the same final host; the strict per-hop acquire/release
-    pairing means an A→B→A chain never re-acquires a semaphore it still holds
-    (asyncio semaphores are not reentrant).
+    Politeness: each hop acquires the semaphore for THAT hop's host around its single GET,
+    the body read on a terminal response, and the HTML branch's extraction, and releases it
+    before following a redirect. A cited PDF's parse is the one thing deliberately outside
+    the hold — it comes back as a ``_PendingDocument`` and is parsed after the semaphore is
+    released, because the gate is loop-wide and the parse is seconds of CPU. Keying per hop
+    — not on the original URL's host — preserves one-request-per-host when chains from
+    different initial hosts converge on the same final host; the strict per-hop
+    acquire/release pairing means an A→B→A chain never re-acquires a semaphore it still
+    holds (asyncio semaphores are not reentrant).
 
     SSRF guard: rejects non-public URLs (private / loopback / link-local IPs,
     userinfo tricks, non-http(s) schemes) BEFORE any network I/O and again on
