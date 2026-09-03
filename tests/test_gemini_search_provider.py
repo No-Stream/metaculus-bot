@@ -161,7 +161,7 @@ async def test_provider_uses_default_model(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert fake_client.aio.models.generate_content.await_count == 1
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
-    assert call_kwargs["model"] == "gemini-3-flash-preview"
+    assert call_kwargs["model"] == "gemini-3.8-flash"
     # The question_text must actually reach the SDK (guard against broken f-string interpolation).
     assert "Will X happen?" in call_kwargs["contents"]
 
@@ -1366,7 +1366,7 @@ class TestGeminiClientConfigAndUsage:
 
     @pytest.mark.asyncio
     async def test_thinking_level_is_set_explicitly(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Left unset, gemini-3-flash-preview thinks at HIGH, which was most of the bill."""
+        """Left unset, the model picks its own level — HIGH on gemini-3-flash-preview, most of the bill."""
         monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
         from metaculus_bot.constants import GEMINI_SEARCH_THINKING_LEVEL
 

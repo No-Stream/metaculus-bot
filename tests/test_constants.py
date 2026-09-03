@@ -12,6 +12,8 @@ from metaculus_bot.constants import (
     BINARY_STACKING_ENABLED_ENV,
     EXTREME_CALL_HIGH,
     EXTREME_CALL_LOW,
+    GAP_FILL_V2_READER_MODEL,
+    GEMINI_SEARCH_DEFAULT_MODEL,
     MC_PROB_MAX,
     MC_PROB_MIN,
     MC_STACKING_ENABLED_ENV,
@@ -96,6 +98,28 @@ class TestNativeSearchDefaults:
     def test_native_search_timeout_is_360s(self):
         """360s cap leaves ~130s headroom on top of observed p99 (~230s)."""
         assert NATIVE_SEARCH_TIMEOUT == 360
+
+
+class TestGeminiNativeSdkModelDefaults:
+    """Pin both native google-genai model ids to gemini-3.8-flash.
+
+    Verified live on that SDK 2026-09-03 by scripts/probes/gemini_verify.py: grounding
+    chunks came back from the google_search tool, thinking_level was accepted, and
+    url_context retrieved a robots-allowed host. The grounded-search provider and the
+    gap-fill v2 reader deliberately run the SAME id so one verification covers both, and
+    so the shared 5k/month grounded-prompt pool is drawn by one model.
+    """
+
+    def test_grounded_search_default_model_is_gemini_3_8_flash(self):
+        assert GEMINI_SEARCH_DEFAULT_MODEL == "gemini-3.8-flash"
+
+    def test_gap_fill_v2_reader_model_is_gemini_3_8_flash(self):
+        assert GAP_FILL_V2_READER_MODEL == "gemini-3.8-flash"
+
+    def test_both_native_surfaces_run_the_same_id(self):
+        # Trivially true while they match, which is the point: it fails the moment one
+        # surface is flipped to a model the other has not been verified on.
+        assert GEMINI_SEARCH_DEFAULT_MODEL == GAP_FILL_V2_READER_MODEL
 
 
 class TestEnvFlagEnabledDefaultKwarg:

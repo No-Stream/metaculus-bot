@@ -407,8 +407,10 @@ OpenAI/Anthropic models). The `read_document` reader uses the personal
 `search_news` (AskNews) use their own personal keys.
 
 One caveat worth flagging for operators: `GAP_FILL_V2_READER_MODEL`'s default id
-is noted in the constants file as unverified on the native AI Studio SDK. A wrong
-id soft-fails `read_document` (model-not-found becomes an
-error outcome), which silently disables the directed-reading rung without
-breaking anything else. If `read_document` never seems to work, check the reader
-model id first.
+(`gemini-3.8-flash`) was verified live on the native AI Studio SDK 2026-09-03, so
+the constants file no longer carries an unverified-id caution. A wrong id still
+soft-fails `read_document` (model-not-found becomes an error outcome), which
+silently disables the directed-reading rung without breaking anything else, and
+url_context retrieval fails the same quiet way on a host whose robots.txt
+disallows `Google-Extended`. If `read_document` never seems to work, check the
+reader model id first, then the target host's robots.txt.
