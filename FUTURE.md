@@ -112,7 +112,11 @@ so four remain live:
 5. **The effect of the two Phase 1 prompt rules the next-season bundle adds**, `_SOFT_CLOCK_RULE`
    and `_HISTORY_DISCHARGED_RULE` in `metaculus_bot/prompts.py` (Items A and C of
    `scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md`; live from the
-   bundle merge). Nothing about either can be measured offline, so the first read is the residual
+   bundle merge). **Item C is not an approved rule.** The plan reserves it for the operator in
+   three places and recommends shipping; it shipped on that recommendation with the operator's
+   final say still pending, so a reader landing here should not take it as settled. If the
+   operator declines it, this watch item narrows to `_SOFT_CLOCK_RULE` alone and the
+   history-repeats comparison below has nothing to measure. AGENTS.md carries the revert recipe. Nothing about either can be measured offline, so the first read is the residual
    round after the fall cup's first resolutions: re-code the live-triple rationales with the
    audit's lens definitions (the lens list at the top of
    `scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md`; tables in `STATS.md`) and compare

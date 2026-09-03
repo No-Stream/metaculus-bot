@@ -592,17 +592,23 @@ _SOFT_CLOCK_RULE = """
 # cadence as its central estimate anyway. 12.1% of coded rationales; about 7 spot-peer points
 # per flagged record (95% CI 2.7 to 12.2); the pattern failed in 83% of fires and in 13 of 13
 # on the live triple. Coder agreement was 0.59 and the label is partly hindsight-contaminated,
-# so read those numbers as upper bounds. Conditional on the member's OWN written
-# acknowledgment, so it cannot fire on a question where nothing has changed, and shipped only
-# once `_ANCHOR_CONSISTENCY_RULE`'s "do not move off your number when history counsels
-# caution" was gone, since the two pulled opposite ways. Shipped on the fix plan's
-# recommendation (section 6) with the operator's final say pending: one constant, one test
-# class, reversible. Binary + MC only. Same pre-indent contract as the rule above.
+# so read those numbers as upper bounds. That caveat is why the model-facing parenthetical
+# names the count as a small audit of this bot's own past forecasts rather than stating a flat
+# rate: against the 17-18% held rate the three older era bands show, 0 of 13 is an ordinary
+# draw (p = 0.09), and a bare figure reads to a forecaster as near-certainty. Conditional on
+# the member's OWN written acknowledgment, so it cannot fire on a question where nothing has
+# changed, and shipped only once `_ANCHOR_CONSISTENCY_RULE`'s "do not move off your number when
+# history counsels caution" was gone, since the two pulled opposite ways. Shipped on the fix
+# plan's recommendation (section 6) with the operator's final say pending; to revert, delete
+# this constant, its two interpolation sites in `binary_prompt` and `multiple_choice_prompt`,
+# and only the history-discharged cases in `TestSoftClockAndHistoryDischargedRules`, which also
+# covers the approved `_SOFT_CLOCK_RULE`. Binary + MC only. Same pre-indent contract as the
+# rule above.
 _HISTORY_DISCHARGED_RULE = """
                • If your own analysis names a reason the historical cadence has been discharged (its driver was
                  met, the deadline passed, the rule changed), that cadence is a bound on your estimate, not its
-                 center; state the post-change estimate and what it rests on (the old cadence held in 0 of 13
-                 recent cases where it was kept as the center)."""
+                 center; state the post-change estimate and what it rests on (in a small audit of this bot's own
+                 past forecasts, a cadence kept as the center held in none of 13 recent cases)."""
 
 
 # Apply the rate to the exposure that is LEFT. On qid 43837 six members applied a monthly

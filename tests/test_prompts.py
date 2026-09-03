@@ -1250,13 +1250,17 @@ class TestSoftClockAndHistoryDischargedRules:
     def test_history_discharged_rule_is_conditional_on_the_members_own_acknowledgment(self) -> None:
         """The condition is the member's OWN written acknowledgment, so the rule cannot fire on
         a question where nothing has changed; and the cadence becomes a BOUND, not a center,
-        which is the whole correction. The receipt rides as a short parenthetical."""
+        which is the whole correction. The receipt rides as a short parenthetical, and it names
+        its own sample: the label had coder agreement 0.59 and partial hindsight contamination, so
+        a bare "0 of 13" would read to a forecaster as a law when it is an ordinary draw at the
+        17-18% held rate the older era bands show."""
         flat = self._flat(_HISTORY_DISCHARGED_RULE)
         assert flat.startswith("• if your own analysis names a reason the historical cadence has been discharged")
         assert "(its driver was met, the deadline passed, the rule changed)" in flat
         assert "that cadence is a bound on your estimate, not its center" in flat
         assert "state the post-change estimate and what it rests on" in flat
-        assert "held in 0 of 13 recent cases" in flat
+        assert "in a small audit of this bot's own past forecasts" in flat
+        assert "held in none of 13 recent cases" in flat
 
     def test_rules_do_not_revive_the_retired_anchor_consistency_wording(self) -> None:
         """Item B retired "do not move off your number when history counsels caution" because it
