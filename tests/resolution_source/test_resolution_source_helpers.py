@@ -641,6 +641,13 @@ class TestAriaTableRewrite:
     def test_a_stray_close_tag_is_ignored(self):
         assert rewrite_aria_tables('</div><div role="cell">2</div>') == "</div><td>2</td>"
 
+    def test_a_data_role_attribute_is_not_an_aria_role(self) -> None:
+        # ``\brole`` matched inside ``data-role="table"`` (a word boundary sits after the hyphen), so a
+        # framework's data attribute rewrote a non-table element; the role attribute must stand alone.
+        html = '<div class="widget" data-role="table"><span data-role="cell">7</span></div>'
+        assert rewrite_aria_tables(html) is None
+        assert rewrite_aria_tables('<div role="table"><div role="cell">7</div></div>') is not None
+
     def test_roles_are_matched_case_insensitively_and_unquoted(self):
         assert rewrite_aria_tables("<span ROLE=Cell>2</span>") == "<td>2</td>"
 
