@@ -1655,15 +1655,14 @@ def gap_fill_analyzer_prompt(
         ANSWERABLE NOW. Every gap must be answerable from sources that exist today. When
         the question resolves off a live data source — a tracker, index, polling or rate
         average, counter, league table, or dashboard — at least ONE gap must ask what that
-        source reads NOW, in the present tense ("what does <tracker> currently display for
-        <series>, and when was it last updated?"), because the current reading is the single
+        source reads NOW, in the present tense, because the current reading is the single
         fact that most often decides these questions. A first pass that already states the
         source's current reading WITH its as-of date counts as answered: spend the slot on
         something the briefing lacks, and re-ask only if the stated reading is undated or
         older than the source's own update cadence. Never phrase a gap as that source's
-        value on the resolution date ("what will <tracker> show on <date>"): no search can
-        answer it and the slot is spent for nothing. If a candidate gap can only be answered
-        by a future observation, rewrite it as the present-tense observable or drop it.
+        value on the resolution date ("what will <tracker> show on <date>"). If a candidate
+        gap can only be answered by a future observation, rewrite it as the present-tense
+        observable or drop it.
 
         NULL RESULTS ARE SEARCH OUTCOMES. Where the first pass says it searched and
         found nothing ("no record found", "no authoritative source located"), treat that
