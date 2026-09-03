@@ -1422,3 +1422,55 @@ class TestSharedHostGate:
 
         assert session.host_peak["a.example.com"] == 1
         assert list(host_semaphores()) == ["a.example.com"], "one gate for the host, not one per call"
+
+
+class TestPerHopRequestTimeout:
+    """Every GET is bounded by what is left of the provider's 45 s wall, not by a flat 20 s.
+
+    A hop admitted with a few seconds of budget left used to be free to run the session's
+    full `RESOLUTION_SOURCE_HTTP_TIMEOUT`, overshoot the outer `wait_for` and take down every
+    sibling page that had already fetched — the exact loss the rest of the ladder's budget
+    arithmetic exists to prevent."""
+
+    def _session(self, article_html: bytes) -> FakeSession:
+        return FakeSession(
+            {"https://slow.example.com/page": FakeResponse(200, body=article_html, content_type="text/html")}
+        )
+
+    async def test_a_fresh_fetch_still_gets_the_full_per_request_timeout(self, article_html):
+        session = self._session(article_html)
+
+        await _fetch_one(session, "https://slow.example.com/page", {}, FetchContext())
+
+        assert session.get_kwargs[0]["timeout"].total == resolution_source.RESOLUTION_SOURCE_HTTP_TIMEOUT
+
+    async def test_a_hop_late_in_the_wall_is_clamped_to_the_remaining_budget(self, article_html):
+        session = self._session(article_html)
+        elapsed = 35.0
+        expected = (
+            resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
+            - elapsed
+            - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+        )
+
+        await _fetch_one(session, "https://slow.example.com/page", {}, FetchContext(started=time.monotonic() - elapsed))
+
+        timeout = session.get_kwargs[0]["timeout"]
+        assert timeout.total == pytest.approx(expected, abs=0.5)
+        assert timeout.total < resolution_source.RESOLUTION_SOURCE_HTTP_TIMEOUT
+        assert timeout.sock_read == timeout.total, "a per-request ClientTimeout replaces the session's, so both fields"
+
+    async def test_a_spent_budget_still_gets_a_token_attempt_rather_than_a_zero_timeout(self, article_html):
+        """A guaranteed-expired request tells us nothing a 0.5 s one does not, and a fast host
+        answering inside the floor is a page we would otherwise refuse for free."""
+        session = self._session(article_html)
+
+        result = await _fetch_one(
+            session,
+            "https://slow.example.com/page",
+            {},
+            FetchContext(started=time.monotonic() - 2 * resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT),
+        )
+
+        assert session.get_kwargs[0]["timeout"].total == resolution_source._MIN_HOP_TIMEOUT_S
+        assert result.status == "success", "the floor is a real attempt, not a formality"

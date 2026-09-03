@@ -622,6 +622,13 @@ def _get_session() -> aiohttp.ClientSession:
     )
 
 
+# Floor under the per-hop timeout `_fetch_one_hop` derives from the remaining wall budget.
+# A hop reached with the budget already spent still gets a token attempt rather than a
+# guaranteed-expired one: nothing downstream distinguishes "timed out at 0.0 s" from "timed
+# out at 0.5 s", and a fast host answering in 200 ms is a page we would otherwise refuse for
+# free. Small enough that the overshoot stays well inside RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S.
+_MIN_HOP_TIMEOUT_S: float = 0.5
+
 _HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 _RAW_TEXT_CONTENT_TYPES = ("text/plain", "text/csv")
 _JSON_CONTENT_TYPES = ("application/json",)
@@ -1170,10 +1177,30 @@ async def _resolution_response_outcome(resp: Any, current_url: str, ctx: FetchCo
 async def _fetch_one_hop(
     session: Any, current_url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
 ) -> FetchResult | str:
-    """ONE GET against ``current_url`` under its host semaphore: terminal result or next URL."""
+    """ONE GET against ``current_url`` under its host semaphore: terminal result or next URL.
+
+    The request's timeout is the REMAINING wall budget rather than the session's flat
+    ``RESOLUTION_SOURCE_HTTP_TIMEOUT``, and it is computed AFTER the semaphore is acquired so
+    a hop that queued behind a slow host does not then help itself to a fresh 20 s. This is
+    the one choke point every hop passes through — the initial GET, each 3xx hop and the
+    meta-refresh hop — so clamping here is what makes the budget arithmetic the rest of the
+    ladder does actually bind: a hop admitted with 3 s left (the meta-refresh rung's floor)
+    could otherwise run the full 20 s, overshoot ``RESOLUTION_SOURCE_WALL_TIMEOUT`` and let
+    the provider's outer ``wait_for`` discard every sibling page that had already fetched.
+    Monotonically <= the old 20 s, and an expiry lands on the existing ``TimeoutError`` path,
+    so overrunning costs this one URL rather than the question.
+
+    BOTH ``ClientTimeout`` fields are set because a per-request timeout REPLACES the
+    session's wholesale rather than merging with it.
+    """
     async with _sem_for_host(host_sems, current_url):
+        hop_timeout_s = min(RESOLUTION_SOURCE_HTTP_TIMEOUT, max(ctx.rung_budget_s(), _MIN_HOP_TIMEOUT_S))
         try:
-            async with session.get(current_url, allow_redirects=False) as resp:
+            async with session.get(
+                current_url,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=hop_timeout_s, sock_read=hop_timeout_s),
+            ) as resp:
                 return await _resolution_response_outcome(resp, current_url, ctx)
         except (TimeoutError, aiohttp.ClientError) as e:
             logger.info(f"resolution_source fetch error for {current_url}: {type(e).__name__}: {e}")

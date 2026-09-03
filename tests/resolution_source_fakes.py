@@ -105,9 +105,13 @@ class FakeSession:
         # Every URL requested, in order — lets tests pin which routes were
         # (and, critically for the Datawrapper hop, were NOT) fetched.
         self.requested: list[str] = []
+        # Per-request kwargs, parallel to `requested` — the per-hop ClientTimeout the
+        # fetcher derives from the remaining wall budget is only observable here.
+        self.get_kwargs: list[dict[str, Any]] = []
 
-    def get(self, url: str, **_kwargs: Any) -> _TrackingResponse:
+    def get(self, url: str, **kwargs: Any) -> _TrackingResponse:
         self.requested.append(url)
+        self.get_kwargs.append(dict(kwargs))
         for prefix, handler_list in self._handlers.items():
             if url.startswith(prefix):
                 idx = min(self._call_counts[prefix], len(handler_list) - 1)
