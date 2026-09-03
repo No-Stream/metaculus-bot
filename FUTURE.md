@@ -772,7 +772,8 @@ separate level formatter at the "latest value" and history-table sites only, lea
 BAND estimates at one decimal as honest about an estimate's precision. The global three-decimal cap
 shipped instead, because the band quantiles are exactly what a forecaster sizes an interval from and
 one decimal costs up to 0.05 index points there, roughly 1-2 buckets on these questions. Three
-rather than `_format_fred_value`'s six keeps six-decimal fabricated precision off an estimate.
+rather than `research/number_format.py`'s `format_decimal_value` six keeps six-decimal fabricated precision off
+an estimate.
 
 ### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-21 (added 2026-07-16)
 
