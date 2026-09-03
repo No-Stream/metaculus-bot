@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-08-27T19:58:37.174184Z"
+exclude-newer = "2026-08-27T23:39:04.393305Z"
 exclude-newer-span = "P1W"
 
 [manifest]
@@ -2463,6 +2463,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "asknews" },
+    { name = "certifi" },
     { name = "exa-py" },
     { name = "forecasting-tools" },
     { name = "fredapi" },
@@ -2517,6 +2518,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.12.15" },
     { name = "asknews", specifier = ">=0.11.2" },
+    { name = "certifi", specifier = ">=2026.5.20" },
     { name = "exa-py", specifier = ">=1.16.0" },
     { name = "forecasting-tools", specifier = "==0.2.92" },
     { name = "fredapi", specifier = ">=0.5.2" },

@@ -19,6 +19,7 @@ import ipaddress
 import logging
 import re
 import socket
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ from urllib.parse import urlparse
 import aiohttp
 import aiohttp.abc
 import aiohttp.resolver
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,15 @@ MAX_REDIRECTS: int = 5
 REDIRECT_STATUSES: frozenset[int] = frozenset({301, 302, 303, 307, 308})
 
 
+# Per-header and per-status-line byte cap for every session this module builds. aiohttp's
+# default is 8,190 B, which is smaller than the Content-Security-Policy header real sources
+# send (measured: who.int 8,765 B, visitwales.com 9,697 B) — and a header over the cap
+# rejects the response before any body is read, so the page arrives as `error http=None`,
+# indistinguishable from a host that never answered. 64 KiB is far above anything observed
+# while still bounding what one response's headers can buffer.
+_MAX_HEADER_BYTES: int = 65536
+
+
 # Safari-like UA + full Accept / Accept-Language / Accept-Encoding.
 # FINDINGS (resolution_source_probe): this exact header set recovered
 # 6 extra sources vs Chrome-UA-only (38/50 vs 32/50).
@@ -137,13 +148,36 @@ def build_session(
     :class:`FilteringResolver` so aiohttp's own connect-time DNS lookup goes
     through the same predicate as the preflight guard — closing the classic
     DNS-rebinding TOCTOU.
+
+    TLS trust is pinned to certifi's bundle rather than left to whatever store the
+    machine happens to carry. Measured 2026-09-03: trade.gov, a cited government source
+    that fetched fine when it was archived, failed the handshake here with
+    ``CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain`` against
+    the default store and succeeded against certifi's — so which sources are reachable
+    was a property of the machine, and a source lost that way is indistinguishable in
+    telemetry from a dead host.
+
+    The header-size caps are raised from aiohttp's 8,190-byte default because two
+    corpus hosts send a Content-Security-Policy header larger than that (who.int
+    8,765 B, visitwales.com 9,697 B) and aiohttp rejects the whole response before any
+    body is read, landing as ``error http=None``. At 64 KiB who.int returns a readable
+    200 and visitwales an honest 404.
     """
     timeout = aiohttp.ClientTimeout(total=timeout_s, sock_read=timeout_s)
-    connector_kwargs: dict[str, Any] = {"limit": connector_limit}
+    connector_kwargs: dict[str, Any] = {
+        "limit": connector_limit,
+        "ssl": ssl.create_default_context(cafile=certifi.where()),
+    }
     if resolver is not None:
         connector_kwargs["resolver"] = resolver
     connector = aiohttp.TCPConnector(**connector_kwargs)
-    return aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers)
+    return aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        headers=headers,
+        max_line_size=_MAX_HEADER_BYTES,
+        max_field_size=_MAX_HEADER_BYTES,
+    )
 
 
 # ---------------------------------------------------------------------------
