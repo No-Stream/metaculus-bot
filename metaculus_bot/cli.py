@@ -362,12 +362,11 @@ def _report_degradation_and_exit(
     # ``alertable`` — adding either subset too would double-count events already
     # inside that total.
     #
-    # Credit suppression (until CREDIT_ALERT_RESUME_DATE): the operator is
-    # self-funding the rest of the season, so an empty donated key is expected
-    # and its fallbacks are SUBTRACTED back out of the total. Every other cause
-    # keeps its full weight, because 401/404/429/guardrail each mean real
-    # breakage. Each event is still counted exactly once: generic adds it, and at
-    # most one subset subtracts it.
+    # Credit suppression (while today is before CREDIT_ALERT_RESUME_DATE): inside
+    # that window an empty donated key is an accepted state and its fallbacks are
+    # SUBTRACTED back out of the total. Every other cause keeps its full weight,
+    # because 401/404/429/guardrail each mean real breakage. Each event is still
+    # counted exactly once: generic adds it, and at most one subset subtracts it.
     #
     # ``credit_fallback`` counts only the SUPPRESSIBLE credit subset — the
     # donated key genuinely drained. A key that was revoked or re-capped to zero
@@ -457,19 +456,17 @@ def _report_degradation_and_exit(
         # deprecation tripwire) still decides the exit status — no green claim.
         logger.info("%s a post-summary check below decides the exit status.", breakdown)
 
-    # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
-    # already logged by credit_telemetry). The run completed and published
-    # normally; exiting non-zero here is purely the reminder-to-refill signal —
-    # and it is suppressed until CREDIT_ALERT_RESUME_DATE, since a drained
-    # donated key is the expected state while the operator self-funds. The INFO
-    # line keeps the log self-explanatory: a reader who sees the breach WARNING
-    # but a green run should not have to guess why.
+    # Donated-key balance below the early-warning floor (CREDIT_FLOOR_BREACH
+    # warning already logged by credit_telemetry). The run completed and published
+    # normally; exiting non-zero here is purely the ask-Metaculus-for-a-top-up
+    # signal — and it is suppressed while today is before CREDIT_ALERT_RESUME_DATE.
+    # The INFO line keeps the log self-explanatory: a reader who sees the breach
+    # WARNING but a green run should not have to guess why.
     if donated_below_floor:
         if alerts_active:
             sys.exit(1)
         logger.info(
-            "Donated-key credit floor breached, but credit alerting is suppressed until %s "
-            "(operator is self-funding the rest of the season), so this run exits zero.",
+            "Donated-key credit floor breached, but credit alerting is suppressed until %s, so this run exits zero.",
             CREDIT_ALERT_RESUME_DATE.isoformat(),
         )
 

@@ -188,13 +188,16 @@ Metaculus Cup and the fall bot tournament. Landed in the repo:
 - Research records are labelled by run mode (`cli.persisted_tournament_id`), so
   cup runs archive under the cup slug instead of the bot tournament's.
 
-One adjacent thing the grant settles: the credit-alert suppression expires on
-`CREDIT_ALERT_RESUME_DATE` (2026-09-10), after which a donated-key balance below
-`OPENROUTER_CREDIT_FLOOR_USD` ($1.00) exits every run non-zero — which, on an
-hourly cup cron, would mean an hourly red check. `make check_credits` on
-2026-09-03 reads the donated key at **$1,449.19 remaining of a $2,300 limit**, so
-alerting resuming is the correct behaviour rather than a new source of red runs,
-and the suppression can be left to expire on its own.
+One adjacent thing the grant settles: credit alerting is back ON.
+`make check_credits` on 2026-09-03 reads the donated key at **$1,449.19 remaining
+of a $2,300 limit**, so a credit shortfall is real news again rather than the
+expected state, and `CREDIT_ALERT_RESUME_DATE` was moved up from 2026-09-10 to
+**2026-09-03** rather than left to expire. `OPENROUTER_CREDIT_FLOOR_USD` moved with
+it, from $1.00 to **$100.00**: the operator cannot refill this key — Metaculus does
+— so the warning has to arrive with runway left to ask, and $100 is roughly 250
+questions at the measured $0.38-0.41 each. A $1 floor would have fired only once
+the key was already dry, which on an hourly cup cron is an hourly red check that
+arrives too late to act on.
 
 Still the operator's, and not doable from a merge:
 
@@ -340,8 +343,8 @@ CRPS and is no better than median on binary.
 | `PERSIST_RESEARCH_ENABLED` | off | `true` (every bot workflow, test ones included since 2026-08-03) | Writes per-question research to JSONL for offline backtest replay |
 | `PLATT_CALIBRATION_ENABLED` | off | unset | Post-hoc logistic recalibration of the final published probability |
 | `GEMINI_USE_DONATED_OPENROUTER_KEY` | on | `true` | Route OpenRouter Gemini calls through the donated key with personal fallback |
-| `OPENROUTER_CREDIT_FLOOR_USD` | see `constants.py` | unset (uses default) | Donated-key remaining-balance floor for the end-of-run refill reminder |
-| `OPENROUTER_CREDIT_ALERT_RESUME_DATE` | `2026-09-10` | unset (uses default) | Date the credit alerts start reddening CI again; before it, credit shortfalls log but exit zero |
+| `OPENROUTER_CREDIT_FLOOR_USD` | `100.0` (see `constants.py`) | unset (uses default) | Donated-key remaining-balance level for the end-of-run early warning to ask Metaculus for a top-up |
+| `OPENROUTER_CREDIT_ALERT_RESUME_DATE` | `2026-09-03` | unset (uses default) | Date the credit alerts start reddening CI again; before it, credit shortfalls log but exit zero. Push it forward to re-arm a suppression window |
 
 ## GitHub Actions workflows
 
@@ -584,7 +587,8 @@ stderr), so per-run spend is durably grep-able:
   OpenRouter dollars went. See "Per-role spend" below.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
   key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD`
-  (`constants.py`).
+  (`constants.py`, $100). That level is an early warning, not an empty tank — read
+  it as "ask Metaculus for a top-up", not "the key is dry".
 
 ### Per-role spend (`CREDIT_ROLE_SPEND`)
 
@@ -638,26 +642,34 @@ the same money from opposite ends, so their ratio is the ledger's own coverage
 check — plus a per-role table over the selected runs.
 
 A floor breach does not abort the run. Forecasting and publishing complete
-normally, and outside the suppression window below `cli.py` then exits non-zero
-so the GitHub Actions check turns red as a reminder to top up the donated key.
-The floor is only checked against the donated key (the personal key reports no
+normally, and outside a suppression window `cli.py` then exits non-zero so the
+GitHub Actions check turns red as a reminder to ask Metaculus to top the donated
+key up. The floor is an EARLY-WARNING level ($100, roughly 250 questions of
+runway) rather than an empty tank, because only Metaculus can refill this key and a
+reminder that arrives when the balance hits $1 arrives too late to act on. The
+floor is only checked against the donated key (the personal key reports no
 `limit_remaining`). Per-run spend prefers the `limit_remaining` drop because the
 donated key routes nearly all spend through BYOK provider integrations, which
 leaves the plain `usage` field frozen while real money burns.
 
-### Credit alerting is suppressed until 2026-09-10
+### The credit-alert suppression window (closed since 2026-09-03)
 
-The operator is funding the rest of the season out of pocket, so an empty donated
-key is the expected state rather than a defect. Until
-`CREDIT_ALERT_RESUME_DATE` (`2026-09-10` in `constants.py`, a few days after the
-tournament closes on `TOURNAMENT_END_DATE`), credit shortfalls no longer redden
-CI. Two paths are gated, because either one alone would keep the check red:
+Credit alerting is ON. It was suppressed from 2026-07-26, when the donated key
+drained and the operator started funding the season out of pocket, so an empty
+donated key was the expected state rather than a defect. Metaculus granted $1,500
+of credits on 2026-09-03, and `CREDIT_ALERT_RESUME_DATE` in `constants.py` was
+moved up from 2026-09-10 to `2026-09-03` that day: a credit shortfall reddens CI
+again. The machinery below is unchanged and re-armable — push
+`CREDIT_ALERT_RESUME_DATE` forward in `constants.py`, or set
+`OPENROUTER_CREDIT_ALERT_RESUME_DATE` in the workflow env, and the window reopens
+with no other edit. Inside a window two paths are gated, because either one alone
+would keep the check red:
 
 1. The floor breach. `cli.py` skips the `sys.exit(1)` and logs an INFO line
    saying the breach was observed but alerting is suppressed until the resume
    date.
-2. The credit-caused donated-to-personal key fallbacks. Each fallback normally
-   counts toward `alertable`. `record_donated_key_fallback` tracks the
+2. The credit-caused donated-to-personal key fallbacks. Each fallback counts
+   toward `alertable` outside the window. `record_donated_key_fallback` tracks the
    suppressible subset in `_credit_key_fallback_count`, a subset of the
    all-causes `_generic_key_fallback_count`, and `cli.py` subtracts the subset
    back out while alerting is suppressed. Every event is counted exactly once:
@@ -668,11 +680,11 @@ CI. Two paths are gated, because either one alone would keep the check red:
    race the increment, undercount the generic total, and take a degraded run
    green.
 
-Non-credit fallback causes still alert in full, since each means real breakage
-rather than an empty wallet: 401 invalid or disabled key, 404 "no allowed
-providers", 429 rate limit, and the guardrail / data-policy block. Bot-side
-degradation is untouched by the suppression too: every counter in the
-`Degradation counters:` summary still alerts in full (they are enumerated under
+Non-credit fallback causes alert in full whatever the window says, since each
+means real breakage rather than an empty wallet: 401 invalid or disabled key, 404
+"no allowed providers", 429 rate limit, and the guardrail / data-policy block.
+Bot-side degradation is untouched by a suppression too: every counter in the
+`Degradation counters:` summary always alerts in full (they are enumerated under
 "Reading run logs" below).
 
 ### What a dry donated key actually returns (and the drained-vs-revoked probe)
@@ -703,15 +715,16 @@ a run, `credit_telemetry.classify_donated_key_state` reads the free, read-only
 
 | `/auth/key` says | State | Alerting |
 | --- | --- | --- |
-| 200, cap > 0, nothing remaining | `drained` | suppressed — the expected empty wallet |
+| 200, cap > 0, nothing remaining | `drained` | suppressible — the expected empty wallet |
 | 200, cap == 0 | `zeroed` | **red** — Metaculus cut us off, never an "empty wallet" |
 | 401 / 404 | `revoked` | **red** — key is gone, not empty |
 | 200, money remaining | `funded` | **red** — the failure was not about credit |
 | probe failed, or no donated key configured | `unknown` | **red** — fail safe |
 
-Only `drained` is subtracted from `alertable`. A probe that errors or times out
-classifies as `unknown` and stays red, so a broken probe can never silently turn
-a red run green.
+Only `drained` is ever subtracted from `alertable`, and only inside a suppression
+window (none is open since 2026-09-03). A probe that errors or times out classifies
+as `unknown` and stays red, so a broken probe can never silently turn a red run
+green.
 
 The probe is what the *ambiguous* spend-cap 403 needs, so it is the only path that
 pays for one. A documented 402 or plain insufficient-credit response says the
@@ -1174,9 +1187,10 @@ the telemetry markers:
   explicit levels (`GEMINI_SEARCH_THINKING_LEVEL`, `GAP_FILL_V2_READER_THINKING_LEVEL`) were
   set. Nothing about this is alertable; it is spend accounting, not degradation.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH`
-  — credit telemetry, described above. `CREDIT_FLOOR_BREACH` keeps firing during
-  the credit-alert suppression window, so seeing one on a green run is expected
-  until 2026-09-10; the adjacent INFO line names the resume date.
+  — credit telemetry, described above. `CREDIT_FLOOR_BREACH` fires whatever the
+  credit-alert window says, so a breach on a GREEN run means a suppression window
+  is open (none is, since 2026-09-03); the adjacent INFO line names the resume
+  date.
   `CREDIT_ROLE_SPEND` is the per-(role, key) decomposition of the run's
   OpenRouter spend; a run with no completions logs a single no-completions line
   under the same token instead of rows.
@@ -1261,6 +1275,6 @@ A run can also exit non-zero for degradation alerts — the counters above,
 personal-key fallbacks, or the model-deprecation tripwire — even when every
 question that met the minimum-forecaster threshold was published. The non-zero
 exit is the CI red-check signal to investigate; it does not mean publishing
-failed. Credit-caused shortfalls are exempt until 2026-09-10 (see the suppression
-section above); every other cause still alerts. See the alert block near the end
+failed. Credit-caused shortfalls alert again as of 2026-09-03, and are exempt only
+inside a suppression window (see that section above); every other cause always alerts. See the alert block near the end
 of `cli.py` for the exact conditions.

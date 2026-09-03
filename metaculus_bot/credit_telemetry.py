@@ -12,13 +12,14 @@ bottom of this module say WHERE it went (forecaster slot, research stage, parser
 attribution" below.
 
 The end-of-run check also reports whether the DONATED key's remaining balance
-(``limit_remaining``) fell below ``OPENROUTER_CREDIT_FLOOR_USD``. cli.main uses
-that to exit non-zero AFTER all forecasting/publishing completes — a
-reminder-to-refill signal, never an abort — and only while credit alerting is
-active (``constants.credit_alerts_active``; suppressed until
-``CREDIT_ALERT_RESUME_DATE`` while the operator self-funds the season). The
-suppression is purely an exit-status decision made in cli.main: this module
-always reports the breach and always logs ``CREDIT_FLOOR_BREACH``.
+(``limit_remaining``) fell below ``OPENROUTER_CREDIT_FLOOR_USD``. That is an
+EARLY-WARNING level and not an empty tank: only Metaculus can refill this key, so
+the reminder has to arrive while there is still runway left to ask for a top-up.
+cli.main uses the breach to exit non-zero AFTER all forecasting/publishing
+completes — never an abort — and only while credit alerting is active
+(``constants.credit_alerts_active``, the dated suppression lever). The suppression
+is purely an exit-status decision made in cli.main: this module always reports the
+breach and always logs ``CREDIT_FLOOR_BREACH``.
 
 Field semantics (verified against live /auth/key pulls, 2026-07-17): ``usage``
 counts only spend billed as native OpenRouter credits. Spend routed through
@@ -282,8 +283,10 @@ class CreditTelemetry:
             if alias == "donated" and snapshot.remaining_usd is not None and snapshot.remaining_usd < self._floor_usd:
                 logger.warning(
                     "CREDIT_FLOOR_BREACH: key=donated remaining=%s floor=%s — donated OpenRouter "
-                    "balance needs a top-up; run completed normally. cli.main logs the exit "
-                    "decision unless a higher-priority degradation alert exits first.",
+                    "balance is below the early-warning floor, so ask Metaculus for a top-up "
+                    "before it runs dry; the key is not necessarily empty and the run completed "
+                    "normally. cli.main logs the exit decision unless a higher-priority "
+                    "degradation alert exits first.",
                     _fmt(snapshot.remaining_usd),
                     _fmt(self._floor_usd),
                 )
@@ -298,8 +301,8 @@ class CreditTelemetry:
 # an LLM call. But a key that Metaculus RE-CAPPED TO ZERO produces the exact
 # same 403 text as a key that simply spent its whole allocation, and the
 # operator wants opposite CI colors for those: a genuinely drained key is the
-# expected state while they self-fund the season (green), a zeroed or revoked
-# one is real breakage (red). No amount of text matching can separate them, so
+# expected empty wallet (green, but only while the credit-alert suppression
+# window is open), a zeroed or revoked one is real breakage (red either way). No amount of text matching can separate them, so
 # we ask the free, read-only /auth/key endpoint what the cap actually looks
 # like. See ``fallback_openrouter.is_suppressible_credit_error``.
 
@@ -438,8 +441,9 @@ def classify_donated_key_state() -> DonatedKeyState:
         if state is DonatedKeyState.DRAINED:
             logger.info(
                 "DONATED_KEY_STATE: state=%s — the donated OpenRouter key spent its whole allocation "
-                "with the cap itself intact. Expected while the operator self-funds the season, so "
-                "credit-caused personal-key fallbacks are exempt from alerting until %s.",
+                "with the cap itself intact. Credit-caused personal-key fallbacks are exempt from "
+                "alerting only while the dated suppression window is open, i.e. before %s; from that "
+                "date on they redden CI like any other fallback.",
                 state.value,
                 CREDIT_ALERT_RESUME_DATE.isoformat(),
             )

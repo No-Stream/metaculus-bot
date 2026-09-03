@@ -177,8 +177,8 @@ class TestKeyRouting:
         gap-fill v2 runs on every question in all four prod workflows, so this
         hand-rolled donated→personal retry was the highest-volume uninstrumented
         personal-key spend path: no counter, no ``PAID PERSONAL-KEY FALLBACK`` WARN,
-        no contribution to the end-of-run summary. After 2026-09-10 a v2-only
-        fallback that should redden CI would silently not.
+        no contribution to the end-of-run summary. With credit alerting live again
+        (since 2026-09-03) a v2-only fallback that should redden CI would silently not.
         """
         _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
         monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: True)

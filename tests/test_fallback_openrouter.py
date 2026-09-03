@@ -502,8 +502,9 @@ class TestCreditCauseClassification:
     live: ``should_retry_with_general_key`` and the credit-subset counter both go
     through it, so the retry decision and the counter can't drift apart.
 
-    Only these messages are exempt from alerting during the suppression window
-    (see ``constants.credit_alerts_active``) — everything else keeps reddening CI.
+    Only these messages are exempt from alerting inside a suppression window (see
+    ``constants.credit_alerts_active``, closed since 2026-09-03) — everything else
+    keeps reddening CI whatever the window says.
     """
 
     @pytest.mark.parametrize(
@@ -546,8 +547,8 @@ class TestCreditCauseClassification:
 class TestPaidFallbackWarningExitClause:
     """The paid-fallback WARNING must not promise a red CI run it won't deliver.
 
-    ``credit_alerts_active`` is monkeypatched (rather than waiting on the wall
-    clock) so both branches stay covered before and after 2026-09-10. The
+    ``credit_alerts_active`` is monkeypatched (rather than reading the wall clock)
+    so both branches stay covered either side of the 2026-09-03 resume date. The
     ``suppressible`` flag is passed in by the caller, which has already paid for
     the donated-key probe — the note renders the decision, it doesn't re-derive it.
     """

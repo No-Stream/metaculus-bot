@@ -13,7 +13,8 @@ needs real keys. Pins:
   and never tripping the floor even when its usage is huge,
 - the dated credit-alert suppression predicate (``credit_alerts_active``), which
   gates only the EXIT status in cli.main — the telemetry here is window-agnostic
-  and keeps reporting a breach either way,
+  and keeps reporting a breach either way — plus the default floor and resume date
+  themselves, which are the two levers the operator retunes,
 - the drained-vs-revoked donated-key discriminator (``classify_donated_key_state``),
   which decides whether a credit-shaped failure is the EXPECTED empty wallet
   (suppressible) or real breakage (must stay red),
@@ -32,7 +33,7 @@ import logging
 import threading
 import time
 from collections.abc import Iterator
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -45,7 +46,12 @@ from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.types.utils import ModelResponse, Usage
 
 from metaculus_bot.check_openrouter_credits import KEY_SPECS
-from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, _date_env, credit_alerts_active
+from metaculus_bot.constants import (
+    CREDIT_ALERT_RESUME_DATE,
+    OPENROUTER_CREDIT_FLOOR_USD,
+    _date_env,
+    credit_alerts_active,
+)
 from metaculus_bot.credit_telemetry import (
     DIRECT_KEY_ALIAS,
     DONATED_KEY_ALIAS,
@@ -222,31 +228,48 @@ class TestRunDeltaSource:
 class TestCreditAlertSuppressionWindow:
     """The dated suppression of credit ALERTING (not of any log line).
 
-    The operator is self-funding the rest of the season, so a drained donated key
-    must not redden CI until ``CREDIT_ALERT_RESUME_DATE``. Every ``today`` here is
-    injected, so these tests keep asserting the same thing after the real date
-    passes 2026-09-10.
+    Alerting was suppressed while the donated key was drained and the operator
+    self-funded the season, and resumed on ``CREDIT_ALERT_RESUME_DATE``
+    (2026-09-03, moved up from 2026-09-10 after the Metaculus grant). Every
+    ``today`` here is injected, so both branches keep being exercised however far
+    the real clock moves past the resume date.
     """
 
-    def test_resume_date_is_2026_09_10(self) -> None:
-        """The hardcoded default is the contract; the env var is only an override."""
-        assert date(2026, 9, 10) == CREDIT_ALERT_RESUME_DATE
+    def test_resume_date_is_2026_09_03(self) -> None:
+        """The hardcoded default is the contract; the env var is only an override.
+
+        Moved up from 2026-09-10 on 2026-09-03, when Metaculus granted $1,500 of
+        credits, so a shortfall reddens CI again from that day.
+        """
+        assert date(2026, 9, 3) == CREDIT_ALERT_RESUME_DATE
 
     def test_inactive_before_resume_date(self) -> None:
         assert credit_alerts_active(date(2026, 7, 25)) is False
-        assert credit_alerts_active(date(2026, 9, 9)) is False
+        assert credit_alerts_active(date(2026, 9, 2)) is False
 
     def test_active_on_and_after_resume_date(self) -> None:
         """Resume day itself counts as active — the window is closed-on-the-right."""
-        assert credit_alerts_active(date(2026, 9, 10)) is True
-        assert credit_alerts_active(date(2026, 9, 11)) is True
+        assert credit_alerts_active(date(2026, 9, 3)) is True
+        assert credit_alerts_active(date(2026, 9, 4)) is True
         assert credit_alerts_active(date(2027, 1, 1)) is True
 
-    def test_resume_date_is_after_tournament_close(self) -> None:
-        """The suppression must not outlive the season it exists for."""
+    def test_resume_date_cannot_outlive_the_season(self) -> None:
+        """The guard the dated lever exists for: a suppression window left open long
+        past the season it was opened for is a stale suppression nobody noticed. The
+        current window closed before the tournament even ends, so this holds with room
+        to spare; it fails if somebody pushes the resume date out into the next season.
+        """
         from metaculus_bot.constants import TOURNAMENT_END_DATE
 
-        assert date.fromisoformat(TOURNAMENT_END_DATE) < CREDIT_ALERT_RESUME_DATE
+        assert date.fromisoformat(TOURNAMENT_END_DATE) + timedelta(days=7) >= CREDIT_ALERT_RESUME_DATE
+
+    def test_alerting_is_live_on_the_real_clock(self) -> None:
+        """The state the operator asked for on 2026-09-03: no injected date, no env
+        override, and credit shortfalls redden CI. Reads the real clock deliberately —
+        this is the one assertion that would catch the resume date being pushed back
+        into the future by accident.
+        """
+        assert credit_alerts_active() is True
 
     def test_today_defaults_to_system_clock_at_call_time(self) -> None:
         """No argument → same answer as passing today's real date explicitly."""
@@ -254,16 +277,16 @@ class TestCreditAlertSuppressionWindow:
 
     def test_env_override_parses_iso_date(self, monkeypatch) -> None:
         monkeypatch.setenv("_TEST_RESUME_DATE_XYZ", "2026-10-01")
-        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 10)) == date(2026, 10, 1)
+        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 3)) == date(2026, 10, 1)
 
-    @pytest.mark.parametrize("bad", ["", "   ", "not-a-date", "2026-13-01", "09/10/2026"])
+    @pytest.mark.parametrize("bad", ["", "   ", "not-a-date", "2026-13-01", "09/03/2026"])
     def test_env_override_falls_back_on_garbage(self, monkeypatch, bad) -> None:
         monkeypatch.setenv("_TEST_RESUME_DATE_XYZ", bad)
-        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 10)) == date(2026, 9, 10)
+        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 3)) == date(2026, 9, 3)
 
     def test_env_unset_uses_default(self, monkeypatch) -> None:
         monkeypatch.delenv("_TEST_RESUME_DATE_XYZ", raising=False)
-        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 10)) == date(2026, 9, 10)
+        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 3)) == date(2026, 9, 3)
 
     def test_telemetry_still_reports_breach_during_suppression(self, monkeypatch, caplog) -> None:
         """Suppression lives in cli.main, not here: the telemetry keeps returning
@@ -283,6 +306,27 @@ class TestCreditAlertSuppressionWindow:
 
 
 class TestFloorCheck:
+    def test_default_floor_warns_while_runway_remains(self, monkeypatch, caplog) -> None:
+        """The shipped default is an EARLY WARNING, not an empty tank.
+
+        A donated key with $50 left still has ~125 questions of runway at the measured
+        $0.38-0.41 each, and must already trip the reminder: only Metaculus can refill
+        this key, so the operator needs lead time to ask. The floor was $1.00 until
+        2026-09-03, which fired only once there was nothing left to warn about.
+        """
+        assert OPENROUTER_CREDIT_FLOOR_USD == 100.0
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [_payload(150.0, 10.0), _payload(50.0, 110.0)]}
+        telemetry = CreditTelemetry()  # no argument: the shipped default floor
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            assert telemetry.log_end_and_check_floor() is True
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("CREDIT_FLOOR_BREACH: key=donated remaining=50.00 floor=100.00" in msg for msg in warnings)
+        # The wording has to read as a warning to go ask, not as an empty wallet.
+        assert any("ask Metaculus for a top-up" in msg for msg in warnings)
+
     def test_donated_below_floor_returns_true_and_warns(self, monkeypatch, caplog) -> None:
         _set_keys(monkeypatch, personal=None)
         responses = {DONATED_KEY: [_payload(60.0, 1.0), _payload(49.99, 11.0)]}

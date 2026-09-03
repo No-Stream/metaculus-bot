@@ -643,7 +643,7 @@ class TestRateLimitRetry:
         assert [call["url"] for call in calls] == [detail_url]
 
     def test_a_non_429_error_status_is_not_retried(self, monkeypatch):
-        # A 404 slug is the expected case here (the bare `metaculus-cup` slug 404s today), and
+        # A 4xx slug is the expected case here (the bare `metaculus-cup` slug returns 400 today), and
         # retrying it six times with backoff would stall the survey on every dead slug.
         calls, sleeps = self._install_responses(monkeypatch, [404])
 

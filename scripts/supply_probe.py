@@ -43,7 +43,7 @@ Two API facts it is built around, both learned by the scratch probes it replaces
 * The endpoint rate-limits aggressively right after a full performance pull, so every
   request carries a bounded 429 retry and pages are spaced.
 
-A slug that errors (the bare ``metaculus-cup`` slug 404s today — see the fall-cup note in
+A slug that errors (the bare ``metaculus-cup`` slug returns 400 today — see the fall-cup note in
 ``metaculus_bot/constants.py``) is reported as an error row and the survey continues, so
 one dead slug cannot hide the live ones. That also makes this the cheapest way to watch
 for the fall cup opening questions: the ``metaculus-cup-fall-2026`` row goes from zero
@@ -556,7 +556,7 @@ def probe_slugs(
 
     Scoped to ``requests.RequestException`` (transport, HTTP status and JSON-decode
     failures of the call). A survey over several slugs expects some to be dead — the bare
-    ``metaculus-cup`` slug 404s today — and aborting the whole run on the first would hide
+    ``metaculus-cup`` slug returns 400 today — and aborting the whole run on the first would hide
     the live ones. Anything that is not a request failure is a contract break and crashes.
 
     ``resolve_forfeits`` costs one detail GET per closed/resolved post that the list page did

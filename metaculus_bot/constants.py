@@ -330,27 +330,37 @@ ASKNEWS_BACKOFF_SECS: float = max(0.0, _float_env("ASKNEWS_BACKOFF_SECS", 2.0))
 ASKNEWS_WALL_TIMEOUT: int = 300
 
 # --- OpenRouter credit telemetry ---
-# End-of-run floor for the DONATED key's remaining balance (limit_remaining).
+# EARLY-WARNING floor for the DONATED key's remaining balance (limit_remaining).
 # Below this, cli.main logs a loud warning and exits non-zero AFTER all
-# forecasting/publishing completes — a reminder-to-refill signal, not an abort.
+# forecasting/publishing completes — a reminder to ask Metaculus for a top-up, not
+# an abort, and not a claim that the key is empty.
+#
+# Sizing: $100 is roughly 250 questions of runway at the measured $0.38-0.41 per
+# question. The lead time is the point — only Metaculus can refill this key, the
+# operator cannot — so the warning has to arrive while there is still time to ask.
+# It was $1.00 until 2026-09-03, which fired only once the key was already dry.
+#
 # The floor is meaningless for the personal key (no limit_remaining), so it is
 # only checked against the donated key. See metaculus_bot/credit_telemetry.py.
-OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 1.0)
+OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 100.0)
 
-# Dated suppression of the credit ALERTS (not the logs). The operator is funding
-# the rest of the season out of pocket, so an empty donated key is expected
-# rather than a defect, and the two paths that turn a credit shortfall into a
-# non-zero exit — the floor breach in cli.main and the credit-caused
-# donated->personal fallbacks folded into ``alertable`` — must not redden CI
-# until this date. The tournament closes on TOURNAMENT_END_DATE (2026-09-06);
-# alerting resumes a few days later so a stale suppression can't outlive the
-# season. Every CREDIT_* log line, including CREDIT_FLOOR_BREACH, keeps firing
-# throughout: only the exit status and the alertable arithmetic change.
+# Dated suppression of the credit ALERTS (not the logs). Before this date, the two
+# paths that turn a credit shortfall into a non-zero exit — the floor breach in
+# cli.main and the credit-caused donated->personal fallbacks folded into
+# ``alertable`` — do not redden CI. Every CREDIT_* log line, including
+# CREDIT_FLOOR_BREACH, keeps firing throughout: only the exit status and the
+# alertable arithmetic change.
+#
+# History: alerting was suppressed from 2026-07-26, when the donated key drained and
+# the operator started self-funding the season, until 2026-09-03, when Metaculus
+# granted $1,500 of credits (the key read $1,449 remaining of a $2,300 limit) and the
+# resume date was moved up from 2026-09-10 to that day. Re-arm a window by pushing
+# this date forward, either here or through the env override.
 #
 # Non-credit fallback causes (401 invalid/disabled key, 404 no-allowed-providers,
 # 429 rate limit, guardrail/data-policy) stay fully alertable — each of those is
 # real breakage, not an expected empty wallet.
-CREDIT_ALERT_RESUME_DATE: date = _date_env("OPENROUTER_CREDIT_ALERT_RESUME_DATE", date(2026, 9, 10))
+CREDIT_ALERT_RESUME_DATE: date = _date_env("OPENROUTER_CREDIT_ALERT_RESUME_DATE", date(2026, 9, 3))
 
 
 def credit_alerts_active(today: date | None = None) -> bool:

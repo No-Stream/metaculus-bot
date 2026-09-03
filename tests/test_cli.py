@@ -1,8 +1,8 @@
 """Tests for ``metaculus_bot.cli.main`` — specifically the sys.exit wiring that
 fires when ``TemplateForecaster.alertable_count > 0``, when the donated
 OpenRouter key fell back to the operator's personal (paid) key during the run,
-or when the donated key's remaining balance ended the run below the refill
-floor (``OPENROUTER_CREDIT_FLOOR_USD``).
+or when the donated key's remaining balance ended the run below the
+early-warning floor (``OPENROUTER_CREDIT_FLOOR_USD``).
 
 The fallback counter folded into ``alertable`` is ``_generic_key_fallback_count``
 — it counts EVERY donated->personal fallback (all causes: 401/402/429/guardrail/
@@ -12,13 +12,12 @@ subsets of that total, broken out in the log line for diagnostics but NOT
 separately added to ``alertable`` (that would double-count events already inside
 the generic total).
 
-Credit alerting is suppressed until ``CREDIT_ALERT_RESUME_DATE`` (2026-09-10)
-because the operator is self-funding the rest of the season, so a drained donated
-key is expected rather than broken. During the window the floor breach does not
-exit non-zero and the credit-caused fallbacks are subtracted back out of
-``alertable``; every other fallback cause (401 / 404 / 429 / guardrail) keeps its
-full weight. Tests inject the window state via ``credit_alerts_active`` rather
-than the wall clock, so they keep testing both sides after the real date passes.
+Credit alerting is gated on ``CREDIT_ALERT_RESUME_DATE`` (2026-09-03, the day
+Metaculus granted credits again). Before that date the floor breach did not exit
+non-zero and the credit-caused fallbacks were subtracted back out of
+``alertable``; every other fallback cause (401 / 404 / 429 / guardrail) always kept
+its full weight. Tests inject the window state via ``credit_alerts_active`` rather
+than the wall clock, so both sides stay covered now that the real date has passed.
 
 Publication already happened inside ``forecast_on_tournament`` by the time cli
 checks alertable state; the non-zero exit is purely so GitHub Actions marks
@@ -723,7 +722,19 @@ class TestCliCreditAlertSuppression:
             telemetry.log_end_and_check_floor.assert_called_once()
 
         messages = [record.getMessage() for record in caplog.records]
-        assert any("credit alerting is suppressed until 2026-09-10" in msg for msg in messages), messages
+        expected = f"credit alerting is suppressed until {CREDIT_ALERT_RESUME_DATE.isoformat()}"
+        assert any(expected in msg for msg in messages), messages
+
+    def test_floor_breach_with_no_injected_date_exits_non_zero(self) -> None:
+        """The live state since 2026-09-03: the real constant, the real clock, no
+        injection — a donated-key floor breach reddens CI again. This is the one test
+        here that would fail if the resume date were pushed back into the future.
+        """
+        assert credit_alerts_active() is True
+        with _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=None):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
 
     def test_floor_breach_on_resume_date_exits_non_zero(self) -> None:
         """The window is closed-on-the-right: the resume day itself alerts."""
@@ -899,10 +910,11 @@ class TestCliCreditAlertSuppression:
             assert summary, messages
             assert "with 0 alertable" in summary[0], summary
             assert "personal_key_fallback=7" in summary[0], summary
-            assert "credit=7 with 7 credit event(s) suppressed until 2026-09-10" in summary[0], summary
+            resume = CREDIT_ALERT_RESUME_DATE.isoformat()
+            assert f"credit=7 with 7 credit event(s) suppressed until {resume}" in summary[0], summary
             assert "donated_key=drained" in summary[0], summary
             # The floor-breach explanation is a separate concern and still lands.
-            assert any("credit alerting is suppressed until 2026-09-10" in msg for msg in messages), messages
+            assert any(f"credit alerting is suppressed until {resume}" in msg for msg in messages), messages
         finally:
             fb_module._generic_key_fallback_count = 0
             fb_module._credit_key_fallback_count = 0

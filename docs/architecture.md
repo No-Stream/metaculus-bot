@@ -25,9 +25,11 @@ Three files form the startup chain:
   `TemplateForecaster` sums them: dropped forecasters, questions that failed to
   publish, stacker fallbacks, research-provider and summarizer failures, gap-fill
   v2 errors, and prediction-market degradation) or the donated OpenRouter key
-  dropped below the refill floor. Credit-caused alerts are suppressed until
-  2026-09-10 while the operator self-funds the season — see "Credit alerting is
-  suppressed" in `docs/operations.md`. See `main` in `cli.py`.
+  dropped below the $100 early-warning floor (`OPENROUTER_CREDIT_FLOOR_USD`, sized
+  so the reminder to ask Metaculus for a top-up arrives with runway left).
+  Credit-caused alerts are live again as of 2026-09-03 and are suppressed only
+  inside a dated window — see "The credit-alert suppression window" in
+  `docs/operations.md`. See `main` in `cli.py`.
 - `metaculus_bot/forecaster.py` — the bot itself. `TemplateForecaster` subclasses the
   framework's `ForecastBot` and owns the per-question pipeline. The method to read
   first is `_research_and_make_predictions`.
