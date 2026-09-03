@@ -352,16 +352,27 @@ def _read_outline(reader: PdfReader) -> tuple[tuple[str, int], ...]:
         return ()
 
 
+OUTLINE_MAX_ENTRIES_WALKED = 2_000
+
+
 def _walk_outline(reader: PdfReader, items: Sequence[object]) -> list[tuple[str, int]]:
-    """Depth-first walk of pypdf's nested list of Destinations.
+    """Depth-first walk of pypdf's nested list of Destinations, without recursion.
+
+    Iterative on purpose: the bookmark tree is attacker-shaped input, and a recursive walk over
+    a pathologically deep tree raises RecursionError, which is not a pypdf error and would break
+    this module's never-raises contract. The explicit stack cannot exhaust the interpreter's, and
+    the entry cap bounds a tree that is wide instead of deep; the digest shows
+    DIGEST_MAX_OUTLINE_ENTRIES of these anyway.
 
     An untitled entry is skipped: the digest renders the outline as "title (p.N)", and a
     bookmark with no title carries no information a reader can act on.
     """
     entries: list[tuple[str, int]] = []
-    for item in items:
+    stack: list[object] = list(reversed(items))
+    while stack and len(entries) < OUTLINE_MAX_ENTRIES_WALKED:
+        item = stack.pop()
         if isinstance(item, list):
-            entries.extend(_walk_outline(reader, item))
+            stack.extend(reversed(item))
             continue
         if not isinstance(item, Destination):
             continue

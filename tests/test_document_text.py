@@ -14,10 +14,13 @@ block per page, which is what makes pypdf's own extractor the thing under test.
 from __future__ import annotations
 
 import io
+import sys
+from typing import cast
 
 import pytest
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
+from pypdf.generic import Destination, Fit, NullObject
 
 from metaculus_bot.constants import DOCUMENT_DIGEST_WINDOW_CHARS
 from metaculus_bot.research import document_text
@@ -132,6 +135,22 @@ class _FakeClock:
         now = self._now
         self._now += self._step
         return now
+
+
+class _FakeDestination(Destination):
+    """A Destination with a title and no real page object; page lookups are faked on the reader."""
+
+    def __init__(self, title: str) -> None:
+        super().__init__(title, NullObject(), Fit.fit())
+
+
+class _FakeReader:
+    def __init__(self, outline: list[object]) -> None:
+        self.outline = outline
+
+    def get_destination_page_number(self, destination: Destination) -> int:
+        del destination
+        return 0
 
 
 class TestIsPdfBody:
@@ -294,6 +313,21 @@ class TestOutline:
         assert result.outline == (("Chapter One", 1), ("Chapter Two", 2), ("Section 2.1", 3)), (
             "pages are 1-based and the nested child sits inline after its parent"
         )
+
+    def test_a_pathologically_deep_outline_does_not_raise(self) -> None:
+        # A bookmark tree nested deeper than the interpreter's recursion limit must flatten,
+        # not raise RecursionError: the module's contract is that a bad PDF never raises.
+        depth = sys.getrecursionlimit() + 200
+        nested: list[object] = [_FakeDestination("leaf")]
+        for _ in range(depth):
+            nested = [nested]
+        reader = cast(PdfReader, _FakeReader(outline=[_FakeDestination("root"), nested]))
+        assert document_text._walk_outline(reader, reader.outline) == [("root", 1), ("leaf", 1)]  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_pathologically_wide_outline_is_capped(self) -> None:
+        wide: list[object] = [_FakeDestination(f"b{i}") for i in range(document_text.OUTLINE_MAX_ENTRIES_WALKED + 50)]
+        reader = cast(PdfReader, _FakeReader(outline=wide))
+        assert len(document_text._walk_outline(reader, reader.outline)) == document_text.OUTLINE_MAX_ENTRIES_WALKED  # pyright: ignore[reportPrivateUsage]
 
     def test_no_outline_is_an_empty_tuple(self) -> None:
         result = _extract(build_text_pdf([["no bookmarks here"]]))
