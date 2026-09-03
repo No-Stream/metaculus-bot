@@ -11,6 +11,7 @@ from forecasting_tools import (
     clean_indents,
 )
 
+from metaculus_bot.constants import MC_PROB_MIN
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
 from metaculus_bot.numeric.utils import nominal_bounds
 from metaculus_bot.time_utils import _as_utc
@@ -1046,8 +1047,8 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
             • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
             • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
 
-        [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
-        Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
+        [**CRITICAL**: You MUST assign a probability to EVERY single option listed above.
+        Even if an option seems very unlikely, assign it at least {MC_PROB_MIN}. Never skip any option.]
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream
@@ -1404,8 +1405,8 @@ def stacking_multiple_choice_prompt(
            • Does my distribution appropriately reflect uncertainty?
            • Are my tail probabilities justified given the evidence?
 
-        **CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
-        Even if an option seems very unlikely, assign it at least 1%. Never skip any option.
+        **CRITICAL**: You MUST assign a probability to EVERY single option listed above.
+        Even if an option seems very unlikely, assign it at least {MC_PROB_MIN}. Never skip any option.
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream

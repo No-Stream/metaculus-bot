@@ -1538,7 +1538,10 @@ class TestTemplateStatesEachCheckOnce:
     template as its final numbered step: an instruction that shapes the answer's structure
     belongs in the template, not in a post-hoc reminder. MC also carried three statements of
     "sum to 100%", two of them in integer percent while the schema demands decimals summing to
-    1.0; the schema line is the one the parser reads, so it is the one that stays."""
+    1.0; the schema line is the one the parser reads, so it is the one that stays. The
+    every-option floor was on the percent scale too ("a probability (1-99%)", "at least 1%") and
+    now interpolates MC_PROB_MIN, since a percent-scale option_probs is hard-rejected and drops
+    the whole ballot to the paid LLM salvage rung (q44558)."""
 
     @staticmethod
     def _flat(prompt: str) -> str:
@@ -1624,8 +1627,12 @@ class TestTemplateStatesEachCheckOnce:
         assert "sum to 100" not in flat
         assert "use integers" not in flat
         assert "remember:" not in flat
-        # The every-option requirement is extraction-critical and stays.
-        assert "you must assign a probability (1-99%) to every single option" in flat
+        # The every-option requirement is extraction-critical and stays, but on the DECIMAL
+        # scale: a percent-scale option_probs is hard-rejected by _check_option_probs and
+        # cannot be repaired, so the whole ballot drops to the paid LLM salvage rung.
+        assert "you must assign a probability to every single option" in flat
+        assert "assign it at least 0.01" in flat
+        assert "1-99%" not in flat
 
 
 class TestKeptScaffoldingBullets:
