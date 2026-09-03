@@ -208,9 +208,12 @@ class TestNumericPromptDisplaysNominalBounds:
         prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
         collapsed = " ".join(prompt.split())
         assert "Forecastability and width" in collapsed
-        # No output line: nothing downstream ever read it.
+        # No output line, and no classification block: nothing downstream ever read either.
+        # These are the strings step 9b actually carried at 7e7d449.
         assert "FORECASTABILITY:" not in prompt
-        assert "HIGH / MEDIUM / LOW" not in prompt
+        assert "FORECASTABILITY: HIGH" not in prompt
+        assert "Forecastability classification" not in prompt
+        assert "How inherently predictable is this quantity" not in prompt
         # The decision the step asks for, and what to do at the unforecastable end.
         assert "how forecastable this quantity is from current information" in collapsed
         assert "close to a random walk" in collapsed
@@ -222,8 +225,13 @@ class TestNumericPromptDisplaysNominalBounds:
         assert collapsed.count("generic disposition") == 1
         assert "Calibration guidance:" not in collapsed
         # Both sides of the log-score asymmetry, so neither direction is a standing push.
-        assert "narrow" in collapsed
-        assert "wide" in collapsed
+        # Pinned as the whole clause: bare "narrow" / "wide" also occur in the Scoring Rule
+        # paragraph and the tails line, so those passed with this step deleted.
+        assert (
+            "Log score punishes a narrow interval that misses far more than a wide one that covers, "
+            "but a wide interval on a predictable quantity also bleeds points" in collapsed
+        )
+        assert "take the width from its realized variability over comparable windows" in collapsed
         # The tails line survives inside the same step.
         assert (
             "Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name"
