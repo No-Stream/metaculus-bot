@@ -62,7 +62,10 @@ Paid / external-effecting — ask before each:
   does and publish to Metaculus. `test_bot_basic.yaml` (one numeric question,
   ~$2.60) and `test_bot.yaml` are `workflow_dispatch`-only, so they fire when
   somebody chooses to fire them — that choice is the operator's. The three
-  `run_bot_on_*.yaml` prod workflows are additionally on `schedule:` crons.
+  `run_bot_on_*.yaml` prod workflows are additionally on `schedule:` crons. **Only `run_bot_on_tournament.yaml` actually runs**: the minibench and Metaculus Cup workflows are
+  `disabled_manually` on GitHub by operator design and have NEVER been enabled (confirmed 2026-09-03), so a
+  supply-probe row saying minibench has 60 closed questions with zero bot forecasts is expected, not a forfeit
+  or a token problem. Do not ask the operator about it again.
   Never dispatch one, and never edit a `schedule:` block or a research/model flag
   in a way that adds runs or raises per-run cost, without the operator's say-so.
   (`gh` needs `--repo No-Stream/metaculus-bot` here: `origin` is the fork,
