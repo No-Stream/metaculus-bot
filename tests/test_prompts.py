@@ -20,6 +20,7 @@ from metaculus_bot.prompts import (
     _AUTO_ANNOTATED_CITATION_CLAUSE,
     _OUTSIDE_VENUE_MARKET_ODDS_BULLET,
     _SOURCE_TIER_TAG_INSTRUCTION,
+    MARKET_SNAPSHOT_SECTION_HEADER,
     TS_ANCHOR_SECTION_HEADER,
     asknews_summarizer_prompt,
     binary_prompt,
@@ -33,6 +34,12 @@ from metaculus_bot.prompts import (
     web_research_prompt,
 )
 from metaculus_bot.research.gemini_attribution import UNVERIFIED_ATTRIBUTION_MARKER
+from metaculus_bot.research.section_format import PROVIDER_SECTION_HEADERS
+
+# Research that carries a rendered prediction-market section. The market clause in the three
+# forecaster prompts is gated on this header (see TestPredictionMarketFraming), so tests that
+# assert on the clause must hand the prompt research that would actually have carried a snapshot.
+_RESEARCH_WITH_MARKETS = f"Some news.\n\n{MARKET_SNAPSHOT_SECTION_HEADER}\n| venue | market | prob |\n| k | m | 0.4 |"
 
 # gap_fill_analyzer_prompt
 
@@ -209,12 +216,18 @@ class TestForecastingWindowAnchor:
         assert "days from now" in result
         assert "BEFORE the open date" in result
 
-    def test_binary_phase0_reinforcement_present(self) -> None:
-        """The Phase 0 resolution check must remind the model about the open timestamp."""
+    def test_binary_pre_open_rule_is_stated_twice_not_three_times(self) -> None:
+        """The pre-open footgun has cost the bot badly, so the rule is deliberately stated
+        TWICE: the forecasting-window line ("events before the open date do NOT resolve YES")
+        and the status-quo derivation's demand to name the specific POST-OPEN event. The third
+        statement, a 447-char 0a restatement with the 1945-detonation worked example, was
+        retired as pure repetition (its receipt is the window line's own docstring)."""
         result = binary_prompt(_binary_q(), research="r")
-        assert "open timestamp" in result
-        assert "1945" in result  # the worked example
-        assert "pre-dating the open date" in result
+        assert "BEFORE the open date" in result
+        assert "POST-OPEN event" in result
+        assert "1945" not in result
+        assert "pre-dating the open date" not in result
+        assert "open timestamp" not in result
 
     def test_binary_asserts_on_missing_open_time(self) -> None:
         """Missing timestamps are a data bug, not a graceful-degrade path."""
@@ -604,12 +617,20 @@ class TestPredictionMarketFraming:
     that a forecaster may supplement the research with its own training
     knowledge is a SEPARATE, prompt-wide directive — not a market-specific one.
 
-    Leakage note: these forecaster prompts have no ``is_benchmarking`` branch —
-    benchmarking suppression happens upstream at the research-data layer (the
-    prediction-market provider is dropped, so ``{research}`` carries no market
-    prices during backtests), which makes this mode-agnostic framing inert
-    when benchmarking. The mode-dependent leakage guard lives on
-    ``web_research_prompt`` (see ``test_strong_evidence_framing_suppressed_when_benchmarking``).
+    Gate: the whole clause renders ONLY when the research carries the rendered
+    ``## Prediction Market Snapshot`` section (``MARKET_SNAPSHOT_SECTION_HEADER``), the
+    same way the numeric prompt gates its TS-anchor clause. Prod-neutral: the header is
+    emitted whenever the provider rendered anything, including the deliberate-empty "no
+    relevant market" sentence, and it is absent only when the provider returned ``""``
+    (benchmarking, flag off, soft-fail) — exactly the prompts where the market policy
+    had nothing to bear on. That also makes the leakage story simpler than it was: a
+    benchmarking prompt no longer carries three paragraphs about markets it cannot see.
+    The mode-dependent leakage guard on the RESEARCH side still lives on
+    ``web_research_prompt`` (see ``test_market_ask_present_non_benchmarking_absent_benchmarking``).
+
+    Notation vs policy: the rendered table's own legend (``MARKET_SIGNAL_LEGEND``) defines the
+    relation tiers, the evidential order, RESOLVED, the ``↳`` rows and ``[remaining N]``; the
+    prompt keeps only the three READING rules the legend does not carry.
     """
 
     def _assert_strong_evidence_framing(self, prompt: str) -> None:
@@ -625,59 +646,45 @@ class TestPredictionMarketFraming:
         assert "extrapolate" in lowered
         assert "constant-hazard" in lowered or "base-rate-over-time" in lowered
         assert "show the arithmetic" in lowered
-        # The liquidity-weighting sentence: weight a crowd signal by how informative it is.
-        assert "weight each market/crowd signal by its stated liquidity/participation label" in lowered
-        # The relation axis, which ranked retrieval added alongside liquidity. The table now
-        # arrives in evidential order with a per-row `relation` grade, so the prompt has to name
-        # the ORDER, name every tier a cell can hold, and say what RESOLVED means about a price —
-        # a forecaster told to weight by a label it was never taught will guess at it.
-        assert "listed in order of evidential value" in lowered
-        for tier in ("same_quantity_same_date", "same_quantity_other_cut", "driver_or_consequence"):
-            assert f"`{tier}`" in lowered, tier
-        assert "realized outcome rather than a forecast" in lowered
-        # Which label wins when the two axes disagree. A tight relation on a THIN market is the shape
-        # that cost q45189: all three forecasters imported a thin single-strike price at full weight,
-        # because the prompt named both labels and never said the liquidity warning governs the price.
-        # The instruction has to be directional too — widen around the implied value rather than
-        # transplant it — since "discount a thin market" alone is what they thought they were doing.
-        assert "the liquidity warning governs the price" in lowered
-        assert "widening your distribution around its implied value" in lowered
-        assert "rather than transplanting its price exactly" in lowered
-        # A multi-outcome market (Kalshi strike family, Polymarket event, PredictIt ballot) has no
-        # single price, so the row the forecaster is told to anchor on renders a blank `prob` cell
-        # and its outcomes carry the prices on indented sub-rows. Without this the strongest
-        # available evidence reads as a market with no price. The glyph itself is explained in the
-        # rendered table's legend; what belongs in the prompt is the anchoring rule.
-        assert "a market with several outcomes has no single price" in lowered
-        assert "anchor on the outcome matching this question" in lowered
-        # And the rule that anchoring on ONE of those outcomes is not enough. A family of `↳` rows is
-        # a distribution over the market's own question, so reading one bracket as an equality
-        # constraint on a tail is a category error — which is exactly what q45189 cost: all three
-        # forecasters correctly identified the margin-vs-share mismatch on a ten-bracket Kalshi ladder,
-        # then each anchored on the single bracket the render had shown them and cut the resolving
-        # bucket below its own prior. The render change makes the whole ladder available; this sentence
-        # is what tells a forecaster to read it as a distribution.
+        # Reading rule 1: an other-cut market is the same quantity at another date/threshold/source,
+        # so it is something to extrapolate from, not to haircut.
+        assert "`same_quantity_other_cut`" in lowered
+        assert "extrapolate from it rather than discount it vaguely" in lowered
+        # Reading rule 2: which label wins when the two axes disagree. A tight relation on a THIN
+        # market is the shape that cost q45189: all three forecasters imported a thin single-strike
+        # price at full weight. The rule carries its reason (a thin price is noisy however tight its
+        # relation) and is directional — widen around the implied value rather than transplant it.
+        assert "the liquidity warning governs" in lowered
+        assert "a thin price is noisy however tight its relation" in lowered
+        assert "widen around its implied value rather than transplant its price" in lowered
+        # Reading rule 3: a family of `↳` rows is a distribution over the market's own question, so
+        # reading one bracket as an equality constraint on a tail is a category error — the other
+        # half of q45189 (all three cut the resolving bucket below their own prior that way).
         assert "is a distribution over that market's own question" in lowered
         assert "read the whole ladder" in lowered
-        assert "[remaining n]" in lowered, "the prompt must name the row the rest of the ladder lives on"
-        # The ladder sentence must describe what the renderer actually does under
-        # compaction: outcomes are either named with their own price or inside a
-        # counted group with its summed price (rendering.py's collapse stages —
-        # unquoted, then settled, then the cheapest open outcomes).
-        assert "accounts for every outcome not given a row of its own" in lowered
-        assert "inside a counted group with its summed price" in lowered
-        # The pre-fix overstatement must stay gone: from stage 3 up some OPEN
-        # outcomes carry only a count and a summed price, so "prices every
-        # outcome" asserted a render the collapse stages do not always deliver
-        # (verify_market-render.md Issue D).
-        assert "which prices every outcome" not in lowered
         assert "never treat one outcome's price as an equality constraint" in lowered
+        assert "cut the resolving bucket below the forecaster's own prior" in lowered
+        # NOTATION is the legend's job, stated beside the table; the prompt must not re-teach it.
+        # These are the phrases the pre-2026-09 clause carried that duplicated MARKET_SIGNAL_LEGEND.
+        assert "weight each market/crowd signal by its stated liquidity/participation label" not in lowered
+        assert "listed in order of evidential value" not in lowered
+        assert "realized outcome rather than a forecast" not in lowered
+        assert "a market with several outcomes has no single price" not in lowered
+        assert "[remaining n]" not in lowered
+        assert "inside a counted group with its summed price" not in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
         # The mis-scoped "you may deviate from a market" carve-out must NOT be present —
         # it undercut the strong-evidence framing. The general expertise principle is
         # asserted separately below.
         assert "deviate from a market" not in lowered
+
+    def _assert_market_clause_absent(self, prompt: str) -> None:
+        lowered = " ".join(prompt.lower().split())
+        assert "prediction markets are strong evidence" not in lowered
+        assert "weight them heavily" not in lowered
+        assert "equality constraint" not in lowered
+        assert "liquidity warning" not in lowered
 
     def _assert_general_expertise_principle(self, prompt: str) -> None:
         """The prompt-wide directive that a forecaster may draw on its own training
@@ -687,14 +694,41 @@ class TestPredictionMarketFraming:
         assert "you are not required to ground every claim in the research" in lowered
 
     def test_binary_prompt_frames_markets_as_strong_evidence(self) -> None:
-        self._assert_strong_evidence_framing(binary_prompt(_binary_q(), research="r"))
+        self._assert_strong_evidence_framing(binary_prompt(_binary_q(), research=_RESEARCH_WITH_MARKETS))
 
     def test_multiple_choice_prompt_frames_markets_as_strong_evidence(self) -> None:
-        self._assert_strong_evidence_framing(multiple_choice_prompt(_mc_q(), research="r"))
+        self._assert_strong_evidence_framing(multiple_choice_prompt(_mc_q(), research=_RESEARCH_WITH_MARKETS))
 
     def test_numeric_prompt_frames_markets_as_strong_evidence(self) -> None:
-        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        result = numeric_prompt(
+            _numeric_q(), research=_RESEARCH_WITH_MARKETS, lower_bound_message="lbm", upper_bound_message="ubm"
+        )
         self._assert_strong_evidence_framing(result)
+
+    def test_market_clause_absent_when_research_carries_no_snapshot(self) -> None:
+        """No snapshot section, no market policy: the clause is ~1.5k chars of instruction about
+        a table the forecaster does not have, and before the gate every benchmarking, flag-off and
+        soft-failed prompt paid for it."""
+        self._assert_market_clause_absent(binary_prompt(_binary_q(), research="Just some news."))
+        self._assert_market_clause_absent(multiple_choice_prompt(_mc_q(), research="Just some news."))
+        self._assert_market_clause_absent(
+            numeric_prompt(
+                _numeric_q(), research="Just some news.", lower_bound_message="lbm", upper_bound_message="ubm"
+            )
+        )
+
+    def test_market_clause_not_triggered_by_another_providers_header(self) -> None:
+        research = f"{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20"
+        self._assert_market_clause_absent(
+            numeric_prompt(_numeric_q(), research=research, lower_bound_message="lbm", upper_bound_message="ubm")
+        )
+
+    def test_gate_header_is_the_one_the_provider_actually_renders(self) -> None:
+        """Pinned against the provider-to-header map rather than a copied string: if the market
+        provider's section header ever changes, the gate has to move with it or every prod prompt
+        silently loses the clause."""
+        assert PROVIDER_SECTION_HEADERS["prediction_market"] is MARKET_SNAPSHOT_SECTION_HEADER
+        assert MARKET_SNAPSHOT_SECTION_HEADER == "## Prediction Market Snapshot"
 
     def test_binary_prompt_carries_general_expertise_principle(self) -> None:
         self._assert_general_expertise_principle(binary_prompt(_binary_q(), research="r"))
@@ -738,6 +772,17 @@ class TestSourceProvenanceLadder:
         lowered = " ".join(prompt.lower().split())
         assert "proximity to the primary record" in lowered
         assert "against the speaker's interest" in lowered
+        # The A-D DEFINITIONS live once, in the research-side _SOURCE_TIER_TAG_INSTRUCTION, and
+        # the briefing arrives carrying the tags (99 of 1,069 archive records, every one since the
+        # tagging landed in prod). The forecaster ladder names the tag shape and keeps only the two
+        # USAGE clauses the tag instruction does not state: (C) facts-not-framing, (D) suggestive only.
+        assert "arrive tagged by source tier" in lowered
+        assert "[a: ...]" in lowered
+        assert "use their cited facts, not their framing" in lowered
+        assert "suggestive only" in lowered
+        assert "government statistics, regulatory filings" not in lowered, (
+            "the tier definitions were re-teaching what the research-side tag instruction already defines"
+        )
 
     def _assert_unverified_attribution_defined(self, prompt: str) -> None:
         """`[unverified attribution]` reaches the forecaster in gemini research sections
@@ -747,7 +792,7 @@ class TestSourceProvenanceLadder:
         claims where the guess matters."""
         lowered = " ".join(prompt.lower().split())
         assert "[unverified attribution]" in lowered
-        assert "could not match the outlet the text named against its own retrieval record" in lowered
+        assert "could not match against its own retrieval record" in lowered
         # The two halves that keep it from reading as "this fact is false" or as a tier grade.
         assert "the claim itself may still be correct" in lowered
         assert "untiered, unattributed evidence rather than as a named outlet's authority" in lowered
@@ -778,13 +823,21 @@ class TestSourceProvenanceLadder:
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         self._assert_ladder_present(result)
 
-    def test_numeric_prompt_preserves_data_anchor(self) -> None:
-        """Regression: appending the ladder must not displace the load-bearing
-        data-anchor bullet in the numeric Source-analysis section."""
+    def test_numeric_status_quo_derivation_is_the_one_anchor_to_latest_statement(self) -> None:
+        """The numeric prompt used to tell the model five times how to pick a centre: the
+        step-0 status-quo derivation, a step-1 "centered near this value" push, a step-3
+        "status-quo outcome" line, step-3 trend continuation and a step-7 trajectory check.
+        One anchor statement (step 0, which already says to move off the latest measurement
+        only for a named post-open event) and one trend statement (step 3) remain."""
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         lowered = " ".join(result.lower().split())
-        assert "most recent authoritative measurement" in lowered
-        assert "centered near this value" in lowered
+        assert lowered.count("most recent authoritative measurement") == 1
+        assert lowered.count("trend continuation") == 1
+        assert "centered near this value" not in lowered
+        assert "status-quo outcome" not in lowered
+        assert "trajectory check" not in lowered
+        # Step 1 no longer claims a "data anchor" it does not carry.
+        assert "source analysis and data anchor" not in lowered
 
 
 class TestPresentTenseInstrumentGaps:
@@ -827,11 +880,49 @@ class TestPresentTenseInstrumentGaps:
         pass is roughly 44% of research spend. The carve-out also keeps the block from
         fighting the prompt's own "DO NOT invent gaps" discipline."""
         lowered = " ".join(self._analyzer().lower().split())
-        assert "if the first pass already states that source's current reading with the date it was read" in lowered
-        assert "no slot should be spent re-fetching a value the briefing holds" in lowered
-        # The two conditions that still earn a verify-style gap.
-        assert "carries no as-of date" in lowered
-        assert "older than the source's own update cadence" in lowered
+        assert "already states the source's current reading with its as-of date counts as answered" in lowered
+        assert "spend the slot on something the briefing lacks" in lowered
+        # The two conditions that still earn a verify-style gap, in one clause.
+        assert "re-ask only if the stated reading is undated or older than the source's own update cadence" in lowered
+
+    def test_analyzer_states_the_present_tense_mandate_with_its_reason(self) -> None:
+        lowered = " ".join(self._analyzer().lower().split())
+        assert "the current reading is the single fact that most often decides these questions" in lowered
+
+
+class TestGapFillAnalyzerSlotDiscipline:
+    """The analyzer fills every slot whatever it is told: 55-77% of archived records sit at
+    the cap and only 8 of 308 returned one or two gaps, so the old "Most questions have 0-2
+    real gaps; a few have 3-5" was behaviourally dead and "3-5" was stale against
+    GAP_FILL_MAX_GAPS = 4. What earns its place is the discipline with its reason (each gap
+    is a paid search) and the ordering contract the cap relies on (order is the ranking, no
+    rank fields). Receipt: scratch/prompt_bloat_audit_2026-09-02.md section 8."""
+
+    def _analyzer(self) -> str:
+        return gap_fill_analyzer_prompt(
+            "Will X happen?",
+            "Resolves YES if X.",
+            "fp",
+            "First pass.",
+            is_benchmarking=False,
+            max_gaps=4,
+        )
+
+    def test_gap_counts_are_gone_and_the_discipline_keeps_its_reason(self) -> None:
+        flat = " ".join(self._analyzer().lower().split())
+        assert "most questions have 0-2" not in flat
+        assert "a few have 3-5" not in flat
+        assert "be thorough but selective" not in flat
+        assert "do not invent gaps for completeness" in flat
+        assert "each gap is a paid search" in flat
+
+    def test_ordering_contract_is_two_sentences(self) -> None:
+        flat = " ".join(self._analyzer().lower().split())
+        assert "order the gaps most forecast-moving first" in flat
+        assert "the list order is the ranking" in flat
+        assert "do not add rank fields or scores" in flat
+        assert "compare the candidate gaps against each other" not in flat
+        assert "order the gaps by decision-relevance" not in flat
 
 
 class TestNullResultReadingClause:
@@ -847,9 +938,12 @@ class TestNullResultReadingClause:
         lowered = " ".join(prompt.lower().split())
         assert "read a null search result as a null search result" in lowered
         assert "could not find evidence of x" in lowered
-        # Coverage-conditioned strength, and the demonstrated-capability discount.
+        # Coverage-conditioned strength.
         assert "weight the absence by how well the topic is covered" in lowered
-        assert "already demonstrated the capability" in lowered
+        # The retired third bullet ("weaker still where the actor has already demonstrated the
+        # behavior") carried no receipt of its own and pushed the wrong way on qid 43837, where
+        # Metaculus had announced eleven prior tournaments, none was found, and the answer was NO.
+        assert "already demonstrated the capability" not in lowered
 
     def test_binary_prompt_carries_null_result_clause(self) -> None:
         self._assert_forecaster_clause_present(binary_prompt(_binary_q(), research="r"))
@@ -893,14 +987,29 @@ class TestNullResultReadingClause:
 
 
 class TestOutsideViewRubricRules:
-    """The three 2026-09-01 outside-view rules, all from verified misses in that
-    residual round. qid 43837: six members applied a monthly announcement rate over the
-    FULL question window when 16 days had already elapsed event-free, then OR-ed it with
-    a specific scheduled path the rate already contained. qid 44557: four of six wrote a
-    17-25% base rate and published 35-55% on soft schedule signals. qid 44561: all six
-    built a "no failure announced yet, so Poisson(1.0)" schedule model instead of the
-    pooled FDIC failure rate. Each rule is a named module constant, so there is exactly
-    one place to read the wording."""
+    """The outside-view corrections from the 2026-09-01 residual round, each stated ONCE.
+
+    qid 43837: six members applied a monthly announcement rate over the FULL question
+    window when 16 days had already elapsed event-free, then OR-ed it with a specific
+    scheduled path the rate already contained. The correction survives in two places
+    that were already there: the remaining-exposure sentence rides the binary
+    conditional-hazard bullet (and stands alone as one MC bullet, since MC has no
+    hazard bullet), and the disjointness half lives in the binary union line. The
+    standalone `_REMAINING_EXPOSURE_RULE` that restated both was retired.
+
+    qid 44557: four of six wrote a 17-25% base rate and published 35-55% on soft
+    schedule signals. What survives is the SIZE: the existing "Anchor on your math"
+    bullet now says a move of more than about 15 points needs a named reason. The
+    standalone `_ANCHOR_CONSISTENCY_RULE` was retired — its first bullet was the fourth
+    request to state the anchor, and its second ("do not move off your number on a
+    general feeling that history counsels caution") priced at zero on the whole archive
+    and would suppress good moves.
+
+    qid 44561: all six built a "no failure announced yet, so Poisson(1.0)" schedule
+    model instead of the pooled FDIC failure rate; `_COUNT_IN_PERIOD_REFERENCE_CLASS`
+    stays verbatim in all three prompts.
+
+    Receipts: scratch/prompt_bloat_audit_2026-09-02.md, scratch/prompt_debloat_2026-09-02/receipts.md."""
 
     @staticmethod
     def _flat(prompt: str) -> str:
@@ -917,46 +1026,61 @@ class TestOutsideViewRubricRules:
     def _numeric(self) -> str:
         return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
 
-    # -- remaining exposure + disjointness (binary, MC) --------------------
+    # -- remaining exposure (binary, MC): once each --------------------------
 
-    def _assert_remaining_exposure(self, prompt: str) -> None:
+    _EXPOSURE_KEY = "rates apply to the exposure that remains"
+
+    def _assert_remaining_exposure_once(self, prompt: str) -> None:
         flat = self._flat(prompt)
-        assert "outside-view rates apply to the exposure that remains" in flat
-        assert "apply it from now until the question's deadline" in flat
-        assert "already elapsed without the event as observed" in flat
-        # The double-count half: a named path and the rate that contains it.
-        assert "the two must be disjoint" in flat
-        assert "remove that path's own instances from the rate before combining" in flat
+        assert flat.count(self._EXPOSURE_KEY) == 1, "the exposure rule must be stated exactly once"
+        assert "apply it from now until the deadline" in flat
+        assert "treating the elapsed event-free part of the window as observed" in flat
+        # The retired constant's phrasings must not come back beside the surviving statement.
+        assert "outside-view rates apply to the exposure" not in flat
+        assert "the two must be disjoint" not in flat
+        assert "remove that path's own instances from the rate before combining" not in flat
 
-    def test_binary_prompt_carries_remaining_exposure_rule(self) -> None:
-        self._assert_remaining_exposure(self._binary())
+    def test_binary_prompt_states_remaining_exposure_once_inside_the_hazard_bullet(self) -> None:
+        prompt = self._binary()
+        self._assert_remaining_exposure_once(prompt)
+        # Folded INTO the conditional-hazard bullet, which is the same rule for recurring events.
+        flat = self._flat(prompt)
+        bullet_at = flat.index(self._EXPOSURE_KEY)
+        assert "no event in the t days already elapsed" in flat[bullet_at : bullet_at + 900]
+        assert "non-recurring, conditional-hazard skipped" in flat[bullet_at : bullet_at + 900]
 
-    def test_multiple_choice_prompt_carries_remaining_exposure_rule(self) -> None:
-        self._assert_remaining_exposure(self._mc())
+    def test_multiple_choice_prompt_states_remaining_exposure_once(self) -> None:
+        self._assert_remaining_exposure_once(self._mc())
 
     def test_binary_union_line_requires_disjoint_paths(self) -> None:
         """The union instruction itself is what invited the qid 43837 double count, so
-        the disjointness requirement lands where the union is computed, not only in the
-        rule below it."""
+        the disjointness requirement lives where the union is computed — and only there,
+        since MC never computes a union."""
         flat = self._flat(self._binary())
         assert "1 - product of (1-p_i)" in flat
         assert "union only over paths that cannot be the same event" in flat
+        assert "union only over paths" not in self._flat(self._mc())
 
-    # -- anchor consistency (binary, MC) -----------------------------------
+    # -- anchor adherence (binary, MC): one rule, with a size ----------------
 
-    def _assert_anchor_consistency(self, prompt: str) -> None:
+    _ANCHOR_SIZE = "more than about 15 points"
+
+    def _assert_single_anchor_rule_with_size(self, prompt: str) -> None:
         flat = self._flat(prompt)
-        assert "state the outside-view number you computed" in flat
-        assert "more than about 15 percentage points" in flat
-        assert "naming the specific evidence that justifies the gap" in flat
-        # And the reverse failure: drifting off your own number on disposition alone.
-        assert "do not move off your own number on a general feeling" in flat
+        assert "anchor on your math" in flat
+        assert flat.count(self._ANCHOR_SIZE) == 1, "the 15-point size belongs to exactly one bullet"
+        assert "named, specific" in flat
+        # The retired `_ANCHOR_CONSISTENCY_RULE` phrasings.
+        assert "state the outside-view number you computed" not in flat
+        assert "more than about 15 percentage points" not in flat
+        assert "do not move off your own number on a general feeling" not in flat
+        assert "history counsels caution" not in flat
 
-    def test_binary_prompt_carries_anchor_consistency_rule(self) -> None:
-        self._assert_anchor_consistency(self._binary())
+    def test_binary_prompt_has_one_anchor_rule_sized_at_15_points(self) -> None:
+        self._assert_single_anchor_rule_with_size(self._binary())
 
-    def test_multiple_choice_prompt_carries_anchor_consistency_rule(self) -> None:
-        self._assert_anchor_consistency(self._mc())
+    def test_multiple_choice_prompt_has_one_anchor_rule_sized_at_15_points(self) -> None:
+        self._assert_single_anchor_rule_with_size(self._mc())
 
     # -- count-in-period reference class (all three types) -----------------
 
@@ -975,23 +1099,21 @@ class TestOutsideViewRubricRules:
 
     def test_numeric_prompt_carries_count_in_period_class(self) -> None:
         """Count questions arrive as all three question types, so this one rule ships to
-        the numeric prompt too — unlike the other two, which are probability-shaped."""
+        the numeric prompt too — unlike the exposure rule, which is probability-shaped."""
         self._assert_count_in_period(self._numeric())
 
     # -- placement + scope -------------------------------------------------
 
-    def test_rules_sit_in_the_outside_view_phase(self) -> None:
-        """All three are outside-view rules: they must land inside PHASE 1, before the
-        inside-view update, so the model reads them while computing the number."""
+    def test_outside_view_rules_sit_in_the_outside_view_phase(self) -> None:
+        """Both outside-view rules must land inside PHASE 1, before the inside-view update,
+        so the model reads them while computing the number. The anchor size rides the
+        final-rationale bullet in PHASE 2, where the final number is written."""
         prompt = self._binary()
         phase1_at = prompt.index("PHASE 1: OUTSIDE VIEW")
         phase2_at = prompt.index("PHASE 2: INSIDE VIEW UPDATE")
-        for phrase in (
-            "For questions asking how many events",
-            "Outside-view rates apply to the exposure that REMAINS",
-            "State the outside-view number you computed",
-        ):
+        for phrase in ("For questions asking how many events", "Rates apply to the exposure that REMAINS"):
             assert phase1_at < prompt.index(phrase) < phase2_at, f"{phrase!r} outside PHASE 1"
+        assert prompt.index("Anchor on your math") > phase2_at
 
     def test_stacking_prompts_do_not_carry_the_rules(self) -> None:
         """Same scope guard as the null-result clause: base prompts only, since stacking
@@ -1008,22 +1130,31 @@ class TestOutsideViewRubricRules:
             ),
         ]
         for prompt in stacked:
-            assert "Outside-view rates apply to the exposure that REMAINS" not in prompt
-            assert "State the outside-view number you computed" not in prompt
-            assert "For questions asking how many events of a kind occur in a period" not in prompt
+            flat = self._flat(prompt)
+            assert self._EXPOSURE_KEY not in flat
+            assert self._ANCHOR_SIZE not in flat
+            assert "anchor on your math" not in flat
+            assert "how many events of a kind occur in a period" not in flat
 
     def test_numeric_prompt_does_not_carry_the_probability_shaped_rules(self) -> None:
-        """Scope: the exposure and anchor rules are worded in probabilities, while the
-        numeric prompt anchors on a range. Only the reference-class rule ships there."""
-        numeric = self._numeric()
-        assert "Outside-view rates apply to the exposure that REMAINS" not in numeric
-        assert "State the outside-view number you computed" not in numeric
+        """Scope: the exposure rule and the 15-point size are worded in probabilities, while
+        the numeric prompt anchors on a range. Only the reference-class rule ships there."""
+        flat = self._flat(self._numeric())
+        assert self._EXPOSURE_KEY not in flat
+        assert self._ANCHOR_SIZE not in flat
 
 
-class TestLastRealApplicationGap:
+class TestLastRealApplicationClause:
     """qid 45215: the question turned on how an electoral threshold cashed out at the
     last real election, a training-data fact no research bundle held and no gap asked
-    for. Analyzer-only — it directs a search slot, which a forecaster prompt cannot."""
+    for. Analyzer-only — it directs a search slot, which a forecaster prompt cannot.
+
+    It shipped as a standalone block whose "one gap MUST ask" mandate pre-committed a paid
+    slot; since the analyzer fills every slot regardless, a mandate does not add spend, it
+    DISPLACES other gaps, and a second mandate beside ANSWERABLE NOW's pre-committed half
+    the slots on a question with both a live instrument and an institutional rule. The gap
+    type is right, so it now lives as a candidate clause inside gap type 6 (base rate /
+    reference class), where the analyzer weighs it against the other gap types."""
 
     def _analyzer(self) -> str:
         return gap_fill_analyzer_prompt(
@@ -1034,36 +1165,39 @@ class TestLastRealApplicationGap:
             is_benchmarking=False,
         )
 
-    def test_analyzer_requires_a_last_real_application_gap(self) -> None:
-        flat = " ".join(self._analyzer().lower().split())
-        assert "last real application of the rule" in flat
-        assert "discontinuous institutional rule applied by a body" in flat
-        assert "at its most recent real application" in flat
+    def test_last_real_application_is_a_candidate_inside_gap_type_six(self) -> None:
+        prompt = self._analyzer()
+        flat = " ".join(prompt.lower().split())
+        assert "how that rule actually applied at its most recent real application" in flat
         assert "as a realized count or outcome" in flat
+        assert "an electoral threshold, a quota, an allocation formula, a cut-off score" in flat
+        # Inside type 6, between the base-rate item and the expert-opinion item.
+        type_six_at = flat.index("6. missing base rate / reference class")
+        type_seven_at = flat.index("7. missing expert opinion")
+        assert type_six_at < flat.index("most recent real application") < type_seven_at
 
-    def test_analyzer_separates_the_institution_rule_from_the_question_threshold(self) -> None:
+    def test_clause_separates_the_institution_rule_from_the_question_threshold(self) -> None:
         """The gap is about how the BODY applies its own rule, not a restatement of the
         question's resolution threshold, which the analyzer already has in front of it."""
         flat = " ".join(self._analyzer().lower().split())
-        assert "not about the question's own resolution threshold" in flat
+        assert "a different fact from the question's own resolution threshold" in flat
 
-    def test_rule_does_not_override_the_do_not_invent_gaps_discipline(self) -> None:
-        flat = " ".join(self._analyzer().lower().split())
-        assert "do not invent gaps" in flat
-        assert "only when such a rule is actually in play" in flat
-
-    def test_rule_sits_with_the_answerable_now_block(self) -> None:
+    def test_the_standalone_mandate_is_gone(self) -> None:
         prompt = self._analyzer()
-        assert prompt.index("ANSWERABLE NOW") < prompt.index("LAST REAL APPLICATION OF THE RULE")
+        assert "LAST REAL APPLICATION OF THE RULE" not in prompt
+        flat = " ".join(prompt.lower().split())
+        assert "one gap must ask how that rule" not in flat
+        # ANSWERABLE NOW keeps the one slot mandate the prompt still carries.
+        assert flat.count("must ask") == 1
 
-    def test_forecaster_prompts_do_not_carry_the_gap_rule(self) -> None:
+    def test_forecaster_prompts_do_not_carry_the_gap_clause(self) -> None:
         """Scope guard: this one is an instruction to the gap AUDITOR."""
         for prompt in (
             binary_prompt(_binary_q(), research="r"),
             multiple_choice_prompt(_mc_q(), research="r"),
             numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"),
         ):
-            assert "LAST REAL APPLICATION OF THE RULE" not in prompt
+            assert "most recent real application" not in prompt
 
 
 class TestMcExampleBlockEscaping:
@@ -1178,7 +1312,9 @@ class TestConjunctiveCriteriaPricing:
         87% via 'season-specific upward adjustment'). Any deviation from the
         product must operate through the clause probabilities themselves, a
         named clause dependence, or a corrected clause decomposition; overrides
-        that route around the clauses are explicitly forbidden."""
+        that route around the clauses are explicitly forbidden. Kept through the
+        2026-09 de-bloat by operator decision, with its reason attached: the
+        criteria stay consumed as constraints."""
         prompt = binary_prompt(_binary_q(), research="r")
         lowered = " ".join(prompt.lower().split())
         assert "you have exactly three valid moves" in lowered
@@ -1190,7 +1326,121 @@ class TestConjunctiveCriteriaPricing:
             "all hedging and adjustment must operate through the clauses, their dependence, or a corrected "
             "decomposition, not around them" in lowered
         )
+        assert "so the criteria stay consumed as constraints" in lowered
         assert "if none applies, stay at the product" in lowered
+
+    def test_clause_product_is_named_as_the_anchor_on_multi_clause_questions(self) -> None:
+        """Three rules used to say how the final number may differ from a computed one and
+        none said WHICH computation anchors when a Step-2 base rate and a 5b clause product
+        both exist. One sentence where the product is computed now says: the product, because
+        it is the more specific computation; the three valid moves are the ways to leave it."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        lowered = " ".join(prompt.lower().split())
+        assert 'this product is the number the "anchor on your math" check in step 6 anchors to' in lowered
+        assert "because it is the more specific computation" in lowered
+        # The anchor bullet names the product among the computations it covers.
+        assert "clause product" in lowered
+        # And the sentence sits in 5b, before the reconciliation bullet.
+        assert prompt.index("more specific computation") < prompt.index("exactly three valid moves")
+
+
+class TestTemplateStatesEachCheckOnce:
+    """The binary and MC templates said several things twice: an odds check and a small-delta
+    check that both asked how a ±10% shift would sit; a trailing "Brief checklist" whose items
+    re-asked for outputs the template had already produced (0b paraphrases the criteria, step 2
+    states the base rate, step 4 lists the evidence, step 5 red-teams). The two checklist items
+    with no template twin, the bait-and-switch check and the consistency line, moved INTO the
+    template as its final numbered step: an instruction that shapes the answer's structure
+    belongs in the template, not in a post-hoc reminder. MC also carried three statements of
+    "sum to 100%", two of them in integer percent while the schema demands decimals summing to
+    1.0; the schema line is the one the parser reads, so it is the one that stays."""
+
+    @staticmethod
+    def _flat(prompt: str) -> str:
+        return " ".join(prompt.lower().split())
+
+    def _binary(self) -> str:
+        return binary_prompt(_binary_q(), research="r")
+
+    def _mc(self) -> str:
+        return multiple_choice_prompt(_mc_q(), research="r")
+
+    def _numeric(self) -> str:
+        return numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+
+    def test_final_checks_is_the_last_template_step_in_every_base_prompt(self) -> None:
+        for prompt in (self._binary(), self._mc(), self._numeric()):
+            flat = self._flat(prompt)
+            assert flat.count("bait-and-switch check") == 1
+            assert "brief checklist" not in flat
+            # Retired checklist echoes of template outputs.
+            assert "paraphrase the resolution criteria" not in flat
+            assert "paraphrase options" not in flat
+            assert "top 3-5 evidence items" not in flat
+            assert "top 3 to 5 evidence items" not in flat
+            assert "blind-spot scenario most likely" not in flat
+            assert "blind-spot statement" not in flat
+            assert "blind spot scenario and expected effect" not in flat
+            assert "state the outside-view base rate you anchored to" not in flat
+            assert "state the outside-view distribution used as anchor" not in flat
+            assert "state the outside view baseline used" not in flat
+            # Placement: inside the template, after the final-rationale step, before the block.
+            final_checks_at = flat.index("final checks")
+            assert flat.index("final rationale") < final_checks_at < flat.index("structured forecast")
+
+    def test_binary_final_checks_keep_the_consistency_line(self) -> None:
+        flat = self._flat(self._binary())
+        assert 'consistency line: "x out of 100 times, [criteria] happens." sensible?' in flat
+
+    def test_mc_final_checks_keep_the_consistency_line(self) -> None:
+        flat = self._flat(self._mc())
+        assert "most likely: __; least likely: __; coherent with rationale?" in flat
+
+    def test_numeric_final_checks_keep_units_and_the_percentile_consistency_line(self) -> None:
+        """Numeric adds the units bullet: the unit-mismatch guard withholds a forecaster that gets
+        the units wrong, so it is the one checklist item with a pipeline consequence."""
+        flat = self._flat(self._numeric())
+        final_checks = flat[flat.index("final checks") :]
+        assert "units: what are the units of the output values and why?" in final_checks
+        assert "which percentile corresponds to the status quo or trend" in final_checks
+
+    def test_numeric_step_seven_asks_for_a_central_estimate_not_a_probability(self) -> None:
+        """ "My base rate was X% ... moving to Y%" was a probability template copy-pasted onto a
+        distribution question (the sibling numeric odds check was cut for the same reason)."""
+        flat = self._flat(self._numeric())
+        assert (
+            "state your outside-view central estimate and range, then say what the current evidence moved and why"
+            in flat
+        )
+        assert "my base rate was x%" not in flat
+        assert "odds check" not in flat
+
+    def test_numeric_outcome_type_is_defined_once_in_the_schema_notes(self) -> None:
+        """The field was defined three times (step 9, schema notes, example). The schema note is
+        the definition; step 9 is a one-line pointer to it."""
+        flat = self._flat(self._numeric())
+        assert "outcome type classification" not in flat
+        assert flat.count("counts, rankings, number of events") == 1
+        assert "record it in `outcome_type`" in flat
+        assert "definition in the schema notes" in flat
+
+    def test_odds_and_delta_are_one_check(self) -> None:
+        for prompt in (self._binary(), self._mc()):
+            flat = self._flat(prompt)
+            assert flat.count("odds and delta check") == 1
+            assert "odds check:" not in flat
+            assert "small-delta check" not in flat
+            assert "9:1" in flat
+
+    def test_mc_states_the_sum_constraint_once_in_decimals(self) -> None:
+        prompt = self._mc()
+        flat = self._flat(prompt)
+        assert "sum to 1.0" in flat
+        assert "sum to 100" not in flat
+        assert "use integers" not in flat
+        assert "remember:" not in flat
+        # The every-option requirement is extraction-critical and stays.
+        assert "you must assign a probability (1-99%) to every single option" in flat
 
 
 class TestResolutionMetricEcho:
@@ -1460,8 +1710,8 @@ class TestStructuredForecastExampleBlocks:
     is fixed, so a slot in it cannot scaffold reasoning).
     """
 
-    # Retired 2026-09-02: each was read only by dormant telemetry, and every one of them
-    # asked the model for post-hoc admin rather than for its forecast.
+    # Retired by the schema de-bloat: each was read only by dormant telemetry, and every one
+    # of them asked the model for post-hoc admin rather than for its forecast.
     _RETIRED_KEYS = (
         "remaining_window_days",
         "base_rate_anchor",

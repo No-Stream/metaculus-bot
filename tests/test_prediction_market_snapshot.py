@@ -34,6 +34,7 @@ from metaculus_bot.research.market_retrieval.ranking import (
     cap_stale_top_tier,
 )
 from metaculus_bot.research.prediction_market import format_snapshot_for_research
+from metaculus_bot.research.section_format import provider_header
 from scripts.telemetry.markers import MARKER_SPECS
 from tests import market_retrieval_fakes as _fakes
 from tests.market_retrieval_fakes import AUTHOR_JSON as _AUTHOR_JSON
@@ -898,10 +899,13 @@ class TestAFamilyReachesTheForecasterWhole:
 
         # And the whole ladder plus the instruction for reading it land in ONE forecaster prompt. The
         # render half is what makes the distribution available; the prompt sentence is what stops a model
-        # reading one bracket as an equality constraint on a tail (the q45189 failure).
+        # reading one bracket as an equality constraint on a tail (the q45189 failure). The provider
+        # returns the bare snapshot; the orchestrator labels it with the section header on the way to the
+        # forecaster (`assemble_provider_sections`), and the prompt's market clause is gated on that header,
+        # so the prompt is built from the section as the forecaster actually receives it.
         question.open_time = datetime.now(UTC) - timedelta(days=30)
         question.scheduled_resolution_time = datetime.now(UTC) + timedelta(days=120)
-        prompt = binary_prompt(question, research=research)
+        prompt = binary_prompt(question, research=f"{provider_header('prediction_market')}\n{research}")
 
         for label, _ in self._BRACKETS:
             assert label in prompt, label
