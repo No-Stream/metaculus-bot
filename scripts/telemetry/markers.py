@@ -803,10 +803,19 @@ MARKER_SPECS: list[MarkerSpec] = [
         # sitting BETWEEN same-shaped ``\S+`` fields silently records None for a value that
         # WAS emitted, and a keyed tail group cannot mis-claim its neighbour's value, so a
         # line carrying ``route`` but no ``reason`` parses correctly.
+        # ``failure_class`` / ``exc`` / ``server`` (all optional, 2026-09-03) are the failure
+        # diagnostics that separate an egress-reputation refusal from a host fault: a small token
+        # vocabulary (``http_403`` / ``http_4xx`` / ``http_5xx`` off the response, ``tls`` /
+        # ``dns`` / ``timeout`` / ``connection`` / ``decode`` off the transport exception), the
+        # exception class name, and the ``Server`` header lower-cased with internal spaces
+        # collapsed to ``_``. Keyed and TAIL-positioned after ``route`` in that fixed order, each
+        # emitted only when present, so an old parser and every archived line still parse and a
+        # line carrying a later field but not an earlier one cannot mis-claim a neighbour's value.
         re.compile(
             r"RESOLUTION_SOURCE_FETCH:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
             r"\s+status=(?P<status>\S+)\s+http=(?P<http>\S+)\s+embeds=(?P<embeds>\S+)"
             r"(?:\s+reason=(?P<reason>\S+))?(?:\s+route=(?P<route>\S+))?"
+            r"(?:\s+failure_class=(?P<failure_class>\S+))?(?:\s+exc=(?P<exc>\S+))?(?:\s+server=(?P<server>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),

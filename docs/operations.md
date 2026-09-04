@@ -1298,10 +1298,17 @@ the telemetry markers:
   `rendered`, `wayback` or `url_context` for an escalated one (`impersonate` is reserved in
   the vocabulary for a rung that is not built). Without it
   a rescued page reads exactly like one the direct route managed on its own, so "what
-  did the ladder actually buy" would not be a query. Both optional fields are keyed and
-  sit at the end of the line, so a line carrying `route` and no `reason` parses
-  correctly and every archived line still parses byte-identically. Tier-2
-  Datawrapper dataset hops ride the same line and are identifiable by their url
+  did the ladder actually buy" would not be a query. Three more optional keyed fields carry
+  failure diagnostics on a non-success fetch, so the archive can separate an egress-reputation
+  refusal from a host fault (the archived Akamai 403s reproduce only from the GitHub runner
+  IP): `failure_class` is a small token vocabulary (`http_403`, `http_4xx`, `http_5xx` off the
+  response, or `tls`, `dns`, `timeout`, `connection`, `decode` off the transport exception),
+  `exc` is that exception's class name, and `server` is the `Server` response header
+  lower-cased with internal spaces collapsed to `_` (the strongest tell of which CDN refused
+  us). All optional fields are keyed and sit at the end of the line in a fixed order
+  (`reason`, `route`, `failure_class`, `exc`, `server`), so a line carrying a later field but
+  not an earlier one parses correctly and every archived line still parses byte-identically.
+  Tier-2 Datawrapper dataset hops ride the same line and are identifiable by their url
   (`static.dwcdn.net/data/<chart_id>.csv`). This replaced the older free-text
   `resolution_source fetched <netloc> (<status>)` lines rather than joining them, so
   each fetch appears exactly once; the remaining free-text lines are REASON lines (a

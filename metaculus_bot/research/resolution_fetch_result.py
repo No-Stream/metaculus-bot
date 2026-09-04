@@ -259,6 +259,38 @@ _NON_OK_FETCH_STATUS: dict[int, FetchStatus] = {
     410: "not_found",
 }
 
+# The `Server` header is free text and delimiter-hostile; bound it so one hostile value cannot
+# blow the marker line's width, and lower-case it so `akamaighost` and `AkamaiGHost` bucket
+# together.
+_SERVER_HEADER_MAX_CHARS = 40
+
+
+def http_failure_class(status: int | None) -> str | None:
+    """The failure-class token for an HTTP status, or None for a 2xx/3xx or missing status.
+
+    ``http_403`` is called out on its own because it is the egress-reputation refusal the
+    escalation ladder exists for; ``http_4xx`` / ``http_5xx`` bucket the rest by side (client
+    vs server). Riding the ``RESOLUTION_SOURCE_FETCH`` marker, so a query can ask "how often is a
+    cited host giving us 403 specifically" without re-scraping expiring run logs.
+    """
+    if status is None or status < 400:
+        return None
+    if status == 403:
+        return "http_403"
+    return "http_4xx" if status < 500 else "http_5xx"
+
+
+def server_header_token(server: str | None) -> str | None:
+    """The ``Server`` header lower-cased and truncated for the marker, or None when absent.
+
+    Internal whitespace is collapsed to ``_`` so the value stays ONE ``\\S+`` token on the
+    space-delimited marker line (``Apache/2.4 (Ubuntu)`` would otherwise split mid-value); the
+    marker cares about the CDN name (``cloudflare``, ``akamaighost``), which the collapse keeps.
+    """
+    if not server:
+        return None
+    return "_".join(server.strip().lower().split())[:_SERVER_HEADER_MAX_CHARS] or None
+
 
 @dataclass
 class RungAttempt:
@@ -355,6 +387,17 @@ class FetchResult:
     chart_title: str | None = None
     parent_url: str | None = None
     data_last_modified: str | None = None  # ISO-8601; None when the header was missing/unparseable
+    # Failure diagnostics for the `RESOLUTION_SOURCE_FETCH` marker, so the archive can separate an
+    # egress-reputation refusal from a host-side fault — the measurement the escalation ladder's
+    # own case rests on (the archived Akamai 403s reproduce only from the GitHub runner). All None
+    # on a success and on every path that never touched a response. `failure_class` is a small
+    # token vocabulary: `http_403` / `http_4xx` / `http_5xx` off the response, or `tls` / `dns` /
+    # `timeout` / `connection` / `decode` off the transport exception. `exc` is that exception's
+    # class name. `server` is the `Server` response header, lower-cased and truncated — the
+    # strongest tell of which CDN refused us.
+    failure_class: str | None = None
+    exc: str | None = None
+    server: str | None = None
 
     def __post_init__(self) -> None:
         """Enforce the ``text`` invariant the field comment states.

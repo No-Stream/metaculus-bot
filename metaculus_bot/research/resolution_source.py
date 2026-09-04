@@ -234,7 +234,9 @@ from metaculus_bot.research.resolution_fetch_result import (
     _fetch_result_sources,
     _render_fetch_failures,
     fetch_outcome_token,
+    http_failure_class,
     looks_like_csv_rows,  # noqa: F401  # re-export: the Tier-1 suite imports the row-shape check from this module path
+    server_header_token,
     vacuous_body_status,
 )
 from metaculus_bot.research.resolution_url_scan import (
@@ -1075,7 +1077,31 @@ async def _resolution_redirect_outcome(resp: Any, current_url: str, content_type
     )
 
 
-def _resolution_status_outcome(status: int, current_url: str, content_type: str) -> FetchResult | None:
+def _network_failure_class(exc: BaseException) -> str:
+    """Bucket a transport exception for the fetch marker's ``failure_class``.
+
+    The specific subclasses come FIRST because aiohttp's TLS and DNS connector errors both
+    subclass ``ClientConnectorError``, so the general connection bucket would otherwise swallow
+    them — and the whole point of the field is to tell a host that refused our TLS from one our
+    egress IP could not resolve. ``exc`` on the same line keeps the exact class name for anything
+    this coarse vocabulary lumps together.
+    """
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(
+        exc, aiohttp.ClientConnectorCertificateError | aiohttp.ClientConnectorSSLError | aiohttp.ClientSSLError
+    ):
+        return "tls"
+    if isinstance(exc, aiohttp.ClientConnectorDNSError):
+        return "dns"
+    if isinstance(exc, aiohttp.ClientPayloadError):
+        return "decode"
+    return "connection"
+
+
+def _resolution_status_outcome(
+    status: int, current_url: str, content_type: str, *, server: str | None = None
+) -> FetchResult | None:
     """Terminal result for a non-200 status, or None when the body should be read."""
     if status == 200:
         return None
@@ -1086,6 +1112,8 @@ def _resolution_status_outcome(status: int, current_url: str, content_type: str)
         text="",
         http_status=status,
         content_type=content_type or None,
+        failure_class=http_failure_class(status),
+        server=server_header_token(server),
     )
 
 
@@ -1682,8 +1710,10 @@ async def _resolution_response_outcome(
     if status in REDIRECT_STATUSES:
         return await _resolution_redirect_outcome(resp, current_url, content_type)
 
-    # Non-redirect response — same status routing as before.
-    non_ok = _resolution_status_outcome(status, current_url, content_type)
+    # Non-redirect response — same status routing as before. The `Server` header rides the
+    # non-200 result so a 403 can be attributed to the CDN that served it (Akamai / Cloudflare).
+    server = resp.headers.get("Server") if resp.headers else None
+    non_ok = _resolution_status_outcome(status, current_url, content_type, server=server)
     if non_ok is not None:
         return non_ok
 
@@ -1748,6 +1778,8 @@ async def _fetch_one_hop(
                 text="",
                 http_status=None,
                 content_type=None,
+                failure_class=_network_failure_class(e),
+                exc=type(e).__name__,
             )
     if isinstance(outcome, _PendingDocument):
         return await _finish_document(outcome, ctx)
@@ -2559,6 +2591,8 @@ async def _datawrapper_dataset_outcome(resp: Any, chart: DatawrapperChartRef, pa
             chart_id=chart.chart_id,
             chart_title=chart.title,
             parent_url=parent_url,
+            failure_class=http_failure_class(status),
+            server=server_header_token(resp.headers.get("Server") if resp.headers else None),
         )
 
     body = await read_body_capped(
@@ -2696,6 +2730,8 @@ async def _fetch_datawrapper_dataset(
                 chart_id=chart.chart_id,
                 chart_title=chart.title,
                 parent_url=parent_url,
+                failure_class=_network_failure_class(e),
+                exc=type(e).__name__,
             )
 
 
@@ -2919,11 +2955,18 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     for r in results:
         reason = f" reason={r.status_reason}" if r.status_reason else ""
         route = f" route={r.route}" if r.route != "direct" else ""
+        # Failure diagnostics, each appended only when present so a success and every archived
+        # line stay byte-identical. Keyed and tail-positioned in a fixed order after `route`, so
+        # a line carrying some but not all of them parses without a positional group claiming a
+        # neighbour's value.
+        failure_class = f" failure_class={r.failure_class}" if r.failure_class else ""
+        exc = f" exc={r.exc}" if r.exc else ""
+        server = f" server={r.server}" if r.server else ""
         logger.info(
             f"RESOLUTION_SOURCE_FETCH: question={qid} url={r.url} status={fetch_outcome_token(r)} "
             f"http={r.http_status if r.http_status is not None else 'n/a'} "
             f"embeds={','.join(r.unreadable_embeds) if r.unreadable_embeds else 'none'}"
-            f"{reason}{route}"
+            f"{reason}{route}{failure_class}{exc}{server}"
         )
         for attempt in r.rung_attempts:
             if attempt.skipped_reason:
