@@ -184,8 +184,14 @@ escalates when the lighter one comes up short:
    rescues in the 2026-09-03 replay came from pages whose DOM was complete when
    `page.goto` raised. The rung's 35 s ceiling is unchanged; the settle comes
    out of the goto budget. The SSRF guard is re-applied to every request Chromium
-   makes. If Playwright isn't installed, this rung logs a one-time warning and
-   the plain result stands. A URL where Chromium ran and extracted nothing is remembered
+   makes EXCEPT three that Playwright's request interception cannot see: a
+   server-side redirect hop, which the driver auto-continues; a request Playwright
+   cannot attribute to a frame, which it auto-continues the same way; and a
+   WebSocket handshake, which routes through a separate API this transport does not
+   register. The route-guard comment in `research/rendered_fetch.py` states what
+   each of those means and what Chromium's own Local Network Access check does and
+   does not cover. If Playwright isn't installed, this rung logs a one-time warning
+   and the plain result stands. A URL where Chromium ran and extracted nothing is remembered
    for the run and never rendered again, so the second launch a documented escalation
    would spend (a js-walled `fetch` the driver follows with `read_document`) is skipped.
    That is the ONLY outcome memoized: a `blocked`, `error` or `throttled` GET is not,

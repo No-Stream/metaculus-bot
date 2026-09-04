@@ -922,22 +922,41 @@ async def _render_in_context(
 ) -> RenderedPage:
     """Guard the context, open the page, navigate and read; leave the closes to the caller."""
 
-    # Defense-in-depth on top of the main-frame pin above. The route guard re-checks every HTTP
-    # request Chromium makes (main-frame goto, server and client-side redirects, subresources)
-    # against is_public_http_url. Two channels are outside it: service-worker traffic, which the
-    # context was created with blocked, and WebSocket connections, which Playwright routes through a separate
-    # `route_web_socket` API and which nothing here opens on the page's behalf — a page's own
-    # WebSocket to a private address would be neither pinned (the pin covers one hostname, and an
-    # IP-literal target skips the resolver) nor guarded, and is a documented residual alongside
-    # the subresource one below. Threat model: these fetches run on GitHub-hosted Azure runners,
-    # where a request to a link-local / RFC1918 host (Azure IMDS at 169.254.169.254, localhost
-    # services, the internal runner network) would exfiltrate internal content into the research
-    # prompt AND the public Metaculus comment. The main-frame host is pinned, so its rebinding
-    # TOCTOU is closed; subresource / redirect hosts remain guarded only by this per-request
-    # preflight (whose getaddrinfo resolves independently of Chromium's connect), so their
-    # rebinding TOCTOU is a documented residual — a filtering forward proxy would close it,
-    # deferred as its own change. Harvested JSON therefore also passes this guard: a harvestable
-    # response is one Chromium was allowed to dial.
+    # Defense-in-depth on top of the main-frame pin above, and not a complete boundary. What the route guard
+    # below DOES see, and re-checks against is_public_http_url: the main-frame goto, every client-side
+    # redirect (a meta refresh or a `location` assignment is a fresh request with no redirect predecessor),
+    # and every subresource, XHR and fetch Playwright can attribute to a frame. Three request channels never
+    # reach it, each confirmed in the pinned Playwright 1.61 driver source on 2026-09-04. A SERVER-SIDE
+    # redirect hop is auto-continued by the driver, which constructs a Route only in the else of `if
+    # (redirectedFrom || ...)`; Playwright's own `page.route` docs say "the handler will only be called for
+    # the first url if the response is a redirect". So a 3xx answer that sends the main frame to a private
+    # address is dialed with no check of ours at all. A request Playwright cannot attribute to a frame is
+    # auto-continued the same way. A WebSocket handshake is invisible to `context.route` by construction,
+    # because HTTP interception is the CDP `Fetch.enable` domain while WebSockets surface only on the
+    # report-only `Network.webSocket*` events; Playwright routes them through a separate `route_web_socket`
+    # API that nothing here registers, and an IP-literal target such as ws://127.0.0.1 never consults the
+    # resolver the pin rewrites. Service-worker traffic is a fourth such channel and is the one that IS
+    # closed, by `service_workers="block"` on the context above. One shape that looks like a hole and is
+    # not: a CORS preflight OPTIONS is auto-fulfilled by the driver with a synthetic 204 and never reaches
+    # the network.
+    #
+    # Threat model: these fetches run on GitHub-hosted Azure runners, where a request to a link-local /
+    # RFC1918 host (Azure IMDS at 169.254.169.254, localhost services, the internal runner network) would
+    # exfiltrate internal content into the research prompt AND the public Metaculus comment. The main-frame
+    # host is pinned, so its own rebinding TOCTOU is closed. A subresource host is guarded only by this
+    # per-request preflight, whose getaddrinfo resolves independently of Chromium's connect, so a rebinding
+    # host (TTL 0) can still win that race; the server-side redirect hop and the page's own WebSocket are
+    # not guarded here at all. Chromium 149 (the build Playwright 1.61 pins) narrows the last two of those:
+    # Local Network Access gates a public page's subresource requests, and since Chrome 147 its WebSocket
+    # handshakes, to local and loopback addresses behind a permission this headless context never grants.
+    # That mitigation is INFERRED from Chromium's feature lists and vendor docs rather than observed,
+    # because the test suite blocks every real browser launch, and it is a browser default we neither pin
+    # nor assert. It also does not cover a MAIN-FRAME navigation, which is exactly the channel the unguarded
+    # redirect hop uses. A filtering forward proxy is the only remedy that covers all of these at connect
+    # time, and it stays deferred as its own change: FUTURE.md item 8 under "Resolution-source fetcher:
+    # Tier-2 LLM fetch + oversized-source summarization" carries the measured recall headroom and the ranked
+    # candidate fixes. Harvested JSON passes the guard below like any other response, so a harvestable
+    # response is one Chromium was allowed to dial, under the same redirect-hop caveat.
     async def _guard_route(route: Any, request: Any) -> None:
         # A thin closure so the registration keeps Playwright's expected handler shape while
         # the vetting itself stays module-level and directly testable.
