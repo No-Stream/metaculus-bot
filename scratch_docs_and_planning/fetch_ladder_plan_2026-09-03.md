@@ -3,7 +3,14 @@
 Written 2026-09-03 for the operator's sign-off. Supersedes the routing half of
 `fetch_escalation_ladder_design.md` (2026-09-01, design only, nothing implemented); that
 document's SSRF posture, budget pattern, telemetry plan and open questions still bind and are
-cited rather than restated. Nothing here is implemented yet.
+cited rather than restated.
+
+**Status, 2026-09-03 evening: built and merged on `next-season-bundle`**, with one exception,
+the TLS-impersonation rung, which waits on the step-0 diagnostic. The last implementation merge
+is `dd1074b`, and the full free gate on it is green (7,291 tests). The design sections below
+stand as written for the sign-off, so "today" and "not yet" in them mean 2026-09-03 before the
+build. "Decisions taken" carries the delivered state: what was built, what was deliberately not
+built, and what was still open when this status was written.
 
 A reader who has never seen this repository should be able to follow this end to end. Every
 number comes from a file or a command named beside it. Where a sentence rests on inference
@@ -455,7 +462,106 @@ caching, and a `rung=` field so prod flakiness is a query rather than a guess.
   `no_matching_passage` / `budget_skipped` / `parse_contention` reasons, pypdf decoded-stream cap 8 MB, BM25 b=0,
   query stopwords, `truncation_note()`. Merges `06ded11` (docs/telemetry), `a98a2b2` (doctext/gemini), `15d6c04` (Tier-1).
 
+### Delivered (status written 2026-09-03 evening)
+
+What the ladder table above became, by merge on `next-season-bundle`. Names are the code's;
+`route=` values are the `FetchRoute` vocabulary in `resolution_fetch_result.py`.
+
+- **Merged `3a541ee`:** URL-extractor paren fix (`resolution_url_scan.py`);
+  `research/document_text.py` (pypdf extraction with page and time caps, iterative outline walk,
+  BM25 passage selection, digests, `truncation_note`); the `GEMINI_USAGE` marker plus
+  `HttpRetryOptions` and pinned thinking levels on both native Gemini clients
+  (`gemini_usage.py`, `gemini_client_config.py`); the marker specs.
+- **Merged `99d3438`:** Tier-1 meta-refresh hop (`route=meta_refresh`), ARIA-table rewrite,
+  local PDF digest (`route=pdf_local`), `unreadable_document` status, `route=` on
+  `RESOLUTION_SOURCE_FETCH` and the `RESOLUTION_SOURCE_ESCALATION` marker, Tier-1's per-host
+  gate on the loop-scoped `http_fetch.host_semaphores`; v2 PDF local-first with pagination,
+  acquisition-first `read_document` (`digest_local`), the url_context size gate, Chromium
+  `domcontentloaded` plus salvage-on-timeout, `agentic/local_document.py`, the
+  `AGENTIC_FETCH_LOCAL_DOC` marker.
+- **Merged `c670015`:** both native Gemini surfaces on `gemini-3.8-flash`
+  (`GEMINI_SEARCH_DEFAULT_MODEL`, `GAP_FILL_V2_READER_MODEL`), grounded search thinking
+  `medium`, reader `low`, verified live by `scripts/probes/gemini_verify.py`. This closes the
+  "grounded search stays on the preview id" paragraph under Models.
+- **Merged `06ded11`, `a98a2b2`, `15d6c04`, `c450a86` (forge and live-QA fix wave):** the list
+  in the bullet above, plus the robots `Google-Extended` pre-check before every paid url_context
+  read (status `robots_disallowed`, marker `AGENTIC_URLCONTEXT_ROBOTS_SKIP`), certifi CA pin and
+  64 KB header caps on the aiohttp session, the shared 2-slot `pdf_parse_semaphore()`, and the
+  per-URL `url_retrieval_status` names carried as `statuses=` on both ungrounded WARNs.
+- **Merged `dd1074b` (8 commits; this document's Phase 3 and Phase 4 in one merge):** shared
+  browser transport `research/rendered_fetch.py` (v2's `_try_rendered_fetch` is a thin wrapper
+  on it). Tier-1 rendered rung, `route=rendered`, floor `RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S`
+  = 12 s, reason `renderer_unavailable` when Chromium is missing on the runner. Derived-API
+  rung, `research/derived_api.py`, `route=derived_api`, JSON endpoints harvested from the
+  render's XHR traffic and reused per host, the section lead disclosing when the endpoint came
+  from another page of the same host. Wayback rung, `research/wayback.py`, `route=wayback`,
+  triggered by `blocked`, `error` and `not_found` and never by `js_wall`; the lead states the
+  capture date and its age in days, a capture older than `RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS`
+  = 30 or undatable is withheld as `stale_data`, at most `RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS`
+  = 2 snapshot attempts per question, the inner URL is unwrapped and re-run through
+  `is_metaculus_self_ref` and `is_public_http_url`, and a capture the archive never served
+  declines and leaves the direct status standing. url_context rung on Tier-1,
+  `route=url_context`, triggered by `blocked`, `js_wall`, `error` and `no_resolving_content`,
+  one attempt, 15 s floor, terminal status `ungrounded`, shared `research/url_context_reader.py`,
+  `GEMINI_USAGE role=resolution_source` (a third role beside `grounded_search` and
+  `read_document`); robots policy moved to `research/robots_policy.py` with a per-host cache
+  shared by both paths. One caveat sentence per non-direct route from `ROUTE_CAVEATS` in
+  `resolution_fetch_result.py`, iterated in ladder order, `direct` absent so an all-direct
+  question renders byte-identical to before (pinned). Seven new `details["counts"]` keys
+  (`rendered_attempts`, `derived_api_reads`, `wayback_attempts`, `url_context_reads`,
+  `renderer_unavailable_skips`, `wayback_cap_skips`, `url_context_robots_skips`). Two greppable
+  lines deliberately not registered as marker specs, `RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP`
+  and `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED`, become spec candidates if the paid flag is ever
+  turned on.
+- **The paid flag.** `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` defaults off, is set in no
+  workflow, and is documented commented-out in `.env.template`. Turning it on makes the
+  resolution-source provider a paid surface (the cost gate in AGENTS.md lists it as free
+  today), so that is an operator decision, not a default.
+
+**Deliberately not built, or built differently from the text above:**
+
+- **Rung 2, TLS impersonation via curl_cffi: not built.** The `impersonate` route token and its
+  caveat sentence are reserved in `FetchRoute` and `ROUTE_CAVEATS`; nothing emits them. The
+  step-0 diagnostic exists (`.github/workflows/fetch_diagnostic.yaml`,
+  `scripts/probes/fetch_diagnostic.py`, commit `18bc926`) but needs its yaml on `main` and an
+  operator dispatch after the merge. Plain 403 with impersonated 200 builds the rung; both 403
+  drops it for good. `curl-cffi` appears only in deptry's ignore list for the probe.
+- **D4 egress change:** parked in FUTURE.md under "GitHub-runner egress reputation is the
+  dominant cause of resolution-source 403s", low priority.
+- **The 45 s Tier-1 wall is unchanged.** Every rung self-bounds with a wall-derived budget and its
+  own floor (the `RESOLUTION_SOURCE_*_MIN_BUDGET_S` constants plus
+  `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`).
+- **The fast-path gate the ladder note promised for Phase 3 was not threaded into the
+  provider.** No fast-path state reaches `resolution_source.py`; the rung floors above do the
+  bounding on thin-window questions instead.
+- **No checked-in `live`-marked replay corpus** (Testing item 3). The 47-URL replay and the
+  171-URL reader-sizing corpora live in gitignored `scratch/fetch_ladder_2026-09-03/` and
+  `/tmp/fetchprobe/`; the fresh-context QA pass runs them from there.
+- **The per-host politeness map is still two maps.** Tier-1 uses `http_fetch.host_semaphores`;
+  v2 keeps its module-global `_FETCH_HOST_SEMAPHORES` in `agentic/tools.py`. Follow-up.
+- **Anti-bot posture** is a soft guideline from the operator: the 80/20 and a bit beyond, no
+  arms race, no residential IPs. The DataDome host (sagaftra.org) and the Cloudflare-challenge
+  host (trueup.io) get url_context when the flag is on and are otherwise accepted as lost.
+
+**Open when this status was written (2026-09-03 evening;
+`HANDOFF_2026-09-03_fetch_ladder_wrapup.md` is the working list and may be ahead of this):**
+forge review of the Phase 3 diff (`6716c53..HEAD`); free live re-QA by a fresh-context subagent
+with the keys blanked; widening the test suite's egress guard, which patches
+`socket.socket.connect` only, so the Chromium subprocess and libcurl escape it; the Phase 3 doc
+deltas; the PR #66 description. Then the operator: push, one approved `test_bot.yaml` dispatch
+on the branch, merge to `main`, `gh workflow enable "Forecast on Metaculus Cup"` and
+`gh workflow run fetch_diagnostic.yaml` (both with `--repo No-Stream/metaculus-bot`). The fall
+bot-tournament slug was unpublished as of 2026-09-03.
+
 ## Sequencing
+
+Status, 2026-09-03 evening: the implementation numbered its merges differently from the phases
+below. Its Phase 1 (`3a541ee`) and Phase 2 (`99d3438`) together are this section's Phase 1; this
+section's Phase 2, the impersonation rung, is not built and waits on step 0; its Phase 3
+(`dd1074b`) is this section's Phase 3 and Phase 4 in one merge. The forge after Phase 1 ran and
+its fix wave merged (`06ded11`, `a98a2b2`, `15d6c04`, `c450a86`). The forge after Phase 3, the
+subagent QA pass and the one paid smoke test were still open when this was written; see
+"Delivered" above.
 
 Phase 1, no gates, independent of the egress question — the URL-extractor fix, meta-refresh plus
 ARIA rewrite, local PDF extraction with its own byte cap and passage selection, the Chromium
