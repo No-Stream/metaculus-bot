@@ -67,7 +67,7 @@ _MODEL_ID_PATTERN = re.compile(
     re.VERBOSE | re.IGNORECASE,
 )
 
-_RULE_POINTER = 'AGENTS.md "Config and models" — add the id to an allowlisted file, or pin the new location here'
+_RULE_POINTER = 'AGENTS.md "Config and models": add the id to an allowlisted file, or pin the new location here'
 
 
 def _docstring_node_ids(tree: ast.Module) -> set[int]:
