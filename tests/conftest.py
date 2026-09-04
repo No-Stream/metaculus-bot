@@ -1,10 +1,14 @@
 import socket
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from curl_cffi.requests import Session as CurlSession
 from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
+from playwright._impl._browser_type import BrowserType as PlaywrightBrowserType
 
 from scripts import gha_artifacts
 
@@ -42,6 +46,19 @@ def _address_is_blocked(family: int, address: Any) -> bool:
     return host not in _ALLOWED_HOSTS
 
 
+def _egress_guard_exempt(request: pytest.FixtureRequest) -> bool:
+    """True when the test carries one of the two markers that opt it out of every egress guard.
+
+    Shared by the socket guard and the native-egress guard below so a test cannot be exempt from
+    one transport and blocked on another; the markers' semantics are documented on
+    :func:`_block_network_egress`.
+    """
+    return (
+        request.node.get_closest_marker("allow_network") is not None
+        or request.node.get_closest_marker("live") is not None
+    )
+
+
 @pytest.fixture(autouse=True)
 def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """Block all real network egress during the test suite (money-safety backstop).
@@ -50,7 +67,9 @@ def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
     ``RuntimeError`` for any AF_INET/AF_INET6 connect to a non-localhost host, so
     no test can silently reach a paid API. Modeled on how ``pytest-socket`` gates
     (localhost + AF_UNIX + socketpair allowed, real hosts blocked) without taking
-    the dependency.
+    the dependency. It sees only Python's own sockets; the two transports in this
+    venv that open theirs elsewhere (a Chromium subprocess, libcurl) are refused
+    by :func:`_block_native_egress`.
 
     Two independent markers skip the guard:
 
@@ -72,9 +91,7 @@ def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
     ``connect_ex`` at the socket level so it also catches literal-IP connects that
     skip DNS resolution entirely. Different scopes on purpose; don't consolidate.
     """
-    if request.node.get_closest_marker("allow_network") is not None:
-        return
-    if request.node.get_closest_marker("live") is not None:
+    if _egress_guard_exempt(request):
         return
 
     real_connect = socket.socket.connect
@@ -98,6 +115,108 @@ def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
 
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+
+
+# ---------------------------------------------------------------------------
+# Native-egress guard: the two transports the socket guard cannot see
+# ---------------------------------------------------------------------------
+
+_PLAYWRIGHT_BROWSER_ENTRY_POINTS: tuple[str, ...] = (
+    "launch",
+    "launch_persistent_context",
+    "connect",
+    "connect_over_cdp",
+)
+
+
+@pytest.fixture
+def native_egress_attempts() -> list[str]:
+    """The browser launches and libcurl requests :func:`_block_native_egress` refused during one test.
+
+    Requested by name only by the tests that exercise the guard itself (``tests/test_egress_guards.py``):
+    they assert the refusal was recorded, then clear it so the guard's teardown check does not fail
+    them for the trip they deliberately caused. Every other test gets the list implicitly through
+    the autouse guard and never touches it.
+    """
+    return []
+
+
+@pytest.fixture(autouse=True)
+def _block_native_egress(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, native_egress_attempts: list[str]
+) -> Iterator[None]:
+    """Refuse the two egress paths that never pass through ``socket.socket.connect`` (money-safety backstop).
+
+    :func:`_block_network_egress` patches Python's socket, which every pure-Python client (aiohttp,
+    httpx, requests, the OpenAI and Google SDKs) goes through. Two transports in this venv do not:
+
+    - **Headless Chromium**, launched through Playwright by ``metaculus_bot/research/rendered_fetch.py``
+      for both the Tier-1 resolution-source rung and gap-fill v2's ``fetch`` tool. The browser is a
+      subprocess with its own network stack, so the socket patch is invisible to it. Verified
+      2026-09-03: three resolution-source marker tests launched a real browser the moment the Tier-1
+      rung landed, and connected to a real host from a unit test.
+    - **libcurl**, entered from Python through ``curl_cffi`` (a transitive dependency via ``yfinance``,
+      which ``metaculus_bot/research/financial_data.py`` and ``ts_fetch.py`` use for every ticker
+      fetch). The C library opens its own sockets.
+
+    Chokepoints, chosen so every caller trips them whichever public API it holds.
+    ``playwright._impl._browser_type.BrowserType`` is the one class both ``playwright.async_api`` and
+    ``playwright.sync_api`` delegate to, and its four entry points (``launch``,
+    ``launch_persistent_context``, ``connect``, ``connect_over_cdp``) are the only ways to obtain a
+    browser. ``curl_cffi.requests.Session.request`` / ``AsyncSession.request`` are where every verb
+    helper lands (``get``, ``post``, ``stream``, the module-level ``curl_cffi.requests.get``), and
+    ``yfinance`` reaches libcurl only through ``Session.get``.
+
+    Each refusal raises a ``RuntimeError`` naming this fixture AND is recorded in
+    ``native_egress_attempts``; the fixture fails the test at teardown if anything was recorded. The
+    record is what makes a trip loud: ``render_page`` soft-fails any exception out of the browser into
+    its ``None`` "declined" signal and ``_render_yfinance_block`` logs and returns ``""``, so without
+    it a refused launch would be byte-identical to the renderer being absent and the leaking test
+    would stay green.
+
+    Deliberately not covered: Playwright's node driver, which ``async_playwright()`` spawns before any
+    launch (a local pipe-connected process with no egress of its own), and curl_cffi's raw
+    ``Curl.perform`` and websocket paths, which nothing in this venv's callers reaches. The same two
+    markers exempt a test as for the socket guard.
+    """
+    if _egress_guard_exempt(request):
+        yield
+        return
+
+    def _refuse(attempt: str) -> None:
+        native_egress_attempts.append(attempt)
+        raise RuntimeError(
+            f"Native network egress blocked in tests by _block_native_egress: {attempt}. "
+            "Stub the transport or mark the test @pytest.mark.allow_network."
+        )
+
+    def _browser_guard(entry_point: str):
+        async def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
+            del self, args, kwargs
+            _refuse(f"playwright BrowserType.{entry_point}")
+
+        return guarded
+
+    def guarded_curl_request(self: Any, method: str, url: str, *args: Any, **kwargs: Any) -> Any:
+        del self, args, kwargs
+        _refuse(f"curl_cffi {method} {url}")
+
+    async def guarded_async_curl_request(self: Any, method: str, url: str, *args: Any, **kwargs: Any) -> Any:
+        del self, args, kwargs
+        _refuse(f"curl_cffi {method} {url}")
+
+    for entry_point in _PLAYWRIGHT_BROWSER_ENTRY_POINTS:
+        monkeypatch.setattr(PlaywrightBrowserType, entry_point, _browser_guard(entry_point))
+    monkeypatch.setattr(CurlSession, "request", guarded_curl_request)
+    monkeypatch.setattr(CurlAsyncSession, "request", guarded_async_curl_request)
+
+    yield
+
+    if native_egress_attempts:
+        pytest.fail(
+            "The test attempted native network egress, which _block_native_egress refused and the code "
+            f"under test then swallowed: {native_egress_attempts}. Stub the transport."
+        )
 
 
 # ---------------------------------------------------------------------------
