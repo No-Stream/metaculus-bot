@@ -21,6 +21,8 @@ tests loudly instead of silently dropping records from the archive:
   metaculus_bot/research/resolution_source.py (one emitter shape, three surfaces,
   told apart by the role field)
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
+* LITELLM_CALLBACK_DRAIN_TIMEOUT -> metaculus_bot/credit_telemetry.py:drain_litellm_callbacks
+  (the completeness flag on that run's CREDIT_ROLE_SPEND rows)
 * STACKER_OUTCOME/TOOLS_USED -> metaculus_bot/comment/markers.py (HTML-comment
   markers; see module docstring in markers.py for why they rarely appear in run logs).
 """
@@ -1629,6 +1631,48 @@ class TestCreditRoleSpend:
         harvested = parse_log_text("\n".join([CREDIT_SPEND_LINE, CREDIT_ROLE_SPEND_LINE]) + "\n", **_META)
         assert len(harvested["credit_spend"]) == 1
         assert len(harvested["credit_role_spend"]) == 1
+
+
+# Verbatim from the WARN in credit_telemetry.drain_litellm_callbacks, with ``%.1f`` rendered at the
+# LITELLM_CALLBACK_DRAIN_TIMEOUT_S default of 10 s. Registered 2026-09-04: the row is the only
+# durable record of WHY a run's CREDIT_ROLE_SPEND rows under-count, so the emitter side is pinned
+# too (tests/test_credit_telemetry.py, where the drain's own test renders the bound as 0.0).
+LITELLM_CALLBACK_DRAIN_TIMEOUT_LINE = (
+    PFX_WARN + "LITELLM_CALLBACK_DRAIN_TIMEOUT: litellm's logging worker did not deliver its queued "
+    "success callbacks within 10.0s; continuing so the run can finish. The CREDIT_ROLE_SPEND "
+    "ledger below may under-count this run's last completions."
+)
+
+
+class TestLitellmCallbackDrainTimeout:
+    """The completeness flag on a run's role ledger: a record means those rows are a lower bound.
+
+    At most one line per run, from the drain in ``cli._forecast_with_callback_drain``'s ``finally``.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(LITELLM_CALLBACK_DRAIN_TIMEOUT_LINE)
+        assert rec["marker"] == "litellm_callback_drain_timeout"
+        # The bound the run used. Near-constant, so the row's value is its presence.
+        assert rec["timeout_s"] == 10.0
+
+    def test_no_question_ref(self):
+        # Per-run, like the credit markers it qualifies.
+        rec = _parse_one(LITELLM_CALLBACK_DRAIN_TIMEOUT_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_steal_or_lose_the_credit_spend_markers(self):
+        # The WARN names ``CREDIT_ROLE_SPEND`` in its prose — that is the whole reason the emitter
+        # chose a distinct prefix — and ``parse_log_text`` breaks on the first matching spec, so
+        # all three lines must land in exactly their own files whichever order the specs sit in.
+        harvested = parse_log_text(
+            "\n".join([LITELLM_CALLBACK_DRAIN_TIMEOUT_LINE, CREDIT_ROLE_SPEND_LINE, CREDIT_SPEND_LINE]) + "\n",
+            **_META,
+        )
+        assert len(harvested["litellm_callback_drain_timeout"]) == 1
+        assert len(harvested["credit_role_spend"]) == 1
+        assert len(harvested["credit_spend"]) == 1
 
 
 class TestHtmlCommentMarkers:

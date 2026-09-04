@@ -831,7 +831,10 @@ How the number is produced, because it decides how to read it:
   published. When the bound trips, the run logs one
   `LITELLM_CALLBACK_DRAIN_TIMEOUT` WARNING and the rows below it may be missing
   the last few completions. Treat that warning as "this run's ledger is a lower
-  bound"; without it, the ledger covers every completion of the run.
+  bound"; without it, the ledger covers every completion of the run. That warning
+  is harvested in its own right, as `litellm_callback_drain_timeout.jsonl` (one
+  row per affected run, carrying the bound it used), so the caveat is answerable
+  offline instead of only from a live log.
 
 Harvested as `credit_role_spend.jsonl` in the telemetry archive.
 `uv run python scripts/reconcile_credit_spend.py --roles` (free, offline) prints

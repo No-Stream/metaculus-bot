@@ -89,6 +89,7 @@ from metaculus_bot.llm_configs import (
     SUMMARIZER_LLM,
     forecaster_role,
 )
+from scripts.telemetry.markers import MARKER_SPECS
 
 DONATED_KEY = "sk-or-v1-DONATEDsecretAB12"
 PERSONAL_KEY = "sk-or-v1-PERSONALsecretCD34"
@@ -1131,6 +1132,13 @@ class TestRoleSpendTracker:
 
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert any(msg.startswith("LITELLM_CALLBACK_DRAIN_TIMEOUT:") for msg in warnings), warnings
+        # Seam pin: the WARN is a harvested marker as of 2026-09-04, and the archive's only record
+        # of WHY a run's CREDIT_ROLE_SPEND rows under-count, so the string this code emits must
+        # still parse under the registry regex. ``%.1f`` renders this test's 0.01 bound as 0.0.
+        spec = next(s for s in MARKER_SPECS if s.name == "litellm_callback_drain_timeout")
+        match = spec.regex.search(caplog.text)
+        assert match is not None, warnings
+        assert match.group("timeout_s") == "0.0"
 
 
 class TestProdLlmsAreRoleTagged:

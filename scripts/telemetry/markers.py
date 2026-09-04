@@ -154,6 +154,9 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   variant is the 2026-08-25 addition that keeps a healthy run in the census)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_ROLE_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
   (``CREDIT_ROLE_SPEND`` is per-RUN, per-(role, key): where the run's OpenRouter dollars went)
+* ``LITELLM_CALLBACK_DRAIN_TIMEOUT`` — ``metaculus_bot/credit_telemetry.py``
+  ``drain_litellm_callbacks`` (per-RUN, at most one line: the callback drain hit its
+  bound, so the ``CREDIT_ROLE_SPEND`` rows of that run are a lower bound)
 * ``STACKER_OUTCOME`` / ``STACKER_SKIP_REASON`` / ``TOOLS_USED`` — ``metaculus_bot/comment/markers.py``
 
 NOTE ON THE HTML-COMMENT MARKERS: the ones on that last line are ``<!-- ... -->``
@@ -1421,6 +1424,31 @@ MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "credit_floor_breach",
         re.compile(r"CREDIT_FLOOR_BREACH:\s*key=(?P<key>\S+)\s+remaining=(?P<remaining>\S+)\s+floor=(?P<floor>\S+)"),
+    ),
+    MarkerSpec(
+        "litellm_callback_drain_timeout",
+        # Per-RUN completeness flag on the ``credit_role_spend`` rows above, emitted at most once
+        # per run from ``credit_telemetry.drain_litellm_callbacks``: litellm's logging worker did
+        # not deliver every queued success callback inside the drain's bound, so the role ledger
+        # logged beside it is a LOWER BOUND, missing that run's last few completions. Without this
+        # row a low ``reconcile_credit_spend.py --roles`` coverage ratio has two readings — a
+        # genuine gap in OpenRouter's per-call cost data, or a drain that gave up — and the archive
+        # cannot tell them apart, because no field on the ``credit_role_spend`` row carries the
+        # caveat. Registered 2026-09-04; the WARN is new in the 2026-09 bundle and has never fired,
+        # so a first record is itself the finding.
+        #
+        # ``timeout_s`` is the bound the run used, i.e. the ``LITELLM_CALLBACK_DRAIN_TIMEOUT_S``
+        # constant unless a caller overrode it, so the row's value is its PRESENCE rather than that
+        # near-constant. The same field name sits on the ``publish_hardening`` spec meaning the
+        # per-attempt POST timeout; one JSONL per marker keeps the two apart, but a pooled
+        # cross-marker query has to key on ``marker``.
+        #
+        # The regex stays loose either side of the ``within <n>s`` clause so a reword of the
+        # surrounding prose keeps harvesting, but that clause is now part of the contract:
+        # rewording it would zero the harvest, which the seam pin in tests/test_credit_telemetry.py
+        # catches. The line names ``CREDIT_ROLE_SPEND`` in its own prose and cannot be stolen by
+        # that spec, which demands ``CREDIT_ROLE_SPEND:\s*role=``, nor by ``credit_spend``.
+        re.compile(r"LITELLM_CALLBACK_DRAIN_TIMEOUT:.*?within (?P<timeout_s>[\d.]+)s"),
     ),
     MarkerSpec(
         "stacker_outcome",

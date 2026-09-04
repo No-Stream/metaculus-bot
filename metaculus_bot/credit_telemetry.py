@@ -720,7 +720,10 @@ async def drain_litellm_callbacks(timeout_s: float = LITELLM_CALLBACK_DRAIN_TIME
     except TimeoutError:
         # Distinct marker on purpose: the CREDIT_ROLE_SPEND harvester spec expects
         # role=/key=/usd=/calls= fields, so prose under that prefix would pollute every
-        # grep of a run log without ever parsing as a row.
+        # grep of a run log without ever parsing as a row. This prefix has carried its own
+        # spec since 2026-09-04 (scripts/telemetry/markers.py
+        # "litellm_callback_drain_timeout"), which reads the "within <n>s" clause; reword
+        # the rest of the sentence freely, but that clause is now a data contract.
         logger.warning(
             "LITELLM_CALLBACK_DRAIN_TIMEOUT: litellm's logging worker did not deliver its queued "
             "success callbacks within %.1fs; continuing so the run can finish. The CREDIT_ROLE_SPEND "
