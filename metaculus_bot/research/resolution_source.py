@@ -133,6 +133,7 @@ import os
 import socket
 import time
 from collections import Counter
+from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -2494,6 +2495,27 @@ async def _url_context_rung(
     )
 
 
+async def _run_rung(
+    ctx: FetchContext, fallback: FetchStatus, rung: Awaitable[FetchResult | None]
+) -> FetchResult | None:
+    """Await one rung and close the attempts it opened with that rung's own wall and outcome.
+
+    The one home for the bracket every dispatcher site used to copy by hand: read
+    ``len(ctx.rungs)`` before the rung runs, await it, then close every attempt opened since
+    with the status that stood once it was over — its result's, or ``fallback`` (the status it
+    left standing) when it declined (:meth:`FetchContext.close_rungs`). Structural rather than
+    stylistic: a rung awaited without the bracket still returned its result, and its attempt fell
+    through to :func:`_stamped_with_route`'s last-resort close, which stamps the ladder's FINAL
+    status and the whole-ladder wall — the two figures the per-rung close exists to keep apart,
+    with the marker parsing either way. ``rung`` is the coroutine created at the call site, which
+    runs none of its code until it is awaited here, so the length is read first.
+    """
+    first_new = len(ctx.rungs)
+    result = await rung
+    ctx.close_rungs(first_new, fallback if result is None else result.status)
+    return result
+
+
 async def _escalate_unresolved(
     session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
 ) -> FetchResult:
@@ -2507,9 +2529,9 @@ async def _escalate_unresolved(
     (``stale_data``, a capture we read and will not serve); it is kept as the fallback rather
     than as an early return, so the paid rung below is still reachable for that page.
 
-    Each rung is closed the moment its result is known (:meth:`FetchContext.close_rungs`), so
-    the attempts it opened carry that rung's own wall and outcome rather than the ladder's:
-    the status it returned, or the direct status it left standing when it declined.
+    Each rung is closed the moment its result is known (:func:`_run_rung`), so the attempts it
+    opened carry that rung's own wall and outcome rather than the ladder's: the status it
+    returned, or the direct status it left standing when it declined.
 
     ``session`` is the aiohttp session the rungs that issue an ordinary GET use; the browser
     rung ignores it, because Chromium brings its own transport.
@@ -2521,9 +2543,9 @@ async def _escalate_unresolved(
         # same-host sibling asks `endpoint_for` only after this escalation has recorded (or
         # failed to record) an endpoint — see `QuestionRungBudget.browser_escalation_gate`.
         async with ctx.shared.browser_escalation_gate(url):
-            first_new = len(ctx.rungs)
-            derived = await _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-            ctx.close_rungs(first_new, (derived or direct).status)
+            derived = await _run_rung(
+                ctx, direct.status, _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+            )
             if derived is not None:
                 return derived
             # Declined HERE rather than inside the rung: the rung's own gates all cost something
@@ -2532,17 +2554,13 @@ async def _escalate_unresolved(
             if ctx.fast_path:
                 _skip_for_fast_path(ctx, "rendered", direct, url)
             else:
-                first_new = len(ctx.rungs)
-                rendered = await _rendered_rung(url, direct, host_sems, ctx)
-                ctx.close_rungs(first_new, (rendered or direct).status)
+                rendered = await _run_rung(ctx, direct.status, _rendered_rung(url, direct, host_sems, ctx))
                 if rendered is not None:
                     return rendered
     # Reached only for the statuses the browser rungs do not claim — the two trigger sets are
     # disjoint by construction (see `_WAYBACK_TRIGGER_STATUSES`), so the order between them is a
     # reading choice: free-and-local first, then the route whose egress is not ours.
-    first_new = len(ctx.rungs)
-    wayback = await _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    ctx.close_rungs(first_new, (wayback or direct).status)
+    wayback = await _run_rung(ctx, direct.status, _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx))
     if wayback is not None and wayback.status == "success":
         return wayback
     # Last, because it is the only rung that spends money and the only one whose product is a
@@ -2551,9 +2569,9 @@ async def _escalate_unresolved(
     # capture too old to serve is still a page we could not read fresh, which is exactly the
     # population this rung exists for. The withhold stays the fallback below, so with the flag
     # off (or the reader declining) a stale capture still reports `stale_data`.
-    first_new = len(ctx.rungs)
-    read = await _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    ctx.close_rungs(first_new, (read or wayback or direct).status)
+    read = await _run_rung(
+        ctx, (wayback or direct).status, _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    )
     if read is not None:
         return read
     return wayback if wayback is not None else direct
@@ -3182,15 +3200,13 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
 
 
 # Every rung with a wall-budget floor, i.e. every rung that can record a `wall_budget` skip, in
-# ladder order. `_rung_counts` breaks the aggregate `rung_budget_skips` out per member.
-_BUDGET_GATED_RUNGS: tuple[FetchRoute, ...] = (
-    "meta_refresh",
-    "pdf_local",
-    "derived_api",
-    "rendered",
-    "wayback",
-    "url_context",
-)
+# ladder order. `_rung_counts` breaks the aggregate `rung_budget_skips` out per member. Derived
+# from the skip-phrase map rather than spelled a second time, because the two drifted in
+# opposite directions: a rung phrased but not listed here silently lost its `<rung>_budget_skips`
+# key from the archive, and a rung listed but not phrased raised `KeyError` from inside
+# `claim_rung_budget`, which the provider's `gather(return_exceptions=False)` turns into losing
+# every page of the question. Dict insertion order is the ladder order, so the keys are unchanged.
+_BUDGET_GATED_RUNGS: tuple[FetchRoute, ...] = tuple(_RUNG_WALL_SKIP_PHRASE)
 
 
 def _document_query(question: MetaculusQuestion) -> str:
