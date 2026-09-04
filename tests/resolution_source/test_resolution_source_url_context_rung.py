@@ -100,6 +100,10 @@ class TestUrlContextRung:
 
         assert result.status == "ungrounded"
         assert result.text == ""
+        # A verdict that served nothing keeps the cited host's status and diagnostics, so the
+        # FETCH line it replaces the direct result on still says which host refused us.
+        assert result.http_status == 403
+        assert result.failure_class == "http_403"
         # Deliberately unregistered while the flag is off everywhere, so the spelling is pinned
         # HERE: parallel to AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED, the v2 reader's twin, so the
         # spec that eventually registers it matches the lines already in the logs.

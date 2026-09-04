@@ -2085,7 +2085,10 @@ async def _wayback_snapshot_result(
     Only a capture we actually READ and cannot date, or can date and it is too old, is withheld
     as ``stale_data`` — because the disclosure that makes a snapshot admissible is its age, and a
     copy with no usable date cannot carry it. The direct status is not lost by that swap either:
-    the ``RESOLUTION_SOURCE_ESCALATION`` line for this rung carries ``from_status``.
+    the ``RESOLUTION_SOURCE_ESCALATION`` line for this rung carries ``from_status``, and the
+    withhold keeps the direct fetch's HTTP status and failure diagnostics, so the
+    ``RESOLUTION_SOURCE_FETCH`` line it replaces the direct result on still says which host
+    refused us and from which CDN.
     """
     snapshot = await _fetch_direct(session, wayback_snapshot_url(url, now=ctx.now), host_sems, _aux_ctx(ctx))
     parsed = parse_snapshot_url(snapshot.url)
@@ -2122,8 +2125,16 @@ async def _wayback_snapshot_result(
             url=url,
             status="stale_data",
             text="",
-            http_status=snapshot.http_status,
-            content_type=snapshot.content_type,
+            # The cited HOST's status and diagnostics, not the archive's: this verdict replaces
+            # the direct result on the FETCH line, where `http=200` was the archive answering
+            # and the missing `failure_class` / `server` undercounted the blocked population
+            # the ladder exists for. Only the success below reports the snapshot's own status,
+            # because those bytes are the archive's.
+            http_status=direct.http_status,
+            content_type=direct.content_type,
+            failure_class=direct.failure_class,
+            exc=direct.exc,
+            server=direct.server,
         )
     # The lead LEADS and its cost comes out of the per-URL cap (:func:`_lead_then_capped_body`):
     # an archived page whose age line has been trimmed off is being passed off as the live one.
@@ -2388,8 +2399,14 @@ async def _url_context_rung(
             url=url,
             status="ungrounded",
             text="",
+            # The host's status and diagnostics stay on a verdict that served nothing: a
+            # model-mediated read has no status of its own, and the FETCH line this result
+            # replaces the direct one on is where "which host refused us" is counted.
             http_status=direct.http_status,
             content_type=direct.content_type,
+            failure_class=direct.failure_class,
+            exc=direct.exc,
+            server=direct.server,
         )
     # The lead LEADS and is budgeted out of the cap (:func:`_lead_then_capped_body`): a model's
     # answer rendered without the disclosure reads as the page itself.

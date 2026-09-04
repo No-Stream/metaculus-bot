@@ -398,7 +398,10 @@ class FetchResult:
     # token vocabulary: `http_403` / `http_4xx` / `http_5xx` off the response, or `tls` / `dns` /
     # `timeout` / `connection` / `decode` off the transport exception. `exc` is that exception's
     # class name. `server` is the `Server` response header, lower-cased and truncated — the
-    # strongest tell of which CDN refused us.
+    # strongest tell of which CDN refused us. A rung verdict that REPLACES a failed direct fetch
+    # on the marker line (the Wayback `stale_data` withhold, the paid reader's `ungrounded`)
+    # keeps the direct fetch's diagnostics and `http_status`: they are facts about the cited host
+    # that triggered the rung, and only a rung that served bytes reports its own status.
     failure_class: str | None = None
     exc: str | None = None
     server: str | None = None
