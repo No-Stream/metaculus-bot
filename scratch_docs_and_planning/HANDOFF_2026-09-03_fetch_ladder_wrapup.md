@@ -5,9 +5,8 @@
 `No-Stream/metaculus-bot`, `upstream` is the Metaculus template — every `gh` call needs
 `--repo No-Stream/metaculus-bot`)
 **Repo:** `/Users/flatljan/personal/metaculus-bot`
-**Status:** Ready for final QA. Local HEAD `c87a5be` is 30 commits ahead of the pushed `ea1d558`
-(50 commits ahead of the PR's reviewed `39877f1`); working tree clean; one implementation agent
-may still be landing Phase 3 (see "Current state").
+**Status:** Ready for final QA. Local HEAD `dd1074b` (plus this doc's own commit) is ~40 commits
+ahead of the pushed `ea1d558`; working tree clean; every implementation agent has finished and is merged.
 
 The operator does NOT read plan docs; every decision or approval you need from them goes inline in
 chat, self-contained, with a recommendation. They sign off on any paid run before it fires.
@@ -77,21 +76,41 @@ agentic research loop (`metaculus_bot/research/agentic/`) whose driver LLM has `
 
 ## Current state
 
-- **Possibly still running: Phase 3 agent** (`phase3-rungs`, worktree
-  `.claude/worktrees/agent-aa2be42d01fc13ffd`, branch `worktree-agent-aa2be42d01fc13ffd`,
-  based on `6716c53`). At 18:32 it had 3 commits (`d77a7ff` move Chromium rung to shared
-  `metaculus_bot/research/rendered_fetch.py`; `8bf9e7a` Tier-1 rendered rung; `eeba91a`
-  XHR-harvested derived API, `metaculus_bot/research/derived_api.py`) and was writing the
-  Wayback rung (`metaculus_bot/research/wayback.py`, `tests/test_wayback.py`), with the
-  url_context-on-Tier-1 rung (behind `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`, default off) and
-  the per-route caveat sentences still to come. **First thing: check
-  `git log --oneline 6716c53..worktree-agent-aa2be42d01fc13ffd` and
-  `git -C .claude/worktrees/agent-aa2be42d01fc13ffd status --short`.** If the worktree is gone
-  and the branch is clean, the agent finished: merge it (`git merge --no-edit
-  worktree-agent-aa2be42d01fc13ffd`), then run the full gates. If the branch is incomplete, read
-  its commits and either finish the remaining rungs or merge what is green and note the rest.
-  Its brief is reproduced in the Phase 3 section of the plan doc.
-- **Gates:** every free gate was green at `6716c53` (`make lint`, `make typecheck`,
+- **Phase 3 MERGED** at `dd1074b` (branch `worktree-agent-aa2be42d01fc13ffd`, 8 commits, its own gates
+  green at 7,282 tests): shared browser transport `metaculus_bot/research/rendered_fetch.py`
+  (the v2 `tools._try_rendered_fetch` is now a thin wrapper); Tier-1 rendered rung (`route=rendered`,
+  floor `RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` = 12 s, new reason `renderer_unavailable`);
+  XHR-harvested derived-API rung (`research/derived_api.py`, `route=derived_api`, per-host endpoint
+  reuse with a coverage disclosure); Wayback rung (`research/wayback.py`, `route=wayback`, 30-day
+  `stale_data` bound, ≤2 attempts/question, Metaculus/SSRF unwrap re-check; a capture the archive
+  never served DECLINES and leaves the direct status standing); url_context rung on Tier-1 behind
+  `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` (default off, set in NO workflow; shared
+  `research/url_context_reader.py`; robots policy moved to `research/robots_policy.py` with a shared
+  per-host cache; new terminal status `ungrounded`; `GEMINI_USAGE role=resolution_source`); one
+  caveat sentence per non-direct route from `ROUTE_CAVEATS` in `resolution_fetch_result.py`
+  (all-direct output byte-identical, pinned). Live probe confirmed the Wayback `2026id_` redirect
+  carries the 14-digit capture stamp. All new tokens harvest with no marker-regex change.
+- **Phase 3 doc deltas NOT yet folded in** (do this in the fresh session, tersely, per the
+  AGENTS.md-is-terse rule): new modules in the layer map (`rendered_fetch`, `derived_api`,
+  `wayback`, `url_context_reader`, `robots_policy` moved out of `agentic/`); AGENTS.md's
+  resolution-source paragraph gains the four rungs; `ungrounded` and `renderer_unavailable` in the
+  status/reason enumerations in AGENTS.md and `docs/research.md`; the new `RESOLUTION_SOURCE_*`
+  budget/age/attempt constants and the env flag `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` — and the
+  load-bearing cost-gate consequence that TURNING THAT FLAG ON MAKES THE RESOLUTION-SOURCE PROVIDER
+  A PAID SURFACE (the cost gate lists it as free today); `GEMINI_USAGE` has a third role
+  (`resolution_source`; the marker spec comment names two); seven new `details["counts"]` keys;
+  two greppable lines deliberately NOT registered as marker specs
+  (`RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP`, `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED`) — FUTURE
+  candidates once the paid flag is ever turned on; the shared robots cache reset is
+  `robots_policy.reset_robots_cache()`.
+- **Containment follow-up (real, not done):** the test suite's egress guard (`tests/conftest.py`,
+  patches `socket.socket.connect`) covers neither the Chromium subprocess nor libcurl; three
+  pre-existing marker tests launched a real browser when the Tier-1 rendered rung landed. The
+  resolution-source test package now declines the browser and empties the Wayback trigger set by
+  default via autouse conftest fixtures; widening the global guard is the proper fix.
+- **Gates:** every free gate was green at `6716c53` and on the Phase 3 branch tip; the full gate on the
+  merged `dd1074b` was launched in tmux session `p5gate` (log `/tmp/p5gate.log`; read `EXITCODE=`) —
+  if that log is gone, re-run step 1's gate command. Previously (`make lint`, `make typecheck`,
   `make lint_imports`, `make deps`, `make test_fast`, 7,191 passed) and the docs-only `c87a5be`
   ran lint + test_fast green. Not yet re-run on anything merged after.
 - **Pushed vs local:** `origin/next-season-bundle` = `ea1d558`; local is 30 ahead. Pushing is the
@@ -106,7 +125,7 @@ agentic research loop (`metaculus_bot/research/agentic/`) whose driver LLM has `
 
 ## What's left to do (in order; 1–3 sequential, 4 and 5 parallel, 6–8 need the operator)
 
-1. **Collect Phase 3** as above; then full gates in tmux:
+1. **Confirm the full gate on `dd1074b`** (see Current state); if not green, fix first. Gate command, in tmux:
    `tmux new-session -d -s gate "(make lint && make typecheck && make lint_imports && make deps && make test_fast) > /tmp/gate.log 2>&1; echo EXITCODE=\$? >> /tmp/gate.log"`
    and poll `tail /tmp/gate.log` (test_fast takes ~150 s; never `sleep` in a foreground Bash).
 2. **Forge the Phase 3 diff** (`git diff 6716c53..HEAD -- . ':(exclude)uv.lock'`) with the NEW
