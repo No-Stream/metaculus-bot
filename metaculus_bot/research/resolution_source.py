@@ -1,10 +1,17 @@
 # SMELL-EXEMPT-monolithic-file-loc: what stays here is fixed by the test suites'
 # monkeypatch surface, not by the layer diagram. Ten `RESOLUTION_SOURCE_*` caps
-# plus `_get_session`, `is_public_http_url`, `_extract_main_text` and
-# `_sem_for_host` are patched on THIS module (tests/test_resolution_source_*.py,
-# tests/test_agentic_tools.py), so every reader of one has to stay here to resolve
-# it as a module global at call time — which pins the network layer, the section
-# renderer and the provider factory. Everything with no patched read moved out:
+# plus `_get_session`, `render_page`, `run_url_context_read`, `_WAYBACK_TRIGGER_STATUSES`,
+# `is_public_http_url`, `_extract_main_text` and `_sem_for_host` are patched on THIS module
+# (tests/resolution_source/*.py, tests/test_agentic_tools.py) — 22 distinct names in all,
+# plus the `resolution_source.asyncio` / `.socket` attribute-of-import targets — so every
+# reader of one has to stay here to resolve it as a module global at call time, which pins the
+# network layer, the section renderer, the escalation ladder and the provider factory.
+# The 2026-09-03 escalation ladder (`_rendered_rung_applies` through `_escalate_unresolved`, the
+# rendered / derived_api / wayback / url_context rungs and their gates) is a self-contained
+# concern with its own vocabulary and IS a candidate split, but it reads `_fetch_direct` and
+# `_classify_html_body` and carries most of the patched names above, so extracting it means
+# injected callbacks or a circular import and a re-point of every patch target; it is deferred to
+# its own PR (FUTURE.md item 3). Everything with no patched read already moved out:
 # `resolution_url_scan` (URL extraction + skip predicates), `resolution_fetch_result`
 # (FetchStatus/FetchResult, the vacuity rule, the result-list reductions), and
 # `resolution_body_text` (markup stripping + the two truncators).

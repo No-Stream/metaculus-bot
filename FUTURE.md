@@ -1242,10 +1242,27 @@ Follow-ups:
    5-14-month-old snapshots as HTTP 200; and anything older than
    `RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS`, or undatable, is withheld as a new `stale_data`
    status rather than served as live. The generic js_wall/blocked slice is still open.
-3. **LOW (deferred) — now over the ceiling:** module split of `resolution_source.py` (extract
-   `ssrf_guard.py`). The "~670 LoC" in the original note is stale — it is **1,175** as of 2026-08-25
-   after the Datawrapper hop, and the shared embed-detection primitives already moved to
-   `http_fetch.py`, so the seam is visible.
+3. **LOW (deferred) — well over the ceiling; split is its own PR.** module split of
+   `resolution_source.py`. The file is **3,170 lines** as of 2026-09-03 (the "~670 LoC" and the
+   later "1,175 as of 2026-08-25" in earlier revisions of this note are both stale — the
+   Datawrapper hop and then the 2026-09-03 escalation ladder are what grew it). Three candidate
+   seams, in order of how self-contained they are: the shared SSRF/fetch primitives into
+   `ssrf_guard.py` (the original note's target; the shared embed-detection primitives already
+   moved to `http_fetch.py`, so this seam is visible); the escalation ladder
+   (`_rendered_rung_applies` through `_escalate_unresolved`, ~L1806-2457, **~650 lines** — the
+   rendered / derived_api / wayback / url_context rungs and their gates, a self-contained concern
+   with its own vocabulary); and the Datawrapper hop (`_datawrapper_hop_status` through
+   `_interleave_dataset_results`, ~L2549-2798, **~250 lines**).
+   **The blocker is the monkeypatch surface, not the layer diagram.** The test suites patch **22
+   distinct names** on `resolution_source` (heaviest: `_get_session`, `render_page`,
+   `run_url_context_read`, `_WAYBACK_TRIGGER_STATUSES`, `_extract_main_text`, and ten
+   `RESOLUTION_SOURCE_*` caps) plus two attribute-of-import targets
+   (`resolution_source.asyncio.wait_for`, `resolution_source.socket.getaddrinfo`), so any split
+   must re-point every one of them, and a patch left on the old module stays green while proving
+   nothing (the trap AGENTS.md documents). The ladder also reads `_fetch_direct` and
+   `_classify_html_body`, so extracting it means injected callbacks through the rung functions or
+   a circular import, and still leaves ~2,500 lines behind. Record over reflex: the split does
+   not leave the code better inside this bundle, so it is deferred to its own PR.
 4. **LOW — the all-failed section notice now overclaims for one status.** When every URL fails, the
    rendered notice still says the resolving page "was unreachable", which is imprecise for a
    `no_resolving_content`: we reached it, got a 200, and could not read the embed. The same notice
