@@ -13,6 +13,7 @@ import pytest
 
 from metaculus_bot.research.wayback import (
     WaybackSnapshot,
+    innermost_url,
     parse_snapshot_url,
     snapshot_age_days,
     wayback_lead,
@@ -65,6 +66,31 @@ class TestParseSnapshotUrl:
 
     def test_an_impossible_timestamp_is_rejected(self):
         assert parse_snapshot_url("https://web.archive.org/web/20261399999999id_/https://x.gov/p") is None
+
+
+class TestInnermostUrl:
+    """Unwrapping is repeated until nothing matches, because a capture OF a capture presents
+    `web.archive.org` as its inner host and would clear a hostname check at one level."""
+
+    def test_a_plain_url_is_its_own_innermost(self):
+        assert innermost_url("https://www.bls.gov/wsp/") == "https://www.bls.gov/wsp/"
+
+    def test_one_level_unwraps_to_the_captured_page(self):
+        assert innermost_url("https://web.archive.org/web/20260828221347id_/https://www.bls.gov/wsp/") == (
+            "https://www.bls.gov/wsp/"
+        )
+
+    def test_a_nested_capture_unwraps_all_the_way(self):
+        nested = (
+            "https://web.archive.org/web/20260901000000id_/"
+            "https://web.archive.org/web/20240101000000/https://www.metaculus.com/questions/45001/"
+        )
+        assert innermost_url(nested) == "https://www.metaculus.com/questions/45001/"
+
+    def test_an_undated_archive_request_is_not_unwrapped(self):
+        """Only a dated capture URL is a snapshot; our own four-digit request shape is not."""
+        request = "https://web.archive.org/web/2026id_/https://x.gov/p"
+        assert innermost_url(request) == request
 
 
 class TestSnapshotAge:

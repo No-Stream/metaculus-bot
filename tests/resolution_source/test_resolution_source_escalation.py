@@ -522,6 +522,33 @@ class TestDerivedApiRung:
         assert len(calls) == 2
         assert second.route == "derived_api"
 
+    async def test_a_remembered_endpoint_answering_html_is_not_served_as_the_feed(self, monkeypatch):
+        """The harvest half gates on a JSON content type; the reuse half — the path that fires on
+        every later cited URL on the host — did not, so a remembered endpoint answering 200 with
+        a "session expired" portal page was published as the page's data feed, under a lead
+        saying it was the JSON the page loads its figures from."""
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))
+        second_url = "https://tracker.example.com/house"
+        portal = _prose_page("Your session has expired. " * 30)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                second_url: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                _FEED_URL: FakeResponse(200, body=portal, content_type="text/html; charset=utf-8"),
+            }
+        )
+
+        await _fetch_one(session, _URL, {})
+        second = await _fetch_one(session, second_url, {})
+
+        assert _FEED_URL in session.requested
+        # Declined, so the URL fell through to the browser, whose own harvest served it.
+        assert len(calls) == 2
+        assert second.route == "derived_api"
+        assert "session has expired" not in second.text
+        assert second.text.startswith("[This page's own HTML carried no readable content.")
+
     async def test_the_derived_get_is_skipped_below_its_floor(self, monkeypatch):
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), []))
         second_url = "https://tracker.example.com/house"
@@ -742,6 +769,29 @@ class TestWaybackRung:
 
         assert result.status == "blocked"
         assert result.route == "wayback"
+        assert result.text == ""
+
+    @pytest.mark.parametrize(
+        "innermost",
+        ["https://www.metaculus.com/questions/45001/", "http://169.254.169.254/latest/meta-data/"],
+    )
+    async def test_a_nested_capture_is_unwrapped_to_its_innermost_url(self, innermost):
+        """A capture OF a capture presents `web.archive.org` as its inner host, which clears both
+        the self-reference test and the public-URL test at one level of unwrapping."""
+        captured = self._NOW - timedelta(days=2)
+        inner = _snapshot_url(innermost, captured=captured - timedelta(days=1))
+        wrapped = _snapshot_url(inner, captured=captured)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": wrapped}),
+                wrapped: FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "blocked"
         assert result.text == ""
 
     async def test_a_snapshot_wrapping_a_private_address_is_refused(self, monkeypatch):

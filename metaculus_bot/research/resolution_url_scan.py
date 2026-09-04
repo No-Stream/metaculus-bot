@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
+from metaculus_bot.research.wayback import innermost_url
+
 # Metaculus-injected markdown escapes: `\_`, `\.`, `\&`, `\-`, `\#`, `\(`, `\)`.
 # FINDINGS: 3.4% of URLs carry these; one flips 404→success once unescaped.
 _MARKDOWN_ESCAPED_CHARS = r"_&.\-#()"
@@ -170,9 +172,14 @@ def is_metaculus_self_ref(url: str) -> bool:
     Uses ``.hostname`` (not ``.netloc``) so a port or userinfo can't slip a
     metaculus URL past the check — ``.netloc`` keeps ``:443`` / ``user@``, which
     would defeat the exact-host and suffix comparisons below.
+
+    Judged on the INNERMOST URL of a Wayback capture, at any depth of nesting: an archived
+    copy of a Metaculus page in front of a forecaster is still the question quoting itself,
+    and the capture URL's own hostname is ``web.archive.org``, which is how a cited capture
+    (or a capture of a capture) sailed past every self-reference filter in the pipeline.
     """
     try:
-        host = (urlparse(url).hostname or "").lower()
+        host = (urlparse(innermost_url(url)).hostname or "").lower()
     except ValueError:
         return False
     return host == "metaculus.com" or host.endswith(".metaculus.com")

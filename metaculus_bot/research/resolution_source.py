@@ -198,6 +198,7 @@ from metaculus_bot.research.rendered_fetch import (
     RENDER_SETTLE_MS,
     RENDER_TIMEOUT_MS,
     RenderedPage,
+    _is_json_content_type,
     note_rendered_no_text,
     render_page,
 )
@@ -231,6 +232,7 @@ from metaculus_bot.research.resolution_url_scan import (
 from metaculus_bot.research.robots_policy import google_extended_blocks_url
 from metaculus_bot.research.url_context_reader import run_url_context_read
 from metaculus_bot.research.wayback import (
+    innermost_url,
     parse_snapshot_url,
     snapshot_age_days,
     wayback_lead,
@@ -1742,6 +1744,18 @@ async def _derived_api_rung(
     feed = await _fetch_direct(session, endpoint.endpoint_url, host_sems, _aux_ctx(ctx))
     if feed.status != "success":
         return None
+    if not _is_json_content_type(feed.content_type or ""):
+        # The same gate the harvest half applies at discovery, because a remembered endpoint is
+        # not a promise about what it answers NEXT time: one came back 200 with an HTML "session
+        # expired" portal page, which the lead below would have introduced as the JSON feed the
+        # page loads its figures from. Declining hands the URL to the browser, whose own harvest
+        # is gated the same way.
+        logger.info(
+            "resolution_source derived_api: %s answered %r rather than JSON — not served as the feed",
+            endpoint.endpoint_url,
+            feed.content_type,
+        )
+        return None
     return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status)
 
 
@@ -1767,9 +1781,10 @@ async def _wayback_snapshot_result(
 
     Three outcomes, in this order, and the order is the design.
 
-    The inner URL is UNWRAPPED and re-checked first, because ``is_metaculus_self_ref`` keys on
-    hostname and ``web.archive.org/web/…/metaculus.com/…`` sails past every self-reference filter
-    in the pipeline — an archived Metaculus page in front of a forecaster is the question quoting
+    The inner URL is UNWRAPPED — repeatedly, since a capture OF a capture presents
+    ``web.archive.org`` as its own inner host — and re-checked first, because a hostname check
+    on ``web.archive.org/web/…/metaculus.com/…`` sails past every self-reference filter in the
+    pipeline — an archived Metaculus page in front of a forecaster is the question quoting
     itself. Then a snapshot the archive could not serve at all (no capture, or a capture that
     404s) DECLINES: there is no archived copy, which is a different fact from a stale one, and
     the direct route's own status says more about the source than a fact about the archive would.
@@ -1780,13 +1795,12 @@ async def _wayback_snapshot_result(
     """
     snapshot = await _fetch_direct(session, wayback_snapshot_url(url), host_sems, _aux_ctx(ctx))
     parsed = parse_snapshot_url(snapshot.url)
-    if parsed is not None and (
-        is_metaculus_self_ref(parsed.inner_url) or not await is_public_http_url(parsed.inner_url)
-    ):
+    captured_of = None if parsed is None else innermost_url(parsed.inner_url)
+    if captured_of is not None and (is_metaculus_self_ref(captured_of) or not await is_public_http_url(captured_of)):
         logger.warning(
             "resolution_source wayback refused: snapshot of %s wraps a URL we do not fetch (%s)",
             urlparse(url).netloc,
-            urlparse(parsed.inner_url).netloc,
+            urlparse(captured_of).netloc,
         )
         return None
     if snapshot.status != "success":
