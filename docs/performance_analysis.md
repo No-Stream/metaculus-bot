@@ -76,8 +76,10 @@ did not fetch. Three archives:
   `CREDIT_ROLE_SPEND`, `GEMINI_GROUNDING_DENSITY`, `GEMINI_UNSUPPORTED_ATTRIBUTION`,
   `FINANCIAL_NOISE_FLAG`, `MARKET_TIER_CAPPED`, `FRED_UNKNOWN_SERIES`), the 2026-09-02
   additions (`AGENTIC_FETCH_THROTTLED`, `MEMBER_FORECAST`), plus `GEMINI_USAGE` (the
-  google-genai token and grounded-query accounting for both Gemini surfaces, which bill
-  outside OpenRouter and so appear in no `CREDIT_*` marker),
+  google-genai token and grounded-query accounting for all three Gemini surfaces, which bill
+  outside OpenRouter and so appear in no `CREDIT_*` marker; the `role` field partitions them
+  into `grounded_search`, gap-fill v2's `read_document` and the resolution-source ladder's
+  `resolution_source`),
   `RESOLUTION_SOURCE_ESCALATION` (one line per escalated fetch rung, with what
   triggered it and what it cost), `AGENTIC_FETCH_LOCAL_DOC` (one line per gap-fill v2
   document read served from the host's own bytes instead of the paid reader — fires only

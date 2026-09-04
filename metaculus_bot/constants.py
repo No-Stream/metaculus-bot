@@ -681,6 +681,14 @@ RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S: float = 2.0
 # page text the section exists to serve.
 RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS: int = 3000
 RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS: float = 30.0  # freshness bound on the dataset's Last-Modified vs fetch time. Live trackers republish at least daily; the stale-route failure class this guards against served 5-14 MONTH old snapshots as HTTP 200 (2026-08-24 verifications). Older/undatable data is withheld (stale_data), never served as live.
+# How far ahead of our clock a timestamp a host or the archive gives us may sit before the
+# freshness guards treat it as unusable rather than as freshest-possible. ONE constant for both
+# guards — the Datawrapper dataset's `Last-Modified` and the Wayback rung's capture stamp —
+# because it is one judgment: tolerate ordinary CDN/host clock skew and nothing more, since past
+# that a future date means a broken clock or a misparse, and each stamp authorizes a lead that
+# asserts a date to forecasters. Unlike the two 30-day age bounds above and below, which are
+# per-artifact calls about how fast the underlying data moves, this one is about our own clock.
+RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE: timedelta = timedelta(hours=6)
 
 # --- Local document text (PDFs read with pypdf, `research/document_text.py`) ---
 # Measured 2026-09-03: local pypdf pulled 833,450 chars out of a 6.7 MB 220-page PDF in

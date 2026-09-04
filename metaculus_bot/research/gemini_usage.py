@@ -1,8 +1,11 @@
-"""Token-usage telemetry for the two native google-genai call sites.
+"""Token-usage telemetry for the native google-genai call sites.
 
-Both native Gemini paths — grounded search (``research/gemini_search.py``) and gap-fill
-v2's ``read_document`` (``research/agentic/tool_backends.py``) — bill the operator's
-personal Google AI Studio key, and neither recorded what it spent. Google-side spend was
+All three native Gemini paths — grounded search (``research/gemini_search.py``), gap-fill
+v2's ``read_document`` (``research/agentic/tool_backends.py``) and the resolution-source
+ladder's paid ``url_context`` rung (``research/resolution_source.py``) — bill the operator's
+personal Google AI Studio key, and none recorded what it spent. The last two share one
+emitter, ``research/url_context_reader.py``, and are told apart by the ``role`` field
+(``read_document`` versus ``resolution_source``). Google-side spend was
 therefore invisible in the run logs: the 2026-09 reconstruction of it only worked because
 the raw research archive happened to store whole SDK responses, which is an accident of a
 different feature rather than a measurement. One INFO line per response makes it a query,
@@ -13,7 +16,7 @@ The marker is a CONTRACT with ``scripts/telemetry/markers.py``: field order and 
 are what the archive parser reads, and ``question`` is last because it is optional (the
 document reader has no question id to carry).
 
-SCOPE: the ledger covers COMPLETED responses only. Both call sites log after the SDK returns,
+SCOPE: the ledger covers COMPLETED responses only. Every call site logs after the SDK returns,
 so a call that hit its wall-clock deadline or raised out of the SDK emits no row at all while
 Google still billed its prompt, thinking and search-query tokens — and a call that burned the
 full wall is by construction among the most expensive in the run. A spend total summed from

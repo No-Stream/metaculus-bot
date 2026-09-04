@@ -14,7 +14,7 @@ That is why the caller triggers this rung on ``blocked`` / ``error`` / ``not_fou
 
 Route facts, live-verified 2026-09-03 against ``https://www.bls.gov/wsp/``:
 
-- ``https://web.archive.org/web/2026id_/<url>`` answers ``302`` with
+- ``https://web.archive.org/web/<year>id_/<url>`` (probed as ``2026id_``) answers ``302`` with
   ``Location: https://web.archive.org/web/20260828221347id_/https://www.bls.gov/wsp/`` and an
   ``x-archive-redirect-reason: found capture at 20260828221347`` header. So the 14-digit capture
   timestamp arrives in the FINAL URL, which is why the caller reads it off the finished hop
@@ -33,27 +33,31 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
-WAYBACK_HOST = "web.archive.org"
+from metaculus_bot.constants import RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE
 
-# `2026id_` is a 4-digit "as near to 2026 as you have" request plus the raw-bytes modifier; the
-# archive redirects it to the nearest capture and puts that capture's full 14-digit timestamp in
-# the Location. Asking for a bare year rather than a specific date is deliberate: we want the
-# freshest capture the archive holds, and the freshness guard is what decides whether it is
-# fresh enough.
-_SNAPSHOT_REQUEST_TEMPLATE = "https://web.archive.org/web/2026id_/{url}"
+# `<year>id_` is a 4-digit "as near to that year as you have" request plus the raw-bytes
+# modifier; the archive redirects it to the nearest capture and puts that capture's full 14-digit
+# timestamp in the Location. Two things about the stamp are deliberate.
+#
+# The YEAR COMES FROM THE CALLER'S CLOCK. The archive pads a bare year up to that year's end, so
+# a year written in here asks for the freshest capture only until it ends: from the following
+# 1 January every request would ask for a capture from a year that has already finished, the age
+# bound would withhold every one of them as stale, and the rung would go on spending two archive
+# round trips per question while rescuing nothing.
+#
+# The GRANULARITY IS THE YEAR, not a full 14-digit stamp, and that is what keeps "the archive
+# never landed on a capture" legible. The caller tells that apart from "it served a capture we
+# cannot use" by whether the finished hop's URL parses as a dated capture; a 14-digit request URL
+# parses as one dated at the request instant, so an archive 404 or an unredirected 200 would read
+# as a capture taken seconds ago and be served as brand new.
+_SNAPSHOT_REQUEST_TEMPLATE = "https://web.archive.org/web/{year}id_/{url}"
 
 # The final URL's shape: 14-digit timestamp, an optional two-letter modifier (`id_` raw bytes,
 # `if_` framed, `im_` image), then the original URL verbatim. Anchored on the archive's own host
 # so nothing else can be mistaken for a snapshot URL.
 _SNAPSHOT_URL_RE = re.compile(r"^https?://web\.archive\.org/web/(\d{14})(?:[a-z]{2}_)?/(.+)$", re.IGNORECASE)
-
-# How far ahead of our clock a capture timestamp may sit before it is unusable rather than
-# maximally fresh. Same value and same reason as the Datawrapper freshness guard's: this
-# tolerates ordinary clock skew and nothing more, because past that a future date means a broken
-# clock or a misparse — and the lead it authorizes asserts a capture date to forecasters.
-_CLOCK_SKEW_TOLERANCE = timedelta(hours=6)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,14 +68,20 @@ class WaybackSnapshot:
     inner_url: str
 
 
-def wayback_snapshot_url(url: str) -> str:
-    """The archive URL to fetch for ``url``'s freshest stored capture.
+def wayback_snapshot_url(url: str, *, now: datetime) -> str:
+    """The archive URL to fetch for ``url``'s freshest stored capture, as of ``now``.
+
+    ``now`` is the caller's wall clock (``FetchContext.now``), threaded in for the same reason
+    the age disclosure's is: the request and the age rendered off what comes back have to be one
+    instant, and a clock read inside here would make the request depend on when the rung
+    happened to run rather than on the fetch it belongs to. Only the year is used, per
+    ``_SNAPSHOT_REQUEST_TEMPLATE``.
 
     ``url`` is interpolated verbatim rather than percent-encoded: the archive's path format
     carries the original URL as-is (scheme, slashes and query included), and encoding it makes
     the archive treat it as a different resource.
     """
-    return _SNAPSHOT_REQUEST_TEMPLATE.format(url=url)
+    return _SNAPSHOT_REQUEST_TEMPLATE.format(year=f"{now:%Y}", url=url)
 
 
 def parse_snapshot_url(final_url: str) -> WaybackSnapshot | None:
@@ -99,11 +109,12 @@ def snapshot_age_days(snapshot: WaybackSnapshot, now: datetime) -> float | None:
     """How many days before ``now`` the capture was taken, or None when that is unusable.
 
     None on a capture dated implausibly far in the FUTURE, which is a broken clock or a misparse
-    on one side rather than the freshest possible copy — the same two-sided rule the Datawrapper
-    freshness guard applies, and for the same reason: the disclosure asserts a date.
+    on one side rather than the freshest possible copy — the same two-sided rule as the
+    Datawrapper freshness guard, off the same shared tolerance, and for the same reason: the
+    disclosure asserts a date.
     """
     delta = now - snapshot.captured_at
-    if -delta > _CLOCK_SKEW_TOLERANCE:
+    if -delta > RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE:
         return None
     return max(0.0, delta.total_seconds() / 86400.0)
 

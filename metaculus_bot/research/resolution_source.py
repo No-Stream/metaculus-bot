@@ -135,6 +135,7 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_READER_MODEL,
     GAP_FILL_V2_READER_THINKING_LEVEL,
     GOOGLE_API_KEY_ENV,
+    RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE,
     RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
@@ -1761,7 +1762,7 @@ async def _wayback_snapshot_result(
     copy with no usable date cannot carry it. The direct status is not lost by that swap either:
     the ``RESOLUTION_SOURCE_ESCALATION`` line for this rung carries ``from_status``.
     """
-    snapshot = await _fetch_direct(session, wayback_snapshot_url(url), host_sems, ctx)
+    snapshot = await _fetch_direct(session, wayback_snapshot_url(url, now=ctx.now), host_sems, ctx)
     parsed = parse_snapshot_url(snapshot.url)
     if parsed is not None and (
         is_metaculus_self_ref(parsed.inner_url) or not await is_public_http_url(parsed.inner_url)
@@ -2162,14 +2163,6 @@ def _datawrapper_last_modified(resp: Any) -> datetime | None:
     return parse_http_last_modified(raw) if raw else None
 
 
-# How far ahead of our clock a dataset's `Last-Modified` may sit before the freshness
-# guard treats it as unusable rather than as freshest-possible. Small on purpose: this
-# tolerates ordinary CDN/host clock skew and nothing more, because the only thing a
-# future date can mean past that is a broken clock or a misparse — and the lead the
-# stamp authorizes asserts a publication date to forecasters.
-_DATAWRAPPER_CLOCK_SKEW_TOLERANCE = timedelta(hours=6)
-
-
 def _datawrapper_freshness_failure(last_modified: datetime | None) -> str | None:
     """Why ``last_modified`` fails the freshness guard, or None when it passes.
 
@@ -2182,7 +2175,7 @@ def _datawrapper_freshness_failure(last_modified: datetime | None) -> str | None
     if last_modified is None:
         return "no parseable Last-Modified"
     now = datetime.now(UTC)
-    if last_modified - now > _DATAWRAPPER_CLOCK_SKEW_TOLERANCE:
+    if last_modified - now > RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE:
         return f"published {last_modified.isoformat()}, which is in the FUTURE"
     if now - last_modified > timedelta(days=RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS):
         return (
@@ -2695,7 +2688,7 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
         if n_fail or n_datasets_withheld:
             logger.info(
                 f"resolution_source: {n_fail}/{len(cited)} cited urls unfetched "
-                f"(js_wall/blocked — candidates for a future Tier-2 LLM fetch); "
+                f"(js_wall/blocked — the escalation ladder rescued none of them); "
                 f"{n_datasets_withheld} embedded dataset(s) withheld",
             )
         qid = getattr(question, "id_of_question", None)

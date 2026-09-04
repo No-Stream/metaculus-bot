@@ -610,7 +610,7 @@ class TestWaybackRung:
         return FakeSession(
             {
                 _URL: page,
-                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": snapshot}),
+                wayback_snapshot_url(_URL, now=self._NOW): FakeResponse(302, headers={"Location": snapshot}),
                 snapshot: archived or FakeResponse(200, body=self._archive_page(), content_type="text/html"),
             }
         )
@@ -676,7 +676,9 @@ class TestWaybackRung:
         session = FakeSession(
             {
                 _URL: FakeResponse(403, body=b"", content_type="text/html"),
-                wayback_snapshot_url(_URL): FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+                wayback_snapshot_url(_URL, now=self._NOW): FakeResponse(
+                    200, body=self._archive_page(), content_type="text/html"
+                ),
             }
         )
 
@@ -692,7 +694,7 @@ class TestWaybackRung:
         session = FakeSession(
             {
                 _URL: FakeResponse(403, body=b"", content_type="text/html"),
-                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": wrapped}),
+                wayback_snapshot_url(_URL, now=self._NOW): FakeResponse(302, headers={"Location": wrapped}),
                 wrapped: FakeResponse(200, body=self._archive_page(), content_type="text/html"),
             }
         )
@@ -709,7 +711,7 @@ class TestWaybackRung:
         session = FakeSession(
             {
                 _URL: FakeResponse(403, body=b"", content_type="text/html"),
-                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": wrapped}),
+                wayback_snapshot_url(_URL, now=self._NOW): FakeResponse(302, headers={"Location": wrapped}),
                 wrapped: FakeResponse(200, body=self._archive_page(), content_type="text/html"),
             }
         )
@@ -741,7 +743,7 @@ class TestWaybackRung:
         session = FakeSession(
             {
                 _URL: FakeResponse(403, body=b"", content_type="text/html"),
-                wayback_snapshot_url(_URL): FakeResponse(404, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL, now=self._NOW): FakeResponse(404, body=b"", content_type="text/html"),
             }
         )
 
@@ -773,7 +775,7 @@ class TestWaybackRung:
         for url in urls:
             snapshot = _snapshot_url(url, captured=self._NOW - timedelta(days=2))
             handlers[url] = FakeResponse(403, body=b"", content_type="text/html")
-            handlers[wayback_snapshot_url(url)] = FakeResponse(302, headers={"Location": snapshot})
+            handlers[wayback_snapshot_url(url, now=self._NOW)] = FakeResponse(302, headers={"Location": snapshot})
             handlers[snapshot] = FakeResponse(200, body=self._archive_page(), content_type="text/html")
         session = FakeSession(handlers)
 

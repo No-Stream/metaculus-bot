@@ -40,6 +40,7 @@ import aiohttp
 from metaculus_bot.constants import RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
 from metaculus_bot.research.http_fetch import read_body_capped
 from metaculus_bot.research.resolution_source import _get_session, is_public_http_url
+from metaculus_bot.research.wayback import wayback_snapshot_url
 
 _HOST_SPACING_S = 1.0
 # The Server header is the informative part of a row's note ("AkamaiGHost",
@@ -50,11 +51,6 @@ _SERVER_HEADER_MAX_CHARS = 20
 _IMPERSONATE_TIMEOUT_S = 25.0
 _EGRESS_IP_URL = "https://api.ipify.org"
 
-# Wayback's "closest snapshot to this timestamp, original bytes" route. The
-# timestamp is deliberately the bare year: what we need to know is whether a
-# snapshot exists and reachable at all, and the age column below reports whatever
-# snapshot Wayback resolved that timestamp to, so a coarse timestamp costs nothing.
-_WAYBACK_TEMPLATE = "https://web.archive.org/web/2026id_/{url}"
 _WAYBACK_TIMESTAMP_RE = re.compile(r"/web/(\d{14})")
 
 
@@ -182,12 +178,16 @@ def probe_impersonated(url: str) -> ProbeOutcome:
 
 
 def probe_wayback(url: str) -> ProbeOutcome:
-    """Probe C: the Wayback Machine copy, reported with its snapshot age."""
+    """Probe C: the Wayback Machine copy, reported with its snapshot age.
+
+    The request URL comes from the rung's own ``wayback_snapshot_url`` rather than a template
+    here, so what the probe measures cannot drift from what production asks the archive for.
+    """
     try:
         from curl_cffi import requests as curl_requests  # noqa: PLC0415  # optional, see probe_impersonated
     except ImportError:
         return ProbeOutcome(None, 0, "curl_cffi absent")
-    archive_url = _WAYBACK_TEMPLATE.format(url=url)
+    archive_url = wayback_snapshot_url(url, now=datetime.now(UTC))
     try:
         resp = curl_requests.get(
             archive_url, impersonate="chrome", allow_redirects=True, timeout=_IMPERSONATE_TIMEOUT_S
@@ -232,7 +232,7 @@ async def run_probes(session: aiohttp.ClientSession, pacer: HostPacer) -> list[P
         bot = await probe_bot_client(session, probe_url.url)
         await pacer.wait(probe_url.url)
         impersonated = await asyncio.to_thread(probe_impersonated, probe_url.url)
-        archive_url = _WAYBACK_TEMPLATE.format(url=probe_url.url)
+        archive_url = wayback_snapshot_url(probe_url.url, now=datetime.now(UTC))
         await pacer.wait(archive_url)
         wayback = await asyncio.to_thread(probe_wayback, probe_url.url)
         rows.append(ProbeRow(probe_url, bot, impersonated, wayback))
