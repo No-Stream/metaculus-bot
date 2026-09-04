@@ -16,6 +16,8 @@ tests loudly instead of silently dropping records from the archive:
 * RESOLUTION_SOURCE_ESCALATION -> metaculus_bot/research/resolution_source.py (per escalated rung)
 * RESOLUTION_SOURCE_URLCONTEXT_{ROBOTS_SKIP,UNGROUNDED_SUPPRESSED,NOT_ADDRESSED}
   -> metaculus_bot/research/resolution_source.py (the paid rung's three per-URL lines)
+* RENDERED_FETCH_OFF_HOST -> metaculus_bot/research/rendered_fetch.py:render_page
+  (the shared render transport refusing a DOM for landing off its DNS pin)
 * GEMINI_USAGE       -> metaculus_bot/research/gemini_search.py,
   metaculus_bot/research/agentic/tool_backends.py and
   metaculus_bot/research/resolution_source.py (one emitter shape, three surfaces,
@@ -1520,6 +1522,77 @@ class TestResolutionSourceUrlContextNotAddressed:
         assert len(harvested["resolution_source_urlcontext_robots_skip"]) == 1
         assert len(harvested["resolution_source_urlcontext_ungrounded_suppressed"]) == 1
         assert len(harvested["resolution_source_urlcontext_not_addressed"]) == 1
+
+
+# Copied from the WARN in rendered_fetch.render_page's RenderOffHost boundary, with the hosts the
+# emitter side pins in tests/test_rendered_fetch.py::TestTheLandingHost so both sides are checked
+# against the same bytes. Registered 2026-09-04 with the landing-host check itself, so no archived
+# run carries a record and a first one is itself the finding.
+RENDERED_FETCH_OFF_HOST_LINE = (
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+    "landed_host=internal.example.net"
+)
+RENDERED_FETCH_OFF_HOST_GAP_FILL_LINE = (
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=gap_fill_v2 pinned_host=dashboard.example.com "
+    "landed_host=169.254.169.254"
+)
+# An http(s) landing with no hostname at all: ``urlparse(...).hostname`` is None and the %s renders
+# it as the word the parser reads as no data.
+RENDERED_FETCH_OFF_HOST_NO_HOSTNAME_LINE = (
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com landed_host=None"
+)
+
+
+class TestRenderedFetchOffHost:
+    """The only per-event record that a page sent headless Chromium off its DNS pin.
+
+    The resolution-source caller counts the refusal under ``render_off_host_skips`` in its
+    ``details["counts"]``, a per-question total that names neither host, and the gap-fill v2 caller
+    keeps no count at all, so without this row a security-relevant event leaves nothing durable.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_LINE)
+        assert rec["marker"] == "rendered_fetch_off_host"
+        # The render transport is shared, so the row has to say which caller asked for it.
+        assert rec["scope"] == "resolution_source"
+        assert rec["pinned_host"] == "dashboard.example.com"
+        # A HOSTNAME, never the landing URL, which can carry a session token or a credential.
+        assert rec["landed_host"] == "internal.example.net"
+
+    def test_the_gap_fill_callers_render_is_told_apart_by_scope(self):
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_GAP_FILL_LINE)
+        assert rec["scope"] == "gap_fill_v2"
+        # The IMDS shape: an IP literal is a stranger like any other host.
+        assert rec["landed_host"] == "169.254.169.254"
+
+    def test_a_landing_with_no_hostname_harvests_as_no_data(self):
+        assert _parse_one(RENDERED_FETCH_OFF_HOST_NO_HOSTNAME_LINE)["landed_host"] is None
+
+    def test_no_question_ref(self):
+        # The transport runs per URL with no question in scope, so a join goes through the run id.
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_collide_with_the_resolution_source_ladder_markers(self):
+        # The refused render is the rung a resolution-source fetch escalated into, so all three
+        # lines show up in the same run's logs, and ``parse_log_text`` routes a line to the FIRST
+        # spec that matches: each has to claim only its own marker word.
+        harvested = parse_log_text(
+            "\n".join(
+                [
+                    RENDERED_FETCH_OFF_HOST_LINE,
+                    RESOLUTION_SOURCE_FETCH_OK_LINE,
+                    RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE,
+                ]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["rendered_fetch_off_host"]) == 1
+        assert len(harvested["resolution_source_fetch"]) == 1
+        assert len(harvested["resolution_source_escalation"]) == 1
 
 
 class TestCredit:

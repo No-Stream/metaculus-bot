@@ -31,6 +31,7 @@ from metaculus_bot.research.derived_api import DerivedEndpoint, derived_api_lead
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.resolution_source import FetchContext
+from scripts.telemetry.markers import MARKER_SPECS
 from tests.playwright_fakes import (
     FakePage,
     FakeResponse,
@@ -939,11 +940,23 @@ class TestTheLandingHost:
         # The page rendered, so "rendered to nothing" would be false, and no clock ran out.
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
         assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
-        # The log names both hosts and never the landing URL's path, which can carry a token.
-        (message,) = [message for message in caplog.messages if "off the pinned host" in message]
-        assert "dashboard.example.com" in message
-        assert "internal.example.net" in message
+        # The refusal is the only per-event record of a page sending the browser off the pin, so it
+        # is a registered marker (scripts/telemetry/markers.py) rather than free text that expires
+        # with the GitHub Actions logs, and the spelling is pinned HERE too so the emitter and the
+        # spec are checked against the same bytes. Hostnames only: the landing URL's path can carry
+        # a session token or a credential.
+        (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
+        assert (
+            message == "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+            "landed_host=internal.example.net"
+        )
         assert "/admin" not in message
+        spec = next(s for s in MARKER_SPECS if s.name == "rendered_fetch_off_host")
+        match = spec.regex.search(message)
+        assert match is not None
+        assert match.group("scope") == _TIER1_SCOPE
+        assert match.group("pinned_host") == "dashboard.example.com"
+        assert match.group("landed_host") == "internal.example.net"
 
     async def test_an_ip_literal_landing_is_off_host(self, monkeypatch):
         """The IMDS shape: the hostname compare refuses a literal like any other stranger."""

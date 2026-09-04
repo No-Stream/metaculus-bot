@@ -919,9 +919,16 @@ async def render_page(
     except (RenderBudgetExpired, RenderDomOverCeiling):
         raise
     except RenderOffHost as exc:
-        # Hostnames only: the landing URL can carry a session token or a credential.
+        # Marker-shaped (``rendered_fetch_off_host`` in scripts/telemetry/markers.py) because this
+        # is the only per-EVENT record that a page sent the browser off the pin: the caller's
+        # ``render_off_host`` skip count says how many, never which host sent us where, and a
+        # free-text WARNING is gone once the GitHub Actions logs expire at 90 days. ``scope`` names
+        # which caller's render it was, since the two have different URL populations.
+        # Hostnames only: the landing URL can carry a session token or a credential. A landing URL
+        # with no hostname at all renders as ``None``, which harvests as no data.
         logger.warning(
-            "rendered fetch refused the DOM of %s: the main frame landed on %s, off the pinned host",
+            "RENDERED_FETCH_OFF_HOST: scope=%s pinned_host=%s landed_host=%s",
+            memo_scope,
             exc.pinned_host,
             urlparse(exc.final_url).hostname,
         )
