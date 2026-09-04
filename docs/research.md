@@ -913,7 +913,14 @@ the larger `DOCUMENT_TEXT_PDF_MAX_BYTES` cap (the receipt file is over the 5 MiB
 cap), an undeclared one keeps the smaller one. Bytes we read and could not turn into text
 get their own status, `unreadable_document`, with `status_reason` naming which of
 `no_text_layer` / `encrypted` / `malformed` applies; only the first could ever be rescued
-by a paid document read, which is why it is not folded into `unsupported_type`.
+by a paid document read, which is why it is not folded into `unsupported_type`. A document
+we read in full whose passage selection matches no query term is WITHHELD as
+`no_resolving_content` / `no_matching_passage` rather than published: its block is the
+header, the outline and one sentence saying nothing matched, and published as `success`
+that was prose standing in for an absent section, indistinguishable in the run log from a
+document that handed the forecasters the resolving paragraph. It is also the one
+`no_resolving_content` the paid url_context rung is not allowed to re-read, since we
+already hold the document's text.
 
 **Tier 2: the embedded Datawrapper dataset.** The first (and so far only) Tier-2 hop
 shipped 2026-08-25 (`5f27c46`, receipt qids 44858/44841) and is narrow by design.
@@ -1058,7 +1065,9 @@ budget]` when later sections are dropped for length.
 The per-URL `FetchStatus` distinguishes two kinds of non-success, and only one is a
 seam. `blocked` / `js_wall` / `no_resolving_content` are pages we could not READ, and
 they are what the escalation rungs above trigger on, as is the `no_text_layer`
-half of `unreadable_document` (a scan, where a model really is the only route). `empty_body`
+half of `unreadable_document` (a scan, where a model really is the only route). The one
+exception inside that family is `no_resolving_content`'s `no_matching_passage`: we read the
+whole document, so there is no harder fetch to try and the paid rung skips it. `empty_body`
 (a 200 whose body is empty or whitespace-only) and `unsupported_type` (including a body whose
 declared charset decodes to mojibake) are bodies that carried no information — refusals
 rather than seams, because there is nothing on the other side to fetch harder. Both
@@ -1075,7 +1084,9 @@ with nothing while refusing ours. On the reason side, `renderer_unavailable` joi
 `embed_shell` / `thin_page` / `no_text_layer` / `encrypted` / `malformed` /
 `no_matching_passage` / `budget_skipped` / `parse_contention` vocabulary, and it is the one that
 rides a rung attempt's `skipped_reason` rather than a result's `status_reason`, since nothing was
-rendered and so nothing about the page changed. Both live in
+rendered and so nothing about the page changed. `no_resolving_content` now has three reasons
+rather than two — `embed_shell`, `thin_page` and `no_matching_passage` — and the third is the
+only one that is a document rather than a page. Both live in
 `research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that
@@ -1121,6 +1132,10 @@ named an embed whose numbers are real but locked inside it — Infogram, Flouris
 Tableau, detected by `unreadable_data_embed_providers` because trafilatura emits no
 iframe or embed-script URLs at any setting; Datawrapper is deliberately excluded from
 that scan since the Tier-2 hop reaches it. `thin_page` means no such provider was named.
+The status's third reason is not a shape of chrome at all: `no_matching_passage` is a cited
+document we read in full that discusses nothing the question asks about, withheld under the
+same status because the outcome for a forecaster is the same, a section with nothing in it to
+grade against.
 That distinction used to be a GATE rather than a label, and the gate was removed on
 2026-09-02 because it was wrong: the
 2026-09-01 residual round found five content-free `success` renders and not one of them

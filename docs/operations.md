@@ -1279,11 +1279,14 @@ the telemetry markers:
   arrived; `embeds` names the routeless data-embed providers (Infogram / Flourish /
   Tableau) found in the page's raw HTML, which is what makes an unreadable-embed
   page queryable even when its prose made the fetch a legitimate `ok`. `reason` is
-  appended only where the status alone is ambiguous — today that is
-  `no_resolving_content`, which is `embed_shell` when the page named such a provider
-  and `thin_page` when the extraction was simply under the chrome floor, the
-  population the floor gained on 2026-09-02 when it stopped being gated on a named
-  provider. Its absence means no reason applies, on a fresh line as much as on an
+  appended only where the status alone is ambiguous — `no_resolving_content` is
+  `embed_shell` when the page named such a provider, `thin_page` when the extraction was
+  simply under the chrome floor (the population the floor gained on 2026-09-02 when it
+  stopped being gated on a named provider), and `no_matching_passage` when a cited
+  document read in full discusses nothing the question asks about;
+  `unreadable_document` splits into `no_text_layer` / `encrypted` / `malformed`, and
+  `unsupported_type` carries `budget_skipped` / `parse_contention` when it was a document
+  we held and declined to parse. Its absence means no reason applies, on a fresh line as much as on an
   archived one. `route` names which rung of the escalation ladder produced the recorded
   outcome: `direct` for the plain fetch, and `meta_refresh`, `pdf_local`, `derived_api`,
   `rendered`, `wayback` or `url_context` for an escalated one (`impersonate` is reserved in

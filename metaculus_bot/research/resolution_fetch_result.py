@@ -36,8 +36,9 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 # `js_wall`: content is what makes a fetch a success.
 #
 # `no_resolving_content` is the 200 whose extracted text carries no content worth
-# grading against — page chrome, and nothing else. Two ways a page earns it, told
-# apart by `FetchResult.status_reason`:
+# grading against — page chrome, and nothing else, or a document that discusses
+# nothing the question asks about. Three ways a fetch earns it, told apart by
+# `FetchResult.status_reason`:
 #
 #   `embed_shell` — the page's numbers exist but live inside a third-party data
 #   embed (Infogram / Flourish / Tableau) our extractor cannot read, and what
@@ -53,6 +54,13 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 #   evidence" caption with nothing resolving in them. The floor is what the
 #   verdict rests on either way, so gating it on a named provider was withholding
 #   one shape of chrome and publishing the other.
+#
+#   `no_matching_passage` — a cited document we read END TO END whose BM25 passage
+#   selection matched no query term. It is the one member of this status that is a
+#   DOCUMENT rather than a page, which is why it is excluded from the paid rung's
+#   population (`_url_context_rung_applies`): the bytes were never the problem, so a
+#   model re-reading the same PDF buys nothing. See the reason table below for what
+#   publishing it as `success` cost.
 #
 # Distinct from `empty_body` (nothing was there at all) and from `js_wall` (the
 # page needs JS to assemble ANY content, i.e. under the much lower JS-wall floor):
@@ -94,16 +102,18 @@ FetchStatus = Literal[
 # generalised thin-page one, so a later "how often does the floor withhold a page
 # nothing else would have caught?" cut is a query rather than a re-derivation.
 #
-# `embed_shell` / `thin_page` belong to `no_resolving_content`; `no_text_layer` /
-# `encrypted` / `malformed` to `unreadable_document`, where the split is what says
-# whether a paid document read could ever help (only `no_text_layer` — the other two
-# are bytes no reader gets text out of).
+# `embed_shell` / `thin_page` / `no_matching_passage` belong to `no_resolving_content`;
+# `no_text_layer` / `encrypted` / `malformed` to `unreadable_document`, where the split is
+# what says whether a paid document read could ever help (only `no_text_layer` — the other
+# two are bytes no reader gets text out of, and `no_matching_passage` is a document whose
+# text we already hold).
 #
-# The document rung adds three. `no_matching_passage` is a `success` we DID read whose BM25
+# The document rung adds three. `no_matching_passage` is a document we DID read whose BM25
 # selection matched no query term: the digest renders its header, its outline and the "no
-# passage matched" sentence, which in the run log and the archive was byte-identical to a
-# document that handed the forecasters the resolving paragraph — on the one surface whose
-# stated contract is that `success` means CONTENT. `budget_skipped` and `parse_contention`
+# passage matched" sentence, and published as `success` that was byte-identical in the run log
+# and the archive to a document that handed the forecasters the resolving paragraph — prose
+# standing in for an absent section, on the one surface whose stated contract is that `success`
+# means CONTENT. It is a `no_resolving_content` for that reason. `budget_skipped` and `parse_contention`
 # belong to the `unsupported_type` a held-but-unparsed document earns, and say which rule
 # declined: the question ran out of wall, or every parse slot was taken. Without them a
 # skipped document is indistinguishable from a body that was never a document at all.
@@ -261,8 +271,8 @@ class FetchResult:
     # disclosure appended to its rendered text.
     unreadable_embeds: list[str] = field(default_factory=list)
     # Which rule produced the status, where the status alone is ambiguous. Set on
-    # `no_resolving_content` (`embed_shell` / `thin_page`) and `unreadable_document`
-    # (`no_text_layer` / `encrypted` / `malformed`); None everywhere else.
+    # `no_resolving_content` (`embed_shell` / `thin_page` / `no_matching_passage`) and
+    # `unreadable_document` (`no_text_layer` / `encrypted` / `malformed`); None everywhere else.
     status_reason: FetchStatusReason | None = None
     # Which rung of the ladder produced this result, and the per-rung attempts behind
     # it. `direct` plus an empty list is the plain fetch, which is the overwhelming

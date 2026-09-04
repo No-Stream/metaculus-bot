@@ -30,6 +30,8 @@ dependencies = [
     "ijson>=3.5.1",
     "pypdf>=6.16.2",
     "certifi>=2026.5.20",
+    "brotli>=1.2.0",                                        # aiohttp's optional `br` decoder; see [tool.deptry] DEP002
+    "backports-zstd>=1.7.0 ; python_full_version < '3.14'", # aiohttp's optional `zstd` decoder; stdlib from 3.14 on
 ]
 # supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 # The freshness window is enforced at lock time via `uv lock --exclude-newer <ts>`
@@ -297,6 +299,17 @@ extend_exclude = [
 ]
 
 [tool.deptry.per_rule_ignores]
+# DEP002 — declared but imported by nothing of ours. Both are aiohttp's OPTIONAL decoders,
+# imported by `aiohttp.compression_utils` and reached only through a response body read. They
+# are load-bearing on the one route where `Accept-Encoding` is not a contract: the Wayback rung
+# fetches captures in `id_` raw mode, which replays whatever `Content-Encoding` the ORIGIN sent
+# the archive's crawler. Without them aiohttp raises `Can not decode content-encoding` on the
+# read and the hop lands as `error` — measured 2026-09-03 on trueup.io's 21-day-old zstd
+# capture, which the rung then reported as "no archived copy served". `backports-zstd` carries
+# the `python_full_version < '3.14'` marker because aiohttp reads zstd from the stdlib
+# `compression.zstd` from 3.14 on, and the backport itself declares `Requires-Python <3.14`.
+# Pinned by tests/test_http_fetch.py::TestUnadvertisedContentEncoding.
+DEP002 = ["brotli", "backports-zstd"]
 # DEP003 — imported but only a transitive dependency. Both are guaranteed present by a
 # declared direct dependency, and both are imported for exception types that surface
 # through that dependency's own API rather than for their own client:

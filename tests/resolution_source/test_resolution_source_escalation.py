@@ -13,6 +13,7 @@ package's autouse fixtures already stub DNS and reset the shared gates.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import get_args
 
@@ -39,6 +40,7 @@ from tests.resolution_source_fakes import (
     _embed_shell_page,
     _prose_page,
 )
+from tests.test_document_text import build_text_pdf
 
 _URL = "https://tracker.example.com/senate"
 _FEED_URL = "https://tracker.example.com/api/series"
@@ -622,7 +624,7 @@ class TestWaybackRung:
         assert result.status == "blocked"
         assert result.route == "wayback"
 
-    async def test_no_archived_copy_at_all_declines(self):
+    async def test_no_archived_copy_at_all_declines(self, caplog):
         session = FakeSession(
             {
                 _URL: FakeResponse(403, body=b"", content_type="text/html"),
@@ -630,10 +632,14 @@ class TestWaybackRung:
             }
         )
 
-        result = await _fetch_one(session, _URL, {}, self._ctx())
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(session, _URL, {}, self._ctx())
 
         assert result.status == "blocked"
         assert result.route == "wayback"
+        # The archive never redirected onto a dated capture, so this is the only decline the
+        # "no archived copy" wording is true of.
+        assert "no archived copy served for tracker.example.com" in caplog.text
 
     async def test_the_rung_is_skipped_below_its_floor(self, monkeypatch):
         monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 4.0)
@@ -671,17 +677,23 @@ class TestWaybackRung:
         assert _rung_counts(results)["wayback_attempts"] == 2
         assert _rung_counts(results)["wayback_cap_skips"] == 1
 
-    async def test_an_archived_page_that_is_itself_unreadable_leaves_the_direct_status(self):
+    async def test_an_archived_page_that_is_itself_unreadable_leaves_the_direct_status(self, caplog):
         session = self._session(
             page=FakeResponse(403, body=b"", content_type="text/html"),
             captured=self._NOW - timedelta(days=2),
             archived=FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
         )
 
-        result = await _fetch_one(session, _URL, {}, self._ctx())
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(session, _URL, {}, self._ctx())
 
         assert result.status == "blocked"
         assert result.route == "wayback"
+        # The decline is right and the wording has to match it: the archive DID serve this
+        # capture, and calling that "no archived copy served" (which it did, until apnews.com
+        # showed up in the sweep as an empty archive) describes a fact we never established.
+        assert "an archived capture was served but is unusable for tracker.example.com" in caplog.text
+        assert "no archived copy served" not in caplog.text
 
 
 class TestUrlContextRung:
@@ -785,6 +797,37 @@ class TestUrlContextRung:
 
         assert result.status == "success"
         assert len(calls) == 1
+
+    async def test_a_document_we_read_in_full_is_never_sent_to_the_paid_reader(self, monkeypatch):
+        """`no_matching_passage` is inside the trigger STATUSES and outside the trigger
+        POPULATION. We hold the whole document's text and its outline, so a model re-reading the
+        same PDF cannot find a passage BM25 could not — it would be spend with a known-zero
+        return, which is the same test every other exclusion in that set passes. Reason-scoped,
+        because `thin_page` and `embed_shell` are pages our client genuinely could not read."""
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        pdf_url = "https://cdc.example.com/report.pdf"
+        session = FakeSession(
+            {
+                pdf_url: FakeResponse(
+                    200,
+                    body=build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2"]]),
+                    content_type="application/pdf",
+                ),
+                # Served, and ALLOWING: without the exclusion every later gate here passes, so
+                # the assertion that fails is the one that matters — the paid call was made.
+                "https://cdc.example.com/robots.txt": FakeResponse(
+                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
+                ),
+            }
+        )
+
+        result = await _fetch_one(session, pdf_url, {}, FetchContext(query="corn futures settlement"))
+
+        assert calls == [], "the paid reader was asked to re-read a document we already hold"
+        assert result.status == "no_resolving_content"
+        assert result.status_reason == "no_matching_passage"
+        assert result.route == "pdf_local"
 
     async def test_a_missing_api_key_skips_without_calling(self, monkeypatch):
         reader, calls = self._reader()
