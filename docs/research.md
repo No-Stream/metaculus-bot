@@ -1223,12 +1223,15 @@ answerable. See "Reading run logs" in `docs/operations.md` for the field meaning
 
 The paid rung adds two greppable log lines that are deliberately NOT registered as marker specs:
 `RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...` (an INFO, the free pre-check
-avoiding a known-zero paid read) and `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED: url=...
-statuses=...` (a WARN, a paid read discarded for retrieving nothing). With the flag off in every
+avoiding a known-zero paid read) and `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=...
+statuses=...` (a WARN, a paid read discarded for retrieving nothing; `statuses` is every reported
+`url_retrieval_status`, `none` when the SDK attached no entry). With the flag off in every
 workflow neither can fire in production, so a spec would only add an always-empty archive
 column; both are FUTURE marker-spec candidates, to be registered if the flag is ever turned on,
-which is when their rates start meaning something. Their `agentic_*` twins on the gap-fill v2
-reader already carry specs and are the pattern to follow.
+which is when their rates start meaning something. Their spellings are pinned by tests so the
+eventual spec matches the lines, and they are parallel to their `AGENTIC_URLCONTEXT_ROBOTS_SKIP`
+/ `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` twins on the gap-fill v2 reader, which already carry
+specs and are the pattern to follow.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window), on the same leakage rationale. The section

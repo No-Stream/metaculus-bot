@@ -2150,7 +2150,14 @@ async def _url_context_rung(
         )
         return None
     if n_retrievals == 0 or not text.strip():
-        logger.warning(f"RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED: url={url} statuses={','.join(statuses) or 'none'}")
+        # Spelled parallel to the gap-fill v2 reader's AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED (and
+        # gemini_search's GEMINI_UNGROUNDED_SUPPRESSED), so the three suppression rates read as
+        # one family. `statuses` carries every reported url_retrieval_status; `none` means the
+        # SDK attached no url_metadata entry at all. Deliberately not a registered marker spec
+        # while the flag is off in every workflow — see docs/research.md.
+        logger.warning(
+            f"RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url={url} statuses={','.join(statuses) or 'none'}"
+        )
         return FetchResult(
             url=url,
             status="ungrounded",

@@ -1043,30 +1043,58 @@ class TestUrlContextRung:
         assert calls[0]["role"] == "resolution_source"
         assert _rung_counts([result])["url_context_reads"] == 1
 
-    async def test_zero_retrievals_discards_the_text(self, monkeypatch):
+    async def test_zero_retrievals_discards_the_text(self, monkeypatch, caplog):
         """Gemini answers fluently out of parametric memory when every retrieval failed (Q38195),
         and this section is captioned primary grading evidence."""
         reader, _calls = self._reader(retrievals=0, statuses=["URL_RETRIEVAL_STATUS_ERROR"])
         self._arm(monkeypatch, reader)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "ungrounded"
         assert result.text == ""
+        # Deliberately unregistered while the flag is off everywhere, so the spelling is pinned
+        # HERE: parallel to AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED, the v2 reader's twin, so the
+        # spec that eventually registers it matches the lines already in the logs.
+        assert (
+            "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate "
+            "statuses=URL_RETRIEVAL_STATUS_ERROR"
+        ) in caplog.messages
 
-    async def test_a_google_extended_disallowing_host_is_skipped_before_paying(self, monkeypatch):
+    async def test_the_ungrounded_line_says_none_when_the_sdk_reported_no_statuses(self, monkeypatch, caplog):
+        def _read(url, ask, **kwargs):
+            del url, ask, kwargs
+            return ("", 0, [])
+
+        self._arm(monkeypatch, _read)
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+            await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+
+        assert (
+            "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate statuses=none"
+        ) in caplog.messages
+
+    async def test_a_google_extended_disallowing_host_is_skipped_before_paying(self, monkeypatch, caplog):
         """Proven live 2026-09-03: a host that disallows the token refuses the fetch server-side,
         so the read would be spend with a known-zero return."""
         reader, calls = self._reader()
         self._arm(monkeypatch, reader)
         session = self._session(robots=b"User-agent: Google-Extended\nDisallow: /\n")
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "blocked"
         assert result.route == "direct"
         assert calls == []
         assert _rung_counts([result])["url_context_robots_skips"] == 1
+        # Unregistered while the flag is off everywhere, so pinned here; parallel to the v2
+        # reader's AGENTIC_URLCONTEXT_ROBOTS_SKIP.
+        assert (
+            "RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=https://tracker.example.com/senate host=tracker.example.com"
+        ) in caplog.messages
 
     async def test_a_robots_file_blocking_generic_crawlers_still_pays(self, monkeypatch):
         """A different and much broader policy than the one this pre-check implements: our own
