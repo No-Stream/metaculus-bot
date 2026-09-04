@@ -47,8 +47,12 @@ the first):
   --no-verify` bypass; `scripts/hooks/no_commit_to_main.sh` is a `language: script` hook,
   so it must stay executable in the index (mode `100755` — `tests/test_no_commit_to_main_hook.py`
   asserts that, along with the behavior on a feature branch and on a detached HEAD).
-- **at push** — the full pytest suite, the same command CI runs. ~105s, too much friction
-  per commit but the right price on the thing reviewers see.
+- **at push** — the full pytest suite, `uv run --frozen pytest --cov=metaculus_bot`, which
+  is the command `.github/workflows/ci.yaml` runs. ~105s, too much friction per commit but
+  the right price on the thing reviewers see.
+
+Run the hooks by hand with `make precommit` (staged files) or `make precommit_all` (the
+whole tree).
 
 Two things can block or stale the install on a checkout that predates the uv migration:
 
@@ -1038,21 +1042,17 @@ open-bound floor) still misses the band, because that interval lies wholly above
 
 The same command prints a second, per-QUESTION section: the **starved outer tail**
 scan, which lives in `performance_analysis/outer_tail.py` (the width monitor owns
-only the CLI wiring). On an open bound the declared outer tail can end up routed
-past the displayed range entirely, leaving every in-range bin above the members'
-declared p99 pinned at the platform's per-bin minimum step (`0.01/N`). Every
-resolution in that band then earns the same floor score, about -219 on any grid
-size, so the band is a cliff at a fixed location rather than a band of the wrong
-width — which is why it reads per question rather than per era, and why widening
-does not fix it. q45218 published its winning rig-count forecast with 27 such
-bins starting one rig above its declared p99, a flat -219.5 zone sixteen rigs
-from the resolution, and the same shape is what made q44182 (-219.0) the worst
-record on the board. A side is flagged when its band's mean per-bin mass is under
-`STARVED_OUTER_TAIL_FLOOR_MULTIPLE` (2.0) times that minimum step; each flagged
-row reports the declared anchor, how many member curves set it and how many were
-dropped, the displayed bound, the band's mass and bin count, the mass sitting
-beyond the bound, and the log score a resolution in the band's thinnest bin would
-earn. The member census is there because the anchor is a median over the members
+only the CLI wiring). `docs/performance_analysis.md` defines the defect, why it is a
+cliff at a fixed location that widening does not fix, and what the archived fire rate
+means; this section covers running it and reading a row. q45218 published its winning
+rig-count forecast with 27 such bins starting one rig above its declared p99, a flat
+-219.5 zone sixteen rigs from the resolution, and the same shape is what made q44182
+(-219.0) the worst record on the board. A side is flagged when its band's mean per-bin
+mass is under `STARVED_OUTER_TAIL_FLOOR_MULTIPLE` (2.0) times the platform's per-bin
+minimum step (`0.01/N`); each flagged row reports the declared anchor, how many member
+curves set it and how many were dropped, the displayed bound, the band's mass and bin
+count, the mass sitting beyond the bound, and the log score a resolution in the band's
+thinnest bin would earn. The member census is there because the anchor is a median over the members
 whose declared curve is usable, so dropping one (an anonymous positional
 `Forecaster N` bucket, an unparseable curve, or one carrying fewer than two
 distinct percentile labels) moves the boundary the verdict is measured against;
@@ -1060,12 +1060,7 @@ the section header states how many sides dropped a member, and every scanned sid
 carries `members_used` / `members_dropped` in the JSON dump.
 `--output-starved-json <path>` writes every scanned side with its verdict,
 flagged or not. This is a DETECTOR: any width response stays gated on the
-standing `k_tail` hold. On the archived cohort it
-fires on 68 of 417 measurable open-bound sides across 49 questions, so a fire
-means "this question carries a cliff" rather than "something went wrong here".
-There is no publish-time twin of this detector, deliberately; the comment above
-`STARVED_OUTER_TAIL_FLOOR_MULTIPLE` in `outer_tail.py` records why, and what a
-version that needed no new publish-path plumbing would have to measure instead.
+standing `k_tail` hold, and there is no publish-time twin of it.
 
 Its era boundaries are **merge-to-main timestamps** (`WIDENING_FLIP`,
 `TS_ANCHOR_ENABLE`), not authoring dates — prod runs from `main`, so a change is
@@ -1225,15 +1220,14 @@ the telemetry markers:
   the driver as successful ones and the driver's own retry was served the cached refusal.
 - `AGENTIC_FETCH_LOCAL_DOC: url=... method=pdf_local|digest_local chars=... pages=...
   passages=...` — an INFO, one per document the gap-fill v2 ladder read without paying a
-  Gemini `url_context` call for it. `pdf_local` is a `fetch` serving a PDF's own extracted
-  text (which paginates, so it selects nothing and `passages` is `n/a`); `digest_local` is a
-  `read_document` answering the ask from BM25-selected passages of text we hold, where
-  `passages=0` is the reading that matters — the document does not discuss what was asked,
-  which in the block itself reads exactly like a successful read. `chars` is the text HELD,
-  not the window handed to the driver, so it is comparable across both routes and against
-  `URL_CONTEXT_SIZE_GATE_TOKENS` (chars / 4), and `pages` is `n/a` for a page with no page
-  structure. Emitted by `log_local_document_read` in
-  `research/agentic/local_document.py`; harvested as `agentic_fetch_local_doc`. This is how
+  Gemini `url_context` call for it. `passages=0` on a `digest_local` is the reading that
+  matters — the document does not discuss what was asked, which in the block itself reads
+  exactly like a successful read — and `pages` is `n/a` for a page with no page structure.
+  The line fires only where text was actually served, so its absence measures nothing: a
+  refused digest leaves no line and the paid read that followed shows up only in the spend.
+  `docs/agentic_gap_fill.md` defines the two methods and the `chars` convention. Emitted by
+  `log_local_document_read` in `research/agentic/local_document.py`; harvested as
+  `agentic_fetch_local_doc`. This is how
   the local-first rung is measured at all: before it every PDF the driver met went to a paid
   reader, 191 calls over the 2026 summer season, and the only trace of one was the spend.
 - `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=... [reason=...]
@@ -1285,6 +1279,13 @@ the telemetry markers:
   failed for a nameable reason from one that never happened. Both `none` and an absent
   field harvest as null, so an archived pre-field line reads the same way. Harvested as
   `agentic_document_ungrounded_suppressed`.
+- `AGENTIC_URLCONTEXT_ROBOTS_SKIP: url=... host=...` — an INFO, one per paid `url_context`
+  read skipped because the host's robots.txt disallows `Google-Extended`, the product token
+  Gemini's retrieval obeys, so the read would have been spend with a known-zero return
+  (`research/agentic/tools.py`; the group parser is `research/agentic/robots_policy.py`).
+  Non-alertable: a fire is a paid call NOT billed, and the free fetch rungs are unaffected by
+  the check. Harvested as `agentic_urlcontext_robots_skip`. `docs/agentic_gap_fill.md` covers
+  the group parser and what a high rate would mean.
 - `FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor symbol=... vr_lag=... vr=...
   floor=... short_vol=... long_vol=... robust_vol=...` — the series behind a rendered
   volatility is noise-dominated: its variance ratio sits below

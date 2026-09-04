@@ -125,9 +125,10 @@ and turns a breach into an error `ToolOutcome` rather than a crash.
   back the passages of it that bear on the ask. Acquisition-first: it runs the
   free rungs (this run's cache, then plain HTTP and headless Chromium) and
   answers from the page's own text with a deterministic BM25 passage digest
-  (`method=digest_local`), and only where it can hold no text at all does Gemini
-  read the URL through the `url_context` tool on the native `google-genai` SDK
-  (`method=document`). So it is for targeted extraction from long or complex
+  (`method=digest_local`), and only where the ladder holds nothing usable — no text at
+  all, or the one refused shape described below — does Gemini read the URL through the
+  `url_context` tool on the native `google-genai` SDK (`method=document`). So it is
+  for targeted extraction from long or complex
   documents and as a fallback when `fetch` was blocked, and the paid half of it
   is now reserved for hosts our own client cannot read — measured 2026-09-03,
   two of 47 archived fetch failures. Requires a precise `ask`: it is what selects
@@ -162,7 +163,16 @@ escalates when the lighter one comes up short:
    even that is reported as `oversize_document` rather than escalated, since a
    document too big to read locally is also too big to be worth having a model
    retrieve. The parse is held for the run, so pagination and a later
-   `read_document` on the same URL neither refetch nor reparse.
+   `read_document` on the same URL neither refetch nor reparse. A read that stopped
+   early says so in the text it serves, led by
+   `[Partial document read: N pages; stopped at the M-page read cap]` or
+   `[Partial document read: N pages; stopped after M pages on the extraction time budget]`
+   — the clause is `document_text.truncation_note`, shared with the digest header so the
+   two wordings cannot drift, and without it the driver pages to the end, sees
+   `truncated=False`, and can report an absence over pages nobody read. The parse itself
+   contends for `http_fetch.pdf_parse_semaphore()`, two slots held loop-wide with the
+   Tier-1 resolution-source PDF rung. It bounds concurrent parses and their pypdf arenas,
+   not how many fetched bodies are resident.
 4. **Headless Chromium** (`_try_rendered_fetch`). If plain extraction returns
    too little text (below `GAP_FILL_V2_MIN_CONTENT_CHARS`), the ladder re-fetches
    with Playwright's headless Chromium to run JavaScript. It waits for
@@ -172,11 +182,75 @@ escalates when the lighter one comes up short:
    `page.goto` raised. The rung's 35 s ceiling is unchanged — the settle comes
    out of the goto budget. The SSRF guard is re-applied to every request Chromium
    makes. If Playwright isn't installed, this rung logs a one-time warning and
-   the plain result stands.
+   the plain result stands. A URL where Chromium ran and extracted nothing is remembered
+   for the run and never rendered again, so the second launch a documented escalation
+   would spend (a js-walled `fetch` the driver follows with `read_document`) is skipped.
+   That is the ONLY outcome memoized: a `blocked`, `error` or `throttled` GET is not,
+   because the driver is told to retry those URLs and caching them would suppress a retry
+   the tool descriptions promise.
 5. **read_document.** If the URL turns out to be an image, or a PDF with no text
    layer at all, `fetch` auto-escalates to `read_document` so the driver keeps
    its "handled automatically" promise without spending a second tool call. The
-   `method` field on the result tells the driver which rung actually served it.
+   `method` field on the result tells the driver which rung actually served it. The
+   escalation passes `ladder_exhausted=True`, an internal argument saying the free rungs
+   just ran for this URL, so `read_document` does not re-request a page (or re-download an
+   image the plain rung classified off its Content-Type). It is deliberately absent from the
+   driver-facing schema, which stays `(url, ask)`: the loop binds handlers with `**arguments`
+   straight off the model, so an advertised — or merely hallucinated —
+   `ladder_exhausted: true` would skip the free ladder and pay. `build_gap_fill_tools`
+   wraps the real function to enforce that, the same way it hides `fetch`'s
+   `question_topic`.
+
+### The free digest, and the one shape it refuses
+
+`read_document` answers from text the ladder already holds with a deterministic BM25
+passage digest. It runs in a worker thread rather than on the event loop:
+`select_passages` tokenises every window of the whole document and holds a counter per
+window, which measured a 1,365 ms contiguous stall for six concurrent 400-page digests —
+inside a research phase whose wall discards work that already succeeded.
+
+The digest is refused — and the paid reader runs instead — for exactly one shape: held text
+under `GAP_FILL_V2_MIN_CONTENT_CHARS`, with no PDF parse behind it, whose digest selected
+NO passage. That is a JavaScript shell whose browser rescue already failed, and digesting
+its navigation chrome stamped an unread page `fetched` — the one tier that supersedes the
+briefing — while the tool description tells the driver a zero-passage digest means the
+document does not discuss the ask. All three conditions are load-bearing: a thin-but-real
+short page that matches the ask is still served free, a held parse is a real local read of
+something a browser cannot help with, and a matching passage is the evidence that the text
+is the page rather than its frame.
+
+The paid rung's deadline arithmetic is fixed by design, and it can overrun. The wait is
+`min(_READ_DOCUMENT_TIMEOUT_S, _READ_DOCUMENT_TOTAL_BUDGET_S − acquisition elapsed)`: 60 s
+when acquisition failed fast, 40 s at the `_LOCAL_DOCUMENT_BUDGET_S` cap. The reader's own
+in-thread ceiling is a FIXED 55 s (two attempts plus backoff, `tool_backends.py`), so past
+about 10 s of acquisition the wait is the shorter of the two, and `wait_for` cannot cancel a
+`to_thread` worker — a worker can outlive the wait by up to 15 s and finish a billed call
+whose answer is discarded. What it cannot do is start a NEW billed request after the wait
+fires: the last attempt begins by 28.5 s in, inside the 40 s floor. Sizing the attempts off
+the variable wait instead would cut one attempt to 19 s on the handover path and fail reads
+that succeed today, so the timeout values are unchanged and the overrun is documented rather
+than traded away.
+
+### The robots pre-check on the paid read
+
+Before the paid `url_context` read — and only there; the free rungs are unaffected —
+`read_document` fetches `<scheme>://<host>/robots.txt` once per host through the same
+SSRF-guarded plain fetch (`_fetch_plain`, under `_ROBOTS_FETCH_TIMEOUT_S`), with the verdict
+cached process-wide. Only the `Google-Extended` group is honoured,
+because that is the product token Gemini's retrieval obeys: a host disallowing it refuses
+the fetch server-side, so the read is spend with a known-zero return, which is what makes one
+free request worth it. `urllib.robotparser` cannot express that —
+`can_fetch("Google-Extended", url)` falls back to the `User-agent: *` group when no
+Google-Extended group exists, which would skip the paid read on every host that merely
+disallows generic crawlers — so the group parser is our own, in
+`metaculus_bot/research/agentic/robots_policy.py`, and every ambiguity there resolves toward
+PAYING rather than skipping (an unreadable robots.txt, an unmodelled rule shape, an absent
+group all come back "not disallowed").
+
+A disallow returns `status="robots_disallowed"` and earns no verification tier, because
+nothing was read: only a `method` with an entry in `provenance._METHOD_TO_TIER` can be
+stamped, which is also why a `throttled` fetch can never claim `fetched` and supersede the
+briefing. It logs one `AGENTIC_URLCONTEXT_ROBOTS_SKIP` line (fields under Telemetry).
 
 ## The output artifact
 
@@ -352,6 +426,23 @@ in the block itself reads exactly like a successful read. `chars` is the text we
 window handed to the driver, so it is comparable across both routes and against
 `URL_CONTEXT_SIZE_GATE_TOKENS` (chars / 4).
 
+The line fires only where a digest or a PDF's text was actually SERVED, so its absence is not
+a measurement: a `read_document` whose digest was refused (the one shape above) or whose
+ladder held nothing leaves no line at all, and the paid read that followed is visible only in
+the reader's own spend. Count fires, never non-fires.
+
+A third is the pre-check that skips a paid read the host would refuse anyway:
+
+```
+AGENTIC_URLCONTEXT_ROBOTS_SKIP: url=... host=...
+```
+
+as an INFO from `tools.py`, harvested as `agentic_urlcontext_robots_skip` and, like the two
+above, with no `question=`. Non-alertable: a fire is a paid call NOT billed, not a defect.
+`host` rides beside `url` because the robots verdict is cached and applied per host, so the
+host is the unit any rate is computed over — and a suspiciously high rate is the signal that
+the group parser is over-matching and withholding reads we could have had.
+
 For a richer trace, the seam accepts an `archive_sink` callback. When the loop
 actually ran, the orchestrator captures `{transcript, telemetry}` through it and
 writes it into the research archive (`persistence.py`), including empty-findings
@@ -373,6 +464,10 @@ level up:
 | `agentic/dispatch.py` | One assistant turn's tool calls in, one tool message each out: batch admission (plan gate, call budget, duplicate detection), provenance absorption, and the tool-message/rejection rendering. |
 | `agentic/tools.py` | `build_gap_fill_tools` and the four tool handlers, including the escalating fetch ladder and its SSRF hardening. |
 | `agentic/local_document.py` | The local PDF rung, the run's held-parse cache, the passage digest `read_document` serves, the url_context size gate, and the `AGENTIC_FETCH_LOCAL_DOC` marker. |
+| `agentic/fetch_outcomes.py` | Response classification for the plain `fetch` rung: content-type and magic-byte sniffers, the outbound-link collector, the metaculus.com refusal, and the per-body-shape outcome builders including the throttle interstitial. |
+| `agentic/tool_backends.py` | The outbound half of the tools: the AskNews and Exa clients with their retry ladders and concurrency caps, the Gemini `url_context` document read and its fixed in-thread ceiling, and the markdown formatting of what comes back. |
+| `agentic/tool_descriptions.py` | The driver-facing tool descriptions and JSON parameter schemas — behavioral text, so a change here changes what the driver does. |
+| `agentic/robots_policy.py` | The `Google-Extended` robots.txt group parser behind the pre-check on the paid read, written because `urllib.robotparser` falls back to `User-agent: *`. |
 | `agentic/driver_prompt.py` | The three prompt builders: `build_system_prompt`, `build_user_brief`, `build_ghost_prompt`, plus the `SupportedQuestion` type. |
 | `agentic/artifact.py` | `render_findings` (the output section) and `detachment_lint`. |
 | `agentic/types.py` | The dataclasses and Pydantic models: `ToolOutcome`, `ToolSpec`, `Finding`, `GhostForecast`, `LoopConfig`, `LoopTelemetry`, `LoopResult`. |

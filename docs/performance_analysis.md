@@ -79,9 +79,11 @@ did not fetch. Three archives:
   google-genai token and grounded-query accounting for both Gemini surfaces, which bill
   outside OpenRouter and so appear in no `CREDIT_*` marker),
   `RESOLUTION_SOURCE_ESCALATION` (one line per escalated fetch rung, with what
-  triggered it and what it cost) and `AGENTIC_FETCH_LOCAL_DOC` (one line per gap-fill v2
-  document read served from the host's own bytes instead of the paid reader).
-  `scripts/telemetry/markers.py` is the registry.
+  triggered it and what it cost), `AGENTIC_FETCH_LOCAL_DOC` (one line per gap-fill v2
+  document read served from the host's own bytes instead of the paid reader — fires only
+  where text was actually served, so its absence measures nothing) and
+  `AGENTIC_URLCONTEXT_ROBOTS_SKIP` (one line per paid read skipped because the host's
+  robots.txt disallows `Google-Extended`). `scripts/telemetry/markers.py` is the registry.
 - **The raw research-provider payload archive**
   (`backtests/research_archive/raw/<run_id>.jsonl`, one file per run) — each provider's
   RAW return before formatting: AskNews article dicts per HOT/HISTORICAL phase,

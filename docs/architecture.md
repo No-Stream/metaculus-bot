@@ -190,10 +190,14 @@ The default strategy is `CONDITIONAL_STACKING` (set in `cli.py`'s `main`). Conce
 
 - Compute the spread across the N forecasts (`spread_metrics.compute_spread`).
 - **Low spread**: return the MEDIAN of the raw per-model predictions.
-- **High spread**: extract the disagreement crux with the analyzer LLM, run a targeted
-  search on it, then hand the full base-model reasonings plus that research to a
-  stacker LLM that rewrites the forecast. If the stacker fails, it falls back to a
-  second stacker LLM, then to MEDIAN.
+- **High spread**: extract the disagreement crux with the analyzer LLM (under
+  `CRUX_SOFT_DEADLINE`), run a targeted search on it — OpenAI native search on the same
+  `NATIVE_SEARCH_*` model, effort, verbosity and timeout settings the native-search provider
+  uses — then hand the full base-model reasonings plus that research to a stacker LLM that
+  rewrites the forecast (`stacking.run_stacking_binary` / `_mc` / `_numeric`). The fallback
+  ladder is primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under
+  `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN, driven by `_stacking_aggregate`
+  (`aggregation_pipeline.py`).
 
 Spread thresholds live in `constants.py`, one per question type:
 `CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD` (a probability range),
@@ -260,7 +264,8 @@ function-scoped import needs one of exactly three real justifications, and its
 1. **Genuinely optional dependency** — matplotlib behind an `ImportError` guard
    (`research/timeseries_anchor.py`, `calibration/fit_platt_cli.py`). matplotlib is in
    the dev group and prod installs `uv sync --no-dev`, so it is the one package that is
-   genuinely absent at runtime. `rapidfuzz`, `yfinance` and `asknews` are all declared
+   genuinely absent at runtime, and the `DEP004` entry in `pyproject.toml` is where that
+   exemption is declared to deptry. `rapidfuzz`, `yfinance` and `asknews` are all declared
    runtime dependencies, so a function-scoped import never protected against their
    absence.
 2. **Late binding for a patch surface** — a test patches the name on its SOURCE module

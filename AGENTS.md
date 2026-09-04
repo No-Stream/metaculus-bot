@@ -318,7 +318,7 @@ Each of these has cost real work at least once. The pointer is where the reasoni
 - **Lint and format**: `make lint` (Ruff check), `make format` (Ruff format + autofix).
 - **Typecheck**: `make typecheck` (basedpyright), `make typecheck_ty` (secondary).
 - **Coverage**: `make cov` (branch coverage is on). **Audit**: `make audit` (osv-scanner over
-  `uv.lock`; `brew install osv-scanner` locally, CI uses the action).
+  `uv.lock`; `brew install osv-scanner` locally, CI runs it via `google/osv-scanner-action`).
 - **Dependency hygiene**: `make deps` (deptry). **Import contracts**: `make lint_imports`
   (import-linter; the contracts live in `pyproject.toml` `[tool.importlinter]`). Both are free
   and both run in CI's lint job and in `make all`.
@@ -339,8 +339,9 @@ environment — a hardcoded absolute path, the checkout location, `$HOME`, gitig
 passes locally by construction, so CI is the first place it can fail. This has shipped: a test
 asserted a launchd plist's `ProgramArguments` equalled a path derived from `__file__`, which
 holds only on the machine whose absolute path the plist hardcodes. Never assert an absolute path
-derived from the developer's environment; assert a repo-relative suffix, or skip when the
-artifact is inherently machine-specific. After pushing, check the run:
+derived from the developer's environment; assert a repo-relative suffix
+(`Path.relative_to(_REPO_ROOT)`), or skip when the artifact is inherently machine-specific.
+After pushing, check the run:
 `gh run list --repo No-Stream/metaculus-bot --branch <branch>` (`--repo` is required, since
 `origin` is the fork and `upstream` is the template).
 
