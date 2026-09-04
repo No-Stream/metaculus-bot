@@ -98,10 +98,12 @@ class TestThePaidReadIsBoundedByTheRemainingWall:
         waits: list[float | None] = []
         real_wait_for = asyncio.wait_for
 
-        # ASYNC109 wants a caller-supplied deadline to be an `asyncio.timeout` block rather than a
-        # `timeout` parameter. This is not a caller: it is a drop-in for `asyncio.wait_for`, whose
-        # signature it must match exactly.
-        async def _recording_wait_for(awaitable, *, timeout=None):  # noqa: ASYNC109
+        # A faithful drop-in, so anything else in this test's extent that reaches for `wait_for`
+        # keeps working: the stdlib takes `timeout` positionally OR by keyword, and narrowing it to
+        # keyword-only here would turn an unrelated positional call into a TypeError. ASYNC109
+        # wants a `timeout` parameter to be an `asyncio.timeout` block, which a stand-in for
+        # `asyncio.wait_for` cannot be.
+        async def _recording_wait_for(awaitable, timeout=None):  # noqa: ASYNC109
             waits.append(timeout)
             return await real_wait_for(awaitable, timeout=timeout)
 
