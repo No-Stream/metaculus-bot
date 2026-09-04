@@ -173,13 +173,16 @@ escalates when the lighter one comes up short:
    contends for `http_fetch.pdf_parse_semaphore()`, two slots held loop-wide with the
    Tier-1 resolution-source PDF rung. It bounds concurrent parses and their pypdf arenas,
    not how many fetched bodies are resident.
-4. **Headless Chromium** (`_try_rendered_fetch`). If plain extraction returns
+4. **Headless Chromium** (`_try_rendered_fetch` in `agentic/tools.py`, a thin mapping
+   onto this ladder's `PlainFetchResult` over the shared browser transport
+   `metaculus_bot/research/rendered_fetch.py`, which the Tier-1 resolution-source
+   rendered rung uses too). If plain extraction returns
    too little text (below `GAP_FILL_V2_MIN_CONTENT_CHARS`), the ladder re-fetches
    with Playwright's headless Chromium to run JavaScript. It waits for
    DOM-ready plus a fixed settle rather than for network idle, and salvages
    `page.content()` when the navigation itself times out: 4 of the 10 render
    rescues in the 2026-09-03 replay came from pages whose DOM was complete when
-   `page.goto` raised. The rung's 35 s ceiling is unchanged — the settle comes
+   `page.goto` raised. The rung's 35 s ceiling is unchanged; the settle comes
    out of the goto budget. The SSRF guard is re-applied to every request Chromium
    makes. If Playwright isn't installed, this rung logs a one-time warning and
    the plain result stands. A URL where Chromium ran and extracted nothing is remembered
@@ -243,7 +246,7 @@ free request worth it. `urllib.robotparser` cannot express that —
 `can_fetch("Google-Extended", url)` falls back to the `User-agent: *` group when no
 Google-Extended group exists, which would skip the paid read on every host that merely
 disallows generic crawlers — so the group parser is our own, in
-`metaculus_bot/research/agentic/robots_policy.py`, and every ambiguity there resolves toward
+`metaculus_bot/research/robots_policy.py` (shared with the Tier-1 url_context rung), and every ambiguity there resolves toward
 PAYING rather than skipping (an unreadable robots.txt, an unmodelled rule shape, an absent
 group all come back "not disallowed").
 
@@ -467,7 +470,7 @@ level up:
 | `agentic/fetch_outcomes.py` | Response classification for the plain `fetch` rung: content-type and magic-byte sniffers, the outbound-link collector, the metaculus.com refusal, and the per-body-shape outcome builders including the throttle interstitial. |
 | `agentic/tool_backends.py` | The outbound half of the tools: the AskNews and Exa clients with their retry ladders and concurrency caps, the Gemini `url_context` document read and its fixed in-thread ceiling, and the markdown formatting of what comes back. |
 | `agentic/tool_descriptions.py` | The driver-facing tool descriptions and JSON parameter schemas — behavioral text, so a change here changes what the driver does. |
-| `agentic/robots_policy.py` | The `Google-Extended` robots.txt group parser behind the pre-check on the paid read, written because `urllib.robotparser` falls back to `User-agent: *`. |
+| `research/robots_policy.py` (outside `agentic/`, shared with the Tier-1 url_context rung) | The `Google-Extended` robots.txt group parser and per-host cache behind the pre-check on every paid read, written because `urllib.robotparser` falls back to `User-agent: *`. |
 | `agentic/driver_prompt.py` | The three prompt builders: `build_system_prompt`, `build_user_brief`, `build_ghost_prompt`, plus the `SupportedQuestion` type. |
 | `agentic/artifact.py` | `render_findings` (the output section) and `detachment_lint`. |
 | `agentic/types.py` | The dataclasses and Pydantic models: `ToolOutcome`, `ToolSpec`, `Finding`, `GhostForecast`, `LoopConfig`, `LoopTelemetry`, `LoopResult`. |
