@@ -94,8 +94,11 @@ class _FakePage:
 
     ``content_hangs`` is the ogimet shape (P3-1): a DOM read that never answers because the page
     keeps navigating. ``goto_raises`` is the salvage shape: the navigation times out with the DOM
-    already rendered. ``teardown`` records the close sequence the context and browser ran, so a
-    test can assert the browser was still torn down after a failure mid-render.
+    already rendered. ``goto_runs_its_budget_out`` puts the clock on that shape: the navigation
+    sleeps for its whole ``timeout`` before it raises or returns, as a real goto timeout does,
+    so a test can measure what the transport spends AFTER the budget is gone. ``teardown``
+    records the close sequence the context and browser ran, so a test can assert the browser
+    was still torn down after a failure mid-render.
     """
 
     def __init__(
@@ -105,12 +108,14 @@ class _FakePage:
         html: str = _DOM,
         content_hangs: bool = False,
         goto_raises: BaseException | None = None,
+        goto_runs_its_budget_out: bool = False,
         status: int = 200,
     ) -> None:
         self._responses = responses
         self._html = html
         self._content_hangs = content_hangs
         self._goto_raises = goto_raises
+        self._goto_runs_its_budget_out = goto_runs_its_budget_out
         self._status = status
         self._handlers: list[Any] = []
         self.detached_handler_tasks: list[asyncio.Future[Any]] = []
@@ -131,6 +136,8 @@ class _FakePage:
                 result = handler(response)
                 if asyncio.iscoroutine(result):
                     self.detached_handler_tasks.append(asyncio.ensure_future(result))
+        if self._goto_runs_its_budget_out:
+            await asyncio.sleep(timeout / 1000)
         if self._goto_raises is not None:
             raise self._goto_raises
         return SimpleNamespace(headers={"content-type": "text/html"}, status=self._status)
@@ -201,9 +208,13 @@ class _FakeBrowser:
 
 
 def _install_fake_playwright(
-    monkeypatch: pytest.MonkeyPatch, page: _FakePage, *, faults: _Faults | None = None
+    monkeypatch: pytest.MonkeyPatch, page: _FakePage, *, faults: _Faults | None = None, launch_delay_s: float = 0.0
 ) -> list[list[str]]:
-    """Wire the fakes in; ``faults`` says where the browser should misbehave (see :class:`_Faults`)."""
+    """Wire the fakes in; ``faults`` says where the browser should misbehave (see :class:`_Faults`).
+
+    ``launch_delay_s`` is what the launch costs on the clock (0.3 s warm to several seconds cold
+    on the real Chromium), spent AFTER the transport has recomputed its navigation budget.
+    """
     launch_args: list[list[str]] = []
     browser_faults = faults or _Faults()
 
@@ -211,6 +222,7 @@ def _install_fake_playwright(
         async def launch(self, *, headless: bool, args: list[str] | None = None) -> _FakeBrowser:
             del headless
             launch_args.append(list(args or []))
+            await asyncio.sleep(launch_delay_s)
             return _FakeBrowser(page, browser_faults)
 
     class _FakePlaywrightManager:
@@ -672,6 +684,44 @@ class TestTheNavigationBudgetAfterTheGates:
         (call,) = page.goto_calls
         assert call["timeout"] + _RENDER_TAIL_MS <= int(deadline_s * 1000)
         assert call["timeout"] >= rendered_fetch.RENDER_MIN_GOTO_MS
+
+    async def test_a_salvaged_dom_comes_back_inside_the_callers_deadline_over_a_pending_body_read(self, monkeypatch):
+        """The Tier-1 rung's shape end to end, with the clock running: the deadline handed to the
+        transport and the rung's outer ``wait_for`` sit at the same instant, the navigation budget
+        is computed BEFORE the launch, and the goto runs that budget out. The DOM read's fixed
+        bound then lands past the outer cut by the launch time, and a same-publisher body still
+        in flight used to hold the harvest drain there, so the outer bound fired and discarded a
+        DOM the transport had already read, billed as ``render_timeout``. The drain is clamped to
+        the caller's deadline less one teardown bound instead; the DOM read keeps its own bound.
+        """
+        monkeypatch.setattr(rendered_fetch, "RENDER_SETTLE_MS", 0)
+        monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 500)
+        monkeypatch.setattr(rendered_fetch, "RENDER_POST_GOTO_TAIL_MS", 500)
+        monkeypatch.setattr(rendered_fetch, "RENDER_MIN_GOTO_MS", 100)
+        pending = _FakeResponse(
+            f"{_PAGE_URL}/api/poll", content_type="application/json", body=_json_body(), body_delay_s=10.0
+        )
+        page = _FakePage([pending], goto_raises=_PlaywrightError("Timeout exceeded"), goto_runs_its_budget_out=True)
+        _install_fake_playwright(monkeypatch, page, launch_delay_s=0.1)
+        budget_s = 1.5
+
+        rendered = await asyncio.wait_for(
+            rendered_fetch.render_page(
+                _PAGE_URL,
+                memo_scope=_TIER1_SCOPE,
+                host_gate=asyncio.Semaphore(1),
+                goto_timeout_ms=int(budget_s * 1000),
+                deadline_monotonic_s=time.monotonic() + budget_s,
+                harvest_json=True,
+            ),
+            timeout=budget_s,
+        )
+
+        assert rendered is not None
+        assert "rendered" in rendered.html
+        assert rendered.json_responses == ()
+        assert pending.body_read_cancelled is True
+        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
 
     async def test_a_call_without_a_deadline_keeps_the_callers_goto_budget(self, monkeypatch):
         """Gap-fill v2's shape: its own ceilings bound the call, so the transport has nothing to

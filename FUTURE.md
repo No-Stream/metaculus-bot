@@ -1327,6 +1327,30 @@ Follow-ups:
    left the queue. Neither acquire is bounded, no launch allowance is reserved, and the 12 s floor
    is unchanged; the bounded acquire remains the reserved call above, and `render_page` is shared
    with v2, so bounding it there would be new timeout policy for both paths at once.
+   **Two residuals of the same deadline arithmetic, priced 2026-09-04 (still the operator's
+   call).** `_rendered_rung` hands the transport a deadline at the same instant as its own outer
+   `wait_for`, and the transport launches Chromium AFTER it recomputes the navigation budget, so
+   whenever the goto runs its budget out the fixed 5 s DOM-read bound sits past the outer cut by
+   the launch time. The strictly-safer half landed 2026-09-04: the harvest drain is clamped to
+   the deadline less one `RENDER_TEARDOWN_TIMEOUT_MS`, so a salvaged DOM is no longer discarded
+   as `render_timeout` over a same-publisher body still in flight. Two shapes remain. (a) After
+   an outer cut, the three bounded teardown steps plus the driver stop run inside the 2 s
+   `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`. A healthy teardown is sub-second and fits; a wedged
+   browser adds up to 6 s and trips the 45 s provider wall, which discards every sibling page
+   the question had already fetched. Reproduced only with fakes, never live. Closing it means
+   reserving 3 x `RENDER_TEARDOWN_TIMEOUT_MS` in the deadline handed to the transport and raising
+   `RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` from 12 s to 18 s so the pre-gate floor matches the
+   post-gate floor. That cuts 6 s of navigation from EVERY Tier-1 render (a 23 s budget goes from
+   a 16 s goto to a 10 s goto) and contradicts the decision recorded in the paragraph above (no
+   launch allowance is reserved, the 12 s floor is unchanged). (b) In the salvage-plus-hang shape
+   (the goto ran its budget out and `page.content()` then hangs, the ogimet shape) the outer cut
+   fires before the transport's own `RenderTimeout`, so the timed-out memo is never written and a
+   second question citing the URL pays a full render again. Closing it by clamping the DOM read to
+   the deadline would shrink the salvage read window to 3 s minus the launch time, and at a cold
+   launch (3 s or more) it would fail the read instantly and memoise a healthy URL as timed out
+   for the run, the semantic downgrade (from "the page kept navigating" to "we ran out of time")
+   that the `RENDER_DOM_READ_TIMEOUT_MS` comment deliberately rejected. The `render_page`
+   docstring and `docs/research.md` state the memo's real condition meanwhile.
 6. **MEDIUM: trafilatura silently drops MediaWiki collapsible boxes, and the surviving text can
    read as the inverse of the truth (verified 2026-08-24 on q44870; tracked here 2026-09-02).** On
    an English Wikipedia endorsements page the box renders as

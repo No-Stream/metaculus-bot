@@ -64,9 +64,13 @@ RENDER_DOM_READ_TIMEOUT_MS: int = 5_000
 # read at its bound. A caller-derived deadline has to leave this much room past the goto, or the
 # salvage-after-goto-timeout population above is cut off by the caller's own bound the instant
 # the settle ends — which is what happened at every Tier-1 budget under 40 s before the
-# navigation budget was recomputed here (see :func:`_goto_budget_ms`). The DOM read on a salvaged
-# page is sub-second, so reserving its full bound also absorbs the launch and the teardown, which
-# is why no separate allowance for those is carried.
+# navigation budget was recomputed here (see :func:`_goto_budget_ms`). Two costs are NOT reserved
+# here: the launch, which runs AFTER the recompute (0.3 s warm, seconds cold), and the bounded
+# teardown. Both fit only inside the caller's own wall margin (2 s for Tier-1), and only while the
+# browser is healthy. So when the goto runs its budget out, the DOM read's fixed bound lands past
+# the caller's deadline by the launch time, which is why the harvest drain is clamped to that
+# deadline in :func:`_navigate_and_read_dom` while the DOM read keeps its own bound (FUTURE.md
+# item 5 prices the two residuals).
 RENDER_POST_GOTO_TAIL_MS: int = RENDER_SETTLE_MS + RENDER_DOM_READ_TIMEOUT_MS
 # Floor under the navigation budget once the gates are held. Below it the render DECLINES rather
 # than making a token attempt: a launch is 100-300 MB and one of the process-wide slots, and a
@@ -424,7 +428,13 @@ async def _teardown_step(name: str, call: Any, playwright_error: type[BaseExcept
 
 
 async def _navigate_and_read_dom(
-    page: Any, url: str, playwright_error: type[BaseException], *, goto_timeout_ms: int, harvest: _JsonHarvest | None
+    page: Any,
+    url: str,
+    playwright_error: type[BaseException],
+    *,
+    goto_timeout_ms: int,
+    deadline_monotonic_s: float | None,
+    harvest: _JsonHarvest | None,
 ) -> RenderedPage | None:
     """Navigate to ``url``, let it settle, and return the rendered page, or None above the DOM ceiling.
 
@@ -440,8 +450,14 @@ async def _navigate_and_read_dom(
     when it fires — deliberately NOT swallowed into the salvage, because a page that keeps
     navigating has no DOM to salvage and the caller needs to tell this from a browser that is
     missing or broken (see :func:`render_page`). The harvest's in-flight body reads are then
-    drained INSIDE what is left of that same bound, never after it: the harvest is opportunistic
-    and may not lengthen a render whose real product is the DOM.
+    drained INSIDE what is left of that same bound, never after it, and no later than the
+    caller's ``deadline_monotonic_s`` less one teardown bound when a deadline was given: the
+    harvest is opportunistic and may not lengthen a render whose real product is the DOM. The
+    second clamp is there because the read bound is fixed and the launch runs after the budget
+    recompute, so in the salvage shape the read bound lands past the caller's deadline by the
+    launch time, and a body still in flight there used to hold the drain past the Tier-1 rung's
+    outer cut, which then discarded a DOM this function had already read. The DOM read itself
+    keeps its fixed bound (see :data:`RENDER_DOM_READ_TIMEOUT_MS` for why).
 
     The DOM is measured in characters against ``RENDERED_DOM_MAX_CHARS`` before anything copies
     it, because the copies are the hazard: the Tier-1 caller encodes it, decodes it back,
@@ -475,7 +491,12 @@ async def _navigate_and_read_dom(
         return None
     json_responses: tuple[HarvestedJson, ...] = ()
     if harvest is not None:
-        await harvest.drain(until_monotonic_s=read_deadline_s)
+        drain_until_s = (
+            read_deadline_s
+            if deadline_monotonic_s is None
+            else min(read_deadline_s, deadline_monotonic_s - RENDER_TEARDOWN_TIMEOUT_MS / 1000)
+        )
+        await harvest.drain(until_monotonic_s=drain_until_s)
         json_responses = tuple(harvest.bodies)
     return RenderedPage(
         url=url, content_type=content_type, html=html, json_responses=json_responses, http_status=http_status
@@ -647,7 +668,10 @@ async def render_page(
     because a caller's outer bound can also fire while the render is still queued behind the two
     gates, which says nothing about the page — and a memoised timeout is RE-RAISED here rather
     than declined, so a second question citing the same hostile page records the same reason
-    again instead of reading as a missing browser.
+    again instead of reading as a missing browser. The memo is written only when this bound fires
+    before the caller's: in the salvage shape (the goto ran its budget out) the DOM-read bound
+    sits past the caller's deadline by the launch time, so the Tier-1 rung's outer cut lands
+    first and that URL is not memoised (see :data:`RENDER_POST_GOTO_TAIL_MS`).
 
     The failure boundary around the browser is split three ways, and the split is the point.
     Playwright's own ``Error`` keeps the once-per-process latch: a launch that cannot find the
@@ -782,7 +806,12 @@ async def _render_in_browser(
         )
         try:
             return await _render_in_context(
-                context, url, playwright_error, goto_budget_ms=goto_budget_ms, harvest_json=harvest_json
+                context,
+                url,
+                playwright_error,
+                goto_budget_ms=goto_budget_ms,
+                deadline_monotonic_s=deadline_monotonic_s,
+                harvest_json=harvest_json,
             )
         finally:
             await _teardown_step("context.close", context.close(), playwright_error)
@@ -791,7 +820,13 @@ async def _render_in_browser(
 
 
 async def _render_in_context(
-    context: Any, url: str, playwright_error: type[BaseException], *, goto_budget_ms: int, harvest_json: bool
+    context: Any,
+    url: str,
+    playwright_error: type[BaseException],
+    *,
+    goto_budget_ms: int,
+    deadline_monotonic_s: float | None,
+    harvest_json: bool,
 ) -> RenderedPage | None:
     """Guard the context, open the page, navigate and read; leave the closes to the caller."""
 
@@ -824,7 +859,12 @@ async def _render_in_context(
         page.on("response", harvest.on_response)
     try:
         return await _navigate_and_read_dom(
-            page, url, playwright_error, goto_timeout_ms=goto_budget_ms, harvest=harvest
+            page,
+            url,
+            playwright_error,
+            goto_timeout_ms=goto_budget_ms,
+            deadline_monotonic_s=deadline_monotonic_s,
+            harvest=harvest,
         )
     finally:
         # A body read still pending here (the DOM read timed out, or the DOM was over the

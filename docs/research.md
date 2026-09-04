@@ -1016,9 +1016,12 @@ unbounded read then blocked for a further 40 s, so the render ran 76 s against t
 every page the question had already fetched was discarded). Around the transport, the rung holds
 the whole `render_page` call to the remaining budget with `asyncio.wait_for`, so no Playwright
 call can overrun the wall from inside it. A cut-off render says nothing about whether Chromium
-works, so it does not trip the once-per-run "rung unavailable" warning, and the URL is memoised
-for the run so a second question citing the same hostile page does not pay for it again; the
-direct result is what stands.
+works, so it does not trip the once-per-run "rung unavailable" warning, and the direct result is
+what stands. The URL is memoised for the run (so a second question citing the same hostile page
+does not pay for it again) only when the transport's own DOM-read bound fires before the rung's
+outer cut. In the salvage shape (the goto ran its budget out) the outer cut lands first by the
+launch time, because the launch runs after the transport recomputes its navigation budget and is
+not reserved in it, so that URL is not memoised (FUTURE.md item 5 prices the residual).
 
 `route=wayback` (`research/wayback.py`) serves an archived capture. The archive earns a rung
 because it is the one free route whose EGRESS IS NOT OURS: measured 2026-09-03, the same client
