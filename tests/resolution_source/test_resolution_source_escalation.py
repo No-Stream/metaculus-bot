@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import get_args
 
 import pytest
 
@@ -855,6 +856,15 @@ class TestRouteCaveats:
         assert rendered.splitlines()[1] == ""
         for caveat in ROUTE_CAVEATS.values():
             assert caveat not in rendered
+
+    def test_every_route_token_except_direct_has_a_caveat(self):
+        """The completeness guard, and the reason `impersonate` carries a sentence for a rung
+        that has not shipped: a future route token added to `FetchRoute` without a caveat would
+        otherwise render rescued content with no disclosure at all, silently."""
+        routes = set(get_args(FetchRoute))
+
+        assert routes - {"direct"} == set(ROUTE_CAVEATS)
+        assert "direct" not in ROUTE_CAVEATS
 
     @pytest.mark.parametrize("route", sorted(ROUTE_CAVEATS))
     def test_every_non_direct_route_says_how_its_section_was_obtained(self, route):
