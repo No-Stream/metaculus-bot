@@ -336,14 +336,17 @@ class RungAttempt:
     parse gate so queueing for a slot is not billed to the parse, and the browser rung
     stamps ``outcome`` with the rendered DOM's own verdict before the harvested feed gets
     its turn, so a feed that rescues the page does not read as the render having done so.
-    Before the closer existed both fields were whole-ladder values stamped once at the end,
-    which billed every rung for the latency of the rungs after it and made a rung that fired
-    and failed read as having rescued the page.
 
-    ``skipped_reason`` marks an attempt that never ran (no wall budget left). Those are
-    NOT escalation lines — the marker means "a rung fired" — so they ride the provider's
-    ``details["counts"]`` instead, where a zero renders nothing but survives into the
-    archive.
+    ``skipped_reason`` marks an attempt that produced no result for the page. Most never
+    ran: no wall budget left, a per-question cap spent, the fast path, a memo hit, no
+    browser, no key, a robots refusal. Two DID run and were thrown away — ``render_timeout``
+    is a render cut off before its DOM could be read, ``render_non_200`` one whose main frame
+    the edge answered with something other than a 200 — so a skip means "nothing came of this
+    rung", not "no work was done". Skips are NOT escalation lines — the marker means "a rung
+    fired and finished" — so they ride the provider's ``details["counts"]`` instead, where a
+    zero renders nothing but survives into the archive; that is also why the most expensive
+    render the ladder produces, a cut-off one, shows up in ``render_timeout_skips`` and never
+    on the latency marker.
     """
 
     rung: FetchRoute

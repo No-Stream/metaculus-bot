@@ -831,19 +831,28 @@ MARKER_SPECS: list[MarkerSpec] = [
         # field that decides whether a rung earns its place on a question under a close-derived
         # time budget.
         #
-        # ``from_status`` is the verbatim ``FetchStatus`` that triggered the escalation (the
-        # unreadable-page family: ``blocked`` / ``js_wall`` / ``no_resolving_content``), so the
-        # trigger population is queryable without joining back to the fetch marker. ``rung``
+        # ``from_status`` is the verbatim ``FetchStatus`` that triggered the escalation, so the
+        # trigger population is queryable without joining back to the fetch marker. Its domain
+        # is per rung, and the pairs are disjoint by construction: ``js_wall`` /
+        # ``no_resolving_content`` for ``meta_refresh``, ``derived_api`` and ``rendered`` (a page
+        # that answered 200 with nothing readable); ``unsupported_type`` for ``pdf_local`` (the
+        # content-type router's verdict before the ``%PDF-`` sniff); ``blocked`` / ``error`` /
+        # ``not_found`` for ``wayback`` (a page our address never read); and ``blocked`` /
+        # ``js_wall`` / ``error`` / ``no_resolving_content`` for ``url_context``. ``blocked``
+        # never pairs with a browser rung, since Chromium dials from the same address. ``rung``
         # names the route tried. ``outcome`` and ``wall_s`` are THAT RUNG's own, stamped as it
         # closes (``RungAttempt``): ``outcome`` is the status that stood once the rung was over
         # — its rescue, its verdict (``stale_data``, ``ungrounded``), or the direct status it
         # left standing when it declined — and ``wall_s`` is what that rung alone cost. So on a
         # page where a dead feed GET was followed by a rescuing render, the first line reads the
         # direct status and the second reads ``success``, which is what keeps a rung that fires
-        # often but rescues nothing distinguishable from one that never fires at all. (Before
-        # the per-rung close existed — never on main — both fields were whole-ladder values,
-        # so every line for a URL carried the FINAL status and each rung was billed for the
-        # latency of the rungs after it.)
+        # often but rescues nothing distinguishable from one that never fires at all. Two rungs
+        # measure ``wall_s`` narrower than their whole footprint: the local PDF read stamps it
+        # inside the parse gate, so queueing for a slot is not billed to the parse, and the paid
+        # rung opens its attempt only after its ``Google-Extended`` robots.txt pre-check (a real
+        # request, bounded at ``ROBOTS_FETCH_TIMEOUT_S``), so that pre-check is not in its
+        # ``wall_s`` — a 15-30% under-count against the rung's 15 s floor when the pre-check has
+        # to fetch. Skipped attempts emit no line at all and ride ``details["counts"]`` instead.
         #
         # The token cannot collide with ``RESOLUTION_SOURCE_FETCH``: both specs match on their
         # own full marker word plus the colon, and neither word is a prefix of the other, so

@@ -729,15 +729,15 @@ def _extract_main_text(body: bytes | str, url: str, *, favor_precision: bool = F
     (a body this module already decoded and rewrote — see :func:`_extract_page_text`).
 
     Default recall is the primary extraction and ``favor_precision=True`` the fallback, under
-    the policy :func:`_extract_page_text` applies. Precision alone shipped here until
-    2026-09-03 and withheld readable pages (kasa.go.kr pruned to 78 chars, two tracxn funding
-    tables, manifold's market body). Default alone then shipped for a day, measured by
-    character count, which is the wrong metric under a head-preserving cap: on congress.gov
-    it swaps the 2,411-char bill-status card for 54,393 chars of a member-name dropdown
-    (trafilatura's readability fallback replaces the main extraction when readability's
-    text is over twice as long, and only precision prunes the dropdown out of that backup
-    tree first), and menu trees (abs.gov.au, kasa.go.kr) clear the chrome floor as
-    `success`. The receipt for running both is the 2026-09-03 calibration
+    the policy :func:`_extract_page_text` applies, because each setting alone loses pages the
+    other reads. Precision alone withholds readable pages (kasa.go.kr pruned to 78 chars, two
+    tracxn funding tables, manifold's market body). Default alone publishes chrome: on
+    congress.gov it swaps the 2,411-char bill-status card for 54,393 chars of a member-name
+    dropdown (trafilatura's readability fallback replaces the main extraction when
+    readability's text is over twice as long, and only precision prunes the dropdown out of
+    that backup tree first), and menu trees (abs.gov.au, kasa.go.kr) clear the chrome floor as
+    `success` — and character count, the metric that once picked it, is the wrong one under a
+    head-preserving cap. The receipt for running both is the 2026-09-03 calibration
     (`scratch/fetch_ladder_2026-09-03/chrome_calibration.md`: 118 bodies, five extractor
     variants on identical bytes, texts labelled by hand). ``include_comments=False`` stays
     at both settings.
@@ -1842,8 +1842,12 @@ async def _fetch_one_hop(
     comes back as a :class:`_PendingDocument` and is parsed after both have exited, because
     that parse is seconds of CPU and the host gate is loop-wide (see
     :class:`_PendingDocument`). The HTML branch's ``to_thread`` hops still run inside the
-    semaphore — trafilatura on a capped page is short next to the request it follows, and
-    moving it would trade a measured hazard for an unmeasured restructure.
+    semaphore and the open response, and since the extractor policy they can be TWO
+    trafilatura passes rather than one: the second is skipped under
+    ``RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S`` of remaining wall, which bounds the
+    worst case without moving the work. Moving it would trade a measured hazard for an
+    unmeasured restructure (FUTURE.md carries the entry); the meta-refresh hop that follows
+    the classification needs the decoded text inside this loop either way.
     """
     async with _sem_for_host(host_sems, current_url):
         hop_timeout_s = min(RESOLUTION_SOURCE_HTTP_TIMEOUT, max(ctx.rung_budget_s(), _MIN_HOP_TIMEOUT_S))

@@ -627,14 +627,18 @@ RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host se
 # table). So this is the observed elbow, and it stays deliberately below it: a page above
 # the floor keeps its text (plus the embed disclosure where one applies), because
 # withholding a terse-but-real data table costs more than leaving one shell visible.
-# UNMOVED but re-read 2026-09-03, when `_extract_main_text` dropped `favor_precision=True`:
-# that census was measured on the precision extractor, and dropping the flag only ever
-# LENGTHENS an extraction, so the floor now binds on strictly fewer pages. Live over 149
-# archived HTML URLs, 10 crossed the floor upward and 9 of them carry the resolving content
-# (funding tables, two Yahoo history tables, a market's own resolution rules); the tenth is
-# a JS flight board whose column headers plus disclaimer now total 644, i.e. one shell
-# published where one was withheld. Left where it is: the elbow it was fitted to is a
-# property of what chrome weighs, not of the extractor, and refitting it against a
+# UNMOVED but re-read 2026-09-03, when the extractor policy changed under it. That census was
+# measured on the precision extractor alone. The floor is now applied twice per page
+# (`resolution_source._extract_page_text`): first to the default (recall) extraction, which
+# only ever LENGTHENS a text relative to precision, so on that pass the floor binds on strictly
+# fewer pages — live over 149 archived HTML URLs, 10 crossed it upward and 9 of them carry the
+# resolving content (funding tables, two Yahoo history tables, a market's own resolution
+# rules); the tenth is a JS flight board whose column headers plus disclaimer total 644, i.e.
+# one shell published where one was withheld. Then, when the default text clears the floor on
+# chrome alone (the line-shape metric below), to the `favor_precision` re-extraction of the same
+# bytes, which is the extractor the census was fitted on, so a precision text under the floor
+# is withheld as `thin_page` exactly as before. Left where it is: the elbow it was fitted to is
+# a property of what chrome weighs, not of the extractor, and refitting it against a
 # recall-era census is its own measurement.
 RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
 # The line-shape check on an extraction that clears the floor (`resolution_source.content_share`):
