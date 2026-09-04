@@ -5,70 +5,16 @@
 `No-Stream/metaculus-bot`, `upstream` is the Metaculus template, so every `gh` call needs
 `--repo No-Stream/metaculus-bot`)
 **Repo:** `/Users/flatljan/personal/metaculus-bot`
-**Status (updated 2026-09-04 11:15 PT, see the two "Update" sections below):** second review pass done and
-fixed; the paid url_context rung is now ON in every bot workflow by operator instruction; the paid rung and
-the rendered rung were both verified live. Local HEAD `06b3fd9` (plus this doc's own commit) is 2 commits
-ahead of the pushed `ad9fec3`; the working tree is clean; the full free gate is green at `06b3fd9` (7,578
-passed, 14 skipped, exit 0). The smoke ran and passed QA (see the late-morning Update). ONE thing is in
-flight: a worktree agent (`fix-kalshi`, branch `worktree-agent-a43a11a9400a966ba`) adding a single-flight
-guard to the Kalshi and PredictIt catalogue caches in `metaculus_bot/research/market_retrieval/session_state.py`
-(the smoke's only red cause), fixing the "rescued none of them" summary-line condition in
-`resolution_source.py`, and logging the first 300 chars of a withheld paid `NOT_ADDRESSED` reply. When it
-reports: `git status` clean, merge its branch, full gate in tmux, commit, then the operator pushes and PR CI
-runs; no further smoke is needed for it (unit-tested, isolated from the ladder). If a fresh session picks
-this up and the agent is gone, re-derive from the QA report and do the same three items. Every operator follow-up is gathered in
-"Operator follow-ups" near the end of this doc; surface that list to the operator only at the very end.
-
-## Update, 2026-09-04 morning (second review pass before the smoke)
-
-The operator pushed `e267d66` at about 07:55 PT and authorized the full 4-question smoke, asking whether a
-final Fable plus GPT-5.6-sol review should precede it. It did. Two pipelines ran over the fix-wave diff
-`16ca9ab..aca5cd8` (inputs at `/tmp/forge-dj3ASu`, receipts copied to `scratch/fetch_ladder_2026-09-03/`
-as `forge_fixwave_*.md` and `fable_panel_*.md` if present, else re-derive from `/tmp/forge-dj3ASu/*.md`):
-
-- **Fable panel** (three lenses: timing arithmetic, cross-branch interactions, forecaster-facing output; one
-  Fable triage verifying against the code): needs-work, 6 findings, 5 FIX, none dropped. Landed as
-  `3900084` (transport: harvest drain clamped to the caller deadline, docstrings corrected) and `89fe55f`
-  (ladder chain, 4 commits: rung verdicts glossed in the failure notice and a 300-char section floor
-  `RESOLUTION_SOURCE_MIN_SECTION_CHARS`; direct-fetch diagnostics carried onto rung verdicts; the paid
-  url_context read withheld as `no_resolving_content` / `not_addressed` when the model's reply opens with
-  the new `NOT_ADDRESSED` sentinel the shared prompt now demands, which is v2-visible since `read_document`
-  shares the prompt; chart-only publication when policy D withheld the page text). TIM-2 (teardown tail vs
-  the 2 s wall margin; salvage-plus-hang memo) was priced in FUTURE.md item 5 and then largely closed by
-  the forge F1 remedy below.
-- **Forge** (14 lenses incl. 3 GPT-5.6-sol codex reviewers, 5 concern reviewers, batched verifiers,
-  triage): needs-work, 18 FIX (12 important, 6 minor), 26 report-only minors, 2 refuted. All 18 FIX plus
-  most report-only minors landed in three worktree merges: ladder code `6650f3f` (F4 precision re-extraction
-  bounded by `RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S` 5 s; F8 `_run_rung`; F9 derived
-  `_BUDGET_GATED_RUNGS`; F19 returned Wayback verdict keeps its route/outcome; F6 failure-class buckets
-  pinned plus new token `malformed_response`; F41 `chrome_metric_withholds` follows the URL's ladder plus
-  `chrome_metric_withholds_rescued`; F26, F33, comments F23/F25/F35/F37/F38; FUTURE F32 and the P3-6
-  deferral), tests and docs `db64969` (F7 `_aux_ctx` pins, F10 marker-helper pins with mutation proofs,
-  F16 curl-cffi as a dev dependency with the deptry entry moved to DEP004, F17, F18, F11/F15/F21/F22/F36
-  docs incl. the paid per-question cap and policy D widening the paid population, F39 Wayback clock pinned
-  with a 2025 fixture date, F40, F42, F43, F30, F31, F29 probe reuses `parse_snapshot_url`, F34
-  Accept-Encoding scoping), and browser transport `acf6b0c` (F1 reconciled remedy: `RENDER_EXIT_RESERVE_MS`
-  = 3 s subtracted from the deadline handed to the transport while `wait_for` keeps `budget_s`, one shared
-  lazily started teardown budget, memo written at the `RenderTimeout` raise site, driver stop left
-  unbounded as the named residual, floor left at 12 s so the 12 to 15 s band declines at the gates with
-  `wall_budget`; F14 outer cut records `wall_budget`, only the transport's own cut records `render_timeout`;
-  F5 `render_non_200`; F20 `render_dom_too_large` via `RenderDomOverCeiling`; F3 `research/public_suffix.py`
-  leaf module with the `.dat` under `research/data/`; F13 one `is_json_content_type`; F2 harvest screens in
-  the sync listener and `Semaphore(1)` over `body()`; F12 shared `tests/playwright_fakes.py`). Docs aligned
-  in `3e5697f`.
-- **Also fixed:** the PR CI test job failed on the pushed tip because the yfinance egress-guard test asserted
-  yfinance's own error handling (cold-runner cookie fetch re-raises the guard's refusal); fixed as `56555a8`.
-- **Decisions the operator may veto** (all reversible constants or small branches): the 3 s exit reserve
-  and the 12 to 15 s decline band (raise `RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` to 15 for a truthful
-  pre-gate check at the cost of that band); the `NOT_ADDRESSED` sentinel reaching gap-fill v2's tool result
-  text; chart-only publication overriding the extractor author's pinned choice.
-- **Verification gates left to the operator:** the paid url_context admission chain has never run against
-  a live key (waive until the flag flip, or one cents-level `scripts/probes/gemini_verify.py
-  --i-accept-spend`); `fetch_diagnostic.yaml` is the post-merge dispatch. A free live Chromium check against
-  the ogimet URL from the QA sweep (P3-1) is the lead's before the smoke. Two stale comments noted, not
-  fixed: `.github/workflows/fetch_diagnostic.yaml` still says curl_cffi is undeclared (it is a dev
-  dependency; `--with` stays needed because that job syncs `--no-dev`); AGENTS.md's probe command carries a
-  now-redundant `--with curl_cffi`.
+**Status (updated 2026-09-04 12:50 PT):** DONE except the operator's push and merge. Second review pass
+fixed; paid url_context rung ON everywhere; paid and rendered rungs verified live; the ONE authorized smoke
+(Test Bot run 33907102246) published all four forecasts and passed a fresh-context QA ("fit to merge"; its
+only red cause, Kalshi HTTP 429 on concurrent catalogue pulls, is fixed by the single-flight guard merged as
+`2ceb481`, reviewed with zero defects, worktree gate 7,579 green). Local HEAD `2ceb481` plus this doc's commit
+is 7 commits ahead of the pushed `cbc26bf`. A full gate on `2ceb481` was started at 12:47 PT in tmux
+(`~/logs/gate14.log`; expect `EXITCODE=0` and about 7,579 passed; if it is red, the failure is in the Kalshi
+single-flight change or a merge artifact, and the smoke does NOT need re-running for that fix). Nothing else
+is in flight. Next: operator pushes, PR CI runs, operator merges PR #66, then the post-merge commands in
+"Operator follow-ups" at the end of this doc. Surface that list to the operator only at the very end.
 
 The operator does NOT read plan docs; every decision or approval you need from them goes inline in
 chat, self-contained, with a recommendation. They sign off on any paid run before it fires.
