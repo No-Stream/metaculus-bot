@@ -106,9 +106,17 @@ def _rendered_document(inner: str) -> RenderedPage:
 
 
 def _fake_render(page: RenderedPage | None, calls: list[dict[str, object]]):
-    async def _render(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False):
+    async def _render(
+        url: str,
+        *,
+        memo_scope: str,
+        host_gate,
+        goto_timeout_ms: int,
+        deadline_monotonic_s: float | None = None,
+        harvest_json: bool = False,
+    ):
         calls.append({"url": url, "goto_timeout_ms": goto_timeout_ms, "harvest_json": harvest_json})
-        del host_gate
+        del memo_scope, host_gate, deadline_monotonic_s
         # A real yield point, so the fake schedules like the browser rung it replaces and a
         # test that races two escalations sees the same interleaving the transport would give.
         await asyncio.sleep(0)
@@ -285,7 +293,7 @@ class TestRenderedRungDeclines:
 
         assert result.status == "js_wall"
         assert result.route == "rendered"
-        assert rendered_fetch.rendered_to_nothing(_URL) is True
+        assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is True
         assert _rung_counts([result])["rendered_attempts"] == 1
         assert len(calls) == 1
 
@@ -299,15 +307,15 @@ class TestRenderedRungDeclines:
 
         await _fetch_one(session, _URL, {})
 
-        assert rendered_fetch.rendered_to_nothing(_URL) is False
+        assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is False
 
 
 def _hanging_render(calls: list[str]):
     """A transport that never comes back: the ogimet shape (P3-1), seen from the caller's side."""
 
-    async def _render(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False) -> None:
+    async def _render(url: str, **kwargs: object) -> None:
         calls.append(url)
-        del host_gate, goto_timeout_ms, harvest_json
+        del kwargs
         await asyncio.Event().wait()
 
     return _render
@@ -325,7 +333,9 @@ def _assert_recorded_as_a_render_timeout(result: FetchResult) -> None:
     assert result.route == "direct"
     attempts = [a for a in result.rung_attempts if a.rung == "rendered"]
     assert [a.skipped_reason for a in attempts] == ["render_timeout"]
-    assert rendered_fetch.rendered_to_nothing(result.url) is True
+    # The timed-out memo is the TRANSPORT's, written only when a browser actually ran (pinned in
+    # tests/test_rendered_fetch.py); the rung never writes the rendered-to-nothing memo on a cut.
+    assert rendered_fetch.rendered_to_nothing(result.url, memo_scope="resolution_source") is False
     assert rendered_fetch._PLAYWRIGHT_WARNED is False
     counts = _rung_counts([result])
     assert counts["render_timeout_skips"] == 1
@@ -364,8 +374,8 @@ class TestRenderedRungTimeout:
         """The inner bound RAISES rather than declining with ``None``, which is what lets the rung
         tell it from a missing browser; both bounds land on the one reason."""
 
-        async def _timed_out(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False) -> None:
-            del url, host_gate, goto_timeout_ms, harvest_json
+        async def _timed_out(url: str, **kwargs: object) -> None:
+            del url, kwargs
             await asyncio.sleep(0)
             raise TimeoutError("rendered fetch DOM read exceeded 5000ms")
 
@@ -635,7 +645,7 @@ class TestDerivedApiRung:
         assert result.route == "rendered"
         assert _rung_counts([result])["derived_api_reads"] == 0
         # Nothing usable came out of the render, so the URL is memoized against a second launch.
-        assert rendered_fetch.rendered_to_nothing(_URL) is True
+        assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is True
 
     async def test_the_per_url_cap_binds_on_a_served_feed(self, monkeypatch):
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 400)
@@ -832,7 +842,7 @@ class TestWaybackRung:
         session = FakeSession(
             {
                 _URL: FakeResponse(403, body=b"", content_type="text/html"),
-                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": wrapped}),
+                wayback_snapshot_url(_URL, now=self._NOW): FakeResponse(302, headers={"Location": wrapped}),
                 wrapped: FakeResponse(200, body=self._archive_page(), content_type="text/html"),
             }
         )
@@ -1356,7 +1366,7 @@ class TestFastPath:
         session = FakeSession(
             {
                 _URL: FakeResponse(403, body=b"", content_type="text/html"),
-                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": snapshot}),
+                wayback_snapshot_url(_URL, now=now): FakeResponse(302, headers={"Location": snapshot}),
                 snapshot: FakeResponse(200, body=_prose_page(_RENDERED_PROSE), content_type="text/html"),
                 feed_page: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
                 _FEED_URL: FakeResponse(200, body=b'{"series":[{"v":1}]}', content_type="application/json"),

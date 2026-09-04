@@ -746,8 +746,17 @@ RESOLUTION_SOURCE_PDF_MIN_BUDGET_S: float = 3.0
 # floor is far above the one-request rungs' 3 s: a launch plus a DOM-ready navigation measured
 # 3-8 s across the 2026-09-03 replay corpus even on pages that rendered cleanly, and the launch
 # slot is contended process-wide, so a question with no budget left would take a slot a sibling
-# question could still land a page with. 12 s admits the 2 s settle plus a 10 s navigation.
+# question could still land a page with. 12 s is exactly the transport's own floor once the gates
+# are held: a 5 s navigation (RENDER_MIN_GOTO_MS), the 2 s settle and the 5 s DOM-read bound, the
+# last reserved so a goto that runs its budget out can still be salvaged inside the rung's bound.
 RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S: float = 12.0
+# Ceiling on the rendered DOM, the browser rung's counterpart to RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
+# and sized to it. `page.content()` is a string, so this is a CHARACTER count taken before anything
+# copies the DOM: the Tier-1 caller encodes it, decodes it back, ARIA-rewrites it and hands
+# trafilatura a tree several times its size, all while the 100-300 MB browser is still resident,
+# so an 8 MB dashboard DOM was ~60-110 MB per in-flight classification. A DOM over the ceiling is
+# declined with the transport's `None` signal; the harvested JSON is declined with it.
+RENDERED_DOM_MAX_CHARS: int = RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
 # The derived-feed GET is one request against a JSON endpoint an earlier render on the same host
 # already found, so its floor is the meta-refresh hop's, on the same "0-2 s typical" probe basis
 # as the HTTP timeout — not the browser floor above. It has its own name because the two rungs

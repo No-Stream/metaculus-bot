@@ -65,9 +65,17 @@ def _decline_the_browser_rung(monkeypatch):
     ``resolution_source.render_page`` again in the test body; that later patch wins.
     """
 
-    async def _declined(url: str, *, host_gate, goto_timeout_ms: int = 0, harvest_json: bool = False) -> None:
+    async def _declined(
+        url: str,
+        *,
+        memo_scope: str,
+        host_gate,
+        goto_timeout_ms: int = 0,
+        deadline_monotonic_s: float | None = None,
+        harvest_json: bool = False,
+    ) -> None:
         """The transport's declined signal. Returns None implicitly; ruff owns that spelling."""
-        del url, host_gate, goto_timeout_ms, harvest_json
+        del url, memo_scope, host_gate, goto_timeout_ms, deadline_monotonic_s, harvest_json
         # A real yield point, so the stub schedules like the browser rung it stands in for.
         await asyncio.sleep(0)
 
