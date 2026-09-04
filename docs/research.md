@@ -1001,7 +1001,9 @@ sails past every self-reference filter in the pipeline, and a failed SSRF or sel
 refuses the rung outright. Then a capture the archive never served DECLINES, leaving the direct
 status standing, because "no archived copy exists" is a different fact from a stale one and the
 direct status says more about the source. Only a capture we did read and cannot date, or can date
-and it is too old, is withheld as `stale_data`.
+and it is too old, is withheld as `stale_data`. A withhold does not end the ladder: the paid rung
+below is still asked about the DIRECT outcome (a stale archive is still a page we could not read
+fresh), and the withhold is what stands when that rung is off or declines.
 
 `route=url_context` is the LAST rung and the only paid one: Gemini reads the page for us
 (`research/url_context_reader.py`, the reader shared with gap-fill v2's `read_document`),

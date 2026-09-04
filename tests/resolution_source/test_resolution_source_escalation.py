@@ -604,7 +604,14 @@ class TestWaybackRung:
     def _archive_page(self) -> bytes:
         return _prose_page(_RENDERED_PROSE)
 
-    def _session(self, *, page: FakeResponse, captured: datetime, archived: FakeResponse | None = None) -> FakeSession:
+    def _session(
+        self,
+        *,
+        page: FakeResponse,
+        captured: datetime,
+        archived: FakeResponse | None = None,
+        extra: dict[str, FakeResponse] | None = None,
+    ) -> FakeSession:
         """A session where the cited URL fails and the archive redirects to a dated capture."""
         snapshot = _snapshot_url(_URL, captured=captured)
         return FakeSession(
@@ -612,6 +619,7 @@ class TestWaybackRung:
                 _URL: page,
                 wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": snapshot}),
                 snapshot: archived or FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+                **(extra or {}),
             }
         )
 
@@ -669,6 +677,39 @@ class TestWaybackRung:
         assert result.text == ""
         # The direct route's own status is not lost by the swap: the escalation line carries it.
         assert [(a.rung, a.from_status) for a in result.rung_attempts] == [("wayback", "blocked")]
+
+    async def test_a_withheld_capture_still_hands_the_url_to_the_paid_reader(self, monkeypatch):
+        """A stale archive is still a page we could not read fresh, which is exactly the
+        population the paid rung was built for. Only a RESCUE ends the ladder early; the
+        withhold stays the fallback when the reader is off or declines, so the `stale_data`
+        marker pair above stands unchanged."""
+        calls: list[dict[str, object]] = []
+
+        def _read(url, ask, **kwargs):
+            calls.append({"url": url, "ask": ask, **kwargs})
+            return ("The page reports 12 major work stoppages.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
+
+        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
+        reset_robots_cache()
+        session = self._session(
+            page=FakeResponse(403, body=b"", content_type="text/html"),
+            captured=self._NOW - timedelta(days=400),
+            extra={
+                "https://tracker.example.com/robots.txt": FakeResponse(
+                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
+                )
+            },
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(now=self._NOW, query="ask"))
+
+        assert [call["url"] for call in calls] == [_URL]
+        assert result.status == "success"
+        assert result.route == "url_context"
+        # The archive attempt is still on the record: it fired, and the reader came after it.
+        assert [a.rung for a in result.rung_attempts] == ["wayback", "url_context"]
 
     async def test_an_undatable_snapshot_is_withheld_too(self):
         """The archive answering our four-digit request means it never landed on a capture, and a

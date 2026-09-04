@@ -1869,13 +1869,14 @@ async def _wayback_rung(
     return await _wayback_snapshot_result(session, url, direct, host_sems=host_sems, ctx=ctx)
 
 
-# What the paid reader is allowed to be asked about. Everything the free ladder left unresolved
-# EXCEPT the outcomes where a model-mediated read cannot help or must not be tried: a 404/410 has
-# no page to read, an empty or undecodable body and an unreadable document are bytes we DID get
-# (only `no_text_layer` could ever be rescued, and that is v2's `read_document` job on a URL the
-# driver chose), a withheld archive copy is a freshness decision rather than a fetch failure, and
-# `ssrf_blocked` is a URL WE refused — handing that to a third-party fetcher is exactly the
-# bypass the guard exists to prevent, which is why it is excluded here and not merely unlisted.
+# What the paid reader is allowed to be asked about. Tested against the DIRECT outcome (an
+# archive withhold on the way down does not change it — see `_escalate_unresolved`): everything
+# the free ladder left unresolved EXCEPT the outcomes where a model-mediated read cannot help or
+# must not be tried. A 404/410 has no page to read, an empty or undecodable body and an unreadable
+# document are bytes we DID get (only `no_text_layer` could ever be rescued, and that is v2's
+# `read_document` job on a URL the driver chose), and `ssrf_blocked` is a URL WE refused — handing
+# that to a third-party fetcher is exactly the bypass the guard exists to prevent, which is why it
+# is excluded here and not merely unlisted.
 # One member of the set is narrowed further by REASON rather than by status — see
 # :func:`_url_context_rung_applies` — so this set is the ceiling on the population, not the
 # population itself.
@@ -2053,7 +2054,9 @@ async def _escalate_unresolved(
     A rung that fired and produced nothing still leaves its attempt on the context, which is
     what makes ``route=rendered status=js_wall`` readable in the archive as "we tried the
     browser and this is still the answer" — the same convention the meta-refresh hop already
-    follows.
+    follows. The Wayback rung is the one rung whose non-rescue is a VERDICT rather than None
+    (``stale_data``, a capture we read and will not serve); it is kept as the fallback rather
+    than as an early return, so the paid rung below is still reachable for that page.
 
     ``session`` is the aiohttp session the rungs that issue an ordinary GET use; the browser
     rung ignores it, because Chromium brings its own transport.
@@ -2070,14 +2073,18 @@ async def _escalate_unresolved(
     # disjoint by construction (see `_WAYBACK_TRIGGER_STATUSES`), so the order between them is a
     # reading choice: free-and-local first, then the route whose egress is not ours.
     wayback = await _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    if wayback is not None:
+    if wayback is not None and wayback.status == "success":
         return wayback
     # Last, because it is the only rung that spends money and the only one whose product is a
     # model's answer rather than the host's bytes. Off by default and off in every workflow.
+    # It is asked about the DIRECT outcome, and an archive WITHHOLD does not stand in its way: a
+    # capture too old to serve is still a page we could not read fresh, which is exactly the
+    # population this rung exists for. The withhold stays the fallback below, so with the flag
+    # off (or the reader declining) a stale capture still reports `stale_data`.
     read = await _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
     if read is not None:
         return read
-    return direct
+    return wayback if wayback is not None else direct
 
 
 async def _fetch_one(
