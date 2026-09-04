@@ -48,14 +48,20 @@ class _PlaywrightError(Exception):
 @pytest.fixture(autouse=True)
 def _reset_state():
     rendered_fetch.reset_render_state()
+    _FakeResponse.in_flight = 0
+    _FakeResponse.peak_in_flight = 0
     yield
     rendered_fetch.reset_render_state()
 
 
 class _FakeResponse:
     """One response event. ``body()`` always yields once, because Playwright's is a round trip to
-    the driver: every handler that passed the count check is suspended in it at the same time,
-    which is the interleaving the post-read re-check exists for."""
+    the driver: every read task that reaches it would be suspended in it at the same time, which
+    is the interleaving the harvest's serialised read exists to prevent. ``peak_in_flight`` records
+    how many bodies were being read at once across every instance, which is the memory claim."""
+
+    in_flight = 0
+    peak_in_flight = 0
 
     def __init__(
         self,
@@ -79,11 +85,15 @@ class _FakeResponse:
 
     async def body(self) -> bytes:
         self.body_reads += 1
+        _FakeResponse.in_flight += 1
+        _FakeResponse.peak_in_flight = max(_FakeResponse.peak_in_flight, _FakeResponse.in_flight)
         try:
             await asyncio.sleep(self._body_delay_s)
         except asyncio.CancelledError:
             self.body_read_cancelled = True
             raise
+        finally:
+            _FakeResponse.in_flight -= 1
         if self._raises:
             raise _PlaywrightError("target closed")
         return self._body
@@ -394,20 +404,67 @@ class TestJsonHarvest:
         assert rendered.json_responses == ()
         assert response.body_read_cancelled is True
 
-    async def test_the_response_count_is_capped_when_every_read_is_in_flight_at_once(self, monkeypatch):
-        """All N handlers pass the count check together and are then all suspended in ``body()``,
-        so a check made only BEFORE the read bounds nothing."""
-        page = _FakePage(
-            [
-                _FakeResponse(f"{_PAGE_URL}/api/{index}", content_type="application/json", body=_json_body())
-                for index in range(rendered_fetch.HARVEST_MAX_RESPONSES + 4)
-            ]
-        )
+    async def test_the_response_count_is_capped_before_the_sixth_body_is_read(self, monkeypatch):
+        """Every response event fires before any body is read, so a count check made only in the
+        listener bounds nothing; the reads are serialised and the count is checked again under
+        that gate, so the cap is binding on the READS, which is the memory bound, not just on
+        what is appended afterwards."""
+        responses = [
+            _FakeResponse(f"{_PAGE_URL}/api/{index}", content_type="application/json", body=_json_body())
+            for index in range(rendered_fetch.HARVEST_MAX_RESPONSES + 4)
+        ]
 
-        rendered = await _render(monkeypatch, page)
+        rendered = await _render(monkeypatch, _FakePage(responses))
 
         assert rendered is not None
         assert len(rendered.json_responses) == rendered_fetch.HARVEST_MAX_RESPONSES
+        assert sum(response.body_reads for response in responses) == rendered_fetch.HARVEST_MAX_RESPONSES
+
+    async def test_at_most_one_body_is_buffered_at_a_time(self, monkeypatch):
+        """``Response.body()`` materialises the whole body (base64 over the driver pipe, then
+        decoded, about 2.3x the body at peak), and a dashboard's response events all fire before
+        any body comes back. Read together, four undeclared 30 MB layers sat beside a 100-300 MB
+        browser twice over on a 7 GB runner; read one at a time, peak harvest memory is one body."""
+        responses = [
+            _FakeResponse(
+                f"{_PAGE_URL}/api/{index}", content_type="application/json", body=_json_body(), body_delay_s=0.01
+            )
+            for index in range(4)
+        ]
+
+        rendered = await _render(monkeypatch, _FakePage(responses))
+
+        assert rendered is not None
+        assert len(rendered.json_responses) == 4
+        assert all(response.body_reads == 1 for response in responses)
+        assert _FakeResponse.peak_in_flight == 1
+
+    async def test_a_response_that_fails_the_screens_spawns_no_read_task(self):
+        """The host, content-type and declared-length screens run in the SYNC listener, so a
+        page's hundreds of subresources (scripts, images, beacons) never become tasks at all;
+        only a response that will actually be read does."""
+        harvest = rendered_fetch._JsonHarvest(page_host="dashboard.example.com", playwright_error=_PlaywrightError)
+        screened_out = [
+            _FakeResponse("https://ads.tracker.test/beacon.json", content_type="application/json", body=_json_body()),
+            _FakeResponse(f"{_PAGE_URL}/app.js", content_type="application/javascript", body=b"x" * 4000),
+            _FakeResponse(
+                f"{_PAGE_URL}/api/geo",
+                content_type="application/json",
+                body=_json_body(),
+                declared_length=rendered_fetch.HARVEST_MAX_BODY_BYTES + 1,
+            ),
+        ]
+        for response in screened_out:
+            harvest.on_response(response)
+        assert harvest._pending == set()
+
+        harvest.on_response(
+            _FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=_json_body())
+        )
+        assert len(harvest._pending) == 1
+        harvest.cancel_pending()
+        await asyncio.sleep(0)
+        assert all(response.body_reads == 0 for response in screened_out)
 
     async def test_a_body_read_that_races_teardown_is_dropped_not_raised(self, monkeypatch):
         """Opportunistic discovery attached to a render whose real product is the DOM: a body

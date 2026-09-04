@@ -608,6 +608,13 @@ def _declared_length_over_cap(content_length: str | None) -> bool:
     content type alone. A declared length over the cap is enough to refuse the read: for a
     compressed response it is the compressed size, and the decoded body is only bigger. Absent,
     unparseable or lying headers fall through to the post-read test, which stays as the backstop.
+
+    That backstop is the harvest's one residual. HTTP/2 and chunked responses routinely declare
+    no length, and Playwright's ``body()`` offers no streaming route, so a single undeclared
+    oversized body is buffered whole before the post-read size test drops it. The reads are
+    serialised (:class:`_JsonHarvest`), so that is at most ONE such body at a time rather than
+    every layer a dashboard requests at once; refusing undeclared bodies outright would drop the
+    payload the rung exists to find.
     """
     if content_length is None:
         return False
@@ -617,41 +624,20 @@ def _declared_length_over_cap(content_length: str | None) -> bool:
         return False
 
 
-async def _harvest_json_response(
-    response: Any, *, page_host: str, into: list[HarvestedJson], playwright_error: type[BaseException]
-) -> None:
-    """Record one JSON response the page fetched, if it clears every bound.
+def _harvestable_json_response(response: Any, *, page_host: str) -> bool:
+    """Whether a response event is worth reading: same publisher, JSON, not declared over the cap.
 
-    Reads the body inside the response event so it is still available — after the page
-    navigates or closes, Playwright discards it. Every rejection is silent: this is
-    opportunistic discovery attached to a render whose real product is the DOM, and a body we
-    could not read must never be able to fail the render.
-
-    ``response.url`` and ``response.headers`` (lower-cased names) are Playwright's documented
-    ``Response`` contract; the fake in the tests honours the same one.
+    Synchronous on purpose, so the listener can apply it before any task exists: ``response.url``
+    and ``response.headers`` (lower-cased names) are sync properties of Playwright's documented
+    ``Response`` contract, and the fake in the tests honours the same one. Every rejection is
+    silent: this is opportunistic discovery attached to a render whose real product is the DOM.
     """
-    if len(into) >= HARVEST_MAX_RESPONSES:
-        return
-    url = response.url
-    if not _harvestable_json_host(urlparse(url).hostname or "", page_host):
-        return
+    if not _harvestable_json_host(urlparse(response.url).hostname or "", page_host):
+        return False
     headers = response.headers
     if not is_json_content_type((headers.get("content-type") or "").lower()):
-        return
-    if _declared_length_over_cap(headers.get("content-length")):
-        return
-    try:
-        body = await response.body()
-    except playwright_error as exc:
-        logger.debug("rendered fetch could not read a harvested response body: %s", exc)
-        return
-    # Re-checked AFTER the read: every handler that passed the check above was suspended in
-    # ``body()`` together, so the check before it bounds nothing on its own.
-    if len(into) >= HARVEST_MAX_RESPONSES:
-        return
-    if not (HARVEST_MIN_BODY_BYTES <= len(body) <= HARVEST_MAX_BODY_BYTES):
-        return
-    into.append(HarvestedJson(url=url, body=body))
+        return False
+    return not _declared_length_over_cap(headers.get("content-length"))
 
 
 class _JsonHarvest:
@@ -665,6 +651,15 @@ class _JsonHarvest:
     The listener is therefore SYNC and creates the tasks itself, so pyee neither tracks them nor
     re-emits their exceptions on the page's ``error`` event, and :meth:`drain` joins them before
     the snapshot, inside the DOM read's own bound.
+
+    Every bound here is a memory bound, and two things make it hold. The listener SCREENS before
+    it spawns, so a page's hundreds of subresources never become tasks and only a response that
+    will actually be read does. And the reads are SERIALISED behind ``_read_gate``: every
+    response event fires before any body comes back, so without it every response that cleared
+    the screens entered ``body()`` together and the count cap bounded nothing, while Playwright
+    materialised each body base64 over the driver pipe and then decoded it (about 2.3x the body
+    at peak) beside a 100-300 MB browser. One body at a time makes the count check under the
+    gate exact and peak harvest memory one body.
     """
 
     def __init__(self, *, page_host: str, playwright_error: type[BaseException]) -> None:
@@ -672,15 +667,37 @@ class _JsonHarvest:
         self._playwright_error = playwright_error
         self.bodies: list[HarvestedJson] = []
         self._pending: set[asyncio.Task[None]] = set()
+        self._read_gate = asyncio.Semaphore(1)
 
     def on_response(self, response: Any) -> None:
-        task = asyncio.create_task(
-            _harvest_json_response(
-                response, page_host=self._page_host, into=self.bodies, playwright_error=self._playwright_error
-            )
-        )
+        if len(self.bodies) >= HARVEST_MAX_RESPONSES:
+            return
+        if not _harvestable_json_response(response, page_host=self._page_host):
+            return
+        task = asyncio.create_task(self._read(response))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
+
+    async def _read(self, response: Any) -> None:
+        """Read one screened body under the gate and keep it if its size clears the floor and cap.
+
+        The body is read inside the response event's lifetime so it is still available (after the
+        page navigates or closes, Playwright discards it). A body we could not read must never be
+        able to fail the render, so Playwright's own error is a DEBUG line and nothing more. The
+        count is checked again under the gate, where it is exact: no other read is in flight, and
+        the append below runs before this task yields again.
+        """
+        async with self._read_gate:
+            if len(self.bodies) >= HARVEST_MAX_RESPONSES:
+                return
+            try:
+                body = await response.body()
+            except self._playwright_error as exc:
+                logger.debug("rendered fetch could not read a harvested response body: %s", exc)
+                return
+        if not (HARVEST_MIN_BODY_BYTES <= len(body) <= HARVEST_MAX_BODY_BYTES):
+            return
+        self.bodies.append(HarvestedJson(url=response.url, body=body))
 
     async def drain(self, *, until_monotonic_s: float) -> None:
         """Wait for the in-flight body reads, but no later than ``until_monotonic_s``; cancel the rest."""
