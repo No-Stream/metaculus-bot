@@ -1111,10 +1111,11 @@ renders nothing while still surviving into the archive, which is what makes "the
 and never fired" distinguishable from "this record predates the rung". Six of the keys count
 rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
 `derived_api_reads`, `wayback_attempts` and `url_context_reads`. Two count the extractor
-policy's decisions rather than rungs, per final result: `chrome_metric_withholds` is a page whose
-extraction cleared the chrome floor on navigation alone and was withheld by the line-shape
-metric (its `reason` is the same `thin_page` an under-floor page carries, so this count is
-what separates the two), and `precision_fallback_rescues` is a page published from the
+policy's decisions rather than rungs, per final result: `chrome_metric_withholds` is an
+extraction the line-shape metric withheld because it cleared the chrome floor on navigation
+alone, including a chart-rescued page whose chart block still published without that text (on
+a page with no chart block its `reason` is the same `thin_page` an under-floor page carries, so
+this count is what separates the two), and `precision_fallback_rescues` is a page published from the
 `favor_precision` re-extraction after the default one failed that metric. The rest count rungs that
 were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
 because each names a different binding constraint. `rung_budget_skips` is the question that ran

@@ -1148,8 +1148,9 @@ class _PageExtraction:
     ``text`` is what the classifier sees: the precision re-extraction when it rescued the
     page, else the default one (None when nothing extracted). ``chrome_metric_withheld``
     marks a default extraction that cleared the chrome floor and failed the line-shape
-    metric with no rescue, so the classifier withholds it; ``precision_rescued`` marks a
-    text that came from the fallback. Both ride the result into ``details["counts"]``.
+    metric with no rescue, so the classifier withholds that text (the page itself still
+    publishes when a chart block carries its numbers); ``precision_rescued`` marks a text
+    that came from the fallback. Both ride the result into ``details["counts"]``.
     """
 
     text: str | None
@@ -1318,7 +1319,12 @@ async def _classify_html_body(
     3. Chart data therefore rescues a page the chrome floor would have withheld —
        including a JS-walled one, where the config in the raw HTML is precisely the
        data the wall was hiding. That is the one place the `js_wall` outcome moves,
-       and it moves only when we actually recovered the numbers.
+       and it moves only when we actually recovered the numbers. A body the line-shape
+       metric withheld does not ride along under the chart block: the metric's verdict is
+       that the text is chrome, the same text is withheld one branch up when no chart
+       block is present, and published it filled the per-URL cap with up to 6,000 chars
+       of navigation. The chart block publishes alone, and the withhold is still counted.
+       The under-floor rider (`looks_like_page_chrome`, under 400 chars) is unchanged.
     """
     # Both embed scans are only possible on the RAW HTML —
     # trafilatura drops iframes and embed scripts at every
@@ -1361,15 +1367,19 @@ async def _classify_html_body(
             ),
             html_text=html_text,
         )
+    # Reachable only with a non-empty chart block, so a blank body still renders the lead alone
+    # (`_lead_then_capped_body`) and the blank-success guard on `FetchResult` cannot trip.
+    published_text = "" if extraction.chrome_metric_withheld else (extracted or "")
     return _HtmlClassification(
         result=FetchResult(
             url=current_url,
             status="success",
-            text=_page_text_with_leads(extracted or "", current_url, unreadable_embeds, chart_block),
+            text=_page_text_with_leads(published_text, current_url, unreadable_embeds, chart_block),
             http_status=http_status,
             content_type=content_type or None,
             datawrapper_charts=charts,
             unreadable_embeds=unreadable_embeds,
+            chrome_metric_withheld=extraction.chrome_metric_withheld,
             precision_rescued=extraction.precision_rescued,
         ),
         html_text=html_text,
@@ -1867,7 +1877,10 @@ async def _rendered_rung(
     nothing about whether Chromium works, and must not latch that warning. The direct result is
     what stands. The transport memoises a timed-out URL itself, and only when a browser actually
     ran (the outer cut can fire while the render is still queued, which says nothing about the
-    page); a memoised URL re-raises on the next question, so it is recorded the same way again.
+    page), and only when its own DOM-read bound fires before this rung's outer cut; in the
+    salvage shape (goto ran its budget out) the outer cut lands first by the launch time, so
+    that URL is not memoised. A memoised URL re-raises on the next question, so it is recorded
+    the same way again.
 
     The rendered DOM re-enters :func:`_classify_html_body`, so a rescued page gets the same
     chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one — unless the
@@ -3123,8 +3136,9 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # flag on and GOOGLE_API_KEY unset the paid rung fires nowhere, and without this key
         # that run is byte-identical in the archive to one with the flag off.
         "url_context_no_api_key_skips": skips_by_reason["no_api_key"],
-        # The extractor policy's two decisions, per final result: a page withheld because its
-        # extraction cleared the chrome floor on navigation alone, and a page published from
+        # The extractor policy's two decisions, per final result: an extraction the line-shape
+        # metric withheld because it cleared the chrome floor on navigation alone (including a
+        # chart-rescued page, whose chart block still published), and a page published from
         # the precision re-extraction after the default one failed the same metric.
         "chrome_metric_withholds": sum(1 for r in results if r.chrome_metric_withheld),
         "precision_fallback_rescues": sum(1 for r in results if r.precision_rescued),
