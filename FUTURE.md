@@ -2668,3 +2668,27 @@ box, or a self-hosted runner). Operator 2026-09-03: "probably too complicated" â
 Wayback and url_context rungs cover the class in the meantime. The same runner-side cause is
 consistent with GitHub cron gaps (q45092 forfeited 2026-09-01: the 00:05Z fire saw 0 questions
 and the next fire was 04:55Z, past a 2.8-hour window).
+
+### Chromium teardown noise after a render: cause found, fix not shipped (added 2026-09-03; LOW)
+
+The phase-3 QA sweep (`/tmp/fetchprobe/qa_report_phase3.md`, P3-10) still saw two
+`TargetClosedError` tracebacks and one `Task was destroyed but it is pending!` right after the
+companiesmarketcap render, despite the `unroute_all(behavior="ignoreErrors")` guard in
+`research/rendered_fetch.py:_render_in_browser`. Read against Playwright 1.61.0's own source, the
+guard covers less than its comment claims. `RouteHandler.stop("ignoreErrors")` only flags the
+handlers so exceptions INSIDE a route callback are swallowed; it does nothing for the task
+`BrowserContext._on_route` spawns in its `finally` (`asyncio.create_task(...
+_update_interception_patterns())`) once `_routes` is empty, which is exactly the state
+`unroute_all` puts the context in. Every route event still in flight at that moment therefore
+fires one un-awaited protocol send that races our `context.close()` / `browser.close()`, and
+loses as either an unretrieved `TargetClosedError` or a task destroyed pending when the driver
+connection drops its callbacks. `BrowserContext.close()` itself does not stop handlers.
+
+Candidate fix: close the PAGE before unrouting (`page.close()` then `unroute_all` then
+`context.close()` then `browser.close()`), which is Playwright's documented order and makes
+`_on_route` return early ("we stall all requests right away") for anything arriving after,
+shrinking the window without closing it. Not shipped because it is a teardown-order change in
+timing code with no fake-driven test that can prove it (the suite refuses real launches) and one
+more un-timed IPC in the rung's tail; it needs a live render against a busy page to verify.
+Since 2026-09-03 the rung is bounded at the remaining wall budget either way, so the noise costs
+log readability, not pages.

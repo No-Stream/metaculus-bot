@@ -40,9 +40,20 @@ logger = logging.getLogger(__name__)
 # pages where ``page.goto`` raised TimeoutError with the DOM fully rendered (both ballotpedia
 # questions, both fts.unocha.org summaries) — network idle never arrives on a page carrying a
 # long-poll widget or an analytics beacon, so waiting for it discarded content Chromium already
-# had. The worst case is not longer than the cap: the goto budget is the cap MINUS the settle.
+# had. The navigation's worst case is the cap: the goto budget is the cap MINUS the settle, and
+# the one call after the settle, the DOM read, carries its own bound below.
 RENDER_TIMEOUT_MS: int = 35_000
 RENDER_SETTLE_MS: int = 2_000
+# Bound on ``page.content()``. On a settled DOM it is a sub-second round trip to the browser; it
+# runs long only when the page keeps navigating after the settle, which Playwright retries
+# internally before giving up ("the page is navigating and changing the content"). Measured
+# 2026-09-03 on ogimet.com: the goto timed out at 33 s as designed, the settle ran, and the
+# unbounded read then blocked for a further 40 s, so the render ran 76 s against a Tier-1
+# provider wall of 45 s and every page that question had already fetched was discarded. A DOM
+# that has not answered in this long is one that will not settle. Fixed rather than derived
+# from the remaining goto budget, because the read that matters most is the salvage AFTER a
+# goto timeout, when that remainder is zero by construction.
+RENDER_DOM_READ_TIMEOUT_MS: int = 5_000
 # Floor under a caller-derived goto budget. A caller bounding the render against its own wall
 # can arrive with very little left; a token attempt is still worth making, because nothing
 # downstream distinguishes "timed out at 0 s" from "timed out at 5 s" and a fast page is one we
@@ -269,6 +280,11 @@ async def _navigate_and_read_dom(
     timed-out goto routinely leaves a fully rendered DOM behind — 4 of the replay's 10 render
     rescues came from exactly that. A genuine navigation error lands here too and salvages an
     empty ``about:blank``, which reaches the ladder as the same "rendered read nothing".
+
+    The DOM read itself is bounded by ``RENDER_DOM_READ_TIMEOUT_MS`` and raises the builtin
+    ``TimeoutError`` when it fires — deliberately NOT swallowed into the salvage, because a page
+    that keeps navigating has no DOM to salvage and the caller needs to tell this from a browser
+    that is missing or broken (see :func:`render_page`).
     """
     try:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
@@ -281,7 +297,8 @@ async def _navigate_and_read_dom(
         if response is not None and hasattr(response, "headers")
         else ""
     )
-    return content_type, await page.content()
+    html = await asyncio.wait_for(page.content(), timeout=RENDER_DOM_READ_TIMEOUT_MS / 1000)
+    return content_type, html
 
 
 def _harvestable_json_host(response_host: str, page_host: str) -> bool:
@@ -350,10 +367,30 @@ async def render_page(
     """Render ``url`` in headless Chromium and return its DOM, or None when the rung is unavailable.
 
     ``None`` is the one graceful-failure signal both callers already handle, and it covers
-    every way this rung can decline: a URL a browser already read to nothing in this run,
+    every way this rung can DECLINE: a URL a browser already read to nothing in this run,
     Playwright missing or broken, a host that cannot be pinned to a public IP, and any error
     out of the browser. A caller that wants to tell those apart reads
     :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
+
+    A render that ran and was CUT OFF is different, and raises the builtin ``TimeoutError``
+    instead: the DOM read outlived ``RENDER_DOM_READ_TIMEOUT_MS`` because the page kept
+    navigating. It is not folded into ``None`` because the two mean different things to a
+    caller — a timeout says nothing about whether Chromium works, so it must neither trip the
+    once-per-process unavailable warning nor be recorded as the browser being absent — and
+    because the Tier-1 rung bounds this whole call against its own wall budget with the same
+    exception, so one ``except TimeoutError`` there covers both bounds. Both callers memoise a
+    timed-out URL for the run (:func:`note_rendered_no_text`), so a second question citing the
+    same hostile page does not pay for it again.
+
+    The failure boundary around the browser is split three ways, and the split is the point.
+    Playwright's own ``Error`` keeps the once-per-process latch: a launch that cannot find the
+    executable is "the renderer is unavailable" and one line per run is the right volume.
+    Anything else is a bug in this module or a dependency behaving unexpectedly, and it is
+    logged with a full traceback EVERY time — one line per run and then silence was how a
+    programming error in the render path hid behind the latch (2026-09-03). It is still
+    swallowed rather than raised, because a raise here propagates out of the Tier-1 provider's
+    ``gather`` and cancels the question's OTHER pages, which is the one thing a rung failure
+    must never do.
 
     ``host_gate`` is the caller's own per-host politeness semaphore for this URL — passed in
     rather than derived, because the two fetch paths keep separate maps (Tier-1's is
@@ -396,8 +433,20 @@ async def render_page(
                 goto_timeout_ms=goto_timeout_ms,
                 harvest_json=harvest_json,
             )
-    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # top-level soft-fail for the rendered rung: any browser failure degrades to the caller's plain result
+    except TimeoutError:
+        logger.warning(
+            "rendered fetch timed out reading the DOM of %s after %dms: the page kept navigating",
+            urlparse(url).netloc,
+            RENDER_DOM_READ_TIMEOUT_MS,
+        )
+        raise
+    except PlaywrightError as exc:
         _warn_playwright_unavailable_once(exc)
+        return None
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # soft-fail boundary for the rendered rung: a raise here cancels the question's sibling pages (see the docstring); logged in full every time so it can never be silent
+        logger.exception(
+            "rendered fetch failed unexpectedly for %s; leaving the plain result standing", urlparse(url).netloc
+        )
         return None
 
 

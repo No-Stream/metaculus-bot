@@ -363,9 +363,19 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
 
     A ``None`` from the transport (Playwright missing, host not pinnable, browser error, or a
     URL a browser already read to nothing this run) is returned unchanged: it is the
-    graceful-failure signal both call sites already degrade on.
+    graceful-failure signal both call sites already degrade on. A render the transport CUT OFF
+    (its DOM-read cap fired because the page kept navigating) raises ``TimeoutError`` instead, so
+    the Tier-1 rung can record its own reason; this ladder's callers only know ``None``, so it
+    is folded back into that signal here, and the URL is memoised the way a render that read
+    nothing is, so a second fetch of the same hostile page in this run does not pay for it again.
+    The ceilings this wrapper already runs under are unchanged: the ``fetch`` tool's
+    ``timeout_s`` and ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
     """
-    page = await render_page(url, host_gate=_host_gate(url))
+    try:
+        page = await render_page(url, host_gate=_host_gate(url))
+    except TimeoutError:
+        note_rendered_no_text(url)
+        return None
     if page is None:
         return None
     if _content_type_is_document(page.content_type):

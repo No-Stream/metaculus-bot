@@ -963,6 +963,18 @@ directly-fetched one, and can still be withheld. A transport that declines (Play
 or broken, a host that will not pin to a public IP, a browser error, or a URL a browser already
 read to nothing this run) is recorded as a SKIP with the new reason `renderer_unavailable`
 rather than as a fired rung, because nothing was rendered and so nothing about the page changed.
+Two bounds hold the rung inside the wall, and a render cut off by either is recorded as a SKIP
+with its own reason, `render_timeout`, rather than as the renderer being unavailable. Inside the
+transport, `page.content()` is capped at `RENDER_DOM_READ_TIMEOUT_MS`: on a settled DOM it is a
+sub-second round trip, and it runs long only when the page keeps navigating after the settle
+(measured 2026-09-03 on ogimet.com, where the goto timed out at 33 s as designed and the
+unbounded read then blocked for a further 40 s, so the render ran 76 s against the 45 s wall and
+every page the question had already fetched was discarded). Around the transport, the rung holds
+the whole `render_page` call to the remaining budget with `asyncio.wait_for`, so no Playwright
+call can overrun the wall from inside it. A cut-off render says nothing about whether Chromium
+works, so it does not trip the once-per-run "rung unavailable" warning, and the URL is memoised
+for the run so a second question citing the same hostile page does not pay for it again; the
+direct result is what stands.
 
 `route=wayback` (`research/wayback.py`) serves an archived capture. The archive earns a rung
 because it is the one free route whose EGRESS IS NOT OURS: measured 2026-09-03, the same client
@@ -1024,17 +1036,21 @@ every page that already fetched when it fires, so an overrunning rung costs the 
 question's resolution evidence rather than just its own attempt. A rung that FIRED
 records itself on the result (`route=` on the fetch marker, plus one
 `RESOLUTION_SOURCE_ESCALATION` line); a rung that was SKIPPED is counted under
-`details["counts"]` instead of logged, alongside the fired counts. Eleven keys, and a zero
+`details["counts"]` instead of logged, alongside the fired counts. Twelve keys, and a zero
 renders nothing while still surviving into the archive, which is what makes "the rung existed
 and never fired" distinguishable from "this record predates the rung". Six of the keys count
 rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
-`derived_api_reads`, `wayback_attempts` and `url_context_reads`. The other five count rungs that
+`derived_api_reads`, `wayback_attempts` and `url_context_reads`. The other six count rungs that
 were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
 because each names a different binding constraint. `rung_budget_skips` is the question that ran out of wall.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
 parse gate is what binds. `renderer_unavailable_skips` is a browser rung that never rendered,
 most often because Chromium is missing on the runner (the install step is `continue-on-error` in
 every workflow, so its absence is by design), and it is invisible in `rendered_attempts`.
+`render_timeout_skips` is a browser rung that launched and was cut off, by the transport's
+DOM-read cap or by the question's remaining wall budget: a page that keeps navigating, which is a
+fact about the page rather than about the runner or the question's clock, and also invisible in
+`rendered_attempts`.
 `wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
 per-question cap is what binds. `url_context_robots_skips` is the free `Google-Extended`
 pre-check earning its request: the host would have refused the read server-side, so that is
@@ -1071,11 +1087,14 @@ to provider diagnostics.
 url_context rung answered with zero successful retrievals, so what came back is recall rather
 than a read of the page and it is discarded rather than rendered. It has its own token because
 it says something no other status does, that the host answered a third-party fetcher's request
-with nothing while refusing ours. On the reason side, `renderer_unavailable` joins the
-`embed_shell` / `thin_page` / `no_text_layer` / `encrypted` / `malformed` /
-`no_matching_passage` / `budget_skipped` / `parse_contention` vocabulary, and it is the one that
-rides a rung attempt's `skipped_reason` rather than a result's `status_reason`, since nothing was
-rendered and so nothing about the page changed. Both live in
+with nothing while refusing ours. On the reason side, `renderer_unavailable` and
+`render_timeout` join the `embed_shell` / `thin_page` / `no_text_layer` / `encrypted` /
+`malformed` / `no_matching_passage` / `budget_skipped` / `parse_contention` vocabulary, and they
+are the two that ride a rung attempt's `skipped_reason` rather than a result's `status_reason`,
+since nothing was rendered and so nothing about the page changed. `renderer_unavailable` is the
+browser declining (missing, broken, unpinnable host, memoised URL); `render_timeout` is a render
+that launched and was cut off because the page kept navigating, and the two are kept apart
+because only the first says anything about Chromium. All of them live in
 `research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that

@@ -113,6 +113,15 @@ FetchStatus = Literal[
 # browser already read to nothing this run. It rides a rung attempt's `skipped_reason` rather
 # than a result's `status_reason` — nothing was rendered, so nothing about the page changed —
 # and it is here so the whole reason vocabulary has one home.
+#
+# `render_timeout` is the browser rung CUT OFF: Chromium launched and navigated, and either the
+# DOM read outlived the transport's `RENDER_DOM_READ_TIMEOUT_MS` because the page kept
+# navigating, or the whole render outlived the question's remaining wall budget. Its own token
+# rather than `renderer_unavailable` because it says nothing about whether Chromium works — the
+# receipt is ogimet.com (2026-09-03), where a 76 s render was recorded as the renderer being
+# unavailable and latched the once-per-run warning, so a real outage later would have logged
+# nothing. Same carriage as `renderer_unavailable`: a rung attempt's `skipped_reason`, since
+# nothing was rendered.
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -123,6 +132,7 @@ FetchStatusReason = Literal[
     "budget_skipped",
     "parse_contention",
     "renderer_unavailable",
+    "render_timeout",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the

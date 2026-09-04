@@ -13,6 +13,7 @@ package's autouse fixtures already stub DNS and reset the shared gates.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from typing import get_args
 
@@ -20,6 +21,7 @@ import pytest
 
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.derived_api import reset_derived_endpoints
+from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS, FetchResult, FetchRoute
 from metaculus_bot.research.resolution_source import (
@@ -29,6 +31,7 @@ from metaculus_bot.research.resolution_source import (
     _fetch_one,
     _rung_counts,
     format_resolution_sections,
+    resolution_source_provider,
 )
 from metaculus_bot.research.robots_policy import reset_robots_cache
 from metaculus_bot.research.wayback import wayback_snapshot_url
@@ -37,6 +40,7 @@ from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
     _embed_shell_page,
+    _mock_question,
     _prose_page,
 )
 
@@ -290,6 +294,115 @@ class TestRenderedRungDeclines:
         await _fetch_one(session, _URL, {})
 
         assert rendered_fetch.rendered_to_nothing(_URL) is False
+
+
+def _hanging_render(calls: list[str]):
+    """A transport that never comes back: the ogimet shape (P3-1), seen from the caller's side."""
+
+    async def _render(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False) -> None:
+        calls.append(url)
+        del host_gate, goto_timeout_ms, harvest_json
+        await asyncio.Event().wait()
+
+    return _render
+
+
+def _admit_a_render_with(monkeypatch: pytest.MonkeyPatch, budget_s: float) -> None:
+    """Let the rung fire on a sub-second budget. The production floor is 12 s, and a test that
+    waited it out would cost more than the suite's whole rendered-rung coverage."""
+    monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S", 0.01)
+    monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: budget_s)
+
+
+def _assert_recorded_as_a_render_timeout(result: FetchResult) -> None:
+    assert result.status == "js_wall"
+    assert result.route == "direct"
+    attempts = [a for a in result.rung_attempts if a.rung == "rendered"]
+    assert [a.skipped_reason for a in attempts] == ["render_timeout"]
+    assert rendered_fetch.rendered_to_nothing(result.url) is True
+    assert rendered_fetch._PLAYWRIGHT_WARNED is False
+    counts = _rung_counts([result])
+    assert counts["render_timeout_skips"] == 1
+    assert counts["rendered_attempts"] == 0
+    assert counts["renderer_unavailable_skips"] == 0
+
+
+class TestRenderedRungTimeout:
+    """P3-1 (live QA, 2026-09-03): a page that kept navigating held ``page.content()`` for 40 s
+    after its goto timed out, the render ran 76 s, and the provider's 45 s wall discarded every
+    page the question had fetched. The rung now bounds the whole transport call at the remaining
+    budget, on top of the transport's own DOM-read cap, and a render cut off by either is its own
+    skip reason: it says nothing about whether Chromium works, so it must neither read as
+    ``renderer_unavailable`` nor latch that warning, and the URL is memoised so a second question
+    citing the same page does not pay for it again. The direct result is what stands.
+    """
+
+    async def test_a_render_that_outlives_the_budget_is_cut_off_at_the_budget(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(resolution_source, "render_page", _hanging_render(calls))
+        _admit_a_render_with(monkeypatch, 0.2)
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        started = time.monotonic()
+        result = await _fetch_one(session, _URL, {})
+        elapsed = time.monotonic() - started
+
+        assert 0.2 <= elapsed < 2.0
+        assert calls == [_URL]
+        _assert_recorded_as_a_render_timeout(result)
+        (attempt,) = [a for a in result.rung_attempts if a.rung == "rendered"]
+        assert attempt.wall_s is not None
+        assert attempt.wall_s >= 0.2
+
+    async def test_the_transports_own_dom_read_timeout_is_recorded_the_same_way(self, monkeypatch):
+        """The inner bound RAISES rather than declining with ``None``, which is what lets the rung
+        tell it from a missing browser; both bounds land on the one reason."""
+
+        async def _timed_out(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False) -> None:
+            del url, host_gate, goto_timeout_ms, harvest_json
+            await asyncio.sleep(0)
+            raise TimeoutError("rendered fetch DOM read exceeded 5000ms")
+
+        monkeypatch.setattr(resolution_source, "render_page", _timed_out)
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        result = await _fetch_one(session, _URL, {})
+
+        _assert_recorded_as_a_render_timeout(result)
+
+
+class TestASlowRenderLeavesTheSiblingPagesStanding:
+    """The invariant every per-rung bound exists for: a rung that overruns costs its own page,
+    never the question's. Before the bound, this shape — one hostile page beside one ordinary
+    one — returned nothing at all, because the provider's outer wall fired first."""
+
+    _NEWS_URL = "https://news.example.com/cpi-report"
+
+    async def test_the_provider_returns_the_other_page_inside_its_wall(self, monkeypatch, article_html, caplog):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(resolution_source, "render_page", _hanging_render([]))
+        _admit_a_render_with(monkeypatch, 0.2)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                self._NEWS_URL: FakeResponse(200, body=article_html, content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        question = _mock_question(resolution_criteria=f"Resolves per {_URL} and {self._NEWS_URL}")
+
+        started = time.monotonic()
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.rendered_fetch"):
+            section = await resolution_source_provider(is_benchmarking=False)(question)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0
+        assert "Consumer Price Index" in section
+        assert "tracker.example.com: js_wall" in section
+        counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
+        assert counts["render_timeout_skips"] == 1
+        assert counts["rendered_attempts"] == 0
+        assert not [message for message in caplog.messages if "rung unavailable" in message]
 
 
 class TestRenderedRungClassification:

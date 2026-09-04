@@ -3366,6 +3366,32 @@ class TestRenderedRungSalvagesATimedOutNavigation:
         assert result.text == ""
 
 
+class TestRenderedRungTimeoutAtTheV2Wrapper:
+    """P3-1's transport bound RAISES ``TimeoutError`` rather than declining with ``None``, so the
+    Tier-1 rung can record its own reason. This wrapper's callers only know ``None``, so it folds
+    the timeout back into that signal and memoises the URL the way a render that read nothing
+    is, so a second fetch of the same hostile page in the run does not pay for it again. The
+    ceilings this wrapper already ran under are unchanged: the ``fetch`` tool's ``timeout_s`` and
+    ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_transport_timeout_declines_and_memoises_the_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        url = "https://example.com/keeps-navigating"
+
+        async def _timed_out(target: str, *, host_gate, goto_timeout_ms: int = 0, harvest_json: bool = False) -> None:
+            del target, host_gate, goto_timeout_ms, harvest_json
+            await asyncio.sleep(0)
+            raise TimeoutError("rendered fetch DOM read exceeded 5000ms")
+
+        monkeypatch.setattr(agentic_tools, "render_page", _timed_out)
+
+        result = await agentic_tools._try_rendered_fetch(url)
+
+        assert result is None
+        assert rendered_fetch.rendered_to_nothing(url) is True
+
+
 # ---------------------------------------------------------------------------
 # The Google-Extended robots pre-check on the paid reader (2026-09-03). Proven live: the
 # verification probe's url_context call returned URL_RETRIEVAL_STATUS_ERROR on

@@ -1538,6 +1538,15 @@ async def _rendered_rung(
     the transport's own 35 s. Degrading to the direct result costs one page; overrunning the
     provider's outer ``wait_for`` costs every page the question already fetched.
 
+    The whole transport call is ALSO held to the remaining budget with ``asyncio.wait_for``, on
+    top of the transport's own DOM-read cap, so no Playwright call — present or future — can
+    overrun the wall from inside the rung. The receipt is ogimet.com (2026-09-03): the goto timed
+    out at 33 s as designed and ``page.content()`` then blocked for 40 s more, for a 76 s render
+    against a 45 s wall. Either bound firing is recorded as its own skip, ``render_timeout``,
+    rather than ``renderer_unavailable`` — a cut-off render says nothing about whether Chromium
+    works, and must not latch that warning — and the URL is memoised so a second question citing
+    the same hostile page does not pay for it again. The direct result is what stands.
+
     The rendered DOM re-enters :func:`_classify_html_body`, so a rescued page gets the same
     chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one. When the
     DOM STILL carries nothing, the JSON the page fetched for itself is the last free route
@@ -1559,15 +1568,30 @@ async def _rendered_rung(
         return None
     attempt = ctx.start_rung("rendered", direct.status, url)
     goto_timeout_ms = int(min(RENDER_TIMEOUT_MS, budget_s * 1000) - RENDER_SETTLE_MS)
-    page = await render_page(
-        url,
-        host_gate=_sem_for_host(host_sems, url),
-        goto_timeout_ms=goto_timeout_ms,
-        # Recording the page's own XHR costs one buffered body per response inside the render
-        # task, which is why the transport keeps it off by default — here it is exactly the
-        # rung's fallback, so it is worth the bytes.
-        harvest_json=True,
-    )
+    try:
+        page = await asyncio.wait_for(
+            render_page(
+                url,
+                host_gate=_sem_for_host(host_sems, url),
+                goto_timeout_ms=goto_timeout_ms,
+                # Recording the page's own XHR costs one buffered body per response inside the
+                # render task, which is why the transport keeps it off by default — here it is
+                # exactly the rung's fallback, so it is worth the bytes.
+                harvest_json=True,
+            ),
+            timeout=budget_s,
+        )
+    except TimeoutError:
+        # One handler for both bounds: the transport's DOM-read cap raises this itself, and the
+        # wait_for above raises it when the whole render outlived the budget.
+        logger.warning(
+            "resolution_source: the rendered rung for %s was cut off (%.1fs budget); leaving the direct result",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        attempt.skipped_reason = "render_timeout"
+        note_rendered_no_text(url)
+        return None
     if page is None:
         # The transport declines with ONE signal for several causes — Playwright missing or
         # broken, a host that will not pin to a public IP, a browser error, or a URL a browser
@@ -2558,6 +2582,12 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         "renderer_unavailable_skips": sum(
             1 for attempt in attempts if attempt.skipped_reason == "renderer_unavailable"
         ),
+        # Its own count too: a render that launched and was cut off — by the transport's DOM-read
+        # cap or by the question's remaining wall budget — is a page that keeps navigating, which
+        # is a fact about the page, whereas the two counts above are facts about the runner and
+        # about the question's clock. Folding it into either would hide the population the
+        # ogimet receipt (2026-09-03) is the first member of.
+        "render_timeout_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "render_timeout"),
         # Also its own count: a question that spent its two snapshot attempts on earlier
         # cited URLs is a question whose per-question cap is binding, which is a different
         # thing to tune than a question that ran out of wall.
