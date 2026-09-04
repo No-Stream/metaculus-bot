@@ -195,6 +195,12 @@ def build_session(
 # in the same process (a backtest question loop, the test suite) would otherwise crash
 # on contention. Clearing on a loop change keeps "shared across every concurrent
 # question", which is what one loop means here, without that hazard.
+#
+# The tradeoff, priced after the fact: sharing the map serializes same-host requests ACROSS
+# the concurrent questions, inside a per-question wall that was not raised and that discards
+# pages which already fetched when it fires — so a question that loses the queue can lose its
+# whole section rather than one page. The acquire wait is deliberately unbounded; FUTURE.md
+# item 5 holds both remedies (partial harvest, or a budget-bounded wait) as operator calls.
 _HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 _HOST_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
 

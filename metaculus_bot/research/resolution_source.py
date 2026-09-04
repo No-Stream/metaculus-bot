@@ -1729,6 +1729,15 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "") -> list[
     serialize there; the Tier-2 dataset fetches contend on the dwcdn host's semaphore
     the same way. Session is closed in ``finally``.
 
+    Sharing the map buys that politeness at the cost of CROSS-QUESTION serialization: a
+    same-host queue now forms across the concurrent questions, inside a
+    ``RESOLUTION_SOURCE_WALL_TIMEOUT`` that was not raised and that discards work which
+    already succeeded when it fires, so a question that loses the queue can lose every
+    page it had already fetched rather than just the contended one (reproduced; the
+    archived tail says 3 of 23 all-fail fetches ran the full per-request timeout). The
+    acquire wait itself is deliberately unbounded — see FUTURE.md item 5, where both
+    remedies (partial harvest, or a budget-bounded wait) are the operator's call.
+
     Teardown race guard (F5): the outer factory wraps this call in
     ``asyncio.wait_for``. When the wall-clock timeout fires, wait_for cancels
     this coroutine — but if a gather is still in flight we'd exit the
