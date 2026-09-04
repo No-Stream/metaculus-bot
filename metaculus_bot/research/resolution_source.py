@@ -221,6 +221,7 @@ from metaculus_bot.research.rendered_fetch import (
     MemoScope,
     RenderBudgetExpired,
     RenderedPage,
+    RenderTimeout,
     _is_json_content_type,
     note_rendered_no_text,
     render_page,
@@ -1848,6 +1849,76 @@ def _rendered_rung_applies(direct: FetchResult) -> bool:
     return direct.status == "no_resolving_content" and direct.status_reason == "thin_page"
 
 
+async def _render_or_record_the_skip(
+    url: str, budget_s: float, host_sems: dict[str, asyncio.Semaphore], attempt: RungAttempt
+) -> RenderedPage | None:
+    """Run the transport under the rung's wall bound; on anything but a page, record why.
+
+    Every way the transport can stop short of a rendered page lands on ``attempt.skipped_reason``
+    here, so the rung itself reads as one statement per outcome. The mapping, and why each token
+    is what it is, is the :func:`_rendered_rung` docstring's business; this function only
+    applies it.
+    """
+    goto_timeout_ms = int(min(RENDER_TIMEOUT_MS, budget_s * 1000) - RENDER_SETTLE_MS)
+    try:
+        page = await asyncio.wait_for(
+            render_page(
+                url,
+                memo_scope=_RENDER_MEMO_SCOPE,
+                host_gate=_sem_for_host(host_sems, url),
+                goto_timeout_ms=goto_timeout_ms,
+                # The transport's exit (shared teardown bound, launch, driver stop) runs AFTER
+                # this deadline and has to land inside the wait_for below, so the deadline is
+                # the budget less that reserve. Strictly safer: it can only shorten the goto or
+                # decline earlier at the transport's own navigation floor.
+                deadline_monotonic_s=time.monotonic() + budget_s - RENDER_EXIT_RESERVE_MS / 1000,
+                # Recording the page's own XHR costs one buffered body per response inside the
+                # render task, which is why the transport keeps it off by default — here it is
+                # exactly the rung's fallback, so it is worth the bytes.
+                harvest_json=True,
+            ),
+            timeout=budget_s,
+        )
+    except RenderBudgetExpired:
+        # The budget ran out in the queue behind the two gates: nothing rendered, so it is the same
+        # skip the pre-gate check records, not a cut-off render and not a missing browser.
+        attempt.skipped_reason = "wall_budget"
+        return None
+    except RenderTimeout as exc:
+        # The transport's own DOM-read bound: a browser ran and the page kept navigating (or the
+        # transport re-raised it for a URL it already cut off this run). A fact about the page.
+        logger.warning(
+            "resolution_source: the rendered rung for %s was cut off by the transport (%.1fs budget): %s; "
+            "leaving the direct result",
+            urlparse(url).netloc,
+            budget_s,
+            exc,
+        )
+        attempt.skipped_reason = "render_timeout"
+        return None
+    except TimeoutError:
+        # The rung's own wait_for above: the render was still queued behind the two gates when
+        # the budget ran out, or the transport overran its exit reserve. Neither says anything
+        # about the page, so it is the wall binding, the same skip the pre-gate check records.
+        # Ordered after the two transport exceptions, which both subclass this.
+        logger.warning(
+            "resolution_source: the rendered rung for %s outlived its %.1fs wall budget before the transport "
+            "answered; leaving the direct result",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        attempt.skipped_reason = "wall_budget"
+        return None
+    if page is None:
+        # The transport declines with ONE signal for several causes — Playwright missing or
+        # broken, a host that will not pin to a public IP, a DOM over its ceiling, or a browser
+        # error — and its own WARN/DEBUG lines say which. Recorded as a SKIP rather than a fired
+        # rung because nothing was rendered: it then claims no `route=` and emits no escalation
+        # line, while keeping the measured wall_s that says what the declined launch cost.
+        attempt.skipped_reason = "renderer_unavailable"
+    return page
+
+
 async def _rendered_rung(
     url: str, direct: FetchResult, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
 ) -> FetchResult | None:
@@ -1878,14 +1949,18 @@ async def _rendered_rung(
     render that runs every bound out hands its DOM back before the cut instead of being
     cancelled in its own exit. The receipt is ogimet.com (2026-09-03): the goto timed out at
     33 s as designed and ``page.content()`` then blocked for 40 s more, for a 76 s render against
-    a 45 s wall. Either bound firing is recorded as its own skip, ``render_timeout``, rather than
-    ``renderer_unavailable`` — a cut-off render says nothing about whether Chromium works, and
-    must not latch that warning. The direct result is what stands. The transport memoises a
-    timed-out URL itself, at the raise site and only when a browser actually ran (the outer cut
-    can fire while the render is still queued, which says nothing about the page); with the
-    reserve in place its DOM-read bound lands before this rung's outer cut even in the salvage
-    shape (goto ran its budget out), so the memo is written there too. A memoised URL re-raises
-    on the next question, so it is recorded the same way again.
+    a 45 s wall. The two bounds are recorded apart, by the exception class the transport raises.
+    Its own DOM-read bound raises :class:`RenderTimeout`: a browser ran and the page kept
+    navigating, which is a fact about the page and is its own skip, ``render_timeout``, rather
+    than ``renderer_unavailable`` — a cut-off render says nothing about whether Chromium works,
+    and must not latch that warning. This rung's outer bound raises a bare ``TimeoutError``: the
+    render was still queued behind the two gates, or the transport overran its exit reserve,
+    neither of which is about the page, so it is recorded as ``wall_budget`` like the pre-gate
+    floor check and the post-gate :class:`RenderBudgetExpired`. The direct result is what stands
+    either way. The transport memoises a timed-out URL itself, at the raise site and only when a
+    browser actually ran; with the reserve in place its DOM-read bound lands before this rung's
+    outer cut even in the salvage shape (goto ran its budget out), so the memo is written there
+    too. A memoised URL re-raises on the next question, so it is recorded the same way again.
 
     The rendered DOM re-enters :func:`_classify_html_body`, so a rescued page gets the same
     chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one — unless the
@@ -1909,50 +1984,8 @@ async def _rendered_rung(
     if budget_s is None:
         return None
     attempt = ctx.start_rung("rendered", direct.status, url)
-    goto_timeout_ms = int(min(RENDER_TIMEOUT_MS, budget_s * 1000) - RENDER_SETTLE_MS)
-    try:
-        page = await asyncio.wait_for(
-            render_page(
-                url,
-                memo_scope=_RENDER_MEMO_SCOPE,
-                host_gate=_sem_for_host(host_sems, url),
-                goto_timeout_ms=goto_timeout_ms,
-                # The transport's exit (shared teardown bound, launch, driver stop) runs AFTER
-                # this deadline and has to land inside the wait_for below, so the deadline is
-                # the budget less that reserve. Strictly safer: it can only shorten the goto or
-                # decline earlier at the transport's own navigation floor.
-                deadline_monotonic_s=time.monotonic() + budget_s - RENDER_EXIT_RESERVE_MS / 1000,
-                # Recording the page's own XHR costs one buffered body per response inside the
-                # render task, which is why the transport keeps it off by default — here it is
-                # exactly the rung's fallback, so it is worth the bytes.
-                harvest_json=True,
-            ),
-            timeout=budget_s,
-        )
-    except RenderBudgetExpired:
-        # The budget ran out in the queue behind the two gates: nothing rendered, so it is the same
-        # skip the pre-gate check records, not a cut-off render and not a missing browser.
-        attempt.skipped_reason = "wall_budget"
-        return None
-    except TimeoutError as exc:
-        # One handler for both bounds: the transport's DOM-read cap raises this itself (and
-        # re-raises it for a URL it already cut off this run), and the wait_for above raises it
-        # when the whole render outlived the budget. The message says which.
-        logger.warning(
-            "resolution_source: the rendered rung for %s was cut off (%.1fs budget): %s; leaving the direct result",
-            urlparse(url).netloc,
-            budget_s,
-            exc,
-        )
-        attempt.skipped_reason = "render_timeout"
-        return None
+    page = await _render_or_record_the_skip(url, budget_s, host_sems, attempt)
     if page is None:
-        # The transport declines with ONE signal for several causes — Playwright missing or
-        # broken, a host that will not pin to a public IP, a DOM over its ceiling, or a browser
-        # error — and its own WARN/DEBUG lines say which. Recorded as a SKIP rather than a fired rung because nothing
-        # was rendered: it then claims no `route=` and emits no escalation line, while keeping
-        # the measured wall_s that says what the declined launch cost.
-        attempt.skipped_reason = "renderer_unavailable"
         return None
     if page.http_status is not None and page.http_status != 200:
         logger.warning(
@@ -3116,11 +3149,12 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # workflow, so its absence is by design) says something different from a question that
         # ran out of wall, and both are invisible in `rendered_attempts`.
         "renderer_unavailable_skips": skips_by_reason["renderer_unavailable"],
-        # Its own count too: a render that launched and was cut off — by the transport's DOM-read
-        # cap or by the question's remaining wall budget — is a page that keeps navigating, which
-        # is a fact about the page, whereas the two counts above are facts about the runner and
-        # about the question's clock. Folding it into either would hide the population the
-        # ogimet receipt (2026-09-03) is the first member of.
+        # Its own count too: a render that launched and was cut off by the transport's DOM-read
+        # cap is a page that keeps navigating, which is a fact about the page, whereas the two
+        # counts above are facts about the runner and about the question's clock (the rung's own
+        # outer cut, which fires while the render is still queued, is a `wall_budget` skip).
+        # Folding it into either would hide the population the ogimet receipt (2026-09-03) is
+        # the first member of.
         "render_timeout_skips": skips_by_reason["render_timeout"],
         # And its own count: a browser rung skipped because an earlier question in this run
         # already rendered the same URL to nothing is the memo doing its job, not a runner without

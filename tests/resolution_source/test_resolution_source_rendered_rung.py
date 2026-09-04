@@ -59,19 +59,34 @@ def _admit_a_render_with(monkeypatch: pytest.MonkeyPatch, budget_s: float) -> No
     monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: budget_s)
 
 
-def _assert_recorded_as_a_render_timeout(result: FetchResult) -> None:
+def _assert_the_direct_result_stands_after_a_cut(result: FetchResult, skipped_reason: str) -> dict[str, int]:
     assert result.status == "js_wall"
     assert result.route == "direct"
     attempts = [a for a in result.rung_attempts if a.rung == "rendered"]
-    assert [a.skipped_reason for a in attempts] == ["render_timeout"]
+    assert [a.skipped_reason for a in attempts] == [skipped_reason]
     # The timed-out memo is the TRANSPORT's, written only when a browser actually ran (pinned in
     # tests/test_rendered_fetch.py); the rung never writes the rendered-to-nothing memo on a cut.
     assert rendered_fetch.rendered_to_nothing(result.url, memo_scope="resolution_source") is False
     assert rendered_fetch._PLAYWRIGHT_WARNED is False
     counts = _rung_counts([result])
-    assert counts["render_timeout_skips"] == 1
     assert counts["rendered_attempts"] == 0
     assert counts["renderer_unavailable_skips"] == 0
+    return counts
+
+
+def _assert_recorded_as_a_render_timeout(result: FetchResult) -> None:
+    """The transport's own cut: a browser ran and the page kept navigating."""
+    counts = _assert_the_direct_result_stands_after_a_cut(result, "render_timeout")
+    assert counts["render_timeout_skips"] == 1
+    assert counts["rung_budget_skips"] == 0
+
+
+def _assert_recorded_as_the_wall_binding(result: FetchResult) -> None:
+    """The rung's own outer cut: the render never left the queue, so the wall was what bound."""
+    counts = _assert_the_direct_result_stands_after_a_cut(result, "wall_budget")
+    assert counts["render_timeout_skips"] == 0
+    assert counts["rung_budget_skips"] == 1
+    assert counts["rendered_budget_skips"] == 1
 
 
 class TestRenderedRungTriggers:
@@ -263,13 +278,19 @@ class TestRenderedRungTimeout:
     """P3-1 (live QA, 2026-09-03): a page that kept navigating held ``page.content()`` for 40 s
     after its goto timed out, the render ran 76 s, and the provider's 45 s wall discarded every
     page the question had fetched. The rung now bounds the whole transport call at the remaining
-    budget, on top of the transport's own DOM-read cap, and a render cut off by either is its own
-    skip reason: it says nothing about whether Chromium works, so it must neither read as
-    ``renderer_unavailable`` nor latch that warning, and the URL is memoised so a second question
-    citing the same page does not pay for it again. The direct result is what stands.
+    budget, on top of the transport's own DOM-read cap, and the two cuts are recorded APART. The
+    transport's cut (``RenderTimeout``) is a browser that ran on a page that kept navigating, its
+    own skip reason: it says nothing about whether Chromium works, so it must neither read as
+    ``renderer_unavailable`` nor latch that warning, and the transport memoises the URL so a
+    second question citing the same page does not pay for it again. The rung's own cut (a bare
+    ``TimeoutError`` from its ``wait_for``) fires while the render is still queued behind the
+    launch gates, which says nothing about the page, so it is the wall binding: ``wall_budget``,
+    the same reason the pre-gate floor and the post-gate ``RenderBudgetExpired`` record. The
+    direct result is what stands either way.
     """
 
-    async def test_a_render_that_outlives_the_budget_is_cut_off_at_the_budget(self, monkeypatch):
+    async def test_a_render_still_queued_at_the_budget_is_cut_off_and_recorded_as_the_wall(self, monkeypatch):
+        """The transport never answers (no browser ran), so the rung's own bound is what fires."""
         calls: list[str] = []
         monkeypatch.setattr(resolution_source, "render_page", _hanging_render(calls))
         _admit_a_render_with(monkeypatch, 0.2)
@@ -281,19 +302,36 @@ class TestRenderedRungTimeout:
 
         assert 0.2 <= elapsed < 2.0
         assert calls == [_URL]
-        _assert_recorded_as_a_render_timeout(result)
+        _assert_recorded_as_the_wall_binding(result)
         (attempt,) = [a for a in result.rung_attempts if a.rung == "rendered"]
         assert attempt.wall_s is not None
         assert attempt.wall_s >= 0.2
 
-    async def test_the_transports_own_dom_read_timeout_is_recorded_the_same_way(self, monkeypatch):
-        """The inner bound RAISES rather than declining with ``None``, which is what lets the rung
-        tell it from a missing browser; both bounds land on the one reason."""
+    async def test_a_render_queued_behind_the_launch_cap_is_the_wall_binding_not_a_render_timeout(self, monkeypatch):
+        """Through the REAL transport: both process-wide launch slots are held by other renders,
+        so this one queues on the gate with the wall running and never reaches a launch. Recorded
+        as ``render_timeout`` it inflated a count documented as a fact about the page while the
+        wall-budget counts stayed at zero."""
+        monkeypatch.setattr(resolution_source, "render_page", rendered_fetch.render_page)
+        _admit_a_render_with(monkeypatch, 0.2)
+        gate = rendered_fetch._RENDERED_FETCH_GLOBAL_SEMAPHORE
+        for _ in range(rendered_fetch.RENDER_LAUNCH_CAP):
+            await gate.acquire()
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        result = await _fetch_one(session, _URL, {})
+
+        _assert_recorded_as_the_wall_binding(result)
+        assert rendered_fetch.render_timed_out(_URL, memo_scope="resolution_source") is False
+
+    async def test_the_transports_own_dom_read_cut_off_is_recorded_as_a_render_timeout(self, monkeypatch):
+        """The inner bound RAISES its own class rather than declining with ``None``, which is what
+        lets the rung tell it from a missing browser and from its own outer cut."""
 
         async def _timed_out(url: str, **kwargs: object) -> None:
             del url, kwargs
             await asyncio.sleep(0)
-            raise TimeoutError("rendered fetch DOM read exceeded 5000ms")
+            raise rendered_fetch.RenderTimeout("the DOM read of tracker.example.com outlived 5000ms")
 
         monkeypatch.setattr(resolution_source, "render_page", _timed_out)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
@@ -332,7 +370,9 @@ class TestASlowRenderLeavesTheSiblingPagesStanding:
         assert "Consumer Price Index" in section
         assert "tracker.example.com: js_wall" in section
         counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
-        assert counts["render_timeout_skips"] == 1
+        # A transport that never answered is the wall binding on the rung, not a cut-off render.
+        assert counts["rendered_budget_skips"] == 1
+        assert counts["render_timeout_skips"] == 0
         assert counts["rendered_attempts"] == 0
         assert not [message for message in caplog.messages if "rung unavailable" in message]
 

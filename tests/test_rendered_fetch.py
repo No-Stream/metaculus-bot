@@ -1002,7 +1002,9 @@ class TestTeardown:
         elapsed = time.monotonic() - started
 
         assert rendered is not None
-        assert 0.2 <= elapsed < 0.4
+        # One bound (200 ms, truncated to whole milliseconds), not two: the second wedged close
+        # got nothing and went to the driver stop.
+        assert 0.18 <= elapsed < 0.4
         assert page.teardown == ["unroute_all", "context.close"]
 
     async def test_the_teardown_budget_starts_with_the_first_step_not_the_launch(self, monkeypatch):
