@@ -192,6 +192,41 @@ class TestUrlContextRung:
         assert result.status == "success"
         assert len(calls) == 1
 
+    async def test_a_robots_file_served_as_a_pdf_keeps_its_read_off_the_pages_record(self, monkeypatch):
+        """The pre-check's GET is a request made on the CITED URL's behalf, so what it reads must
+        not be booked against the page.
+
+        `_fetch_robots_txt` goes through `_fetch_direct`, which CLASSIFIES: a host answering
+        `/robots.txt` with `application/pdf` sends it down the local document read, which stamps a
+        `pdf_local` attempt and a `pdf_documents_read` onto whatever context it was handed. On the
+        PAGE's context that is a document read attributed to a page whose own fetch was a 403, and
+        `route` would move to `pdf_local` on a page no document was ever cited from. The child
+        context `_aux_ctx` builds is what keeps the page's record to the rung it actually earned.
+        An unreadable policy still proceeds to pay, which is the only direction this pre-check is
+        allowed to fail in, so the paid read below is what a correct run reaches."""
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+                "https://tracker.example.com/robots.txt": FakeResponse(
+                    200,
+                    body=build_text_pdf([["User-agent: Google-Extended", "Disallow: /"]]),
+                    content_type="application/pdf",
+                ),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+
+        # The pre-check really ran and really read the document: without this the assertions
+        # below would also hold for a fixture that never fetched robots.txt at all.
+        assert "https://tracker.example.com/robots.txt" in session.requested
+        assert len(calls) == 1
+        assert result.route == "url_context"
+        assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("url_context", "")]
+        assert _rung_counts([result])["pdf_documents_read"] == 0
+
     async def test_a_document_we_read_in_full_is_never_sent_to_the_paid_reader(self, monkeypatch):
         """`no_matching_passage` is inside the trigger STATUSES and outside the trigger
         POPULATION. We hold the whole document's text and its outline, so a model re-reading the
