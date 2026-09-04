@@ -603,7 +603,9 @@ class TestAriaTableRewrite:
         body = cdc_aria_stat_block_page()
 
         before = resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
-        after = resolution_source._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0)
+        after = resolution_source._extract_page_text(
+            body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0
+        ).text
 
         assert before is not None
         assert after is not None
@@ -622,7 +624,7 @@ class TestAriaTableRewrite:
 
         assert resolution_source._extract_page_text(
             article_html.decode(), article_html, "https://news.example.com/report", 0.0
-        ) == resolution_source._extract_main_text(article_html, "https://news.example.com/report")
+        ).text == resolution_source._extract_main_text(article_html, "https://news.example.com/report")
 
     def test_an_unclosed_role_element_is_still_rewritten(self):
         """A truncated capture (and plenty of live HTML) never closes its outer divs. Leaving
@@ -677,7 +679,7 @@ class TestAriaTableRewrite:
         assert 0.0 < ratio < MAX_UNDECODABLE_CHAR_RATIO, "pins that the old gate admitted this page"
         assert "�" in html_text, "our own decode is what mangled it"
 
-        out = resolution_source._extract_page_text(html_text, body, "https://sante.example.com/qc", ratio)
+        out = resolution_source._extract_page_text(html_text, body, "https://sante.example.com/qc", ratio).text
 
         assert out is not None
         assert "Résumé" in out
@@ -692,14 +694,14 @@ class TestAriaTableRewrite:
 
         assert resolution_source._extract_page_text(
             body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", ratio
-        ) == resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+        ).text == resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
 
     def test_a_cleanly_decoded_page_still_gets_the_rewrite(self):
         """Non-vacuity for the two cases above: at 0.0 the labelled row is present, so they
         are asserting a real fallback rather than an extraction that never differs."""
         body = cdc_aria_stat_block_page()
 
-        out = resolution_source._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0)
+        out = resolution_source._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0).text
 
         assert out is not None
         assert "| Hospitalizations | 922 |" in out

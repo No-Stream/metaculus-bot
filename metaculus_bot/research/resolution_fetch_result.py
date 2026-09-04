@@ -269,6 +269,14 @@ class FetchResult:
     # majority and renders no extra telemetry at all.
     route: FetchRoute = "direct"
     rung_attempts: list[RungAttempt] = field(default_factory=list)
+    # The HTML extractor policy's decision (`resolution_source._extract_page_text`); False off
+    # the HTML path. `chrome_metric_withheld`: the extraction cleared the chrome floor on
+    # navigation alone and the line-shape metric withheld it (the `thin_page` reason covers
+    # this and the under-floor case alike). `precision_rescued`: the published text is the
+    # `favor_precision` re-extraction, taken after the default one failed that metric. Both
+    # ride `details["counts"]`, so no status or reason token moved.
+    chrome_metric_withheld: bool = False
+    precision_rescued: bool = False
     # Provenance for Tier-2 dataset results (None on ordinary page fetches).
     chart_id: str | None = None
     chart_title: str | None = None
