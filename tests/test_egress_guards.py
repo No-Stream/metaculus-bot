@@ -15,6 +15,7 @@ is touched, and the one real connect is to a listener on loopback.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 
 import pytest
@@ -93,10 +94,12 @@ class TestCurlGuard:
         native_egress_attempts.clear()
 
     def test_yfinance_reaches_libcurl_through_the_guard(self, native_egress_attempts: list[str]) -> None:
-        """yfinance builds its own impersonating ``Session`` and calls ``get`` on it; it also swallows
-        the refusal into an empty frame, which is exactly why the guard records the attempt."""
-        history = yfinance.Ticker("AAPL").history(period="5d", raise_errors=False)
-        assert history.empty
+        """yfinance builds its own impersonating ``Session`` and calls ``get`` on it. What it does with
+        the refusal depends on its cookie cache: with a cached crumb it swallows the error into an
+        empty frame, on a cold runner the cookie fetch re-raises it. Either way the guard has recorded
+        the attempt, which is the fact under test; the frame itself is yfinance's business."""
+        with contextlib.suppress(RuntimeError):
+            yfinance.Ticker("AAPL").history(period="5d", raise_errors=False)
         assert native_egress_attempts, "yfinance made no curl_cffi request, so the guard saw nothing"
         assert all(attempt.startswith("curl_cffi GET https://") for attempt in native_egress_attempts)
         native_egress_attempts.clear()
