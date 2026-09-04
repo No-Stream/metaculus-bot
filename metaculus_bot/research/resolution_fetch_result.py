@@ -141,6 +141,58 @@ FetchRoute = Literal[
     "url_context",
 ]
 
+# One forecaster-facing sentence per non-direct route, rendered under the "primary grading
+# evidence" caveat for every route present in a question's snapshot. Keyed by `FetchRoute` and
+# ITERATED, so the mapping is both the vocabulary check and the render order: cheapest and most
+# transparent first, model-mediated last.
+#
+# `direct` is deliberately ABSENT rather than mapped to "". A route that adds nothing must be
+# unrepresentable here, because that is what makes an all-direct question's section
+# byte-identical to what it rendered before the ladder existed — the overwhelming majority of
+# questions, and the thing a diff against the archive has to keep clean.
+#
+# Each sentence says the same two things in its own terms: where the bytes came from, and what
+# the reader must not conclude from having them. The section they sit in is captioned primary
+# grading evidence, so a rung that quietly substituted one artifact for another would overstate
+# what was retrieved by exactly the amount that decides a forecast.
+ROUTE_CAVEATS: dict[FetchRoute, str] = {
+    "meta_refresh": (
+        "One or more sections below came from the page a cited URL redirected to through a "
+        "`<meta refresh>` tag rather than an HTTP redirect; the content is the target page's, "
+        "fetched normally."
+    ),
+    "pdf_local": (
+        "One or more sections below are the query-relevant passages of a cited PDF, extracted "
+        "locally — not the whole document. A figure that does not appear was not selected by that "
+        "extraction, which is different from being absent from the document."
+    ),
+    "impersonate": (
+        "One or more sections below were fetched on a retry that presented a different client "
+        "fingerprint after the host refused ours; the content is the page's own."
+    ),
+    "rendered": (
+        "One or more sections below were read from a page rendered in a headless browser, because "
+        "a plain fetch of it returned no text; the content is the page's own after its scripts ran."
+    ),
+    "derived_api": (
+        "One or more sections below are the JSON data feed a page loads its figures from rather "
+        "than page text, because the page itself carried no readable content. The lead on each "
+        "names the endpoint and says whether it was found on that page or on another page of the "
+        "same host."
+    ),
+    "wayback": (
+        "One or more sections below are ARCHIVED copies from the Wayback Machine rather than the "
+        "live page, because the live page could not be fetched. Each states its capture date and "
+        "its age in days: a quantity that has moved since that capture will not be in it."
+    ),
+    "url_context": (
+        "One or more sections below are a model's reading of a page this bot could not fetch, not "
+        "a copy of that page. Treat figures in them as REPORTED rather than retrieved, and weight "
+        "them below sections quoted from bytes the host served."
+    ),
+}
+
+
 # HTTP status -> FetchStatus for non-OK terminal responses — the ONE table both the
 # Tier-1 page fetch (_resolution_status_outcome) and the Tier-2 Datawrapper CDN hop
 # (_datawrapper_hop_status) read, so a future addition (451, 503, ...) cannot land on

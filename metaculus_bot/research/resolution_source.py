@@ -206,6 +206,7 @@ from metaculus_bot.research.resolution_body_text import (
 from metaculus_bot.research.resolution_chart_data import render_inline_chart_data
 from metaculus_bot.research.resolution_fetch_result import (
     _NON_OK_FETCH_STATUS,
+    ROUTE_CAVEATS,
     FetchResult,
     FetchRoute,
     FetchStatus,
@@ -528,6 +529,20 @@ def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -
     return sections, dropped
 
 
+def _route_caveats(successes: list[FetchResult]) -> list[str]:
+    """One sentence per non-direct route present in the sections that will RENDER.
+
+    Computed over the successes rather than over every result, because a caveat describes an
+    artifact a forecaster can see: a rung that fired and failed left the direct route's own
+    outcome, which the failure notice already names. Order comes from ``ROUTE_CAVEATS``' own
+    insertion order, so it is stable across questions rather than following fetch order.
+
+    Empty for an all-direct question, which is the overwhelming majority and the case whose
+    rendered section has to stay byte-identical to what it was before the ladder existed.
+    """
+    return [caveat for route, caveat in ROUTE_CAVEATS.items() if any(r.route == route for r in successes)]
+
+
 def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
     """Render fetch results as a markdown body block (orchestrator adds the ``##`` header).
 
@@ -592,7 +607,12 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
         return notice
 
     fetched_iso = fetched_at.strftime("%Y-%m-%d")
-    caveat = f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence."
+    caveat = "\n".join(
+        [
+            f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence.",
+            *_route_caveats(successes),
+        ]
+    )
 
     sections, dropped = _budgeted_success_sections(successes, fetched_iso)
 
