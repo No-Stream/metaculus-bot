@@ -440,8 +440,11 @@ The resolution-source escalation ladder is otherwise tuned by constants rather t
 in `constants.py` and all read at call time. Each rung has a minimum-wall-budget floor below
 which it is skipped: `RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S`,
 `RESOLUTION_SOURCE_PDF_MIN_BUDGET_S`, `RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S`,
-`RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` (far above the others, because the rung launches a
-browser and the launch slot is contended process-wide),
+`RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` (12 s, far above the others, because the rung launches a
+browser and the launch slot is contended process-wide; it is the pre-gate floor, and the
+transport's post-gate need of `RENDER_MIN_GOTO_MS` plus `RENDER_POST_GOTO_TAIL_MS` plus
+`RENDER_EXIT_RESERVE_MS` is 15 s, so a render admitted with 12 to 15 s left declines at the gates
+with a `wall_budget` skip; that band is deliberate and the operator's to change),
 `RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S` and `RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S`. Every
 floor is measured against the remaining provider wall less
 `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`. Three more bound the two rungs that serve something
@@ -516,9 +519,13 @@ ladder and the Tier-1 resolution-source ladder, which share the transport in
 step that raises a GitHub warning annotation when it failed, because both callers degrade
 gracefully without a browser. The cost of a missing browser is visible per question in the
 resolution-source provider's `renderer_unavailable_skips` count, so a run whose install failed
-is readable from the archive rather than only from the annotation. That count now excludes a URL
-an earlier question already rendered to nothing this run (its own `rendered_no_text_skips`), so a
-memo hit cannot inflate the install-failed signal.
+is readable from the archive rather than only from the annotation. That count excludes a URL an
+earlier question already rendered to nothing this run (its own `rendered_no_text_skips`) and the
+three declines that are facts about the page rather than the runner, each under its own key: a
+render the transport's DOM-read bound cut off (`render_timeout_skips`), a browser answered a
+non-200 where the direct GET got 200 (`render_non_200_skips`) and a rendered DOM over
+`RENDERED_DOM_MAX_CHARS` (`render_dom_too_large_skips`). Neither a memo hit nor a hostile page
+can inflate the install-failed signal.
 
 | Workflow | Trigger | Mode | What it does |
 |---|---|---|---|
@@ -1353,9 +1360,11 @@ the telemetry markers:
   is: `js_wall` or `no_resolving_content` for `meta_refresh`, `derived_api` and `rendered`, the
   200s that carried nothing readable; `unsupported_type` for `pdf_local`, a body we held and had
   not parsed; `blocked`, `error` or `not_found` for `wayback`, whose whole point is a page our
-  address never reached; and those three plus `js_wall` and `no_resolving_content` for
-  `url_context`, the only rung that draws from both families. A pair outside that table (a
-  `blocked` render, say) is a defect rather than a rare case. `rung` is the route tried. `outcome`
+  address never reached; and `blocked`, `error`, `js_wall` or `no_resolving_content` for
+  `url_context`, the only rung that draws from both families (`not_found` is not in its set,
+  because a 404 or 410 has no page for a third-party fetcher to read, and a
+  `no_resolving_content` whose reason is `no_matching_passage` is excluded on the reason). A pair
+  outside that table (a `blocked` render, say) is a defect rather than a rare case. `rung` is the route tried. `outcome`
   and `wall_s` are that RUNG's own, stamped as
   the dispatcher closes it: `outcome` is the status that stood once the rung was over (its
   rescue, its own verdict such as `stale_data` or `ungrounded`, or the direct status it left

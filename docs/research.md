@@ -601,10 +601,11 @@ Four stages per question:
    the measured hazard, and the question's own words reach the venues regardless.
 3. **Pool assembly**, three channels unioned, with channel order as the ranking: a
    settlement-source join (Kalshi events whose `settlement_sources` domains match a
-   publisher the question's own resolution URLs name, matched through a vendored
-   public-suffix list — the recall channel a word-overlap scorer structurally
-   cannot see), then the venue-index hits, then the enumerable universes ranked by
-   a fuzzy scorer with NO floor (Kalshi to width 100). A bounded Manifold detail
+   publisher the question's own resolution URLs name, matched by registrable domain
+   through the vendored public-suffix list in `research/public_suffix.py`, the recall
+   channel a word-overlap scorer structurally cannot see), then the venue-index hits,
+   then the enumerable universes ranked by a fuzzy scorer with NO floor (Kalshi to
+   width 100). A bounded Manifold detail
    fan-out then fills in the
    `textDescription` rules text the search listing omits, via per-market detail
    GETs, and on a multi-outcome row its leading
@@ -993,7 +994,11 @@ that host costs one GET (floor `RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S`, the
 floor) instead of a second browser launch. Because a host's feed is usually parameterised, the
 lead on each served block names the endpoint and says whether it was discovered on that page or
 on another page of the same host, so a forecaster can check that the feed covers the quantity
-asked about.
+asked about. A response the render recorded is harvestable only when it came from the page's own
+publisher by registrable domain (`research/public_suffix.py`, a leaf that reads the vendored
+`research/data/public_suffix_list.dat` and is shared with the market-retrieval settlement join)
+or from an explicitly allow-listed CDN, so a stranger's JSON on a shared suffix is never read as
+the cited page's content.
 
 `route=rendered` re-reads the page out of a headless Chromium render
 (`research/rendered_fetch.py`, the transport shared with gap-fill v2's fetch ladder and its
@@ -1001,19 +1006,31 @@ process-global two-launch cap). It triggers on `js_wall` and on the `thin_page` 
 `no_resolving_content`, both pages that answered 200 with nothing readable, and deliberately not
 on `embed_shell`, since `page.content()` returns the main frame's HTML and an Infogram or
 Flourish iframe comes back as a bare tag. Its floor,
-`RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S`, is far above the one-request rungs' because a launch
-plus a DOM-ready navigation costs several seconds even on a page that renders cleanly, and the
-launch slot is contended process-wide, so a question with no budget left would take a slot a
-sibling question could still land a page with. The rendered DOM re-enters `_classify_html_body`,
-so a rescued page gets the same chart read, ARIA rewrite, floors and disclosure leads as a
-directly-fetched one, and can still be withheld. A transport that declines (Playwright missing
-or broken, a host that will not pin to a public IP, or a browser error) is recorded as a SKIP
-with the reason `renderer_unavailable` rather than as a fired rung, because nothing was rendered
-and so nothing about the page changed. Two nearby cases are kept OUT of that reason so a memo
-hit or a queue timeout cannot read as the Chromium install having failed: a URL an earlier
-question already rendered to nothing this run is `rendered_no_text` (the memo doing its job),
-and a render that ran out of budget queued behind the launch gates, which the transport signals
-with `RenderBudgetExpired`, is `wall_budget` (the same reason the pre-gate floor check records).
+`RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` (12 s), is far above the one-request rungs' because a
+launch plus a DOM-ready navigation costs several seconds even on a page that renders cleanly, and
+the launch slot is contended process-wide, so a question with no budget left would take a slot a
+sibling question could still land a page with. That floor is the PRE-gate check, read before the
+render queues on the per-host gate and the launch cap. The transport's own post-gate need is
+higher: `RENDER_MIN_GOTO_MS` (5 s of navigation) plus `RENDER_POST_GOTO_TAIL_MS` (the 2 s settle
+and the 5 s DOM-read bound, reserved so a goto that runs its budget out can still be salvaged)
+plus `RENDER_EXIT_RESERVE_MS` (3 s, described below), 15 s in all, so a render admitted with 12 to
+15 s of wall left declines at the gates with a `wall_budget` skip rather than launching. That band
+is deliberate: raising the floor to 15 s would make the pre-gate check truthful at the cost of the
+band's reach, and the call is the operator's (FUTURE.md item 5). The rendered DOM re-enters
+`_classify_html_body`, so a rescued page gets the same chart read, ARIA rewrite, floors and
+disclosure leads as a directly-fetched one, and can still be withheld. A transport that declines
+(Playwright missing or broken, a host that will not pin to a public IP, or a browser error) is
+recorded as a SKIP with the reason `renderer_unavailable` rather than as a fired rung, because
+nothing was rendered and so nothing about the page changed. Four nearby cases are kept OUT of
+that reason, so that neither a memo hit, a queue timeout nor a fact about the page can read as
+the Chromium install having failed. A URL an earlier question already rendered to nothing this
+run is `rendered_no_text` (the memo doing its job). A render that ran out of budget queued behind
+the launch gates, which the transport signals with `RenderBudgetExpired`, is `wall_budget` (the
+same reason the pre-gate floor check records). A browser that was answered a non-200 where the
+direct GET got 200 is `render_non_200`: the DOM belongs to the host's interstitial or error page,
+so it is not read as content, and the URL is not memoised because a 429 is retryable. A rendered
+DOM over `RENDERED_DOM_MAX_CHARS`, which the transport signals with `RenderDomOverCeiling`, is
+`render_dom_too_large`, declined before anything copies it.
 Two more bounds hold the rung inside the wall, and which one fired is what the skip reason says.
 Inside the transport, `page.content()` is capped at `RENDER_DOM_READ_TIMEOUT_MS`: on a settled DOM
 it is a sub-second round trip, and it runs long only when the page keeps navigating after the settle
@@ -1024,17 +1041,32 @@ every page the question had already fetched was discarded). That cap raises the 
 navigating is a fact about the page. Around the transport, the rung holds the whole `render_page`
 call to the remaining budget with `asyncio.wait_for`, so no Playwright call can overrun the wall
 from inside it; that outer cut records `wall_budget`, the same reason the pre-gate floor check and
-a render queued behind the launch gates record, because what bound it is the question's remaining
-clock rather than the page. A render cut off either way says nothing about whether Chromium
-works, so neither trips the once-per-run "rung unavailable" warning, and the direct result is
-what stands. A browser that was answered a non-200 where the direct GET got 200 is not read as
-content at all and records its own `render_non_200` skip: the DOM belongs to the host's error page,
-and before that token the branch returned with no reason recorded, so the population was
-invisible. The URL is memoised for the run (so a second question citing the same hostile page
-does not pay for it again) only when the transport's own DOM-read bound fires before the rung's
-outer cut. In the salvage shape (the goto ran its budget out) the outer cut lands first by the
-launch time, because the launch runs after the transport recomputes its navigation budget and is
-not reserved in it, so that URL is not memoised (FUTURE.md item 5 prices the residual).
+a render queued behind the launch gates record, because what fired it was the question's remaining
+clock rather than the page: the render was still queued behind the per-host gate or the launch
+cap, or the transport overran its exit reserve. A render cut off either way says nothing about
+whether Chromium works, so neither trips the once-per-run "rung unavailable" warning, and the
+direct result is what stands.
+
+The outer `wait_for` bounds when the rung stops WAITING, not when the transport stops RUNNING:
+`asyncio.wait_for` cancels the render and then awaits its unwinding teardown, so the exit has to
+fit inside the rung's bound as well. `_rendered_rung` therefore hands the transport a deadline
+`RENDER_EXIT_RESERVE_MS` before its own `wait_for` fires: 3 s, the shared 2 s teardown budget plus
+1 s for the launch (which runs after the transport recomputes its navigation budget, so it is
+not in that budget) and the driver stop. The transport sizes the goto off that deadline less the
+post-goto tail and clamps the harvest drain to it, and the reserve never lengthens a wait: it can
+only shorten the goto or make the render decline earlier at `RENDER_MIN_GOTO_MS`. The three
+teardown steps (unroute, context close, browser close) share ONE `RENDER_TEARDOWN_TIMEOUT_MS`
+budget, started lazily by the first step that asks rather than at launch, so whatever the browser
+does the exit costs at most 2 s before the driver stop, and a step that outlives what is left of
+the budget is abandoned to that stop. The driver stop at the end of the `async_playwright()`
+block is the one step left unbounded, deliberately: it is what actually kills the Chromium
+process, and abandoning it on a wedged browser would leak 100 to 300 MB past `RENDER_LAUNCH_CAP`.
+It is the exit's one named residual; a healthy stop is milliseconds and fits in the reserve's
+spare second, and a wedged one is unmeasured live. With the reserve in place the transport's
+DOM-read bound lands before the rung's outer cut even in the salvage shape (the goto ran its
+budget out), so the timed-out memo, written at the `RenderTimeout` raise site, lands too, and a
+second question citing the same hostile page records `render_timeout` again instead of paying
+for another render.
 
 `route=wayback` (`research/wayback.py`) serves an archived capture. The archive earns a rung
 because it is the one free route whose EGRESS IS NOT OURS: measured 2026-09-03, the same client
@@ -1140,9 +1172,9 @@ rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`
 policy's decisions rather than rungs. `chrome_metric_withholds` is a cited URL somewhere on whose
 ladder the line-shape metric withheld an HTML extraction, because that extraction cleared the
 chrome floor on navigation alone: the withhold flag is carried onto a later rung's rescue, so a
-direct body the metric withheld still counts here when the rendered or Wayback rung goes on to
-serve the page, and it counts a chart-rescued page whose chart block published without that text
-(on a page with no chart block its `reason` is the same `thin_page` an under-floor page carries, so
+direct body the metric withheld still counts here when the rendered rung, a derived feed or the
+paid reader goes on to serve the page, and it counts a chart-rescued page whose chart block
+published without that text (on a page with no chart block its `reason` is the same `thin_page` an under-floor page carries, so
 this count is what separates the two). `chrome_metric_withholds_rescued` is the subset a later rung
 then served, that is a withheld extraction on a URL whose final result is `success` on a route
 other than `direct`, which is what makes "the metric cost us the page" separable from "the metric
@@ -1159,15 +1191,22 @@ by the pages before it" is the question the flag's rollout asks.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
 parse gate is what binds. `renderer_unavailable_skips` is a browser rung that never rendered,
 most often because Chromium is missing on the runner (the install step is `continue-on-error` in
-every workflow, so its absence is by design), and it is invisible in `rendered_attempts`; it no
-longer includes a URL an earlier question rendered to nothing, which is its own
-`rendered_no_text_skips` so a memo hit cannot inflate the install-failed signal.
+every workflow, so its absence is by design), and it is invisible in `rendered_attempts`. It
+excludes a URL an earlier question rendered to nothing, which is its own
+`rendered_no_text_skips`, and the three facts about the page that follow, each under its own key,
+so neither a memo hit nor a hostile page can inflate the install-failed signal.
 `render_timeout_skips` is a browser rung the transport's own DOM-read cap cut off: a page that
 keeps navigating after the settle, which is a fact about the page rather than about the runner or
 the question's clock, and also invisible in `rendered_attempts`. A render the rung's OUTER bound
-cut off instead lands in `rendered_budget_skips` with the rest of the wall skips, since what bound
-it was the question's remaining clock. `render_non_200_skips` is a browser answered a non-200 on a
-page the direct GET got 200 from, so the DOM is the host's error page and is not read as content.
+cut off instead lands in `rendered_budget_skips` with the rest of the wall skips, because that cut
+fires while the render is still queued behind the launch gates or once the transport has overrun
+its exit reserve, neither of which is about the page. `render_non_200_skips` is a browser answered
+a non-200 on a page the direct GET got 200 from, so the DOM is the host's error page and is not
+read as content; what binds is the edge telling Chromium apart from our GET, the rate the
+escalation ladder's own case rests on. `render_dom_too_large_skips` is a browser that rendered the
+page to a DOM over `RENDERED_DOM_MAX_CHARS` and was declined unread; what binds is the size
+ceiling, a fact about the page that used to be folded into `renderer_unavailable_skips`, where it
+pointed triage at the Playwright install.
 `wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
 per-question cap is what binds; `url_context_cap_skips` is the paid rung's analogue, a question
 that spent its per-question paid-read budget (`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`) on
@@ -1220,19 +1259,22 @@ one, split by what each qualifies. `FetchStatusReason` qualifies a result's STAT
 / `encrypted` / `malformed` under `unreadable_document`, and `budget_skipped` / `parse_contention`
 under the `unsupported_type` a held-but-unparsed document earns. `RungSkipReason` qualifies a rung
 attempt that PRODUCED NO RESULT (`RungAttempt.skipped_reason`), which is why it has nowhere else to
-record its reason. Most of those attempts never ran at all; two of them did run and came back with
-nothing usable, `render_timeout` and `render_non_200`, so "skip" here means "produced nothing"
-rather than "never started". The vocabulary is `wall_budget`, `wayback_cap`, `url_context_cap`,
-`fast_path`, `no_api_key`, `robots_disallowed`, `rendered_no_text`, `renderer_unavailable`,
-`render_timeout`, `render_non_200`, and `parse_contention` again (a held document declined for want
+record its reason. Most of those attempts never ran at all; three of them did run a browser and
+came back with nothing usable, `render_timeout`, `render_non_200` and `render_dom_too_large`, so
+"skip" here means "produced nothing" rather than "never started". The vocabulary is `wall_budget`,
+`wayback_cap`, `url_context_cap`, `fast_path`, `no_api_key`, `robots_disallowed`,
+`rendered_no_text`, `renderer_unavailable`, `render_timeout`, `render_non_200`,
+`render_dom_too_large`, and `parse_contention` again (a held document declined for want
 of a parse slot records the skip AND stamps the withheld result's `status_reason`, the one token
 shared by both Literals). Both are a
 closed `Literal`, so a misspelt reason is a type error rather than a permanently-zero count.
 `renderer_unavailable` is the browser declining before it rendered anything (missing, broken,
 unpinnable host); `render_timeout` is a render the transport's own DOM-read cap cut off because the
 page kept navigating, and the two are kept apart because only the first says anything about
-Chromium. A render the rung's outer bound cut off is `wall_budget` instead, and a browser answered
-a non-200 where the direct GET got 200 is `render_non_200`.
+Chromium. A render the rung's own outer bound cut off is `wall_budget` instead, because that bound
+fires while the render is still queued behind the launch gates or once the transport has overrun
+its exit reserve; a browser answered a non-200 where the direct GET got 200 is `render_non_200`;
+and a rendered DOM over `RENDERED_DOM_MAX_CHARS` is `render_dom_too_large`.
 `no_resolving_content` has four reasons (`embed_shell`, `thin_page`, `no_matching_passage` and
 `not_addressed`): the third is the only one that is a document rather than a page, and the fourth
 is the paid reader's, a page Gemini retrieved whose answer said it does not discuss the ask. All
