@@ -754,9 +754,16 @@ RESOLUTION_SOURCE_PDF_MIN_BUDGET_S: float = 3.0
 # floor is far above the one-request rungs' 3 s: a launch plus a DOM-ready navigation measured
 # 3-8 s across the 2026-09-03 replay corpus even on pages that rendered cleanly, and the launch
 # slot is contended process-wide, so a question with no budget left would take a slot a sibling
-# question could still land a page with. 12 s is exactly the transport's own floor once the gates
-# are held: a 5 s navigation (RENDER_MIN_GOTO_MS), the 2 s settle and the 5 s DOM-read bound, the
-# last reserved so a goto that runs its budget out can still be salvaged inside the rung's bound.
+# question could still land a page with. This is the PRE-gate floor, read before the render
+# queues on the per-host gate and the launch cap. The transport's own POST-gate need is higher:
+# a 5 s navigation (RENDER_MIN_GOTO_MS), the 2 s settle plus the 5 s DOM-read bound
+# (RENDER_POST_GOTO_TAIL_MS, reserved so a goto that runs its budget out can still be salvaged),
+# and the 3 s exit reserve the rung subtracts from the deadline it hands over
+# (RENDER_EXIT_RESERVE_MS: the shared teardown bound plus a second for the launch and the driver
+# stop), 15 s in all. The floor deliberately sits below that: a render admitted with 12-15 s
+# declines at the gates with an honest `wall_budget` skip rather than launching, and raising the
+# floor to 15 s would make the pre-gate check truthful at the cost of that band's reach, which is
+# the operator's call. Left at 12 s pending it.
 RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S: float = 12.0
 # Ceiling on the rendered DOM, the browser rung's counterpart to RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
 # and sized to it. `page.content()` is a string, so this is a CHARACTER count taken before anything

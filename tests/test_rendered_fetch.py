@@ -158,13 +158,14 @@ class _FakePage:
 class _Faults:
     """Where the fake browser misbehaves. ``new_page_error`` / ``new_context_error`` fail the
     render INSIDE the gates, which is the failure-boundary shape the warn latch was written for;
-    ``close_error`` and ``close_hangs`` misbehave in teardown, where the real
-    ``BrowserContext.close`` neither swallows a target-closed error nor bounds its wait."""
+    ``close_error``, ``close_hangs`` and ``browser_close_hangs`` misbehave in teardown, where the
+    real ``BrowserContext.close`` neither swallows a target-closed error nor bounds its wait."""
 
     new_page_error: BaseException | None = None
     new_context_error: BaseException | None = None
     close_error: BaseException | None = None
     close_hangs: bool = False
+    browser_close_hangs: bool = False
 
 
 class _FakeContext:
@@ -205,6 +206,8 @@ class _FakeBrowser:
 
     async def close(self) -> None:
         self._page.teardown.append("browser.close")
+        if self._faults.browser_close_hangs:
+            await asyncio.Event().wait()
 
 
 def _install_fake_playwright(
@@ -685,25 +688,36 @@ class TestTheNavigationBudgetAfterTheGates:
         assert call["timeout"] + _RENDER_TAIL_MS <= int(deadline_s * 1000)
         assert call["timeout"] >= rendered_fetch.RENDER_MIN_GOTO_MS
 
-    async def test_a_salvaged_dom_comes_back_inside_the_callers_deadline_over_a_pending_body_read(self, monkeypatch):
-        """The Tier-1 rung's shape end to end, with the clock running: the deadline handed to the
-        transport and the rung's outer ``wait_for`` sit at the same instant, the navigation budget
-        is computed BEFORE the launch, and the goto runs that budget out. The DOM read's fixed
-        bound then lands past the outer cut by the launch time, and a same-publisher body still
-        in flight used to hold the harvest drain there, so the outer bound fired and discarded a
-        DOM the transport had already read, billed as ``render_timeout``. The drain is clamped to
-        the caller's deadline less one teardown bound instead; the DOM read keeps its own bound.
-        """
+    @staticmethod
+    def _scale_the_tier_1_shape_down(monkeypatch: pytest.MonkeyPatch) -> None:
+        """The Tier-1 rung's constants at a tenth of their size, so a test can run the whole
+        goto / settle / read / drain / teardown chain with the clock on in under two seconds. The
+        exit reserve keeps its production RELATION to the teardown bound (that bound plus an
+        allowance for the launch and the driver stop); only the magnitudes shrink."""
         monkeypatch.setattr(rendered_fetch, "RENDER_SETTLE_MS", 0)
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 500)
         monkeypatch.setattr(rendered_fetch, "RENDER_POST_GOTO_TAIL_MS", 500)
         monkeypatch.setattr(rendered_fetch, "RENDER_MIN_GOTO_MS", 100)
+        monkeypatch.setattr(rendered_fetch, "RENDER_TEARDOWN_TIMEOUT_MS", 300)
+        monkeypatch.setattr(rendered_fetch, "RENDER_EXIT_RESERVE_MS", 300 + 500)
+
+    async def test_a_salvaged_dom_comes_back_inside_the_callers_deadline_over_a_pending_body_read(self, monkeypatch):
+        """The Tier-1 rung's shape end to end, with the clock running: the rung's outer
+        ``wait_for`` sits at the budget, the deadline handed to the transport sits the exit
+        reserve before it, the navigation budget is computed BEFORE the launch, and the goto runs
+        that budget out. The DOM read's fixed bound then lands past the transport's deadline by
+        the launch time, and a same-publisher body still in flight used to hold the harvest drain
+        there and on into the reserve, so the outer bound fired and discarded a DOM the transport
+        had already read, billed as ``render_timeout``. The drain is clamped to the transport's
+        deadline instead; the DOM read keeps its own bound.
+        """
+        self._scale_the_tier_1_shape_down(monkeypatch)
         pending = _FakeResponse(
             f"{_PAGE_URL}/api/poll", content_type="application/json", body=_json_body(), body_delay_s=10.0
         )
         page = _FakePage([pending], goto_raises=_PlaywrightError("Timeout exceeded"), goto_runs_its_budget_out=True)
         _install_fake_playwright(monkeypatch, page, launch_delay_s=0.1)
-        budget_s = 1.5
+        budget_s = 2.0
 
         rendered = await asyncio.wait_for(
             rendered_fetch.render_page(
@@ -711,7 +725,7 @@ class TestTheNavigationBudgetAfterTheGates:
                 memo_scope=_TIER1_SCOPE,
                 host_gate=asyncio.Semaphore(1),
                 goto_timeout_ms=int(budget_s * 1000),
-                deadline_monotonic_s=time.monotonic() + budget_s,
+                deadline_monotonic_s=time.monotonic() + budget_s - rendered_fetch.RENDER_EXIT_RESERVE_MS / 1000,
                 harvest_json=True,
             ),
             timeout=budget_s,
@@ -722,6 +736,52 @@ class TestTheNavigationBudgetAfterTheGates:
         assert rendered.json_responses == ()
         assert pending.body_read_cancelled is True
         assert page.teardown == ["unroute_all", "context.close", "browser.close"]
+
+    async def test_a_render_that_runs_every_bound_out_still_hands_its_dom_back_inside_the_rungs_bound(
+        self, monkeypatch, caplog
+    ):
+        """The worst case the exit reserve exists for, under the rung's own ``wait_for``: the goto
+        consumes its whole recomputed budget, a harvested body is still in flight at the
+        transport's deadline, and the browser then wedges on ``context.close``. Three separate
+        2 s teardown bounds let that teardown run 6 s past the outer cut (``wait_for`` cancels
+        the render and then AWAITS its finallys), which tripped the provider's 45 s wall and
+        discarded every page the question had fetched. With one shared bound and the reserve
+        subtracted from the deadline, the DOM comes back before the cut and the wedged close is
+        left to the driver stop.
+        """
+        self._scale_the_tier_1_shape_down(monkeypatch)
+        pending = _FakeResponse(
+            f"{_PAGE_URL}/api/poll", content_type="application/json", body=_json_body(), body_delay_s=10.0
+        )
+        page = _FakePage([pending], goto_raises=_PlaywrightError("Timeout exceeded"), goto_runs_its_budget_out=True)
+        _install_fake_playwright(monkeypatch, page, faults=_Faults(close_hangs=True), launch_delay_s=0.1)
+        budget_s = 2.0
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"):
+            rendered = await asyncio.wait_for(
+                rendered_fetch.render_page(
+                    _PAGE_URL,
+                    memo_scope=_TIER1_SCOPE,
+                    host_gate=asyncio.Semaphore(1),
+                    goto_timeout_ms=int(budget_s * 1000),
+                    deadline_monotonic_s=time.monotonic() + budget_s - rendered_fetch.RENDER_EXIT_RESERVE_MS / 1000,
+                    harvest_json=True,
+                ),
+                timeout=budget_s,
+            )
+        elapsed = time.monotonic() - started
+
+        assert rendered is not None
+        assert "rendered" in rendered.html
+        assert rendered.json_responses == ()
+        assert pending.body_read_cancelled is True
+        # The drain ran to the transport's deadline (1.2 s) and the wedged close to the shared
+        # teardown bound (0.3 s); the browser close had nothing left and went to the driver stop.
+        assert 1.45 <= elapsed < budget_s
+        assert page.teardown == ["unroute_all", "context.close"]
+        left_to_the_driver = [message for message in caplog.messages if "leaving it to the driver stop" in message]
+        assert len(left_to_the_driver) == 2
 
     async def test_a_call_without_a_deadline_keeps_the_callers_goto_budget(self, monkeypatch):
         """Gap-fill v2's shape: its own ceilings bound the call, so the transport has nothing to
@@ -749,7 +809,10 @@ class TestTheNavigationBudgetAfterTheGates:
         (call,) = calls
         assert call["memo_scope"] == _TIER1_SCOPE
         assert call["harvest_json"] is True
-        assert 19.5 < call["deadline_monotonic_s"] - call["called_at"] <= 20.0
+        # The deadline sits the exit reserve before the rung's own 20 s bound, so the transport's
+        # teardown and driver stop land inside that bound rather than being cancelled by it.
+        reserve_s = rendered_fetch.RENDER_EXIT_RESERVE_MS / 1000
+        assert 19.5 - reserve_s < call["deadline_monotonic_s"] - call["called_at"] <= 20.0 - reserve_s
 
 
 class TestTheDomCeiling:
@@ -921,8 +984,58 @@ class TestTeardown:
         assert time.monotonic() - started < 1.0
         assert rendered is not None
         assert "rendered" in rendered.html
-        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
+        # The wedged context close spent the whole shared budget, so the browser close is not
+        # attempted on its own clock; the driver stop kills the browser either way.
+        assert page.teardown == ["unroute_all", "context.close"]
         assert [message for message in caplog.messages if "did not finish" in message]
+
+    async def test_the_teardown_steps_share_one_bound(self, monkeypatch):
+        """Three separately bounded steps let a wedged browser hold a render for three bounds after
+        its DOM was read, past the Tier-1 rung's cut. One budget, started by the first step that
+        runs, caps the whole exit at one bound whatever the browser does."""
+        monkeypatch.setattr(rendered_fetch, "RENDER_TEARDOWN_TIMEOUT_MS", 200)
+        page = _FakePage([])
+        _install_fake_playwright(monkeypatch, page, faults=_Faults(close_hangs=True, browser_close_hangs=True))
+
+        started = time.monotonic()
+        rendered = await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+        elapsed = time.monotonic() - started
+
+        assert rendered is not None
+        assert 0.2 <= elapsed < 0.4
+        assert page.teardown == ["unroute_all", "context.close"]
+
+    async def test_the_teardown_budget_starts_with_the_first_step_not_the_launch(self, monkeypatch):
+        """Computed before the launch, the budget would be spent by the time teardown runs and
+        every step would be abandoned to the driver stop, even on a healthy browser."""
+        monkeypatch.setattr(rendered_fetch, "RENDER_TEARDOWN_TIMEOUT_MS", 100)
+        monkeypatch.setattr(rendered_fetch, "RENDER_MIN_GOTO_MS", 100)
+        page = _FakePage([], goto_runs_its_budget_out=True)
+
+        rendered = await _render(monkeypatch, page, goto_timeout_ms=300)
+
+        assert rendered is not None
+        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
+
+    async def test_the_timed_out_memo_survives_a_callers_cut_during_teardown(self, monkeypatch):
+        """The DOM read fires ``RenderTimeout``, the wedged close then holds the unwinding
+        finallys, and the caller's own ``wait_for`` cuts in during that teardown. The cancellation
+        REPLACES the propagating ``RenderTimeout``, so a handler around the call never sees it;
+        the memo is written at the raise site so the cut-off URL is still remembered for the run."""
+        monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 50)
+        monkeypatch.setattr(rendered_fetch, "RENDER_TEARDOWN_TIMEOUT_MS", 5_000)
+        page = _FakePage([], content_hangs=True)
+        _install_fake_playwright(monkeypatch, page, faults=_Faults(close_hangs=True))
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1)),
+                timeout=0.3,
+            )
+
+        assert page.teardown[:2] == ["unroute_all", "context.close"]
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
 
     async def test_a_failure_before_the_page_exists_still_closes_the_browser(self, monkeypatch, caplog):
         page = _FakePage([])

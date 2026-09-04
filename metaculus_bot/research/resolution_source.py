@@ -215,6 +215,7 @@ from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
 from metaculus_bot.research.rendered_fetch import (
+    RENDER_EXIT_RESERVE_MS,
     RENDER_SETTLE_MS,
     RENDER_TIMEOUT_MS,
     MemoScope,
@@ -1862,25 +1863,29 @@ async def _rendered_rung(
     Self-bounding on the shared pattern: skipped below ``RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S``
     of remaining wall, and the navigation gets the remaining budget less the settle, capped at
     the transport's own 35 s — as a CEILING. The transport tightens it after the gates to what is
-    actually left less the settle and the DOM read, or declines under its own floor before a
-    browser is launched, so a goto that runs its budget out can still be settled and read inside
-    the bound below. Degrading to the direct result costs one page; overrunning the provider's
-    outer ``wait_for`` costs every page the question already fetched.
+    actually left of the DEADLINE handed to it less the settle and the DOM read, or declines
+    under its own floor before a browser is launched, so a goto that runs its budget out can
+    still be settled and read. That deadline is the remaining budget LESS the transport's exit
+    reserve (``RENDER_EXIT_RESERVE_MS``: the shared teardown bound plus a second for the launch
+    and the driver stop), because the transport spends those after its DOM is in hand and this
+    rung's own bound has to fit them too. Degrading to the direct result costs one page;
+    overrunning the provider's outer ``wait_for`` costs every page the question already fetched.
 
     The whole transport call — queue, launch, navigation, DOM read and teardown — is ALSO held
-    to the remaining budget with ``asyncio.wait_for``, on top of the transport's own DOM-read
-    and teardown caps, so nothing inside the rung can outlive the wall: a cut during teardown
-    cancels it and the transport's driver stop kills the browser. The receipt is ogimet.com
-    (2026-09-03): the goto timed out at 33 s as designed and ``page.content()`` then blocked for
-    40 s more, for a 76 s render against a 45 s wall. Either bound firing is recorded as its own
-    skip, ``render_timeout``, rather than ``renderer_unavailable`` — a cut-off render says
-    nothing about whether Chromium works, and must not latch that warning. The direct result is
-    what stands. The transport memoises a timed-out URL itself, and only when a browser actually
-    ran (the outer cut can fire while the render is still queued, which says nothing about the
-    page), and only when its own DOM-read bound fires before this rung's outer cut; in the
-    salvage shape (goto ran its budget out) the outer cut lands first by the launch time, so
-    that URL is not memoised. A memoised URL re-raises on the next question, so it is recorded
-    the same way again.
+    to the remaining budget with ``asyncio.wait_for``. That bounds when this rung stops WAITING,
+    not when the transport stops RUNNING: ``wait_for`` cancels the render and then awaits its
+    unwinding teardown, so the reserve above is what keeps that teardown inside the wall, and a
+    render that runs every bound out hands its DOM back before the cut instead of being
+    cancelled in its own exit. The receipt is ogimet.com (2026-09-03): the goto timed out at
+    33 s as designed and ``page.content()`` then blocked for 40 s more, for a 76 s render against
+    a 45 s wall. Either bound firing is recorded as its own skip, ``render_timeout``, rather than
+    ``renderer_unavailable`` — a cut-off render says nothing about whether Chromium works, and
+    must not latch that warning. The direct result is what stands. The transport memoises a
+    timed-out URL itself, at the raise site and only when a browser actually ran (the outer cut
+    can fire while the render is still queued, which says nothing about the page); with the
+    reserve in place its DOM-read bound lands before this rung's outer cut even in the salvage
+    shape (goto ran its budget out), so the memo is written there too. A memoised URL re-raises
+    on the next question, so it is recorded the same way again.
 
     The rendered DOM re-enters :func:`_classify_html_body`, so a rescued page gets the same
     chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one — unless the
@@ -1912,7 +1917,11 @@ async def _rendered_rung(
                 memo_scope=_RENDER_MEMO_SCOPE,
                 host_gate=_sem_for_host(host_sems, url),
                 goto_timeout_ms=goto_timeout_ms,
-                deadline_monotonic_s=time.monotonic() + budget_s,
+                # The transport's exit (shared teardown bound, launch, driver stop) runs AFTER
+                # this deadline and has to land inside the wait_for below, so the deadline is
+                # the budget less that reserve. Strictly safer: it can only shorten the goto or
+                # decline earlier at the transport's own navigation floor.
+                deadline_monotonic_s=time.monotonic() + budget_s - RENDER_EXIT_RESERVE_MS / 1000,
                 # Recording the page's own XHR costs one buffered body per response inside the
                 # render task, which is why the transport keeps it off by default — here it is
                 # exactly the rung's fallback, so it is worth the bytes.
