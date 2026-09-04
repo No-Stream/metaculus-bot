@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urlparse
 
 import aiohttp
 import pytest
@@ -1625,9 +1626,14 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
             return await super().launch(headless=headless, args=args)
 
     page = FakePage(html="<html><body><p>rendered body</p></body></html>")
-    install_fake_playwright(
-        monkeypatch, page, pinned=("host.example.com", "93.184.216.34"), chromium=_BarrierChromium(page)
-    )
+    install_fake_playwright(monkeypatch, page, chromium=_BarrierChromium(page))
+
+    async def _pin_each_host(url: str) -> tuple[str, str]:
+        # Each render is to its own host, and the transport holds the landing to the pinned one,
+        # so the pin has to be the requested host as the real resolver returns it.
+        return urlparse(url).hostname or "", "93.184.216.34"
+
+    monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", _pin_each_host)
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr(
@@ -3007,6 +3013,51 @@ class TestRenderedRungTimeoutAtTheV2Wrapper:
 
         assert result is None
         assert rendered_fetch.rendered_to_nothing(url, memo_scope="gap_fill_v2") is False
+
+    @pytest.mark.asyncio
+    async def test_an_off_host_landing_declines_without_memoising_the_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The transport's third non-``None`` decline: Chromium's main frame landed off the pinned
+        host, so the DOM was never read. This wrapper folds it into ``None`` like the other two,
+        because its callers know no other signal, and nothing from that render reaches the driver.
+        Not memoised: the page rendered, on a host that was not the one asked for."""
+        url = "https://example.com/redirects-inward"
+
+        async def _off_host(target: str, **kwargs: object) -> None:
+            del kwargs
+            await asyncio.sleep(0)
+            raise rendered_fetch.RenderOffHost(
+                requested_url=target, final_url="http://169.254.169.254/latest/meta-data/", pinned_host="example.com"
+            )
+
+        monkeypatch.setattr(agentic_tools, "render_page", _off_host)
+
+        result = await agentic_tools._try_rendered_fetch(url)
+
+        assert result is None
+        assert rendered_fetch.rendered_to_nothing(url, memo_scope="gap_fill_v2") is False
+
+    @pytest.mark.asyncio
+    async def test_through_the_transport_an_off_host_landing_is_never_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end through the fake browser: the landing is checked before ``page.content()``,
+        so no DOM from the other host exists for this ladder to extract, memoise or publish."""
+        page = FakePage(html="<html><body><p>internal status page</p></body></html>", land_on="http://10.0.0.8/status")
+        install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
+        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+        extract = MagicMock(return_value="internal status page")
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", extract)
+
+        result = await agentic_tools._try_rendered_fetch("https://example.com/page")
+
+        assert result is None
+        assert page.content_reads == 0
+        extract.assert_not_called()
+        assert rendered_fetch.rendered_to_nothing("https://example.com/page", memo_scope="gap_fill_v2") is False
+        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
 
 
 # ---------------------------------------------------------------------------

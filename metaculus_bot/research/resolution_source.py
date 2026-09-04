@@ -225,6 +225,7 @@ from metaculus_bot.research.rendered_fetch import (
     RenderBudgetExpired,
     RenderDomOverCeiling,
     RenderedPage,
+    RenderOffHost,
     RenderTimeout,
     is_json_content_type,
     note_rendered_no_text,
@@ -1970,6 +1971,13 @@ async def _render_or_record_the_skip(
         # The transport already logged the size.
         attempt.skipped_reason = "render_dom_too_large"
         return None
+    except RenderOffHost:
+        # Chromium's main frame landed on a host other than the pinned one, a server-side redirect
+        # the route guard never sees, and the transport refused the DOM unread. Also a fact about
+        # the page, and nothing from the render exists to publish. The transport already logged
+        # both hosts.
+        attempt.skipped_reason = "render_off_host"
+        return None
     if page is None:
         # The transport declines with ONE signal for several causes — Playwright missing or
         # broken, a host that will not pin to a public IP, or a browser error — and its own
@@ -2031,7 +2039,11 @@ async def _rendered_rung(
     the rung leaves the direct result standing and does not memoise, because a 429 is retryable;
     that is its own skip, ``render_non_200``. A DOM over ``RENDERED_DOM_MAX_CHARS`` is likewise a
     fact about the page and its own skip, ``render_dom_too_large`` (the transport raises
-    :class:`RenderDomOverCeiling` for it), so neither inflates ``renderer_unavailable``.
+    :class:`RenderDomOverCeiling` for it), so neither inflates ``renderer_unavailable``. A main
+    frame that landed on a host other than the one the browser's DNS pin covers is refused by the
+    transport before its DOM is read (:class:`RenderOffHost`), and is its own skip too,
+    ``render_off_host``: a server-side redirect the route guard never sees, so a fact about the
+    page rather than the install, and nothing from the render exists to publish.
     When the DOM STILL carries nothing, the JSON the page fetched for itself is the last free
     route (:func:`_derived_api_from_harvest`) — a JavaScript dashboard's numbers arrive over XHR
     and are in its HTML at no wait condition. Only once that fails too is the URL memoized
@@ -3318,6 +3330,11 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # disallows Google-Extended refuses the read server-side, so this is spend avoided
         # rather than a page lost, and it must not read as a failure.
         "url_context_robots_skips": skips_by_reason["robots_disallowed"],
+        # Its own count: Chromium's main frame landed on a host other than the pinned one (a
+        # server-side redirect hop the route guard never sees), so the transport refused the DOM
+        # unread. A fact about the page, and the one count that says how often a cited page sends
+        # the browser somewhere else, which is what prices the host-equality rule.
+        "render_off_host_skips": skips_by_reason["render_off_host"],
         # Its own count because it is a MISCONFIGURATION rather than a tuning signal: with the
         # flag on and GOOGLE_API_KEY unset the paid rung fires nowhere, and without this key
         # that run is byte-identical in the archive to one with the flag off.

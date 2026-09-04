@@ -196,6 +196,11 @@ FetchStatusReason = Literal[
 # `render_dom_too_large` — the browser rendered the page and its DOM is over `RENDERED_DOM_MAX_CHARS`
 #   (`rendered_fetch.RenderDomOverCeiling`), so it was declined unread. A fact about the page,
 #   kept out of `renderer_unavailable` whose comment points triage at the Playwright install.
+# `render_off_host`: the browser's main frame landed on a host other than the one its DNS pin
+#   covers (`rendered_fetch.RenderOffHost`), a server-side redirect hop the route guard never sees,
+#   so the transport refused the DOM before reading it. A fact about the page, kept out of
+#   `renderer_unavailable` for the same reason as the two above. The URL is not memoised, because
+#   nothing about the page was read.
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",
@@ -209,6 +214,7 @@ RungSkipReason = Literal[
     "render_timeout",
     "render_non_200",
     "render_dom_too_large",
+    "render_off_host",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the

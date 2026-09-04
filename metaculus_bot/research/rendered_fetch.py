@@ -5,8 +5,8 @@ wall to Chromium since 2026-07; the Tier-1 resolution-source fetcher gained the 
 2026-09-03, after a replay of 47 archived fetch failures measured Chromium rescuing 6 of the
 8 pages that still failed from a residential address. Keeping the transport here is what
 makes that one rung rather than two: the DNS pin, the per-request route guard, the
-process-global launch cap and the wait-condition arithmetic are all SSRF- or
-memory-load-bearing, and a second copy of any of them would drift.
+landing-host check, the WebSocket block, the process-global launch cap and the wait-condition
+arithmetic are all SSRF- or memory-load-bearing, and a second copy of any of them would drift.
 
 What this module owns is the TRANSPORT — launch, navigate, read the DOM, optionally record
 the JSON the page fetched for itself — and it hands back a :class:`RenderedPage` rather than
@@ -189,6 +189,35 @@ class RenderDomOverCeiling(Exception):
     """
 
 
+class RenderOffHost(Exception):
+    """Chromium's main frame landed on a host other than the one the DNS pin covers.
+
+    Raised BEFORE ``page.content()`` is read, so no DOM from the other host ever exists in this
+    process. The pin (``--host-resolver-rules=MAP <host> <ip>``) forces the resolution of ONE
+    hostname, the one the render was asked for; a server-side redirect hop is dialed by the
+    browser with no route handler of ours involved (Playwright constructs a Route only for a
+    request with no ``redirectedFrom``), so a main frame that ended up anywhere else was reached
+    through Chromium's own resolver, outside every check this transport makes. Refusing the DOM
+    is what closes that channel: an attacker who answers our aiohttp GET with a wall and the
+    browser with a 302 to a private address gets nothing published for it.
+
+    Its own class for the same reason as :class:`RenderDomOverCeiling`: the page rendered, so it
+    is a fact about the page rather than about the browser install, and the callers count it
+    under its own token. Not a ``TimeoutError``: no clock ran out. Not memoised: the page was not
+    "rendered to nothing", and the host it redirected the browser to is not something a retry
+    within the run changes. ``final_url`` is carried for the caller's own classification; the
+    transport's log names only its hostname, because a landing URL can carry a token.
+    """
+
+    def __init__(self, *, requested_url: str, final_url: str, pinned_host: str) -> None:
+        self.requested_url = requested_url
+        self.final_url = final_url
+        self.pinned_host = pinned_host
+        super().__init__(
+            f"the render of {pinned_host} landed on {urlparse(final_url).hostname or final_url!r}, off the pinned host"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class HarvestedJson:
     """One JSON response the rendered page fetched for itself."""
@@ -208,6 +237,13 @@ class RenderedPage:
     answered differently from the direct GET on the same URL — a 403 or 429 interstitial whose
     markup clears a chrome floor is not the page — and only the caller decides what to do
     about that.
+
+    ``url`` is the URL the render was ASKED for, and stays so: both callers key their memos on
+    it and one uses it as the base for link resolution. ``final_url`` is ``page.url`` after the
+    settle, the URL the main frame actually landed on, and is always on the same host as ``url``
+    by the time a page is returned (:class:`RenderOffHost` is raised otherwise). It is
+    ``about:blank`` when the navigation never committed, which is the salvage of a genuine
+    navigation error.
     """
 
     url: str
@@ -215,6 +251,7 @@ class RenderedPage:
     html: str
     json_responses: tuple[HarvestedJson, ...] = ()
     http_status: int | None = None
+    final_url: str = ""
 
 
 def reset_render_state() -> None:
@@ -396,6 +433,41 @@ async def _vet_route(route: Any, request: Any, playwright_error: type[BaseExcept
         logger.debug("rendered fetch route guard race during teardown: %s", exc)
 
 
+def _block_web_socket(web_socket_route: Any) -> None:
+    """Refuse one WebSocket the page tried to open, by doing nothing with it.
+
+    A routed socket dials the server only if its handler calls ``connect_to_server()``
+    (Playwright 1.61: ``_after_handle`` sends ``ensureOpened`` instead, so the page sees an open
+    socket that goes nowhere). Not calling it is the whole block. Registered with
+    ``context.route_web_socket`` because ``context.route`` never sees a handshake: HTTP
+    interception is the CDP ``Fetch`` domain, WebSockets surface only on the report-only
+    ``Network.webSocket*`` events, and an IP-literal target such as ``ws://127.0.0.1`` never
+    consults the resolver the DNS pin rewrites.
+
+    Provably raise-free, deliberately. Playwright dispatches this on a task it creates itself, the
+    detached-listener shape behind the 2026-07-25 traceback storm, and it stays registered through
+    the context close (``unroute_all`` clears HTTP routes only and there is no
+    ``unroute_web_socket``). So the host is taken with ``str.partition``, which cannot raise on any
+    string, rather than ``urlparse``, which raises on an unbalanced IPv6 bracket; the userinfo is
+    dropped so a credentialled socket URL does not reach the log.
+    """
+    host_port = web_socket_route.url.partition("//")[2].partition("/")[0].rpartition("@")[2]
+    logger.debug("rendered fetch blocked a page WebSocket to %s", host_port)
+
+
+def _landed_host(final_url: str) -> str | None:
+    """Hostname of the URL the main frame landed on, or None when no navigation committed.
+
+    ``page.url`` is ``about:blank`` (or empty) when a genuine navigation error left nothing
+    behind, which is nobody's host and falls through to the empty DOM read it always did. An
+    http(s) URL with no hostname at all yields ``""``, which matches no pin and so fails closed.
+    """
+    parsed = urlparse(final_url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    return parsed.hostname or ""
+
+
 def _goto_budget_ms(goto_timeout_ms: int, deadline_monotonic_s: float | None) -> int | None:
     """The navigation budget once both gates are held, or None when it is under the floor.
 
@@ -488,6 +560,7 @@ async def _navigate_and_read_dom(
     goto_timeout_ms: int,
     deadline_monotonic_s: float | None,
     harvest: _JsonHarvest | None,
+    pinned_host: str,
 ) -> RenderedPage:
     """Navigate to ``url``, let it settle, and return the rendered page.
 
@@ -498,6 +571,17 @@ async def _navigate_and_read_dom(
     timed-out goto routinely leaves a fully rendered DOM behind — 4 of the replay's 10 render
     rescues came from exactly that. A genuine navigation error lands here too and salvages an
     empty ``about:blank``, which reaches the ladder as the same "rendered read nothing".
+
+    Before anything is read, the main frame has to be on ``pinned_host``, the one hostname the
+    launch's ``--host-resolver-rules`` covers. A server-side redirect hop is followed by Chromium
+    with no route handler of ours involved, so ``page.url`` is the only record of where the frame
+    actually went, and it is read after the settle on BOTH paths: on the salvage path ``response``
+    is None and there is no other source, and that path is where a timed-out navigation may
+    already have landed on a redirect target. A landing on any other host, an IP literal
+    included, raises :class:`RenderOffHost` with ``page.content()`` never called. Hostnames are
+    compared as ``urlparse`` normalises them (lower-cased, brackets stripped), which is the same
+    form the pin was built from, so the compare is like with like. ``about:blank`` is nobody's
+    host and falls through to the empty read it always produced.
 
     The DOM read is bounded by ``RENDER_DOM_READ_TIMEOUT_MS`` and raises :class:`RenderTimeout`
     when it fires — deliberately NOT swallowed into the salvage, because a page that keeps
@@ -527,6 +611,10 @@ async def _navigate_and_read_dom(
         logger.debug("rendered fetch goto failed, salvaging DOM: %s: %s", type(exc).__name__, exc)
         response = None
     await page.wait_for_timeout(RENDER_SETTLE_MS)
+    final_url: str = page.url
+    landed_host = _landed_host(final_url)
+    if landed_host is not None and landed_host != pinned_host:
+        raise RenderOffHost(requested_url=url, final_url=final_url, pinned_host=pinned_host)
     # ``goto`` returns None for an about:blank or same-document navigation, and the salvage
     # above leaves no response either; both read as "no main-frame response".
     content_type = (response.headers.get("content-type") or "").lower() if response is not None else ""
@@ -555,7 +643,12 @@ async def _navigate_and_read_dom(
         await harvest.drain(until_monotonic_s=drain_until_s)
         json_responses = tuple(harvest.bodies)
     return RenderedPage(
-        url=url, content_type=content_type, html=html, json_responses=json_responses, http_status=http_status
+        url=url,
+        content_type=content_type,
+        html=html,
+        json_responses=json_responses,
+        http_status=http_status,
+        final_url=final_url,
     )
 
 
@@ -724,12 +817,14 @@ async def render_page(
     ``None`` is the one graceful-failure signal both callers already handle, and it covers
     every way this rung can DECLINE with nothing rendered: a URL a browser already read to
     nothing in this run under the caller's own ``memo_scope``, Playwright missing or broken, a
-    host that cannot be pinned to a public IP, and any error out of the browser. Two declines are
-    NOT ``None``, because each is a fact the caller counts apart from a missing browser: a
+    host that cannot be pinned to a public IP, and any error out of the browser. Three declines
+    are NOT ``None``, because each is a fact the caller counts apart from a missing browser: a
     navigation budget under the floor once the gates are held raises :class:`RenderBudgetExpired`
-    (the caller's wall budget ran out in the queue), and a rendered DOM over
+    (the caller's wall budget ran out in the queue), a rendered DOM over
     ``RENDERED_DOM_MAX_CHARS`` raises :class:`RenderDomOverCeiling` (the page rendered and is too
-    big to read safely). A caller that wants to tell the ``None`` causes apart reads
+    big to read safely), and a main frame that landed on a host other than the pinned one raises
+    :class:`RenderOffHost` (the page sent the browser somewhere the pin does not cover, and its
+    DOM was refused unread). A caller that wants to tell the ``None`` causes apart reads
     :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
 
     A render that ran and was CUT OFF is different, and raises :class:`RenderTimeout` (a
@@ -818,9 +913,18 @@ async def render_page(
                 deadline_monotonic_s=deadline_monotonic_s,
                 harvest_json=harvest_json,
             )
-    # The two declines the caller records under their own tokens: nothing is memoised for either
-    # (nothing ran for the first; the second rendered content, just too much of it).
+    # The three declines the caller records under their own tokens: nothing is memoised for any
+    # of them (nothing ran for the first; the second rendered content, just too much of it; the
+    # third rendered a page on a host the pin does not cover, and read none of it).
     except (RenderBudgetExpired, RenderDomOverCeiling):
+        raise
+    except RenderOffHost as exc:
+        # Hostnames only: the landing URL can carry a session token or a credential.
+        logger.warning(
+            "rendered fetch refused the DOM of %s: the main frame landed on %s, off the pinned host",
+            exc.pinned_host,
+            urlparse(exc.final_url).hostname,
+        )
         raise
     # Ordered before Playwright's Error deliberately, though the order is not load-bearing:
     # Playwright's TimeoutError derives from its own Error, not the builtin, so this clause never
@@ -898,6 +1002,7 @@ async def _render_in_browser(
                 url,
                 playwright_error,
                 memo_scope=memo_scope,
+                pinned_host=host,
                 goto_budget_ms=goto_budget_ms,
                 deadline_monotonic_s=deadline_monotonic_s,
                 harvest_json=harvest_json,
@@ -915,6 +1020,7 @@ async def _render_in_context(
     playwright_error: type[BaseException],
     *,
     memo_scope: MemoScope,
+    pinned_host: str,
     goto_budget_ms: int,
     deadline_monotonic_s: float | None,
     harvest_json: bool,
@@ -926,43 +1032,46 @@ async def _render_in_context(
     # below DOES see, and re-checks against is_public_http_url: the main-frame goto, every client-side
     # redirect (a meta refresh or a `location` assignment is a fresh request with no redirect predecessor),
     # and every subresource, XHR and fetch Playwright can attribute to a frame. Three request channels never
-    # reach it, each confirmed in the pinned Playwright 1.61 driver source on 2026-09-04. A SERVER-SIDE
-    # redirect hop is auto-continued by the driver, which constructs a Route only in the else of `if
-    # (redirectedFrom || ...)`; Playwright's own `page.route` docs say "the handler will only be called for
-    # the first url if the response is a redirect". So a 3xx answer that sends the main frame to a private
-    # address is dialed with no check of ours at all. A request Playwright cannot attribute to a frame is
-    # auto-continued the same way. A WebSocket handshake is invisible to `context.route` by construction,
-    # because HTTP interception is the CDP `Fetch.enable` domain while WebSockets surface only on the
-    # report-only `Network.webSocket*` events; Playwright routes them through a separate `route_web_socket`
-    # API that nothing here registers, and an IP-literal target such as ws://127.0.0.1 never consults the
-    # resolver the pin rewrites. Service-worker traffic is a fourth such channel and is the one that IS
-    # closed, by `service_workers="block"` on the context above. One shape that looks like a hole and is
-    # not: a CORS preflight OPTIONS is auto-fulfilled by the driver with a synthetic 204 and never reaches
-    # the network.
+    # reach it, each confirmed in the pinned Playwright 1.61 driver source on 2026-09-04, and each is closed
+    # or bounded somewhere else. A SERVER-SIDE redirect hop is auto-continued by the driver, which constructs
+    # a Route only in the else of `if (redirectedFrom || ...)`; Playwright's own `page.route` docs say "the
+    # handler will only be called for the first url if the response is a redirect". So a 3xx answer that
+    # sends the main frame elsewhere is dialed with no check of ours; what closes it is the landing-host
+    # check in `_navigate_and_read_dom`, which refuses the DOM unread when `page.url` is not on the pinned
+    # host. A request Playwright cannot attribute to a frame is auto-continued the same way, and stays the
+    # one channel with no check of ours. A WebSocket handshake is invisible to `context.route` by
+    # construction, because HTTP interception is the CDP `Fetch.enable` domain while WebSockets surface only
+    # on the report-only `Network.webSocket*` events; it is closed by the `route_web_socket` handler
+    # registered below, `_block_web_socket`, which never connects the socket to a server (see its
+    # docstring for the mechanism and its limits: it is Playwright's in-page replacement of
+    # `globalThis.WebSocket`, so a dedicated Worker very likely keeps the native constructor). Service-worker
+    # traffic is a fourth such channel and is closed by `service_workers="block"` on the context above. One
+    # shape that looks like a hole and is not: a CORS preflight OPTIONS is auto-fulfilled by the driver with
+    # a synthetic 204 and never reaches the network.
     #
     # Threat model: these fetches run on GitHub-hosted Azure runners, where a request to a link-local /
     # RFC1918 host (Azure IMDS at 169.254.169.254, localhost services, the internal runner network) would
     # exfiltrate internal content into the research prompt AND the public Metaculus comment. The main-frame
-    # host is pinned, so its own rebinding TOCTOU is closed. A subresource host is guarded only by this
-    # per-request preflight, whose getaddrinfo resolves independently of Chromium's connect, so a rebinding
-    # host (TTL 0) can still win that race; the server-side redirect hop and the page's own WebSocket are
-    # not guarded here at all. Chromium 149 (the build Playwright 1.61 pins) narrows the last two of those:
-    # Local Network Access gates a public page's subresource requests, and since Chrome 147 its WebSocket
-    # handshakes, to local and loopback addresses behind a permission this headless context never grants.
-    # That mitigation is INFERRED from Chromium's feature lists and vendor docs rather than observed,
+    # host is pinned, so its own rebinding TOCTOU is closed, and a main frame that ends up on any other host
+    # is refused. A subresource host is guarded only by this per-request preflight, whose getaddrinfo
+    # resolves independently of Chromium's connect, so a rebinding host (TTL 0) can still win that race.
+    # Chromium 149 (the build Playwright 1.61 pins) narrows that: Local Network Access gates a public page's
+    # subresource requests to local and loopback addresses behind a permission this headless context never
+    # grants. That mitigation is INFERRED from Chromium's feature lists and vendor docs rather than observed,
     # because the test suite blocks every real browser launch, and it is a browser default we neither pin
-    # nor assert. It also does not cover a MAIN-FRAME navigation, which is exactly the channel the unguarded
-    # redirect hop uses. A filtering forward proxy is the only remedy that covers all of these at connect
-    # time, and it stays deferred as its own change: FUTURE.md item 8 under "Resolution-source fetcher:
-    # Tier-2 LLM fetch + oversized-source summarization" carries the measured recall headroom and the ranked
-    # candidate fixes. Harvested JSON passes the guard below like any other response, so a harvestable
-    # response is one Chromium was allowed to dial, under the same redirect-hop caveat.
+    # nor assert. A filtering forward proxy is the only remedy that covers every channel at connect time,
+    # and it stays deferred as its own change: FUTURE.md item 8 under "Resolution-source fetcher: Tier-2 LLM
+    # fetch + oversized-source summarization" carries the ranked candidates. Harvested JSON passes the guard
+    # below like any other response, so a harvestable response is one Chromium was allowed to dial.
     async def _guard_route(route: Any, request: Any) -> None:
         # A thin closure so the registration keeps Playwright's expected handler shape while
         # the vetting itself stays module-level and directly testable.
         await _vet_route(route, request, playwright_error)
 
     await context.route("**/*", _guard_route)
+    # Before `new_page`, because only sockets created after the registration are routed. Not wrapped:
+    # a Playwright error here takes the same pre-page path as a failed `route` or `new_page`.
+    await context.route_web_socket("**/*", _block_web_socket)
     page = await context.new_page()
     harvest: _JsonHarvest | None = None
     if harvest_json:
@@ -977,6 +1086,7 @@ async def _render_in_context(
             goto_timeout_ms=goto_budget_ms,
             deadline_monotonic_s=deadline_monotonic_s,
             harvest=harvest,
+            pinned_host=pinned_host,
         )
     finally:
         # A body read still pending here (the DOM read timed out, or the DOM was over the
@@ -992,5 +1102,9 @@ async def _render_in_context(
         # guard already ran for every request dialed while the page was live, and a request
         # racing teardown has no live target to exfiltrate through. Bounded and guarded like the
         # two closes that follow it, on the same shared budget, so neither a race nor a wedged
-        # browser can skip them or hold the render past one teardown bound.
+        # browser can skip them or hold the render past one teardown bound. It clears the HTTP
+        # guard only: `unroute_all` touches `_routes` and never `_web_socket_routes`, and Playwright
+        # has no `unroute_web_socket`, so the WebSocket handler stays registered through the
+        # context close by design. That is safe because it is raise-free (see `_block_web_socket`)
+        # and issues no protocol call of its own, so there is nothing for the close to race.
         await _teardown_step("unroute_all", context.unroute_all(behavior="ignoreErrors"), playwright_error, teardown)

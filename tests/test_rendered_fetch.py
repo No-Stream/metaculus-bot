@@ -23,6 +23,7 @@ import time
 from typing import Any
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -30,7 +31,14 @@ from metaculus_bot.research.derived_api import DerivedEndpoint, derived_api_lead
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.resolution_source import FetchContext
-from tests.playwright_fakes import FakePage, FakeResponse, Faults, PlaywrightError, install_fake_playwright
+from tests.playwright_fakes import (
+    FakePage,
+    FakeResponse,
+    FakeWebSocketRoute,
+    Faults,
+    PlaywrightError,
+    install_fake_playwright,
+)
 
 _PAGE_URL = "https://dashboard.example.com/senate"
 _DOM = "<!doctype html><html><head><title>Dashboard</title></head><body><p>rendered</p></body></html>"
@@ -741,6 +749,75 @@ class TestTheBrowserContext:
         assert page.context_kwargs["user_agent"]
 
 
+class TestTheWebSocketChannel:
+    """``context.route`` never sees a WebSocket handshake: HTTP interception is the CDP ``Fetch``
+    domain, sockets surface only on the report-only ``Network.webSocket*`` events, and an
+    IP-literal target such as ``ws://127.0.0.1`` never consults the resolver the DNS pin
+    rewrites. Playwright's separate ``route_web_socket`` API is the one hook, and a routed socket
+    dials nothing unless its handler calls ``connect_to_server()``, so a handler that does nothing
+    closes the channel. What the fake can show is the registration and the handler's behaviour;
+    Chromium actually refusing the handshake is not observable here, because the suite blocks
+    every real launch."""
+
+    async def test_the_block_is_registered_on_the_context_before_the_page_exists(self, monkeypatch):
+        """Only sockets created after the registration are routed, so a page opened first could
+        open one before the block existed."""
+        page = FakePage([])
+
+        rendered = await _render(monkeypatch, page)
+
+        assert rendered is not None
+        assert page.web_socket_patterns == ["**/*"]
+        assert page.web_socket_handler is rendered_fetch._block_web_socket
+        assert page.setup_events.index("route_web_socket") < page.setup_events.index("new_page")
+
+    def test_the_block_never_connects_and_returns_normally(self, caplog):
+        """The handler runs on a task Playwright creates, where a raise is a detached-listener
+        traceback (the 2026-07-25 storm), and ``connect_to_server()`` is the handshake being
+        refused; the one thing it does is name the host it refused, at DEBUG."""
+        socket = FakeWebSocketRoute("ws://user:secret@127.0.0.1:8080/feed?token=abc")
+
+        with caplog.at_level(logging.DEBUG, logger="metaculus_bot.research.rendered_fetch"):
+            result = rendered_fetch._block_web_socket(socket)
+
+        assert result is None
+        assert socket.connect_calls == 0
+        assert socket.close_calls == []
+        (message,) = [message for message in caplog.messages if "WebSocket" in message]
+        assert "127.0.0.1:8080" in message
+        assert "secret" not in message
+        assert "token" not in message
+
+    @pytest.mark.parametrize("url", ["", "not a url", "ws://[::1/broken", "wss://x.example"])
+    def test_the_block_cannot_raise_on_an_odd_url(self, url):
+        """``urlparse`` raises on an unbalanced IPv6 bracket; the handler must not, whatever the
+        page hands it."""
+        socket = FakeWebSocketRoute(url)
+        assert rendered_fetch._block_web_socket(socket) is None
+        assert socket.connect_calls == 0
+
+    async def test_a_playwright_error_at_the_registration_takes_the_pre_page_path(self, monkeypatch, caplog):
+        """One more driver call before ``new_page``: not wrapped, so a Playwright-class error there
+        latches the once-per-run warning like a failed launch, and the browser is still closed."""
+        page = FakePage([])
+        install_fake_playwright(
+            monkeypatch, page, faults=Faults(route_web_socket_error=PlaywrightError("Target closed"))
+        )
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"):
+            rendered = await rendered_fetch.render_page(
+                _PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1)
+            )
+
+        assert rendered is None
+        assert page.goto_calls == []
+        assert rendered_fetch._PLAYWRIGHT_WARNED is True
+        # The failure lands before the page's own try/finally, so there is no HTTP guard drain to
+        # run, and the two closes still happen.
+        assert page.teardown == ["context.close", "browser.close"]
+        assert [message for message in caplog.messages if "rung unavailable" in message]
+
+
 class TestDnsPinEligibility:
     """Chromium matches ``--host-resolver-rules`` against the canonical (punycode) hostname, so a
     pattern built from a unicode or trailing-dot host is accepted and matches nothing: the pin
@@ -832,6 +909,131 @@ class TestTheMainFrameStatus:
 
         assert result is not None
         assert result.status == "success"
+
+
+class TestTheLandingHost:
+    """A server-side redirect hop is dialed with no check of ours: the driver constructs a Route
+    only for a request with no ``redirectedFrom``, so a 302 to a private address was followed,
+    rendered, and handed back attached to the cited URL. The DNS pin covers ONE hostname, so a
+    main frame that landed anywhere else was reached through Chromium's own resolver, and its DOM
+    is refused before it is read. ``page.url`` is read after the settle on both paths, because on
+    the salvage path (the goto raised, no response object) it is the only source of the landing."""
+
+    _OFF_HOST = "https://internal.example.net/admin/secrets"
+
+    async def test_an_off_host_landing_is_refused_before_the_dom_is_read(self, monkeypatch, caplog):
+        page = FakePage([], land_on=self._OFF_HOST)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"),
+            pytest.raises(rendered_fetch.RenderOffHost) as raised,
+        ):
+            await _render(monkeypatch, page)
+
+        assert page.content_reads == 0
+        assert raised.value.requested_url == _PAGE_URL
+        assert raised.value.final_url == self._OFF_HOST
+        assert raised.value.pinned_host == "dashboard.example.com"
+        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
+        assert rendered_fetch._PLAYWRIGHT_WARNED is False
+        # The page rendered, so "rendered to nothing" would be false, and no clock ran out.
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+        # The log names both hosts and never the landing URL's path, which can carry a token.
+        (message,) = [message for message in caplog.messages if "off the pinned host" in message]
+        assert "dashboard.example.com" in message
+        assert "internal.example.net" in message
+        assert "/admin" not in message
+
+    async def test_an_ip_literal_landing_is_off_host(self, monkeypatch):
+        """The IMDS shape: the hostname compare refuses a literal like any other stranger."""
+        page = FakePage([], land_on="http://169.254.169.254/latest/meta-data/")
+
+        with pytest.raises(rendered_fetch.RenderOffHost):
+            await _render(monkeypatch, page)
+
+        assert page.content_reads == 0
+
+    async def test_a_same_host_landing_on_another_path_or_scheme_is_read(self, monkeypatch):
+        """Only the HOST is pinned: a canonical-path or scheme hop on the same host is the ordinary
+        shape, and the landing rides on the page for the caller."""
+        landed = "http://dashboard.example.com/senate/2026?tab=polls"
+        page = FakePage([], land_on=landed)
+
+        rendered = await _render(monkeypatch, page)
+
+        assert rendered is not None
+        assert rendered.url == _PAGE_URL
+        assert rendered.final_url == landed
+        assert page.content_reads == 1
+
+    async def test_a_landing_that_differs_only_in_case_is_the_same_host(self, monkeypatch):
+        page = FakePage([], land_on="https://Dashboard.Example.COM/senate")
+
+        rendered = await _render(monkeypatch, page)
+
+        assert rendered is not None
+        assert rendered.final_url == "https://Dashboard.Example.COM/senate"
+
+    async def test_a_navigation_that_never_committed_falls_through_to_the_dom_read(self, monkeypatch):
+        """A genuine navigation failure leaves the page on ``about:blank``, which is nobody's host:
+        the DOM read proceeds and yields the empty document it always did."""
+        page = FakePage([], goto_raises=PlaywrightError("net::ERR_NAME_NOT_RESOLVED"), html=_EMPTY_DOM)
+
+        rendered = await _render(monkeypatch, page)
+
+        assert rendered is not None
+        assert rendered.final_url == "about:blank"
+        assert rendered.html == _EMPTY_DOM
+        assert page.content_reads == 1
+
+    async def test_the_salvage_path_applies_the_check_too(self, monkeypatch):
+        """A timed-out goto may already have landed on the redirect target (4 of the replay's 10
+        render rescues came through this path); ``response`` is None there, so ``page.url`` is
+        the only source of the landing, and it is checked before the salvage read."""
+        page = FakePage([], goto_raises=PlaywrightTimeoutError("Timeout 33000ms exceeded."), land_on=self._OFF_HOST)
+
+        with pytest.raises(rendered_fetch.RenderOffHost):
+            await _render(monkeypatch, page)
+
+        assert page.content_reads == 0
+        assert page.settles == [rendered_fetch.RENDER_SETTLE_MS]
+
+    async def test_a_salvaged_same_host_landing_carries_its_final_url(self, monkeypatch):
+        landed = f"{_PAGE_URL}/2026"
+        page = FakePage([], goto_raises=PlaywrightTimeoutError("Timeout 33000ms exceeded."), land_on=landed)
+
+        rendered = await _render(monkeypatch, page)
+
+        assert rendered is not None
+        assert rendered.http_status is None
+        assert rendered.final_url == landed
+
+    async def test_the_tier_1_rung_records_an_off_host_landing_as_its_own_skip(self, monkeypatch):
+        """Folded into ``renderer_unavailable`` it would point triage at the Playwright install;
+        folded into ``None`` it would be invisible. The direct result stands."""
+
+        async def _off_host(url: str, **_kwargs: Any) -> None:
+            await asyncio.sleep(0)
+            raise rendered_fetch.RenderOffHost(
+                requested_url=url, final_url="http://10.0.0.8/status", pinned_host="dashboard.example.com"
+            )
+
+        monkeypatch.setattr(resolution_source, "render_page", _off_host)
+        direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
+        ctx = FetchContext()
+
+        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+
+        assert result is None
+        assert [attempt.skipped_reason for attempt in ctx.rungs] == ["render_off_host"]
+        direct.rung_attempts = list(ctx.rungs)
+        counts = resolution_source._rung_counts([direct])
+        assert counts["render_off_host_skips"] == 1
+        assert counts["renderer_unavailable_skips"] == 0
+        assert counts["rendered_attempts"] == 0
+        assert rendered_fetch._PLAYWRIGHT_WARNED is False
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
 
 
 class TestTeardown:
@@ -1003,15 +1205,27 @@ class TestTheDomReadIsBounded:
             await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
 
     async def test_an_os_timeout_under_the_render_is_a_logged_decline_not_a_cut_off(self, monkeypatch, caplog):
-        install_fake_playwright(
-            monkeypatch, FakePage([]), faults=Faults(new_page_error=TimeoutError("[Errno 60] ETIMEDOUT"))
-        )
-        with caplog.at_level(logging.ERROR, logger="metaculus_bot.research.rendered_fetch"):
+        """The classification, pinned: the builtin ``TimeoutError`` that is not a ``RenderTimeout``
+        lands in the logged boundary with its own traceback, latches nothing, memoises nothing, and
+        is never described as the DOM read being cut off. Asserting only ``None`` plus some
+        ``exc_info`` record let an ``AttributeError`` raised one line earlier keep this green."""
+        page = FakePage([])
+        install_fake_playwright(monkeypatch, page, faults=Faults(new_page_error=TimeoutError("[Errno 60] ETIMEDOUT")))
+
+        with caplog.at_level(logging.DEBUG, logger="metaculus_bot.research.rendered_fetch"):
             rendered = await rendered_fetch.render_page(
                 _PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1)
             )
+
         assert rendered is None
-        assert [record for record in caplog.records if record.exc_info is not None]
+        (record,) = [record for record in caplog.records if record.exc_info is not None]
+        assert record.levelno == logging.ERROR
+        assert record.exc_info[0] is TimeoutError
+        assert "failed unexpectedly" in record.getMessage()
+        assert not [message for message in caplog.messages if "timed out reading the DOM" in message]
+        assert rendered_fetch._PLAYWRIGHT_WARNED is False
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+        assert page.teardown == ["context.close", "browser.close"]
 
     async def test_a_prompt_dom_read_is_untouched_by_the_bound(self, monkeypatch):
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 50)

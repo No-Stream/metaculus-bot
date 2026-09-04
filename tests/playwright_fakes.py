@@ -39,6 +39,7 @@ __all__ = [
     "FakePage",
     "FakePlaywrightManager",
     "FakeResponse",
+    "FakeWebSocketRoute",
     "Faults",
     "PlaywrightError",
     "install_fake_playwright",
@@ -108,12 +109,21 @@ class FakePage:
     so a test can measure what the transport spends AFTER the budget is gone. ``status`` is the
     main-frame response's HTTP status.
 
+    ``land_on`` is where the main frame ends up, when that is not the URL ``goto`` was given: the
+    server-side redirect hop Playwright follows without consulting any route handler. ``url``
+    mirrors Playwright's own ``Page.url``: ``about:blank`` until a navigation commits, then the
+    landing URL. A goto that raises leaves it at ``about:blank`` (the navigation never committed)
+    unless the test set ``land_on``, which is the salvage shape where a timed-out navigation had
+    already landed on a redirect target.
+
     Everything the transport does to the page and its context is recorded on the page, because
     the page is the one object a test holds: ``goto_calls``, ``settles`` (each
-    ``wait_for_timeout``), ``context_kwargs`` (what ``new_context`` was given), ``route_patterns``
-    and ``route_handler`` (what ``context.route`` registered), ``unroute_behavior``, and
-    ``teardown`` (the close sequence the context and browser ran, so a test can assert the browser
-    was still torn down after a failure mid-render).
+    ``wait_for_timeout``), ``content_reads`` (each ``page.content()``), ``context_kwargs`` (what
+    ``new_context`` was given), ``route_patterns`` and ``route_handler`` (what ``context.route``
+    registered), ``web_socket_patterns`` and ``web_socket_handler`` (what ``route_web_socket``
+    registered), ``setup_events`` (the order the context was guarded and the page opened in),
+    ``unroute_behavior``, and ``teardown`` (the close sequence the context and browser ran, so a
+    test can assert the browser was still torn down after a failure mid-render).
     """
 
     def __init__(
@@ -125,6 +135,7 @@ class FakePage:
         goto_raises: BaseException | None = None,
         goto_runs_its_budget_out: bool = False,
         status: int = 200,
+        land_on: str | None = None,
     ) -> None:
         self._responses = responses or []
         self._html = html
@@ -132,13 +143,19 @@ class FakePage:
         self._goto_raises = goto_raises
         self._goto_runs_its_budget_out = goto_runs_its_budget_out
         self._status = status
+        self._land_on = land_on
         self._handlers: list[Any] = []
+        self.url = "about:blank"
         self.detached_handler_tasks: list[asyncio.Future[Any]] = []
         self.goto_calls: list[dict[str, Any]] = []
         self.settles: list[float] = []
+        self.content_reads = 0
         self.context_kwargs: dict[str, Any] = {}
         self.route_patterns: list[str] = []
         self.route_handler: Any = None
+        self.web_socket_patterns: list[str] = []
+        self.web_socket_handler: Any = None
+        self.setup_events: list[str] = []
         self.unroute_behavior: str | None = None
         self.teardown: list[str] = []
 
@@ -158,13 +175,17 @@ class FakePage:
         if self._goto_runs_its_budget_out:
             await asyncio.sleep(timeout / 1000)
         if self._goto_raises is not None:
+            if self._land_on is not None:
+                self.url = self._land_on
             raise self._goto_raises
-        return SimpleNamespace(headers={"content-type": "text/html"}, status=self._status)
+        self.url = self._land_on or url
+        return SimpleNamespace(headers={"content-type": "text/html"}, status=self._status, url=self.url)
 
     async def wait_for_timeout(self, ms: float) -> None:
         self.settles.append(ms)
 
     async def content(self) -> str:
+        self.content_reads += 1
         if self._content_hangs:
             await asyncio.Event().wait()
         # The real read is a round trip; yielding here lets the detached handler tasks run
@@ -182,9 +203,31 @@ class Faults:
 
     new_page_error: BaseException | None = None
     new_context_error: BaseException | None = None
+    route_web_socket_error: BaseException | None = None
     close_error: BaseException | None = None
     close_hangs: bool = False
     browser_close_hangs: bool = False
+
+
+class FakeWebSocketRoute:
+    """One routed WebSocket handshake, as Playwright hands it to a ``route_web_socket`` handler.
+
+    A routed socket dials the server only if the handler calls ``connect_to_server()``, so the
+    count of those calls is the whole claim a blocking handler makes. ``close`` takes ``code`` and
+    ``reason`` like the real one, so a handler that reached for it would still run here.
+    """
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.connect_calls = 0
+        self.close_calls: list[tuple[int | None, str | None]] = []
+
+    def connect_to_server(self) -> FakeWebSocketRoute:
+        self.connect_calls += 1
+        return self
+
+    async def close(self, code: int | None = None, reason: str | None = None) -> None:
+        self.close_calls.append((code, reason))
 
 
 class FakeContext:
@@ -195,8 +238,17 @@ class FakeContext:
     async def route(self, pattern: str, handler: Any) -> None:
         self._page.route_patterns.append(pattern)
         self._page.route_handler = handler
+        self._page.setup_events.append("route")
+
+    async def route_web_socket(self, pattern: str, handler: Any) -> None:
+        self._page.setup_events.append("route_web_socket")
+        if self._faults.route_web_socket_error is not None:
+            raise self._faults.route_web_socket_error
+        self._page.web_socket_patterns.append(pattern)
+        self._page.web_socket_handler = handler
 
     async def new_page(self) -> FakePage:
+        self._page.setup_events.append("new_page")
         if self._faults.new_page_error is not None:
             raise self._faults.new_page_error
         return self._page

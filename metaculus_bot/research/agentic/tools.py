@@ -94,7 +94,13 @@ from metaculus_bot.research.http_fetch import (
     decode_text_body,
     read_body_capped,
 )
-from metaculus_bot.research.rendered_fetch import MemoScope, RenderDomOverCeiling, note_rendered_no_text, render_page
+from metaculus_bot.research.rendered_fetch import (
+    MemoScope,
+    RenderDomOverCeiling,
+    RenderOffHost,
+    note_rendered_no_text,
+    render_page,
+)
 from metaculus_bot.research.robots_policy import ROBOTS_FETCH_TIMEOUT_S, google_extended_blocks_url, robots_host
 
 logger = logging.getLogger(__name__)
@@ -364,14 +370,19 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     URL a browser already read to nothing this run under THIS ladder's memo scope) is returned
     unchanged: it is the graceful-failure signal both call sites already degrade on. A render the
     transport CUT OFF (its DOM-read cap fired because the page kept navigating) raises
-    ``TimeoutError`` instead, and a rendered DOM over ``RENDERED_DOM_MAX_CHARS`` raises
-    ``RenderDomOverCeiling``, so the Tier-1 rung can record each under its own reason; this
-    ladder's callers only know ``None``, so both are folded back into that signal here. The
-    transport memoises the cut-off itself and re-raises it on the next fetch of the same URL, so
-    a second fetch of the same hostile page in this run does not pay for it again; the oversized
-    DOM is memoised by nobody, since the page did render. The ceilings this wrapper already runs
-    under are unchanged: the ``fetch`` tool's ``timeout_s`` and ``_LOCAL_DOCUMENT_BUDGET_S`` on
-    the document ladder.
+    ``TimeoutError`` instead, a rendered DOM over ``RENDERED_DOM_MAX_CHARS`` raises
+    ``RenderDomOverCeiling``, and a main frame that landed on a host other than the pinned one
+    raises ``RenderOffHost`` with the DOM never read, so the Tier-1 rung can record each under its
+    own reason; this ladder's callers only know ``None``, so all three are folded back into that
+    signal here, and nothing from an off-host render reaches the driver. The transport memoises
+    the cut-off itself and re-raises it on the next fetch of the same URL, so a second fetch of
+    the same hostile page in this run does not pay for it again; the oversized DOM and the
+    off-host landing are memoised by nobody, since the page did render. The ceilings this
+    wrapper already runs under are unchanged: the ``fetch`` tool's ``timeout_s`` and
+    ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
+
+    The URL handed to the browser is the plain rung's ``url``, which is the last hop of its own
+    redirect loop, so the pin already covers the host that serves the content.
 
     The memo scope is this ladder's own because "rendered to nothing" means something weaker
     here than in Tier-1: bare trafilatura emptiness, where Tier-1 also tries the ARIA rewrite,
@@ -379,7 +390,7 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     """
     try:
         page = await render_page(url, memo_scope=_RENDER_MEMO_SCOPE, host_gate=_host_gate(url))
-    except (TimeoutError, RenderDomOverCeiling):
+    except (TimeoutError, RenderDomOverCeiling, RenderOffHost):
         return None
     if page is None:
         return None
