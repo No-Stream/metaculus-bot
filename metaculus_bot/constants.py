@@ -629,6 +629,12 @@ RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host se
 # property of what chrome weighs, not of the extractor, and refitting it against a
 # recall-era census is its own measurement.
 RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
+# The line-shape check on an extraction that clears the floor (`resolution_source.content_share`):
+# navigation-tree chrome tops out at 0.329 (kasa homepage, ambiguous) and 0.239 (strictly labelled, the
+# manifold sidebar); the thinnest labelled content is 0.431 (wastewaterscan dashboard). Calibrated
+# 2026-09-03 on 118 bodies, receipt `scratch/fetch_ladder_2026-09-03/chrome_calibration.md`.
+RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS: int = 60  # a non-table line at least this long is content, shorter is chrome
+RESOLUTION_SOURCE_CONTENT_SHARE_MIN: float = 0.38
 # --- Inline chart configs (Highcharts), read straight out of the page we already hold ---
 # qid 43949: the resolving IOM page fetched 200 and extracted ~80k chars of incident rows
 # and prose carrying none of the resolving figures, because the annual series lives in

@@ -879,6 +879,37 @@ at once). Content is extracted with trafilatura (HTML), or read raw (JSON / text
 CSV). A PDF is read locally with pypdf and rendered as a passage digest (below);
 anything else is left unread as `unsupported_type`.
 
+**Which extraction publishes** is a policy, not a flag (`_extract_page_text`,
+calibrated 2026-09-03 on 118 re-fetched bodies with five extractor variants run on identical
+bytes; receipt `scratch/fetch_ladder_2026-09-03/chrome_calibration.md`). Trafilatura's default
+recall is the primary extraction. Its text is scored by line shape: `content_share` is the
+share of extracted characters that sit in table rows (lines starting with `|`) or in lines of
+at least `RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS` (60), and a text at or above
+`RESOLUTION_SOURCE_CONTENT_SHARE_MIN` (0.38) that also clears the 400-char chrome floor
+publishes. A text that clears the floor on short lines alone is chrome, and the same input is
+re-extracted with `favor_precision=True`, which is the one trafilatura setting that prunes
+navigation out of the backup tree its readability fallback swaps in; that text publishes only
+if it clears the floor and the same metric. Otherwise the page is withheld as
+`no_resolving_content` with reason `thin_page`, so the rendered rung still fires. The two
+cases that fixed the policy: congress.gov, where the default extraction replaces the 2,411-char
+bill-status card ("Latest Action", "Passed House") with 54,393 chars of a member-name
+dropdown and precision restores the card; and uk.finance.yahoo.com, whose 1,191-char direct
+body is a menu plus one quote line while its render is the full 23,991-char price table that
+a floor-only check never reached because the menu counted as success. On the labelled
+corpus the policy publishes every content text (46 of 46), publishes 2 chrome texts against
+11 for default-only and 4 for precision-only, and withholds no content. The margin is about
+0.05 on each side: navigation-tree chrome tops out at 0.329 (kasa.go.kr's homepage, a menu
+with a news ticker) and the thinnest labelled content is 0.431 (a wastewaterscan dashboard
+of 79-char readings). What it gives up, deliberately: prose-shaped boilerplate (AP's
+cookie-consent wall, clinicaltrials.gov's glossary) is sentences and passes any line-shape
+metric, and kasa's ticker line is withheld with its menu. Precision alone shipped until
+2026-09-03 and withheld readable pages (kasa.go.kr pruned to 78 chars, two tracxn funding
+tables, manifold's market body); default alone shipped for one day on a character-count
+measurement, which under a head-preserving 6,000-char cap is the wrong metric, and the
+earlier claim that its biggest gainers had been read by hand and were all content was
+wrong. Both decisions ride `details["counts"]` as `chrome_metric_withholds` and
+`precision_fallback_rescues`; no status or reason token changed.
+
 Two free rungs sit under the HTML path, both reached only when the page carried nothing
 readable. A **meta-refresh hop** follows the redirect no HTTP status announces:
 cdc.gov's surveillance URLs answer 200 with a ~300-byte stub whose only content is
@@ -1043,13 +1074,18 @@ every page that already fetched when it fires, so an overrunning rung costs the 
 question's resolution evidence rather than just its own attempt. A rung that FIRED
 records itself on the result (`route=` on the fetch marker, plus one
 `RESOLUTION_SOURCE_ESCALATION` line); a rung that was SKIPPED is counted under
-`details["counts"]` instead of logged, alongside the fired counts. Twelve keys, and a zero
+`details["counts"]` instead of logged, alongside the fired counts. Fourteen keys, and a zero
 renders nothing while still surviving into the archive, which is what makes "the rung existed
 and never fired" distinguishable from "this record predates the rung". Six of the keys count
 rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
-`derived_api_reads`, `wayback_attempts` and `url_context_reads`. The other six count rungs that
+`derived_api_reads`, `wayback_attempts` and `url_context_reads`. Six count rungs that
 were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
-because each names a different binding constraint. `rung_budget_skips` is the question that ran out of wall.
+because each names a different binding constraint. The last two count the extractor policy's
+decisions rather than rungs, per final result: `chrome_metric_withholds` is a page whose
+extraction cleared the chrome floor on navigation alone and was withheld by the line-shape
+metric (its `reason` is the same `thin_page` an under-floor page carries, so this count is
+what separates the two), and `precision_fallback_rescues` is a page published from the
+`favor_precision` re-extraction after the default one failed that metric. `rung_budget_skips` is the question that ran out of wall.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
 parse gate is what binds. `renderer_unavailable_skips` is a browser rung that never rendered,
 most often because Chromium is missing on the runner (the install step is `continue-on-error` in
@@ -1141,8 +1177,10 @@ this status, which costs nothing because everything archived below that floor is
 chrome and the shortest archived extraction that carries the resolving content is 401
 chars. That calibration was re-checked against the same census when the gate was
 generalised: of 68 cited successes, all 8 below 400 chars are chrome, and the
-per-URL list is in the constant's own comment. Above the floor the page kept real
-prose, so the prose is rendered, and where a
+per-URL list is in the constant's own comment. Above the floor the text still has to be
+content-shaped (the extractor policy above: table rows and long lines, not a menu tree),
+and a page that is chrome at both extractor settings takes the same `thin_page` withhold.
+A page that passes is rendered as is, and where a
 third-party data embed hid figures from it one bracketed line says plainly that those
 figures are not in the text.
 

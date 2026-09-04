@@ -37,8 +37,12 @@ a page and the one the paid rung is not allowed to re-read; `thin_page` otherwis
 (q45088's 127-char SPA tab list, q45215's 385 chars of region names — five such renders
 in the 2026-09-01 round, none naming a provider, which is why the floor is no longer
 gated on one).
-A page ABOVE the floor keeps its text, plus a one-line disclosure where an embed
-hid figures from it.
+A page ABOVE the floor keeps its text when that text is content-shaped, plus a
+one-line disclosure where an embed hid figures from it. Over the floor on short lines
+alone (`content_share` under `RESOLUTION_SOURCE_CONTENT_SHARE_MIN`: a menu tree, a
+member dropdown) it is still chrome; the same body is re-extracted under
+`favor_precision`, and the page is withheld as `thin_page` when that fails too
+(`_extract_page_text`).
 
 Three free rungs sit under Tier 1, all deterministic and none of them a model call.
 An ARIA-TABLE REWRITE runs before every extraction (`rewrite_aria_tables`): a
@@ -135,6 +139,8 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_READER_MODEL,
     GAP_FILL_V2_READER_THINKING_LEVEL,
     GOOGLE_API_KEY_ENV,
+    RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS,
+    RESOLUTION_SOURCE_CONTENT_SHARE_MIN,
     RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
@@ -445,6 +451,30 @@ def looks_like_page_chrome(text: str) -> bool:
     return len(text.strip()) < RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
 
 
+def content_share(text: str) -> float:
+    """Share of an extraction's characters that sit in content-shaped lines.
+
+    Content is table rows (lines starting with ``|``, whatever their length: a price-history
+    table is rows of 10-char cells) and lines of at least
+    ``RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS``; every other line is chrome-shaped. Lines are
+    stripped and blank ones dropped first. One pass over the extracted text, no second parse.
+
+    A line-shape rule separates navigation trees from content and nothing more: prose-shaped
+    boilerplate (a cookie-consent wall, a glossary) is sentences and passes, and a news ticker
+    made of short headlines is withheld with the menu around it. Both are the deliberate
+    trade; the calibration numbers sit on ``RESOLUTION_SOURCE_CONTENT_SHARE_MIN``.
+    """
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    total = sum(len(line) for line in lines)
+    if total == 0:
+        return 0.0
+    content = sum(
+        len(line) for line in lines if line.startswith("|") or len(line) >= RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS
+    )
+    return content / total
+
+
 def _unreadable_embed_disclosure(providers: list[str]) -> str:
     """The one-line note a rendered page carries when it hides figures in an embed.
 
@@ -637,20 +667,25 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
 # ---------------------------------------------------------------------------
 
 
-def _extract_main_text(body: bytes | str, url: str) -> str | None:
+def _extract_main_text(body: bytes | str, url: str, *, favor_precision: bool = False) -> str | None:
     """Trafilatura extraction. Callers wrap in ``await asyncio.to_thread(...)``.
 
     Takes bytes (the response body, letting trafilatura detect the encoding) or text
     (a body this module already decoded and rewrote — see :func:`_extract_page_text`).
 
-    Runs at trafilatura's DEFAULT recall. ``favor_precision=True`` shipped here until
-    2026-09-03 and was the single largest source of withheld-but-readable pages: measured
-    over 97 archived resolution-source URLs it lost text on some pages and gained it on
-    none, and three pages it pruned below the floors (kasa.go.kr 78 chars against 6,567,
-    two tracxn pages) were classified `js_wall` and published to nobody. Precision exists
-    to suppress boilerplate, which is a real cost on a section captioned primary grading
-    evidence, so ``include_comments=False`` stays and the biggest gainers were read by hand
-    for chrome before this flipped — the gains were article bodies and data tables.
+    Default recall is the primary extraction and ``favor_precision=True`` the fallback, under
+    the policy :func:`_extract_page_text` applies. Precision alone shipped here until
+    2026-09-03 and withheld readable pages (kasa.go.kr pruned to 78 chars, two tracxn funding
+    tables, manifold's market body). Default alone then shipped for a day, measured by
+    character count, which is the wrong metric under a head-preserving cap: on congress.gov
+    it swaps the 2,411-char bill-status card for 54,393 chars of a member-name dropdown
+    (trafilatura's readability fallback replaces the main extraction when readability's
+    text is over twice as long, and only precision prunes the dropdown out of that backup
+    tree first), and menu trees (abs.gov.au, kasa.go.kr) clear the chrome floor as
+    `success`. The receipt for running both is the 2026-09-03 calibration
+    (`scratch/fetch_ladder_2026-09-03/chrome_calibration.md`: 118 bodies, five extractor
+    variants on identical bytes, texts labelled by hand). ``include_comments=False`` stays
+    at both settings.
 
     Returns None on empty/failed extraction so callers can classify.
     """
@@ -661,6 +696,7 @@ def _extract_main_text(body: bytes | str, url: str) -> str | None:
             include_comments=False,
             include_tables=True,
             output_format="txt",
+            favor_precision=favor_precision,
         )
     except (ValueError, TypeError, RuntimeError) as e:
         # Trafilatura occasionally raises on truly malformed input. We soft-fail
@@ -892,11 +928,44 @@ def _resolution_status_outcome(status: int, current_url: str, content_type: str)
     )
 
 
-def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio: float) -> str | None:
-    """Main-text extraction, with ARIA tables rewritten to real ones first.
+@dataclass(frozen=True, slots=True)
+class _PageExtraction:
+    """What the extractor policy decided for one HTML body (:func:`_extract_page_text`).
 
-    Both halves are CPU-bound sync work over a body up to the response cap, so this runs
-    in one ``asyncio.to_thread`` hop rather than two.
+    ``text`` is what the classifier sees: the precision re-extraction when it rescued the
+    page, else the default one (None when nothing extracted). ``chrome_metric_withheld``
+    marks a default extraction that cleared the chrome floor and failed the line-shape
+    metric with no rescue, so the classifier withholds it; ``precision_rescued`` marks a
+    text that came from the fallback. Both ride the result into ``details["counts"]``.
+    """
+
+    text: str | None
+    chrome_metric_withheld: bool = False
+    precision_rescued: bool = False
+
+
+def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio: float) -> _PageExtraction:
+    """The publishable extraction of an HTML body: ARIA tables rewritten first, default
+    recall as the primary extractor, precision as the fallback, both scored by line shape.
+
+    All of it is CPU-bound sync work over a body up to the response cap, so it runs in one
+    ``asyncio.to_thread`` hop rather than several.
+
+    The policy, calibrated 2026-09-03 (receipt on ``RESOLUTION_SOURCE_CONTENT_SHARE_MIN``):
+    the default extraction publishes when it clears the chrome floor and
+    :func:`content_share` is at least the threshold. When it clears the floor on chrome
+    alone, the same input is re-extracted under ``favor_precision=True``, which is the one
+    setting that prunes the tree readability's fallback swapped in, and that text publishes
+    only if it clears the floor AND the metric. Otherwise the page is chrome and the
+    classifier withholds it under ``thin_page``, so the rendered rung still fires
+    (uk.finance.yahoo's direct body is a menu plus one quote line; its render is the whole
+    price table). On the calibration corpus this publishes every labelled content text (46
+    of 46, three of them the congress.gov status card the default alone loses) and blocks the
+    navigation-tree chrome (abs, ocearch, portwatch, copernicus, the congress dropdown), at
+    the cost of one extra trafilatura pass on the pages that fail the metric. What it gives
+    up: prose-shaped boilerplate (a cookie-consent wall, a glossary) passes any line-shape
+    metric, and kasa.go.kr's news ticker is withheld with its menu. An extraction under the
+    floor skips the metric, because precision only ever shortens.
 
     Trafilatura gets the ORIGINAL BYTES in two cases, and in both its extraction is
     byte-identical to what it was before this rung existed: a page with no ARIA role at
@@ -916,7 +985,22 @@ def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio:
     have, and the rewrite is the only thing that forecloses its own encoding detection.
     """
     rewritten = rewrite_aria_tables(html_text) if undecodable_ratio == 0.0 else None
-    return _extract_main_text(body if rewritten is None else rewritten, url)
+    source = body if rewritten is None else rewritten
+    default = _extract_main_text(source, url)
+    if (
+        default is None
+        or looks_like_page_chrome(default)
+        or content_share(default) >= RESOLUTION_SOURCE_CONTENT_SHARE_MIN
+    ):
+        return _PageExtraction(text=default)
+    precision = _extract_main_text(source, url, favor_precision=True)
+    if (
+        precision is not None
+        and not looks_like_page_chrome(precision)
+        and content_share(precision) >= RESOLUTION_SOURCE_CONTENT_SHARE_MIN
+    ):
+        return _PageExtraction(text=precision, precision_rescued=True)
+    return _PageExtraction(text=default, chrome_metric_withheld=True)
 
 
 def _no_content_verdict(
@@ -928,7 +1012,8 @@ def _no_content_verdict(
     routeless embed is the most specific thing we can say (`embed_shell` — the numbers
     exist and we have no route to them), the JS-wall floor keeps its own much lower
     threshold and its position in the middle so the chrome floor cannot swallow that
-    population, and `thin_page` is everything else under the floor.
+    population, and `thin_page` is everything else: under the floor, or over it on chrome
+    alone (the line-shape metric in :func:`_extract_page_text`).
     """
     if unreadable_embeds:
         # Datawrapper is exempt from the embed scan (it has the Tier-2 hop), so a
@@ -1009,15 +1094,17 @@ async def _classify_html_body(
 
     Order of the three verdicts, and why:
 
-    1. CONTENT is extracted text OR chart data read out of the raw HTML. The chart
+    1. CONTENT is extracted text that clears the chrome floor and the line-shape metric
+       (:func:`_extract_page_text`, which retries under precision when the default
+       extraction is chrome-shaped) OR chart data read out of the raw HTML. The chart
        rung runs on every HTML page, not only thin ones, because q43949's page
        extracted ~80k chars of prose with none of the resolving figures in it — a
        thin-only gate would miss the record the rung exists for.
     2. With no content, a named routeless embed makes it `embed_shell`, an
-       extraction under the JS-wall floor makes it `js_wall`, and anything else
-       under the chrome floor makes it `thin_page`. The `js_wall` check keeps its
-       exact old meaning and its position between the two, so the generalised
-       chrome floor cannot swallow the JS-wall population.
+       extraction under the JS-wall floor makes it `js_wall`, and anything else,
+       under the chrome floor or over it on short lines alone, makes it `thin_page`.
+       The `js_wall` check keeps its exact old meaning and its position between the
+       two, so the generalised chrome floor cannot swallow the JS-wall population.
     3. Chart data therefore rescues a page the chrome floor would have withheld —
        including a JS-walled one, where the config in the raw HTML is precisely the
        data the wall was hiding. That is the one place the `js_wall` outcome moves,
@@ -1034,7 +1121,8 @@ async def _classify_html_body(
     html_text, undecodable_ratio = decode_text_body(body, content_type)
     charts = extract_datawrapper_charts(html_text)
     unreadable_embeds = unreadable_data_embed_providers(html_text)
-    extracted = await asyncio.to_thread(_extract_page_text, html_text, body, current_url, undecodable_ratio)
+    extraction = await asyncio.to_thread(_extract_page_text, html_text, body, current_url, undecodable_ratio)
+    extracted = extraction.text
     # In a thread for the same reason the extraction is: it is sync CPU work (one
     # regex sweep plus a `json.loads` per config) over a body up to the 5 MiB
     # response cap, and blocking the loop here would stall every sibling fetch.
@@ -1042,7 +1130,7 @@ async def _classify_html_body(
     # sample. The Datawrapper / embed scans above are single regex searches and stay
     # inline.
     chart_block = await asyncio.to_thread(render_inline_chart_data, html_text)
-    if looks_like_page_chrome(extracted or "") and not chart_block:
+    if (extraction.chrome_metric_withheld or looks_like_page_chrome(extracted or "")) and not chart_block:
         # No content anywhere. Which of the three withholds applies is a disclosure
         # question, not a routing one — all three retain the result as the escalation
         # seam and none of them render. A walled page still exposes its
@@ -1058,6 +1146,7 @@ async def _classify_html_body(
                 status_reason=reason,
                 datawrapper_charts=charts,
                 unreadable_embeds=unreadable_embeds,
+                chrome_metric_withheld=extraction.chrome_metric_withheld,
             ),
             html_text=html_text,
         )
@@ -1070,6 +1159,7 @@ async def _classify_html_body(
             content_type=content_type or None,
             datawrapper_charts=charts,
             unreadable_embeds=unreadable_embeds,
+            precision_rescued=extraction.precision_rescued,
         ),
         html_text=html_text,
     )
@@ -1815,6 +1905,7 @@ async def _wayback_snapshot_result(
         content_type=snapshot.content_type,
         datawrapper_charts=snapshot.datawrapper_charts,
         unreadable_embeds=snapshot.unreadable_embeds,
+        precision_rescued=snapshot.precision_rescued,
     )
 
 
@@ -2634,6 +2725,11 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # disallows Google-Extended refuses the read server-side, so this is spend avoided
         # rather than a page lost, and it must not read as a failure.
         "url_context_robots_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "robots_disallowed"),
+        # The extractor policy's two decisions, per final result: a page withheld because its
+        # extraction cleared the chrome floor on navigation alone, and a page published from
+        # the precision re-extraction after the default one failed the same metric.
+        "chrome_metric_withholds": sum(1 for r in results if r.chrome_metric_withheld),
+        "precision_fallback_rescues": sum(1 for r in results if r.precision_rescued),
     }
 
 
