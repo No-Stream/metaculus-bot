@@ -1402,6 +1402,32 @@ class TestUrlContextRung:
         assert result.status == "blocked"
         assert result.route == "url_context"
 
+    async def test_the_per_question_paid_read_cap_binds_across_cited_urls(self, monkeypatch):
+        """The paid rung's analogue of the Wayback per-question cap: a question citing several
+        dead sources pays at most RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS times inside one
+        provider wall, and the read the cap declines records a `url_context_cap` skip."""
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS", 2)
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        shared = QuestionRungBudget()
+        urls = [f"https://dead{index}.example.com/page" for index in range(3)]
+        handlers: dict[str, object] = {}
+        for url in urls:
+            handlers[url] = FakeResponse(403, body=b"denied", content_type="text/html")
+            handlers[f"https://dead{urls.index(url)}.example.com/robots.txt"] = FakeResponse(
+                200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
+            )
+        session = FakeSession(handlers)
+
+        results = [await _fetch_one(session, url, {}, FetchContext(query="ask", shared=shared)) for url in urls]
+
+        assert [r.route for r in results] == ["url_context", "url_context", "direct"]
+        assert len(calls) == 2, "the third cited URL paid for a read past the per-question cap"
+        assert results[2].status == "blocked"
+        assert [(a.rung, a.skipped_reason) for a in results[2].rung_attempts] == [("url_context", "url_context_cap")]
+        assert _rung_counts(results)["url_context_reads"] == 2
+        assert _rung_counts(results)["url_context_cap_skips"] == 1
+
     async def test_the_read_lead_is_truncated_when_it_alone_exceeds_the_cap(self, monkeypatch):
         """The same pathological case as the archive lead: at a cap below the mandatory
         model-mediated disclosure's length, the earlier bare-lead return exceeded the per-URL

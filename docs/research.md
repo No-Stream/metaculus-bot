@@ -1067,7 +1067,11 @@ the budget after the pre-check is what keeps that ceiling honest, and a pre-chec
 records a `wall_budget` skip rather than a paid call nothing reads. It has its
 own retry count, `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`, deliberately lower than the v2
 reader's, because a retry inside a wall shared with every other cited URL spends the budget the
-pages already fetched need in order to render. Zero successful retrievals
+pages already fetched need in order to render. A per-QUESTION paid-read cap,
+`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`, bounds how many reads a single question can pay
+for across its cited URLs — the analogue of the Wayback per-question cap and a distinct quantity
+from the SDK retry count — claimed last, only for a read that has cleared every cheaper gate, and
+a read the cap declines records a `url_context_cap` skip. Zero successful retrievals
 DISCARDS the text under the new terminal status `ungrounded`, the same floor `gemini_search` and
 v2's `read_document` apply: Gemini answers fluently out of parametric memory when every
 retrieval failed, and a fluent unsourced answer under the primary-grading-evidence caption is
@@ -1123,7 +1127,10 @@ DOM-read cap or by the question's remaining wall budget: a page that keeps navig
 fact about the page rather than about the runner or the question's clock, and also invisible in
 `rendered_attempts`.
 `wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
-per-question cap is what binds. `fast_path_skips` is an expensive rung (the render, the paid read)
+per-question cap is what binds; `url_context_cap_skips` is the paid rung's analogue, a question
+that spent its per-question paid-read budget (`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`) on
+earlier cited URLs, so the spend cap binds rather than the wall or the flag. `fast_path_skips`
+is an expensive rung (the render, the paid read)
 declined because the QUESTION's close-derived budget put it on the time-budget fast path, a fact
 about the question's window rather than about the provider's own 45 s wall, which is what
 `rung_budget_skips` counts. `url_context_robots_skips` is the free `Google-Extended`

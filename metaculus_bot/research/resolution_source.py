@@ -167,6 +167,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
     RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
     RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV,
+    RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
     RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
     RESOLUTION_SOURCE_WALL_TIMEOUT,
     RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS,
@@ -797,6 +798,9 @@ class QuestionRungBudget:
     """
 
     wayback_attempts_left: int = RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS
+    # Paid url_context reads left for this question — the analogue of the Wayback cap, so a
+    # question citing several dead sources cannot pay per source inside one provider wall.
+    url_context_attempts_left: int = RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS
     # One browser escalation per host at a time WITHIN the question, see `browser_escalation_gate`.
     browser_escalation_gates: dict[str, asyncio.Semaphore] = field(default_factory=dict)
 
@@ -805,6 +809,13 @@ class QuestionRungBudget:
         if self.wayback_attempts_left <= 0:
             return False
         self.wayback_attempts_left -= 1
+        return True
+
+    def take_url_context_attempt(self) -> bool:
+        """Claim one paid url_context read for this question, or False when they are spent."""
+        if self.url_context_attempts_left <= 0:
+            return False
+        self.url_context_attempts_left -= 1
         return True
 
     def browser_escalation_gate(self, url: str) -> asyncio.Semaphore:
@@ -2287,6 +2298,18 @@ async def _url_context_admission(
     )
     if budget_s is None:
         return None
+    # Last, and only for a read that cleared every cheaper gate, so a slot is spent on a read
+    # that is actually about to fire — not on one robots or the wall already declined. Mirrors
+    # the Wayback per-question cap: a question citing several dead sources pays at most
+    # RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS times inside one provider wall.
+    if not ctx.shared.take_url_context_attempt():
+        logger.info(
+            "resolution_source: skipping the url_context rung for %s — this question's %d paid read(s) are spent",
+            urlparse(url).netloc,
+            RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
+        )
+        ctx.skip_rung("url_context", direct.status, url, "url_context_cap")
+        return None
     return api_key, budget_s
 
 
@@ -3029,6 +3052,9 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # cited URLs is a question whose per-question cap is binding, which is a different
         # thing to tune than a question that ran out of wall.
         "wayback_cap_skips": skips_by_reason["wayback_cap"],
+        # The paid rung's analogue: a question that spent its per-question paid-read budget on
+        # earlier cited URLs, which is the spend cap binding rather than the wall or the flag.
+        "url_context_cap_skips": skips_by_reason["url_context_cap"],
         # Its own count: an expensive rung declined because the QUESTION's close-derived budget
         # put it on the fast path, which is a fact about the question's window rather than about
         # the provider's own 45 s wall (`rung_budget_skips`) — the two are tuned differently.

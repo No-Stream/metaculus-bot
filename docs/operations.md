@@ -431,9 +431,12 @@ other than the live page: `RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS` (an archived 
 than this is withheld as `stale_data` rather than served, matching the Datawrapper freshness
 bound), `RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS` (snapshot fetches per question, since every
 snapshot contends on one host gate) and `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS` (the SDK retry
-count for one paid read, deliberately fewer than gap-fill v2 allows its reader).
-`docs/research.md` has the reasoning behind each. Read the values off `constants.py`; that is the
-only authoritative copy.
+count for one paid read, deliberately fewer than gap-fill v2 allows its reader). Two more bound
+the paid rung's spend per question: `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` caps how many
+paid reads one question may pay for across its cited URLs (the analogue of the Wayback cap, a
+distinct quantity from the SDK retry count above, recorded as a `url_context_cap` skip when it
+binds). `docs/research.md` has the reasoning behind each. Read the values off `constants.py`; that
+is the only authoritative copy.
 
 ### Gap-fill
 

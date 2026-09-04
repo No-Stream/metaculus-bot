@@ -148,6 +148,8 @@ FetchStatusReason = Literal[
 #
 # `wall_budget` — the rung's own floor was below the remaining provider wall (`claim_rung_budget`).
 # `wayback_cap` — the question spent its per-question snapshot attempts on earlier cited URLs.
+# `url_context_cap` — the question spent its per-question PAID-read attempts on earlier cited URLs
+#   (the paid rung's analogue of `wayback_cap`, bounding spend when the flag is on).
 # `fast_path` — an expensive rung (the browser, the paid reader) declined because the question's
 #   close-derived time budget put it on the fast path, a fact about the window not the 45 s wall.
 # `no_api_key` — the paid rung is flag-on but `GOOGLE_API_KEY` is unset, a misconfiguration that
@@ -169,6 +171,7 @@ FetchStatusReason = Literal[
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",
+    "url_context_cap",
     "fast_path",
     "no_api_key",
     "robots_disallowed",
