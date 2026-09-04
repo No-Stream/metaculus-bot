@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.provider_diagnostics import pop_provider_detail
+from metaculus_bot.research.rendered_fetch import RenderedPage
 from metaculus_bot.research.resolution_source import (
     _WAYBACK_TRIGGER_STATUSES,
     FetchContext,
@@ -21,10 +23,22 @@ from metaculus_bot.research.resolution_source import (
     FetchStatus,
     _fetch_one,
     _run_rung,
+    _rung_counts,
+    resolution_source_provider,
 )
 from metaculus_bot.research.robots_policy import reset_robots_cache
 from metaculus_bot.research.wayback import wayback_snapshot_url
-from tests.resolution_source_fakes import _RENDERED_PROSE, _URL, FakeResponse, FakeSession, _prose_page, _snapshot_url
+from tests.resolution_source_fakes import (
+    _RENDERED_PROSE,
+    _URL,
+    FakeResponse,
+    FakeSession,
+    _escape_config,
+    _fake_render,
+    _mock_question,
+    _prose_page,
+    _snapshot_url,
+)
 
 
 def _result(status: FetchStatus = "success") -> FetchResult:
@@ -167,3 +181,97 @@ class TestAVerdictKeepsItsOwnRoute:
             ("wayback", "stale_data", ""),
             ("url_context", None, "no_api_key"),
         ]
+
+
+# The abs.gov.au shape the extractor policy was calibrated on: about 2,000 chars of 48-char
+# listing lines, well over the chrome floor and nothing but a menu, so real trafilatura extracts
+# it and the line-shape metric withholds it.
+_MENU_TREE = (
+    "<!doctype html><html><head><title>Labour Force, Australia</title></head><body><nav>Home</nav><main>"
+    "<h1>Labour Force, Australia</h1><ul>"
+    + "".join(f"<li>Labour Force, Australia, release {i:02d} 2026 Archive release</li>" for i in range(36))
+    + "</ul></main></body></html>"
+).encode()
+
+
+class TestChromeMetricWithholdCounts:
+    """A metric withhold is a fact about the URL's ladder and is counted wherever the ladder ends.
+
+    Summed off the final result's own flag, a menu tree the rendered rung then rescued reached
+    neither key: the rescue's extraction was never withheld, so `chrome_metric_withholds` lost
+    exactly the population the policy exists to hand to the browser. The direct fetch's flag is
+    carried onto the rescue, and `chrome_metric_withholds_rescued` counts the carried-and-served
+    subset.
+    """
+
+    async def test_a_withhold_with_no_rescue_counts_once_and_is_not_a_rescue(self):
+        session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
+
+        result = await _fetch_one(session, _URL, {})
+
+        assert result.status == "no_resolving_content"
+        assert result.chrome_metric_withheld is True
+        counts = _rung_counts([result])
+        assert counts["chrome_metric_withholds"] == 1
+        assert counts["chrome_metric_withholds_rescued"] == 0
+
+    async def test_a_withhold_the_rendered_rung_rescued_is_counted_under_both_keys(self, monkeypatch):
+        page = RenderedPage(url=_URL, content_type="text/html", html=_prose_page(_RENDERED_PROSE).decode())
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
+
+        result = await _fetch_one(session, _URL, {})
+
+        assert result.status == "success"
+        assert result.route == "rendered"
+        assert "47.2 percent" in result.text
+        # Carried from the direct fetch: the rendered DOM's own extraction passed the metric.
+        assert result.chrome_metric_withheld is True
+        assert result.precision_rescued is False
+        counts = _rung_counts([result])
+        assert counts["chrome_metric_withholds"] == 1
+        assert counts["chrome_metric_withholds_rescued"] == 1
+
+    async def test_a_chart_block_publishing_alone_is_a_withhold_but_not_a_rescue(self):
+        """The chart block is the direct fetch's own content, so `route` stays `direct`."""
+        config = {"xAxis": [{"categories": ["2024", "2025"]}], "series": [{"name": "Unemployed", "data": [1, 2]}]}
+        page = _MENU_TREE.replace(
+            b"</ul></main>",
+            f'</ul><div class="charts-highchart" data-chart="{_escape_config(config)}"></div></main>'.encode(),
+        )
+        session = FakeSession({_URL: FakeResponse(200, body=page)})
+
+        result = await _fetch_one(session, _URL, {})
+
+        assert result.status == "success"
+        assert result.route == "direct"
+        assert result.chrome_metric_withheld is True
+        counts = _rung_counts([result])
+        assert counts["chrome_metric_withholds"] == 1
+        assert counts["chrome_metric_withholds_rescued"] == 0
+
+    async def test_a_page_the_metric_never_withheld_moves_neither_key(self, article_html):
+        session = FakeSession({_URL: FakeResponse(200, body=article_html)})
+
+        result = await _fetch_one(session, _URL, {})
+
+        assert result.status == "success"
+        counts = _rung_counts([result])
+        assert counts["chrome_metric_withholds"] == 0
+        assert counts["chrome_metric_withholds_rescued"] == 0
+
+    async def test_the_rescued_key_reaches_the_provider_detail(self, monkeypatch):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        page = RenderedPage(url=_URL, content_type="text/html", html=_prose_page(_RENDERED_PROSE).decode())
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per {_URL} on release.")
+
+        await resolution_source_provider(is_benchmarking=False)(q)
+
+        detail = pop_provider_detail(q.id_of_question, "resolution_source")
+        assert detail["sources"] == {"tracker.example.com": "ok"}
+        assert detail["counts"]["chrome_metric_withholds"] == 1
+        assert detail["counts"]["chrome_metric_withholds_rescued"] == 1
+        assert detail["counts"]["rendered_attempts"] == 1

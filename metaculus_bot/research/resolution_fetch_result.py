@@ -395,14 +395,20 @@ class FetchResult:
     # majority and renders no extra telemetry at all.
     route: FetchRoute = "direct"
     rung_attempts: list[RungAttempt] = field(default_factory=list)
-    # The HTML extractor policy's decision (`resolution_source._extract_page_text`); False off
-    # the HTML path. `chrome_metric_withheld`: the extraction cleared the chrome floor on
-    # navigation alone and the line-shape metric withheld it. That is an extraction the metric
-    # withheld, not necessarily a page: on a chart-rescued page the chart block still publishes
-    # alone and this stays True, while on a page with no chart block the `thin_page` reason
-    # covers this and the under-floor case alike. `precision_rescued`: the published text is the
-    # `favor_precision` re-extraction, taken after the default one failed that metric. Both
-    # ride `details["counts"]`, so no status or reason token moved.
+    # The HTML extractor policy's decisions (`resolution_source._extract_page_text`); False off
+    # the HTML path. `chrome_metric_withheld`: the line-shape metric withheld an HTML extraction
+    # of this URL somewhere on its ladder — an extraction that cleared the chrome floor on
+    # navigation alone. That is a fact about the URL's ladder, not necessarily about this
+    # result's text: on a chart-rescued page the chart block still publishes alone and this
+    # stays True; on a page with no chart block the `thin_page` reason covers this and the
+    # under-floor case alike; and on a page a later rung rescued (the rendered DOM, a derived
+    # feed, the paid reader) the flag is CARRIED from the direct fetch onto the rescue
+    # (`_fetch_one`), whose own extraction the metric never saw, so the withholds the ladder
+    # then paid off are counted rather than lost. `precision_rescued`: the published text is the
+    # `favor_precision` re-extraction, taken after the default one failed that metric (this
+    # result's own; an archived copy carries the snapshot's). Both ride `details["counts"]`
+    # (`chrome_metric_withholds`, `chrome_metric_withholds_rescued`,
+    # `precision_fallback_rescues`), so no status or reason token moved.
     chrome_metric_withheld: bool = False
     precision_rescued: bool = False
     # Provenance for Tier-2 dataset results (None on ordinary page fetches).

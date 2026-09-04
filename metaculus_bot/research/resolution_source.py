@@ -2615,6 +2615,12 @@ async def _fetch_one(
     # once it returns, and its status is what they left standing.
     ctx.close_rungs(0, direct.status)
     escalated = await _escalate_unresolved(session, url, direct, host_sems=host_sems, ctx=ctx)
+    if direct.chrome_metric_withheld:
+        # The withhold is a fact about this URL's ladder, carried onto whatever the ladder
+        # returns for it: a rung's rescue has its own extraction, which the metric never
+        # withheld, so summed off final results alone the withholds the ladder then paid off
+        # — the policy's whole point — reached no count at all (`chrome_metric_withholds`).
+        escalated.chrome_metric_withheld = True
     return _stamped_with_route(escalated, ctx)
 
 
@@ -3212,11 +3218,19 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # flag on and GOOGLE_API_KEY unset the paid rung fires nowhere, and without this key
         # that run is byte-identical in the archive to one with the flag off.
         "url_context_no_api_key_skips": skips_by_reason["no_api_key"],
-        # The extractor policy's two decisions, per final result: an extraction the line-shape
-        # metric withheld because it cleared the chrome floor on navigation alone (including a
-        # chart-rescued page, whose chart block still published), and a page published from
-        # the precision re-extraction after the default one failed the same metric.
+        # The extractor policy's decisions, per cited URL. `chrome_metric_withholds`: the
+        # line-shape metric withheld an HTML extraction of the URL somewhere on its ladder — the
+        # final result's own (including a chart-rescued page, whose chart block still published
+        # without that text) or the direct fetch's, carried onto the rung result that replaced it
+        # (`_fetch_one`). `chrome_metric_withholds_rescued`: the subset a rung past the direct
+        # fetch then served (`route` is not `direct` and the result is a success) — the policy's
+        # headline win, a menu tree withheld and the price table rendered, which summed off the
+        # rescue's own flag alone reached neither key. `precision_fallback_rescues`: the published
+        # text is the precision re-extraction, taken after the default one failed the metric.
         "chrome_metric_withholds": sum(1 for r in results if r.chrome_metric_withheld),
+        "chrome_metric_withholds_rescued": sum(
+            1 for r in results if r.chrome_metric_withheld and r.status == "success" and r.route != "direct"
+        ),
         "precision_fallback_rescues": sum(1 for r in results if r.precision_rescued),
     }
 
