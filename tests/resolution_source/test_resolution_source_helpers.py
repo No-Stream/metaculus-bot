@@ -205,6 +205,23 @@ class TestSkipPredicates:
         # A host that merely contains the string is not a self-ref.
         assert is_metaculus_self_ref("https://notmetaculus.com/x") is False
 
+    def test_is_metaculus_self_ref_sees_through_a_wayback_capture(self):
+        """A capture of a Metaculus page is the question quoting itself with an archive in front
+        of it; the hostname check alone reads `web.archive.org` and lets it through — at any
+        depth of nesting."""
+        assert (
+            is_metaculus_self_ref("https://web.archive.org/web/20240101000000/https://www.metaculus.com/q/1/") is True
+        )
+        assert (
+            is_metaculus_self_ref(
+                "https://web.archive.org/web/20260901000000id_/"
+                "https://web.archive.org/web/20240101000000/https://metaculus.com/questions/45001/"
+            )
+            is True
+        )
+        # A capture of an ordinary page is still an ordinary (fetchable) source.
+        assert is_metaculus_self_ref("https://web.archive.org/web/20240101000000/https://www.bls.gov/cpi/") is False
+
     def test_is_fred_url(self):
         assert is_fred_url("https://fred.stlouisfed.org/series/DGS10") is True
         assert is_fred_url("https://stlouisfed.org/other") is False
@@ -239,6 +256,16 @@ class TestSelectFetchableUrls:
             "Details at https://b.example.com/y",
         )
         assert set(urls) == {"https://a.example.com/x", "https://b.example.com/y"}
+
+    def test_a_cited_capture_of_a_metaculus_page_is_dropped_like_the_page_itself(self):
+        """Directly cited, the capture never reaches the Wayback rung's own unwrap check: it is
+        fetched as an ordinary page. The selection filter is where it has to be caught."""
+        criteria = (
+            "Resolves per https://web.archive.org/web/20240101000000/https://www.metaculus.com/questions/45001/ "
+            "and https://web.archive.org/web/20260801000000/https://www.bls.gov/cpi/."
+        )
+        urls = select_fetchable_urls(criteria, "")
+        assert urls == ["https://web.archive.org/web/20260801000000/https://www.bls.gov/cpi/"]
 
     def test_cap_applied_after_skip_filter(self, monkeypatch):
         # F2 regression: cap must apply AFTER dropping self-refs/FRED/Yahoo, or

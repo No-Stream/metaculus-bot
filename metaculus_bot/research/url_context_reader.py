@@ -88,5 +88,7 @@ def run_url_context_read(
     )
     log_gemini_usage(response, role=role, model=model)
     _, _, n_url_success, entries = extract_url_context_telemetry(response)
-    text = getattr(response, "text", "")
-    return (text if isinstance(text, str) else "", n_url_success, [status for status, _url in entries])
+    # `.text` is the SDK's documented property, `None` when the response carries no text part;
+    # read directly so an SDK rename fails loudly rather than as "the model answered nothing" on
+    # a call that was paid for.
+    return (response.text or "", n_url_success, [status for status, _url in entries])

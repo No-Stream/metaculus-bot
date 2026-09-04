@@ -238,8 +238,10 @@ than traded away.
 
 Before the paid `url_context` read — and only there; the free rungs are unaffected —
 `read_document` fetches `<scheme>://<host>/robots.txt` once per host through the same
-SSRF-guarded plain fetch (`_fetch_plain`, under `_ROBOTS_FETCH_TIMEOUT_S`), with the verdict
-cached process-wide. Only the `Google-Extended` group is honoured,
+SSRF-guarded plain fetch (`_fetch_plain`, under `robots_policy.ROBOTS_FETCH_TIMEOUT_S`, the
+bound the Tier-1 resolution-source reader shares), with the verdict cached process-wide and
+filled single-flight, so concurrent callers on one host share one read. Only the
+`Google-Extended` group is honoured,
 because that is the product token Gemini's retrieval obeys: a host disallowing it refuses
 the fetch server-side, so the read is spend with a known-zero return, which is what makes one
 free request worth it. `urllib.robotparser` cannot express that —

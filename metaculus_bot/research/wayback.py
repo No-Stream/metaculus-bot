@@ -105,6 +105,20 @@ def parse_snapshot_url(final_url: str) -> WaybackSnapshot | None:
     return WaybackSnapshot(captured_at=captured_at, inner_url=inner_url)
 
 
+def innermost_url(url: str) -> str:
+    """The URL a snapshot is ultimately a capture OF, unwrapping nested captures; ``url`` itself
+    when it is not a snapshot URL.
+
+    Repeated rather than single-level because the archive stores captures of its own capture
+    URLs, and a capture OF a capture presents ``web.archive.org`` as its inner host — which clears
+    a hostname-keyed self-reference check and a public-URL check at one level of unwrapping.
+    Terminates because every pass strictly shortens the string.
+    """
+    while (snapshot := parse_snapshot_url(url)) is not None:
+        url = snapshot.inner_url
+    return url
+
+
 def snapshot_age_days(snapshot: WaybackSnapshot, now: datetime) -> float | None:
     """How many days before ``now`` the capture was taken, or None when that is unusable.
 

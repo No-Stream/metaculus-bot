@@ -1028,9 +1028,13 @@ class TestResolutionSourceFetchMarker:
         # declines — so the second skip is the transport reporting itself unavailable rather than
         # another budget skip.
         assert counts["renderer_unavailable_skips"] == 1
+        # The same budget skip once more under its per-rung key, so the archive can say WHICH
+        # rung the wall bound; the aggregate stays as it was.
+        assert counts["meta_refresh_budget_skips"] == 1
         # A total rather than an exact dict: the key SET grows every time a rung lands, and a
-        # literal here made three unrelated commits edit this one test.
-        assert sum(counts.values()) == 2
+        # literal here made three unrelated commits edit this one test. Three, not two, because
+        # the budget skip is counted in the aggregate AND in its per-rung key.
+        assert sum(counts.values()) == 3
 
 
 class TestFetchResolutionSources:

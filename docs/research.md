@@ -1032,7 +1032,9 @@ sails past every self-reference filter in the pipeline, and a failed SSRF or sel
 refuses the rung outright. Then a capture the archive never served DECLINES, leaving the direct
 status standing, because "no archived copy exists" is a different fact from a stale one and the
 direct status says more about the source. Only a capture we did read and cannot date, or can date
-and it is too old, is withheld as `stale_data`.
+and it is too old, is withheld as `stale_data`. A withhold does not end the ladder: the paid rung
+below is still asked about the DIRECT outcome (a stale archive is still a page we could not read
+fresh), and the withhold is what stands when that rung is off or declines.
 
 `route=url_context` is the LAST rung and the only paid one: Gemini reads the page for us
 (`research/url_context_reader.py`, the reader shared with gap-fill v2's `read_document`),
@@ -1040,10 +1042,16 @@ reaching hosts our own client cannot because Gemini dials from Google's address.
 default behind `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` and set in no workflow yaml, so it fires
 nowhere in production today; `docs/operations.md` covers what turning it on costs and on whose
 key. Every gate is checked in increasing cost order before a cent is spent: the trigger statuses
-(`blocked`, `js_wall`, `error`, `no_resolving_content`), the flag, the free per-host
-`Google-Extended` robots pre-check (`research/robots_policy.py`, whose cache is shared with v2's
-reader, worth a request of its own because a host disallowing that token refuses Gemini's fetch
-server-side), the API key, and the `RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S` floor. It has its
+(`blocked`, `js_wall`, `error`, `no_resolving_content`, tested against the DIRECT outcome, so a
+withheld Wayback capture on the way down does not close the rung), the flag, the API key, the
+`RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S` floor, then the per-host `Google-Extended` robots
+pre-check (`research/robots_policy.py`, whose cache and `ROBOTS_FETCH_TIMEOUT_S` bound are shared
+with v2's reader; worth a request of its own because a host disallowing that token refuses
+Gemini's fetch server-side), and the budget floor a SECOND time. The pre-check is the one gate
+that costs a request, and the paid read runs in a thread that `asyncio.wait_for` cannot cancel, so
+the client-side ceiling sized off the remaining budget is the only bound that can stop it; re-reading
+the budget after the pre-check is what keeps that ceiling honest, and a pre-check that ate the room
+records a `wall_budget` skip rather than a paid call nothing reads. It has its
 own retry count, `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`, deliberately lower than the v2
 reader's, because a retry inside a wall shared with every other cited URL spends the budget the
 pages already fetched need in order to render. Zero successful retrievals
@@ -1074,18 +1082,23 @@ every page that already fetched when it fires, so an overrunning rung costs the 
 question's resolution evidence rather than just its own attempt. A rung that FIRED
 records itself on the result (`route=` on the fetch marker, plus one
 `RESOLUTION_SOURCE_ESCALATION` line); a rung that was SKIPPED is counted under
-`details["counts"]` instead of logged, alongside the fired counts. Fourteen keys, and a zero
+`details["counts"]` instead of logged, alongside the fired counts. A zero
 renders nothing while still surviving into the archive, which is what makes "the rung existed
 and never fired" distinguishable from "this record predates the rung". Six of the keys count
 rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
-`derived_api_reads`, `wayback_attempts` and `url_context_reads`. Six count rungs that
-were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
-because each names a different binding constraint. The last two count the extractor policy's
-decisions rather than rungs, per final result: `chrome_metric_withholds` is a page whose
+`derived_api_reads`, `wayback_attempts` and `url_context_reads`. Two count the extractor
+policy's decisions rather than rungs, per final result: `chrome_metric_withholds` is a page whose
 extraction cleared the chrome floor on navigation alone and was withheld by the line-shape
 metric (its `reason` is the same `thin_page` an under-floor page carries, so this count is
 what separates the two), and `precision_fallback_rescues` is a page published from the
-`favor_precision` re-extraction after the default one failed that metric. `rung_budget_skips` is the question that ran out of wall.
+`favor_precision` re-extraction after the default one failed that metric. The rest count rungs that
+were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
+because each names a different binding constraint. `rung_budget_skips` is the question that ran
+out of wall, summed over every rung; the same skips are broken out per rung as
+`meta_refresh_budget_skips`, `pdf_local_budget_skips`, `derived_api_budget_skips`,
+`rendered_budget_skips`, `wayback_budget_skips` and `url_context_budget_skips`, because the
+aggregate cannot say WHICH rung the wall is binding on and "how often is the paid rung starved
+by the pages before it" is the question the flag's rollout asks.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
 parse gate is what binds. `renderer_unavailable_skips` is a browser rung that never rendered,
 most often because Chromium is missing on the runner (the install step is `continue-on-error` in
@@ -1095,11 +1108,15 @@ DOM-read cap or by the question's remaining wall budget: a page that keeps navig
 fact about the page rather than about the runner or the question's clock, and also invisible in
 `rendered_attempts`.
 `wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
-per-question cap is what binds. `url_context_robots_skips` is the free `Google-Extended`
+per-question cap is what binds. `fast_path_skips` is an expensive rung (the render, the paid read)
+declined because the QUESTION's close-derived budget put it on the time-budget fast path, a fact
+about the question's window rather than about the provider's own 45 s wall, which is what
+`rung_budget_skips` counts. `url_context_robots_skips` is the free `Google-Extended`
 pre-check earning its request: the host would have refused the read server-side, so that is
-spend avoided rather than a page lost and it must not read as a failure. One skip reason has no
-count of its own: the paid rung's `no_api_key`, which is a misconfiguration rather than a tuning
-signal.
+spend avoided rather than a page lost and it must not read as a failure. `url_context_no_api_key_skips`
+is the paid rung enabled with no `GOOGLE_API_KEY` set: a misconfiguration rather than a tuning
+signal, and counted precisely because without it "flag on, key missing" is byte-identical in the
+archive to "flag off".
 
 It is **SSRF-hardened** because these URLs are user-authored and fetches run from
 CI: a preflight `is_public_http_url` check rejects private / loopback /
@@ -1250,12 +1267,15 @@ documented here rather than re-spelled on either side. See "Reading run logs" in
 
 The paid rung adds two greppable log lines that are deliberately NOT registered as marker specs:
 `RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...` (an INFO, the free pre-check
-avoiding a known-zero paid read) and `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED: url=...
-statuses=...` (a WARN, a paid read discarded for retrieving nothing). With the flag off in every
+avoiding a known-zero paid read) and `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=...
+statuses=...` (a WARN, a paid read discarded for retrieving nothing; `statuses` is every reported
+`url_retrieval_status`, `none` when the SDK attached no entry). With the flag off in every
 workflow neither can fire in production, so a spec would only add an always-empty archive
 column; both are FUTURE marker-spec candidates, to be registered if the flag is ever turned on,
-which is when their rates start meaning something. Their `agentic_*` twins on the gap-fill v2
-reader already carry specs and are the pattern to follow.
+which is when their rates start meaning something. Their spellings are pinned by tests so the
+eventual spec matches the lines, and they are parallel to their `AGENTIC_URLCONTEXT_ROBOTS_SKIP`
+/ `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` twins on the gap-fill v2 reader, which already carry
+specs and are the pattern to follow.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window), on the same leakage rationale. The section
@@ -1410,7 +1430,11 @@ Gemini grounded search, which uses the personal Google key directly.
 
 All of that is subject to the question's close-derived time budget: a question on the
 fast path runs the primary plus the cheap hard-capped providers only, with the slow
-optional search providers dropped and BOTH gap-fill passes skipped. See the pipeline's
+optional search providers dropped and BOTH gap-fill passes skipped. The resolution-source
+fetcher stays in but learns about the fast path too (`resolution_source_provider(...,
+fast_path=)`), and its two EXPENSIVE escalation rungs, the Chromium render and the paid
+`url_context` read, decline on it before any side effect, each recording a `fast_path` skip
+(`counts["fast_path_skips"]`); the cheap rungs run as they do off it. See the pipeline's
 time-budget step for how the budget is granted and what it cuts.
 
 ## Cost note

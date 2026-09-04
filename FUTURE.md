@@ -1317,6 +1317,18 @@ Follow-ups:
    trafilatura. Same extraction-fidelity family as the Datawrapper hop in item 2, and NOT covered by
    items 1 to 3 above (conditional summarization would summarize the same defective extraction).
    (`scratch/residual_2026-08-24/dossiers/44870_verification.md` §2.1.)
+7. **LOW — a DIRECTLY cited Wayback capture renders with no age line (added 2026-09-03).** A
+   question whose criteria cite `https://web.archive.org/web/<14 digits>/<page>` outright is
+   fetched by `_fetch_direct` as an ordinary page, so it never passes through the Wayback rung
+   and never gets the `wayback_lead` capture-date / age disclosure that rung makes mandatory. The
+   self-reference half is closed: `is_metaculus_self_ref` now judges the innermost URL of a
+   capture at any nesting depth, so a cited capture of a Metaculus page is dropped at selection.
+   The disclosure half is deliberately NOT retrofitted onto the direct path: the section heading
+   already prints the cited URL with its 14-digit timestamp, the lead's wording ("the live page
+   could not be fetched") would be false for a capture the question chose to cite, and that
+   path's all-direct output is byte-identically pinned. If a residual round ever finds a
+   forecaster misreading a cited capture as live, the fix is a separate lead for the cited-capture
+   shape, rendered from `parse_snapshot_url` on the cited URL.
 
 ### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
 

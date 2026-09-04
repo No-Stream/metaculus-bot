@@ -517,6 +517,30 @@ class TestProviderSelection:
         names = [n for _, n in providers]
         assert "resolution_source" in names
 
+    @pytest.mark.parametrize("fast_path", [True, False])
+    def test_resolution_source_learns_about_the_fast_path(self, mock_llm, monkeypatch, fast_path):
+        """The provider's two EXPENSIVE rungs (the browser, the paid reader) decline on the fast
+        path, and the factory call here is the only place the flag can reach it."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("GEMINI_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "false")
+        monkeypatch.delenv("ASKNEWS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("ASKNEWS_SECRET", raising=False)
+        monkeypatch.delenv("EXA_API_KEY", raising=False)
+        monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PROVIDER", raising=False)
+        factory = MagicMock(return_value=AsyncMock(return_value=""))
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
+        with patch("metaculus_bot.research.resolution_source.resolution_source_provider", factory):
+            providers = orch._select_research_providers(fast_path=fast_path)
+
+        assert "resolution_source" in [n for _, n in providers]
+        factory.assert_called_once_with(is_benchmarking=False, fast_path=fast_path)
+
     def test_excludes_resolution_source_when_flag_unset(self, mock_llm, monkeypatch):
         monkeypatch.delenv("RESOLUTION_SOURCE_ENABLED", raising=False)
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")

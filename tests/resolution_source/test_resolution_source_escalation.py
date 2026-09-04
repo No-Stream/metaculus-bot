@@ -220,8 +220,12 @@ class TestRenderedRungBudget:
         assert calls == []
         skips = [a for a in result.rung_attempts if a.rung == "rendered"]
         assert [a.skipped_reason for a in skips] == ["wall_budget"]
-        assert _rung_counts([result])["rung_budget_skips"] == 1
-        assert _rung_counts([result])["rendered_attempts"] == 0
+        counts = _rung_counts([result])
+        assert counts["rung_budget_skips"] == 1
+        # The aggregate cannot say WHICH rung the wall bound; the per-rung key can.
+        assert counts["rendered_budget_skips"] == 1
+        assert counts["url_context_budget_skips"] == 0
+        assert counts["rendered_attempts"] == 0
 
     async def test_the_navigation_budget_comes_off_the_remaining_wall(self, monkeypatch):
         """A render admitted with 20 s left may not then help itself to the full 35 s cap."""
@@ -501,6 +505,44 @@ class TestDerivedApiRung:
         assert "DIFFERENT page" in second.text
         assert _URL in second.text
 
+    async def test_two_same_host_urls_fetched_concurrently_share_one_launch(self, monkeypatch):
+        """The shape prod actually takes: `fetch_resolution_sources` fans one task out per cited
+        URL, so both same-host URLs reach `endpoint_for` before either render has finished. The
+        second must wait for the first's escalation and then take the feed off an ordinary GET,
+        or the docstring's "one Chromium launch per host" is true only for sequential fetches."""
+        calls: list[dict[str, object]] = []
+        harvested = self._harvested()
+
+        async def _slow_render(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False):
+            calls.append({"url": url, "goto_timeout_ms": goto_timeout_ms, "harvest_json": harvest_json})
+            del host_gate
+            # Long enough that the sibling task reaches its own escalation while this render is
+            # still in flight, which is the interleaving the fan-out produces.
+            await asyncio.sleep(0.02)
+            return harvested
+
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(resolution_source, "render_page", _slow_render)
+        second_url = "https://tracker.example.com/house"
+        session = FakeSession(
+            {
+                _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                second_url: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                _FEED_URL: FakeResponse(200, body=self._FEED.encode(), content_type="application/json"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        question = _mock_question(resolution_criteria=f"Resolves per {_URL} and {second_url}")
+
+        section = await resolution_source_provider(is_benchmarking=False)(question)
+
+        assert len(calls) == 1, "the second same-host URL launched its own browser"
+        assert _FEED_URL in session.requested
+        counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
+        assert counts["rendered_attempts"] == 1
+        assert counts["derived_api_reads"] == 2
+        assert ROUTE_CAVEATS["derived_api"] in section
+
     async def test_a_feed_that_fails_hands_the_url_on_to_the_browser(self, monkeypatch):
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))
@@ -521,6 +563,33 @@ class TestDerivedApiRung:
         # The dead feed did not end the ladder: the browser ran for the second URL too.
         assert len(calls) == 2
         assert second.route == "derived_api"
+
+    async def test_a_remembered_endpoint_answering_html_is_not_served_as_the_feed(self, monkeypatch):
+        """The harvest half gates on a JSON content type; the reuse half — the path that fires on
+        every later cited URL on the host — did not, so a remembered endpoint answering 200 with
+        a "session expired" portal page was published as the page's data feed, under a lead
+        saying it was the JSON the page loads its figures from."""
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))
+        second_url = "https://tracker.example.com/house"
+        portal = _prose_page("Your session has expired. " * 30)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                second_url: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                _FEED_URL: FakeResponse(200, body=portal, content_type="text/html; charset=utf-8"),
+            }
+        )
+
+        await _fetch_one(session, _URL, {})
+        second = await _fetch_one(session, second_url, {})
+
+        assert _FEED_URL in session.requested
+        # Declined, so the URL fell through to the browser, whose own harvest served it.
+        assert len(calls) == 2
+        assert second.route == "derived_api"
+        assert "session has expired" not in second.text
+        assert second.text.startswith("[This page's own HTML carried no readable content.")
 
     async def test_the_derived_get_is_skipped_below_its_floor(self, monkeypatch):
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), []))
@@ -543,6 +612,10 @@ class TestDerivedApiRung:
             ("rendered", "wall_budget"),
         ]
         assert _FEED_URL not in session.requested
+        counts = _rung_counts([second])
+        assert counts["rung_budget_skips"] == 2
+        assert counts["derived_api_budget_skips"] == 1
+        assert counts["rendered_budget_skips"] == 1
 
     async def test_an_undecodable_feed_is_never_served_as_content(self, monkeypatch):
         """A body we could not decode must not become the page's content on a section
@@ -604,7 +677,14 @@ class TestWaybackRung:
     def _archive_page(self) -> bytes:
         return _prose_page(_RENDERED_PROSE)
 
-    def _session(self, *, page: FakeResponse, captured: datetime, archived: FakeResponse | None = None) -> FakeSession:
+    def _session(
+        self,
+        *,
+        page: FakeResponse,
+        captured: datetime,
+        archived: FakeResponse | None = None,
+        extra: dict[str, FakeResponse] | None = None,
+    ) -> FakeSession:
         """A session where the cited URL fails and the archive redirects to a dated capture."""
         snapshot = _snapshot_url(_URL, captured=captured)
         return FakeSession(
@@ -612,6 +692,7 @@ class TestWaybackRung:
                 _URL: page,
                 wayback_snapshot_url(_URL, now=self._NOW): FakeResponse(302, headers={"Location": snapshot}),
                 snapshot: archived or FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+                **(extra or {}),
             }
         )
 
@@ -670,6 +751,39 @@ class TestWaybackRung:
         # The direct route's own status is not lost by the swap: the escalation line carries it.
         assert [(a.rung, a.from_status) for a in result.rung_attempts] == [("wayback", "blocked")]
 
+    async def test_a_withheld_capture_still_hands_the_url_to_the_paid_reader(self, monkeypatch):
+        """A stale archive is still a page we could not read fresh, which is exactly the
+        population the paid rung was built for. Only a RESCUE ends the ladder early; the
+        withhold stays the fallback when the reader is off or declines, so the `stale_data`
+        marker pair above stands unchanged."""
+        calls: list[dict[str, object]] = []
+
+        def _read(url, ask, **kwargs):
+            calls.append({"url": url, "ask": ask, **kwargs})
+            return ("The page reports 12 major work stoppages.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
+
+        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
+        reset_robots_cache()
+        session = self._session(
+            page=FakeResponse(403, body=b"", content_type="text/html"),
+            captured=self._NOW - timedelta(days=400),
+            extra={
+                "https://tracker.example.com/robots.txt": FakeResponse(
+                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
+                )
+            },
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(now=self._NOW, query="ask"))
+
+        assert [call["url"] for call in calls] == [_URL]
+        assert result.status == "success"
+        assert result.route == "url_context"
+        # The archive attempt is still on the record: it fired, and the reader came after it.
+        assert [a.rung for a in result.rung_attempts] == ["wayback", "url_context"]
+
     async def test_an_undatable_snapshot_is_withheld_too(self):
         """The archive answering our four-digit request means it never landed on a capture, and a
         copy with no usable date cannot carry the age disclosure."""
@@ -703,6 +817,29 @@ class TestWaybackRung:
 
         assert result.status == "blocked"
         assert result.route == "wayback"
+        assert result.text == ""
+
+    @pytest.mark.parametrize(
+        "innermost",
+        ["https://www.metaculus.com/questions/45001/", "http://169.254.169.254/latest/meta-data/"],
+    )
+    async def test_a_nested_capture_is_unwrapped_to_its_innermost_url(self, innermost):
+        """A capture OF a capture presents `web.archive.org` as its inner host, which clears both
+        the self-reference test and the public-URL test at one level of unwrapping."""
+        captured = self._NOW - timedelta(days=2)
+        inner = _snapshot_url(innermost, captured=captured - timedelta(days=1))
+        wrapped = _snapshot_url(inner, captured=captured)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": wrapped}),
+                wrapped: FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "blocked"
         assert result.text == ""
 
     async def test_a_snapshot_wrapping_a_private_address_is_refused(self, monkeypatch):
@@ -792,6 +929,38 @@ class TestWaybackRung:
         assert _rung_counts(results)["wayback_attempts"] == 2
         assert _rung_counts(results)["wayback_cap_skips"] == 1
 
+    async def test_an_archived_pdf_keeps_the_wayback_route_and_its_caveat(self):
+        """The snapshot fetch runs on a CHILD context, so the rungs the archive's own bytes go
+        through (here the local PDF read) stay off the cited URL's record.
+
+        Sharing the page's context stamped this result `route=pdf_local`, double-counted one
+        rescue as a Wayback attempt AND a document read, and — because `_route_caveats` keys on
+        the route — rendered the PDF sentence while DROPPING the archived-copy disclosure the
+        operator made the condition of admitting a snapshot at all."""
+        session = self._session(
+            page=FakeResponse(403, body=b"denied", content_type="text/html"),
+            captured=self._NOW - timedelta(days=3),
+            archived=FakeResponse(
+                200,
+                body=build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2 as of August 24"]]),
+                content_type="application/pdf",
+            ),
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(now=self._NOW, query="hospitalizations reported"))
+
+        assert result.status == "success"
+        assert result.route == "wayback"
+        assert [a.rung for a in result.rung_attempts] == ["wayback"]
+        assert result.text.startswith("[Archived copy from the Wayback Machine, captured 2026-09-01, 3 days before")
+        assert "922" in result.text
+        counts = _rung_counts([result])
+        assert counts["wayback_attempts"] == 1
+        assert counts["pdf_documents_read"] == 0
+        rendered = format_resolution_sections([result], self._NOW)
+        assert ROUTE_CAVEATS["wayback"] in rendered
+        assert ROUTE_CAVEATS["pdf_local"] not in rendered
+
     async def test_an_archived_page_that_is_itself_unreadable_leaves_the_direct_status(self, caplog):
         session = self._session(
             page=FakeResponse(403, body=b"", content_type="text/html"),
@@ -876,30 +1045,58 @@ class TestUrlContextRung:
         assert calls[0]["role"] == "resolution_source"
         assert _rung_counts([result])["url_context_reads"] == 1
 
-    async def test_zero_retrievals_discards_the_text(self, monkeypatch):
+    async def test_zero_retrievals_discards_the_text(self, monkeypatch, caplog):
         """Gemini answers fluently out of parametric memory when every retrieval failed (Q38195),
         and this section is captioned primary grading evidence."""
         reader, _calls = self._reader(retrievals=0, statuses=["URL_RETRIEVAL_STATUS_ERROR"])
         self._arm(monkeypatch, reader)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "ungrounded"
         assert result.text == ""
+        # Deliberately unregistered while the flag is off everywhere, so the spelling is pinned
+        # HERE: parallel to AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED, the v2 reader's twin, so the
+        # spec that eventually registers it matches the lines already in the logs.
+        assert (
+            "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate "
+            "statuses=URL_RETRIEVAL_STATUS_ERROR"
+        ) in caplog.messages
 
-    async def test_a_google_extended_disallowing_host_is_skipped_before_paying(self, monkeypatch):
+    async def test_the_ungrounded_line_says_none_when_the_sdk_reported_no_statuses(self, monkeypatch, caplog):
+        def _read(url, ask, **kwargs):
+            del url, ask, kwargs
+            return ("", 0, [])
+
+        self._arm(monkeypatch, _read)
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+            await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+
+        assert (
+            "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate statuses=none"
+        ) in caplog.messages
+
+    async def test_a_google_extended_disallowing_host_is_skipped_before_paying(self, monkeypatch, caplog):
         """Proven live 2026-09-03: a host that disallows the token refuses the fetch server-side,
         so the read would be spend with a known-zero return."""
         reader, calls = self._reader()
         self._arm(monkeypatch, reader)
         session = self._session(robots=b"User-agent: Google-Extended\nDisallow: /\n")
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "blocked"
         assert result.route == "direct"
         assert calls == []
         assert _rung_counts([result])["url_context_robots_skips"] == 1
+        # Unregistered while the flag is off everywhere, so pinned here; parallel to the v2
+        # reader's AGENTIC_URLCONTEXT_ROBOTS_SKIP.
+        assert (
+            "RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=https://tracker.example.com/senate host=tracker.example.com"
+        ) in caplog.messages
 
     async def test_a_robots_file_blocking_generic_crawlers_still_pays(self, monkeypatch):
         """A different and much broader policy than the one this pre-check implements: our own
@@ -955,6 +1152,9 @@ class TestUrlContextRung:
         assert result.status == "blocked"
         assert calls == []
         assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("url_context", "no_api_key")]
+        # Its own count: without it "flag on, key missing" is byte-identical in the archive to
+        # "flag off", and the moment that matters is the paid flag's rollout.
+        assert _rung_counts([result])["url_context_no_api_key_skips"] == 1
 
     async def test_the_rung_is_skipped_below_its_floor(self, monkeypatch):
         reader, calls = self._reader()
@@ -966,6 +1166,81 @@ class TestUrlContextRung:
         assert result.status == "blocked"
         assert calls == []
         assert ("url_context", "wall_budget") in [(a.rung, a.skipped_reason) for a in result.rung_attempts]
+
+    def _budget_that_drops_after_the_robots_read(self, session: FakeSession, *, before: float, after: float):
+        """A wall budget that reads ``before`` until the robots.txt GET has gone out, then ``after``.
+
+        The pre-check is the one gate that costs a request, so it is the one place the budget
+        can move between being read and being spent."""
+
+        def _budget(_self: FetchContext) -> float:
+            return after if any(url.endswith("/robots.txt") for url in session.requested) else before
+
+        return _budget
+
+    async def test_the_reader_is_sized_off_the_budget_left_after_the_robots_pre_check(self, monkeypatch):
+        """The read runs in a thread, which `wait_for` cannot cancel, so the client ceiling is the
+        only thing that returns the worker — and a ceiling sized off a figure read BEFORE a real
+        request went out could outlive the provider's wall while the money is spent anyway."""
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        session = self._session()
+        monkeypatch.setattr(
+            FetchContext,
+            "rung_budget_s",
+            self._budget_that_drops_after_the_robots_read(session, before=20.0, after=16.0),
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+
+        assert result.status == "success"
+        assert calls[0]["attempts"] == resolution_source.RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS
+        assert calls[0]["timeout_ms"] == int((16.0 - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000)
+
+    async def test_a_pre_check_that_eats_the_room_skips_before_paying(self, monkeypatch):
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        session = self._session()
+        monkeypatch.setattr(
+            FetchContext,
+            "rung_budget_s",
+            self._budget_that_drops_after_the_robots_read(session, before=20.0, after=5.0),
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+
+        assert result.status == "blocked"
+        assert calls == []
+        assert "https://tracker.example.com/robots.txt" in session.requested
+        # One skip, recorded AFTER the pre-check ate the room, never two.
+        assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("url_context", "wall_budget")]
+
+    async def test_the_robots_pre_check_is_bounded_and_fails_toward_paying(self, monkeypatch):
+        """A robots.txt that never answers must neither hold the paid rung nor withhold it: the
+        pre-check gets the same fixed bound gap-fill v2 gives it, and an unreadable policy
+        proceeds to pay, the only direction it is allowed to fail in."""
+
+        class _HangingResponse(FakeResponse):
+            async def read(self) -> bytes:
+                await asyncio.Event().wait()
+                return b""
+
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        monkeypatch.setattr(resolution_source, "ROBOTS_FETCH_TIMEOUT_S", 0.05)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+                "https://tracker.example.com/robots.txt": _HangingResponse(200, content_type="text/plain"),
+            }
+        )
+
+        started = time.monotonic()
+        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+
+        assert time.monotonic() - started < 2.0
+        assert result.status == "success"
+        assert len(calls) == 1
 
     @pytest.mark.parametrize("status", [404, 410])
     async def test_a_missing_page_is_never_sent_to_the_reader(self, monkeypatch, status):
@@ -989,6 +1264,113 @@ class TestUrlContextRung:
 
         assert result.status == "blocked"
         assert result.route == "url_context"
+
+
+class TestFastPath:
+    """A question on the time-budget fast path declines the two EXPENSIVE rungs — the browser and
+    the paid reader — before any side effect, with its own greppable skip reason. The cheap rungs
+    (meta-refresh, local PDF, derived-feed reuse, Wayback) run exactly as they do off it, and a
+    question with no fast path is byte-identical to before the gate existed."""
+
+    async def test_the_provider_declines_the_browser_on_the_fast_path(self, monkeypatch):
+        calls: list[dict[str, object]] = []
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(
+            resolution_source,
+            "render_page",
+            _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
+        )
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        section = await resolution_source_provider(is_benchmarking=False, fast_path=True)(question)
+
+        assert calls == []
+        assert "tracker.example.com: js_wall" in section
+        counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
+        assert counts["fast_path_skips"] == 1
+        assert counts["rendered_attempts"] == 0
+        assert counts["renderer_unavailable_skips"] == 0
+
+    async def test_off_the_fast_path_the_provider_renders_as_before(self, monkeypatch):
+        calls: list[dict[str, object]] = []
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(
+            resolution_source,
+            "render_page",
+            _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
+        )
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        section = await resolution_source_provider(is_benchmarking=False)(question)
+
+        assert len(calls) == 1
+        assert "Nebraska Senate polling average" in section
+        counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
+        assert counts["fast_path_skips"] == 0
+        assert counts["rendered_attempts"] == 1
+
+    async def test_the_paid_reader_declines_on_the_fast_path_only_when_it_was_armed(self, monkeypatch):
+        """Recorded only when the rung would otherwise have been considered: with the flag off a
+        fast-path skip would read as spend avoided on a rung that could never have fired."""
+        calls: list[dict[str, object]] = []
+
+        def _read(url, ask, **kwargs):
+            calls.append({"url": url, "ask": ask, **kwargs})
+            return ("text", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
+        reset_robots_cache()
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+                "https://tracker.example.com/robots.txt": FakeResponse(
+                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
+                ),
+            }
+        )
+
+        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
+        armed = await _fetch_one(session, _URL, {}, FetchContext(query="ask", fast_path=True))
+        monkeypatch.delenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED")
+        unarmed = await _fetch_one(session, _URL, {}, FetchContext(query="ask", fast_path=True))
+
+        assert calls == []
+        assert armed.status == "blocked"
+        assert [(a.rung, a.skipped_reason) for a in armed.rung_attempts] == [("url_context", "fast_path")]
+        assert unarmed.rung_attempts == []
+        # Declined before the pre-check, so no request went out for it either.
+        assert "https://tracker.example.com/robots.txt" not in session.requested
+
+    async def test_the_cheap_rungs_still_run_on_the_fast_path(self, monkeypatch):
+        """The Wayback rung and a remembered derived feed are ordinary GETs and stay in."""
+        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        now = datetime(2026, 9, 4, tzinfo=UTC)
+        snapshot = _snapshot_url(_URL, captured=now - timedelta(days=2))
+        feed_page = "https://tracker.example.com/house"
+        resolution_source.derived_api.remember_endpoint(feed_page, _FEED_URL)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": snapshot}),
+                snapshot: FakeResponse(200, body=_prose_page(_RENDERED_PROSE), content_type="text/html"),
+                feed_page: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                _FEED_URL: FakeResponse(200, body=b'{"series":[{"v":1}]}', content_type="application/json"),
+            }
+        )
+
+        archived = await _fetch_one(session, _URL, {}, FetchContext(now=now, fast_path=True))
+        derived = await _fetch_one(session, feed_page, {}, FetchContext(now=now, fast_path=True))
+
+        assert archived.route == "wayback"
+        assert archived.status == "success"
+        assert derived.route == "derived_api"
+        assert derived.status == "success"
+        assert [(a.rung, a.skipped_reason) for a in derived.rung_attempts] == [("derived_api", "")]
 
 
 def _success(route: FetchRoute, url: str = _URL) -> FetchResult:
@@ -1042,6 +1424,35 @@ class TestRouteCaveats:
         # Deduped, and ordered by the mapping rather than by fetch order.
         assert rendered.count(ROUTE_CAVEATS["wayback"]) == 1
         assert rendered.index(ROUTE_CAVEATS["rendered"]) < rendered.index(ROUTE_CAVEATS["wayback"])
+
+    def test_a_section_dropped_by_the_budget_adds_no_caveat(self, monkeypatch):
+        """The caveat describes an artifact a forecaster can SEE. Computed over every success, it
+        told forecasters a section below was rendered in a browser when the aggregate budget had
+        already dropped that section (reproduced on prod constants: 5 x 6000 per-URL pages
+        against an 18000 total, with the rendered page cited last)."""
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 40)
+        first = FetchResult(
+            url="https://a.example.com/p", status="success", text="x" * 60, http_status=200, content_type="text/html"
+        )
+        rendered_last = _success("rendered", "https://b.example.com/p")
+
+        rendered = format_resolution_sections([first, rendered_last], self._AT)
+
+        assert "[1 additional source(s) omitted — section budget]" in rendered
+        assert "### https://b.example.com/p" not in rendered
+        assert ROUTE_CAVEATS["rendered"] not in rendered
+
+    def test_a_kept_section_keeps_its_caveat_when_a_sibling_is_dropped(self, monkeypatch):
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 40)
+        rendered_first = _success("rendered", "https://b.example.com/p")
+        dropped = FetchResult(
+            url="https://a.example.com/p", status="success", text="x" * 60, http_status=200, content_type="text/html"
+        )
+
+        rendered = format_resolution_sections([rendered_first, dropped], self._AT)
+
+        assert "### https://b.example.com/p" in rendered
+        assert ROUTE_CAVEATS["rendered"] in rendered
 
     def test_a_failed_rung_adds_no_caveat(self):
         """A caveat describes an artifact a forecaster can see; a rung that fired and failed left
