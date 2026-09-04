@@ -167,7 +167,8 @@ class TestATimedOutReadPublishesNothing:
 
         assert len(calls) == 1
         assert result.status == "blocked"
-        assert "Read via Gemini url_context" not in result.text
+        # Empty rather than merely lacking the "[Read via Gemini url_context ...]" disclosure:
+        # the direct 403 published nothing and the timed-out read must not change that.
         assert result.text == ""
         # The attempt is still recorded and still counted: the rung fired and Google may well
         # have billed it, so this is spend the telemetry has to carry.

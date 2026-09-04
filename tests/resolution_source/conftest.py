@@ -81,7 +81,7 @@ def _decline_the_wayback_rung(monkeypatch):
     A convenience rather than a containment, unlike the browser fixture above: nothing here can
     reach the network in the first place. The rung fires on ``blocked`` / ``error`` /
     ``not_found``, the outcome dozens of these tests deliberately produce, and every one of them
-    drives a ``FakeSession``, so an unwanted fire issues no request at all — the archive URL has
+    drives a ``FakeSession``, so an unwanted fire never leaves the process — the archive URL has
     no handler and ``FakeSession.get`` raises ``AssertionError: no handler for URL
     https://web.archive.org/...`` mid-ladder. That error is outside the hop's
     ``(TimeoutError, aiohttp.ClientError)`` catch, so it surfaces as a loud failure of an
