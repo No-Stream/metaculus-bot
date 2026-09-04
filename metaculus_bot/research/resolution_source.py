@@ -1114,6 +1114,17 @@ def _network_failure_class(exc: BaseException) -> str:
     them — and the whole point of the field is to tell a host that refused our TLS from one our
     egress IP could not resolve. ``exc`` on the same line keeps the exact class name for anything
     this coarse vocabulary lumps together.
+
+    ``malformed_response`` is a response aiohttp's parser refused before the body was ours: a
+    ``Content-Encoding`` it cannot decode (the trueup.io zstd failure that had the brotli and zstd
+    decoders added, 2026-09-03), a header past the session's size caps, a bad status line. The
+    parser raises those as ``HttpProcessingError`` and the client re-raises them as
+    ``ClientResponseError(status=400)``, a SIBLING of ``ClientPayloadError`` under ``ClientError``
+    rather than a subclass, so ``decode`` cannot claim them and ``connection`` used to. Its own
+    token rather than a wider ``decode`` because the two say different things: ``decode`` is a
+    body that arrived and could not be read, this is a response that never got that far. Nothing
+    on this path calls ``raise_for_status`` or follows redirects through aiohttp, so a
+    ``ClientResponseError`` here is always the parser's.
     """
     if isinstance(exc, TimeoutError):
         return "timeout"
@@ -1125,6 +1136,8 @@ def _network_failure_class(exc: BaseException) -> str:
         return "dns"
     if isinstance(exc, aiohttp.ClientPayloadError):
         return "decode"
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return "malformed_response"
     return "connection"
 
 

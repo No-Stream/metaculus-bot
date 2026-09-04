@@ -415,7 +415,10 @@ class FetchResult:
     # own case rests on (the archived Akamai 403s reproduce only from the GitHub runner). All None
     # on a success and on every path that never touched a response. `failure_class` is a small
     # token vocabulary: `http_403` / `http_4xx` / `http_5xx` off the response, or `tls` / `dns` /
-    # `timeout` / `connection` / `decode` off the transport exception. `exc` is that exception's
+    # `timeout` / `connection` / `decode` / `malformed_response` off the transport exception
+    # (`resolution_source._network_failure_class`; the last is a response aiohttp's parser refused,
+    # an undecodable Content-Encoding or an oversized header, which is neither a connection fault
+    # nor a body we held and could not decode). `exc` is that exception's
     # class name. `server` is the `Server` response header, lower-cased and truncated — the
     # strongest tell of which CDN refused us. A rung verdict that REPLACES a failed direct fetch
     # on the marker line (the Wayback `stale_data` withhold, the paid reader's `ungrounded`)

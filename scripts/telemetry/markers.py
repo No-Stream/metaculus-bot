@@ -806,7 +806,10 @@ MARKER_SPECS: list[MarkerSpec] = [
         # ``failure_class`` / ``exc`` / ``server`` (all optional, 2026-09-03) are the failure
         # diagnostics that separate an egress-reputation refusal from a host fault: a small token
         # vocabulary (``http_403`` / ``http_4xx`` / ``http_5xx`` off the response, ``tls`` /
-        # ``dns`` / ``timeout`` / ``connection`` / ``decode`` off the transport exception), the
+        # ``dns`` / ``timeout`` / ``connection`` / ``decode`` / ``malformed_response`` off the
+        # transport exception, the last added 2026-09-04 for a response aiohttp's parser refused
+        # — an undecodable Content-Encoding, an oversized header — which recorded as
+        # ``connection`` before), the
         # exception class name, and the ``Server`` header lower-cased with internal spaces
         # collapsed to ``_``. Keyed and TAIL-positioned after ``route`` in that fixed order, each
         # emitted only when present, so an old parser and every archived line still parse and a
