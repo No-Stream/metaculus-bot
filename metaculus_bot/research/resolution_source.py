@@ -527,11 +527,26 @@ def _page_text_with_leads(extracted: str, url: str, providers: list[str], chart_
     leads = [lead for lead in (chart_block, _unreadable_embed_disclosure(providers) if providers else "") if lead]
     if not leads:
         return _truncate_with_marker(extracted, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
-    lead_text = "\n\n".join(leads)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead_text) - 2
-    if body_cap <= 0 or not extracted.strip():
-        return _truncate_with_marker(lead_text, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
-    return f"{lead_text}\n\n{_truncate_with_marker(extracted, body_cap, url)}"
+    return _lead_then_capped_body("\n\n".join(leads), extracted, url)
+
+
+def _lead_then_capped_body(lead: str, body: str, url: str) -> str:
+    """A provenance lead, then as much of ``body`` as the per-URL cap leaves, inside the bound.
+
+    The one arithmetic every rung that serves an artifact under a lead uses: the chart-data /
+    embed leads here, the derived feed, the archived capture, the model's reading. The lead LEADS
+    because every truncator on this text is head-preserving, so anything at the tail is the first
+    thing a later trim discards, and a lead trimmed off leaves the artifact passed off as the live
+    page (the q44554/44556 failure). Its cost comes OUT of the cap rather than on top of it, so
+    the per-URL bound ``_budgeted_success_sections`` relies on still holds — including the
+    pathological case where the lead alone exceeds the cap, where the lead itself is truncated
+    (a bare lead there busts the bound the aggregate budget assumes). A blank body renders the
+    lead alone for the same reason.
+    """
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    if body_cap <= 0 or not body.strip():
+        return _truncate_with_marker(lead, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
+    return f"{lead}\n\n{_truncate_with_marker(body, body_cap, url)}"
 
 
 def _budgeted_success_sections(
@@ -1904,26 +1919,14 @@ def _derived_api_result(
 ) -> FetchResult:
     """One derived-feed result: the provenance lead, then the budgeted JSON.
 
-    The lead LEADS, like every other lead this module renders, because each truncator here is
-    head-preserving and anything at the tail is the first thing a later trim discards — and a
-    feed served with its provenance line trimmed off is a JSON blob nobody can check. Its cost
-    comes out of the per-URL cap rather than being added on top, so the section budget still
-    binds.
+    The lead LEADS and its cost comes out of the per-URL cap (:func:`_lead_then_capped_body`),
+    because a feed served with its provenance line trimmed off is a JSON blob nobody can check.
     """
     lead = derived_api.derived_api_lead(endpoint, url)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
-    if body_cap <= 0:
-        return FetchResult(
-            url=url,
-            status="success",
-            text=_truncate_with_marker(lead, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url),
-            http_status=http_status,
-            content_type="application/json",
-        )
     return FetchResult(
         url=url,
         status="success",
-        text=f"{lead}\n\n{_truncate_with_marker(raw, body_cap, url)}",
+        text=_lead_then_capped_body(lead, raw, url),
         http_status=http_status,
         content_type="application/json",
     )
@@ -2055,17 +2058,13 @@ async def _wayback_snapshot_result(
             http_status=snapshot.http_status,
             content_type=snapshot.content_type,
         )
+    # The lead LEADS and its cost comes out of the per-URL cap (:func:`_lead_then_capped_body`):
+    # an archived page whose age line has been trimmed off is being passed off as the live one.
     lead = wayback_lead(parsed, age_days, direct.status)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
-    # The lead LEADS and its cost comes out of the per-URL cap, like every other lead here: the
-    # truncators are head-preserving, so a trailing disclosure is the first thing a later trim
-    # discards — and an archived page whose age line has been trimmed off is being passed off as
-    # the live one.
-    text = lead if body_cap <= 0 else f"{lead}\n\n{_truncate_with_marker(snapshot.text, body_cap, url)}"
     return FetchResult(
         url=url,
         status="success",
-        text=text,
+        text=_lead_then_capped_body(lead, snapshot.text, url),
         http_status=snapshot.http_status,
         content_type=snapshot.content_type,
         datawrapper_charts=snapshot.datawrapper_charts,
@@ -2327,16 +2326,13 @@ async def _url_context_rung(
             http_status=direct.http_status,
             content_type=direct.content_type,
         )
+    # The lead LEADS and is budgeted out of the cap (:func:`_lead_then_capped_body`): a model's
+    # answer rendered without the disclosure reads as the page itself.
     lead = _url_context_lead(direct.status)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
-    # The lead LEADS and is budgeted out of the cap, like every other lead here: the truncators
-    # are head-preserving, so a trailing disclosure is the first thing a later trim discards —
-    # and a model's answer rendered without it reads as the page itself.
-    served = lead if body_cap <= 0 else f"{lead}\n\n{_truncate_with_marker(text.strip(), body_cap, url)}"
     return FetchResult(
         url=url,
         status="success",
-        text=served,
+        text=_lead_then_capped_body(lead, text.strip(), url),
         http_status=direct.http_status,
         content_type="text/plain",
     )

@@ -1099,6 +1099,23 @@ class TestWaybackRung:
         assert "an archived capture was served but is unusable for tracker.example.com" in caplog.text
         assert "no archived copy served" not in caplog.text
 
+    async def test_the_archived_lead_is_truncated_when_it_alone_exceeds_the_cap(self, monkeypatch):
+        """The pathological case the shared cap helper (`_lead_then_capped_body`) fixes: at a cap
+        below the age-disclosure lead's own length, the earlier bare-lead return busted the
+        per-URL bound `_budgeted_success_sections` relies on. The lead is now truncated to fit."""
+        cap = 60
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        session = self._session(
+            page=FakeResponse(403, body=b"denied", content_type="text/html"),
+            captured=self._NOW - timedelta(days=3),
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "success"
+        assert result.route == "wayback"
+        assert len(result.text) <= cap
+
 
 class TestUrlContextRung:
     """The LAST rung and the only paid one: every gate is checked before a cent is spent, and
@@ -1384,6 +1401,21 @@ class TestUrlContextRung:
 
         assert result.status == "blocked"
         assert result.route == "url_context"
+
+    async def test_the_read_lead_is_truncated_when_it_alone_exceeds_the_cap(self, monkeypatch):
+        """The same pathological case as the archive lead: at a cap below the mandatory
+        model-mediated disclosure's length, the earlier bare-lead return exceeded the per-URL
+        bound. The shared cap helper truncates the lead instead."""
+        cap = 60
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        reader, _calls = self._reader(text="The page reports 12 major work stoppages. " * 5)
+        self._arm(monkeypatch, reader)
+
+        result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+
+        assert result.status == "success"
+        assert result.route == "url_context"
+        assert len(result.text) <= cap
 
 
 class TestFastPath:
