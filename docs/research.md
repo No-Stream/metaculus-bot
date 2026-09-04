@@ -568,7 +568,14 @@ Four stages per question:
    event's nested markets are kept past the first one. It is cached for
    `KALSHI_CACHE_TTL_S` only if it **completed**: a pull cut short by a 429, the wall
    or a runaway bound still serves the question that paid for it, but pinning that
-   partial list would let one blip on the first question starve the whole run.
+   partial list would let one blip on the first question starve the whole run. Both
+   catalogues are pulled SINGLE-FLIGHT, one pull per cache key at a time: the TTL
+   check cannot see a pull that has started and not finished, so a run's concurrent
+   questions used to open one whole pagination each against the same venue and be
+   rate-limited for it. Callers arriving while a pull is in flight await that pull and
+   share its outcome, a failure included, since re-asking a rate limiter from three
+   more questions is a second violation rather than a retry. One lost pull therefore
+   bumps `kalshi_catalogue_fetch_failures` once rather than once per waiting question.
    PredictIt's whole ~197-market dump is one GET, and all ~197 go into the pool
    UNFILTERED: its old fuzzy pre-filter ranked "Will the Pope visit Cuba" above the
    on-topic market. Neither venue needs a query, which is

@@ -100,7 +100,9 @@ from metaculus_bot.research.market_retrieval.queries import (
 # is still what the orchestrator sees — and for the test suite.
 from metaculus_bot.research.market_retrieval.session_state import (
     _KALSHI_CACHE,  # noqa: F401  # re-export: tests assert on the cache's TTL-pinning behaviour
+    _KALSHI_CATALOGUE_IN_FLIGHT,  # noqa: F401  # re-export: tests assert the single-flight guard is reset with its cache
     _PREDICTIT_CACHE,  # noqa: F401  # re-export
+    _PREDICTIT_UNIVERSE_IN_FLIGHT,  # noqa: F401  # re-export
     _SNAPSHOT_CACHE,
     _bump_kalshi_catalogue_failure,  # noqa: F401  # re-export: tests seed the counter through the seam
     _bump_source_loss,

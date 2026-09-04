@@ -841,6 +841,13 @@ RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS: int = 1
 # how much a single question can spend when the flag is on. Its own constant so the two paid
 # knobs tune independently.
 RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS: int = 2
+# How much of a WITHHELD url_context reply reaches the run log. A read we paid for and then
+# discarded is otherwise unauditable: the `not_addressed` sentinel means the model says the page
+# does not discuss the ask, and nothing on the record distinguishes that from the model dutifully
+# reading a bot-challenge page it was served instead — the question the smoke run could not answer
+# for sagaftra.org. A few hundred characters is enough to tell those apart and short enough that
+# the discarded answer cannot flood a log or read as evidence.
+RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS: int = 300
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google

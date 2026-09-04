@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from metaculus_bot.constants import RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.resolution_source import (
     FetchContext,
@@ -135,6 +136,61 @@ class TestUrlContextRung:
         assert (
             "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate statuses=none"
         ) in caplog.messages
+
+    async def test_a_withheld_not_addressed_reply_is_kept_in_the_log(self, monkeypatch, caplog):
+        """The reply is the only thing that says WHICH `not_addressed` this was.
+
+        "The page genuinely does not discuss the ask" and "the model dutifully summarized the
+        bot-challenge page the host served it instead" reach this branch identically, and the smoke
+        run could not tell them apart for sagaftra.org because the withheld text was kept nowhere.
+        Its own INFO line, deliberately unregistered, so the marker above it stays the data
+        contract; whitespace-collapsed so one discarded answer cannot spread over a run log, and
+        bounded because the point is to audit the read rather than to keep it.
+        """
+        reply = "NOT_ADDRESSED.\n\n  The page served is a\tDataDome challenge. " + "Verifying you are human. " * 40
+        reader, _calls = paid_reader(text=reply)
+        arm_paid_rung(monkeypatch, reader)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
+
+        assert result.status_reason == "not_addressed"
+        prefix = "url_context not_addressed reply for tracker.example.com: "
+        logged = [message for message in caplog.messages if message.startswith(prefix)]
+        assert len(logged) == 1
+        preview = logged[0].removeprefix(prefix)
+        assert preview.startswith("NOT_ADDRESSED. The page served is a DataDome challenge. Verifying you are human.")
+        assert len(preview) == RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS + 1, "bounded, plus the truncation mark"
+        assert preview.endswith("…")
+
+    async def test_a_suppressed_ungrounded_reply_is_kept_in_the_log_when_there_is_one(self, monkeypatch, caplog):
+        """Same audit trail for the other withhold, and only when the reader said something: the
+        ungrounded branch also fires on an EMPTY reply, where there is nothing to keep."""
+        reader, _calls = paid_reader(
+            text="The Senate recorded 12 stoppages, from memory.", retrievals=0, statuses=["URL_RETRIEVAL_STATUS_ERROR"]
+        )
+        arm_paid_rung(monkeypatch, reader)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
+
+        assert result.status == "ungrounded"
+        assert (
+            "url_context ungrounded reply for tracker.example.com: The Senate recorded 12 stoppages, from memory."
+        ) in caplog.messages
+
+    async def test_an_empty_ungrounded_reply_logs_no_preview(self, monkeypatch, caplog):
+        def _read(url, ask, **kwargs):
+            del url, ask, kwargs
+            return ("   ", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
+
+        arm_paid_rung(monkeypatch, _read)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
+
+        assert result.status == "ungrounded"
+        assert not [message for message in caplog.messages if message.startswith("url_context ungrounded reply")]
 
     async def test_a_google_extended_disallowing_host_is_skipped_before_paying(self, monkeypatch, caplog):
         """Proven live 2026-09-03: a host that disallows the token refuses the fetch server-side,
