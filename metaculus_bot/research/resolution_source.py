@@ -1011,17 +1011,20 @@ def _stamped_with_route(result: FetchResult, ctx: FetchContext) -> FetchResult:
 
     ``route`` is the LAST rung that fired, which is the one that produced this outcome
     (a meta-refresh hop onto a PDF reads ``pdf_local``: the hop got us the bytes, the
-    local read is what the text came from). Skipped rungs never claim the route.
+    local read is what the text came from). Skipped rungs never claim the route. The one
+    exception is a result that already names its rung: a rung's VERDICT (the Wayback
+    ``stale_data`` withhold) can be returned as the ladder's fallback after a later rung
+    fired and failed, and the last rung to fire is then not the one that produced it.
 
     Every rung the dispatcher ran has already been closed with its own wall and outcome
-    (:meth:`FetchContext.close_rungs`); the close here is the last resort for an attempt a
-    future rung opens without bracketing, and stamps it with the final status rather than
-    leaving the marker to print ``None``.
+    (:func:`_run_rung`); the close here is the last resort for an attempt a future rung
+    opens without bracketing, and stamps it with the final status rather than leaving the
+    marker to print ``None``.
     """
     ctx.close_rungs(0, result.status)
     result.rung_attempts = list(ctx.rungs)
     fired: list[FetchRoute] = [attempt.rung for attempt in ctx.rungs if not attempt.skipped_reason]
-    if fired:
+    if fired and result.route == "direct":
         result.route = fired[-1]
     return result
 
@@ -2185,6 +2188,11 @@ async def _wayback_snapshot_result(
             failure_class=direct.failure_class,
             exc=direct.exc,
             server=direct.server,
+            # A verdict names its own rung. The dispatcher otherwise stamps the LAST rung that
+            # fired, and the paid rung fires after this one: a stale capture the reader then
+            # failed to improve on came back `route=url_context status=stale_data`, a status that
+            # rung cannot produce, on the field that partitions the archive by route.
+            route="wayback",
         )
     # The lead LEADS and its cost comes out of the per-URL cap (:func:`_lead_then_capped_body`):
     # an archived page whose age line has been trimmed off is being passed off as the live one.
@@ -2568,10 +2576,11 @@ async def _escalate_unresolved(
     # It is asked about the DIRECT outcome, and an archive WITHHOLD does not stand in its way: a
     # capture too old to serve is still a page we could not read fresh, which is exactly the
     # population this rung exists for. The withhold stays the fallback below, so with the flag
-    # off (or the reader declining) a stale capture still reports `stale_data`.
-    read = await _run_rung(
-        ctx, (wayback or direct).status, _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    )
+    # off (or the reader declining) a stale capture still reports `stale_data`. The paid rung's
+    # own attempt closes on the DIRECT status when it declines, like every other rung: the
+    # archive's verdict is not an outcome a model read can produce, and on the escalation line
+    # `rung=url_context outcome=stale_data` read as if it had.
+    read = await _run_rung(ctx, direct.status, _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx))
     if read is not None:
         return read
     return wayback if wayback is not None else direct
