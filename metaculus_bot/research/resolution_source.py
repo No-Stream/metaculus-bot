@@ -496,13 +496,21 @@ def _page_text_with_leads(extracted: str, url: str, providers: list[str], chart_
     return f"{lead_text}\n\n{_truncate_with_marker(extracted, body_cap, url)}"
 
 
-def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -> tuple[list[str], int]:
-    """Render the success sections inside the two partitioned budgets; returns ``(sections, dropped)``.
+def _budgeted_success_sections(
+    successes: list[FetchResult], fetched_iso: str
+) -> tuple[list[str], list[FetchResult], int]:
+    """Render the success sections inside the two partitioned budgets.
+
+    Returns ``(sections, kept, dropped)``: the rendered sections, the results they were rendered
+    FROM in the same order, and how many successes the budget dropped outright. ``kept`` exists
+    for the route caveats, which describe an artifact a forecaster can see and so must be
+    computed over what renders rather than over every success.
 
     Cited pages and Tier-2 datasets draw on separate allowances, so a chart's rows can
     never evict the page text the section exists to serve.
     """
     sections: list[str] = []
+    kept: list[FetchResult] = []
     page_remaining = RESOLUTION_SOURCE_TOTAL_MAX_CHARS
     dataset_remaining = RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS * RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS
     dropped = 0
@@ -531,21 +539,25 @@ def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -
         else:
             page_remaining -= len(body)
         sections.append(f"### {r.url}\n(fetched {fetched_iso})\n\n{body}")
-    return sections, dropped
+        kept.append(r)
+    return sections, kept, dropped
 
 
-def _route_caveats(successes: list[FetchResult]) -> list[str]:
-    """One sentence per non-direct route present in the sections that will RENDER.
+def _route_caveats(rendered: list[FetchResult]) -> list[str]:
+    """One sentence per non-direct route present in the sections that RENDER.
 
-    Computed over the successes rather than over every result, because a caveat describes an
-    artifact a forecaster can see: a rung that fired and failed left the direct route's own
-    outcome, which the failure notice already names. Order comes from ``ROUTE_CAVEATS``' own
-    insertion order, so it is stable across questions rather than following fetch order.
+    Computed over the successes the section budget KEPT rather than over every result, because a
+    caveat describes an artifact a forecaster can see: a rung that fired and failed left the
+    direct route's own outcome, which the failure notice already names, and a success the
+    aggregate budget dropped has no section below for the sentence to describe (on prod
+    constants, 5 x 6000 per-URL pages against an 18000 total, a rendered page cited last was
+    disclosed and then omitted). Order comes from ``ROUTE_CAVEATS``' own insertion order, so it
+    is stable across questions rather than following fetch order.
 
     Empty for an all-direct question, which is the overwhelming majority and the case whose
     rendered section has to stay byte-identical to what it was before the ladder existed.
     """
-    return [caveat for route, caveat in ROUTE_CAVEATS.items() if any(r.route == route for r in successes)]
+    return [caveat for route, caveat in ROUTE_CAVEATS.items() if any(r.route == route for r in rendered)]
 
 
 def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
@@ -612,14 +624,13 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
         return notice
 
     fetched_iso = fetched_at.strftime("%Y-%m-%d")
+    sections, kept, dropped = _budgeted_success_sections(successes, fetched_iso)
     caveat = "\n".join(
         [
             f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence.",
-            *_route_caveats(successes),
+            *_route_caveats(kept),
         ]
     )
-
-    sections, dropped = _budgeted_success_sections(successes, fetched_iso)
 
     rendered = caveat + "\n\n" + "\n\n".join(sections)
     if dropped:
