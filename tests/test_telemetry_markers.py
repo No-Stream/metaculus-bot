@@ -1181,6 +1181,16 @@ RESOLUTION_SOURCE_FETCH_REASON_AND_ROUTE_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44556 url=https://tracker.example.com/senate "
     "status=no_resolving_content http=200 embeds=infogram reason=embed_shell route=rendered"
 )
+# The failure-diagnostics tail: an egress-reputation 403 with its CDN named. `failure_class`,
+# `exc` and `server` are keyed and sit after `route`, so all subsets parse.
+RESOLUTION_SOURCE_FETCH_FAILURE_CLASS_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
+    "status=blocked http=403 embeds=none failure_class=http_403 server=akamaighost"
+)
+RESOLUTION_SOURCE_FETCH_TRANSPORT_ERROR_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://slow.example.com/x "
+    "status=error http=n/a embeds=none failure_class=timeout exc=ServerTimeoutError"
+)
 
 
 class TestResolutionSourceFetch:
@@ -1287,6 +1297,32 @@ class TestResolutionSourceFetch:
             RESOLUTION_SOURCE_FETCH_DATASET_LINE,
         ):
             assert _parse_one(line).get("route") is None
+
+    def test_an_http_failure_carries_its_class_and_server(self):
+        # The egress-vs-host measurement: a 403 with the CDN that served it, so the archive can
+        # ask "how often is a cited host giving the runner IP a 403 from Akamai".
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_FAILURE_CLASS_LINE)
+        assert rec["status"] == "blocked"
+        assert rec["failure_class"] == "http_403"
+        assert rec["server"] == "akamaighost"
+        # No transport exception on an HTTP response, so `exc` stays absent.
+        assert rec["exc"] is None
+
+    def test_a_transport_error_carries_its_class_and_exception(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_TRANSPORT_ERROR_LINE)
+        assert rec["status"] == "error"
+        assert rec["http"] is None
+        assert rec["failure_class"] == "timeout"
+        assert rec["exc"] == "ServerTimeoutError"
+        assert rec["server"] is None
+
+    def test_lines_without_the_failure_fields_harvest_them_as_none(self):
+        # Additive at the tail: every archived line and every success predates them.
+        for line in (RESOLUTION_SOURCE_FETCH_OK_LINE, RESOLUTION_SOURCE_FETCH_BLOCKED_LINE):
+            rec = _parse_one(line)
+            assert rec.get("failure_class") is None
+            assert rec.get("exc") is None
+            assert rec.get("server") is None
 
 
 # Copied from the emitting format string (resolution_source.py). One line per ESCALATED rung:

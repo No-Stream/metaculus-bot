@@ -802,6 +802,13 @@ RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S: float = 15.0
 # provider wall shared with every other cited URL there is no such room, and a second attempt
 # would spend the budget that renders the pages already fetched.
 RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS: int = 1
+# PAID READS per QUESTION, the analogue of the Wayback cap and a different quantity from the SDK
+# retry count above: `_ATTEMPTS` is how many billed requests one read may dispatch, this is how
+# many url_context READS a single question may pay for across its cited URLs. Without it a
+# question citing several dead sources pays once per source inside the provider wall; two bounds
+# how much a single question can spend when the flag is on. Its own constant so the two paid
+# knobs tune independently.
+RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS: int = 2
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google

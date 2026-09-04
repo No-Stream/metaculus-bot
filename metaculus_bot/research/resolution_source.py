@@ -1,10 +1,17 @@
 # SMELL-EXEMPT-monolithic-file-loc: what stays here is fixed by the test suites'
 # monkeypatch surface, not by the layer diagram. Ten `RESOLUTION_SOURCE_*` caps
-# plus `_get_session`, `is_public_http_url`, `_extract_main_text` and
-# `_sem_for_host` are patched on THIS module (tests/test_resolution_source_*.py,
-# tests/test_agentic_tools.py), so every reader of one has to stay here to resolve
-# it as a module global at call time — which pins the network layer, the section
-# renderer and the provider factory. Everything with no patched read moved out:
+# plus `_get_session`, `render_page`, `run_url_context_read`, `_WAYBACK_TRIGGER_STATUSES`,
+# `is_public_http_url`, `_extract_main_text` and `_sem_for_host` are patched on THIS module
+# (tests/resolution_source/*.py, tests/test_agentic_tools.py) — 22 distinct names in all,
+# plus the `resolution_source.asyncio` / `.socket` attribute-of-import targets — so every
+# reader of one has to stay here to resolve it as a module global at call time, which pins the
+# network layer, the section renderer, the escalation ladder and the provider factory.
+# The 2026-09-03 escalation ladder (`_rendered_rung_applies` through `_escalate_unresolved`, the
+# rendered / derived_api / wayback / url_context rungs and their gates) is a self-contained
+# concern with its own vocabulary and IS a candidate split, but it reads `_fetch_direct` and
+# `_classify_html_body` and carries most of the patched names above, so extracting it means
+# injected callbacks or a circular import and a re-point of every patch target; it is deferred to
+# its own PR (FUTURE.md item 3). Everything with no patched read already moved out:
 # `resolution_url_scan` (URL extraction + skip predicates), `resolution_fetch_result`
 # (FetchStatus/FetchResult, the vacuity rule, the result-list reductions), and
 # `resolution_body_text` (markup stripping + the two truncators).
@@ -128,7 +135,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -167,6 +174,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
     RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
     RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV,
+    RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
     RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
     RESOLUTION_SOURCE_WALL_TIMEOUT,
     RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS,
@@ -230,10 +238,13 @@ from metaculus_bot.research.resolution_fetch_result import (
     FetchStatus,
     FetchStatusReason,
     RungAttempt,
+    RungSkipReason,
     _fetch_result_sources,
     _render_fetch_failures,
     fetch_outcome_token,
+    http_failure_class,
     looks_like_csv_rows,  # noqa: F401  # re-export: the Tier-1 suite imports the row-shape check from this module path
+    server_header_token,
     vacuous_body_status,
 )
 from metaculus_bot.research.resolution_url_scan import (
@@ -527,11 +538,26 @@ def _page_text_with_leads(extracted: str, url: str, providers: list[str], chart_
     leads = [lead for lead in (chart_block, _unreadable_embed_disclosure(providers) if providers else "") if lead]
     if not leads:
         return _truncate_with_marker(extracted, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
-    lead_text = "\n\n".join(leads)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead_text) - 2
-    if body_cap <= 0 or not extracted.strip():
-        return _truncate_with_marker(lead_text, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
-    return f"{lead_text}\n\n{_truncate_with_marker(extracted, body_cap, url)}"
+    return _lead_then_capped_body("\n\n".join(leads), extracted, url)
+
+
+def _lead_then_capped_body(lead: str, body: str, url: str) -> str:
+    """A provenance lead, then as much of ``body`` as the per-URL cap leaves, inside the bound.
+
+    The one arithmetic every rung that serves an artifact under a lead uses: the chart-data /
+    embed leads here, the derived feed, the archived capture, the model's reading. The lead LEADS
+    because every truncator on this text is head-preserving, so anything at the tail is the first
+    thing a later trim discards, and a lead trimmed off leaves the artifact passed off as the live
+    page (the q44554/44556 failure). Its cost comes OUT of the cap rather than on top of it, so
+    the per-URL bound ``_budgeted_success_sections`` relies on still holds — including the
+    pathological case where the lead alone exceeds the cap, where the lead itself is truncated
+    (a bare lead there busts the bound the aggregate budget assumes). A blank body renders the
+    lead alone for the same reason.
+    """
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    if body_cap <= 0 or not body.strip():
+        return _truncate_with_marker(lead, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
+    return f"{lead}\n\n{_truncate_with_marker(body, body_cap, url)}"
 
 
 def _budgeted_success_sections(
@@ -779,6 +805,9 @@ class QuestionRungBudget:
     """
 
     wayback_attempts_left: int = RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS
+    # Paid url_context reads left for this question — the analogue of the Wayback cap, so a
+    # question citing several dead sources cannot pay per source inside one provider wall.
+    url_context_attempts_left: int = RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS
     # One browser escalation per host at a time WITHIN the question, see `browser_escalation_gate`.
     browser_escalation_gates: dict[str, asyncio.Semaphore] = field(default_factory=dict)
 
@@ -787,6 +816,13 @@ class QuestionRungBudget:
         if self.wayback_attempts_left <= 0:
             return False
         self.wayback_attempts_left -= 1
+        return True
+
+    def take_url_context_attempt(self) -> bool:
+        """Claim one paid url_context read for this question, or False when they are spent."""
+        if self.url_context_attempts_left <= 0:
+            return False
+        self.url_context_attempts_left -= 1
         return True
 
     def browser_escalation_gate(self, url: str) -> asyncio.Semaphore:
@@ -808,6 +844,18 @@ class QuestionRungBudget:
         finished work (FUTURE.md item 5, the operator's call).
         """
         return semaphore_for_host(url, self.browser_escalation_gates)
+
+
+# The human phrase each rung's wall-budget skip logs, keyed by route so the one message template
+# in `FetchContext.claim_rung_budget` reads the same as the six hand-copied lines it replaced.
+_RUNG_WALL_SKIP_PHRASE: dict[FetchRoute, str] = {
+    "meta_refresh": "the meta-refresh hop",
+    "pdf_local": "the local PDF read",
+    "derived_api": "the derived-feed GET",
+    "rendered": "the rendered rung",
+    "wayback": "the wayback rung",
+    "url_context": "the url_context rung",
+}
 
 
 @dataclass
@@ -852,12 +900,38 @@ class FetchContext:
         """
         return RESOLUTION_SOURCE_WALL_TIMEOUT - (time.monotonic() - self.started) - RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
 
+    def claim_rung_budget(
+        self, rung: FetchRoute, from_status: FetchStatus, url: str, floor_s: float, *, note: str = ""
+    ) -> float | None:
+        """The remaining wall budget for ``rung``, or None once it has recorded the skip.
+
+        The one home for the wall-budget preamble every rung copied: read the remaining wall,
+        and below the rung's own floor log once, record a ``wall_budget`` skip on this context and
+        return None; otherwise hand back the budget the rung sizes its work off. Structural rather
+        than stylistic — an incomplete copy still returned None and simply never appeared in the
+        ``rung_budget_skips`` count, so the archive under-reported how often the wall is the
+        binding constraint. ``note`` is the one place the message varies (the paid rung's second
+        check adds " after the robots pre-check", the PDF read's re-check " after queueing").
+        """
+        budget_s = self.rung_budget_s()
+        if budget_s < floor_s:
+            logger.warning(
+                "resolution_source: skipping %s for %s — %.1fs of wall budget left%s",
+                _RUNG_WALL_SKIP_PHRASE[rung],
+                urlparse(url).netloc,
+                budget_s,
+                note,
+            )
+            self.skip_rung(rung, from_status, url, "wall_budget")
+            return None
+        return budget_s
+
     def start_rung(self, rung: FetchRoute, from_status: FetchStatus, url: str) -> RungAttempt:
         attempt = RungAttempt(rung=rung, from_status=from_status, url=url, started_at=time.monotonic())
         self.rungs.append(attempt)
         return attempt
 
-    def skip_rung(self, rung: FetchRoute, from_status: FetchStatus, url: str, reason: str) -> None:
+    def skip_rung(self, rung: FetchRoute, from_status: FetchStatus, url: str, reason: RungSkipReason) -> None:
         self.rungs.append(
             RungAttempt(
                 rung=rung,
@@ -868,6 +942,24 @@ class FetchContext:
                 skipped_reason=reason,
             )
         )
+
+    def close_rungs(self, first_new: int, outcome: FetchStatus) -> None:
+        """Close every attempt opened since ``first_new`` with ONE clock reading and one outcome.
+
+        The dispatcher calls this the moment a rung's result is known — ``first_new`` is
+        ``len(ctx.rungs)`` read before the rung ran — so each attempt's ``wall_s`` measures
+        that rung alone and its ``outcome`` is the status that stood once it was over: the
+        rescue it returned, or the direct status it left standing when it declined. A rung
+        that already stamped either field for itself keeps its stamp (``finish`` respects the
+        PDF read's own ``wall_s``; the browser rung's own ``outcome`` is the rendered DOM's
+        verdict), which is what keeps a harvested feed's rescue from being credited to the
+        render that only found the endpoint.
+        """
+        now = time.monotonic()
+        for attempt in self.rungs[first_new:]:
+            attempt.finish(now)
+            if attempt.outcome is None and not attempt.skipped_reason:
+                attempt.outcome = outcome
 
 
 def _aux_ctx(ctx: FetchContext) -> FetchContext:
@@ -912,10 +1004,13 @@ def _stamped_with_route(result: FetchResult, ctx: FetchContext) -> FetchResult:
     ``route`` is the LAST rung that fired, which is the one that produced this outcome
     (a meta-refresh hop onto a PDF reads ``pdf_local``: the hop got us the bytes, the
     local read is what the text came from). Skipped rungs never claim the route.
+
+    Every rung the dispatcher ran has already been closed with its own wall and outcome
+    (:meth:`FetchContext.close_rungs`); the close here is the last resort for an attempt a
+    future rung opens without bracketing, and stamps it with the final status rather than
+    leaving the marker to print ``None``.
     """
-    now = time.monotonic()
-    for attempt in ctx.rungs:
-        attempt.finish(now)
+    ctx.close_rungs(0, result.status)
     result.rung_attempts = list(ctx.rungs)
     fired: list[FetchRoute] = [attempt.rung for attempt in ctx.rungs if not attempt.skipped_reason]
     if fired:
@@ -1000,7 +1095,31 @@ async def _resolution_redirect_outcome(resp: Any, current_url: str, content_type
     )
 
 
-def _resolution_status_outcome(status: int, current_url: str, content_type: str) -> FetchResult | None:
+def _network_failure_class(exc: BaseException) -> str:
+    """Bucket a transport exception for the fetch marker's ``failure_class``.
+
+    The specific subclasses come FIRST because aiohttp's TLS and DNS connector errors both
+    subclass ``ClientConnectorError``, so the general connection bucket would otherwise swallow
+    them — and the whole point of the field is to tell a host that refused our TLS from one our
+    egress IP could not resolve. ``exc`` on the same line keeps the exact class name for anything
+    this coarse vocabulary lumps together.
+    """
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(
+        exc, aiohttp.ClientConnectorCertificateError | aiohttp.ClientConnectorSSLError | aiohttp.ClientSSLError
+    ):
+        return "tls"
+    if isinstance(exc, aiohttp.ClientConnectorDNSError):
+        return "dns"
+    if isinstance(exc, aiohttp.ClientPayloadError):
+        return "decode"
+    return "connection"
+
+
+def _resolution_status_outcome(
+    status: int, current_url: str, content_type: str, *, server: str | None = None
+) -> FetchResult | None:
     """Terminal result for a non-200 status, or None when the body should be read."""
     if status == 200:
         return None
@@ -1011,6 +1130,8 @@ def _resolution_status_outcome(status: int, current_url: str, content_type: str)
         text="",
         http_status=status,
         content_type=content_type or None,
+        failure_class=http_failure_class(status),
+        server=server_header_token(server),
     )
 
 
@@ -1136,14 +1257,10 @@ async def _meta_refresh_hop(
     target = meta_refresh_target(html_text)
     if target is None:
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the meta-refresh hop for %s — %.1fs of wall budget left",
-            urlparse(current_url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("meta_refresh", from_status, current_url, "wall_budget")
+    if (
+        ctx.claim_rung_budget("meta_refresh", from_status, current_url, RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S)
+        is None
+    ):
         return None
     ctx.start_rung("meta_refresh", from_status, current_url)
     logger.info(
@@ -1472,16 +1589,9 @@ async def _resolution_pdf_outcome(
         content_type=content_type,
         from_status=from_status,
     )
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
-        # Checked here, before the response context closes, so a question with no budget
-        # left never even queues for a parse slot it would have to give back.
-        logger.warning(
-            "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left",
-            netloc,
-            budget_s,
-        )
-        ctx.skip_rung("pdf_local", from_status, current_url, "wall_budget")
+    # Checked here, before the response context closes, so a question with no budget left never
+    # even queues for a parse slot it would have to give back.
+    if ctx.claim_rung_budget("pdf_local", from_status, current_url, RESOLUTION_SOURCE_PDF_MIN_BUDGET_S) is None:
         return _document_not_parsed(pending, "budget_skipped")
     return pending
 
@@ -1526,14 +1636,10 @@ async def _finish_document(pending: _PendingDocument, ctx: FetchContext) -> Fetc
     try:
         # Re-read after the wait: the queue itself consumed budget, and `max_seconds` is
         # wall-clock, so a stale figure would hand pypdf a bound that already expired.
-        budget_s = ctx.rung_budget_s()
-        if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
-            logger.warning(
-                "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left after queueing",
-                netloc,
-                budget_s,
-            )
-            ctx.skip_rung("pdf_local", pending.from_status, pending.url, "wall_budget")
+        budget_s = ctx.claim_rung_budget(
+            "pdf_local", pending.from_status, pending.url, RESOLUTION_SOURCE_PDF_MIN_BUDGET_S, note=" after queueing"
+        )
+        if budget_s is None:
             return _document_not_parsed(pending, "budget_skipped")
         attempt = ctx.start_rung("pdf_local", pending.from_status, pending.url)
         pdf, digest = await asyncio.to_thread(
@@ -1622,8 +1728,10 @@ async def _resolution_response_outcome(
     if status in REDIRECT_STATUSES:
         return await _resolution_redirect_outcome(resp, current_url, content_type)
 
-    # Non-redirect response — same status routing as before.
-    non_ok = _resolution_status_outcome(status, current_url, content_type)
+    # Non-redirect response — same status routing as before. The `Server` header rides the
+    # non-200 result so a 403 can be attributed to the CDN that served it (Akamai / Cloudflare).
+    server = resp.headers.get("Server") if resp.headers else None
+    non_ok = _resolution_status_outcome(status, current_url, content_type, server=server)
     if non_ok is not None:
         return non_ok
 
@@ -1688,6 +1796,8 @@ async def _fetch_one_hop(
                 text="",
                 http_status=None,
                 content_type=None,
+                failure_class=_network_failure_class(e),
+                exc=type(e).__name__,
             )
     if isinstance(outcome, _PendingDocument):
         return await _finish_document(outcome, ctx)
@@ -1771,14 +1881,8 @@ async def _rendered_rung(
     if rendered_to_nothing(url, memo_scope=_RENDER_MEMO_SCOPE):
         ctx.skip_rung("rendered", direct.status, url, "rendered_no_text")
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the rendered rung for %s — %.1fs of wall budget left",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("rendered", direct.status, url, "wall_budget")
+    budget_s = ctx.claim_rung_budget("rendered", direct.status, url, RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S)
+    if budget_s is None:
         return None
     attempt = ctx.start_rung("rendered", direct.status, url)
     goto_timeout_ms = int(min(RENDER_TIMEOUT_MS, budget_s * 1000) - RENDER_SETTLE_MS)
@@ -1839,6 +1943,10 @@ async def _rendered_rung(
         # when a goto timed out and the DOM was salvaged, and a non-200 never reaches here.
         http_status=direct.http_status if direct.http_status is not None else 200,
     )
+    # The render's own verdict, stamped before the harvest gets its turn: when the harvested
+    # feed rescues the page, the ladder's result is `success` and the closer would otherwise
+    # credit the render with a rescue the DOM never delivered.
+    attempt.outcome = classified.result.status
     if classified.result.status == "success":
         return classified.result
     derived = _derived_api_from_harvest(url, direct, page, ctx)
@@ -1879,26 +1987,14 @@ def _derived_api_result(
 ) -> FetchResult:
     """One derived-feed result: the provenance lead, then the budgeted JSON.
 
-    The lead LEADS, like every other lead this module renders, because each truncator here is
-    head-preserving and anything at the tail is the first thing a later trim discards — and a
-    feed served with its provenance line trimmed off is a JSON blob nobody can check. Its cost
-    comes out of the per-URL cap rather than being added on top, so the section budget still
-    binds.
+    The lead LEADS and its cost comes out of the per-URL cap (:func:`_lead_then_capped_body`),
+    because a feed served with its provenance line trimmed off is a JSON blob nobody can check.
     """
     lead = derived_api.derived_api_lead(endpoint, url)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
-    if body_cap <= 0:
-        return FetchResult(
-            url=url,
-            status="success",
-            text=_truncate_with_marker(lead, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url),
-            http_status=http_status,
-            content_type="application/json",
-        )
     return FetchResult(
         url=url,
         status="success",
-        text=f"{lead}\n\n{_truncate_with_marker(raw, body_cap, url)}",
+        text=_lead_then_capped_body(lead, raw, url),
         http_status=http_status,
         content_type="application/json",
     )
@@ -1926,14 +2022,7 @@ async def _derived_api_rung(
     endpoint = derived_api.endpoint_for(url)
     if endpoint is None:
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the derived-feed GET for %s — %.1fs of wall budget left",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("derived_api", direct.status, url, "wall_budget")
+    if ctx.claim_rung_budget("derived_api", direct.status, url, RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S) is None:
         return None
     ctx.start_rung("derived_api", direct.status, url)
     logger.info(
@@ -2030,17 +2119,13 @@ async def _wayback_snapshot_result(
             http_status=snapshot.http_status,
             content_type=snapshot.content_type,
         )
+    # The lead LEADS and its cost comes out of the per-URL cap (:func:`_lead_then_capped_body`):
+    # an archived page whose age line has been trimmed off is being passed off as the live one.
     lead = wayback_lead(parsed, age_days, direct.status)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
-    # The lead LEADS and its cost comes out of the per-URL cap, like every other lead here: the
-    # truncators are head-preserving, so a trailing disclosure is the first thing a later trim
-    # discards — and an archived page whose age line has been trimmed off is being passed off as
-    # the live one.
-    text = lead if body_cap <= 0 else f"{lead}\n\n{_truncate_with_marker(snapshot.text, body_cap, url)}"
     return FetchResult(
         url=url,
         status="success",
-        text=text,
+        text=_lead_then_capped_body(lead, snapshot.text, url),
         http_status=snapshot.http_status,
         content_type=snapshot.content_type,
         datawrapper_charts=snapshot.datawrapper_charts,
@@ -2062,14 +2147,7 @@ async def _wayback_rung(
     """
     if direct.status not in _WAYBACK_TRIGGER_STATUSES:
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the wayback rung for %s — %.1fs of wall budget left",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("wayback", direct.status, url, "wall_budget")
+    if ctx.claim_rung_budget("wayback", direct.status, url, RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S) is None:
         return None
     if not ctx.shared.take_wayback_attempt():
         logger.warning(
@@ -2212,27 +2290,32 @@ async def _url_context_admission(
         )
         ctx.skip_rung("url_context", direct.status, url, "no_api_key")
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the url_context rung for %s — %.1fs of wall budget left",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("url_context", direct.status, url, "wall_budget")
+    if ctx.claim_rung_budget("url_context", direct.status, url, RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S) is None:
         return None
     if await _url_context_robots_skip(session, url, host_sems, ctx):
         logger.info(f"RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url={url} host={urlparse(url).netloc}")
         ctx.skip_rung("url_context", direct.status, url, "robots_disallowed")
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the url_context rung for %s — %.1fs of wall budget left after the robots pre-check",
+    budget_s = ctx.claim_rung_budget(
+        "url_context",
+        direct.status,
+        url,
+        RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
+        note=" after the robots pre-check",
+    )
+    if budget_s is None:
+        return None
+    # Last, and only for a read that cleared every cheaper gate, so a slot is spent on a read
+    # that is actually about to fire — not on one robots or the wall already declined. Mirrors
+    # the Wayback per-question cap: a question citing several dead sources pays at most
+    # RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS times inside one provider wall.
+    if not ctx.shared.take_url_context_attempt():
+        logger.info(
+            "resolution_source: skipping the url_context rung for %s — this question's %d paid read(s) are spent",
             urlparse(url).netloc,
-            budget_s,
+            RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
         )
-        ctx.skip_rung("url_context", direct.status, url, "wall_budget")
+        ctx.skip_rung("url_context", direct.status, url, "url_context_cap")
         return None
     return api_key, budget_s
 
@@ -2302,16 +2385,13 @@ async def _url_context_rung(
             http_status=direct.http_status,
             content_type=direct.content_type,
         )
+    # The lead LEADS and is budgeted out of the cap (:func:`_lead_then_capped_body`): a model's
+    # answer rendered without the disclosure reads as the page itself.
     lead = _url_context_lead(direct.status)
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
-    # The lead LEADS and is budgeted out of the cap, like every other lead here: the truncators
-    # are head-preserving, so a trailing disclosure is the first thing a later trim discards —
-    # and a model's answer rendered without it reads as the page itself.
-    served = lead if body_cap <= 0 else f"{lead}\n\n{_truncate_with_marker(text.strip(), body_cap, url)}"
     return FetchResult(
         url=url,
         status="success",
-        text=served,
+        text=_lead_then_capped_body(lead, text.strip(), url),
         http_status=direct.http_status,
         content_type="text/plain",
     )
@@ -2330,6 +2410,10 @@ async def _escalate_unresolved(
     (``stale_data``, a capture we read and will not serve); it is kept as the fallback rather
     than as an early return, so the paid rung below is still reachable for that page.
 
+    Each rung is closed the moment its result is known (:meth:`FetchContext.close_rungs`), so
+    the attempts it opened carry that rung's own wall and outcome rather than the ladder's:
+    the status it returned, or the direct status it left standing when it declined.
+
     ``session`` is the aiohttp session the rungs that issue an ordinary GET use; the browser
     rung ignores it, because Chromium brings its own transport.
     """
@@ -2340,7 +2424,9 @@ async def _escalate_unresolved(
         # same-host sibling asks `endpoint_for` only after this escalation has recorded (or
         # failed to record) an endpoint — see `QuestionRungBudget.browser_escalation_gate`.
         async with ctx.shared.browser_escalation_gate(url):
+            first_new = len(ctx.rungs)
             derived = await _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+            ctx.close_rungs(first_new, (derived or direct).status)
             if derived is not None:
                 return derived
             # Declined HERE rather than inside the rung: the rung's own gates all cost something
@@ -2349,13 +2435,17 @@ async def _escalate_unresolved(
             if ctx.fast_path:
                 _skip_for_fast_path(ctx, "rendered", direct, url)
             else:
+                first_new = len(ctx.rungs)
                 rendered = await _rendered_rung(url, direct, host_sems, ctx)
+                ctx.close_rungs(first_new, (rendered or direct).status)
                 if rendered is not None:
                     return rendered
     # Reached only for the statuses the browser rungs do not claim — the two trigger sets are
     # disjoint by construction (see `_WAYBACK_TRIGGER_STATUSES`), so the order between them is a
     # reading choice: free-and-local first, then the route whose egress is not ours.
+    first_new = len(ctx.rungs)
     wayback = await _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    ctx.close_rungs(first_new, (wayback or direct).status)
     if wayback is not None and wayback.status == "success":
         return wayback
     # Last, because it is the only rung that spends money and the only one whose product is a
@@ -2364,7 +2454,9 @@ async def _escalate_unresolved(
     # capture too old to serve is still a page we could not read fresh, which is exactly the
     # population this rung exists for. The withhold stays the fallback below, so with the flag
     # off (or the reader declining) a stale capture still reports `stale_data`.
+    first_new = len(ctx.rungs)
     read = await _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    ctx.close_rungs(first_new, (read or wayback or direct).status)
     if read is not None:
         return read
     return wayback if wayback is not None else direct
@@ -2382,6 +2474,9 @@ async def _fetch_one(
     """
     ctx = FetchContext() if ctx is None else ctx
     direct = await _fetch_direct(session, url, host_sems, ctx)
+    # The rungs inside the direct fetch (the meta-refresh hop, the local PDF read) are over
+    # once it returns, and its status is what they left standing.
+    ctx.close_rungs(0, direct.status)
     escalated = await _escalate_unresolved(session, url, direct, host_sems=host_sems, ctx=ctx)
     return _stamped_with_route(escalated, ctx)
 
@@ -2526,6 +2621,8 @@ async def _datawrapper_dataset_outcome(resp: Any, chart: DatawrapperChartRef, pa
             chart_id=chart.chart_id,
             chart_title=chart.title,
             parent_url=parent_url,
+            failure_class=http_failure_class(status),
+            server=server_header_token(resp.headers.get("Server") if resp.headers else None),
         )
 
     body = await read_body_capped(
@@ -2663,6 +2760,8 @@ async def _fetch_datawrapper_dataset(
                 chart_id=chart.chart_id,
                 chart_title=chart.title,
                 parent_url=parent_url,
+                failure_class=_network_failure_class(e),
+                exc=type(e).__name__,
             )
 
 
@@ -2875,25 +2974,36 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     Each rung that FIRED also gets one ``RESOLUTION_SOURCE_ESCALATION`` line. The
     fetch line above carries only the final outcome, so on its own it cannot say
     whether a rung rescued the page or what the attempt cost — and ``wall_s`` is what
-    decides whether a rung earns its latency under a close-derived time budget. The
-    ``url`` on an escalation line is the URL the rung was invoked ON, which for a
-    meta-refresh hop is the stub rather than the target the fetch line names.
+    decides whether a rung earns its latency under a close-derived time budget. Both
+    ``outcome`` and ``wall_s`` are the RUNG's own (``RungAttempt``): the status that stood
+    once that rung was over and what that rung alone cost, so on a page where a dead feed
+    GET was followed by a rescuing render the first line reads the direct status and the
+    second reads ``success``, and neither is billed for the other's latency. The ``url``
+    on an escalation line is the URL the rung was invoked ON, which for a meta-refresh hop
+    is the stub rather than the target the fetch line names.
     """
     for r in results:
         reason = f" reason={r.status_reason}" if r.status_reason else ""
         route = f" route={r.route}" if r.route != "direct" else ""
+        # Failure diagnostics, each appended only when present so a success and every archived
+        # line stay byte-identical. Keyed and tail-positioned in a fixed order after `route`, so
+        # a line carrying some but not all of them parses without a positional group claiming a
+        # neighbour's value.
+        failure_class = f" failure_class={r.failure_class}" if r.failure_class else ""
+        exc = f" exc={r.exc}" if r.exc else ""
+        server = f" server={r.server}" if r.server else ""
         logger.info(
             f"RESOLUTION_SOURCE_FETCH: question={qid} url={r.url} status={fetch_outcome_token(r)} "
             f"http={r.http_status if r.http_status is not None else 'n/a'} "
             f"embeds={','.join(r.unreadable_embeds) if r.unreadable_embeds else 'none'}"
-            f"{reason}{route}"
+            f"{reason}{route}{failure_class}{exc}{server}"
         )
         for attempt in r.rung_attempts:
             if attempt.skipped_reason:
                 continue
             logger.info(
                 f"RESOLUTION_SOURCE_ESCALATION: question={qid} url={attempt.url} "
-                f"from_status={attempt.from_status} rung={attempt.rung} outcome={r.status} "
+                f"from_status={attempt.from_status} rung={attempt.rung} outcome={attempt.outcome} "
                 f"wall_s={attempt.wall_s if attempt.wall_s is not None else 0.0:.2f}"
             )
 
@@ -2907,7 +3017,11 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
     """
     attempts = [attempt for r in results for attempt in r.rung_attempts]
     fired_by_rung = Counter(attempt.rung for attempt in attempts if not attempt.skipped_reason)
-    skips_by_reason = Counter(attempt.skipped_reason for attempt in attempts if attempt.skipped_reason)
+    # Typed on `RungSkipReason` so every literal key indexed below is checked: a misspelt reason
+    # is a type error rather than a permanently-zero count silently absent from the archive.
+    skips_by_reason: Counter[RungSkipReason | Literal[""]] = Counter(
+        attempt.skipped_reason for attempt in attempts if attempt.skipped_reason
+    )
     budget_skips_by_rung = Counter(attempt.rung for attempt in attempts if attempt.skipped_reason == "wall_budget")
     return {
         "meta_refresh_hops": fired_by_rung["meta_refresh"],
@@ -2945,6 +3059,9 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # cited URLs is a question whose per-question cap is binding, which is a different
         # thing to tune than a question that ran out of wall.
         "wayback_cap_skips": skips_by_reason["wayback_cap"],
+        # The paid rung's analogue: a question that spent its per-question paid-read budget on
+        # earlier cited URLs, which is the spend cap binding rather than the wall or the flag.
+        "url_context_cap_skips": skips_by_reason["url_context_cap"],
         # Its own count: an expensive rung declined because the QUESTION's close-derived budget
         # put it on the fast path, which is a fact about the question's window rather than about
         # the provider's own 45 s wall (`rung_budget_skips`) — the two are tuned differently.

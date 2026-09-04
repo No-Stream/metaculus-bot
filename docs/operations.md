@@ -431,9 +431,12 @@ other than the live page: `RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS` (an archived 
 than this is withheld as `stale_data` rather than served, matching the Datawrapper freshness
 bound), `RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS` (snapshot fetches per question, since every
 snapshot contends on one host gate) and `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS` (the SDK retry
-count for one paid read, deliberately fewer than gap-fill v2 allows its reader).
-`docs/research.md` has the reasoning behind each. Read the values off `constants.py`; that is the
-only authoritative copy.
+count for one paid read, deliberately fewer than gap-fill v2 allows its reader). Two more bound
+the paid rung's spend per question: `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` caps how many
+paid reads one question may pay for across its cited URLs (the analogue of the Wayback cap, a
+distinct quantity from the SDK retry count above, recorded as a `url_context_cap` skip when it
+binds). `docs/research.md` has the reasoning behind each. Read the values off `constants.py`; that
+is the only authoritative copy.
 
 ### Gap-fill
 
@@ -491,7 +494,9 @@ ladder and the Tier-1 resolution-source ladder, which share the transport in
 step that raises a GitHub warning annotation when it failed, because both callers degrade
 gracefully without a browser. The cost of a missing browser is visible per question in the
 resolution-source provider's `renderer_unavailable_skips` count, so a run whose install failed
-is readable from the archive rather than only from the annotation.
+is readable from the archive rather than only from the annotation. That count now excludes a URL
+an earlier question already rendered to nothing this run (its own `rendered_no_text_skips`), so a
+memo hit cannot inflate the install-failed signal.
 
 | Workflow | Trigger | Mode | What it does |
 |---|---|---|---|
@@ -1275,7 +1280,13 @@ the telemetry markers:
   [route=...]` — one line per URL the resolution-source provider fetched, emitted by
   `_log_fetch_outcome_markers` in `research/resolution_source.py`. `status` is `ok`
   for a success and the verbatim `FetchStatus` otherwise (`blocked`, `js_wall`,
-  `no_resolving_content`, `stale_data`, `ungrounded`, ...); `http` is `n/a` when no response ever
+  `no_resolving_content`, `stale_data`, `ungrounded`, ...). Since the escalation ladder it may
+  be a RUNG's verdict rather than the direct fetch's: the Wayback rung's `stale_data` where the
+  direct fetch said `blocked` / `error` / `not_found`, the paid reader's `ungrounded` where it
+  said `blocked` / `js_wall` / `error` / `no_resolving_content`. An era-bucketed `blocked` rate
+  off this field alone shows a drop at that merge that is bookkeeping, not hosts refusing us
+  less; the direct outcome is `from_status` on the sibling `RESOLUTION_SOURCE_ESCALATION` line,
+  and `route` partitions the two populations. `http` is `n/a` when no response ever
   arrived; `embeds` names the routeless data-embed providers (Infogram / Flourish /
   Tableau) found in the page's raw HTML, which is what makes an unreadable-embed
   page queryable even when its prose made the fetch a legitimate `ok`. `reason` is
@@ -1292,10 +1303,17 @@ the telemetry markers:
   `rendered`, `wayback` or `url_context` for an escalated one (`impersonate` is reserved in
   the vocabulary for a rung that is not built). Without it
   a rescued page reads exactly like one the direct route managed on its own, so "what
-  did the ladder actually buy" would not be a query. Both optional fields are keyed and
-  sit at the end of the line, so a line carrying `route` and no `reason` parses
-  correctly and every archived line still parses byte-identically. Tier-2
-  Datawrapper dataset hops ride the same line and are identifiable by their url
+  did the ladder actually buy" would not be a query. Three more optional keyed fields carry
+  failure diagnostics on a non-success fetch, so the archive can separate an egress-reputation
+  refusal from a host fault (the archived Akamai 403s reproduce only from the GitHub runner
+  IP): `failure_class` is a small token vocabulary (`http_403`, `http_4xx`, `http_5xx` off the
+  response, or `tls`, `dns`, `timeout`, `connection`, `decode` off the transport exception),
+  `exc` is that exception's class name, and `server` is the `Server` response header
+  lower-cased with internal spaces collapsed to `_` (the strongest tell of which CDN refused
+  us). All optional fields are keyed and sit at the end of the line in a fixed order
+  (`reason`, `route`, `failure_class`, `exc`, `server`), so a line carrying a later field but
+  not an earlier one parses correctly and every archived line still parses byte-identically.
+  Tier-2 Datawrapper dataset hops ride the same line and are identifiable by their url
   (`static.dwcdn.net/data/<chart_id>.csv`). This replaced the older free-text
   `resolution_source fetched <netloc> (<status>)` lines rather than joining them, so
   each fetch appears exactly once; the remaining free-text lines are REASON lines (a
@@ -1308,15 +1326,20 @@ the telemetry markers:
   the escalation, and which statuses appear depends on the rung: the unreadable-page family
   (`blocked`, `js_wall`, `no_resolving_content`) for the browser and derived-feed rungs, plus
   `error` and `not_found` for the Wayback rung, whose whole point is a page our address never
-  reached. `rung` is the route tried, `outcome` is what came back, and
-  `wall_s` is what that rung cost. The `RESOLUTION_SOURCE_FETCH` line above records only
-  the FINAL outcome per URL, so on its own it cannot say how many rungs were spent or
+  reached. `rung` is the route tried. `outcome` and `wall_s` are that RUNG's own, stamped as
+  the dispatcher closes it: `outcome` is the status that stood once the rung was over (its
+  rescue, its own verdict such as `stale_data` or `ungrounded`, or the direct status it left
+  standing when it declined) and `wall_s` is what that rung alone cost. A URL with several
+  lines therefore reads as a sequence, and on a page where a dead feed GET was followed by a
+  rescuing render the first line carries the direct status and the second carries `success`,
+  with neither billed for the other's latency. The `RESOLUTION_SOURCE_FETCH` line above records
+  only the FINAL outcome per URL, so on its own it cannot say how many rungs were spent or
   which one rescued the page; this marker is where a rung that fires often and rescues
   nothing becomes distinguishable from one that never fires, and where the latency case
   for keeping a rung on a question under a close-derived time budget gets made. A rung that
   never RAN (no wall budget, no browser, the per-question snapshot cap, the robots pre-check)
   emits no line here by design and is counted in the provider's `details["counts"]` instead;
-  `docs/research.md` lists the eleven count keys.
+  `docs/research.md` lists every count key.
   Harvested as `resolution_source_escalation`.
 - `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]` — a WARN, one per
   gap-fill v2 `read_document` call whose `url_context` retrieval brought back nothing,

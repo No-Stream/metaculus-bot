@@ -1,7 +1,7 @@
 """Reading a Wayback Machine snapshot URL: the route in, the timestamp out, the disclosure.
 
 Pure parsing and rendering, no network. The rung that uses these lives in
-``tests/resolution_source/test_resolution_source_escalation.py``; what is pinned here is the
+``tests/resolution_source/test_resolution_source_wayback_rung.py``; what is pinned here is the
 route shape the live probe confirmed on 2026-09-03 and the two-sided freshness rule.
 """
 

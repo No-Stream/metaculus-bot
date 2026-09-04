@@ -962,8 +962,10 @@ the version-free `static.dwcdn.net/data/<chart_id>.csv` route, because the page 
 pins a stale chart version whose `datawrapper.dwcdn.net/<id>/<version>/dataset.csv`
 form keeps serving 5-14-month-old snapshots as HTTP 200 (the naive fix the 2026-08-24
 verifications refuted). A `Last-Modified` freshness guard then withholds anything
-outside the window under a Tier-2-only `stale_data` status rather than serving stale
-data as live: older than `RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS`, undatable, or
+outside the window under the `stale_data` status rather than serving stale data as live
+(the Wayback rung below uses the same status for an over-age archived capture of a cited
+page; the two are told apart by `chart_id`): older than
+`RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS`, undatable, or
 implausibly far in the FUTURE — a future date past a six-hour clock-skew tolerance
 means a broken clock, not maximal freshness. The hop is bounded by
 `RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS`,
@@ -998,11 +1000,15 @@ launch slot is contended process-wide, so a question with no budget left would t
 sibling question could still land a page with. The rendered DOM re-enters `_classify_html_body`,
 so a rescued page gets the same chart read, ARIA rewrite, floors and disclosure leads as a
 directly-fetched one, and can still be withheld. A transport that declines (Playwright missing
-or broken, a host that will not pin to a public IP, a browser error, or a URL a browser already
-read to nothing this run) is recorded as a SKIP with the new reason `renderer_unavailable`
-rather than as a fired rung, because nothing was rendered and so nothing about the page changed.
-Two bounds hold the rung inside the wall, and a render cut off by either is recorded as a SKIP
-with its own reason, `render_timeout`, rather than as the renderer being unavailable. Inside the
+or broken, a host that will not pin to a public IP, or a browser error) is recorded as a SKIP
+with the reason `renderer_unavailable` rather than as a fired rung, because nothing was rendered
+and so nothing about the page changed. Two nearby cases are kept OUT of that reason so a memo
+hit or a queue timeout cannot read as the Chromium install having failed: a URL an earlier
+question already rendered to nothing this run is `rendered_no_text` (the memo doing its job),
+and a render that ran out of budget queued behind the launch gates, which the transport signals
+with `RenderBudgetExpired`, is `wall_budget` (the same reason the pre-gate floor check records).
+Two more bounds hold the rung inside the wall, and a render cut off by either is recorded as a
+SKIP with its own reason, `render_timeout`, rather than as the renderer being unavailable. Inside the
 transport, `page.content()` is capped at `RENDER_DOM_READ_TIMEOUT_MS`: on a settled DOM it is a
 sub-second round trip, and it runs long only when the page keeps navigating after the settle
 (measured 2026-09-03 on ogimet.com, where the goto timed out at 33 s as designed and the
@@ -1034,7 +1040,14 @@ status standing, because "no archived copy exists" is a different fact from a st
 direct status says more about the source. Only a capture we did read and cannot date, or can date
 and it is too old, is withheld as `stale_data`. A withhold does not end the ladder: the paid rung
 below is still asked about the DIRECT outcome (a stale archive is still a page we could not read
-fresh), and the withhold is what stands when that rung is off or declines.
+fresh), and the withhold is what stands when that rung is off or declines. This rung is NOT
+flag-gated, so from its merge a cited page's `status` can be a rung's verdict where it used to
+be the direct outcome: `stale_data` where the direct fetch said `blocked` / `error` /
+`not_found`, and (flag on) `ungrounded` where it said `blocked` / `js_wall` / `error` /
+`no_resolving_content`. An era-bucketed `blocked` or `error` rate read off `status` alone will
+show a drop at that merge that is a bookkeeping change, not hosts refusing us less; take the
+direct outcome from `from_status` on the `RESOLUTION_SOURCE_ESCALATION` line, or partition
+`status` by `route`, where `direct` rows are unchanged.
 
 `route=url_context` is the LAST rung and the only paid one: Gemini reads the page for us
 (`research/url_context_reader.py`, the reader shared with gap-fill v2's `read_document`),
@@ -1054,7 +1067,11 @@ the budget after the pre-check is what keeps that ceiling honest, and a pre-chec
 records a `wall_budget` skip rather than a paid call nothing reads. It has its
 own retry count, `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`, deliberately lower than the v2
 reader's, because a retry inside a wall shared with every other cited URL spends the budget the
-pages already fetched need in order to render. Zero successful retrievals
+pages already fetched need in order to render. A per-QUESTION paid-read cap,
+`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`, bounds how many reads a single question can pay
+for across its cited URLs — the analogue of the Wayback per-question cap and a distinct quantity
+from the SDK retry count — claimed last, only for a read that has cleared every cheaper gate, and
+a read the cap declines records a `url_context_cap` skip. Zero successful retrievals
 DISCARDS the text under the new terminal status `ungrounded`, the same floor `gemini_search` and
 v2's `read_document` apply: Gemini answers fluently out of parametric memory when every
 retrieval failed, and a fluent unsourced answer under the primary-grading-evidence caption is
@@ -1102,13 +1119,18 @@ by the pages before it" is the question the flag's rollout asks.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
 parse gate is what binds. `renderer_unavailable_skips` is a browser rung that never rendered,
 most often because Chromium is missing on the runner (the install step is `continue-on-error` in
-every workflow, so its absence is by design), and it is invisible in `rendered_attempts`.
+every workflow, so its absence is by design), and it is invisible in `rendered_attempts`; it no
+longer includes a URL an earlier question rendered to nothing, which is its own
+`rendered_no_text_skips` so a memo hit cannot inflate the install-failed signal.
 `render_timeout_skips` is a browser rung that launched and was cut off, by the transport's
 DOM-read cap or by the question's remaining wall budget: a page that keeps navigating, which is a
 fact about the page rather than about the runner or the question's clock, and also invisible in
 `rendered_attempts`.
 `wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
-per-question cap is what binds. `fast_path_skips` is an expensive rung (the render, the paid read)
+per-question cap is what binds; `url_context_cap_skips` is the paid rung's analogue, a question
+that spent its per-question paid-read budget (`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`) on
+earlier cited URLs, so the spend cap binds rather than the wall or the flag. `fast_path_skips`
+is an expensive rung (the render, the paid read)
 declined because the QUESTION's close-derived budget put it on the time-budget fast path, a fact
 about the question's window rather than about the provider's own 45 s wall, which is what
 `rung_budget_skips` counts. `url_context_robots_skips` is the free `Google-Extended`
@@ -1149,17 +1171,23 @@ to provider diagnostics.
 url_context rung answered with zero successful retrievals, so what came back is recall rather
 than a read of the page and it is discarded rather than rendered. It has its own token because
 it says something no other status does, that the host answered a third-party fetcher's request
-with nothing while refusing ours. On the reason side, `renderer_unavailable` and
-`render_timeout` join the `embed_shell` / `thin_page` / `no_text_layer` / `encrypted` /
-`malformed` / `no_matching_passage` / `budget_skipped` / `parse_contention` vocabulary, and they
-are the two that ride a rung attempt's `skipped_reason` rather than a result's `status_reason`,
-since nothing was rendered and so nothing about the page changed. `renderer_unavailable` is the
-browser declining (missing, broken, unpinnable host, memoised URL); `render_timeout` is a render
-that launched and was cut off because the page kept navigating, and the two are kept apart
-because only the first says anything about Chromium. `no_resolving_content` now has three reasons
-rather than two (`embed_shell`, `thin_page` and `no_matching_passage`), and the third is the
-only one that is a document rather than a page. All of them live in
-`research/resolution_fetch_result.py` with the rest of the vocabulary.
+with nothing while refusing ours. On the reason side there are now two vocabularies rather than
+one, split by what each qualifies. `FetchStatusReason` qualifies a result's STATUS —
+`embed_shell` / `thin_page` / `no_matching_passage` under `no_resolving_content`, `no_text_layer`
+/ `encrypted` / `malformed` under `unreadable_document`, and `budget_skipped` / `parse_contention`
+under the `unsupported_type` a held-but-unparsed document earns. `RungSkipReason` qualifies a
+rung ATTEMPT that never ran (`RungAttempt.skipped_reason`), which produced no result and so has
+nowhere else to record its reason: `wall_budget`, `wayback_cap`, `fast_path`, `no_api_key`,
+`robots_disallowed`, `rendered_no_text`, `renderer_unavailable`, `render_timeout`, and
+`parse_contention` again (a held document declined for want of a parse slot records the skip AND
+stamps the withheld result's `status_reason`, the one token shared by both Literals). Both are a
+closed `Literal`, so a misspelt reason is a type error rather than a permanently-zero count.
+`renderer_unavailable` is the browser declining before it rendered anything (missing, broken,
+unpinnable host); `render_timeout` is a render that launched and was cut off because the page
+kept navigating, and the two are kept apart because only the first says anything about Chromium.
+`no_resolving_content` has three reasons rather than two (`embed_shell`, `thin_page` and
+`no_matching_passage`), and the third is the only one that is a document rather than a page. All
+of them live in `research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that
 decision is made, on every raw-body branch — Tier-1 JSON/text/CSV and the Tier-2
@@ -1170,8 +1198,10 @@ like `0�.�4�2�` type-checks as text and rendered as grading evidence. It
 whitespace-only, which is `empty_body`. Or — datasets only — it is not row-shaped, so
 nothing may claim it is the chart's live series. That third check is deliberately
 ordered BEFORE the freshness verdict, so an empty CDN body cannot borrow
-`stale_data`'s benign diagnostics token (`stale_data` reports to diagnostics as the
-benign "guard working as designed", which would hide a broken hop). Row shape is also
+`stale_data`'s benign diagnostics token (a DATASET's `stale_data`, the one carrying a
+`chart_id`, reports to diagnostics as the benign "guard working as designed", which would
+hide a broken hop; a cited page's `stale_data` from the Wayback rung is a lost source and
+keeps its loss token). Row shape is also
 decided on the PRE-strip text, because `looks_like_csv_rows` rejects markup by its
 leading `<` and stripping first would remove exactly the allow-listed fragment tags
 (`<p>`, `<div>`) a CDN soft-404 opens with, letting an error page carry the

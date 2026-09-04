@@ -834,9 +834,12 @@ class TestResolutionSourceFetchMarker:
             await resolution_source_provider(is_benchmarking=False)(q)
 
         lines = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")]
+        # The 403 carries its failure_class (server absent: the fake response sends no Server
+        # header), which is what separates an egress-reputation refusal from a host fault.
         assert lines == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.bls.gov/cpi/ status=ok http=200 embeds=none",
-            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data status=blocked http=403 embeds=none",
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data "
+            "status=blocked http=403 embeds=none failure_class=http_403",
         ]
 
     async def test_the_marker_names_the_unreadable_embed_providers(
@@ -892,8 +895,11 @@ class TestResolutionSourceFetchMarker:
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
             await resolution_source_provider(is_benchmarking=False)(q)
 
+        # A transport failure carries its class and the exception's name, so the archive tells a
+        # timeout from a TLS or DNS refusal without re-scraping the run log.
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            "RESOLUTION_SOURCE_FETCH: question=999 url=https://slow.example.com/x status=error http=n/a embeds=none"
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://slow.example.com/x "
+            "status=error http=n/a embeds=none failure_class=timeout exc=TimeoutError"
         ]
 
     async def test_no_fetch_is_logged_twice(self, article_html, monkeypatch, caplog):

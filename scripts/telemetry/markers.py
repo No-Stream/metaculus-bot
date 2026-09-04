@@ -764,6 +764,13 @@ MARKER_SPECS: list[MarkerSpec] = [
         # (``blocked`` / ``js_wall`` / ``no_resolving_content`` / ``stale_data`` / ...), the
         # same token the provider-diagnostics source map uses, minus that map's
         # dataset-``stale_data``-to-``none`` amnesty — telemetry keeps the reason verbatim.
+        # Since the escalation ladder (2026-09-03) it may be a RUNG's verdict rather than the
+        # direct fetch's: the Wayback rung's ``stale_data`` where the direct fetch said
+        # ``blocked`` / ``error`` / ``not_found``, the paid reader's ``ungrounded`` where it
+        # said ``blocked`` / ``js_wall`` / ``error`` / ``no_resolving_content``. An
+        # era-bucketed ``blocked`` rate off this field alone shows a drop at that merge that is
+        # bookkeeping, not hosts refusing us less; the direct outcome is ``from_status`` on the
+        # sibling escalation line, and ``route`` partitions the two populations.
         # ``http`` is ``n/a`` when no response ever arrived (timeout, client error, SSRF
         # rejection). ``embeds`` names the routeless data-embed providers found in the
         # page's raw HTML, or the ``none`` sentinel (which harvests as None); it is what
@@ -796,10 +803,19 @@ MARKER_SPECS: list[MarkerSpec] = [
         # sitting BETWEEN same-shaped ``\S+`` fields silently records None for a value that
         # WAS emitted, and a keyed tail group cannot mis-claim its neighbour's value, so a
         # line carrying ``route`` but no ``reason`` parses correctly.
+        # ``failure_class`` / ``exc`` / ``server`` (all optional, 2026-09-03) are the failure
+        # diagnostics that separate an egress-reputation refusal from a host fault: a small token
+        # vocabulary (``http_403`` / ``http_4xx`` / ``http_5xx`` off the response, ``tls`` /
+        # ``dns`` / ``timeout`` / ``connection`` / ``decode`` off the transport exception), the
+        # exception class name, and the ``Server`` header lower-cased with internal spaces
+        # collapsed to ``_``. Keyed and TAIL-positioned after ``route`` in that fixed order, each
+        # emitted only when present, so an old parser and every archived line still parse and a
+        # line carrying a later field but not an earlier one cannot mis-claim a neighbour's value.
         re.compile(
             r"RESOLUTION_SOURCE_FETCH:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
             r"\s+status=(?P<status>\S+)\s+http=(?P<http>\S+)\s+embeds=(?P<embeds>\S+)"
             r"(?:\s+reason=(?P<reason>\S+))?(?:\s+route=(?P<route>\S+))?"
+            r"(?:\s+failure_class=(?P<failure_class>\S+))?(?:\s+exc=(?P<exc>\S+))?(?:\s+server=(?P<server>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),
@@ -815,8 +831,16 @@ MARKER_SPECS: list[MarkerSpec] = [
         # ``from_status`` is the verbatim ``FetchStatus`` that triggered the escalation (the
         # unreadable-page family: ``blocked`` / ``js_wall`` / ``no_resolving_content``), so the
         # trigger population is queryable without joining back to the fetch marker. ``rung``
-        # names the route tried and ``outcome`` what came back, which keeps a rung that fires
-        # often but rescues nothing distinguishable from one that never fires at all.
+        # names the route tried. ``outcome`` and ``wall_s`` are THAT RUNG's own, stamped as it
+        # closes (``RungAttempt``): ``outcome`` is the status that stood once the rung was over
+        # — its rescue, its verdict (``stale_data``, ``ungrounded``), or the direct status it
+        # left standing when it declined — and ``wall_s`` is what that rung alone cost. So on a
+        # page where a dead feed GET was followed by a rescuing render, the first line reads the
+        # direct status and the second reads ``success``, which is what keeps a rung that fires
+        # often but rescues nothing distinguishable from one that never fires at all. (Before
+        # the per-rung close existed — never on main — both fields were whole-ladder values,
+        # so every line for a URL carried the FINAL status and each rung was billed for the
+        # latency of the rungs after it.)
         #
         # The token cannot collide with ``RESOLUTION_SOURCE_FETCH``: both specs match on their
         # own full marker word plus the colon, and neither word is a prefix of the other, so
