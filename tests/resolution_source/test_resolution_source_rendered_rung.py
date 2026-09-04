@@ -10,7 +10,7 @@ import pytest
 
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
-from metaculus_bot.research.rendered_fetch import RenderedPage
+from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.resolution_source import (
     FetchContext,
@@ -19,6 +19,7 @@ from metaculus_bot.research.resolution_source import (
     resolution_source_provider,
 )
 from tests.resolution_source_fakes import (
+    _FEED_URL,
     _INFOGRAM_EMBED_MARKUP,
     _JS_SHELL,
     _RENDERED_PROSE,
@@ -411,6 +412,58 @@ class TestASlowRenderLeavesTheSiblingPagesStanding:
         assert counts["render_timeout_skips"] == 0
         assert counts["rendered_attempts"] == 0
         assert not [message for message in caplog.messages if "rung unavailable" in message]
+
+
+def _menu_tree_dom() -> RenderedPage:
+    """A rendered DOM the line-shape metric withholds: about 2,000 chars of 48-char listing lines,
+    well over the chrome floor and nothing but a release archive (the abs.gov.au shape the
+    extractor-policy tests measure the metric on)."""
+    months = ("January", "February", "March", "April", "May", "June", "July", "August", "September")
+    items = "".join(f"<li>Labour Force, Australia, {month} 2026 Archive release</li>" for month in months * 5)
+    return _rendered_document(f"<h1>Labour Force, Australia</h1><ul>{items}</ul>")
+
+
+class TestRenderedRungMetricWithhold:
+    """`chrome_metric_withholds` counts a withhold anywhere on the URL's ladder, and the direct
+    fetch of a js_wall page carries nothing for the metric to withhold. The rendered DOM is the
+    first extraction of such a URL the metric sees, so its withhold has to reach the count from
+    here, whether the harvested feed then rescues the page or nothing does."""
+
+    async def test_a_withheld_rendered_dom_with_no_rescue_is_counted_once(self, monkeypatch):
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(_menu_tree_dom(), []))
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        result = await _fetch_one(session, _URL, {})
+
+        assert result.status == "js_wall"
+        assert result.route == "rendered"
+        assert result.chrome_metric_withheld is True
+        counts = _rung_counts([result])
+        assert counts["chrome_metric_withholds"] == 1
+        assert counts["chrome_metric_withholds_rescued"] == 0
+        # The render was tried and found chrome, so the URL is memoised like any empty render.
+        assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is True
+
+    async def test_a_withheld_rendered_dom_the_harvested_feed_rescued_is_counted_under_both_keys(self, monkeypatch):
+        menu_tree = _menu_tree_dom()
+        feed = b'{"series":[{"date":"2026-09-01","osborn":47.2,"ricketts":45.8}]}'
+        page = RenderedPage(
+            url=_URL,
+            content_type="text/html",
+            html=menu_tree.html,
+            json_responses=(HarvestedJson(url=_FEED_URL, body=feed),),
+        )
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        result = await _fetch_one(session, _URL, {})
+
+        assert result.status == "success"
+        assert result.route == "derived_api"
+        assert result.chrome_metric_withheld is True
+        counts = _rung_counts([result])
+        assert counts["chrome_metric_withholds"] == 1
+        assert counts["chrome_metric_withholds_rescued"] == 1
 
 
 class TestRenderedRungClassification:

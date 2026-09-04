@@ -2075,6 +2075,13 @@ async def _rendered_rung(
         # optional second pass declines under its floor rather than overrunning the provider.
         remaining_wall_s=ctx.rung_budget_s(),
     )
+    if classified.result.chrome_metric_withheld:
+        # The metric withheld the rendered DOM's extraction. `chrome_metric_withholds` counts a
+        # withhold anywhere on the URL's ladder, and a js_wall direct fetch had nothing for the
+        # metric to withhold, so the fact is stamped on the direct result: `_fetch_one` carries
+        # it from there onto whatever this ladder leaves standing, the direct result when nothing
+        # rescues the page or the harvested feed when it does.
+        direct.chrome_metric_withheld = True
     # The render's own verdict, stamped before the harvest gets its turn: when the harvested
     # feed rescues the page, the ladder's result is `success` and the closer would otherwise
     # credit the render with a rescue the DOM never delivered.
