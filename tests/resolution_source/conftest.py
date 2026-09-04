@@ -15,24 +15,29 @@ import pytest
 
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import reset_host_semaphores, reset_pdf_parse_semaphore
+from metaculus_bot.research.robots_policy import reset_robots_cache
 from tests.resolution_source_fakes import _INFOGRAM_EMBED_MARKUP, _embed_shell_page
 
 
 @pytest.fixture(autouse=True)
 def _reset_shared_gates():
-    """Drop the loop-wide per-host semaphore map and the PDF-parse gate around every test.
+    """Drop the loop-wide per-host semaphore map, the PDF-parse gate and the shared robots.txt
+    cache around every test.
 
-    Both deliberately outlive one provider call (that is what makes politeness and the
-    parse bound hold across concurrent questions), so without this a permit one test left
-    held would gate another, and a serialization assertion would pass or fail on test
-    order. They self-heal across event loops too, but resetting is cheap and states the
-    intent.
+    All three deliberately outlive one provider call (that is what makes politeness, the
+    parse bound and the one-robots-read-per-host rule hold across concurrent questions), so
+    without this a permit one test left held would gate another, a serialization assertion
+    would pass or fail on test order, and a disallowing robots.txt one test served would skip
+    the paid rung in the next. They self-heal across event loops too, but resetting is cheap
+    and states the intent.
     """
     reset_host_semaphores()
     reset_pdf_parse_semaphore()
+    reset_robots_cache()
     yield
     reset_host_semaphores()
     reset_pdf_parse_semaphore()
+    reset_robots_cache()
 
 
 @pytest.fixture(autouse=True)
