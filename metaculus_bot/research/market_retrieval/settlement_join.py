@@ -15,11 +15,12 @@ dials are facts rather than tunings:
      ``https://kalshi.com/`` (the "local news outlets", "official social media accounts"
      entries), so joining on that domain unions a tenth of the exchange into every question
      that happens to link Kalshi. It names the venue, not a series.
-  2. The **public suffix list**, used to compute the registrable domain. ``data.bls.gov`` and
-     ``www.bls.gov`` are the same publisher and meet at ``bls.gov``. But naive
-     "last two labels" collapses ``abs.gov.au`` to ``gov.au``, which would union every
-     Australian government event into any question citing any Australian agency. The PSL is the
-     published answer to exactly that question.
+  2. The **public suffix list**, used to compute the registrable domain
+     (``research.public_suffix``, the leaf this join shares with the rendered-fetch JSON
+     harvest). ``data.bls.gov`` and ``www.bls.gov`` are the same publisher and meet at
+     ``bls.gov``. But naive "last two labels" collapses ``abs.gov.au`` to ``gov.au``, which
+     would union every Australian government event into any question citing any Australian
+     agency. The PSL is the published answer to exactly that question.
 
 There is deliberately **no pool cap** on this channel: capping the per-host pool at 50 events
 dropped near-identical from 12/17 to 2/17, because the BLS pool is 77 events and holds 10 of
@@ -33,9 +34,14 @@ import re
 from collections import defaultdict
 from collections.abc import Sequence
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+# The registrable-domain helper and its vendored public-suffix list live in the
+# `research.public_suffix` leaf, shared with the rendered-fetch JSON harvest; `registrable_domain`
+# is imported here at module scope so this join's callers and tests keep reading it off this
+# module.
+from metaculus_bot.research.public_suffix import registrable_domain
 
 # Reuses the SHIPPED extractor and the SHIPPED Metaculus self-reference test rather than
 # re-implementing either: `extract_source_urls` already handles markdown links, bare URLs,
@@ -52,50 +58,7 @@ logger = logging.getLogger(__name__)
 # facts. Don't collapse the two — the helper is where a future Metaculus host change lands.
 SELF_REFERENCE_DOMAINS: frozenset[str] = frozenset({"kalshi.com", "metaculus.com"})
 
-# Frozen 2026-08-04 from https://publicsuffix.org/list/public_suffix_list.dat — PSL version
-# 2026-07-25_14-20-03_UTC, 10,239 rules (281 wildcard, 8 exception), byte-identical to the copy
-# the bake-off measured on. Vendored rather than fetched: a `tldextract`-style dependency
-# downloads the list at runtime, which the tests' egress guard blocks and which would be a new
-# prod failure mode. Refreshing it is a deliberate commit, so a suffix-list change can never
-# silently move a measured pool.
-#
-# `uv_build` ships the `.dat` with NO packaging configuration — MEASURED 2026-08-04 (uv 0.9.18),
-# not assumed. `uv build` puts it in both artifacts (wheel and sdist), and installing the wheel
-# `--no-deps` into a bare venv resolves this very expression to a real 332,855-byte file parsing
-# to the same 10,239 rules, SHA-256 identical to the checked-in copy. So the module-relative
-# read works installed, not just under the editable `uv sync` prod runs from. If a future
-# `[tool.uv.build-backend]` block adds an include/exclude list, this file has to be on it —
-# a dropped `.dat` fails at first PSL use with FileNotFoundError, and the suite would not
-# catch it because tests run from the checkout where the file is always there.
-_PUBLIC_SUFFIX_LIST_PATH = Path(__file__).parent / "data/public_suffix_list.dat"
-
 _WWW_PREFIX_RE = re.compile(r"^www\d*\.")
-
-
-@lru_cache(maxsize=1)
-def _public_suffix_rules() -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
-    """The PSL split into (exact, wildcard-parent, exception) rule sets.
-
-    The three kinds are the whole algorithm: `gov.au` is exact, `*.ck` means every direct
-    child of `ck` is itself a suffix, and `!www.ck` carves one back out. Comments (`//`) and
-    blank lines are dropped; the ICANN/PRIVATE section split is deliberately ignored, because
-    a private registry (`s3.amazonaws.com`) is still not a publisher boundary we want to
-    collapse across.
-    """
-    exact: set[str] = set()
-    wildcard_parents: set[str] = set()
-    exceptions: set[str] = set()
-    for raw in _PUBLIC_SUFFIX_LIST_PATH.read_text(encoding="utf-8").splitlines():
-        rule = raw.strip()
-        if not rule or rule.startswith("//"):
-            continue
-        if rule.startswith("!"):
-            exceptions.add(rule[1:].lower())
-        elif rule.startswith("*."):
-            wildcard_parents.add(rule[2:].lower())
-        else:
-            exact.add(rule.lower())
-    return frozenset(exact), frozenset(wildcard_parents), frozenset(exceptions)
 
 
 def _decode_idna_label(label: str) -> str:
@@ -141,36 +104,6 @@ def normalize_host(url: str) -> str | None:
     if "xn--" in host:
         host = ".".join(_decode_idna_label(label) for label in host.split("."))
     return host or None
-
-
-def registrable_domain(host: str) -> str | None:
-    """Collapse a host to its registrable domain: the public suffix plus one more label.
-
-    `data.bls.gov` -> `bls.gov`, `abs.gov.au` -> `abs.gov.au` (because `gov.au` is itself a
-    public suffix, so the registrable domain is the whole three-label host, NOT `gov.au`).
-    Returns None for a host that IS a bare public suffix with nothing registered under it —
-    there is no publisher there to join on.
-    """
-    exact, wildcard_parents, exceptions = _public_suffix_rules()
-    labels = host.split(".")
-
-    # Longest matching rule wins, per the PSL algorithm. An exception rule (`!www.ck`) means
-    # the matched suffix is one label SHORTER than the wildcard would make it.
-    suffix_len = 1  # An unknown TLD is treated as a suffix of one label, per the PSL default.
-    for start in range(len(labels)):
-        candidate = ".".join(labels[start:])
-        if candidate in exceptions:
-            suffix_len = len(labels) - start - 1
-            break
-        if candidate in exact:
-            suffix_len = max(suffix_len, len(labels) - start)
-        parent = ".".join(labels[start + 1 :])
-        if parent and parent in wildcard_parents:
-            suffix_len = max(suffix_len, len(labels) - start)
-
-    if len(labels) <= suffix_len:
-        return None
-    return ".".join(labels[-(suffix_len + 1) :])
 
 
 @lru_cache(maxsize=4096)

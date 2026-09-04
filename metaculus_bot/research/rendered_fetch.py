@@ -38,6 +38,7 @@ from urllib.parse import urlparse
 
 from metaculus_bot.constants import RENDERED_DOM_MAX_CHARS
 from metaculus_bot.research.http_fetch import BROWSER_HEADERS
+from metaculus_bot.research.public_suffix import registrable_domain
 
 logger = logging.getLogger(__name__)
 
@@ -573,16 +574,7 @@ def _harvestable_json_host(response_host: str, page_host: str) -> bool:
     the PSL algorithm would collapse two of them to their last two octets, so they are compared
     exactly and never otherwise. The explicitly allow-listed CDNs are the one exception to
     same-publisher.
-
-    The import is function-scoped because it is a REAL circular import: ``settlement_join``
-    imports ``resolution_source`` at module scope, and ``resolution_source`` imports this module
-    at module scope for its rendered rung, so a module-scope import here raises
-    ``ImportError: partially initialized module`` on the first import of either.
     """
-    from metaculus_bot.research.market_retrieval.settlement_join import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real circular import: settlement_join -> resolution_source -> this module, per the docstring
-        registrable_domain,
-    )
-
     if not response_host or not page_host:
         return False
     if response_host == page_host:
