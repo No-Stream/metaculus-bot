@@ -219,8 +219,8 @@ search index to the ensemble. Model and request timeout come from
 enables both the `google_search` tool and the `url_context` tool, so the model
 can read specific URLs named in a question's fine print directly.
 
-Output is stitched together with inline citation markers spliced in from the
-response's grounding metadata, plus a `### Sources` list
+Output is stitched together with real `[N]` citation markers spliced in from the
+response's grounding metadata, plus a matching `### Sources` domain list
 (`_format_grounded_response`). url_context fetches are logged and only
 *successful* fetches are surfaced to forecasters (a "fired but fetched nothing"
 run collapses to a terse `_url_context: none_` marker rather than pushing dead
@@ -265,8 +265,8 @@ named 19 institutions (Bloomberg, FactSet, Goldman Sachs, Kalshi, AP, …) over 
 single grounded domain. The zero-chunk floor cannot see any of this, because it
 fires only when nothing grounded at all, and the forecaster prompts instruct
 weighting by source tier — so an unbacked tier tag is an authority claim we
-manufactured. `_check_attributions` →
-`gemini_attribution.rewrite_unsupported_attributions` (shipped 2026-09-01)
+manufactured. `_check_attributions` → `rewrite_unsupported_attributions`
+(`research/gemini_attribution.py`, shipped 2026-09-01)
 replaces each one with `[unverified attribution]` at format time. It runs on the
 grounded path ONLY — the url_context-only escape gets the citation strip and
 returns — after that strip and before the `### Sources` block is appended, with
@@ -505,8 +505,9 @@ at the cause, because the currency's ISO code is not recoverable downstream —
 FRED's country codes are not ISO currency codes and the `BO` in `DEXBOUS` is a
 country, so the classifier is the only step that can name the pair. (2) A series
 FRED reports as nonexistent raises `UnknownFredSeries`
-(`research/fred_rendering.py`, keyed on FRED's own `400 "The series does not
-exist"` body, which fredapi surfaces as a `ValueError`), so it reaches diagnostics
+(`research/fred_rendering.py`, keyed on FRED's own
+`400 "The series does not exist"` body, which fredapi surfaces as a `ValueError`),
+so it reaches diagnostics
 as `unknown_series` rather than the ambiguous `empty` that was q45363's only trace,
 with one `FRED_UNKNOWN_SERIES: series_id=... proposed_by=classifier|resolution_url`
 WARN harvested as `fred_unknown_series` — non-alertable, since an invented id is
@@ -533,9 +534,9 @@ where it used to leave no source token at all and N unfetched series read as a
 fully healthy line. The keyless benchmarking fetcher stays silent on all of this:
 fredgraph cannot tell a bad id from a vintage predating the series.
 
-Both volatility surfaces emit `FINANCIAL_NOISE_FLAG:
-surface=financial_data|ts_anchor symbol=... vr_lag=... vr=... floor=...
-short_vol=... long_vol=... robust_vol=...` at INFO, harvested as
+Both volatility surfaces emit
+`FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor symbol=... vr_lag=... vr=...
+floor=... short_vol=... long_vol=... robust_vol=...` at INFO, harvested as
 `financial_noise_flag` and non-alertable — it describes the vendor's data, not a
 bot defect. The sibling flag on the time-series-anchor surface
 (`ts_render._realized_vol_lines`) runs the same screen with the same constants,
@@ -685,7 +686,8 @@ bettor count for Manifold, `no-liquidity-data` for PredictIt), close date,
 `open`/`RESOLVED` status, and the ranker's `relation` + `why`, followed by each
 market's resolution rules.
 
-A close date already in the past when the forecast was made carries a `(Nd ago)` suffix,
+A close date already in the past when the forecast was made carries a `(Nd ago)` suffix
+(`_close_cell`, `rendering.py`), on parent rows and `↳` sub-rows alike,
 dated against the snapshot's own `forecast_time` so a later replay of the archived payload
 reproduces what the forecaster saw rather than re-aging every row against the replay's clock.
 The suffix claims only that the DATE has passed, not that trading stopped, because Manifold's
@@ -1005,7 +1007,7 @@ prose, so the prose is rendered, and where a
 third-party data embed hid figures from it one bracketed line says plainly that those
 figures are not in the text.
 
-`status_reason` records which shape of chrome it was. `embed_shell` means the RAW HTML
+`FetchResult.status_reason` records which shape of chrome it was. `embed_shell` means the RAW HTML
 named an embed whose numbers are real but locked inside it — Infogram, Flourish or
 Tableau, detected by `unreadable_data_embed_providers` because trafilatura emits no
 iframe or embed-script URLs at any setting; Datawrapper is deliberately excluded from
