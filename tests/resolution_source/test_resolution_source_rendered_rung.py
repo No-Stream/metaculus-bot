@@ -466,6 +466,55 @@ class TestRenderedRungMetricWithhold:
         assert counts["chrome_metric_withholds_rescued"] == 1
 
 
+class TestOneJsonVocabulary:
+    """The 200-response router used to recognise only `application/json`, while the harvest that
+    discovers a feed and the reuse gate that serves it both accepted `text/json` and any `+json`
+    suffix. A remembered `+json` endpoint therefore came back `unsupported_type` from its GET and
+    never reached the reuse gate, so every later cited URL on the host paid the wasted GET and
+    then a full Chromium launch: exactly the saving the derived-feed rung exists to deliver."""
+
+    _FEED = b'{"series":[{"date":"2026-09-01","osborn":47.2,"ricketts":45.8}]}'
+
+    async def test_a_remembered_vnd_api_json_feed_is_served_without_a_second_launch(self, monkeypatch):
+        calls: list[dict[str, object]] = []
+        harvested = RenderedPage(
+            url=_URL,
+            content_type="text/html",
+            html=_JS_SHELL.decode(),
+            json_responses=(HarvestedJson(url=_FEED_URL, body=self._FEED),),
+        )
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(harvested, calls))
+        second_url = "https://tracker.example.com/house"
+        session = FakeSession(
+            {
+                _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                second_url: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                _FEED_URL: FakeResponse(200, body=self._FEED, content_type="application/vnd.api+json"),
+            }
+        )
+
+        first = await _fetch_one(session, _URL, {})
+        second = await _fetch_one(session, second_url, {})
+
+        assert first.route == "derived_api"
+        assert second.status == "success"
+        assert second.route == "derived_api"
+        assert '"osborn":47.2' in second.text
+        assert len(calls) == 1, "the +json feed fell through the router and the second URL launched a browser"
+        assert _FEED_URL in session.requested
+
+    @pytest.mark.parametrize("content_type", ["text/json", "application/geo+json"])
+    async def test_a_directly_cited_json_url_is_read_as_text(self, content_type):
+        body = b'{"series":[' + b'{"date":"2026-09-01","value":47.2},' * 20 + b"]}"
+        session = FakeSession({_URL: FakeResponse(200, body=body, content_type=content_type)})
+
+        result = await _fetch_one(session, _URL, {})
+
+        assert result.status == "success"
+        assert result.route == "direct"
+        assert '"value":47.2' in result.text
+
+
 class TestRenderedRungClassification:
     """A rescued page goes through the SAME classification path as a directly-fetched one,
     which is what makes it indistinguishable downstream."""

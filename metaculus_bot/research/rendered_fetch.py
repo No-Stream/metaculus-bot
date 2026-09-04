@@ -587,7 +587,15 @@ def _harvestable_json_host(response_host: str, page_host: str) -> bool:
     return publisher is not None and registrable_domain(response_host) == publisher
 
 
-def _is_json_content_type(content_type: str) -> bool:
+def is_json_content_type(content_type: str) -> bool:
+    """Whether a (lower-cased) Content-Type names a JSON body: ``application/json``, ``text/json``
+    or any ``+json`` structured suffix (``application/geo+json``, ``application/vnd.api+json``).
+
+    The ONE JSON vocabulary for the fetch paths. The harvest applies it at discovery, the
+    derived-feed rung at reuse, and the resolution-source 200-response router when it decides
+    what a directly cited URL is; a narrower spelling at any one of them strands a feed the
+    others accept, and a remembered endpoint is first-find-wins for the run.
+    """
     return any(token in content_type for token in _JSON_CONTENT_TYPE_TOKENS)
 
 
@@ -628,7 +636,7 @@ async def _harvest_json_response(
     if not _harvestable_json_host(urlparse(url).hostname or "", page_host):
         return
     headers = response.headers
-    if not _is_json_content_type((headers.get("content-type") or "").lower()):
+    if not is_json_content_type((headers.get("content-type") or "").lower()):
         return
     if _declared_length_over_cap(headers.get("content-length")):
         return

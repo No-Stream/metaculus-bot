@@ -426,6 +426,29 @@ class TestJsonHarvest:
         assert "rendered" in rendered.html
 
 
+class TestJsonContentType:
+    """The one JSON vocabulary for the harvest, the derived-feed reuse gate and the 200-response
+    router: a feed one half of the ladder discovers must not be `unsupported_type` to another."""
+
+    @pytest.mark.parametrize(
+        ("content_type", "expected"),
+        [
+            ("application/json", True),
+            ("application/json; charset=utf-8", True),
+            ("text/json", True),
+            ("application/geo+json", True),
+            ("application/vnd.api+json", True),
+            ("application/ld+json", True),
+            ("text/html", False),
+            ("application/javascript", False),
+            ("text/plain", False),
+            ("", False),
+        ],
+    )
+    def test_the_vocabulary(self, content_type, expected):
+        assert rendered_fetch.is_json_content_type(content_type) is expected
+
+
 class TestHarvestableHost:
     """Same publisher by registrable domain (the vendored public-suffix list), or an allow-listed
     CDN. ``www.<x>`` page plus ``api.<x>`` / ``data.<x>`` feed is the ordinary dashboard shape,

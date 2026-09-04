@@ -225,7 +225,7 @@ from metaculus_bot.research.rendered_fetch import (
     RenderDomOverCeiling,
     RenderedPage,
     RenderTimeout,
-    _is_json_content_type,
+    is_json_content_type,
     note_rendered_no_text,
     render_page,
     rendered_to_nothing,
@@ -800,7 +800,6 @@ _MIN_HOP_TIMEOUT_S: float = 0.5
 
 _HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 _RAW_TEXT_CONTENT_TYPES = ("text/plain", "text/csv")
-_JSON_CONTENT_TYPES = ("application/json",)
 _PDF_CONTENT_TYPES = ("application/pdf", "application/x-pdf")
 
 
@@ -1804,12 +1803,12 @@ async def _resolution_response_outcome(
     if non_ok is not None:
         return non_ok
 
-    # 200 OK: route on content type.
+    # 200 OK: route on content type. JSON is recognised by the one vocabulary the harvest and
+    # the derived-feed reuse gate use (`text/json` and `+json` feeds included), so a feed one
+    # half of the ladder discovers is not `unsupported_type` to the other.
     if any(ct in content_type for ct in _HTML_CONTENT_TYPES):
         return await _resolution_html_outcome(resp, current_url, content_type, ctx)
-    if any(ct in content_type for ct in _JSON_CONTENT_TYPES) or any(
-        ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES
-    ):
+    if is_json_content_type(content_type) or any(ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES):
         return await _resolution_text_outcome(resp, current_url, content_type)
 
     # Everything else routes through the PDF rung, which reads the body and checks the
@@ -2171,7 +2170,7 @@ async def _derived_api_rung(
     feed = await _fetch_direct(session, endpoint.endpoint_url, host_sems, _aux_ctx(ctx))
     if feed.status != "success":
         return None
-    if not _is_json_content_type(feed.content_type or ""):
+    if not is_json_content_type(feed.content_type or ""):
         # The same gate the harvest half applies at discovery, because a remembered endpoint is
         # not a promise about what it answers NEXT time: one came back 200 with an HTML "session
         # expired" portal page, which the lead below would have introduced as the JSON feed the
