@@ -1285,8 +1285,9 @@ the telemetry markers:
   population the floor gained on 2026-09-02 when it stopped being gated on a named
   provider. Its absence means no reason applies, on a fresh line as much as on an
   archived one. `route` names which rung of the escalation ladder produced the recorded
-  outcome: `direct` for the plain fetch, and `meta_refresh`, `impersonate`, `pdf_local`,
-  `derived_api`, `rendered`, `wayback` or `url_context` for an escalated one. Without it
+  outcome: `direct` for the plain fetch, and `meta_refresh`, `pdf_local`, `derived_api`,
+  `rendered`, `wayback` or `url_context` for an escalated one (`impersonate` is reserved in
+  the vocabulary for a rung that is not built). Without it
   a rescued page reads exactly like one the direct route managed on its own, so "what
   did the ladder actually buy" would not be a query. Both optional fields are keyed and
   sit at the end of the line, so a line carrying `route` and no `reason` parses

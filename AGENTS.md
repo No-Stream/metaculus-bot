@@ -140,8 +140,8 @@ Top level:
 - `scratch_docs_and_planning/` — plans and audits, including
   `residual_analysis_playbook.md` (the per-round residual procedure),
   `probabilistic_tools_activation.md` (activation pending) and
-  `fetch_escalation_ladder_design.md` (DESIGN ONLY, nothing in it implemented, its open
-  questions are the operator's). `metaculus_api_doc_LARGE_FILE.yml` there is the full Metaculus
+  `fetch_escalation_ladder_design.md` (superseded by `fetch_ladder_plan_2026-09-03.md`, whose
+  ladder is built except the TLS-impersonation rung). `metaculus_api_doc_LARGE_FILE.yml` there is the full Metaculus
   API spec — read it with offset/limit.
 - `REFERENCE_COPY_OF_forecasting_tools*/` — read-only copy of the framework source; edits do not
   affect the installed package. `REFERENCE_COPY_OF_panchul*/` — a Q2 2025 competition winner,
