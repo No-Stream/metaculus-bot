@@ -5,10 +5,10 @@
 `No-Stream/metaculus-bot`, `upstream` is the Metaculus template, so every `gh` call needs
 `--repo No-Stream/metaculus-bot`)
 **Repo:** `/Users/flatljan/personal/metaculus-bot`
-**Status:** Phase 3 of the fetch ladder has been reviewed, live-QA'd and fixed. Local HEAD `55e02f5`
-(plus this doc's own commit) is 76 commits ahead of the pushed `ea1d558`; the working tree is
-clean; the full free gate is green at `55e02f5` (7,428 passed). One follow-up worktree (telemetry
-and structure) was still in flight when this was written and has to be merged before the push.
+**Status:** Phase 3 of the fetch ladder has been reviewed, live-QA'd and fixed, and the telemetry and
+structure follow-up is merged. Local HEAD `aca5cd8` (plus this doc's own commit) is 90 commits ahead
+of the pushed `ea1d558`; the working tree is clean; the full free gate is green at `aca5cd8` (7,440
+passed, 14 skipped, exit 0). Nothing is in flight; the next steps are the operator's.
 
 The operator does NOT read plan docs; every decision or approval you need from them goes inline in
 chat, self-contained, with a recommendation. They sign off on any paid run before it fires.
@@ -177,7 +177,7 @@ fixed what both found. Starting point: HEAD `16ca9ab`, gates green at 7,291 test
 - **HEAD `55e02f5`**, working tree clean, 76 commits ahead of `origin/next-season-bundle`
   (`ea1d558`), where PR #66's CI last ran green. Pushing is the operator's action (blocked for
   agents).
-- **One follow-up worktree in flight at the time of writing:** branch
+- **The telemetry and structure follow-up (merged; see the merge line at the end of this bullet):** branch
   `worktree-agent-a9f7b67682bcb1934` at `.claude/worktrees/agent-a9f7b67682bcb1934` (locked). Its
   scope: F15 (per-rung `outcome=` and `wall_s=` on `RESOLUTION_SOURCE_ESCALATION`, instead of the
   whole-ladder values credited to every rung), F16 (the `stale_data` / `ungrounded` vocabulary in
@@ -194,8 +194,12 @@ fixed what both found. Starting point: HEAD `16ca9ab`, gates green at 7,291 test
   `resolution_fetch_result.py`, `resolution_source.py`, `scripts/telemetry/markers.py` and the
   escalation test module.
 
-  *Merge of the telemetry follow-up:* not yet merged when this was written; the session lead
-  completes this sentence after the merge and the gate.
+  *Merge of the telemetry follow-up:* merged as `aca5cd8` at 22:12 PT (twelve commits, the last
+  `ea1b29a` being the test-module split); the full free gate on `aca5cd8` is green (7,440 passed, 14
+  skipped, exit 0). Beyond the listed scope it also landed the optional per-question cap on paid
+  url_context reads (`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`, default 2, skip reason
+  `url_context_cap`, count `url_context_cap_skips`) and moved `renderer_unavailable` /
+  `render_timeout` out of `FetchStatusReason` into the new `RungSkipReason` Literal.
 - **Report-only findings left as the verifier judged:** R1 (cross-page reuse of a remembered JSON
   feed is the plan's own specification, disclosed twice) and R2 (the Wayback attempt cap is per
   question while the gate it contends for is loop-wide; FUTURE.md item 5, the operator's call).
@@ -217,16 +221,13 @@ fixed what both found. Starting point: HEAD `16ca9ab`, gates green at 7,291 test
   revision of the announced-unscheduled plan's status section, which the bundle already carries in
   `d38980b`. Idle teammates from the session are harmless and die with it.
 
-## What's left to do (in order; 1 is agent work, 2 to 5 need the operator)
+## What's left to do (in order; 1 is done, 2 to 5 need the operator)
 
-1. **Merge the telemetry follow-up branch** (`worktree-agent-a9f7b67682bcb1934`) once its agent
-   reports done: check `git status --short` first (the auto-merge hook can stage a worktree's
-   uncommitted edits into the main tree), `git merge` it, resolve conflicts (expected in
-   `resolution_source.py` imports and the `docs/research.md` counts paragraph if anything else
-   touched them), then run the full free gate in tmux:
+1. **Done: the telemetry follow-up branch is merged** (`aca5cd8`) and the full free gate is green
+   there (7,440 passed). After any further change, re-run the gate in tmux:
    `tmux new-session -d -s gate "set -o pipefail; (make lint && make typecheck && make lint_imports && make deps && make test_fast) 2>&1 | tee ~/logs/gate.log; echo EXITCODE=\$? >> ~/logs/gate.log"`
    and poll with `tail ~/logs/gate.log` (`make test_fast` takes about 155 s; never `sleep` in a
-   foreground Bash). Then update the "Merge of the telemetry follow-up" line above.
+   foreground Bash).
 2. **Operator: push the branch** (blocked for agents) and watch PR #66's CI go green:
    `gh run list --repo No-Stream/metaculus-bot --branch next-season-bundle`.
 3. **Smoke test (PAID, operator signs off first; ask inline with command and cost).** ONE dispatch
