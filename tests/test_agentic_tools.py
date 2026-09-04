@@ -24,7 +24,7 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_READER_THINKING_LEVEL,
     URL_CONTEXT_SIZE_GATE_TOKENS,
 )
-from metaculus_bot.research import http_fetch
+from metaculus_bot.research import http_fetch, rendered_fetch
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import fetch_outcomes, local_document, robots_policy, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -111,13 +111,12 @@ def _reset_tool_state() -> None:
     agentic_tools._FETCH_TEXT_CACHE.clear()
     agentic_tools._FETCH_LINKS_CACHE.clear()
     agentic_tools._FETCH_HOST_SEMAPHORES.clear()
-    agentic_tools._RENDERED_NO_TEXT.clear()
     agentic_tools._ROBOTS_TXT_CACHE.clear()
-    agentic_tools._PLAYWRIGHT_WARNED = False
-    # Fresh module-global rendered-fetch semaphore per test: construction is
-    # loop-free in 3.12, so this prevents a contended acquire in one test's
-    # event loop from leaking a loop binding into a later test.
-    agentic_tools._RENDERED_FETCH_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
+    # Run-scoped state of the shared render transport: the rendered-to-nothing memo, the
+    # one-shot playwright warn latch, and a FRESH launch semaphore (construction is loop-free
+    # in 3.12, so rebinding prevents a contended acquire in one test's event loop from leaking
+    # a loop binding into a later test).
+    rendered_fetch.reset_render_state()
 
 
 def test_tool_schemas_round_trip_for_public_tools() -> None:
@@ -775,7 +774,9 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
-    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    monkeypatch.setattr(
+        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+    )
 
     async def blocking_read(resp: object, label: str, *, max_bytes: int = 0) -> bytes:
         events.append("plain_read_started")
@@ -885,7 +886,9 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
         return "evil" not in url
 
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", _is_public)
-    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    monkeypatch.setattr(
+        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+    )
     monkeypatch.setattr(
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="body text " * 60)
     )
@@ -1663,7 +1666,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
             assert wait_until == "domcontentloaded"
             # The settle is taken OUT of the goto budget, so the rung's 35 s ceiling is
             # unchanged rather than lengthened by the wait that replaced networkidle.
-            assert timeout == agentic_tools._RENDERED_FETCH_TIMEOUT_MS - agentic_tools._RENDERED_SETTLE_MS
+            assert timeout == rendered_fetch.RENDER_TIMEOUT_MS - rendered_fetch.RENDER_SETTLE_MS
             return SimpleNamespace(headers={"content-type": "text/html"})
 
         async def wait_for_timeout(self, ms: float) -> None:
@@ -1710,11 +1713,13 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    monkeypatch.setattr(
+        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+    )
     # Patch our own fresh global semaphore (bound in THIS test's loop) rather than
     # leaning on the autouse fixture + import order — asyncio.Semaphore binds to the
     # running loop on first await, so a stale cross-file binding would raise here.
-    monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+    monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: RecordingSemaphore())
     monkeypatch.setattr(
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
@@ -1746,7 +1751,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     The peak must equal the cap (proving contention was actually reached) and
     never exceed it."""
     cap = 2
-    monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(cap))
+    monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(cap))
 
     live = 0
     peak = 0
@@ -1806,7 +1811,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
             return None
 
     monkeypatch.setattr(
-        agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("host.example.com", "93.184.216.34"))
+        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("host.example.com", "93.184.216.34"))
     )
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
@@ -1917,10 +1922,12 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     async def fake_is_public(url: str) -> bool:
         return "169.254.169.254" not in url
 
-    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    monkeypatch.setattr(
+        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+    )
     # Self-sufficient global semaphore bound in this test's loop (see the sibling
     # rendered-fetch test) — avoids a cross-file stale-loop-binding RuntimeError.
-    monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+    monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", fake_is_public)
     monkeypatch.setattr(
@@ -1953,14 +1960,14 @@ def _addrinfo6(ip: str) -> list[tuple[Any, ...]]:
 
 
 def test_host_resolver_rule_ipv4_is_bare() -> None:
-    assert agentic_tools._host_resolver_rule("example.com", "93.184.216.34") == (
+    assert rendered_fetch._host_resolver_rule("example.com", "93.184.216.34") == (
         "--host-resolver-rules=MAP example.com 93.184.216.34"
     )
 
 
 def test_host_resolver_rule_ipv6_is_bracketed() -> None:
     # Chromium's rule parser requires IPv6 literals bracketed in the MAP target.
-    assert agentic_tools._host_resolver_rule("example.com", "2606:2800:220:1:248:1893:25c8:1946") == (
+    assert rendered_fetch._host_resolver_rule("example.com", "2606:2800:220:1:248:1893:25c8:1946") == (
         "--host-resolver-rules=MAP example.com [2606:2800:220:1:248:1893:25c8:1946]"
     )
 
@@ -1970,7 +1977,7 @@ async def test_resolve_pinned_host_public_ip_returns_host_and_ip(monkeypatch: py
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("93.184.216.34")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await agentic_tools._resolve_pinned_host("https://example.com/page") == ("example.com", "93.184.216.34")
+    assert await rendered_fetch._resolve_pinned_host("https://example.com/page") == ("example.com", "93.184.216.34")
 
 
 @pytest.mark.asyncio
@@ -1978,7 +1985,7 @@ async def test_resolve_pinned_host_private_ip_fails_closed(monkeypatch: pytest.M
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("10.0.0.5")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await agentic_tools._resolve_pinned_host("https://internal.example.com/page") is None
+    assert await rendered_fetch._resolve_pinned_host("https://internal.example.com/page") is None
 
 
 @pytest.mark.asyncio
@@ -1987,7 +1994,7 @@ async def test_resolve_pinned_host_link_local_fails_closed(monkeypatch: pytest.M
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("169.254.169.254")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await agentic_tools._resolve_pinned_host("https://rebind.example.com/page") is None
+    assert await rendered_fetch._resolve_pinned_host("https://rebind.example.com/page") is None
 
 
 @pytest.mark.asyncio
@@ -1998,7 +2005,7 @@ async def test_resolve_pinned_host_rejects_when_any_address_disallowed(monkeypat
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=mixed))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await agentic_tools._resolve_pinned_host("https://mixed.example.com/page") is None
+    assert await rendered_fetch._resolve_pinned_host("https://mixed.example.com/page") is None
 
 
 @pytest.mark.asyncio
@@ -2006,7 +2013,7 @@ async def test_resolve_pinned_host_ipv6_public_is_pinned(monkeypatch: pytest.Mon
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo6("2606:2800:220:1:248:1893:25c8:1946")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await agentic_tools._resolve_pinned_host("https://v6.example.com/page") == (
+    assert await rendered_fetch._resolve_pinned_host("https://v6.example.com/page") == (
         "v6.example.com",
         "2606:2800:220:1:248:1893:25c8:1946",
     )
@@ -2017,21 +2024,21 @@ async def test_resolve_pinned_host_ip_literal_public_pins_to_itself(monkeypatch:
     # An IP-literal host needs no DNS; getaddrinfo must not even be consulted.
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=AssertionError("getaddrinfo must not run")))
 
-    assert await agentic_tools._resolve_pinned_host("https://93.184.216.34/page") == ("93.184.216.34", "93.184.216.34")
+    assert await rendered_fetch._resolve_pinned_host("https://93.184.216.34/page") == ("93.184.216.34", "93.184.216.34")
 
 
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_ip_literal_private_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=AssertionError("getaddrinfo must not run")))
 
-    assert await agentic_tools._resolve_pinned_host("http://127.0.0.1/latest/meta-data/") is None
+    assert await rendered_fetch._resolve_pinned_host("http://127.0.0.1/latest/meta-data/") is None
 
 
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_userinfo_and_scheme_fail_closed() -> None:
     # Userinfo defeats hostname trust; non-http(s) schemes are never fetched.
-    assert await agentic_tools._resolve_pinned_host("https://trusted@169.254.169.254/") is None
-    assert await agentic_tools._resolve_pinned_host("ftp://example.com/x") is None
+    assert await rendered_fetch._resolve_pinned_host("https://trusted@169.254.169.254/") is None
+    assert await rendered_fetch._resolve_pinned_host("ftp://example.com/x") is None
 
 
 @pytest.mark.asyncio
@@ -2039,7 +2046,7 @@ async def test_resolve_pinned_host_dns_failure_fails_closed(monkeypatch: pytest.
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=socket.gaierror("no such host")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await agentic_tools._resolve_pinned_host("https://nxdomain.example.com/page") is None
+    assert await rendered_fetch._resolve_pinned_host("https://nxdomain.example.com/page") is None
 
 
 @pytest.mark.asyncio
@@ -2062,7 +2069,7 @@ async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: p
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=None))
+    monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=None))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setitem(
         sys.modules,
@@ -2126,7 +2133,9 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    monkeypatch.setattr(
+        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+    )
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr(
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
@@ -3100,7 +3109,7 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
                 return None
 
         monkeypatch.setattr(
-            agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.gov", "93.184.216.34"))
+            rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.gov", "93.184.216.34"))
         )
         monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=""))
         monkeypatch.setitem(
@@ -3291,9 +3300,9 @@ class TestRenderedRungSalvagesATimedOutNavigation:
                 return None
 
         monkeypatch.setattr(
-            agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+            rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
         )
-        monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
         monkeypatch.setitem(
             sys.modules,
@@ -3325,7 +3334,7 @@ class TestRenderedRungSalvagesATimedOutNavigation:
         assert result.status == "ok"
         assert result.method == "rendered"
         assert result.text == "The tracker reports 41 cases this week."
-        assert settles == [agentic_tools._RENDERED_SETTLE_MS]
+        assert settles == [rendered_fetch.RENDER_SETTLE_MS]
 
     @pytest.mark.asyncio
     async def test_a_navigation_error_with_no_dom_reads_as_rendered_nothing(
