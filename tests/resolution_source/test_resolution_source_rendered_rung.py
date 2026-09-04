@@ -378,6 +378,122 @@ class TestRenderedRungRefusedByTheEdge:
         assert not [message for message in caplog.messages if "RESOLUTION_SOURCE_ESCALATION" in message]
 
 
+class TestRenderedRungLandedOffHost:
+    """A server-side redirect hop is dialed by Chromium with no check of ours, so the transport
+    refuses a main frame that landed on a host other than the one its DNS pin covers
+    (``RenderOffHost``). Its own skip: folded into ``renderer_unavailable`` it would point triage
+    at the Playwright install, and it is a fact about the page (it answered our GET with a wall
+    and sent the browser somewhere else), which is the rate a residual round would ask for. The
+    direct result stands and nothing from the render is published."""
+
+    @staticmethod
+    async def _off_host_render(url: str, **kwargs: object) -> None:
+        del kwargs
+        await asyncio.sleep(0)
+        raise rendered_fetch.RenderOffHost(
+            requested_url=url, final_url="http://10.0.0.8/status", pinned_host="tracker.example.com"
+        )
+
+    async def test_an_off_host_landing_is_its_own_skip_and_claims_no_route(self, monkeypatch, caplog):
+        monkeypatch.setattr(resolution_source, "render_page", self._off_host_render)
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(session, _URL, {})
+            resolution_source._log_fetch_outcome_markers(1, [result])
+
+        counts = _assert_the_direct_result_stands_after_a_cut(result, "render_off_host")
+        assert counts["render_off_host_skips"] == 1
+        assert counts["render_dom_too_large_skips"] == 0
+        assert counts["render_non_200_skips"] == 0
+        # Nothing was read, so nothing claims the browser rung fired.
+        assert not [message for message in caplog.messages if "RESOLUTION_SOURCE_ESCALATION" in message]
+
+    async def test_the_count_reaches_the_providers_details(self, monkeypatch):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(resolution_source, "render_page", self._off_host_render)
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        section = await resolution_source_provider(is_benchmarking=False)(question)
+
+        assert "tracker.example.com: js_wall" in section
+        counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
+        assert counts["render_off_host_skips"] == 1
+        assert counts["renderer_unavailable_skips"] == 0
+        assert counts["rendered_attempts"] == 0
+
+
+class TestRenderedRungRendersTheFinalUrl:
+    """The browser is handed the URL the direct fetch LANDED on, after its redirect hops were
+    followed and re-guarded (``FetchResult.url`` is the last hop's URL), so the DNS pin covers the
+    host that actually serves the content and the landing-host check has the right host to hold
+    the browser to. The rung's attempt stays keyed on the cited URL, because that is what the
+    escalation line names, and the render memos move to the URL actually rendered."""
+
+    _FINAL = "https://www.tracker.example.com/senate"
+
+    def _redirected_session(self) -> FakeSession:
+        return FakeSession(
+            {
+                _URL: FakeResponse(302, headers={"Location": self._FINAL}),
+                self._FINAL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+            }
+        )
+
+    async def test_a_redirected_direct_fetch_hands_the_browser_its_final_url(self, monkeypatch):
+        calls: list[dict[str, object]] = []
+        rescued = _rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>")
+        page = RenderedPage(url=self._FINAL, content_type="text/html", html=rescued.html, final_url=self._FINAL)
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, calls))
+
+        result = await _fetch_one(self._redirected_session(), _URL, {})
+
+        assert [call["url"] for call in calls] == [self._FINAL]
+        assert result.status == "success"
+        assert result.route == "rendered"
+        assert result.url == self._FINAL
+        (attempt,) = [a for a in result.rung_attempts if a.rung == "rendered"]
+        assert attempt.url == _URL
+
+    async def test_the_render_memos_are_keyed_on_the_rendered_url(self, monkeypatch):
+        calls: list[dict[str, object]] = []
+        empty = RenderedPage(url=self._FINAL, content_type="text/html", html=_JS_SHELL.decode(), final_url=self._FINAL)
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(empty, calls))
+
+        first = await _fetch_one(self._redirected_session(), _URL, {})
+        second = await _fetch_one(self._redirected_session(), _URL, {})
+
+        assert first.route == "rendered"
+        assert rendered_fetch.rendered_to_nothing(self._FINAL, memo_scope="resolution_source") is True
+        assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is False
+        assert len(calls) == 1
+        attempts = [a for a in second.rung_attempts if a.rung == "rendered"]
+        assert [a.skipped_reason for a in attempts] == ["rendered_no_text"]
+
+    @pytest.mark.parametrize(
+        "landed",
+        ["https://www.metaculus.com/questions/999/", "http://10.0.0.8/status"],
+    )
+    async def test_a_final_url_the_ladder_would_not_fetch_is_never_rendered(self, monkeypatch, caplog, landed):
+        """Unreachable through ``_fetch_direct``, whose every hop is vetted, so it is driven with a
+        hand-built direct result: the URL the browser dials is decided here, so the refusal lives
+        here too, and it declines before any attempt is opened."""
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(_rendered("<html></html>"), calls))
+        direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
+        ctx = FetchContext()
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+            result = await resolution_source._rendered_rung(_URL, direct, {}, ctx)
+
+        assert result is None
+        assert calls == []
+        assert ctx.rungs == []
+        assert [message for message in caplog.messages if "not rendering" in message]
+
+
 class TestASlowRenderLeavesTheSiblingPagesStanding:
     """The invariant every per-rung bound exists for: a rung that overruns costs its own page,
     never the question's. Before the bound, this shape — one hostile page beside one ordinary

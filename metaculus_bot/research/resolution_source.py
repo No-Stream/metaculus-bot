@@ -2050,17 +2050,36 @@ async def _rendered_rung(
     (:func:`note_rendered_no_text`), so a second URL on the same page in this run does not spend
     another launch to learn the same thing; that memo hit is its own skip, ``rendered_no_text``,
     so it never inflates the count the operator reads as the Chromium install having failed.
+
+    The browser is handed ``direct.url``, the URL the direct fetch LANDED on once its redirect
+    hops were followed and re-guarded, rather than the cited ``url``: the pin then covers the
+    host that actually serves the content, which is also the host the landing check holds the
+    browser to, and a page whose canonical form is one ordinary hop away (``example.com`` to
+    ``www.example.com``) is not refused for taking it. When the two differ, the landing is
+    re-vetted here with the same two checks every derived hop owes (:func:`_vetted_hop_target`),
+    because this is where the URL the browser dials is decided. The render memos are keyed on
+    the URL rendered; the rung's attempt stays keyed on the cited ``url``, which is what the
+    escalation line names, and the harvested feed is remembered for the cited URL's host, which
+    is the host the next cited URL asks :func:`_derived_api_rung` about.
     """
     if not _rendered_rung_applies(direct):
         return None
-    if rendered_to_nothing(url, memo_scope=_RENDER_MEMO_SCOPE):
+    render_url = direct.url
+    if render_url != url and (is_metaculus_self_ref(render_url) or not await is_public_http_url(render_url)):
+        logger.warning(
+            "resolution_source: not rendering %s, where the cited %s landed: a host we do not fetch",
+            urlparse(render_url).netloc,
+            urlparse(url).netloc,
+        )
+        return None
+    if rendered_to_nothing(render_url, memo_scope=_RENDER_MEMO_SCOPE):
         ctx.skip_rung("rendered", direct.status, url, "rendered_no_text")
         return None
     budget_s = ctx.claim_rung_budget("rendered", direct.status, url, RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S)
     if budget_s is None:
         return None
     attempt = ctx.start_rung("rendered", direct.status, url)
-    page = await _render_or_record_the_skip(url, budget_s, host_sems, attempt)
+    page = await _render_or_record_the_skip(render_url, budget_s, host_sems, attempt)
     if page is None:
         return None
     if page.http_status is not None and page.http_status != 200:
@@ -2068,7 +2087,7 @@ async def _rendered_rung(
             "resolution_source: the browser was answered %d for %s where the direct GET got 200; "
             "not reading that page as content",
             page.http_status,
-            urlparse(url).netloc,
+            urlparse(render_url).netloc,
         )
         # Its own skip, not a fired rung: nothing about the page was read, so the attempt claims
         # no route and emits no escalation line, and the count keeps "Chromium refused where our
@@ -2077,7 +2096,7 @@ async def _rendered_rung(
         return None
     classified = await _classify_html_body(
         page.html.encode("utf-8", errors="replace"),
-        url,
+        render_url,
         page.content_type or "text/html",
         # The direct fetch's status, not the browser's: this page answered 200 and carried no
         # text, which is the fact the record should keep. Chromium reports no status at all
@@ -2103,7 +2122,7 @@ async def _rendered_rung(
     derived = _derived_api_from_harvest(url, direct, page, ctx)
     if derived is not None:
         return derived
-    note_rendered_no_text(url, memo_scope=_RENDER_MEMO_SCOPE)
+    note_rendered_no_text(render_url, memo_scope=_RENDER_MEMO_SCOPE)
     return None
 
 
@@ -3311,6 +3330,11 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # a fact about the page that used to be folded into `renderer_unavailable_skips`, where it
         # pointed triage at the Playwright install.
         "render_dom_too_large_skips": skips_by_reason["render_dom_too_large"],
+        # Its own count: Chromium's main frame landed on a host other than the pinned one (a
+        # server-side redirect hop the route guard never sees), so the transport refused the DOM
+        # unread. A fact about the page, and the one count that says how often a cited page sends
+        # the browser somewhere else, which is what prices the host-equality rule.
+        "render_off_host_skips": skips_by_reason["render_off_host"],
         # And its own count: a browser rung skipped because an earlier question in this run
         # already rendered the same URL to nothing is the memo doing its job, not a runner without
         # Chromium — folded into `renderer_unavailable_skips` it inflated the install-failed signal.
@@ -3330,11 +3354,6 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # disallows Google-Extended refuses the read server-side, so this is spend avoided
         # rather than a page lost, and it must not read as a failure.
         "url_context_robots_skips": skips_by_reason["robots_disallowed"],
-        # Its own count: Chromium's main frame landed on a host other than the pinned one (a
-        # server-side redirect hop the route guard never sees), so the transport refused the DOM
-        # unread. A fact about the page, and the one count that says how often a cited page sends
-        # the browser somewhere else, which is what prices the host-equality rule.
-        "render_off_host_skips": skips_by_reason["render_off_host"],
         # Its own count because it is a MISCONFIGURATION rather than a tuning signal: with the
         # flag on and GOOGLE_API_KEY unset the paid rung fires nowhere, and without this key
         # that run is byte-identical in the archive to one with the flag off.
