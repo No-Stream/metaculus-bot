@@ -17,7 +17,12 @@ from datetime import UTC, datetime
 import pytest
 
 from metaculus_bot.research import resolution_source
-from metaculus_bot.research.http_fetch import meta_refresh_target, rewrite_aria_tables
+from metaculus_bot.research.http_fetch import (
+    MAX_UNDECODABLE_CHAR_RATIO,
+    decode_text_body,
+    meta_refresh_target,
+    rewrite_aria_tables,
+)
 from metaculus_bot.research.resolution_source import (
     FetchResult,
     extract_source_urls,
@@ -32,7 +37,7 @@ from metaculus_bot.research.resolution_source import (
     strip_markdown_escapes,
     vacuous_body_status,
 )
-from tests.resolution_source_fakes import cdc_aria_stat_block_page
+from tests.resolution_source_fakes import cdc_aria_stat_block_page, cp1252_aria_stat_block_page
 
 
 class TestStripMarkdownEscapes:
@@ -659,6 +664,45 @@ class TestAriaTableRewrite:
         assert rewrite_aria_tables('<div role="row"><br role="cell"><div role="cell">2</div></div>') == (
             '<tr><br role="cell"><td>2</td></tr>'
         )
+
+    def test_a_cp1252_page_keeps_its_accents_instead_of_being_rewritten(self):
+        """The rewrite forecloses trafilatura's own encoding detection, so it is trusted only
+        on a body that decoded cleanly. This page declares windows-1252 ONLY in a
+        `<meta charset>`, which `decode_text_body` cannot see, so our decode mojibakes it —
+        and the ratio lands FAR below the shared refuse-the-body bound, which is why keying
+        the gate on that bound let it through and shipped mojibake as grading evidence."""
+        body = cp1252_aria_stat_block_page()
+        html_text, ratio = decode_text_body(body, "text/html")
+
+        assert 0.0 < ratio < MAX_UNDECODABLE_CHAR_RATIO, "pins that the old gate admitted this page"
+        assert "�" in html_text, "our own decode is what mangled it"
+
+        out = resolution_source._extract_page_text(html_text, body, "https://sante.example.com/qc", ratio)
+
+        assert out is not None
+        assert "Résumé" in out
+        assert "Québec" in out
+        assert "�" not in out, "the bytes path found the meta declaration our decode missed"
+
+    @pytest.mark.parametrize("ratio", [0.01, MAX_UNDECODABLE_CHAR_RATIO + 0.01])
+    def test_any_undecodable_character_falls_back_to_the_bytes_path(self, ratio: float):
+        """Below AND above the shared bound: the guard is `== 0.0`, so both sides of the old
+        threshold now hand trafilatura the original bytes."""
+        body = cdc_aria_stat_block_page()
+
+        assert resolution_source._extract_page_text(
+            body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", ratio
+        ) == resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+
+    def test_a_cleanly_decoded_page_still_gets_the_rewrite(self):
+        """Non-vacuity for the two cases above: at 0.0 the labelled row is present, so they
+        are asserting a real fallback rather than an extraction that never differs."""
+        body = cdc_aria_stat_block_page()
+
+        out = resolution_source._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0)
+
+        assert out is not None
+        assert "| Hospitalizations | 922 |" in out
 
 
 class TestMetaRefreshTarget:

@@ -971,6 +971,25 @@ class TestResolutionSourceFetchMarker:
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
 
+    async def test_a_document_whose_passages_matched_nothing_says_so_on_the_line(self, monkeypatch, caplog):
+        """`status=ok` on a zero-passage digest was byte-identical to one carrying the
+        resolving paragraph, on the surface whose contract is that success means CONTENT."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        body = build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2 as of August 24"]])
+        session = FakeSession(
+            {"https://cdc.example.com/r.pdf": FakeResponse(200, body=body, content_type="application/pdf")}
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="Resolves per https://cdc.example.com/r.pdf corn futures settlement")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/r.pdf "
+            "status=ok http=200 embeds=none reason=no_matching_passage route=pdf_local"
+        ]
+
     async def test_a_skipped_rung_is_counted_but_not_reported_as_an_escalation(self, monkeypatch, caplog):
         """The marker means "a rung fired". A rung that never ran for want of wall budget
         rides `details["counts"]` instead, where it stays queryable without inflating the
@@ -1387,6 +1406,10 @@ class TestLocalPdfReading:
         assert result.route == "direct"
         assert [a.skipped_reason for a in result.rung_attempts] == ["wall_budget"]
         assert any("skipping the local PDF read" in m for m in caplog.messages)
+        assert result.status_reason == "budget_skipped", (
+            "without the reason, a document we held and declined to read is byte-identical "
+            "in the per-fetch marker to a body that was never a document"
+        )
 
     async def test_a_query_no_passage_matches_renders_the_document_without_inventing_relevance(self):
         session = self._session()
@@ -1398,6 +1421,24 @@ class TestLocalPdfReading:
         assert result.status == "success"
         assert "No passage in this document matched the query" in result.text
         assert "922" not in result.text
+        # A zero-passage digest and one carrying the resolving paragraph render the same
+        # header and outline, so nothing in the run log or the archive separated them.
+        assert result.status_reason == "no_matching_passage"
+        assert result.text.startswith("Document: https://cdc.example.com/report.pdf"), (
+            "the header is still published — this is a document we read, not a failure"
+        )
+
+    async def test_a_matched_digest_carries_no_reason(self):
+        """The reason is the exception, so its ABSENCE has to mean the selection found
+        something rather than 'this record predates the token'."""
+        session = self._session()
+
+        result = await _fetch_one(
+            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations reported")
+        )
+
+        assert result.status == "success"
+        assert result.status_reason is None
 
 
 class TestPdfParseGate:
@@ -1499,6 +1540,7 @@ class TestPdfParseGate:
             result = await _fetch_one(self._session(url), url, {}, spent)
 
         assert result.status == "unsupported_type"
+        assert result.status_reason == "parse_contention"
         assert [a.skipped_reason for a in result.rung_attempts] == ["parse_contention"]
         assert any("no parse slot" in m for m in caplog.messages)
         assert _rung_counts([result])["pdf_contention_skips"] == 1

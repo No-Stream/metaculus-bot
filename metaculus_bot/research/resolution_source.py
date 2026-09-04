@@ -144,7 +144,6 @@ from metaculus_bot.research.document_text import (
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     MAX_REDIRECTS,
-    MAX_UNDECODABLE_CHAR_RATIO,
     REDIRECT_STATUSES,
     DatawrapperChartRef,
     FilteringResolver,
@@ -814,10 +813,17 @@ def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio:
     declares its encoding only in a ``<meta charset>`` decodes as UTF-8 here and comes
     back as mojibake, while trafilatura reading the bytes would have found the meta
     declaration. Handing it the rewritten mojibake instead would lose a page we can read
-    today, so above the shared undecodable bound the rewrite is skipped rather than
-    trusted.
+    today, so the rewrite is trusted ONLY on a body that decoded cleanly.
+
+    That is why the gate is ``== 0.0`` and not ``MAX_UNDECODABLE_CHAR_RATIO``: the shared
+    bound is the refuse-the-whole-body threshold and is far too loose for this decision. A
+    mostly-ASCII cp1252 page whose only non-UTF-8 bytes are accented characters scores
+    around 0.01 against a bound of 0.10, so under the old gate it took the rewrite and
+    reached forecasters as ``R<?>sum<?> ... Qu<?>bec`` where the bytes path returns the
+    accents. Any U+FFFD at all means this decode lost information trafilatura might not
+    have, and the rewrite is the only thing that forecloses its own encoding detection.
     """
-    rewritten = None if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO else rewrite_aria_tables(html_text)
+    rewritten = rewrite_aria_tables(html_text) if undecodable_ratio == 0.0 else None
     return _extract_main_text(body if rewritten is None else rewritten, url)
 
 
@@ -1169,7 +1175,7 @@ async def _resolution_pdf_outcome(
             budget_s,
         )
         ctx.skip_rung("pdf_local", from_status, current_url, "wall_budget")
-        return _document_not_parsed(pending)
+        return _document_not_parsed(pending, "budget_skipped")
     return pending
 
 
@@ -1209,7 +1215,7 @@ async def _finish_document(pending: _PendingDocument, ctx: FetchContext) -> Fetc
             budget_s,
         )
         ctx.skip_rung("pdf_local", pending.from_status, pending.url, "parse_contention")
-        return _document_not_parsed(pending)
+        return _document_not_parsed(pending, "parse_contention")
     try:
         # Re-read after the wait: the queue itself consumed budget, and `max_seconds` is
         # wall-clock, so a stale figure would hand pypdf a bound that already expired.
@@ -1221,7 +1227,7 @@ async def _finish_document(pending: _PendingDocument, ctx: FetchContext) -> Fetc
                 budget_s,
             )
             ctx.skip_rung("pdf_local", pending.from_status, pending.url, "wall_budget")
-            return _document_not_parsed(pending)
+            return _document_not_parsed(pending, "budget_skipped")
         attempt = ctx.start_rung("pdf_local", pending.from_status, pending.url)
         pdf, digest = await asyncio.to_thread(
             _parse_and_digest,
@@ -1255,15 +1261,24 @@ async def _finish_document(pending: _PendingDocument, ctx: FetchContext) -> Fetc
         text=digest.block,
         http_status=pending.http_status,
         content_type=pending.content_type or None,
+        # A zero-passage digest is a document we read that does not discuss the ask, and its
+        # block reads identically to one carrying the resolving paragraph — same header, same
+        # outline, plus a sentence saying nothing matched. No status flip (it IS a successful
+        # read, and a loss token here would move `sources=ok/total` and drag every sibling
+        # into the "yielded no usable content" notice), just the reason that separates them.
+        status_reason=None if digest.passages else "no_matching_passage",
     )
 
 
-def _document_not_parsed(pending: _PendingDocument) -> FetchResult:
+def _document_not_parsed(pending: _PendingDocument, reason: FetchStatusReason) -> FetchResult:
     """The result for a document we held and chose not to parse.
 
     ``unsupported_type`` rather than ``unreadable_document``: nothing read the bytes, so
     nothing established they carry no text, and only the latter is worth a paid document
-    read later. Which rule declined rides on the rung attempt's ``skipped_reason``.
+    read later. ``reason`` says which rule declined — the same token the rung attempt's
+    ``skipped_reason`` carries, repeated here because the two ride different markers
+    (``RESOLUTION_SOURCE_ESCALATION`` versus ``RESOLUTION_SOURCE_FETCH``) and a reader of
+    the per-fetch line should not have to join to learn we were holding a document.
     """
     return FetchResult(
         url=pending.url,
@@ -1271,6 +1286,7 @@ def _document_not_parsed(pending: _PendingDocument) -> FetchResult:
         text="",
         http_status=pending.http_status,
         content_type=pending.content_type or None,
+        status_reason=reason,
     )
 
 
@@ -1829,8 +1845,11 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     when its prose made it a success.
 
     ``reason`` is appended only where the status alone is ambiguous —
-    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page``, and
-    ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs ``malformed``.
+    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page``,
+    ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs ``malformed``, the
+    ``no_matching_passage`` that separates a document we read and whose passage selection
+    matched nothing from one that answered the ask, and the ``budget_skipped`` /
+    ``parse_contention`` that say an ``unsupported_type`` was a document we were holding.
     ``route`` is appended only when a ladder rung produced the outcome. Both are
     appended rather than always emitted so every line the archive already holds stays
     byte-identical and an absent field keeps meaning "this does not apply", not "old
