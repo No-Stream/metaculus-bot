@@ -3382,12 +3382,20 @@ def resolution_source_provider(is_benchmarking: bool = False, *, fast_path: bool
         # by-design withholds (`stale_data`) on exactly the tracker questions the
         # hop serves. Datasets get their own count so both stay readable.
         cited = [r for r in results if r.chart_id is None]
-        n_fail = sum(1 for r in cited if r.status != "success")
+        unfetched = [r for r in cited if r.status != "success"]
         n_datasets_withheld = sum(1 for r in results if r.chart_id is not None and r.status != "success")
-        if n_fail or n_datasets_withheld:
+        if unfetched or n_datasets_withheld:
+            # Counts rather than a verdict. This line used to assert the ladder "rescued none of
+            # them" whenever anything was unfetched, which is false on the ordinary mixed
+            # question — Wayback serving one host while a second stays walled — and the summary is
+            # where a run log gets read first. A rescue is a success no direct fetch produced,
+            # the same reading `_rung_counts` takes; the statuses say what the losses actually
+            # were instead of naming two of them by hand.
+            n_rescued = sum(1 for r in cited if r.status == "success" and r.route != "direct")
+            lost_statuses = ",".join(sorted({r.status for r in unfetched})) or "none"
             logger.info(
-                f"resolution_source: {n_fail}/{len(cited)} cited urls unfetched "
-                f"(js_wall/blocked — the escalation ladder rescued none of them); "
+                f"resolution_source: {len(unfetched)}/{len(cited)} cited urls unfetched "
+                f"({lost_statuses}); {n_rescued} rescued by a later rung; "
                 f"{n_datasets_withheld} embedded dataset(s) withheld",
             )
         qid = getattr(question, "id_of_question", None)

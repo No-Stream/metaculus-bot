@@ -9,8 +9,10 @@ see ``test_resolution_source_helpers.py`` for the layer map.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket as _socket
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import FilteringResolver
@@ -164,6 +166,50 @@ class TestResolutionSourceProvider:
         assert counts, "the rung counts must survive into the archive even when nothing fired"
         assert set(counts.values()) == {0}
         assert _counts_suffix(detail) == ""
+
+    async def test_the_unfetched_summary_counts_what_the_ladder_rescued(self, monkeypatch, caplog):
+        """The question-level summary states rescue COUNTS instead of asserting a verdict.
+
+        It used to close every unfetched count with "the escalation ladder rescued none of them",
+        which is false on the ordinary mixed question: the live smoke run printed it on a question
+        where Wayback had just served bls.gov while a second host stayed walled. This summary is
+        where a run log gets read first, so a wrong clause there sends a reader looking for a
+        broken ladder. Driven off crafted results rather than the ladder itself, because what is
+        under test is the sentence.
+        """
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        results = [
+            FetchResult(
+                url="https://www.bls.gov/cpi/",
+                status="success",
+                text="CPI for all urban consumers rose 0.2 percent in August.",
+                http_status=200,
+                content_type="text/html",
+                route="wayback",
+            ),
+            FetchResult(
+                url="https://www.sagaftra.org/contracts",
+                status="js_wall",
+                text="",
+                http_status=200,
+                content_type="text/html",
+            ),
+        ]
+        question = _mock_question(
+            resolution_criteria="See https://www.bls.gov/cpi/ and https://www.sagaftra.org/contracts"
+        )
+
+        with (
+            patch.object(resolution_source, "fetch_resolution_sources", AsyncMock(return_value=results)),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"),
+        ):
+            await resolution_source_provider(is_benchmarking=False)(question)
+
+        summaries = [rec.getMessage() for rec in caplog.records if "cited urls unfetched" in rec.getMessage()]
+        assert summaries == [
+            "resolution_source: 1/2 cited urls unfetched (js_wall); 1 rescued by a later rung; "
+            "0 embedded dataset(s) withheld"
+        ]
 
     def test_duplicate_domains_keep_both_outcomes(self):
         """Two URLs on the SAME domain are common (a stats site's index + data page).
