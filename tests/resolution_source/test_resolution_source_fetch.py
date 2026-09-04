@@ -1014,8 +1014,13 @@ class TestResolutionSourceFetchMarker:
         assert counts == {
             "meta_refresh_hops": 0,
             "pdf_documents_read": 0,
+            "rendered_attempts": 0,
             "rung_budget_skips": 1,
             "pdf_contention_skips": 0,
+            # The withheld page also earned a browser attempt, which this package's autouse
+            # fixture declines — so the skip that follows the meta-refresh one is the browser
+            # transport reporting itself unavailable, not a second budget skip.
+            "renderer_unavailable_skips": 1,
         }
 
 
@@ -1274,8 +1279,14 @@ class TestMetaRefreshHop:
         assert result.status == "js_wall"
         assert result.route == "direct"
         assert session.requested == ["https://cdc.example.com/surveillance"]
-        assert [a.skipped_reason for a in result.rung_attempts] == ["wall_budget"]
+        # Two skips, both for want of wall: the meta-refresh hop and then the browser rung,
+        # each self-bounded against the same spent budget.
+        assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [
+            ("meta_refresh", "wall_budget"),
+            ("rendered", "wall_budget"),
+        ]
         assert any("skipping the meta-refresh hop" in m for m in caplog.messages)
+        assert any("skipping the rendered rung" in m for m in caplog.messages)
 
 
 class TestLocalPdfReading:

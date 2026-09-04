@@ -9,6 +9,8 @@ session are ordinary imports from ``tests/resolution_source_fakes.py``.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from metaculus_bot.research import resolution_source
@@ -31,6 +33,33 @@ def _reset_shared_gates():
     yield
     reset_host_semaphores()
     reset_pdf_parse_semaphore()
+
+
+@pytest.fixture(autouse=True)
+def _decline_the_browser_rung(monkeypatch):
+    """Turn the headless-Chromium escalation OFF for every test in this package by default.
+
+    This is a NETWORK guard, not a convenience. The suite's autouse egress block patches
+    ``socket.socket.connect``, and a Chromium subprocess does not go through it — so without
+    this, any fixture whose page classifies as ``js_wall`` or ``thin_page`` launches a real
+    browser, against a host whose DNS the stub above points at 8.8.8.8, and makes a real
+    connection from a unit test. (Verified: it did, on three pre-existing marker tests, the
+    moment the Tier-1 rendered rung landed.)
+
+    ``None`` is the transport's own "declined" signal, so the ladder degrades exactly as it
+    does on a runner where the ``continue-on-error`` Chromium install failed — which is also
+    what keeps every pre-ladder expectation in this package intact, minus the one
+    ``renderer_unavailable`` skip the attempt now records. Tests that exercise the rung
+    monkeypatch ``resolution_source.render_page`` again in the test body; that later patch wins.
+    """
+
+    async def _declined(url: str, *, host_gate, goto_timeout_ms: int = 0, harvest_json: bool = False) -> None:
+        """The transport's declined signal. Returns None implicitly; ruff owns that spelling."""
+        del url, host_gate, goto_timeout_ms, harvest_json
+        # A real yield point, so the stub schedules like the browser rung it stands in for.
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(resolution_source, "render_page", _declined)
 
 
 @pytest.fixture(autouse=True)

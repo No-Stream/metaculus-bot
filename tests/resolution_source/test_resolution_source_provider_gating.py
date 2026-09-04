@@ -163,8 +163,10 @@ class TestResolutionSourceProvider:
         assert detail["counts"] == {
             "meta_refresh_hops": 0,
             "pdf_documents_read": 0,
+            "rendered_attempts": 0,
             "rung_budget_skips": 0,
             "pdf_contention_skips": 0,
+            "renderer_unavailable_skips": 0,
         }
         assert _counts_suffix(detail) == ""
 

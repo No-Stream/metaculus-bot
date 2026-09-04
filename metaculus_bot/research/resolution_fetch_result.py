@@ -98,6 +98,12 @@ FetchStatus = Literal[
 # belong to the `unsupported_type` a held-but-unparsed document earns, and say which rule
 # declined: the question ran out of wall, or every parse slot was taken. Without them a
 # skipped document is indistinguishable from a body that was never a document at all.
+#
+# `renderer_unavailable` is the browser rung declining before it rendered anything: Playwright
+# missing or broken, a host that will not pin to a public IP, a browser error, or a URL a
+# browser already read to nothing this run. It rides a rung attempt's `skipped_reason` rather
+# than a result's `status_reason` — nothing was rendered, so nothing about the page changed —
+# and it is here so the whole reason vocabulary has one home.
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -107,6 +113,7 @@ FetchStatusReason = Literal[
     "no_matching_passage",
     "budget_skipped",
     "parse_contention",
+    "renderer_unavailable",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the

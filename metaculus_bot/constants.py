@@ -726,6 +726,15 @@ RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S: float = (
 # rather than not at all.
 RESOLUTION_SOURCE_PDF_MIN_BUDGET_S: float = 3.0
 
+# --- Resolution-source escalation rungs that need a browser -------------------
+# The rendered rung launches headless Chromium (`research/rendered_fetch.py`, shared with the
+# gap-fill v2 fetch ladder and its process-global Semaphore(2) launch cap). Two reasons its
+# floor is far above the one-request rungs' 3 s: a launch plus a DOM-ready navigation measured
+# 3-8 s across the 2026-09-03 replay corpus even on pages that rendered cleanly, and the launch
+# slot is contended process-wide, so a question with no budget left would take a slot a sibling
+# question could still land a page with. 12 s admits the 2 s settle plus a 10 s navigation.
+RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S: float = 12.0
+
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
 # Search results (distinct from OpenRouter's Exa-backed :online plugin). Adds a
