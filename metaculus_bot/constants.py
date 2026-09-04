@@ -643,6 +643,18 @@ RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
 # 2026-09-03 on 118 bodies, receipt `scratch/fetch_ladder_2026-09-03/chrome_calibration.md`.
 RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS: int = 60  # a non-table line at least this long is content, shorter is chrome
 RESOLUTION_SOURCE_CONTENT_SHARE_MIN: float = 0.38
+# Wall budget under which the `favor_precision` re-extraction is skipped and the default text is
+# withheld as it would be had that pass failed (`resolution_source._extract_page_text`). The pass
+# is CPU, runs after the body is already in hand — on the rendered rung after the browser has
+# spent the whole remaining budget — and costs a little more than the default pass did on the
+# same bytes: on a synthetic div-soup dashboard DOM on the operator's laptop (2026-09-04) the
+# precision pass took 1.5 s at 1 MiB, 3.2 s at 2 MiB and 9.7 s at 5 MiB (nested list menus run
+# 5-10x cheaper; the second review pass measured 42 s at 5.2 MiB on a heavier synthetic tree),
+# against the 2 s margin the rung leaves the provider's wall. Sized so a body around 1-2 MiB
+# still gets its second pass on a slower GitHub runner; a bigger body near the wall is withheld
+# rather than published, and the real lever for those is `RENDERED_DOM_MAX_CHARS` (FUTURE.md).
+# Read against the wall remaining AFTER the default pass, so that pass's own cost counts.
+RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S: float = 5.0
 # --- Inline chart configs (Highcharts), read straight out of the page we already hold ---
 # qid 43949: the resolving IOM page fetched 200 and extracted ~80k chars of incident rows
 # and prose carrying none of the resolving figures, because the annual series lives in

@@ -2760,3 +2760,23 @@ timing code with no fake-driven test that can prove it (the suite refuses real l
 more un-timed IPC in the rung's tail; it needs a live render against a busy page to verify.
 Since 2026-09-03 the rung is bounded at the remaining wall budget either way, so the noise costs
 log readability, not pages.
+
+### The rendered DOM ceiling is the real bound on post-render extraction cost (added 2026-09-04; LOW)
+
+`RENDERED_DOM_MAX_CHARS` is 5 MiB, sized to the response cap for memory. The rendered rung hands
+the browser its whole remaining wall budget and classifies the DOM afterwards, and every
+trafilatura pass over that DOM is unbudgeted CPU inside the 2 s margin the rung leaves the
+provider's outer `wait_for`, which discards every page the question already fetched when it
+fires. Measured 2026-09-04 on the operator's laptop, synthetic div-soup dashboard DOM: the
+default pass 1.1 / 2.6 / 8.3 s and the precision pass 1.5 / 3.2 / 9.7 s at 1 / 2 / 5 MiB
+(nested menu lists run 5-10x cheaper; the second forge pass measured 42 s for both passes at
+5.2 MiB on a heavier synthetic tree). The same-day fix bounds only the SECOND pass
+(`RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S`: skipped under the floor, with the default
+text withheld as if the pass had failed), which can only ever withhold. The first pass is still
+unbounded, and at 5 MiB it alone overruns the margin on this laptop, let alone on a GitHub
+runner sharing its thread pool with up to five sibling URLs. The lever is the ceiling: 1-2 MiB
+would hold the default pass to a few seconds. Not moved in this bundle because nothing measures
+how many rescuable DOMs sit between 1 and 5 MiB (the phase-3 QA sweep's 12 rendered successes
+were all far smaller). Read the fall season's `route=rendered` successes first; if none of them
+needed the band, lower the ceiling, and if some did, the alternative is a reserve inside the
+render budget sized to the DOM the browser actually returned.

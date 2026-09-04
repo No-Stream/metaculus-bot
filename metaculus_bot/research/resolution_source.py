@@ -170,6 +170,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MIN_SECTION_CHARS,
     RESOLUTION_SOURCE_PDF_MIN_BUDGET_S,
     RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+    RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S,
     RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S,
     RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
@@ -1158,12 +1159,25 @@ class _PageExtraction:
     precision_rescued: bool = False
 
 
-def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio: float) -> _PageExtraction:
+def _extract_page_text(
+    html_text: str, body: bytes, url: str, undecodable_ratio: float, *, remaining_wall_s: float | None = None
+) -> _PageExtraction:
     """The publishable extraction of an HTML body: ARIA tables rewritten first, default
     recall as the primary extractor, precision as the fallback, both scored by line shape.
 
     All of it is CPU-bound sync work over a body up to the response cap, so it runs in one
     ``asyncio.to_thread`` hop rather than several.
+
+    The precision pass is the one part of it that is skippable, and it is skipped when
+    ``remaining_wall_s`` — the provider wall the caller had left when it handed the body over,
+    less what the default pass has since spent — is under
+    ``RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S``. Nothing budgets this work otherwise: the
+    rendered rung gives the browser its whole remaining budget and classifies the DOM afterwards,
+    and a 5 MiB navigation tree costs seconds per pass against the 2 s margin the rung leaves the
+    outer ``wait_for``, which discards every page the question already fetched when it fires. A
+    skipped pass takes the exit a FAILED pass takes, the default text withheld under the metric,
+    so the wall can only ever withhold a page here, never publish one the metric refused. None,
+    the default, means unbounded, which is what the direct-path tests drive it with.
 
     The policy, calibrated 2026-09-03 (receipt on ``RESOLUTION_SOURCE_CONTENT_SHARE_MIN``):
     the default extraction publishes when it clears the chrome floor and
@@ -1198,6 +1212,7 @@ def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio:
     accents. Any U+FFFD at all means this decode lost information trafilatura might not
     have, and the rewrite is the only thing that forecloses its own encoding detection.
     """
+    started = time.monotonic()
     rewritten = rewrite_aria_tables(html_text) if undecodable_ratio == 0.0 else None
     source = body if rewritten is None else rewritten
     default = _extract_main_text(source, url)
@@ -1207,6 +1222,16 @@ def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio:
         or content_share(default) >= RESOLUTION_SOURCE_CONTENT_SHARE_MIN
     ):
         return _PageExtraction(text=default)
+    if remaining_wall_s is not None:
+        wall_left_s = remaining_wall_s - (time.monotonic() - started)
+        if wall_left_s < RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S:
+            logger.info(
+                "resolution_source: skipping the precision re-extraction for %s — %.1fs of wall budget left; "
+                "withholding the default text",
+                urlparse(url).netloc,
+                wall_left_s,
+            )
+            return _PageExtraction(text=default, chrome_metric_withheld=True)
     precision = _extract_main_text(source, url, favor_precision=True)
     if (
         precision is not None
@@ -1294,7 +1319,7 @@ class _HtmlClassification:
 
 
 async def _classify_html_body(
-    body: bytes, current_url: str, content_type: str, *, http_status: int
+    body: bytes, current_url: str, content_type: str, *, http_status: int, remaining_wall_s: float | None = None
 ) -> _HtmlClassification:
     """Trafilatura extraction plus the inline-chart rung and the chrome / JS-wall checks.
 
@@ -1302,6 +1327,10 @@ async def _classify_html_body(
     fetch, a meta-refresh hop, or a headless-Chromium render. That is what makes a rescued
     page indistinguishable from a directly-fetched one downstream — same chart read, same ARIA
     rewrite, same floors, same disclosure leads.
+
+    ``remaining_wall_s`` is the provider wall the caller has left (``FetchContext.rung_budget_s``),
+    handed through to :func:`_extract_page_text` so its optional second pass can decline under
+    the floor; both production callers pass it, and None keeps the pass unbounded.
 
     Order of the three verdicts, and why:
 
@@ -1337,7 +1366,9 @@ async def _classify_html_body(
     html_text, undecodable_ratio = decode_text_body(body, content_type)
     charts = extract_datawrapper_charts(html_text)
     unreadable_embeds = unreadable_data_embed_providers(html_text)
-    extraction = await asyncio.to_thread(_extract_page_text, html_text, body, current_url, undecodable_ratio)
+    extraction = await asyncio.to_thread(
+        _extract_page_text, html_text, body, current_url, undecodable_ratio, remaining_wall_s=remaining_wall_s
+    )
     extracted = extraction.text
     # In a thread for the same reason the extraction is: it is sync CPU work (one
     # regex sweep plus a `json.loads` per config) over a body up to the 5 MiB
@@ -1411,7 +1442,9 @@ async def _resolution_html_outcome(
             http_status=status,
             content_type=content_type or None,
         )
-    classified = await _classify_html_body(body, current_url, content_type, http_status=status)
+    classified = await _classify_html_body(
+        body, current_url, content_type, http_status=status, remaining_wall_s=ctx.rung_budget_s()
+    )
     if classified.result.status == "success":
         return classified.result
     hop = await _meta_refresh_hop(
@@ -1961,6 +1994,9 @@ async def _rendered_rung(
         # text, which is the fact the record should keep. Chromium reports no status at all
         # when a goto timed out and the DOM was salvaged, and a non-200 never reaches here.
         http_status=direct.http_status if direct.http_status is not None else 200,
+        # What the browser left of the wall: the render spent the rest, and the extractor's
+        # optional second pass declines under its floor rather than overrunning the provider.
+        remaining_wall_s=ctx.rung_budget_s(),
     )
     # The render's own verdict, stamped before the harvest gets its turn: when the harvested
     # feed rescues the page, the ladder's result is `success` and the closer would otherwise
