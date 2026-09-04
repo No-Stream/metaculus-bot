@@ -118,6 +118,7 @@ import logging
 import os
 import socket
 import time
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -2769,45 +2770,66 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
     from "this record predates the rung".
     """
     attempts = [attempt for r in results for attempt in r.rung_attempts]
-    fired = [attempt for attempt in attempts if not attempt.skipped_reason]
+    fired_by_rung = Counter(attempt.rung for attempt in attempts if not attempt.skipped_reason)
+    skips_by_reason = Counter(attempt.skipped_reason for attempt in attempts if attempt.skipped_reason)
+    budget_skips_by_rung = Counter(attempt.rung for attempt in attempts if attempt.skipped_reason == "wall_budget")
     return {
-        "meta_refresh_hops": sum(1 for attempt in fired if attempt.rung == "meta_refresh"),
-        "pdf_documents_read": sum(1 for attempt in fired if attempt.rung == "pdf_local"),
-        "rendered_attempts": sum(1 for attempt in fired if attempt.rung == "rendered"),
-        "derived_api_reads": sum(1 for attempt in fired if attempt.rung == "derived_api"),
-        "wayback_attempts": sum(1 for attempt in fired if attempt.rung == "wayback"),
-        "url_context_reads": sum(1 for attempt in fired if attempt.rung == "url_context"),
-        "rung_budget_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wall_budget"),
+        "meta_refresh_hops": fired_by_rung["meta_refresh"],
+        "pdf_documents_read": fired_by_rung["pdf_local"],
+        "rendered_attempts": fired_by_rung["rendered"],
+        "derived_api_reads": fired_by_rung["derived_api"],
+        "wayback_attempts": fired_by_rung["wayback"],
+        "url_context_reads": fired_by_rung["url_context"],
+        "rung_budget_skips": skips_by_reason["wall_budget"],
+        # The same skips broken out per rung, because the aggregate cannot say WHICH rung the
+        # provider's wall is binding on — and at the paid flag's rollout "how often does the
+        # paid rung get starved by the pages before it" is the question. The total stays as it
+        # is, since the archive already reads it.
+        **{f"{rung}_budget_skips": budget_skips_by_rung[rung] for rung in _BUDGET_GATED_RUNGS},
         # Its own count rather than folded into the budget skips: a document left unread
         # because two others were already parsing says the 2-slot gate is the binding
         # constraint, which is a different thing to fix than a question that ran late.
-        "pdf_contention_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "parse_contention"),
+        "pdf_contention_skips": skips_by_reason["parse_contention"],
         # Also its own count, for the same reason: a browser rung that never rendered because
         # Chromium is missing on the runner (the install step is `continue-on-error` in every
         # workflow, so its absence is by design) says something different from a question that
         # ran out of wall, and both are invisible in `rendered_attempts`.
-        "renderer_unavailable_skips": sum(
-            1 for attempt in attempts if attempt.skipped_reason == "renderer_unavailable"
-        ),
+        "renderer_unavailable_skips": skips_by_reason["renderer_unavailable"],
         # Its own count too: a render that launched and was cut off — by the transport's DOM-read
         # cap or by the question's remaining wall budget — is a page that keeps navigating, which
         # is a fact about the page, whereas the two counts above are facts about the runner and
         # about the question's clock. Folding it into either would hide the population the
         # ogimet receipt (2026-09-03) is the first member of.
-        "render_timeout_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "render_timeout"),
+        "render_timeout_skips": skips_by_reason["render_timeout"],
         # Also its own count: a question that spent its two snapshot attempts on earlier
         # cited URLs is a question whose per-question cap is binding, which is a different
         # thing to tune than a question that ran out of wall.
-        "wayback_cap_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wayback_cap"),
+        "wayback_cap_skips": skips_by_reason["wayback_cap"],
         # Its own count: an expensive rung declined because the QUESTION's close-derived budget
         # put it on the fast path, which is a fact about the question's window rather than about
         # the provider's own 45 s wall (`rung_budget_skips`) — the two are tuned differently.
-        "fast_path_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "fast_path"),
+        "fast_path_skips": skips_by_reason["fast_path"],
         # Its own count because it is the free pre-check EARNING its request: a host that
         # disallows Google-Extended refuses the read server-side, so this is spend avoided
         # rather than a page lost, and it must not read as a failure.
-        "url_context_robots_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "robots_disallowed"),
+        "url_context_robots_skips": skips_by_reason["robots_disallowed"],
+        # Its own count because it is a MISCONFIGURATION rather than a tuning signal: with the
+        # flag on and GOOGLE_API_KEY unset the paid rung fires nowhere, and without this key
+        # that run is byte-identical in the archive to one with the flag off.
+        "url_context_no_api_key_skips": skips_by_reason["no_api_key"],
     }
+
+
+# Every rung with a wall-budget floor, i.e. every rung that can record a `wall_budget` skip, in
+# ladder order. `_rung_counts` breaks the aggregate `rung_budget_skips` out per member.
+_BUDGET_GATED_RUNGS: tuple[FetchRoute, ...] = (
+    "meta_refresh",
+    "pdf_local",
+    "derived_api",
+    "rendered",
+    "wayback",
+    "url_context",
+)
 
 
 def _document_query(question: MetaculusQuestion) -> str:

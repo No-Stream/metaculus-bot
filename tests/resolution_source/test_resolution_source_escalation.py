@@ -220,8 +220,12 @@ class TestRenderedRungBudget:
         assert calls == []
         skips = [a for a in result.rung_attempts if a.rung == "rendered"]
         assert [a.skipped_reason for a in skips] == ["wall_budget"]
-        assert _rung_counts([result])["rung_budget_skips"] == 1
-        assert _rung_counts([result])["rendered_attempts"] == 0
+        counts = _rung_counts([result])
+        assert counts["rung_budget_skips"] == 1
+        # The aggregate cannot say WHICH rung the wall bound; the per-rung key can.
+        assert counts["rendered_budget_skips"] == 1
+        assert counts["url_context_budget_skips"] == 0
+        assert counts["rendered_attempts"] == 0
 
     async def test_the_navigation_budget_comes_off_the_remaining_wall(self, monkeypatch):
         """A render admitted with 20 s left may not then help itself to the full 35 s cap."""
@@ -608,6 +612,10 @@ class TestDerivedApiRung:
             ("rendered", "wall_budget"),
         ]
         assert _FEED_URL not in session.requested
+        counts = _rung_counts([second])
+        assert counts["rung_budget_skips"] == 2
+        assert counts["derived_api_budget_skips"] == 1
+        assert counts["rendered_budget_skips"] == 1
 
     async def test_an_undecodable_feed_is_never_served_as_content(self, monkeypatch):
         """A body we could not decode must not become the page's content on a section
@@ -1114,6 +1122,9 @@ class TestUrlContextRung:
         assert result.status == "blocked"
         assert calls == []
         assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("url_context", "no_api_key")]
+        # Its own count: without it "flag on, key missing" is byte-identical in the archive to
+        # "flag off", and the moment that matters is the paid flag's rollout.
+        assert _rung_counts([result])["url_context_no_api_key_skips"] == 1
 
     async def test_the_rung_is_skipped_below_its_floor(self, monkeypatch):
         reader, calls = self._reader()

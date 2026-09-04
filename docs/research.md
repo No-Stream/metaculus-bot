@@ -1057,7 +1057,12 @@ and never fired" distinguishable from "this record predates the rung". Six of th
 rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
 `derived_api_reads`, `wayback_attempts` and `url_context_reads`. The rest count rungs that
 were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
-because each names a different binding constraint. `rung_budget_skips` is the question that ran out of wall.
+because each names a different binding constraint. `rung_budget_skips` is the question that ran
+out of wall, summed over every rung; the same skips are broken out per rung as
+`meta_refresh_budget_skips`, `pdf_local_budget_skips`, `derived_api_budget_skips`,
+`rendered_budget_skips`, `wayback_budget_skips` and `url_context_budget_skips`, because the
+aggregate cannot say WHICH rung the wall is binding on and "how often is the paid rung starved
+by the pages before it" is the question the flag's rollout asks.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
 parse gate is what binds. `renderer_unavailable_skips` is a browser rung that never rendered,
 most often because Chromium is missing on the runner (the install step is `continue-on-error` in
@@ -1072,9 +1077,10 @@ declined because the QUESTION's close-derived budget put it on the time-budget f
 about the question's window rather than about the provider's own 45 s wall, which is what
 `rung_budget_skips` counts. `url_context_robots_skips` is the free `Google-Extended`
 pre-check earning its request: the host would have refused the read server-side, so that is
-spend avoided rather than a page lost and it must not read as a failure. One skip reason has no
-count of its own: the paid rung's `no_api_key`, which is a misconfiguration rather than a tuning
-signal.
+spend avoided rather than a page lost and it must not read as a failure. `url_context_no_api_key_skips`
+is the paid rung enabled with no `GOOGLE_API_KEY` set: a misconfiguration rather than a tuning
+signal, and counted precisely because without it "flag on, key missing" is byte-identical in the
+archive to "flag off".
 
 It is **SSRF-hardened** because these URLs are user-authored and fetches run from
 CI: a preflight `is_public_http_url` check rejects private / loopback /
