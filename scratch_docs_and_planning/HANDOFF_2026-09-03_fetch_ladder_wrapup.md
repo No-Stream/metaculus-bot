@@ -5,16 +5,18 @@
 `No-Stream/metaculus-bot`, `upstream` is the Metaculus template, so every `gh` call needs
 `--repo No-Stream/metaculus-bot`)
 **Repo:** `/Users/flatljan/personal/metaculus-bot`
-**Status (updated 2026-09-04 12:50 PT):** DONE except the operator's push and merge. Second review pass
-fixed; paid url_context rung ON everywhere; paid and rendered rungs verified live; the ONE authorized smoke
-(Test Bot run 33907102246) published all four forecasts and passed a fresh-context QA ("fit to merge"; its
-only red cause, Kalshi HTTP 429 on concurrent catalogue pulls, is fixed by the single-flight guard merged as
-`2ceb481`, reviewed with zero defects, worktree gate 7,579 green). Local HEAD `2ceb481` plus this doc's commit
-is 7 commits ahead of the pushed `cbc26bf`. A full gate on `2ceb481` was started at 12:47 PT in tmux
-(`~/logs/gate14.log`; expect `EXITCODE=0` and about 7,579 passed; if it is red, the failure is in the Kalshi
-single-flight change or a merge artifact, and the smoke does NOT need re-running for that fix). Nothing else
-is in flight. Next: operator pushes, PR CI runs, operator merges PR #66, then the post-merge commands in
-"Operator follow-ups" at the end of this doc. Surface that list to the operator only at the very end.
+**Status (updated 2026-09-04 14:45 PT):** DONE except the operator's push and merge. The pushed head
+`1f2b504` has PR CI green (run 33917127083). After it, the Codex review triage landed as four worktree merges
+plus three small commits ending at `c07d7cf`: the browser route-guard comment and docs now say what the guard
+covers (server-side redirect hops are unguarded), the model-id rule in AGENTS.md and `docs/roster_history.md`
+states the real split with `tests/test_model_name_locations.py` pinning it, the `litellm_callback_drain_timeout`
+marker spec is registered, and FUTURE.md carries the deferred browser-transport fix (item 8) and the un-clocked
+PDF prologue (LOW). The full free gate on `c07d7cf` is green (7,592 passed, 14 skipped, 33 deselected,
+`~/logs/gate17.log`). The commit after `c07d7cf` adds the tracked PR description
+(`scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`, 97 KB, over GitHub's 65,536-character
+body cap) and this status; the PR body on GitHub is the 14.7 KB condensed version. Nothing is in flight. Next:
+operator pushes, PR CI reruns, operator merges PR #66, then the post-merge commands in "Operator follow-ups" at
+the end of this doc, which now also holds the one open decision (the browser-transport follow-up PR).
 
 The operator does NOT read plan docs; every decision or approval you need from them goes inline in
 chat, self-contained, with a recommendation. They sign off on any paid run before it fires.
@@ -356,8 +358,7 @@ Taken tonight by the session lead, and open to the operator's veto:
   landed only declines the two expensive rungs (render, paid read) when the time budget's fast
   path is on, and counts the declines.
 - **F3 makes the paid url_context rung reachable when the Wayback capture is too stale.** That is
-  a cost-policy consequence; the flag defaults off in code but is ON in every bot workflow since 2026-09-04 (operator instruction), so this path is live and bounded by the 2-read cap
-  until the operator turns it on.
+  a cost-policy consequence; the flag defaults off in code but is ON in every bot workflow since 2026-09-04 (operator instruction), so this path is live and bounded by the 2-read cap.
 - **P3-8 flipped**: a zero-passage PDF digest is `no_resolving_content` / `no_matching_passage`,
   not `success`, per the prose-never-stands-in-for-an-absent-section rule.
 - **Policy D for the extractor** (details above): the one decision here that changes what
@@ -372,9 +373,10 @@ Taken tonight by the session lead, and open to the operator's veto:
   dispatch a bot workflow without the operator's explicit go for THAT run. Free: all `make` gates,
   `make supply_probe`, `make check_credits`, `make sync_all`, the probe scripts without their spend
   flag, `fetch_diagnostic` (no secrets).
-- **`RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` stays off.** Turning it on makes the resolution-source
-  provider a paid Gemini surface on the operator's personal Google AI Studio key. Operator decision
-  only. The flag is documented commented-out in `.env.template` and named in AGENTS.md's cost gate.
+- **`RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` is ON in every bot workflow since 06b3fd9** (operator rule: a
+  flagged feature ships flag-on). The code default stays off. On, the resolution-source provider is a paid
+  Gemini surface on the operator's personal Google AI Studio key, bounded by the robots pre-check, the 15 s
+  floor and `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` (2). Named in AGENTS.md's cost gate.
 - **The repo Makefile has no `test_select` target**; run single files with
   `uv run pytest <paths>` (`make test_fast` for the suite).
 - **Fake `render_page` doubles must accept the transport's full keyword set**: `memo_scope`,
@@ -449,7 +451,16 @@ Everything below needs the operator or is the operator's call. Do not drip these
    cancellation inside `PlaywrightContextManager.__aenter__`; `tests/test_agentic_tools.py` and
    `constants.py` size (own PR); Tier-1 paid rung configured by `GAP_FILL_V2_READER_*` constants (R18);
    policy D re-calibration once a season of `chrome_metric_withholds` counts exists; Accept-Encoding
-   widening (now safe, unmeasured).
+   widening (now safe, unmeasured); and, from the 2026-09-04 Codex triage, item 8 (the browser transport's
+   three unguarded channels and the follow-up design, FUTURE.md ~1405-1552), the un-clocked PDF parse prologue
+   (LOW, ~2834-2934), and the stale per-model cost heuristic in `ensemble_analysis/ensemble_simulator.py`
+   (adjacent rot, offline only, found by the model-id inventory).
+8. **Decision: build the browser-transport follow-up PR right after the merge?** About 210 lines across
+   `rendered_fetch.py`, `resolution_source.py`, `agentic/tools.py`, the Playwright fakes and tests: re-vet the
+   final URL after navigation with `is_public_http_url` (closes IP-literal private redirects, near-zero recall
+   cost), block page WebSockets with `route_web_socket`, then hand the browser the direct fetch's final URL and
+   measure cross-host redirects with a free local render probe before adding strict pinned-host equality.
+   Recommendation: yes, as its own PR; the smoke does not need re-running for it.
 
 ## References
 
