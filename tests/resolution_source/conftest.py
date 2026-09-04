@@ -15,24 +15,34 @@ import pytest
 
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import reset_host_semaphores, reset_pdf_parse_semaphore
+from metaculus_bot.research.robots_policy import reset_robots_cache
 from tests.resolution_source_fakes import _INFOGRAM_EMBED_MARKUP, _embed_shell_page
 
 
 @pytest.fixture(autouse=True)
 def _reset_shared_gates():
-    """Drop the loop-wide per-host semaphore map and the PDF-parse gate around every test.
+    """Drop the process-wide gates and caches around every test in this package.
 
-    Both deliberately outlive one provider call (that is what makes politeness and the
-    parse bound hold across concurrent questions), so without this a permit one test left
-    held would gate another, and a serialization assertion would pass or fail on test
-    order. They self-heal across event loops too, but resetting is cheap and states the
-    intent.
+    All three deliberately outlive one provider call. The per-host semaphore map and the
+    PDF-parse gate are what make politeness and the parse bound hold across concurrent
+    questions, so without a reset a permit one test left held would gate another and a
+    serialization assertion would pass or fail on test order. They self-heal across event
+    loops too, but resetting is cheap and states the intent.
+
+    The robots.txt cache is the one whose leak is silent rather than merely order-dependent:
+    it is keyed by HOST, and every test in this package fetches ``tracker.example.com``, so a
+    test that registers a ``Disallow`` for Google-Extended would otherwise decline the paid
+    rung in every later test on that host — a rung that never ran, asserted as a rung that
+    declined. Reset here rather than in each class's setup, which is where it used to live and
+    where a new module has no way to know it was needed.
     """
     reset_host_semaphores()
     reset_pdf_parse_semaphore()
+    reset_robots_cache()
     yield
     reset_host_semaphores()
     reset_pdf_parse_semaphore()
+    reset_robots_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -68,16 +78,23 @@ def _decline_the_browser_rung(monkeypatch):
 def _decline_the_wayback_rung(monkeypatch):
     """Empty the archive rung's trigger set for every test in this package by default.
 
-    Same shape of argument as the browser fixture above, one layer out: the rung fires on
-    ``blocked`` / ``error`` / ``not_found``, which is the outcome dozens of these tests
-    deliberately produce, and each fire is a real ``web.archive.org`` GET over aiohttp — one the
-    suite's socket guard would refuse, but a refusal mid-ladder is not the outcome those tests
-    were written to assert. With the trigger set empty the rung declines before it looks at
-    anything, so it records no attempt, claims no ``route``, and issues no request — leaving
-    every pre-ladder expectation in this package exactly as it was.
+    A convenience rather than a containment, unlike the browser fixture above: nothing here can
+    reach the network in the first place. The rung fires on ``blocked`` / ``error`` /
+    ``not_found``, the outcome dozens of these tests deliberately produce, and every one of them
+    drives a ``FakeSession``, so an unwanted fire never leaves the process — the archive URL has
+    no handler and ``FakeSession.get`` raises ``AssertionError: no handler for URL
+    https://web.archive.org/...`` mid-ladder. That error is outside the hop's
+    ``(TimeoutError, aiohttp.ClientError)`` catch, so it surfaces as a loud failure of an
+    assertion the test never meant to make, which is the reason to decline rather than a network
+    risk. Emptying the trigger set declines before the rung looks at anything, so it records no
+    attempt, claims no ``route`` and issues no request, keeping every pre-ladder expectation in
+    this package intact without adding an archive handler to dozens of tests.
 
     Tests that exercise the rung restore the module's OWN constant object (imported, so the two
-    cannot drift), which reads as "these statuses trigger the archive".
+    cannot drift), which reads as "these statuses trigger the archive". The trigger population is
+    pinned in ``TestWaybackRung``, and its ``ssrf_blocked`` EXCLUSION — which this fixture would
+    otherwise hide from every test in the package — in
+    ``test_resolution_source_third_party_rung_ssrf.py``.
     """
     monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", frozenset())
 
