@@ -8,6 +8,10 @@ import pytest
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from curl_cffi.requests import Session as CurlSession
 from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
+
+# `playwright._impl._browser_type` is a PRIVATE module path, imported against an unpinned
+# `playwright>=1.54.0`; if a version bump breaks this line, the private path moved, and the
+# checkout is fine. See `_block_native_egress` for why the guard needs this class specifically.
 from playwright._impl._browser_type import BrowserType as PlaywrightBrowserType
 
 from scripts import gha_artifacts
@@ -155,9 +159,12 @@ def _block_native_egress(
       subprocess with its own network stack, so the socket patch is invisible to it. Verified
       2026-09-03: three resolution-source marker tests launched a real browser the moment the Tier-1
       rung landed, and connected to a real host from a unit test.
-    - **libcurl**, entered from Python through ``curl_cffi`` (a transitive dependency via ``yfinance``,
-      which ``metaculus_bot/research/financial_data.py`` and ``ts_fetch.py`` use for every ticker
-      fetch). The C library opens its own sockets.
+    - **libcurl**, entered from Python through ``curl_cffi``, the client ``yfinance`` drives for
+      every ticker fetch in ``metaculus_bot/research/financial_data.py`` and ``ts_fetch.py``. The C
+      library opens its own sockets. ``curl_cffi`` is a declared dev dependency (pyproject
+      ``[dependency-groups] dev``) precisely so the module-scope import at the top of this file
+      can stay hard: it used to arrive only as yfinance's transitive dependency, and a yfinance
+      client swap would have taken the whole suite down at collection.
 
     Chokepoints, chosen so every caller trips them whichever public API it holds.
     ``playwright._impl._browser_type.BrowserType`` is the one class both ``playwright.async_api`` and
