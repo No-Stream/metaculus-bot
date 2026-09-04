@@ -31,6 +31,7 @@ from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
 from metaculus_bot.research.document_text import extract_pdf_text
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
+from tests.playwright_fakes import FakeBrowser, FakeChromium, FakePage, FakePlaywrightManager, install_fake_playwright
 from tests.test_document_text import build_text_pdf
 
 
@@ -70,11 +71,6 @@ class _FakeSession:
         return self._responses[0]
 
 
-# Every rendered-rung fake page appends its settle here, so a test can assert the DOM-ready
-# wait actually happened without any of them sleeping.
-settles: list[float] = []
-
-
 def _scanned_pdf() -> bytes:
     """A structurally valid PDF with a page and no text layer at all — a scan."""
     writer = PdfWriter()
@@ -102,7 +98,6 @@ def _serve_pdf(monkeypatch: pytest.MonkeyPatch, body: bytes, *, content_type: st
 
 @pytest.fixture(autouse=True)
 def _reset_tool_state() -> None:
-    settles.clear()
     # Run-scoped state of the local-document rung: held parses, plus the pypdf parse gate it now
     # shares process-wide with the Tier-1 rung (its own reset helper, since the gate is
     # loop-scoped and one test's held slot must not gate another's).
@@ -775,9 +770,6 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
-    monkeypatch.setattr(
-        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
-    )
 
     async def blocking_read(resp: object, label: str, *, max_bytes: int = 0) -> bytes:
         events.append("plain_read_started")
@@ -792,55 +784,17 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
-
-        async def wait_for_timeout(self, ms: float) -> None:
-            settles.append(ms)
-
-        async def content(self) -> str:
-            return "<html><body><p>rendered body</p></body></html>"
-
-    class FakeContext:
-        async def route(self, pattern: str, handler) -> None:
-            return None
-
-        async def unroute_all(self, *, behavior: str | None = None) -> None:
-            return None
-
-        async def new_page(self) -> FakePage:
-            return FakePage()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeBrowser:
-        async def new_context(self, **kwargs) -> FakeContext:
-            return FakeContext()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeChromium:
-        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
-            return FakeBrowser()
-
-    class FakePlaywrightManager:
-        chromium = FakeChromium()
-
-        async def __aenter__(self) -> FakePlaywrightManager:
+    class _RecordingManager(FakePlaywrightManager):
+        async def __aenter__(self) -> _RecordingManager:
             # Runs strictly after _try_rendered_fetch acquires the host gate.
             events.append("rendered_started")
             return self
 
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-    monkeypatch.setitem(
-        sys.modules,
-        "playwright.async_api",
-        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
+    install_fake_playwright(
+        monkeypatch,
+        FakePage(html="<html><body><p>rendered body</p></body></html>"),
+        pinned=("example.com", "93.184.216.34"),
+        manager_cls=_RecordingManager,
     )
 
     plain_task = asyncio.create_task(agentic_tools._fetch_plain("https://example.com/plain-page"))
@@ -888,14 +842,9 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
 
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", _is_public)
     monkeypatch.setattr(
-        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
-    )
-    monkeypatch.setattr(
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="body text " * 60)
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-
-    captured: dict[str, Any] = {}
 
     class FakeRoute:
         def __init__(self, *, raise_on_action: bool = False) -> None:
@@ -913,65 +862,18 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
                 raise _RacingClosedError("Route.abort: Target page, context or browser has been closed")
             self.aborted = code
 
-    class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
-
-        async def wait_for_timeout(self, ms: float) -> None:
-            settles.append(ms)
-
-        async def content(self) -> str:
-            return "<html><body><p>rendered body</p></body></html>"
-
-    class FakeContext:
-        async def route(self, pattern: str, handler) -> None:
-            captured["guard"] = handler
-
-        async def unroute_all(self, *, behavior: str | None = None) -> None:
-            captured["unroute_behavior"] = behavior
-
-        async def new_page(self) -> FakePage:
-            return FakePage()
-
-        async def close(self) -> None:
-            captured["context_closed"] = True
-
-    class FakeBrowser:
-        async def new_context(self, **kwargs) -> FakeContext:
-            return FakeContext()
-
-        async def close(self) -> None:
-            captured["browser_closed"] = True
-
-    class FakeChromium:
-        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
-            return FakeBrowser()
-
-    class FakePlaywrightManager:
-        chromium = FakeChromium()
-
-        async def __aenter__(self) -> FakePlaywrightManager:
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-    monkeypatch.setitem(
-        sys.modules,
-        "playwright.async_api",
-        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
-    )
+    page = FakePage(html="<html><body><p>rendered body</p></body></html>")
+    install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
 
     result = await agentic_tools._try_rendered_fetch("https://example.com/page")
     assert result is not None
     assert result.method == "rendered"
 
     # Teardown drained the handlers before close (Playwright's remedy for the storm).
-    assert captured["unroute_behavior"] == "ignoreErrors"
-    assert captured.get("context_closed") is True
-    assert captured.get("browser_closed") is True
+    assert page.unroute_behavior == "ignoreErrors"
+    assert page.teardown == ["unroute_all", "context.close", "browser.close"]
 
-    guard = captured["guard"]
+    guard = page.route_handler
 
     # SSRF guard intact: disallowed URL is aborted, allowed URL is continued.
     disallowed = FakeRoute()
@@ -1661,62 +1563,8 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-    class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            assert url == "https://example.com/page"
-            assert wait_until == "domcontentloaded"
-            # The settle is taken OUT of the goto budget, so the rung's 35 s ceiling is
-            # unchanged rather than lengthened by the wait that replaced networkidle.
-            assert timeout == rendered_fetch.RENDER_TIMEOUT_MS - rendered_fetch.RENDER_SETTLE_MS
-            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
-
-        async def wait_for_timeout(self, ms: float) -> None:
-            settles.append(ms)
-
-        async def content(self) -> str:
-            return '<html><body><a href="/next">Next</a><p>Rendered body</p></body></html>'
-
-    routes: list[str] = []
-
-    class FakeContext:
-        async def route(self, pattern: str, handler) -> None:
-            routes.append(pattern)
-
-        async def unroute_all(self, *, behavior: str | None = None) -> None:
-            return None
-
-        async def new_page(self) -> FakePage:
-            return FakePage()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeBrowser:
-        async def new_context(self, **kwargs) -> FakeContext:
-            assert kwargs["user_agent"]
-            assert "Accept-Language" in kwargs["extra_http_headers"]
-            return FakeContext()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeChromium:
-        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
-            assert headless is True
-            return FakeBrowser()
-
-    class FakePlaywrightManager:
-        chromium = FakeChromium()
-
-        async def __aenter__(self) -> FakePlaywrightManager:
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-    monkeypatch.setattr(
-        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
-    )
+    page = FakePage(html='<html><body><a href="/next">Next</a><p>Rendered body</p></body></html>')
+    chromium = install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
     # Patch our own fresh global semaphore (bound in THIS test's loop) rather than
     # leaning on the autouse fixture + import order — asyncio.Semaphore binds to the
     # running loop on first await, so a stale cross-file binding would raise here.
@@ -1726,11 +1574,6 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-    monkeypatch.setitem(
-        sys.modules,
-        "playwright.async_api",
-        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
-    )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
@@ -1738,7 +1581,16 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     assert outcome.method == "rendered"
     assert outcome.links == ["https://example.com/next"]
     assert semaphore_entries == ["entered"]
-    assert routes == ["**/*"]
+    assert page.route_patterns == ["**/*"]
+    (call,) = page.goto_calls
+    assert call["url"] == "https://example.com/page"
+    assert call["wait_until"] == "domcontentloaded"
+    # The settle is taken OUT of the goto budget, so the rung's 35 s ceiling is
+    # unchanged rather than lengthened by the wait that replaced networkidle.
+    assert call["timeout"] == rendered_fetch.RENDER_TIMEOUT_MS - rendered_fetch.RENDER_SETTLE_MS
+    assert page.context_kwargs["user_agent"]
+    assert "Accept-Language" in page.context_kwargs["extra_http_headers"]
+    assert chromium.headless == [True]
 
 
 @pytest.mark.asyncio
@@ -1759,37 +1611,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     hold = asyncio.Event()
     at_cap = asyncio.Event()
 
-    class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
-
-        async def wait_for_timeout(self, ms: float) -> None:
-            settles.append(ms)
-
-        async def content(self) -> str:
-            return "<html><body><p>rendered body</p></body></html>"
-
-    class FakeContext:
-        async def route(self, pattern: str, handler) -> None:
-            return None
-
-        async def unroute_all(self, *, behavior: str | None = None) -> None:
-            return None
-
-        async def new_page(self) -> FakePage:
-            return FakePage()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeBrowser:
-        async def new_context(self, **kwargs) -> FakeContext:
-            return FakeContext()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeChromium:
+    class _BarrierChromium(FakeChromium):
         async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
             nonlocal live, peak
             live += 1
@@ -1800,19 +1622,11 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
                 await hold.wait()
             finally:
                 live -= 1
-            return FakeBrowser()
+            return await super().launch(headless=headless, args=args)
 
-    class FakePlaywrightManager:
-        chromium = FakeChromium()
-
-        async def __aenter__(self) -> FakePlaywrightManager:
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-    monkeypatch.setattr(
-        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("host.example.com", "93.184.216.34"))
+    page = FakePage(html="<html><body><p>rendered body</p></body></html>")
+    install_fake_playwright(
+        monkeypatch, page, pinned=("host.example.com", "93.184.216.34"), chromium=_BarrierChromium(page)
     )
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
@@ -1820,11 +1634,6 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="rendered body")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-    monkeypatch.setitem(
-        sys.modules,
-        "playwright.async_api",
-        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
-    )
 
     tasks = [
         asyncio.create_task(agentic_tools._try_rendered_fetch(f"https://host{index}.example.com/page"))
@@ -1867,64 +1676,26 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
         async def abort(self, error_code: str) -> None:
             aborted.append((self.request.url, error_code))
 
-    guard_holder: list = []
-
-    class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
+    class _RedirectingPage(FakePage):
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> Any:  # noqa: ASYNC109  # mirrors Playwright API
             # Drive the guard the way Chromium would: the public main-frame
             # request continues; the page's client-side redirect to the
             # private host is aborted.
-            guard = guard_holder[0]
+            guard = self.route_handler
             main_route = FakeRoute(url)
             await guard(main_route, main_route.request)
             private_route = FakeRoute("http://169.254.169.254/latest/meta-data/")
             await guard(private_route, private_route.request)
-            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
-
-        async def wait_for_timeout(self, ms: float) -> None:
-            settles.append(ms)
-
-        async def content(self) -> str:
-            return "<html><body><p>public content only</p></body></html>"
-
-    class FakeContext:
-        async def route(self, pattern: str, handler) -> None:
-            guard_holder.append(handler)
-
-        async def unroute_all(self, *, behavior: str | None = None) -> None:
-            return None
-
-        async def new_page(self) -> FakePage:
-            return FakePage()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeBrowser:
-        async def new_context(self, **kwargs) -> FakeContext:
-            return FakeContext()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeChromium:
-        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
-            return FakeBrowser()
-
-    class FakePlaywrightManager:
-        chromium = FakeChromium()
-
-        async def __aenter__(self) -> FakePlaywrightManager:
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
+            return await super().goto(url, wait_until=wait_until, timeout=timeout)
 
     async def fake_is_public(url: str) -> bool:
+        await asyncio.sleep(0)
         return "169.254.169.254" not in url
 
-    monkeypatch.setattr(
-        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+    install_fake_playwright(
+        monkeypatch,
+        _RedirectingPage(html="<html><body><p>public content only</p></body></html>"),
+        pinned=("example.com", "93.184.216.34"),
     )
     # Self-sufficient global semaphore bound in this test's loop (see the sibling
     # rendered-fetch test) — avoids a cross-file stale-loop-binding RuntimeError.
@@ -1935,11 +1706,6 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="public content only")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-    monkeypatch.setitem(
-        sys.modules,
-        "playwright.async_api",
-        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
-    )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
@@ -2054,106 +1820,35 @@ async def test_resolve_pinned_host_dns_failure_fails_closed(monkeypatch: pytest.
 async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Vetting fails (disallowed / unresolvable host) → Chromium is NOT launched
     and the rung returns the graceful-failure ``None`` the ladder degrades on."""
-    launched: list[Any] = []
-
-    class FakeChromium:
-        async def launch(self, *, headless: bool, args: list[str] | None = None) -> Any:
-            launched.append(args)
-            raise AssertionError("Chromium must not launch for a non-pinnable host")
-
-    class FakePlaywrightManager:
-        chromium = FakeChromium()
-
-        async def __aenter__(self) -> FakePlaywrightManager:
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-    monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=None))
+    chromium = install_fake_playwright(monkeypatch, FakePage(), pinned=None)
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
-    monkeypatch.setitem(
-        sys.modules,
-        "playwright.async_api",
-        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
-    )
 
     outcome = await agentic_tools._try_rendered_fetch("https://rebind.example.com/page")
 
     assert outcome is None
-    assert launched == []
+    assert chromium.launch_args == [], "Chromium must not launch for a non-pinnable host"
 
 
 @pytest.mark.asyncio
 async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     """Vetting succeeds → Chromium launches with a ``--host-resolver-rules=MAP``
     arg pinning the main-frame host to exactly the vetted public IP."""
-    launch_args: list[list[str] | None] = []
-
-    class FakePage:
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
-
-        async def wait_for_timeout(self, ms: float) -> None:
-            settles.append(ms)
-
-        async def content(self) -> str:
-            return "<html><body><p>Rendered body</p></body></html>"
-
-    class FakeContext:
-        async def route(self, pattern: str, handler) -> None:
-            return None
-
-        async def unroute_all(self, *, behavior: str | None = None) -> None:
-            return None
-
-        async def new_page(self) -> FakePage:
-            return FakePage()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeBrowser:
-        async def new_context(self, **kwargs) -> FakeContext:
-            return FakeContext()
-
-        async def close(self) -> None:
-            return None
-
-    class FakeChromium:
-        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
-            launch_args.append(args)
-            return FakeBrowser()
-
-    class FakePlaywrightManager:
-        chromium = FakeChromium()
-
-        async def __aenter__(self) -> FakePlaywrightManager:
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-    monkeypatch.setattr(
-        rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
+    chromium = install_fake_playwright(
+        monkeypatch,
+        FakePage(html="<html><body><p>Rendered body</p></body></html>"),
+        pinned=("example.com", "93.184.216.34"),
     )
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr(
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-    monkeypatch.setitem(
-        sys.modules,
-        "playwright.async_api",
-        SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
-    )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
     assert outcome is not None
     assert outcome.method == "rendered"
-    assert len(launch_args) == 1
-    assert launch_args[0] == ["--host-resolver-rules=MAP example.com 93.184.216.34"]
+    assert chromium.launch_args == [["--host-resolver-rules=MAP example.com 93.184.216.34"]]
 
 
 @pytest.fixture
@@ -3062,61 +2757,11 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
     """
 
     @staticmethod
-    def _wire_launch_counting_playwright(monkeypatch: pytest.MonkeyPatch, launches: list[str]) -> None:
-        """A Chromium that renders every page to an empty DOM and records each launch."""
-
-        class FakePage:
-            async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-                return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
-
-            async def wait_for_timeout(self, ms: float) -> None:
-                settles.append(ms)
-
-            async def content(self) -> str:
-                return "<html><body></body></html>"
-
-        class FakeContext:
-            async def route(self, pattern: str, handler: Any) -> None:
-                return None
-
-            async def unroute_all(self, *, behavior: str | None = None) -> None:
-                return None
-
-            async def new_page(self) -> FakePage:
-                return FakePage()
-
-            async def close(self) -> None:
-                return None
-
-        class FakeBrowser:
-            async def new_context(self, **kwargs: Any) -> FakeContext:
-                return FakeContext()
-
-            async def close(self) -> None:
-                return None
-
-        class FakeChromium:
-            async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
-                launches.append("launch")
-                return FakeBrowser()
-
-        class FakePlaywrightManager:
-            chromium = FakeChromium()
-
-            async def __aenter__(self) -> FakePlaywrightManager:
-                return self
-
-            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-                return None
-
-        monkeypatch.setattr(
-            rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.gov", "93.184.216.34"))
-        )
+    def _wire_launch_counting_playwright(monkeypatch: pytest.MonkeyPatch) -> FakeChromium:
+        """A Chromium that renders every page to an empty DOM; the returned launcher counts launches."""
         monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=""))
-        monkeypatch.setitem(
-            sys.modules,
-            "playwright.async_api",
-            SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
+        return install_fake_playwright(
+            monkeypatch, FakePage(html="<html><body></body></html>"), pinned=("example.gov", "93.184.216.34")
         )
 
     @pytest.mark.asyncio
@@ -3151,8 +2796,7 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("_robots_allowed")
     async def test_a_js_wall_renders_once_then_read_document_pays(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        launches: list[str] = []
-        self._wire_launch_counting_playwright(monkeypatch, launches)
+        chromium = self._wire_launch_counting_playwright(monkeypatch)
         plain = AsyncMock(
             return_value=SimpleNamespace(
                 status="empty",
@@ -3176,7 +2820,7 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
         outcome = await agentic_tools.read_document("https://example.gov/wall", "what does the tracker report?")
 
         assert outcome.method == "document", "the paid reader is the rung left for a page we cannot read"
-        assert len(launches) == 1, "the second launch would re-learn what this run already knows"
+        assert len(chromium.launch_args) == 1, "the second launch would re-learn what this run already knows"
         assert plain.await_count == 2, (
             "the plain GET is deliberately NOT negative-cached: the driver is told to retry these URLs"
         )
@@ -3266,64 +2910,18 @@ class TestRenderedRungSalvagesATimedOutNavigation:
     """
 
     @staticmethod
-    def _wire_playwright(monkeypatch: pytest.MonkeyPatch, page: object) -> None:
-        class FakeContext:
-            async def route(self, pattern: str, handler) -> None:
-                return None
-
-            async def unroute_all(self, *, behavior: str | None = None) -> None:
-                return None
-
-            async def new_page(self) -> object:
-                return page
-
-            async def close(self) -> None:
-                return None
-
-        class FakeBrowser:
-            async def new_context(self, **kwargs) -> FakeContext:
-                return FakeContext()
-
-            async def close(self) -> None:
-                return None
-
-        class FakeChromium:
-            async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
-                return FakeBrowser()
-
-        class FakePlaywrightManager:
-            chromium = FakeChromium()
-
-            async def __aenter__(self) -> FakePlaywrightManager:
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb) -> None:
-                return None
-
-        monkeypatch.setattr(
-            rendered_fetch, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34"))
-        )
+    def _wire_playwright(monkeypatch: pytest.MonkeyPatch, page: FakePage) -> None:
+        install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
         monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-        monkeypatch.setitem(
-            sys.modules,
-            "playwright.async_api",
-            SimpleNamespace(async_playwright=FakePlaywrightManager, Error=_PlaywrightError),
-        )
 
     @pytest.mark.asyncio
     async def test_a_goto_timeout_still_returns_the_rendered_dom(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        class TimingOutPage:
-            async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:  # noqa: ASYNC109  # mirrors Playwright API
-                raise _PlaywrightTimeoutError("Timeout 33000ms exceeded.")
-
-            async def wait_for_timeout(self, ms: float) -> None:
-                settles.append(ms)
-
-            async def content(self) -> str:
-                return "<html><body><p>The tracker reports 41 cases this week.</p></body></html>"
-
-        self._wire_playwright(monkeypatch, TimingOutPage())
+        page = FakePage(
+            goto_raises=_PlaywrightTimeoutError("Timeout 33000ms exceeded."),
+            html="<html><body><p>The tracker reports 41 cases this week.</p></body></html>",
+        )
+        self._wire_playwright(monkeypatch, page)
         monkeypatch.setattr(
             "metaculus_bot.research.resolution_source._extract_main_text",
             MagicMock(return_value="The tracker reports 41 cases this week."),
@@ -3335,7 +2933,7 @@ class TestRenderedRungSalvagesATimedOutNavigation:
         assert result.status == "ok"
         assert result.method == "rendered"
         assert result.text == "The tracker reports 41 cases this week."
-        assert settles == [rendered_fetch.RENDER_SETTLE_MS]
+        assert page.settles == [rendered_fetch.RENDER_SETTLE_MS]
 
     @pytest.mark.asyncio
     async def test_a_navigation_error_with_no_dom_reads_as_rendered_nothing(
@@ -3345,17 +2943,13 @@ class TestRenderedRungSalvagesATimedOutNavigation:
         "rendered read nothing" outcome the rung produced before, so the ladder falls through
         exactly as it did."""
 
-        class FailingPage:
-            async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:  # noqa: ASYNC109  # mirrors Playwright API
-                raise _PlaywrightError("net::ERR_NAME_NOT_RESOLVED")
-
-            async def wait_for_timeout(self, ms: float) -> None:
-                settles.append(ms)
-
-            async def content(self) -> str:
-                return "<html><head></head><body></body></html>"
-
-        self._wire_playwright(monkeypatch, FailingPage())
+        self._wire_playwright(
+            monkeypatch,
+            FakePage(
+                goto_raises=_PlaywrightError("net::ERR_NAME_NOT_RESOLVED"),
+                html="<html><head></head><body></body></html>",
+            ),
+        )
         monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
 
         result = await agentic_tools._try_rendered_fetch("https://example.com/gone")
@@ -3442,6 +3036,7 @@ def _fetch_plain_serving_robots(robots_txt: str | None, *, calls: list[str]) -> 
 
     async def fetch_plain(url: str) -> Any:
         calls.append(url)
+        await asyncio.sleep(0)
         if url.endswith("/robots.txt"):
             if robots_txt is None:
                 return _plain_result_stub(url, status="error", text="Fetch error: TimeoutError:")
@@ -3552,6 +3147,7 @@ class TestUrlContextRobotsPreCheck:
         page = "The report states that training compute grew fourfold in 2026. " * 12
 
         async def fetch_plain(url: str) -> Any:
+            await asyncio.sleep(0)
             if url.endswith("/robots.txt"):
                 return _plain_result_stub(url, status="ok", text=_GOOGLE_EXTENDED_BLOCKED_ROBOTS)
             return _plain_result_stub(url, status="ok", text=page)

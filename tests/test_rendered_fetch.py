@@ -7,21 +7,19 @@ both callers: the XHR harvest and its bounds, the two render memos and their sco
 navigation budget recomputed once the gates are held, the DOM ceiling, the main-frame status,
 the browser-context hardening, and the run-scoped state reset.
 
-Nothing here launches a browser. Playwright is faked through ``sys.modules`` the same way the
-agentic suite fakes it. The fake page fires its response handlers the way pyee does — call, do
-not await — so a listener that hands back a coroutine leaves a detached task behind exactly as
-the real ``Page.on`` would, and the harvest tests exercise that interleaving rather than a
-one-handler-at-a-time serialisation that would make every race look sound.
+Nothing here launches a browser. Playwright is faked through ``sys.modules`` by the one shared
+object graph in ``tests/playwright_fakes.py``, which the agentic suite drives too. Its fake page
+fires its response handlers the way pyee does — call, do not await — so a listener that hands
+back a coroutine leaves a detached task behind exactly as the real ``Page.on`` would, and the
+harvest tests exercise that interleaving rather than a one-handler-at-a-time serialisation that
+would make every race look sound.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 import time
-from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -32,6 +30,7 @@ from metaculus_bot.research.derived_api import DerivedEndpoint, derived_api_lead
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.resolution_source import FetchContext
+from tests.playwright_fakes import FakePage, FakeResponse, Faults, PlaywrightError, install_fake_playwright
 
 _PAGE_URL = "https://dashboard.example.com/senate"
 _DOM = "<!doctype html><html><head><title>Dashboard</title></head><body><p>rendered</p></body></html>"
@@ -41,242 +40,23 @@ _V2_SCOPE = "gap_fill_v2"
 _RENDER_TAIL_MS = rendered_fetch.RENDER_SETTLE_MS + rendered_fetch.RENDER_DOM_READ_TIMEOUT_MS
 
 
-class _PlaywrightError(Exception):
-    """Stands in for playwright.async_api.Error."""
-
-
 @pytest.fixture(autouse=True)
 def _reset_state():
     rendered_fetch.reset_render_state()
-    _FakeResponse.in_flight = 0
-    _FakeResponse.peak_in_flight = 0
+    FakeResponse.reset_read_tracking()
     yield
     rendered_fetch.reset_render_state()
 
 
-class _FakeResponse:
-    """One response event. ``body()`` always yields once, because Playwright's is a round trip to
-    the driver: every read task that reaches it would be suspended in it at the same time, which
-    is the interleaving the harvest's serialised read exists to prevent. ``peak_in_flight`` records
-    how many bodies were being read at once across every instance, which is the memory claim."""
-
-    in_flight = 0
-    peak_in_flight = 0
-
-    def __init__(
-        self,
-        url: str,
-        *,
-        content_type: str,
-        body: bytes,
-        raises: bool = False,
-        body_delay_s: float = 0.0,
-        declared_length: int | None = None,
-    ) -> None:
-        self.url = url
-        self.headers = {"content-type": content_type}
-        if declared_length is not None:
-            self.headers["content-length"] = str(declared_length)
-        self._body = body
-        self._raises = raises
-        self._body_delay_s = body_delay_s
-        self.body_reads = 0
-        self.body_read_cancelled = False
-
-    async def body(self) -> bytes:
-        self.body_reads += 1
-        _FakeResponse.in_flight += 1
-        _FakeResponse.peak_in_flight = max(_FakeResponse.peak_in_flight, _FakeResponse.in_flight)
-        try:
-            await asyncio.sleep(self._body_delay_s)
-        except asyncio.CancelledError:
-            self.body_read_cancelled = True
-            raise
-        finally:
-            _FakeResponse.in_flight -= 1
-        if self._raises:
-            raise _PlaywrightError("target closed")
-        return self._body
-
-
-class _FakePage:
-    """A page that replays a fixed list of response events during ``goto``.
-
-    ``content_hangs`` is the ogimet shape (P3-1): a DOM read that never answers because the page
-    keeps navigating. ``goto_raises`` is the salvage shape: the navigation times out with the DOM
-    already rendered. ``goto_runs_its_budget_out`` puts the clock on that shape: the navigation
-    sleeps for its whole ``timeout`` before it raises or returns, as a real goto timeout does,
-    so a test can measure what the transport spends AFTER the budget is gone. ``teardown``
-    records the close sequence the context and browser ran, so a test can assert the browser
-    was still torn down after a failure mid-render.
-    """
-
-    def __init__(
-        self,
-        responses: list[_FakeResponse],
-        *,
-        html: str = _DOM,
-        content_hangs: bool = False,
-        goto_raises: BaseException | None = None,
-        goto_runs_its_budget_out: bool = False,
-        status: int = 200,
-    ) -> None:
-        self._responses = responses
-        self._html = html
-        self._content_hangs = content_hangs
-        self._goto_raises = goto_raises
-        self._goto_runs_its_budget_out = goto_runs_its_budget_out
-        self._status = status
-        self._handlers: list[Any] = []
-        self.detached_handler_tasks: list[asyncio.Future[Any]] = []
-        self.goto_calls: list[dict[str, Any]] = []
-        self.context_kwargs: dict[str, Any] = {}
-        self.teardown: list[str] = []
-
-    def on(self, event: str, handler: Any) -> None:
-        assert event == "response"
-        self._handlers.append(handler)
-
-    async def goto(self, url: str, *, wait_until: str, timeout: int) -> Any:  # noqa: ASYNC109  # Playwright's own signature; this stands in for it
-        self.goto_calls.append({"url": url, "wait_until": wait_until, "timeout": timeout})
-        # pyee's dispatch: call the listener; a coroutine comes back wrapped in ensure_future and
-        # is never awaited by anyone, so it is still pending when goto returns.
-        for response in self._responses:
-            for handler in self._handlers:
-                result = handler(response)
-                if asyncio.iscoroutine(result):
-                    self.detached_handler_tasks.append(asyncio.ensure_future(result))
-        if self._goto_runs_its_budget_out:
-            await asyncio.sleep(timeout / 1000)
-        if self._goto_raises is not None:
-            raise self._goto_raises
-        return SimpleNamespace(headers={"content-type": "text/html"}, status=self._status)
-
-    async def wait_for_timeout(self, ms: int) -> None:
-        del ms
-
-    async def content(self) -> str:
-        if self._content_hangs:
-            await asyncio.Event().wait()
-        # The real read is a round trip; yielding here lets the detached handler tasks run
-        # between goto and the snapshot, which is where the un-joined harvest lost bodies.
-        await asyncio.sleep(0)
-        return self._html
-
-
-@dataclass
-class _Faults:
-    """Where the fake browser misbehaves. ``new_page_error`` / ``new_context_error`` fail the
-    render INSIDE the gates, which is the failure-boundary shape the warn latch was written for;
-    ``close_error``, ``close_hangs`` and ``browser_close_hangs`` misbehave in teardown, where the
-    real ``BrowserContext.close`` neither swallows a target-closed error nor bounds its wait."""
-
-    new_page_error: BaseException | None = None
-    new_context_error: BaseException | None = None
-    close_error: BaseException | None = None
-    close_hangs: bool = False
-    browser_close_hangs: bool = False
-
-
-class _FakeContext:
-    def __init__(self, page: _FakePage, faults: _Faults) -> None:
-        self._page = page
-        self._faults = faults
-
-    async def route(self, pattern: str, handler: Any) -> None:
-        del pattern, handler
-
-    async def new_page(self) -> _FakePage:
-        if self._faults.new_page_error is not None:
-            raise self._faults.new_page_error
-        return self._page
-
-    async def unroute_all(self, *, behavior: str) -> None:
-        del behavior
-        self._page.teardown.append("unroute_all")
-
-    async def close(self) -> None:
-        self._page.teardown.append("context.close")
-        if self._faults.close_hangs:
-            await asyncio.Event().wait()
-        if self._faults.close_error is not None:
-            raise self._faults.close_error
-
-
-class _FakeBrowser:
-    def __init__(self, page: _FakePage, faults: _Faults) -> None:
-        self._page = page
-        self._faults = faults
-
-    async def new_context(self, **kwargs: Any) -> _FakeContext:
-        self._page.context_kwargs = kwargs
-        if self._faults.new_context_error is not None:
-            raise self._faults.new_context_error
-        return _FakeContext(self._page, self._faults)
-
-    async def close(self) -> None:
-        self._page.teardown.append("browser.close")
-        if self._faults.browser_close_hangs:
-            await asyncio.Event().wait()
-
-
-def _install_fake_playwright(
-    monkeypatch: pytest.MonkeyPatch, page: _FakePage, *, faults: _Faults | None = None, launch_delay_s: float = 0.0
-) -> list[list[str]]:
-    """Wire the fakes in; ``faults`` says where the browser should misbehave (see :class:`_Faults`).
-
-    ``launch_delay_s`` is what the launch costs on the clock (0.3 s warm to several seconds cold
-    on the real Chromium), spent AFTER the transport has recomputed its navigation budget.
-    """
-    launch_args: list[list[str]] = []
-    browser_faults = faults or _Faults()
-
-    class _FakeChromium:
-        async def launch(self, *, headless: bool, args: list[str] | None = None) -> _FakeBrowser:
-            del headless
-            launch_args.append(list(args or []))
-            await asyncio.sleep(launch_delay_s)
-            return _FakeBrowser(page, browser_faults)
-
-    class _FakePlaywrightManager:
-        chromium = _FakeChromium()
-
-        async def __aenter__(self) -> Any:
-            return self
-
-        async def __aexit__(self, *_exc: Any) -> None:
-            return None
-
-    monkeypatch.setitem(
-        sys.modules,
-        "playwright.async_api",
-        SimpleNamespace(async_playwright=_FakePlaywrightManager, Error=_PlaywrightError),
-    )
-    monkeypatch.setattr(
-        rendered_fetch,
-        "_resolve_pinned_host",
-        _async_return(("dashboard.example.com", "93.184.216.34")),
-    )
-    return launch_args
-
-
-def _async_return(value: Any):
-    async def _call(*_args: Any, **_kwargs: Any) -> Any:
-        await asyncio.sleep(0)
-        return value
-
-    return _call
-
-
 async def _render(
     monkeypatch: pytest.MonkeyPatch,
-    page: _FakePage,
+    page: FakePage,
     *,
     harvest_json: bool = True,
     goto_timeout_ms: int = 10_000,
     deadline_monotonic_s: float | None = None,
 ):
-    _install_fake_playwright(monkeypatch, page)
+    install_fake_playwright(monkeypatch, page)
     return await rendered_fetch.render_page(
         _PAGE_URL,
         memo_scope=_TIER1_SCOPE,
@@ -297,7 +77,7 @@ class TestJsonHarvest:
 
     async def test_a_same_origin_json_body_is_harvested(self, monkeypatch):
         body = b'{"series":[' + b'{"date":"2026-09-01","value":47.2},' * 20 + b"]}"
-        page = _FakePage([_FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=body)])
+        page = FakePage([FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=body)])
 
         rendered = await _render(monkeypatch, page)
 
@@ -307,7 +87,7 @@ class TestJsonHarvest:
     async def test_harvesting_is_off_unless_the_caller_asks(self, monkeypatch):
         """The bodies buffer inside the render task alongside a 100-300 MB browser, so only a
         caller with a use for a derived feed pays for them."""
-        page = _FakePage([_FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=_json_body())])
+        page = FakePage([FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=_json_body())])
 
         rendered = await _render(monkeypatch, page, harvest_json=False)
 
@@ -316,8 +96,8 @@ class TestJsonHarvest:
 
     async def test_a_cross_origin_response_is_not_harvested(self, monkeypatch):
         """A stranger's JSON must never become the cited page's content."""
-        page = _FakePage(
-            [_FakeResponse("https://ads.tracker.test/beacon.json", content_type="application/json", body=_json_body())]
+        page = FakePage(
+            [FakeResponse("https://ads.tracker.test/beacon.json", content_type="application/json", body=_json_body())]
         )
 
         rendered = await _render(monkeypatch, page)
@@ -327,7 +107,7 @@ class TestJsonHarvest:
 
     async def test_a_non_json_response_is_not_harvested(self, monkeypatch):
         body = b"x" * 4000
-        page = _FakePage([_FakeResponse(f"{_PAGE_URL}/app.js", content_type="application/javascript", body=body)])
+        page = FakePage([FakeResponse(f"{_PAGE_URL}/app.js", content_type="application/javascript", body=body)])
 
         rendered = await _render(monkeypatch, page)
 
@@ -336,9 +116,7 @@ class TestJsonHarvest:
 
     async def test_a_tiny_json_body_is_not_harvested(self, monkeypatch):
         """Below the floor a JSON body is a ping, a feature flag or an empty envelope."""
-        page = _FakePage(
-            [_FakeResponse(f"{_PAGE_URL}/api/flags", content_type="application/json", body=b'{"ok":true}')]
-        )
+        page = FakePage([FakeResponse(f"{_PAGE_URL}/api/flags", content_type="application/json", body=b'{"ok":true}')])
 
         rendered = await _render(monkeypatch, page)
 
@@ -347,7 +125,7 @@ class TestJsonHarvest:
 
     async def test_an_oversized_json_body_is_not_harvested(self, monkeypatch):
         body = b"[" + b"1," * rendered_fetch.HARVEST_MAX_BODY_BYTES + b"]"
-        page = _FakePage([_FakeResponse(f"{_PAGE_URL}/api/all", content_type="application/json", body=body)])
+        page = FakePage([FakeResponse(f"{_PAGE_URL}/api/all", content_type="application/json", body=body)])
 
         rendered = await _render(monkeypatch, page)
 
@@ -359,14 +137,14 @@ class TestJsonHarvest:
         decoded) before any size test could run on it, so the declared size is the only bound
         that can keep a 60 MB GeoJSON out of memory. The post-read test stays as the backstop
         for absent, compressed or lying headers."""
-        response = _FakeResponse(
+        response = FakeResponse(
             f"{_PAGE_URL}/api/geo",
             content_type="application/json",
             body=_json_body(),
             declared_length=rendered_fetch.HARVEST_MAX_BODY_BYTES + 1,
         )
 
-        rendered = await _render(monkeypatch, _FakePage([response]))
+        rendered = await _render(monkeypatch, FakePage([response]))
 
         assert rendered is not None
         assert rendered.json_responses == ()
@@ -376,11 +154,11 @@ class TestJsonHarvest:
         """Every ``page.on`` firing is its own task and nothing used to join them, so a body that
         arrived a beat late was appended after the snapshot and then lost at teardown — exactly
         the derived-API rung's payload, and the miss stuck because the caller memoised it."""
-        response = _FakeResponse(
+        response = FakeResponse(
             f"{_PAGE_URL}/api/series", content_type="application/json", body=_json_body(), body_delay_s=0.05
         )
 
-        rendered = await _render(monkeypatch, _FakePage([response]))
+        rendered = await _render(monkeypatch, FakePage([response]))
 
         assert rendered is not None
         assert [harvested.url for harvested in rendered.json_responses] == [f"{_PAGE_URL}/api/series"]
@@ -391,12 +169,12 @@ class TestJsonHarvest:
         """The drain runs INSIDE the DOM-read bound, never after it: the harvest is opportunistic
         and may not lengthen a render whose real product is the DOM."""
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 100)
-        response = _FakeResponse(
+        response = FakeResponse(
             f"{_PAGE_URL}/api/slow", content_type="application/json", body=_json_body(), body_delay_s=5.0
         )
 
         started = time.monotonic()
-        rendered = await _render(monkeypatch, _FakePage([response]))
+        rendered = await _render(monkeypatch, FakePage([response]))
 
         assert time.monotonic() - started < 1.0
         assert rendered is not None
@@ -410,11 +188,11 @@ class TestJsonHarvest:
         that gate, so the cap is binding on the READS, which is the memory bound, not just on
         what is appended afterwards."""
         responses = [
-            _FakeResponse(f"{_PAGE_URL}/api/{index}", content_type="application/json", body=_json_body())
+            FakeResponse(f"{_PAGE_URL}/api/{index}", content_type="application/json", body=_json_body())
             for index in range(rendered_fetch.HARVEST_MAX_RESPONSES + 4)
         ]
 
-        rendered = await _render(monkeypatch, _FakePage(responses))
+        rendered = await _render(monkeypatch, FakePage(responses))
 
         assert rendered is not None
         assert len(rendered.json_responses) == rendered_fetch.HARVEST_MAX_RESPONSES
@@ -426,28 +204,28 @@ class TestJsonHarvest:
         any body comes back. Read together, four undeclared 30 MB layers sat beside a 100-300 MB
         browser twice over on a 7 GB runner; read one at a time, peak harvest memory is one body."""
         responses = [
-            _FakeResponse(
+            FakeResponse(
                 f"{_PAGE_URL}/api/{index}", content_type="application/json", body=_json_body(), body_delay_s=0.01
             )
             for index in range(4)
         ]
 
-        rendered = await _render(monkeypatch, _FakePage(responses))
+        rendered = await _render(monkeypatch, FakePage(responses))
 
         assert rendered is not None
         assert len(rendered.json_responses) == 4
         assert all(response.body_reads == 1 for response in responses)
-        assert _FakeResponse.peak_in_flight == 1
+        assert FakeResponse.peak_in_flight == 1
 
     async def test_a_response_that_fails_the_screens_spawns_no_read_task(self):
         """The host, content-type and declared-length screens run in the SYNC listener, so a
         page's hundreds of subresources (scripts, images, beacons) never become tasks at all;
         only a response that will actually be read does."""
-        harvest = rendered_fetch._JsonHarvest(page_host="dashboard.example.com", playwright_error=_PlaywrightError)
+        harvest = rendered_fetch._JsonHarvest(page_host="dashboard.example.com", playwright_error=PlaywrightError)
         screened_out = [
-            _FakeResponse("https://ads.tracker.test/beacon.json", content_type="application/json", body=_json_body()),
-            _FakeResponse(f"{_PAGE_URL}/app.js", content_type="application/javascript", body=b"x" * 4000),
-            _FakeResponse(
+            FakeResponse("https://ads.tracker.test/beacon.json", content_type="application/json", body=_json_body()),
+            FakeResponse(f"{_PAGE_URL}/app.js", content_type="application/javascript", body=b"x" * 4000),
+            FakeResponse(
                 f"{_PAGE_URL}/api/geo",
                 content_type="application/json",
                 body=_json_body(),
@@ -458,9 +236,7 @@ class TestJsonHarvest:
             harvest.on_response(response)
         assert harvest._pending == set()
 
-        harvest.on_response(
-            _FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=_json_body())
-        )
+        harvest.on_response(FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=_json_body()))
         assert len(harvest._pending) == 1
         harvest.cancel_pending()
         await asyncio.sleep(0)
@@ -469,10 +245,10 @@ class TestJsonHarvest:
     async def test_a_body_read_that_races_teardown_is_dropped_not_raised(self, monkeypatch):
         """Opportunistic discovery attached to a render whose real product is the DOM: a body
         we could not read must never be able to fail the render."""
-        page = _FakePage(
+        page = FakePage(
             [
-                _FakeResponse(f"{_PAGE_URL}/api/gone", content_type="application/json", body=_json_body(), raises=True),
-                _FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=_json_body()),
+                FakeResponse(f"{_PAGE_URL}/api/gone", content_type="application/json", body=_json_body(), raises=True),
+                FakeResponse(f"{_PAGE_URL}/api/series", content_type="application/json", body=_json_body()),
             ]
         )
 
@@ -584,14 +360,14 @@ class TestTheRenderMemos:
         rendered_fetch.note_rendered_no_text(_PAGE_URL, memo_scope=_V2_SCOPE)
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_V2_SCOPE) is True
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
-        launch_args = _install_fake_playwright(monkeypatch, _FakePage([]))
+        chromium = install_fake_playwright(monkeypatch, FakePage([]))
 
         declined = await rendered_fetch.render_page(_PAGE_URL, memo_scope=_V2_SCOPE, host_gate=asyncio.Semaphore(1))
         rendered = await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
 
         assert declined is None
         assert rendered is not None
-        assert len(launch_args) == 1
+        assert len(chromium.launch_args) == 1
 
     async def test_a_render_the_transport_cut_off_is_memoised_and_raises_again_without_launching(self, monkeypatch):
         """A second question citing a page that already ran out the clock must record
@@ -599,17 +375,17 @@ class TestTheRenderMemos:
         the Chromium install having failed. So the transport re-raises the memoised timeout
         instead of folding it into the ``None`` every other decline shares."""
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 50)
-        launch_args = _install_fake_playwright(monkeypatch, _FakePage([], content_hangs=True))
+        chromium = install_fake_playwright(monkeypatch, FakePage([], content_hangs=True))
         with pytest.raises(TimeoutError):
             await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
         assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
-        assert len(launch_args) == 1
+        assert len(chromium.launch_args) == 1
 
         with pytest.raises(TimeoutError):
             await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
 
-        assert len(launch_args) == 1
+        assert len(chromium.launch_args) == 1
         # The other path's clock is its own.
         assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_V2_SCOPE) is False
 
@@ -618,7 +394,7 @@ class TestTheRenderMemos:
         gates, which says nothing about the page. Only the transport knows a browser ran, so only
         the transport writes the timed-out memo — a queue cut leaves the URL live for the next
         question."""
-        launch_args = _install_fake_playwright(monkeypatch, _FakePage([]))
+        chromium = install_fake_playwright(monkeypatch, FakePage([]))
         gate = rendered_fetch._RENDERED_FETCH_GLOBAL_SEMAPHORE
         for _ in range(rendered_fetch.RENDER_LAUNCH_CAP):
             await gate.acquire()
@@ -629,7 +405,7 @@ class TestTheRenderMemos:
                 timeout=0.1,
             )
 
-        assert launch_args == []
+        assert chromium.launch_args == []
         assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
         for _ in range(rendered_fetch.RENDER_LAUNCH_CAP):
@@ -637,7 +413,7 @@ class TestTheRenderMemos:
         rendered = await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
         assert rendered is not None
 
-    async def test_the_memo_is_bounded(self):
+    def test_the_memo_is_bounded(self):
         for index in range(rendered_fetch._RENDER_MEMO_MAX_ENTRIES + 5):
             rendered_fetch.note_rendered_no_text(f"https://x.example/{index}", memo_scope=_TIER1_SCOPE)
         assert rendered_fetch.rendered_to_nothing("https://x.example/0", memo_scope=_TIER1_SCOPE) is False
@@ -653,7 +429,7 @@ class TestTheRenderMemos:
         empty DOM and memoises under its own scope; the Tier-1 rung on the same URL must still
         launch — its classification can rescue the page on chart data or the harvested feed alone —
         and only then memoise under ITS scope."""
-        launch_args = _install_fake_playwright(monkeypatch, _FakePage([], html=_EMPTY_DOM))
+        chromium = install_fake_playwright(monkeypatch, FakePage([], html=_EMPTY_DOM))
 
         v2_result = await agentic_tools._try_rendered_fetch(_PAGE_URL)
 
@@ -662,13 +438,13 @@ class TestTheRenderMemos:
         assert v2_result.method == "rendered"
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_V2_SCOPE) is True
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
-        assert len(launch_args) == 1
+        assert len(chromium.launch_args) == 1
 
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = FetchContext()
         tier1_result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
-        assert len(launch_args) == 2
+        assert len(chromium.launch_args) == 2
         assert tier1_result is None
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
         assert [attempt.skipped_reason for attempt in ctx.rungs] == [""]
@@ -686,8 +462,8 @@ class TestTheNavigationBudgetAfterTheGates:
         """Its own exception rather than the shared ``None``: the caller's wall budget ran out in
         the queue, which is neither a missing browser nor a render that was cut off, and it must
         be recorded as the first of those three and not the other two."""
-        page = _FakePage([])
-        launch_args = _install_fake_playwright(monkeypatch, page)
+        page = FakePage([])
+        chromium = install_fake_playwright(monkeypatch, page)
         with (
             caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"),
             pytest.raises(rendered_fetch.RenderBudgetExpired),
@@ -699,7 +475,7 @@ class TestTheNavigationBudgetAfterTheGates:
                 deadline_monotonic_s=time.monotonic() + 1.0,
             )
 
-        assert launch_args == []
+        assert chromium.launch_args == []
         assert page.goto_calls == []
         assert rendered_fetch._PLAYWRIGHT_WARNED is False
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
@@ -725,8 +501,8 @@ class TestTheNavigationBudgetAfterTheGates:
         """Both launch slots are held for 0.3 s while the render queues behind them; the goto
         it then runs must be measured from AFTER the wait, not from the figure the caller
         computed before it."""
-        page = _FakePage([])
-        _install_fake_playwright(monkeypatch, page)
+        page = FakePage([])
+        install_fake_playwright(monkeypatch, page)
         gate = rendered_fetch._RENDERED_FETCH_GLOBAL_SEMAPHORE
         for _ in range(rendered_fetch.RENDER_LAUNCH_CAP):
             await gate.acquire()
@@ -756,7 +532,7 @@ class TestTheNavigationBudgetAfterTheGates:
         """Tier-1 passes a 20 s budget as an 18 s goto ceiling plus the deadline. A goto that runs
         its budget out and is then salvaged needs the settle AND the DOM read to finish inside
         that same 20 s, so the transport sizes the goto off the deadline less both."""
-        page = _FakePage([], goto_raises=_PlaywrightError("Timeout exceeded"))
+        page = FakePage([], goto_raises=PlaywrightError("Timeout exceeded"))
         deadline_s = 20.0
         started = time.monotonic()
 
@@ -792,11 +568,11 @@ class TestTheNavigationBudgetAfterTheGates:
         deadline instead; the DOM read keeps its own bound.
         """
         self._scale_the_tier_1_shape_down(monkeypatch)
-        pending = _FakeResponse(
+        pending = FakeResponse(
             f"{_PAGE_URL}/api/poll", content_type="application/json", body=_json_body(), body_delay_s=10.0
         )
-        page = _FakePage([pending], goto_raises=_PlaywrightError("Timeout exceeded"), goto_runs_its_budget_out=True)
-        _install_fake_playwright(monkeypatch, page, launch_delay_s=0.1)
+        page = FakePage([pending], goto_raises=PlaywrightError("Timeout exceeded"), goto_runs_its_budget_out=True)
+        install_fake_playwright(monkeypatch, page, launch_delay_s=0.1)
         budget_s = 2.0
 
         rendered = await asyncio.wait_for(
@@ -830,11 +606,11 @@ class TestTheNavigationBudgetAfterTheGates:
         left to the driver stop.
         """
         self._scale_the_tier_1_shape_down(monkeypatch)
-        pending = _FakeResponse(
+        pending = FakeResponse(
             f"{_PAGE_URL}/api/poll", content_type="application/json", body=_json_body(), body_delay_s=10.0
         )
-        page = _FakePage([pending], goto_raises=_PlaywrightError("Timeout exceeded"), goto_runs_its_budget_out=True)
-        _install_fake_playwright(monkeypatch, page, faults=_Faults(close_hangs=True), launch_delay_s=0.1)
+        page = FakePage([pending], goto_raises=PlaywrightError("Timeout exceeded"), goto_runs_its_budget_out=True)
+        install_fake_playwright(monkeypatch, page, faults=Faults(close_hangs=True), launch_delay_s=0.1)
         budget_s = 2.0
 
         started = time.monotonic()
@@ -866,7 +642,7 @@ class TestTheNavigationBudgetAfterTheGates:
     async def test_a_call_without_a_deadline_keeps_the_callers_goto_budget(self, monkeypatch):
         """Gap-fill v2's shape: its own ceilings bound the call, so the transport has nothing to
         recompute against and the caller's figure stands."""
-        page = _FakePage([])
+        page = FakePage([])
 
         rendered = await _render(monkeypatch, page, goto_timeout_ms=10_000)
 
@@ -906,7 +682,7 @@ class TestTheDomCeiling:
         be able to count it apart from a browser that is missing, and it is not memoised, because
         "rendered to nothing" would be false."""
         monkeypatch.setattr(rendered_fetch, "RENDERED_DOM_MAX_CHARS", 100)
-        page = _FakePage([], html="<html><body>" + "x" * 200 + "</body></html>")
+        page = FakePage([], html="<html><body>" + "x" * 200 + "</body></html>")
 
         with (
             caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"),
@@ -946,7 +722,7 @@ class TestTheDomCeiling:
         html = "<html><body>" + "x" * 50 + "</body></html>"
         monkeypatch.setattr(rendered_fetch, "RENDERED_DOM_MAX_CHARS", len(html))
 
-        rendered = await _render(monkeypatch, _FakePage([], html=html))
+        rendered = await _render(monkeypatch, FakePage([], html=html))
 
         assert rendered is not None
         assert rendered.html == html
@@ -957,7 +733,7 @@ class TestTheBrowserContext:
         """``browser_context.route`` does not intercept requests a service worker makes, so a
         worker could dial past the SSRF route guard; Playwright's own remedy is to block them
         whenever interception is in use."""
-        page = _FakePage([])
+        page = FakePage([])
 
         await _render(monkeypatch, page)
 
@@ -983,7 +759,7 @@ class TestDnsPinEligibility:
 
     async def test_a_unicode_host_never_launches(self, monkeypatch, caplog):
         real_resolve = rendered_fetch._resolve_pinned_host
-        launch_args = _install_fake_playwright(monkeypatch, _FakePage([]))
+        chromium = install_fake_playwright(monkeypatch, FakePage([]))
         monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", real_resolve)
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"):
@@ -992,7 +768,7 @@ class TestDnsPinEligibility:
             )
 
         assert rendered is None
-        assert launch_args == []
+        assert chromium.launch_args == []
         assert [message for message in caplog.messages if "not pinnable" in message]
 
 
@@ -1014,13 +790,13 @@ class TestTheMainFrameStatus:
     )
 
     async def test_the_status_rides_on_the_rendered_page(self, monkeypatch):
-        rendered = await _render(monkeypatch, _FakePage([], status=403))
+        rendered = await _render(monkeypatch, FakePage([], status=403))
         assert rendered is not None
         assert rendered.http_status == 403
 
     async def test_a_salvaged_dom_carries_no_status(self, monkeypatch):
         """No response object survives a goto timeout, which is the salvage path."""
-        rendered = await _render(monkeypatch, _FakePage([], goto_raises=_PlaywrightError("Timeout exceeded")))
+        rendered = await _render(monkeypatch, FakePage([], goto_raises=PlaywrightError("Timeout exceeded")))
         assert rendered is not None
         assert rendered.http_status is None
         assert rendered.content_type == ""
@@ -1067,11 +843,11 @@ class TestTeardown:
 
     async def test_a_teardown_error_does_not_replace_the_cut_off_and_still_closes_the_browser(self, monkeypatch):
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 50)
-        page = _FakePage([], content_hangs=True)
-        _install_fake_playwright(
+        page = FakePage([], content_hangs=True)
+        install_fake_playwright(
             monkeypatch,
             page,
-            faults=_Faults(close_error=_PlaywrightError("Target page, context or browser has been closed")),
+            faults=Faults(close_error=PlaywrightError("Target page, context or browser has been closed")),
         )
 
         with pytest.raises(rendered_fetch.RenderTimeout):
@@ -1082,8 +858,8 @@ class TestTeardown:
 
     async def test_a_wedged_close_is_bounded_and_the_read_dom_is_still_returned(self, monkeypatch, caplog):
         monkeypatch.setattr(rendered_fetch, "RENDER_TEARDOWN_TIMEOUT_MS", 50)
-        page = _FakePage([])
-        _install_fake_playwright(monkeypatch, page, faults=_Faults(close_hangs=True))
+        page = FakePage([])
+        install_fake_playwright(monkeypatch, page, faults=Faults(close_hangs=True))
 
         started = time.monotonic()
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"):
@@ -1104,8 +880,8 @@ class TestTeardown:
         its DOM was read, past the Tier-1 rung's cut. One budget, started by the first step that
         runs, caps the whole exit at one bound whatever the browser does."""
         monkeypatch.setattr(rendered_fetch, "RENDER_TEARDOWN_TIMEOUT_MS", 200)
-        page = _FakePage([])
-        _install_fake_playwright(monkeypatch, page, faults=_Faults(close_hangs=True, browser_close_hangs=True))
+        page = FakePage([])
+        install_fake_playwright(monkeypatch, page, faults=Faults(close_hangs=True, browser_close_hangs=True))
 
         started = time.monotonic()
         rendered = await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
@@ -1122,7 +898,7 @@ class TestTeardown:
         every step would be abandoned to the driver stop, even on a healthy browser."""
         monkeypatch.setattr(rendered_fetch, "RENDER_TEARDOWN_TIMEOUT_MS", 100)
         monkeypatch.setattr(rendered_fetch, "RENDER_MIN_GOTO_MS", 100)
-        page = _FakePage([], goto_runs_its_budget_out=True)
+        page = FakePage([], goto_runs_its_budget_out=True)
 
         rendered = await _render(monkeypatch, page, goto_timeout_ms=300)
 
@@ -1136,8 +912,8 @@ class TestTeardown:
         the memo is written at the raise site so the cut-off URL is still remembered for the run."""
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 50)
         monkeypatch.setattr(rendered_fetch, "RENDER_TEARDOWN_TIMEOUT_MS", 5_000)
-        page = _FakePage([], content_hangs=True)
-        _install_fake_playwright(monkeypatch, page, faults=_Faults(close_hangs=True))
+        page = FakePage([], content_hangs=True)
+        install_fake_playwright(monkeypatch, page, faults=Faults(close_hangs=True))
 
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(
@@ -1150,8 +926,8 @@ class TestTeardown:
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
 
     async def test_a_failure_before_the_page_exists_still_closes_the_browser(self, monkeypatch, caplog):
-        page = _FakePage([])
-        _install_fake_playwright(monkeypatch, page, faults=_Faults(new_context_error=RuntimeError("no context")))
+        page = FakePage([])
+        install_fake_playwright(monkeypatch, page, faults=Faults(new_context_error=RuntimeError("no context")))
 
         with caplog.at_level(logging.ERROR, logger="metaculus_bot.research.rendered_fetch"):
             rendered = await rendered_fetch.render_page(
@@ -1170,6 +946,8 @@ class TestRunScopedState:
             assert not gate.locked()
             await gate.acquire()
         assert gate.locked()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gate.acquire(), timeout=0.05)
 
 
 class TestTheDomReadIsBounded:
@@ -1182,10 +960,10 @@ class TestTheDomReadIsBounded:
     own reason — it is not a browser that is missing or broken.
     """
 
-    async def _render_a_hanging_dom(self, monkeypatch: pytest.MonkeyPatch) -> _FakePage:
+    async def _render_a_hanging_dom(self, monkeypatch: pytest.MonkeyPatch) -> FakePage:
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 50)
-        page = _FakePage([], content_hangs=True)
-        _install_fake_playwright(monkeypatch, page)
+        page = FakePage([], content_hangs=True)
+        install_fake_playwright(monkeypatch, page)
         with pytest.raises(TimeoutError):
             await rendered_fetch.render_page(
                 _PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1), goto_timeout_ms=10_000
@@ -1220,13 +998,13 @@ class TestTheDomReadIsBounded:
         while an OS-level ``TimeoutError`` (also a subclass, via ``OSError``) from anywhere under
         the render is NOT a cut-off render and lands in the logged boundary instead."""
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 50)
-        _install_fake_playwright(monkeypatch, _FakePage([], content_hangs=True))
+        install_fake_playwright(monkeypatch, FakePage([], content_hangs=True))
         with pytest.raises(rendered_fetch.RenderTimeout):
             await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
 
     async def test_an_os_timeout_under_the_render_is_a_logged_decline_not_a_cut_off(self, monkeypatch, caplog):
-        _install_fake_playwright(
-            monkeypatch, _FakePage([]), faults=_Faults(new_page_error=TimeoutError("[Errno 60] ETIMEDOUT"))
+        install_fake_playwright(
+            monkeypatch, FakePage([]), faults=Faults(new_page_error=TimeoutError("[Errno 60] ETIMEDOUT"))
         )
         with caplog.at_level(logging.ERROR, logger="metaculus_bot.research.rendered_fetch"):
             rendered = await rendered_fetch.render_page(
@@ -1237,7 +1015,7 @@ class TestTheDomReadIsBounded:
 
     async def test_a_prompt_dom_read_is_untouched_by_the_bound(self, monkeypatch):
         monkeypatch.setattr(rendered_fetch, "RENDER_DOM_READ_TIMEOUT_MS", 50)
-        rendered = await _render(monkeypatch, _FakePage([]), harvest_json=False)
+        rendered = await _render(monkeypatch, FakePage([]), harvest_json=False)
         assert rendered is not None
         assert "rendered" in rendered.html
 
@@ -1252,7 +1030,7 @@ class TestTheFailureBoundary:
     """
 
     async def _render_twice(self, monkeypatch: pytest.MonkeyPatch, caplog, error: BaseException) -> None:
-        _install_fake_playwright(monkeypatch, _FakePage([]), faults=_Faults(new_page_error=error))
+        install_fake_playwright(monkeypatch, FakePage([]), faults=Faults(new_page_error=error))
         with caplog.at_level(logging.DEBUG, logger="metaculus_bot.research.rendered_fetch"):
             first = await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
             second = await rendered_fetch.render_page(
@@ -1262,7 +1040,7 @@ class TestTheFailureBoundary:
         assert second is None
 
     async def test_a_playwright_error_declines_and_warns_once(self, monkeypatch, caplog):
-        await self._render_twice(monkeypatch, caplog, _PlaywrightError("Browser closed unexpectedly"))
+        await self._render_twice(monkeypatch, caplog, PlaywrightError("Browser closed unexpectedly"))
         assert rendered_fetch._PLAYWRIGHT_WARNED is True
         unavailable = [record for record in caplog.records if "rung unavailable" in record.getMessage()]
         assert len(unavailable) == 1
