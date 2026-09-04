@@ -11,6 +11,7 @@ extraction end to end.
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import UTC, datetime
 
@@ -24,7 +25,13 @@ from metaculus_bot.research.http_fetch import (
     meta_refresh_target,
     rewrite_aria_tables,
 )
-from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS, RungAttempt
+from metaculus_bot.research.resolution_fetch_result import (
+    _SERVER_HEADER_MAX_CHARS,
+    ROUTE_CAVEATS,
+    RungAttempt,
+    http_failure_class,
+    server_header_token,
+)
 from metaculus_bot.research.resolution_source import (
     FetchResult,
     extract_source_urls,
@@ -415,6 +422,100 @@ class TestVacuousBodyStatus:
         be a live series does."""
         assert vacuous_body_status('{"cve": "x"}', 0.0, require_csv_rows=False) is None
         assert vacuous_body_status('{"cve": "x"}', 0.0, require_csv_rows=True) == "unsupported_type"
+
+
+class TestServerHeaderToken:
+    """The marker's ``server`` field is ONE ``\\S+`` token, and this helper is what makes it one.
+
+    The archive parser (``resolution_source_fetch`` in ``scripts/telemetry/markers.py``) reads the
+    field as ``(?:\\s+server=(?P<server>\\S+))?`` with no trailing anchor, so a value that kept its
+    internal whitespace would not FAIL to parse: ``Server: Apache/2.4.62 (Debian)`` would match on
+    ``apache/2.4.62`` and the archive would record that as the whole header, ``(Debian)`` silently
+    dropped. Wrong data rather than a parse error, which is why the collapse, the case fold and the
+    width cap are pinned here rather than left to the two production call sites that are the
+    helper's only other readers.
+    """
+
+    def test_internal_whitespace_collapses_to_underscores(self):
+        assert server_header_token("Apache/2.4.62 (Debian)") == "apache/2.4.62_(debian)"
+        # Tabs, newlines and runs of spaces are one separator each, not one underscore per character.
+        assert server_header_token("nginx/1.25\t(Ubuntu)\n  edge-\r\n  pop") == "nginx/1.25_(ubuntu)_edge-_pop"
+
+    def test_the_case_fold_buckets_one_vendor_s_spellings_together(self):
+        """``AkamaiGHost`` and ``akamaighost`` are the same CDN; a query grouping by server must see
+        one key."""
+        assert server_header_token("AkamaiGHost") == "akamaighost"
+
+    @pytest.mark.parametrize("header", [None, "", "   \t"])
+    def test_an_absent_or_blank_header_is_none_not_an_empty_token(self, header: str | None):
+        """A bare ``server=`` with nothing after it is a line the parser's ``\\S+`` would refuse.
+        The emitter appends the field only when the token is truthy, so blank must come back None
+        rather than ``""``."""
+        assert server_header_token(header) is None
+
+    def test_the_width_cap_bounds_the_collapsed_token_not_the_raw_header(self):
+        """Truncation runs AFTER the collapse, so the cap is exactly the emitted token's width.
+
+        Capping the raw header first and collapsing second would shrink a shorter string: for this
+        input that order yields the 36-char ``apache/2.4.62_(debian)_openssl/3.0.1``, the right
+        order the 40-char ``apache/2.4.62_(debian)_openssl/3.0.13_mo`` (both hand-computed at the
+        cap of 40 the constant carried when this was written).
+        """
+        raw = "Apache/2.4.62 (Debian)     OpenSSL/3.0.13 mod_wsgi/4.9.4 Python/3.11"
+        collapsed = "apache/2.4.62_(debian)_openssl/3.0.13_mod_wsgi/4.9.4_python/3.11"
+        assert len(collapsed) > _SERVER_HEADER_MAX_CHARS, "the fixture must exceed the cap to exercise it"
+
+        token = server_header_token(raw)
+
+        assert token == collapsed[:_SERVER_HEADER_MAX_CHARS]
+        assert token is not None
+        assert len(token) == _SERVER_HEADER_MAX_CHARS
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "Apache/2.4.62 (Debian)",
+            "AkamaiGHost",
+            "cloudflare",
+            "  Microsoft-IIS/10.0   ",
+            "nginx/1.25\t(Ubuntu)\n  edge-\r\n  pop",
+            "Apache/2.4.62 (Debian)     OpenSSL/3.0.13 mod_wsgi/4.9.4 Python/3.11",
+        ],
+    )
+    def test_every_emitted_token_is_a_single_non_whitespace_run(self, header: str):
+        """The marker-line invariant made explicit rather than implied by the cases above: every
+        kind of whitespace ``str.split`` recognises must be gone from the token, or the archive's
+        ``\\S+`` reads a prefix of the value and records it as the whole."""
+        token = server_header_token(header)
+        assert token is not None
+        assert re.fullmatch(r"\S+", token), token
+
+
+class TestHttpFailureClass:
+    """The ``failure_class`` vocabulary off an HTTP status.
+
+    ``http_403`` stands on its own because it is the egress-reputation refusal the escalation
+    ladder exists for; the rest bucket by side. Below 400 the answer is None so a success and a
+    vetted redirect emit no field at all, which is what keeps every archived line byte-identical.
+    """
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [
+            (403, "http_403"),
+            (400, "http_4xx"),
+            (404, "http_4xx"),
+            (429, "http_4xx"),
+            (499, "http_4xx"),
+            (500, "http_5xx"),
+            (503, "http_5xx"),
+            (200, None),
+            (302, None),
+            (None, None),
+        ],
+    )
+    def test_the_status_maps_to_its_class_token(self, status: int | None, expected: str | None):
+        assert http_failure_class(status) == expected
 
 
 class TestFetchResultInvariant:

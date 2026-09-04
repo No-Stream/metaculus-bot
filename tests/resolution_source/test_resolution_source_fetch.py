@@ -36,6 +36,7 @@ from metaculus_bot.research.resolution_source import (
     looks_like_page_chrome,
     resolution_source_provider,
 )
+from scripts.telemetry.markers import MARKER_SPECS
 from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
@@ -841,6 +842,50 @@ class TestResolutionSourceFetchMarker:
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data "
             "status=blocked http=403 embeds=none failure_class=http_403",
         ]
+
+    async def test_a_spaced_server_header_stays_one_marker_token(self, monkeypatch, caplog):
+        """Emitter and parser pinned against ONE string.
+
+        The marker spec reads the field as ``(?:\\s+server=(?P<server>\\S+))?`` with no trailing
+        anchor, so a ``Server`` value that kept its space would still MATCH: the archive would
+        record ``server=apache/2.4.62`` and drop ``(Debian)`` with no parse error to notice. The
+        whole-line assertion pins what the emitter writes; the spec-regex assertion pins that the
+        parser reads all of it back as the one value.
+        """
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                "https://cbp.gov/data": FakeResponse(
+                    403, body=b"", content_type="text/html", headers={"Server": "Apache/2.4.62 (Debian)"}
+                )
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="See https://cbp.gov/data")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        (line,) = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")]
+        assert line == (
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data "
+            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian)"
+        )
+        spec = next(s for s in MARKER_SPECS if s.name == "resolution_source_fetch")
+        match = spec.regex.search(line)
+        assert match is not None
+        assert match.groupdict() == {
+            "question": "999",
+            "url": "https://cbp.gov/data",
+            "status": "blocked",
+            "http": "403",
+            "embeds": "none",
+            "reason": None,
+            "route": None,
+            "failure_class": "http_403",
+            "exc": None,
+            "server": "apache/2.4.62_(debian)",
+        }
 
     async def test_the_marker_names_the_unreadable_embed_providers(
         self, tracker_with_infogram_html, monkeypatch, caplog

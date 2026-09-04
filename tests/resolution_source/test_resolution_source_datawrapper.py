@@ -695,6 +695,36 @@ class TestDatawrapperHopFailureModes:
         assert result.status == "error"
         assert result.http_status is None
 
+    async def test_a_refused_dataset_carries_its_failure_class_and_the_cdn_s_server_token(self):
+        """The Tier-2 hop reads the same two marker-field helpers as the cited-page fetch, so a
+        CDN 403 is attributable to the edge that served it. The spaced header is deliberate: it is
+        the shape that would split the marker's ``server`` field into two tokens if the collapse
+        were ever skipped on this call site."""
+        session = FakeSession(
+            {
+                DATASET_URL: FakeResponse(
+                    403, body=b"", content_type="text/html", headers={"Server": "Apache/2.4.62 (Debian)"}
+                )
+            }
+        )
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+        assert result.status == "blocked"
+        assert result.failure_class == "http_403"
+        assert result.server == "apache/2.4.62_(debian)"
+        assert result.exc is None
+
+    async def test_a_transport_failure_carries_its_class_and_the_exception_name(self):
+        """No response means no status and no ``Server`` header; what the archive gets instead is
+        the transport bucket and the exact class, which is how a CDN body cut short is told from a
+        timeout without re-scraping the run log."""
+        session = FakeSession({DATASET_URL: aiohttp.ClientPayloadError("truncated")})
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+        assert result.status == "error"
+        assert result.http_status is None
+        assert result.failure_class == "decode"
+        assert result.exc == "ClientPayloadError"
+        assert result.server is None
+
     async def test_a_soft_404_fragment_is_rejected_before_tag_stripping(self):
         """A CDN soft-404 served as 200 can arrive as an HTML FRAGMENT opening with
         allow-listed tags (`<p>`), which strip_html_tags removes — so row-shape is
@@ -1018,6 +1048,54 @@ class TestProviderEndToEnd:
 
         sources = pop_provider_detail(q.id_of_question, "resolution_source")["sources"]
         assert sources[f"datawrapper:{CHART_ID}"] == "error"
+
+    async def test_a_refused_hop_names_its_failure_class_and_cdn_server_on_the_marker(self, monkeypatch, caplog):
+        """The failure diagnostics ride the hop's own ``RESOLUTION_SOURCE_FETCH`` line exactly as
+        they ride a cited page's, and the ``Server`` value is one token: the spec's
+        ``(?P<server>\\S+)`` would otherwise match ``apache/2.4.62`` alone and the archive would
+        file a CDN 403 against a truncated header with no parse error to notice."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: FakeResponse(
+                    403, body=b"", content_type="text/html", headers={"Server": "Apache/2.4.62 (Debian)"}
+                ),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} "
+            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian)",
+        ]
+
+    async def test_a_hop_that_never_got_a_response_reports_its_transport_class(self, monkeypatch, caplog):
+        """``http=n/a`` alone said only that no response came back; ``failure_class`` and ``exc``
+        are what tell a refused connection from a timeout or a TLS rejection on the CDN."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: aiohttp.ClientError("boom"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} "
+            "status=error http=n/a embeds=none failure_class=connection exc=ClientError",
+        ]
 
     async def test_datasets_cannot_evict_cited_page_text(self, monkeypatch):
         """The partitioned section budget: datasets draw on their OWN allowance, so
