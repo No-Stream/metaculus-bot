@@ -1422,6 +1422,15 @@ the telemetry markers:
   reaches the host, and the money bought a true negative. `host` because the rollout question is
   which hosts Gemini reaches but finds nothing on. Same registration date and no question id.
   Harvested as `resolution_source_urlcontext_not_addressed`.
+- `url_context not_addressed reply for <host>: <first 300 chars>` and its `ungrounded` twin — an
+  INFO line each, emitted immediately after the two markers above and deliberately NOT registered,
+  so nothing archives them and the markers' own line shapes stay the contract. They carry the head
+  of the reply the withhold discarded, whitespace-collapsed and capped at
+  `RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS`. Read them when a withhold needs explaining: a
+  `not_addressed` verdict meaning the page truly does not discuss the ask and one meaning the model
+  summarized the bot-challenge page the host served it instead are otherwise indistinguishable, and
+  the reply is what tells them apart. The `ungrounded` line appears only when that read said
+  something, since the same branch also fires on an empty reply.
 - `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]` — a WARN, one per
   gap-fill v2 `read_document` call whose `url_context` retrieval brought back nothing,
   so the answer would have been unsourced recall and the `fetched` verification tier is

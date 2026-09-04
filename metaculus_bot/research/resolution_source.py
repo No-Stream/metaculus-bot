@@ -183,6 +183,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS,
     RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S,
+    RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS,
     env_flag_enabled,
 )
 from metaculus_bot.research import derived_api
@@ -2474,6 +2475,20 @@ async def _url_context_admission(
     return api_key, budget_s
 
 
+def _withheld_reply_preview(reply: str) -> str:
+    """The head of a paid reply we are DISCARDING, collapsed onto one log line.
+
+    Whitespace-collapsed because a model's answer arrives with newlines and a multi-line log
+    record is what makes a run log unreadable, and bounded by
+    ``RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS`` because the point is to audit what the read
+    said, not to keep it.
+    """
+    collapsed = " ".join(reply.split())
+    if len(collapsed) <= RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS:
+        return collapsed
+    return f"{collapsed[:RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS]}…"
+
+
 async def _url_context_rung(
     session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
 ) -> FetchResult | None:
@@ -2541,6 +2556,12 @@ async def _url_context_rung(
         logger.warning(
             f"RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url={url} statuses={','.join(statuses) or 'none'}"
         )
+        if text.strip():
+            # The suppressed answer itself, on its own unregistered line (see the
+            # `not_addressed` twin below for why a withheld reply is kept at all). Only when
+            # there IS one: the same branch fires on an empty reply, where there is nothing to
+            # audit.
+            logger.info(f"url_context ungrounded reply for {urlparse(url).netloc}: {_withheld_reply_preview(text)}")
         return FetchResult(
             url=url,
             status="ungrounded",
@@ -2561,6 +2582,11 @@ async def _url_context_rung(
         # because the rollout question is which hosts Gemini can
         # reach but finds nothing on.
         logger.warning(f"RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url={url} host={urlparse(url).netloc}")
+        # What the withheld read actually SAID, on a separate unregistered line so the marker's
+        # own shape stays a data contract. Without it the verdict is unauditable: "the page does
+        # not discuss this" and "the model read the bot-challenge page it was served" reach this
+        # branch identically, and the text that tells them apart was being dropped on the floor.
+        logger.info(f"url_context not_addressed reply for {urlparse(url).netloc}: {_withheld_reply_preview(answer)}")
         return FetchResult(
             url=url,
             status="no_resolving_content",
