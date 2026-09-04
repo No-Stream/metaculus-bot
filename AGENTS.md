@@ -187,8 +187,9 @@ Per question, inside `forecaster.py:_research_and_make_predictions`. Detail:
 0. **Close-derived time budget** (`time_budget.py`), granted at intake before any spend:
    `min(PER_QUESTION_WALL_CLOCK_DEADLINE, close_time − now − PUBLISH_RESERVE_SECONDS)`. Three
    consequences: an intake skip when the budget is non-viable, a fast path that drops the slow
-   optional providers and both gap-fill passes, and a research-phase deadline that cancels
-   stragglers. Every question logs a `TIME_BUDGET` marker.
+   optional providers and both gap-fill passes (and makes the resolution-source fetcher's two
+   expensive rungs, the browser render and the paid read, decline), and a research-phase
+   deadline that cancels stragglers. Every question logs a `TIME_BUDGET` marker.
 1. **Research** — `run_research` (`research/orchestrator.py`) picks exactly one primary provider
    by priority and runs the add-on providers alongside it in parallel, each independently
    env-gated, then two gap-fill passes append their own sections. Detail: `docs/research.md`,

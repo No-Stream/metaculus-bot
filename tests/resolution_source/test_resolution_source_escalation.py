@@ -1225,6 +1225,113 @@ class TestUrlContextRung:
         assert result.route == "url_context"
 
 
+class TestFastPath:
+    """A question on the time-budget fast path declines the two EXPENSIVE rungs — the browser and
+    the paid reader — before any side effect, with its own greppable skip reason. The cheap rungs
+    (meta-refresh, local PDF, derived-feed reuse, Wayback) run exactly as they do off it, and a
+    question with no fast path is byte-identical to before the gate existed."""
+
+    async def test_the_provider_declines_the_browser_on_the_fast_path(self, monkeypatch):
+        calls: list[dict[str, object]] = []
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(
+            resolution_source,
+            "render_page",
+            _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
+        )
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        section = await resolution_source_provider(is_benchmarking=False, fast_path=True)(question)
+
+        assert calls == []
+        assert "tracker.example.com: js_wall" in section
+        counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
+        assert counts["fast_path_skips"] == 1
+        assert counts["rendered_attempts"] == 0
+        assert counts["renderer_unavailable_skips"] == 0
+
+    async def test_off_the_fast_path_the_provider_renders_as_before(self, monkeypatch):
+        calls: list[dict[str, object]] = []
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(
+            resolution_source,
+            "render_page",
+            _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
+        )
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        section = await resolution_source_provider(is_benchmarking=False)(question)
+
+        assert len(calls) == 1
+        assert "Nebraska Senate polling average" in section
+        counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
+        assert counts["fast_path_skips"] == 0
+        assert counts["rendered_attempts"] == 1
+
+    async def test_the_paid_reader_declines_on_the_fast_path_only_when_it_was_armed(self, monkeypatch):
+        """Recorded only when the rung would otherwise have been considered: with the flag off a
+        fast-path skip would read as spend avoided on a rung that could never have fired."""
+        calls: list[dict[str, object]] = []
+
+        def _read(url, ask, **kwargs):
+            calls.append({"url": url, "ask": ask, **kwargs})
+            return ("text", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
+        reset_robots_cache()
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+                "https://tracker.example.com/robots.txt": FakeResponse(
+                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
+                ),
+            }
+        )
+
+        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
+        armed = await _fetch_one(session, _URL, {}, FetchContext(query="ask", fast_path=True))
+        monkeypatch.delenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED")
+        unarmed = await _fetch_one(session, _URL, {}, FetchContext(query="ask", fast_path=True))
+
+        assert calls == []
+        assert armed.status == "blocked"
+        assert [(a.rung, a.skipped_reason) for a in armed.rung_attempts] == [("url_context", "fast_path")]
+        assert unarmed.rung_attempts == []
+        # Declined before the pre-check, so no request went out for it either.
+        assert "https://tracker.example.com/robots.txt" not in session.requested
+
+    async def test_the_cheap_rungs_still_run_on_the_fast_path(self, monkeypatch):
+        """The Wayback rung and a remembered derived feed are ordinary GETs and stay in."""
+        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        now = datetime(2026, 9, 4, tzinfo=UTC)
+        snapshot = _snapshot_url(_URL, captured=now - timedelta(days=2))
+        feed_page = "https://tracker.example.com/house"
+        resolution_source.derived_api.remember_endpoint(feed_page, _FEED_URL)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": snapshot}),
+                snapshot: FakeResponse(200, body=_prose_page(_RENDERED_PROSE), content_type="text/html"),
+                feed_page: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                _FEED_URL: FakeResponse(200, body=b'{"series":[{"v":1}]}', content_type="application/json"),
+            }
+        )
+
+        archived = await _fetch_one(session, _URL, {}, FetchContext(now=now, fast_path=True))
+        derived = await _fetch_one(session, feed_page, {}, FetchContext(now=now, fast_path=True))
+
+        assert archived.route == "wayback"
+        assert archived.status == "success"
+        assert derived.route == "derived_api"
+        assert derived.status == "success"
+        assert [(a.rung, a.skipped_reason) for a in derived.rung_attempts] == [("derived_api", "")]
+
+
 def _success(route: FetchRoute, url: str = _URL) -> FetchResult:
     return FetchResult(
         url=url, status="success", text="body text", http_status=200, content_type="text/html", route=route

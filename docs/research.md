@@ -1051,11 +1051,11 @@ every page that already fetched when it fires, so an overrunning rung costs the 
 question's resolution evidence rather than just its own attempt. A rung that FIRED
 records itself on the result (`route=` on the fetch marker, plus one
 `RESOLUTION_SOURCE_ESCALATION` line); a rung that was SKIPPED is counted under
-`details["counts"]` instead of logged, alongside the fired counts. Twelve keys, and a zero
+`details["counts"]` instead of logged, alongside the fired counts. A zero
 renders nothing while still surviving into the archive, which is what makes "the rung existed
 and never fired" distinguishable from "this record predates the rung". Six of the keys count
 rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
-`derived_api_reads`, `wayback_attempts` and `url_context_reads`. The other six count rungs that
+`derived_api_reads`, `wayback_attempts` and `url_context_reads`. The rest count rungs that
 were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
 because each names a different binding constraint. `rung_budget_skips` is the question that ran out of wall.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
@@ -1067,7 +1067,10 @@ DOM-read cap or by the question's remaining wall budget: a page that keeps navig
 fact about the page rather than about the runner or the question's clock, and also invisible in
 `rendered_attempts`.
 `wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
-per-question cap is what binds. `url_context_robots_skips` is the free `Google-Extended`
+per-question cap is what binds. `fast_path_skips` is an expensive rung (the render, the paid read)
+declined because the QUESTION's close-derived budget put it on the time-budget fast path, a fact
+about the question's window rather than about the provider's own 45 s wall, which is what
+`rung_budget_skips` counts. `url_context_robots_skips` is the free `Google-Extended`
 pre-check earning its request: the host would have refused the read server-side, so that is
 spend avoided rather than a page lost and it must not read as a failure. One skip reason has no
 count of its own: the paid rung's `no_api_key`, which is a misconfiguration rather than a tuning
@@ -1374,7 +1377,11 @@ Gemini grounded search, which uses the personal Google key directly.
 
 All of that is subject to the question's close-derived time budget: a question on the
 fast path runs the primary plus the cheap hard-capped providers only, with the slow
-optional search providers dropped and BOTH gap-fill passes skipped. See the pipeline's
+optional search providers dropped and BOTH gap-fill passes skipped. The resolution-source
+fetcher stays in but learns about the fast path too (`resolution_source_provider(...,
+fast_path=)`), and its two EXPENSIVE escalation rungs, the Chromium render and the paid
+`url_context` read, decline on it before any side effect, each recording a `fast_path` skip
+(`counts["fast_path_skips"]`); the cheap rungs run as they do off it. See the pipeline's
 time-budget step for how the budget is granted and what it cuts.
 
 ## Cost note

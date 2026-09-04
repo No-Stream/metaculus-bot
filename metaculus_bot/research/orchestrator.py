@@ -290,7 +290,9 @@ class ResearchOrchestrator:
         the phase's longest configured pole — so dropping the cheap hard-capped
         providers (resolution_source 45 s, prediction_market 150 s, ts_anchor 20 s,
         financial classifier 30 s) cannot shorten the phase and only discards the
-        resolution ground truth. What the fast path CAN shed is the measured tail:
+        resolution ground truth. The flag is still handed to ``resolution_source``, whose
+        two expensive escalation rungs (a Chromium launch, the paid reader) decline on it
+        while its direct fetch and cheap rungs run. What the fast path CAN shed is the measured tail:
         native_search is the phase's slowest provider on 51.5% of questions and
         reached 292 s against the primary's 110 s measured worst case
         (scratch/residual_2026-08-24/time_budget_design.md). Anything still
@@ -351,7 +353,15 @@ class ResearchOrchestrator:
                 resolution_source_provider,
             )
 
-            providers.append((resolution_source_provider(is_benchmarking=self._is_benchmarking), "resolution_source"))
+            # Stays on the fast path (cheap, hard-capped at 45 s — see the docstring above);
+            # the flag makes its two EXPENSIVE ladder rungs, the browser and the paid reader,
+            # decline instead.
+            providers.append(
+                (
+                    resolution_source_provider(is_benchmarking=self._is_benchmarking, fast_path=fast_path),
+                    "resolution_source",
+                )
+            )
 
         if not providers:
             providers.append((_empty_provider, "none"))
