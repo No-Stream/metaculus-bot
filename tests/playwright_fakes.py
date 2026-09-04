@@ -1,0 +1,299 @@
+"""One fake Playwright object graph for every test that drives ``rendered_fetch.render_page``.
+
+The transport is faked through ``sys.modules["playwright.async_api"]`` rather than by patching
+``render_page``: these tests exercise the launch, the route guard, the navigation budget, the
+DOM read, the XHR harvest and the teardown, so the double has to honour the slice of
+Playwright's API the transport touches. Nothing here launches a browser, and the suite's
+autouse ``_block_native_egress`` refuses a real launch anyway.
+
+One copy here so they can't drift. Before this module the graph was hand-copied nine times
+across ``tests/test_agentic_tools.py``, and the transport change that put ``http_status`` on
+``RenderedPage`` cost seven byte-identical ``status=200`` edits, one per copy, while the single
+parameterised page in ``tests/test_rendered_fetch.py`` absorbed it with one default. A test
+with bespoke behaviour (a launch that blocks on a barrier, a goto that drives the route guard,
+a manager that records when the driver started) SUBCLASSES the class it needs and hands the
+instance to :func:`install_fake_playwright` rather than growing a hook parameter.
+
+The error class is Playwright's real ``Error``: the transport catches whatever class the fake
+module exposes as ``Error``, and tests that raise Playwright's real ``TimeoutError`` (a subclass
+of that ``Error``) from ``goto`` need the salvage path to recognise it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from playwright.async_api import Error as PlaywrightError
+
+from metaculus_bot.research import rendered_fetch
+
+__all__ = [
+    "FakeBrowser",
+    "FakeChromium",
+    "FakeContext",
+    "FakePage",
+    "FakePlaywrightManager",
+    "FakeResponse",
+    "Faults",
+    "PlaywrightError",
+    "install_fake_playwright",
+]
+
+DEFAULT_DOM = "<!doctype html><html><head><title>Dashboard</title></head><body><p>rendered</p></body></html>"
+DEFAULT_PIN = ("dashboard.example.com", "93.184.216.34")
+
+
+class FakeResponse:
+    """One response event. ``body()`` always yields once, because Playwright's is a round trip to
+    the driver: every read task that reaches it would be suspended in it at the same time, which
+    is the interleaving the harvest's serialised read exists to prevent. ``peak_in_flight`` records
+    how many bodies were being read at once across every instance, which is the memory claim."""
+
+    in_flight = 0
+    peak_in_flight = 0
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        content_type: str,
+        body: bytes,
+        raises: bool = False,
+        body_delay_s: float = 0.0,
+        declared_length: int | None = None,
+    ) -> None:
+        self.url = url
+        self.headers = {"content-type": content_type}
+        if declared_length is not None:
+            self.headers["content-length"] = str(declared_length)
+        self._body = body
+        self._raises = raises
+        self._body_delay_s = body_delay_s
+        self.body_reads = 0
+        self.body_read_cancelled = False
+
+    @classmethod
+    def reset_read_tracking(cls) -> None:
+        cls.in_flight = 0
+        cls.peak_in_flight = 0
+
+    async def body(self) -> bytes:
+        self.body_reads += 1
+        FakeResponse.in_flight += 1
+        FakeResponse.peak_in_flight = max(FakeResponse.peak_in_flight, FakeResponse.in_flight)
+        try:
+            await asyncio.sleep(self._body_delay_s)
+        except asyncio.CancelledError:
+            self.body_read_cancelled = True
+            raise
+        finally:
+            FakeResponse.in_flight -= 1
+        if self._raises:
+            raise PlaywrightError("target closed")
+        return self._body
+
+
+class FakePage:
+    """A page that replays a fixed list of response events during ``goto``.
+
+    ``content_hangs`` is the ogimet shape (P3-1): a DOM read that never answers because the page
+    keeps navigating. ``goto_raises`` is the salvage shape: the navigation times out with the DOM
+    already rendered. ``goto_runs_its_budget_out`` puts the clock on that shape: the navigation
+    sleeps for its whole ``timeout`` before it raises or returns, as a real goto timeout does,
+    so a test can measure what the transport spends AFTER the budget is gone. ``status`` is the
+    main-frame response's HTTP status.
+
+    Everything the transport does to the page and its context is recorded on the page, because
+    the page is the one object a test holds: ``goto_calls``, ``settles`` (each
+    ``wait_for_timeout``), ``context_kwargs`` (what ``new_context`` was given), ``route_patterns``
+    and ``route_handler`` (what ``context.route`` registered), ``unroute_behavior``, and
+    ``teardown`` (the close sequence the context and browser ran, so a test can assert the browser
+    was still torn down after a failure mid-render).
+    """
+
+    def __init__(
+        self,
+        responses: list[FakeResponse] | None = None,
+        *,
+        html: str = DEFAULT_DOM,
+        content_hangs: bool = False,
+        goto_raises: BaseException | None = None,
+        goto_runs_its_budget_out: bool = False,
+        status: int = 200,
+    ) -> None:
+        self._responses = responses or []
+        self._html = html
+        self._content_hangs = content_hangs
+        self._goto_raises = goto_raises
+        self._goto_runs_its_budget_out = goto_runs_its_budget_out
+        self._status = status
+        self._handlers: list[Any] = []
+        self.detached_handler_tasks: list[asyncio.Future[Any]] = []
+        self.goto_calls: list[dict[str, Any]] = []
+        self.settles: list[float] = []
+        self.context_kwargs: dict[str, Any] = {}
+        self.route_patterns: list[str] = []
+        self.route_handler: Any = None
+        self.unroute_behavior: str | None = None
+        self.teardown: list[str] = []
+
+    def on(self, event: str, handler: Any) -> None:
+        assert event == "response"
+        self._handlers.append(handler)
+
+    async def goto(self, url: str, *, wait_until: str, timeout: int) -> Any:  # noqa: ASYNC109  # Playwright's own signature; this stands in for it
+        self.goto_calls.append({"url": url, "wait_until": wait_until, "timeout": timeout})
+        # pyee's dispatch: call the listener; a coroutine comes back wrapped in ensure_future and
+        # is never awaited by anyone, so it is still pending when goto returns.
+        for response in self._responses:
+            for handler in self._handlers:
+                result = handler(response)
+                if asyncio.iscoroutine(result):
+                    self.detached_handler_tasks.append(asyncio.ensure_future(result))
+        if self._goto_runs_its_budget_out:
+            await asyncio.sleep(timeout / 1000)
+        if self._goto_raises is not None:
+            raise self._goto_raises
+        return SimpleNamespace(headers={"content-type": "text/html"}, status=self._status)
+
+    async def wait_for_timeout(self, ms: float) -> None:
+        self.settles.append(ms)
+
+    async def content(self) -> str:
+        if self._content_hangs:
+            await asyncio.Event().wait()
+        # The real read is a round trip; yielding here lets the detached handler tasks run
+        # between goto and the snapshot, which is where the un-joined harvest lost bodies.
+        await asyncio.sleep(0)
+        return self._html
+
+
+@dataclass
+class Faults:
+    """Where the fake browser misbehaves. ``new_page_error`` / ``new_context_error`` fail the
+    render INSIDE the gates, which is the failure-boundary shape the warn latch was written for;
+    ``close_error``, ``close_hangs`` and ``browser_close_hangs`` misbehave in teardown, where the
+    real ``BrowserContext.close`` neither swallows a target-closed error nor bounds its wait."""
+
+    new_page_error: BaseException | None = None
+    new_context_error: BaseException | None = None
+    close_error: BaseException | None = None
+    close_hangs: bool = False
+    browser_close_hangs: bool = False
+
+
+class FakeContext:
+    def __init__(self, page: FakePage, faults: Faults) -> None:
+        self._page = page
+        self._faults = faults
+
+    async def route(self, pattern: str, handler: Any) -> None:
+        self._page.route_patterns.append(pattern)
+        self._page.route_handler = handler
+
+    async def new_page(self) -> FakePage:
+        if self._faults.new_page_error is not None:
+            raise self._faults.new_page_error
+        return self._page
+
+    async def unroute_all(self, *, behavior: str | None = None) -> None:
+        self._page.unroute_behavior = behavior
+        self._page.teardown.append("unroute_all")
+
+    async def close(self) -> None:
+        self._page.teardown.append("context.close")
+        if self._faults.close_hangs:
+            await asyncio.Event().wait()
+        if self._faults.close_error is not None:
+            raise self._faults.close_error
+
+
+class FakeBrowser:
+    def __init__(self, page: FakePage, faults: Faults) -> None:
+        self._page = page
+        self._faults = faults
+
+    async def new_context(self, **kwargs: Any) -> FakeContext:
+        self._page.context_kwargs = kwargs
+        if self._faults.new_context_error is not None:
+            raise self._faults.new_context_error
+        return FakeContext(self._page, self._faults)
+
+    async def close(self) -> None:
+        self._page.teardown.append("browser.close")
+        if self._faults.browser_close_hangs:
+            await asyncio.Event().wait()
+
+
+class FakeChromium:
+    """The launcher. ``launch_delay_s`` is what the launch costs on the clock (0.3 s warm to
+    several seconds cold on the real Chromium), spent AFTER the transport has recomputed its
+    navigation budget. Every launch's ``args`` and ``headless`` are recorded."""
+
+    def __init__(self, page: FakePage, faults: Faults | None = None, *, launch_delay_s: float = 0.0) -> None:
+        self._page = page
+        self._faults = faults or Faults()
+        self._launch_delay_s = launch_delay_s
+        self.launch_args: list[list[str]] = []
+        self.headless: list[bool] = []
+
+    async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
+        self.launch_args.append(list(args or []))
+        self.headless.append(headless)
+        await asyncio.sleep(self._launch_delay_s)
+        return FakeBrowser(self._page, self._faults)
+
+
+class FakePlaywrightManager:
+    """What ``async_playwright()`` returns: an async context manager exposing ``chromium``."""
+
+    def __init__(self, chromium: FakeChromium) -> None:
+        self.chromium = chromium
+
+    async def __aenter__(self) -> FakePlaywrightManager:
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        return None
+
+
+def _async_return(value: Any):
+    async def _call(*_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.sleep(0)
+        return value
+
+    return _call
+
+
+def install_fake_playwright(
+    monkeypatch: pytest.MonkeyPatch,
+    page: FakePage,
+    *,
+    faults: Faults | None = None,
+    launch_delay_s: float = 0.0,
+    pinned: tuple[str, str] | None = DEFAULT_PIN,
+    chromium: FakeChromium | None = None,
+    manager_cls: type[FakePlaywrightManager] = FakePlaywrightManager,
+) -> FakeChromium:
+    """Wire the fakes in and return the launcher, whose ``launch_args`` say what was launched.
+
+    ``faults`` says where the browser should misbehave (see :class:`Faults`). ``pinned`` is what
+    the transport's DNS pin resolves to, ``(host, vetted_ip)``; ``None`` makes the host
+    unpinnable, so the transport declines before any launch. A bespoke ``chromium`` (a subclass
+    with its own ``launch``) or ``manager_cls`` (a subclass with its own ``__aenter__``) replaces
+    the default of that one piece; everything else stays shared.
+    """
+    launcher = chromium or FakeChromium(page, faults, launch_delay_s=launch_delay_s)
+    manager = manager_cls(launcher)
+    monkeypatch.setitem(
+        sys.modules,
+        "playwright.async_api",
+        SimpleNamespace(async_playwright=lambda: manager, Error=PlaywrightError),
+    )
+    monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", _async_return(pinned))
+    return launcher

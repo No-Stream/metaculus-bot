@@ -1327,30 +1327,47 @@ Follow-ups:
    left the queue. Neither acquire is bounded, no launch allowance is reserved, and the 12 s floor
    is unchanged; the bounded acquire remains the reserved call above, and `render_page` is shared
    with v2, so bounding it there would be new timeout policy for both paths at once.
-   **Two residuals of the same deadline arithmetic, priced 2026-09-04 (still the operator's
-   call).** `_rendered_rung` hands the transport a deadline at the same instant as its own outer
-   `wait_for`, and the transport launches Chromium AFTER it recomputes the navigation budget, so
-   whenever the goto runs its budget out the fixed 5 s DOM-read bound sits past the outer cut by
-   the launch time. The strictly-safer half landed 2026-09-04: the harvest drain is clamped to
-   the deadline less one `RENDER_TEARDOWN_TIMEOUT_MS`, so a salvaged DOM is no longer discarded
-   as `render_timeout` over a same-publisher body still in flight. Two shapes remain. (a) After
-   an outer cut, the three bounded teardown steps plus the driver stop run inside the 2 s
-   `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`. A healthy teardown is sub-second and fits; a wedged
-   browser adds up to 6 s and trips the 45 s provider wall, which discards every sibling page
-   the question had already fetched. Reproduced only with fakes, never live. Closing it means
-   reserving 3 x `RENDER_TEARDOWN_TIMEOUT_MS` in the deadline handed to the transport and raising
-   `RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` from 12 s to 18 s so the pre-gate floor matches the
-   post-gate floor. That cuts 6 s of navigation from EVERY Tier-1 render (a 23 s budget goes from
-   a 16 s goto to a 10 s goto) and contradicts the decision recorded in the paragraph above (no
-   launch allowance is reserved, the 12 s floor is unchanged). (b) In the salvage-plus-hang shape
-   (the goto ran its budget out and `page.content()` then hangs, the ogimet shape) the outer cut
-   fires before the transport's own `RenderTimeout`, so the timed-out memo is never written and a
-   second question citing the URL pays a full render again. Closing it by clamping the DOM read to
-   the deadline would shrink the salvage read window to 3 s minus the launch time, and at a cold
-   launch (3 s or more) it would fail the read instantly and memoise a healthy URL as timed out
-   for the run, the semantic downgrade (from "the page kept navigating" to "we ran out of time")
-   that the `RENDER_DOM_READ_TIMEOUT_MS` comment deliberately rejected. The `render_page`
-   docstring and `docs/research.md` state the memo's real condition meanwhile.
+   **The render's exit-cost accounting, closed 2026-09-04, and what it leaves open.**
+   `_rendered_rung` used to hand the transport a deadline at the same instant as its own outer
+   `wait_for`, while the three teardown steps each carried a fresh 2 s bound. `asyncio.wait_for`
+   cancels the render and then awaits its unwinding finallys, so a wedged browser could run up to
+   6 s past the cut and trip the 45 s provider wall, discarding every page the question had
+   already fetched, and a cancellation landing during that teardown replaced the propagating
+   `RenderTimeout`, so the timed-out memo never landed. What shipped: the three teardown steps
+   share ONE lazily started `RENDER_TEARDOWN_TIMEOUT_MS` budget (`_TeardownBudget`), so the whole
+   exit costs at most 2 s before the driver stop; `RENDER_EXIT_RESERVE_MS` (that bound plus one
+   second for the launch and the driver stop, 3 s in all) is subtracted from the deadline the rung
+   hands the transport while the rung keeps `timeout=budget_s` on its `wait_for`; the harvest
+   drain is clamped to that deadline itself; and the memo is written at the `RenderTimeout` raise
+   site with `memo_scope` threaded down. Strictly safer throughout: the goto can only get shorter
+   or decline earlier at `RENDER_MIN_GOTO_MS`. Three things stay open, and each is a deliberate
+   choice rather than an oversight. (a) The `async_playwright()` driver stop is the one unbounded
+   step in the exit. It is what actually kills the Chromium process, and abandoning it on a wedged
+   browser would leak 100 to 300 MB past `RENDER_LAUNCH_CAP`, an OOM nothing can catch; the
+   reserve's spare second is sized for a healthy stop, and a wedged one is unmeasured live. (b)
+   `RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` stays at 12 s while the post-gate need is now
+   `RENDER_MIN_GOTO_MS` + `RENDER_POST_GOTO_TAIL_MS` + `RENDER_EXIT_RESERVE_MS` = 5 + 7 + 3 = 15 s,
+   so a render admitted with 12 to 15 s of wall declines at the gates with an honest `wall_budget`
+   skip rather than launching. Raising the floor to 15 s would make the pre-gate check truthful at
+   the cost of that band's reach, and the plan's own rule forbids raising it without the operator.
+   (c) The 2026-09-04 review's other two structural notes on the transport, sequenced after the
+   fixes above because all of them edit the same region: `rendered_fetch.py` is about 980 lines
+   carrying the render budget, the SSRF pin, the teardown and a 200-line XHR-harvest subsystem, and
+   the harvest (`_JsonHarvest`, `_harvestable_json_host`, `_harvestable_json_response`,
+   `_declared_length_over_cap`, the `HARVEST_*` constants and `is_json_content_type`) is a clean
+   extraction into a `rendered_harvest.py` leaf; and `_navigate_and_read_dom` does eight things
+   (goto, salvage, settle, status and content-type read, bounded DOM read with the memo write, the
+   ceiling check, the drain clamp, the page assembly) while the harvest task set is cancelled from
+   two places for one invariant (`drain` cancels what outlived the clamp; `_render_in_context`'s
+   `finally` cancels what a raise left pending), so the harvest deserves a single owner of its
+   lifecycle when it moves. Neither is a bug; both are the shape the next transport change pays for.
+   **The harvest's one memory residual (2026-09-04).** The listener now screens a response event
+   before it spawns a task and the reads run one at a time behind a `Semaphore(1)`, so peak harvest
+   memory is one body. That one body can still be an undeclared oversized one: HTTP/2 and chunked
+   responses routinely send no `Content-Length`, and Playwright's `body()` has no streaming route,
+   so it is buffered whole before the post-read size test drops it. Refusing undeclared bodies
+   outright would drop the payload the rung exists to find (dashboard feeds commonly omit the
+   header), so the residual is accepted and documented at `_declared_length_over_cap`.
 6. **MEDIUM: trafilatura silently drops MediaWiki collapsible boxes, and the surviving text can
    read as the inverse of the truth (verified 2026-08-24 on q44870; tracked here 2026-09-02).** On
    an English Wikipedia endorsements page the box renders as

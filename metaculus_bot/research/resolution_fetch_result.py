@@ -177,12 +177,25 @@ FetchStatusReason = Literal[
 # `renderer_unavailable` — the browser declined before rendering anything: Playwright missing or
 #   broken, a host that will not pin to a public IP, or a browser error. Nothing was rendered, so
 #   nothing about the page changed, which is why it is a skip reason and not a `status_reason`.
-# `render_timeout` — the browser rung CUT OFF: Chromium launched and navigated, and either the
-#   DOM read outlived `RENDER_DOM_READ_TIMEOUT_MS` because the page kept navigating, or the whole
-#   render outlived the remaining wall. Its own token rather than `renderer_unavailable` because
-#   it says nothing about whether Chromium works — the receipt is ogimet.com (2026-09-03), where
-#   a 76 s render was recorded as the renderer being unavailable and latched the once-per-run
-#   warning, so a real outage later would have logged nothing.
+# `render_timeout` — the browser rung CUT OFF by the transport's own bound: Chromium launched and
+#   navigated, and the DOM read outlived `RENDER_DOM_READ_TIMEOUT_MS` because the page kept
+#   navigating (or the URL was already cut off that way earlier in the run). A fact about the
+#   page. The rung's own outer bound firing is NOT this token but `wall_budget`: it fires while the
+#   render is still queued behind the launch gates, which says nothing about the page. Its own
+#   token rather than `renderer_unavailable` because it says nothing about whether Chromium works
+#   — the receipt is ogimet.com (2026-09-03), where a 76 s render was recorded as the renderer
+#   being unavailable and latched the once-per-run warning, so a real outage later would have
+#   logged nothing.
+# `render_non_200` — the browser rendered the page and the main frame was answered with something
+#   other than a 200 where the direct GET got one: the edge telling the browser apart, whose
+#   interstitial markup (a 403 or 429 challenge) is not the page. A skip rather than a fired rung
+#   because nothing about the page was read; its own token because "Chromium is refused where our
+#   GET was not" is the rate a residual round asks for, and folded into the fired count it was
+#   byte-identical to a render that ran and produced chrome again. The URL is deliberately NOT
+#   memoised, because a 429 is retryable.
+# `render_dom_too_large` — the browser rendered the page and its DOM is over `RENDERED_DOM_MAX_CHARS`
+#   (`rendered_fetch.RenderDomOverCeiling`), so it was declined unread. A fact about the page,
+#   kept out of `renderer_unavailable` whose comment points triage at the Playwright install.
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",
@@ -194,6 +207,8 @@ RungSkipReason = Literal[
     "rendered_no_text",
     "renderer_unavailable",
     "render_timeout",
+    "render_non_200",
+    "render_dom_too_large",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the

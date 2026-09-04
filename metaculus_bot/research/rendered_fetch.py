@@ -38,6 +38,7 @@ from urllib.parse import urlparse
 
 from metaculus_bot.constants import RENDERED_DOM_MAX_CHARS
 from metaculus_bot.research.http_fetch import BROWSER_HEADERS
+from metaculus_bot.research.public_suffix import registrable_domain
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +65,13 @@ RENDER_DOM_READ_TIMEOUT_MS: int = 5_000
 # read at its bound. A caller-derived deadline has to leave this much room past the goto, or the
 # salvage-after-goto-timeout population above is cut off by the caller's own bound the instant
 # the settle ends — which is what happened at every Tier-1 budget under 40 s before the
-# navigation budget was recomputed here (see :func:`_goto_budget_ms`). Two costs are NOT reserved
-# here: the launch, which runs AFTER the recompute (0.3 s warm, seconds cold), and the bounded
-# teardown. Both fit only inside the caller's own wall margin (2 s for Tier-1), and only while the
-# browser is healthy. So when the goto runs its budget out, the DOM read's fixed bound lands past
-# the caller's deadline by the launch time, which is why the harvest drain is clamped to that
-# deadline in :func:`_navigate_and_read_dom` while the DOM read keeps its own bound (FUTURE.md
-# item 5 prices the two residuals).
+# navigation budget was recomputed here (see :func:`_goto_budget_ms`). Two costs are NOT in this
+# tail and are the CALLER's to reserve, in the deadline it hands the transport
+# (:data:`RENDER_EXIT_RESERVE_MS`): the launch, which runs AFTER the recompute (0.3 s warm,
+# seconds cold), and the shared teardown bound. So when the goto runs its budget out, the DOM
+# read's fixed bound lands past the transport's deadline by the launch time, inside that reserve,
+# and the harvest drain is clamped to the deadline itself in :func:`_navigate_and_read_dom` so a
+# body still in flight cannot spend the reserve on the harvest's behalf.
 RENDER_POST_GOTO_TAIL_MS: int = RENDER_SETTLE_MS + RENDER_DOM_READ_TIMEOUT_MS
 # Floor under the navigation budget once the gates are held. Below it the render DECLINES rather
 # than making a token attempt: a launch is 100-300 MB and one of the process-wide slots, and a
@@ -78,13 +79,24 @@ RENDER_POST_GOTO_TAIL_MS: int = RENDER_SETTLE_MS + RENDER_DOM_READ_TIMEOUT_MS
 # read in the seconds that were left. Live only through :func:`_goto_budget_ms`, which is the one
 # place the budget is computed after both gates are held.
 RENDER_MIN_GOTO_MS: int = 5_000
-# Bound on each teardown call (unroute, context close, browser close). A healthy browser answers
-# each in well under a second; a wedged one never answers `BrowserContext.close`, which awaits its
-# closed-future with no timeout of its own, and a render whose DOM was already read would then sit
-# in teardown until the caller's bound cut it — discarding the page it had. Past this bound the
-# call is abandoned and the driver stop at the end of the ``async_playwright()`` block kills the
-# browser process anyway, so nothing is left running.
+# ONE bound on the whole teardown (unroute, context close, browser close together), shared by
+# the three steps through :class:`_TeardownBudget`. A healthy browser answers each in well under
+# a second; a wedged one never answers `BrowserContext.close`, which awaits its closed-future with
+# no timeout of its own, and a render whose DOM was already read would then sit in teardown until
+# the caller's bound cut it — discarding the page it had. Shared rather than per step because
+# three separate 2 s bounds let a wedged browser run 6 s past the caller's cut (`asyncio.wait_for`
+# cancels the render and then AWAITS its unwinding finallys), which is what tripped the Tier-1
+# provider's 45 s wall. Past the bound a step is abandoned and the driver stop at the end of the
+# ``async_playwright()`` block kills the browser process anyway, so nothing is left running.
 RENDER_TEARDOWN_TIMEOUT_MS: int = 2_000
+# What a caller with a hard deadline must reserve for the render's EXIT, on top of the goto and
+# the post-goto tail: the shared teardown bound plus one second for the costs that run between
+# the budget recompute and the goto (the launch at 0.3 s warm, `new_context`, `new_page`) and for
+# the driver stop after the closes. The Tier-1 rung hands the transport its wall budget LESS this
+# reserve while keeping its own `wait_for` at the full budget, so a render that runs every bound
+# out still hands its DOM back before the outer cut instead of being cancelled in teardown. It
+# can only shorten the goto or decline earlier at `RENDER_MIN_GOTO_MS`, never lengthen a wait.
+RENDER_EXIT_RESERVE_MS: int = RENDER_TEARDOWN_TIMEOUT_MS + 1_000
 
 # Process-global cap on concurrent headless Chromium launches. Module-level, so the bound
 # spans every question running under the orchestrator's Semaphore(6) AND both fetch paths:
@@ -142,10 +154,13 @@ class RenderTimeout(TimeoutError):
     render: the first is re-raised for the caller to record as ``render_timeout``, the second is
     not a fact about the page and lands in the logged boundary like any other unexpected error.
 
-    The timed-out memo is written HERE, on this exception, and nowhere else: a caller that bounds
-    the whole call with its own ``wait_for`` cannot tell a render that ran out the clock from one
-    that never left the queue behind the two gates, and memoising the second would switch the
-    URL off for every later question in the run over a wait that was never about the page.
+    The timed-out memo is written at the RAISE SITE of this exception, inside the transport, and
+    nowhere else: a caller that bounds the whole call with its own ``wait_for`` cannot tell a
+    render that ran out the clock from one that never left the queue behind the two gates, and
+    memoising the second would switch the URL off for every later question in the run over a
+    wait that was never about the page. At the raise site rather than in a handler because the
+    exception unwinds through the bounded teardown before any handler sees it, and a caller's
+    cancellation landing during that teardown replaces it, so a handler would never run.
     """
 
 
@@ -159,6 +174,18 @@ class RenderBudgetExpired(TimeoutError):
     its own ``wait_for`` already handles that class; deliberately NOT a :class:`RenderTimeout`,
     because no browser ran and there is nothing to memoise. Only reachable with a deadline, so
     the gap-fill v2 path never sees it.
+    """
+
+
+class RenderDomOverCeiling(Exception):
+    """Chromium rendered the page and its DOM is over ``RENDERED_DOM_MAX_CHARS``.
+
+    Raised instead of returning ``None`` so the caller can record it as what it is, a fact about
+    the page (it rendered, and it is too big to read safely), rather than as the renderer being
+    unavailable, the count the operator reads as the Chromium install having failed. Not a
+    ``TimeoutError``: no clock ran out. Not memoised: the DOM had content, so "rendered to
+    nothing" would be false, and a size is not something a retry changes within a run either
+    way. Both callers decline on it the way they decline on ``None``.
     """
 
 
@@ -404,23 +431,48 @@ async def _in_own_task(call: Any, *, timeout_ms: int) -> Any:
     return await asyncio.wait_for(asyncio.ensure_future(call), timeout=timeout_ms / 1000)
 
 
-async def _teardown_step(name: str, call: Any, playwright_error: type[BaseException]) -> None:
+class _TeardownBudget:
+    """One ``RENDER_TEARDOWN_TIMEOUT_MS`` shared by every teardown step of one render.
+
+    Started by the FIRST step that asks, not when the render begins: computed eagerly before the
+    launch it would already be spent by the time teardown runs, and every step would be abandoned
+    to the driver stop. Each later step gets what the earlier ones left, floored at zero, so the
+    steps together hold a render for at most one bound past its last read whatever the browser
+    does. A step handed zero is scheduled and cancelled before it runs, which the driver stop then
+    covers, rather than skipped: the one code path keeps the one log line.
+    """
+
+    def __init__(self) -> None:
+        self._deadline_s: float | None = None
+
+    def remaining_ms(self) -> int:
+        now = time.monotonic()
+        if self._deadline_s is None:
+            self._deadline_s = now + RENDER_TEARDOWN_TIMEOUT_MS / 1000
+        return max(0, int((self._deadline_s - now) * 1000))
+
+
+async def _teardown_step(name: str, call: Any, playwright_error: type[BaseException], budget: _TeardownBudget) -> None:
     """Run one teardown call so that it can neither wedge the render nor replace its exception.
 
-    Bounded by ``RENDER_TEARDOWN_TIMEOUT_MS``; past it the call is abandoned and the driver stop
-    kills the browser. Playwright's own errors are swallowed at DEBUG because teardown races them
-    by construction: ``BrowserContext.close`` does not swallow ``TargetClosedError`` the way
-    ``Browser.close`` does, and the next protocol call re-raises any error a detached listener
-    stored on the connection, so an unguarded close in a ``finally`` would replace the
-    :class:`RenderTimeout` (or the caller's cancellation) unwinding through it and turn a cut-off
-    render into "the renderer is unavailable". Anything else is a bug and propagates.
+    Bounded by what is left of the render's shared teardown ``budget``; past it the call is
+    abandoned and the driver stop kills the browser. Playwright's own errors are swallowed at
+    DEBUG because teardown races them by construction: ``BrowserContext.close`` does not swallow
+    ``TargetClosedError`` the way ``Browser.close`` does, and the next protocol call re-raises any
+    error a detached listener stored on the connection, so an unguarded close in a ``finally``
+    would replace the :class:`RenderTimeout` (or the caller's cancellation) unwinding through it
+    and turn a cut-off render into "the renderer is unavailable". Anything else is a bug and
+    propagates.
     """
+    remaining_ms = budget.remaining_ms()
     try:
-        await _in_own_task(call, timeout_ms=RENDER_TEARDOWN_TIMEOUT_MS)
+        await _in_own_task(call, timeout_ms=remaining_ms)
     except TimeoutError:
         logger.warning(
-            "rendered fetch teardown: %s did not finish in %dms; leaving it to the driver stop",
+            "rendered fetch teardown: %s did not finish in the %dms left of the %dms teardown budget; "
+            "leaving it to the driver stop",
             name,
+            remaining_ms,
             RENDER_TEARDOWN_TIMEOUT_MS,
         )
     except playwright_error as exc:
@@ -432,11 +484,12 @@ async def _navigate_and_read_dom(
     url: str,
     playwright_error: type[BaseException],
     *,
+    memo_scope: MemoScope,
     goto_timeout_ms: int,
     deadline_monotonic_s: float | None,
     harvest: _JsonHarvest | None,
-) -> RenderedPage | None:
-    """Navigate to ``url``, let it settle, and return the rendered page, or None above the DOM ceiling.
+) -> RenderedPage:
+    """Navigate to ``url``, let it settle, and return the rendered page.
 
     Two departures from a plain ``networkidle`` navigation, both measured 2026-09-03. The wait
     condition is ``domcontentloaded`` plus a fixed settle, because network idle never arrives on
@@ -449,20 +502,24 @@ async def _navigate_and_read_dom(
     The DOM read is bounded by ``RENDER_DOM_READ_TIMEOUT_MS`` and raises :class:`RenderTimeout`
     when it fires — deliberately NOT swallowed into the salvage, because a page that keeps
     navigating has no DOM to salvage and the caller needs to tell this from a browser that is
-    missing or broken (see :func:`render_page`). The harvest's in-flight body reads are then
+    missing or broken (see :func:`render_page`). The timed-out memo for ``memo_scope`` is written
+    here, immediately before the raise, so it lands even when the caller's own cut arrives while
+    the exception is still unwinding through teardown. The harvest's in-flight body reads are
     drained INSIDE what is left of that same bound, never after it, and no later than the
-    caller's ``deadline_monotonic_s`` less one teardown bound when a deadline was given: the
-    harvest is opportunistic and may not lengthen a render whose real product is the DOM. The
-    second clamp is there because the read bound is fixed and the launch runs after the budget
-    recompute, so in the salvage shape the read bound lands past the caller's deadline by the
-    launch time, and a body still in flight there used to hold the drain past the Tier-1 rung's
-    outer cut, which then discarded a DOM this function had already read. The DOM read itself
-    keeps its fixed bound (see :data:`RENDER_DOM_READ_TIMEOUT_MS` for why).
+    caller's ``deadline_monotonic_s`` when a deadline was given: the harvest is opportunistic and
+    may not lengthen a render whose real product is the DOM. The second clamp is there because
+    the read bound is fixed and the launch runs after the budget recompute, so in the salvage
+    shape the read bound lands past the transport's deadline by the launch time, and a body still
+    in flight there used to hold the drain into the caller's exit reserve and past its outer cut,
+    which then discarded a DOM this function had already read. The deadline already excludes
+    that reserve (:data:`RENDER_EXIT_RESERVE_MS`), so nothing is subtracted from it again here.
+    The DOM read itself keeps its fixed bound (see :data:`RENDER_DOM_READ_TIMEOUT_MS` for why).
 
     The DOM is measured in characters against ``RENDERED_DOM_MAX_CHARS`` before anything copies
     it, because the copies are the hazard: the Tier-1 caller encodes it, decodes it back,
     rewrites it and hands trafilatura a tree several times its size, all while the browser is
-    still resident. A DOM over the ceiling is declined with the transport's ``None`` signal.
+    still resident. A DOM over the ceiling raises :class:`RenderDomOverCeiling`, its own decline,
+    so the caller can count it apart from a browser that is missing.
     """
     try:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
@@ -478,6 +535,7 @@ async def _navigate_and_read_dom(
     try:
         html = await _in_own_task(page.content(), timeout_ms=RENDER_DOM_READ_TIMEOUT_MS)
     except TimeoutError as exc:
+        _note_render_timeout(url, memo_scope=memo_scope)
         raise RenderTimeout(
             f"the DOM read of {urlparse(url).netloc} outlived {RENDER_DOM_READ_TIMEOUT_MS}ms: the page kept navigating"
         ) from exc
@@ -488,14 +546,12 @@ async def _navigate_and_read_dom(
             len(html),
             RENDERED_DOM_MAX_CHARS,
         )
-        return None
+        raise RenderDomOverCeiling(
+            f"the rendered DOM of {urlparse(url).netloc} is {len(html)} chars, over the {RENDERED_DOM_MAX_CHARS}-char ceiling"
+        )
     json_responses: tuple[HarvestedJson, ...] = ()
     if harvest is not None:
-        drain_until_s = (
-            read_deadline_s
-            if deadline_monotonic_s is None
-            else min(read_deadline_s, deadline_monotonic_s - RENDER_TEARDOWN_TIMEOUT_MS / 1000)
-        )
+        drain_until_s = read_deadline_s if deadline_monotonic_s is None else min(read_deadline_s, deadline_monotonic_s)
         await harvest.drain(until_monotonic_s=drain_until_s)
         json_responses = tuple(harvest.bodies)
     return RenderedPage(
@@ -518,16 +574,7 @@ def _harvestable_json_host(response_host: str, page_host: str) -> bool:
     the PSL algorithm would collapse two of them to their last two octets, so they are compared
     exactly and never otherwise. The explicitly allow-listed CDNs are the one exception to
     same-publisher.
-
-    The import is function-scoped because it is a REAL circular import: ``settlement_join``
-    imports ``resolution_source`` at module scope, and ``resolution_source`` imports this module
-    at module scope for its rendered rung, so a module-scope import here raises
-    ``ImportError: partially initialized module`` on the first import of either.
     """
-    from metaculus_bot.research.market_retrieval.settlement_join import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real circular import: settlement_join -> resolution_source -> this module, per the docstring
-        registrable_domain,
-    )
-
     if not response_host or not page_host:
         return False
     if response_host == page_host:
@@ -540,7 +587,15 @@ def _harvestable_json_host(response_host: str, page_host: str) -> bool:
     return publisher is not None and registrable_domain(response_host) == publisher
 
 
-def _is_json_content_type(content_type: str) -> bool:
+def is_json_content_type(content_type: str) -> bool:
+    """Whether a (lower-cased) Content-Type names a JSON body: ``application/json``, ``text/json``
+    or any ``+json`` structured suffix (``application/geo+json``, ``application/vnd.api+json``).
+
+    The ONE JSON vocabulary for the fetch paths. The harvest applies it at discovery, the
+    derived-feed rung at reuse, and the resolution-source 200-response router when it decides
+    what a directly cited URL is; a narrower spelling at any one of them strands a feed the
+    others accept, and a remembered endpoint is first-find-wins for the run.
+    """
     return any(token in content_type for token in _JSON_CONTENT_TYPE_TOKENS)
 
 
@@ -553,6 +608,13 @@ def _declared_length_over_cap(content_length: str | None) -> bool:
     content type alone. A declared length over the cap is enough to refuse the read: for a
     compressed response it is the compressed size, and the decoded body is only bigger. Absent,
     unparseable or lying headers fall through to the post-read test, which stays as the backstop.
+
+    That backstop is the harvest's one residual. HTTP/2 and chunked responses routinely declare
+    no length, and Playwright's ``body()`` offers no streaming route, so a single undeclared
+    oversized body is buffered whole before the post-read size test drops it. The reads are
+    serialised (:class:`_JsonHarvest`), so that is at most ONE such body at a time rather than
+    every layer a dashboard requests at once; refusing undeclared bodies outright would drop the
+    payload the rung exists to find.
     """
     if content_length is None:
         return False
@@ -562,41 +624,20 @@ def _declared_length_over_cap(content_length: str | None) -> bool:
         return False
 
 
-async def _harvest_json_response(
-    response: Any, *, page_host: str, into: list[HarvestedJson], playwright_error: type[BaseException]
-) -> None:
-    """Record one JSON response the page fetched, if it clears every bound.
+def _harvestable_json_response(response: Any, *, page_host: str) -> bool:
+    """Whether a response event is worth reading: same publisher, JSON, not declared over the cap.
 
-    Reads the body inside the response event so it is still available — after the page
-    navigates or closes, Playwright discards it. Every rejection is silent: this is
-    opportunistic discovery attached to a render whose real product is the DOM, and a body we
-    could not read must never be able to fail the render.
-
-    ``response.url`` and ``response.headers`` (lower-cased names) are Playwright's documented
-    ``Response`` contract; the fake in the tests honours the same one.
+    Synchronous on purpose, so the listener can apply it before any task exists: ``response.url``
+    and ``response.headers`` (lower-cased names) are sync properties of Playwright's documented
+    ``Response`` contract, and the fake in the tests honours the same one. Every rejection is
+    silent: this is opportunistic discovery attached to a render whose real product is the DOM.
     """
-    if len(into) >= HARVEST_MAX_RESPONSES:
-        return
-    url = response.url
-    if not _harvestable_json_host(urlparse(url).hostname or "", page_host):
-        return
+    if not _harvestable_json_host(urlparse(response.url).hostname or "", page_host):
+        return False
     headers = response.headers
-    if not _is_json_content_type((headers.get("content-type") or "").lower()):
-        return
-    if _declared_length_over_cap(headers.get("content-length")):
-        return
-    try:
-        body = await response.body()
-    except playwright_error as exc:
-        logger.debug("rendered fetch could not read a harvested response body: %s", exc)
-        return
-    # Re-checked AFTER the read: every handler that passed the check above was suspended in
-    # ``body()`` together, so the check before it bounds nothing on its own.
-    if len(into) >= HARVEST_MAX_RESPONSES:
-        return
-    if not (HARVEST_MIN_BODY_BYTES <= len(body) <= HARVEST_MAX_BODY_BYTES):
-        return
-    into.append(HarvestedJson(url=url, body=body))
+    if not is_json_content_type((headers.get("content-type") or "").lower()):
+        return False
+    return not _declared_length_over_cap(headers.get("content-length"))
 
 
 class _JsonHarvest:
@@ -610,6 +651,15 @@ class _JsonHarvest:
     The listener is therefore SYNC and creates the tasks itself, so pyee neither tracks them nor
     re-emits their exceptions on the page's ``error`` event, and :meth:`drain` joins them before
     the snapshot, inside the DOM read's own bound.
+
+    Every bound here is a memory bound, and two things make it hold. The listener SCREENS before
+    it spawns, so a page's hundreds of subresources never become tasks and only a response that
+    will actually be read does. And the reads are SERIALISED behind ``_read_gate``: every
+    response event fires before any body comes back, so without it every response that cleared
+    the screens entered ``body()`` together and the count cap bounded nothing, while Playwright
+    materialised each body base64 over the driver pipe and then decoded it (about 2.3x the body
+    at peak) beside a 100-300 MB browser. One body at a time makes the count check under the
+    gate exact and peak harvest memory one body.
     """
 
     def __init__(self, *, page_host: str, playwright_error: type[BaseException]) -> None:
@@ -617,15 +667,37 @@ class _JsonHarvest:
         self._playwright_error = playwright_error
         self.bodies: list[HarvestedJson] = []
         self._pending: set[asyncio.Task[None]] = set()
+        self._read_gate = asyncio.Semaphore(1)
 
     def on_response(self, response: Any) -> None:
-        task = asyncio.create_task(
-            _harvest_json_response(
-                response, page_host=self._page_host, into=self.bodies, playwright_error=self._playwright_error
-            )
-        )
+        if len(self.bodies) >= HARVEST_MAX_RESPONSES:
+            return
+        if not _harvestable_json_response(response, page_host=self._page_host):
+            return
+        task = asyncio.create_task(self._read(response))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
+
+    async def _read(self, response: Any) -> None:
+        """Read one screened body under the gate and keep it if its size clears the floor and cap.
+
+        The body is read inside the response event's lifetime so it is still available (after the
+        page navigates or closes, Playwright discards it). A body we could not read must never be
+        able to fail the render, so Playwright's own error is a DEBUG line and nothing more. The
+        count is checked again under the gate, where it is exact: no other read is in flight, and
+        the append below runs before this task yields again.
+        """
+        async with self._read_gate:
+            if len(self.bodies) >= HARVEST_MAX_RESPONSES:
+                return
+            try:
+                body = await response.body()
+            except self._playwright_error as exc:
+                logger.debug("rendered fetch could not read a harvested response body: %s", exc)
+                return
+        if not (HARVEST_MIN_BODY_BYTES <= len(body) <= HARVEST_MAX_BODY_BYTES):
+            return
+        self.bodies.append(HarvestedJson(url=response.url, body=body))
 
     async def drain(self, *, until_monotonic_s: float) -> None:
         """Wait for the in-flight body reads, but no later than ``until_monotonic_s``; cancel the rest."""
@@ -650,11 +722,14 @@ async def render_page(
     """Render ``url`` in headless Chromium and return its DOM, or None when the rung declines.
 
     ``None`` is the one graceful-failure signal both callers already handle, and it covers
-    every way this rung can DECLINE: a URL a browser already read to nothing in this run under
-    the caller's own ``memo_scope``, Playwright missing or broken, a host that cannot be pinned
-    to a public IP, a DOM over the ceiling, and any error out of the browser. A navigation budget
-    under the floor once the gates are held is the one decline that is NOT ``None``: it raises
-    :class:`RenderBudgetExpired` so the caller can record its own wall budget running out. A caller that wants to tell those apart reads
+    every way this rung can DECLINE with nothing rendered: a URL a browser already read to
+    nothing in this run under the caller's own ``memo_scope``, Playwright missing or broken, a
+    host that cannot be pinned to a public IP, and any error out of the browser. Two declines are
+    NOT ``None``, because each is a fact the caller counts apart from a missing browser: a
+    navigation budget under the floor once the gates are held raises :class:`RenderBudgetExpired`
+    (the caller's wall budget ran out in the queue), and a rendered DOM over
+    ``RENDERED_DOM_MAX_CHARS`` raises :class:`RenderDomOverCeiling` (the page rendered and is too
+    big to read safely). A caller that wants to tell the ``None`` causes apart reads
     :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
 
     A render that ran and was CUT OFF is different, and raises :class:`RenderTimeout` (a
@@ -662,16 +737,24 @@ async def render_page(
     because the page kept navigating. It is not folded into ``None`` because the two mean
     different things to a caller — a timeout says nothing about whether Chromium works, so it
     must neither trip the once-per-process unavailable warning nor be recorded as the browser
-    being absent — and because the Tier-1 rung bounds this whole call against its own wall
-    budget with the same exception, so one ``except TimeoutError`` there covers both bounds.
-    The transport memoises the timed-out URL for the run at that point — and only at that point,
-    because a caller's outer bound can also fire while the render is still queued behind the two
-    gates, which says nothing about the page — and a memoised timeout is RE-RAISED here rather
-    than declined, so a second question citing the same hostile page records the same reason
-    again instead of reading as a missing browser. The memo is written only when this bound fires
-    before the caller's: in the salvage shape (the goto ran its budget out) the DOM-read bound
-    sits past the caller's deadline by the launch time, so the Tier-1 rung's outer cut lands
-    first and that URL is not memoised (see :data:`RENDER_POST_GOTO_TAIL_MS`).
+    being absent — and it is its own class so the Tier-1 rung, which also bounds this whole call
+    with a ``wait_for`` of its own, can tell a render that ran out the clock (this exception) from
+    one its outer bound cut while it was still queued behind the two gates (a bare
+    ``TimeoutError``, which says nothing about the page). The transport memoises the timed-out
+    URL for the run at the raise site — and only there, for that same reason — and a memoised
+    timeout is RE-RAISED here rather than declined, so a second question citing the same hostile
+    page records the same reason again instead of reading as a missing browser.
+
+    What a deadline bounds, and what it does not. ``deadline_monotonic_s`` is the instant by
+    which the transport must have its DOM (and any harvested bodies) in hand: the goto is sized
+    off it less the post-goto tail, the harvest drain is clamped to it, and the salvage DOM read
+    can land at most the launch time past it. Teardown then runs inside the shared
+    ``RENDER_TEARDOWN_TIMEOUT_MS`` bound, and the driver stop at the end of the
+    ``async_playwright()`` block runs after that, so a caller with a hard wall has to hand in a
+    deadline that reserves both (:data:`RENDER_EXIT_RESERVE_MS`). The driver stop is the one
+    step left UNBOUNDED, deliberately: it is what actually kills the Chromium process, and
+    abandoning it on a wedged browser would leak 100-300 MB past ``RENDER_LAUNCH_CAP``, an OOM
+    nothing can catch. A healthy stop is milliseconds and fits inside the reserve's spare second.
 
     The failure boundary around the browser is split three ways, and the split is the point.
     Playwright's own ``Error`` keeps the once-per-process latch: a launch that cannot find the
@@ -728,26 +811,27 @@ async def render_page(
                 playwright,
                 url,
                 PlaywrightError,
+                memo_scope=memo_scope,
                 host=host,
                 vetted_ip=vetted_ip,
                 goto_timeout_ms=goto_timeout_ms,
                 deadline_monotonic_s=deadline_monotonic_s,
                 harvest_json=harvest_json,
             )
-    # Nothing ran and nothing is memoised; the caller records its own wall budget running out.
-    except RenderBudgetExpired:
+    # The two declines the caller records under their own tokens: nothing is memoised for either
+    # (nothing ran for the first; the second rendered content, just too much of it).
+    except (RenderBudgetExpired, RenderDomOverCeiling):
         raise
     # Ordered before Playwright's Error deliberately, though the order is not load-bearing:
     # Playwright's TimeoutError derives from its own Error, not the builtin, so this clause never
     # sees one, and a raw OS-level TimeoutError is not a RenderTimeout and falls through to the
-    # logged boundary below.
+    # logged boundary below. The memo was already written at the raise site; only the log is here.
     except RenderTimeout:
         logger.warning(
             "rendered fetch timed out reading the DOM of %s after %dms: the page kept navigating",
             urlparse(url).netloc,
             RENDER_DOM_READ_TIMEOUT_MS,
         )
-        _note_render_timeout(url, memo_scope=memo_scope)
         raise
     except PlaywrightError as exc:
         _warn_playwright_unavailable_once(exc)
@@ -764,17 +848,21 @@ async def _render_in_browser(
     url: str,
     playwright_error: type[BaseException],
     *,
+    memo_scope: MemoScope,
     host: str,
     vetted_ip: str,
     goto_timeout_ms: int,
     deadline_monotonic_s: float | None,
     harvest_json: bool,
-) -> RenderedPage | None:
+) -> RenderedPage:
     """Recompute the budget, launch, render inside a guarded context, tear both down bounded.
 
     Split out of :func:`render_page` so the gates it runs under, and the soft-fail boundary
-    around them, read as one statement each there.
+    around them, read as one statement each there. The three teardown steps (the unroute inside
+    the context, then the two closes here) share ONE :class:`_TeardownBudget`, so whatever the
+    browser does the exit costs at most ``RENDER_TEARDOWN_TIMEOUT_MS`` before the driver stop.
     """
+    teardown = _TeardownBudget()
     goto_budget_ms = _goto_budget_ms(goto_timeout_ms, deadline_monotonic_s)
     if goto_budget_ms is None:
         logger.warning(
@@ -809,14 +897,16 @@ async def _render_in_browser(
                 context,
                 url,
                 playwright_error,
+                memo_scope=memo_scope,
                 goto_budget_ms=goto_budget_ms,
                 deadline_monotonic_s=deadline_monotonic_s,
                 harvest_json=harvest_json,
+                teardown=teardown,
             )
         finally:
-            await _teardown_step("context.close", context.close(), playwright_error)
+            await _teardown_step("context.close", context.close(), playwright_error, teardown)
     finally:
-        await _teardown_step("browser.close", browser.close(), playwright_error)
+        await _teardown_step("browser.close", browser.close(), playwright_error, teardown)
 
 
 async def _render_in_context(
@@ -824,10 +914,12 @@ async def _render_in_context(
     url: str,
     playwright_error: type[BaseException],
     *,
+    memo_scope: MemoScope,
     goto_budget_ms: int,
     deadline_monotonic_s: float | None,
     harvest_json: bool,
-) -> RenderedPage | None:
+    teardown: _TeardownBudget,
+) -> RenderedPage:
     """Guard the context, open the page, navigate and read; leave the closes to the caller."""
 
     # Defense-in-depth on top of the main-frame pin above. The route guard re-checks every HTTP
@@ -862,6 +954,7 @@ async def _render_in_context(
             page,
             url,
             playwright_error,
+            memo_scope=memo_scope,
             goto_timeout_ms=goto_budget_ms,
             deadline_monotonic_s=deadline_monotonic_s,
             harvest=harvest,
@@ -879,5 +972,6 @@ async def _render_in_context(
         # mid-flight (Playwright's own remedy for this exact message). SSRF is unaffected: the
         # guard already ran for every request dialed while the page was live, and a request
         # racing teardown has no live target to exfiltrate through. Bounded and guarded like the
-        # two closes that follow it, so neither a race nor a wedged browser can skip them.
-        await _teardown_step("unroute_all", context.unroute_all(behavior="ignoreErrors"), playwright_error)
+        # two closes that follow it, on the same shared budget, so neither a race nor a wedged
+        # browser can skip them or hold the render past one teardown bound.
+        await _teardown_step("unroute_all", context.unroute_all(behavior="ignoreErrors"), playwright_error, teardown)
