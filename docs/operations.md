@@ -526,11 +526,12 @@ gracefully without a browser. The cost of a missing browser is visible per quest
 resolution-source provider's `renderer_unavailable_skips` count, so a run whose install failed
 is readable from the archive rather than only from the annotation. That count excludes a URL an
 earlier question already rendered to nothing this run (its own `rendered_no_text_skips`) and the
-three declines that are facts about the page rather than the runner, each under its own key: a
+four declines that are facts about the page rather than the runner, each under its own key: a
 render the transport's DOM-read bound cut off (`render_timeout_skips`), a browser answered a
-non-200 where the direct GET got 200 (`render_non_200_skips`) and a rendered DOM over
-`RENDERED_DOM_MAX_CHARS` (`render_dom_too_large_skips`). Neither a memo hit nor a hostile page
-can inflate the install-failed signal.
+non-200 where the direct GET got 200 (`render_non_200_skips`), a rendered DOM over
+`RENDERED_DOM_MAX_CHARS` (`render_dom_too_large_skips`) and a main frame that landed on a host
+other than the one the transport pinned (`render_off_host_skips`, added 2026-09-04). Neither a memo
+hit nor a hostile page can inflate the install-failed signal.
 
 | Workflow | Trigger | Mode | What it does |
 |---|---|---|---|
@@ -1435,6 +1436,18 @@ the telemetry markers:
   host served it instead are otherwise indistinguishable, and the reply is what tells them
   apart. The `ungrounded` line appears only when that read said something, since the same
   branch also fires on an empty reply.
+- `RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host>
+  landed_host=<host>`, a WARNING, one per headless-Chromium render whose main frame ended up on a
+  host other than the one the transport pinned at launch, emitted by the shared transport
+  `research/rendered_fetch.py` and so fired for either caller, which is what `scope` names. The
+  DOM was refused before it was read, so nothing from that render is published and the direct
+  fetch's result stands. Hostnames only, never the landing URL, which can carry a session token.
+  This is the ONLY per-event record of an off-host landing, because a refused render is a skip and
+  a skip emits no `RESOLUTION_SOURCE_ESCALATION` line; the per-question rate is
+  `render_off_host_skips` in the resolution-source provider's `details["counts"]`. Registered on
+  2026-09-04 with the check itself, so no archived run from before that merge carries one, and a
+  local probe of 22 real render targets on that date produced zero of them. Harvested as
+  `rendered_fetch_off_host`.
 - `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]` — a WARN, one per
   gap-fill v2 `read_document` call whose `url_context` retrieval brought back nothing,
   so the answer would have been unsourced recall and the `fetched` verification tier is

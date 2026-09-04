@@ -173,30 +173,37 @@ escalates when the lighter one comes up short:
    contends for `http_fetch.pdf_parse_semaphore()`, two slots held loop-wide with the
    Tier-1 resolution-source PDF rung. It bounds concurrent parses and their pypdf arenas,
    not how many fetched bodies are resident.
-4. **Headless Chromium** (`_try_rendered_fetch` in `agentic/tools.py`, a thin mapping
-   onto this ladder's `PlainFetchResult` over the shared browser transport
-   `metaculus_bot/research/rendered_fetch.py`, which the Tier-1 resolution-source
-   rendered rung uses too). If plain extraction returns
-   too little text (below `GAP_FILL_V2_MIN_CONTENT_CHARS`), the ladder re-fetches
-   with Playwright's headless Chromium to run JavaScript. It waits for
-   DOM-ready plus a fixed settle rather than for network idle, and salvages
-   `page.content()` when the navigation itself times out: 4 of the 10 render
-   rescues in the 2026-09-03 replay came from pages whose DOM was complete when
-   `page.goto` raised. The rung's 35 s ceiling is unchanged; the settle comes
-   out of the goto budget. The SSRF guard is re-applied to every request Chromium
-   makes EXCEPT three that Playwright's request interception cannot see: a
-   server-side redirect hop, which the driver auto-continues; a request Playwright
-   cannot attribute to a frame, which it auto-continues the same way; and a
-   WebSocket handshake, which routes through a separate API this transport does not
-   register. The route-guard comment in `research/rendered_fetch.py` states what
-   each of those means and what Chromium's own Local Network Access check does and
-   does not cover. If Playwright isn't installed, this rung logs a one-time warning
-   and the plain result stands. A URL where Chromium ran and extracted nothing is remembered
-   for the run and never rendered again, so the second launch a documented escalation
-   would spend (a js-walled `fetch` the driver follows with `read_document`) is skipped.
-   That is the ONLY outcome memoized: a `blocked`, `error` or `throttled` GET is not,
-   because the driver is told to retry those URLs and caching them would suppress a retry
-   the tool descriptions promise.
+4. **Headless Chromium** (`_try_rendered_fetch` in `agentic/tools.py`, a thin mapping onto
+   this ladder's `PlainFetchResult` over the shared browser transport
+   `metaculus_bot/research/rendered_fetch.py`, which the Tier-1 resolution-source rendered
+   rung uses too). If plain extraction returns too little text (below
+   `GAP_FILL_V2_MIN_CONTENT_CHARS`), the ladder re-fetches with Playwright's headless
+   Chromium to run JavaScript. It waits for DOM-ready plus a fixed settle rather than for
+   network idle, and salvages `page.content()` when the navigation itself times out: 4 of
+   the 10 render rescues in the 2026-09-03 replay came from pages whose DOM was complete
+   when `page.goto` raised. The rung's 35 s ceiling is unchanged; the settle comes out of
+   the goto budget. The SSRF guard is re-applied to every request Chromium makes EXCEPT
+   three that Playwright's request interception cannot see, and since 2026-09-04 two of
+   those three are closed by other mechanisms in the same transport. A server-side
+   redirect hop is auto-continued by the driver and stays invisible to the ROUTE HANDLER,
+   the callback that re-checks each request the browser is about to make; what closes it
+   for the main frame is the transport's landing-host check, which after the navigation
+   settles compares the LANDING HOST, the hostname `page.url` ended up on, with the PINNED
+   HOST that its `--host-resolver-rules` launch argument covers, and refuses the DOM
+   unread when the two differ. This ladder folds that refusal into the same None it
+   returns for a render that read nothing. A WebSocket handshake, which routes through a
+   separate Playwright API, is blocked by a `route_web_socket` handler that never connects
+   the socket to a server. What is left is a request Playwright cannot attribute to a
+   frame, auto-continued the same way, and a cross-host subresource whose host Chromium
+   resolves with no pin of ours. The route-guard comment in `research/rendered_fetch.py`
+   states what each of those means and what Chromium's own Local Network Access check does
+   and does not cover. If Playwright isn't installed, this rung logs a one-time warning
+   and the plain result stands. A URL where Chromium ran and extracted nothing is
+   remembered for the run and never rendered again, so the second launch a documented
+   escalation would spend (a js-walled `fetch` the driver follows with `read_document`) is
+   skipped. That is the ONLY outcome memoized: a `blocked`, `error` or `throttled` GET is
+   not, because the driver is told to retry those URLs and caching them would suppress a
+   retry the tool descriptions promise.
 5. **read_document.** If the URL turns out to be an image, or a PDF with no text
    layer at all, `fetch` auto-escalates to `read_document` so the driver keeps
    its "handled automatically" promise without spending a second tool call. The

@@ -267,7 +267,8 @@ Each of these has cost real work at least once. The pointer is where the reasoni
   loop that re-guards every hop, the meta-refresh hop that no HTTP status announces, and the
   per-host politeness semaphores. Two transports sit beside it and are SHARED with gap-fill v2
   rather than copied: `research/rendered_fetch.py` owns the headless-Chromium render, including
-  the DNS pin, the per-request route guard and the process-global launch cap, and
+  the DNS pin, the per-request route guard, the landing-host check after navigation, the
+  WebSocket block and the process-global launch cap, and
   `research/url_context_reader.py` owns the one paid Gemini `url_context` read, with
   `research/robots_policy.py` the per-host `Google-Extended` pre-check in front of it. Do not
   hand-roll a fetch, a render or a reader.

@@ -1017,7 +1017,14 @@ Flourish iframe comes back as a bare tag. Its floor,
 launch plus a DOM-ready navigation costs several seconds even on a page that renders cleanly, and
 the launch slot is contended process-wide, so a question with no budget left would take a slot a
 sibling question could still land a page with. That floor is the PRE-gate check, read before the
-render queues on the per-host gate and the launch cap. The transport's own post-gate need is
+render queues on the per-host gate and the launch cap. The browser is handed `direct.url`, the URL
+the direct fetch LANDED on once its own redirect hops were followed and re-guarded, rather than the
+cited URL, so the DNS pin the transport sets covers the host that actually serves the content and a
+page whose canonical form is one ordinary hop away (`example.com` to `www.example.com`) is not
+refused for taking it; when the two differ, the landing is re-vetted with the same self-reference
+and public-URL checks every derived hop owes. Both render memos and the HTML classifier key on the
+URL rendered, while the rung's attempt stays keyed on the cited URL, which is what the escalation
+line names. The transport's own post-gate need is
 higher: `RENDER_MIN_GOTO_MS` (5 s of navigation) plus `RENDER_POST_GOTO_TAIL_MS` (the 2 s settle
 and the 5 s DOM-read bound, reserved so a goto that runs its budget out can still be salvaged)
 plus `RENDER_EXIT_RESERVE_MS` (3 s, described below), 15 s in all, so a render admitted with 12 to
@@ -1028,7 +1035,7 @@ band's reach, and the call is the operator's (FUTURE.md item 5). The rendered DO
 disclosure leads as a directly-fetched one, and can still be withheld. A transport that declines
 (Playwright missing or broken, a host that will not pin to a public IP, or a browser error) is
 recorded as a SKIP with the reason `renderer_unavailable` rather than as a fired rung, because
-nothing was rendered and so nothing about the page changed. Four nearby cases are kept OUT of
+nothing was rendered and so nothing about the page changed. Five nearby cases are kept OUT of
 that reason, so that neither a memo hit, a queue timeout nor a fact about the page can read as
 the Chromium install having failed. A URL an earlier question already rendered to nothing this
 run is `rendered_no_text` (the memo doing its job). A render that ran out of budget queued behind
@@ -1037,7 +1044,11 @@ same reason the pre-gate floor check records). A browser that was answered a non
 direct GET got 200 is `render_non_200`: the DOM belongs to the host's interstitial or error page,
 so it is not read as content, and the URL is not memoised because a 429 is retryable. A rendered
 DOM over `RENDERED_DOM_MAX_CHARS`, which the transport signals with `RenderDomOverCeiling`, is
-`render_dom_too_large`, declined before anything copies it.
+`render_dom_too_large`, declined before anything copies it. And a main frame that landed on a host
+other than the pinned one, which the transport signals with `RenderOffHost`, is `render_off_host`:
+the transport refuses the DOM before `page.content()` is read, so nothing from that render reaches
+the classifier and the direct result stands. It emits one WARNING under the marker
+`RENDERED_FETCH_OFF_HOST` (below) and, like every skip, no `RESOLUTION_SOURCE_ESCALATION` line.
 Two more bounds hold the rung inside the wall, and which one fired is what the skip reason says.
 Inside the transport, `page.content()` is capped at `RENDER_DOM_READ_TIMEOUT_MS`: on a settled DOM
 it is a sub-second round trip, and it runs long only when the page keeps navigating after the settle
@@ -1200,7 +1211,7 @@ parse gate is what binds. `renderer_unavailable_skips` is a browser rung that ne
 most often because Chromium is missing on the runner (the install step is `continue-on-error` in
 every workflow, so its absence is by design), and it is invisible in `rendered_attempts`. It
 excludes a URL an earlier question rendered to nothing, which is its own
-`rendered_no_text_skips`, and the three facts about the page that follow, each under its own key,
+`rendered_no_text_skips`, and the four facts about the page that follow, each under its own key,
 so neither a memo hit nor a hostile page can inflate the install-failed signal.
 `render_timeout_skips` is a browser rung the transport's own DOM-read cap cut off: a page that
 keeps navigating after the settle, which is a fact about the page rather than about the runner or
@@ -1213,7 +1224,10 @@ read as content; what binds is the edge telling Chromium apart from our GET, the
 escalation ladder's own case rests on. `render_dom_too_large_skips` is a browser that rendered the
 page to a DOM over `RENDERED_DOM_MAX_CHARS` and was declined unread; what binds is the size
 ceiling, a fact about the page that used to be folded into `renderer_unavailable_skips`, where it
-pointed triage at the Playwright install.
+pointed triage at the Playwright install. `render_off_host_skips` is a browser whose main frame
+landed on a host other than the pinned one, a server-side redirect hop the route handler never
+sees, so the transport refused the DOM unread; it is the one count that says how often a cited page
+sends the browser somewhere else, which is what prices the host-equality rule.
 `wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
 per-question cap is what binds; `url_context_cap_skips` is the paid rung's analogue, a question
 that spent its per-question paid-read budget (`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`) on
@@ -1235,9 +1249,16 @@ connect-time `FilteringResolver` (the actual DNS-rebinding boundary, not the
 preflight) re-checks every resolved IP. Redirects are followed manually under the
 `MAX_REDIRECTS` hop cap (`research/http_fetch.py`, shared with the v2 agentic
 tools), re-guarding each `Location`. That per-hop re-guard is the aiohttp path's;
-the `route=rendered` rung guards its requests differently and less completely,
-because Playwright's request interception never sees a server-side redirect hop,
-and the route-guard comment in `research/rendered_fetch.py` is the authority on
+the `route=rendered` rung guards its requests differently, because Playwright's
+request interception never sees a server-side redirect hop. Since 2026-09-04 the
+transport closes that channel for the main frame rather than accepting it: once the
+navigation has settled it compares the LANDING HOST, the hostname `page.url` ended
+up on, with the PINNED HOST that its `--host-resolver-rules` launch argument covers,
+and refuses the DOM unread when the two differ. It also registers a
+`route_web_socket` handler that never connects the socket to a server, so a page
+WebSocket, which HTTP interception cannot see at all, is blocked. What is left is a
+cross-host SUBRESOURCE, whose host Chromium resolves with no pin of ours, and the
+route-guard comment in `research/rendered_fetch.py` is the authority on
 what that transport does and does not cover. Per-URL truncation appends a
 `[truncated at N chars — full source at URL]` marker, the aggregate section-budget
 trim routes through the same marker-emitting truncator (a bare slice could cut
@@ -1270,22 +1291,24 @@ one, split by what each qualifies. `FetchStatusReason` qualifies a result's STAT
 / `encrypted` / `malformed` under `unreadable_document`, and `budget_skipped` / `parse_contention`
 under the `unsupported_type` a held-but-unparsed document earns. `RungSkipReason` qualifies a rung
 attempt that PRODUCED NO RESULT (`RungAttempt.skipped_reason`), which is why it has nowhere else to
-record its reason. Most of those attempts never ran at all; three of them did run a browser and
-came back with nothing usable, `render_timeout`, `render_non_200` and `render_dom_too_large`, so
-"skip" here means "produced nothing" rather than "never started". The vocabulary is `wall_budget`,
-`wayback_cap`, `url_context_cap`, `fast_path`, `no_api_key`, `robots_disallowed`,
-`rendered_no_text`, `renderer_unavailable`, `render_timeout`, `render_non_200`,
-`render_dom_too_large`, and `parse_contention` again (a held document declined for want
-of a parse slot records the skip AND stamps the withheld result's `status_reason`, the one token
-shared by both Literals). Both are a
-closed `Literal`, so a misspelt reason is a type error rather than a permanently-zero count.
+record its reason. Most of those attempts never ran at all; four of them did run a browser and
+came back with nothing usable, `render_timeout`, `render_non_200`, `render_dom_too_large` and
+`render_off_host`, so "skip" here means "produced nothing" rather than "never started". The
+vocabulary is `wall_budget`, `wayback_cap`, `url_context_cap`, `fast_path`, `no_api_key`,
+`robots_disallowed`, `rendered_no_text`, `renderer_unavailable`, `render_timeout`, `render_non_200`,
+`render_dom_too_large`, `render_off_host`, and `parse_contention` again (a held document declined
+for want of a parse slot records the skip AND stamps the withheld result's `status_reason`, the one
+token shared by both Literals). Both are a closed `Literal`, so a misspelt reason is a type error
+rather than a permanently-zero count.
 `renderer_unavailable` is the browser declining before it rendered anything (missing, broken,
 unpinnable host); `render_timeout` is a render the transport's own DOM-read cap cut off because the
 page kept navigating, and the two are kept apart because only the first says anything about
 Chromium. A render the rung's own outer bound cut off is `wall_budget` instead, because that bound
 fires while the render is still queued behind the launch gates or once the transport has overrun
 its exit reserve; a browser answered a non-200 where the direct GET got 200 is `render_non_200`;
-and a rendered DOM over `RENDERED_DOM_MAX_CHARS` is `render_dom_too_large`.
+a rendered DOM over `RENDERED_DOM_MAX_CHARS` is `render_dom_too_large`; and a main frame that
+landed on a host other than the pinned one is `render_off_host`, the server-side redirect hop the
+route handler never sees, refused before the DOM was read.
 `no_resolving_content` has four reasons (`embed_shell`, `thin_page`, `no_matching_passage` and
 `not_addressed`): the third is the only one that is a document rather than a page, and the fourth
 is the paid reader's, a page Gemini retrieved whose answer said it does not discuss the ask. All
@@ -1416,6 +1439,14 @@ first two are parallel to their `AGENTIC_URLCONTEXT_ROBOTS_SKIP` /
 `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` twins on the gap-fill v2 reader. No archived run from
 before that merge carries any of the three, so an era-bucketed rate starts there.
 `docs/operations.md` "Reading run logs" has the field meanings.
+
+The shared browser transport adds one greppable line of its own, a registered marker spec since
+2026-09-04: `RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host>
+landed_host=<host>`, a WARNING harvested as `rendered_fetch_off_host`. It fires wherever the render
+was asked for, so `scope` says which caller paid for the launch, and it names hostnames only, never
+the landing URL, which can carry a session token. It is the ONLY per-event record of an off-host
+landing, because a refused render is a skip and a skip emits no `RESOLUTION_SOURCE_ESCALATION` line;
+the per-question rate lives in `render_off_host_skips` under `details["counts"]`.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window), on the same leakage rationale. The section
