@@ -118,7 +118,7 @@ import logging
 import os
 import socket
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -782,6 +782,23 @@ class FetchContext:
                 skipped_reason=reason,
             )
         )
+
+
+def _aux_ctx(ctx: FetchContext) -> FetchContext:
+    """A child context for a request a rung makes on the cited URL's BEHALF.
+
+    The Wayback snapshot, the remembered derived feed and the robots.txt pre-check all go
+    through :func:`_fetch_direct`, whose own rungs (the meta-refresh hop, the local PDF read)
+    stamp attempts onto whatever context they are handed. On the PAGE's context those stamps
+    hijack the record: an archived PDF capture came back ``route="pdf_local"`` — ``route`` is
+    the last rung that fired — was counted as a Wayback attempt AND a document read, and lost
+    the archived-copy caveat that ``_route_caveats`` keys on the route. The child shares the
+    clock, the query, the wall-clock origin and the per-question budget, and owns a rung list
+    nobody reads, which is :class:`FetchContext`'s one-per-fetched-URL invariant applied to a
+    URL the question never cited. Its attempts are deliberately NOT merged back: that would put
+    ``pdf_local`` last again and the route would still be wrong.
+    """
+    return replace(ctx, rungs=[])
 
 
 def _stamped_with_route(result: FetchResult, ctx: FetchContext) -> FetchResult:
@@ -1722,7 +1739,7 @@ async def _derived_api_rung(
         f"resolution_source derived_api: {urlparse(url).netloc} -> {endpoint.endpoint_url} "
         f"(found on {endpoint.discovered_on}, direct read was {direct.status})"
     )
-    feed = await _fetch_direct(session, endpoint.endpoint_url, host_sems, ctx)
+    feed = await _fetch_direct(session, endpoint.endpoint_url, host_sems, _aux_ctx(ctx))
     if feed.status != "success":
         return None
     return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status)
@@ -1761,7 +1778,7 @@ async def _wayback_snapshot_result(
     copy with no usable date cannot carry it. The direct status is not lost by that swap either:
     the ``RESOLUTION_SOURCE_ESCALATION`` line for this rung carries ``from_status``.
     """
-    snapshot = await _fetch_direct(session, wayback_snapshot_url(url), host_sems, ctx)
+    snapshot = await _fetch_direct(session, wayback_snapshot_url(url), host_sems, _aux_ctx(ctx))
     parsed = parse_snapshot_url(snapshot.url)
     if parsed is not None and (
         is_metaculus_self_ref(parsed.inner_url) or not await is_public_http_url(parsed.inner_url)
@@ -1909,7 +1926,7 @@ async def _fetch_robots_txt(
     floor — which reads as "no directives", i.e. proceed and pay, the only direction an
     unreadable robots.txt is allowed to fail in.
     """
-    result = await _fetch_direct(session, robots_url, host_sems, ctx)
+    result = await _fetch_direct(session, robots_url, host_sems, _aux_ctx(ctx))
     return result.text if result.status == "success" else None
 
 

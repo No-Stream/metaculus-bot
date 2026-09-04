@@ -790,6 +790,38 @@ class TestWaybackRung:
         assert _rung_counts(results)["wayback_attempts"] == 2
         assert _rung_counts(results)["wayback_cap_skips"] == 1
 
+    async def test_an_archived_pdf_keeps_the_wayback_route_and_its_caveat(self):
+        """The snapshot fetch runs on a CHILD context, so the rungs the archive's own bytes go
+        through (here the local PDF read) stay off the cited URL's record.
+
+        Sharing the page's context stamped this result `route=pdf_local`, double-counted one
+        rescue as a Wayback attempt AND a document read, and — because `_route_caveats` keys on
+        the route — rendered the PDF sentence while DROPPING the archived-copy disclosure the
+        operator made the condition of admitting a snapshot at all."""
+        session = self._session(
+            page=FakeResponse(403, body=b"denied", content_type="text/html"),
+            captured=self._NOW - timedelta(days=3),
+            archived=FakeResponse(
+                200,
+                body=build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2 as of August 24"]]),
+                content_type="application/pdf",
+            ),
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(now=self._NOW, query="hospitalizations reported"))
+
+        assert result.status == "success"
+        assert result.route == "wayback"
+        assert [a.rung for a in result.rung_attempts] == ["wayback"]
+        assert result.text.startswith("[Archived copy from the Wayback Machine, captured 2026-09-01, 3 days before")
+        assert "922" in result.text
+        counts = _rung_counts([result])
+        assert counts["wayback_attempts"] == 1
+        assert counts["pdf_documents_read"] == 0
+        rendered = format_resolution_sections([result], self._NOW)
+        assert ROUTE_CAVEATS["wayback"] in rendered
+        assert ROUTE_CAVEATS["pdf_local"] not in rendered
+
     async def test_an_archived_page_that_is_itself_unreadable_leaves_the_direct_status(self, caplog):
         session = self._session(
             page=FakeResponse(403, body=b"", content_type="text/html"),
