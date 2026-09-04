@@ -5,18 +5,25 @@
 `No-Stream/metaculus-bot`, `upstream` is the Metaculus template, so every `gh` call needs
 `--repo No-Stream/metaculus-bot`)
 **Repo:** `/Users/flatljan/personal/metaculus-bot`
-**Status (updated 2026-09-04 14:45 PT):** DONE except the operator's push and merge. The pushed head
+**Status (updated 2026-09-04, late afternoon PT):** DONE except the operator's push and merge. The pushed head
 `1f2b504` has PR CI green (run 33917127083). After it, the Codex review triage landed as four worktree merges
 plus three small commits ending at `c07d7cf`: the browser route-guard comment and docs now say what the guard
 covers (server-side redirect hops are unguarded), the model-id rule in AGENTS.md and `docs/roster_history.md`
-states the real split with `tests/test_model_name_locations.py` pinning it, the `litellm_callback_drain_timeout`
-marker spec is registered, and FUTURE.md carries the deferred browser-transport fix (item 8) and the un-clocked
-PDF prologue (LOW). The full free gate on `c07d7cf` is green (7,592 passed, 14 skipped, 33 deselected,
-`~/logs/gate17.log`). The commit after `c07d7cf` adds the tracked PR description
-(`scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`, 97 KB, over GitHub's 65,536-character
-body cap) and this status; the PR body on GitHub is the 14.7 KB condensed version. Nothing is in flight. Next:
-operator pushes, PR CI reruns, operator merges PR #66, then the post-merge commands in "Operator follow-ups" at
-the end of this doc, which now also holds the one open decision (the browser-transport follow-up PR).
+states the real split with `tests/test_model_name_locations.py` pinning it, the
+`litellm_callback_drain_timeout` marker spec is registered, and FUTURE.md carries the browser-transport fix
+(item 8, deferred at that point) and the un-clocked PDF prologue (LOW). The full free gate on `c07d7cf` is
+green (7,592 passed, 14 skipped, 33 deselected, `~/logs/gate17.log`). The commit after `c07d7cf` adds the
+tracked PR description (`scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`, 97 KB,
+over GitHub's 65,536-character body cap) and this status; the PR body on GitHub is the 14.7 KB condensed
+version. Then, on the operator's instruction the same afternoon, the browser-transport follow-up was BUILT
+into this PR rather than deferred to its own: `6646a0b` refuses a render whose main frame landed off the
+pinned host and blocks page WebSockets, and `8ced8a5` hands the browser the direct fetch's landing URL so the
+pin covers the host that serves the content. A free local render probe priced strict host equality first, at
+zero refusals across 22 real render targets. The full free gate on the implementation worktree is green (7,608
+passed, 22 skipped, 33 deselected); the transport's off-host WARNING is being registered as the marker spec
+`rendered_fetch_off_host` in a parallel worktree, and the lead re-gates the merged tip once that and the
+documentation commit have landed. Next: operator pushes, PR CI reruns, operator merges PR #66, then the
+post-merge commands in "Operator follow-ups" at the end of this doc.
 
 The operator does NOT read plan docs; every decision or approval you need from them goes inline in
 chat, self-contained, with a recommendation. They sign off on any paid run before it fires.
@@ -452,15 +459,19 @@ Everything below needs the operator or is the operator's call. Do not drip these
    `constants.py` size (own PR); Tier-1 paid rung configured by `GAP_FILL_V2_READER_*` constants (R18);
    policy D re-calibration once a season of `chrome_metric_withholds` counts exists; Accept-Encoding
    widening (now safe, unmeasured); and, from the 2026-09-04 Codex triage, item 8 (the browser transport's
-   three unguarded channels and the follow-up design, FUTURE.md ~1405-1552), the un-clocked PDF parse prologue
-   (LOW, ~2834-2934), and the stale per-model cost heuristic in `ensemble_analysis/ensemble_simulator.py`
-   (adjacent rot, offline only, found by the model-id inventory).
-8. **Decision: build the browser-transport follow-up PR right after the merge?** About 210 lines across
-   `rendered_fetch.py`, `resolution_source.py`, `agentic/tools.py`, the Playwright fakes and tests: re-vet the
-   final URL after navigation with `is_public_http_url` (closes IP-literal private redirects, near-zero recall
-   cost), block page WebSockets with `route_web_socket`, then hand the browser the direct fetch's final URL and
-   measure cross-host redirects with a free local render probe before adding strict pinned-host equality.
-   Recommendation: yes, as its own PR; the smoke does not need re-running for it.
+   three unguarded channels, now BUILT on 2026-09-04 with one residual left, FUTURE.md ~1409-1500), the
+   un-clocked PDF parse prologue (LOW, ~2929-3029), and the stale per-model cost heuristic in
+   `ensemble_analysis/ensemble_simulator.py` (adjacent rot, offline only, found by the model-id inventory).
+8. **Record, not a decision: the browser-transport follow-up was BUILT on 2026-09-04**, on the operator's
+   instruction the same afternoon, and it is in this PR rather than a later one. `6646a0b` refuses a render
+   whose main frame landed on a host other than the pinned one and blocks page WebSockets with
+   `route_web_socket`; `8ced8a5` hands the browser the direct fetch's landing URL so the pin covers the host
+   that serves the content. The decline is the skip token `render_off_host`, counted as
+   `render_off_host_skips`, and the transport's WARNING is the marker `RENDERED_FETCH_OFF_HOST`. The free
+   local render probe that priced strict host equality ran first and its numbers are in the PR description under
+   "The browser transport closure". One residual is left, a cross-host subresource Chromium resolves with no
+   pin of ours, recorded in FUTURE.md item 8 with the single observation that would settle it. Nothing here
+   needs the operator, and the smoke was not re-run for it.
 
 ## References
 
