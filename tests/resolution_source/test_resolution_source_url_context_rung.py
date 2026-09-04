@@ -17,11 +17,14 @@ from metaculus_bot.research.resolution_source import (
     _rung_counts,
     format_resolution_sections,
 )
-from metaculus_bot.research.robots_policy import reset_robots_cache
 from tests.resolution_source_fakes import (
+    _ROBOTS_URL,
     _URL,
     FakeResponse,
     FakeSession,
+    arm_paid_rung,
+    paid_reader,
+    refused_page_with_robots,
 )
 from tests.test_document_text import build_text_pdf
 
@@ -30,53 +33,25 @@ class TestUrlContextRung:
     """The LAST rung and the only paid one: every gate is checked before a cent is spent, and
     zero successful retrievals discards the text rather than rendering recall as evidence."""
 
-    _ANSWER = (
-        "The Bureau of Labor Statistics work stoppages page reports 12 major work stoppages "
-        "beginning in 2026 through August, per the table dated 2026-08-28."
-    )
-
-    def _reader(self, *, text: str = "", retrievals: int = 1, statuses: list[str] | None = None):
-        calls: list[dict[str, object]] = []
-
-        def _read(url, ask, **kwargs):
-            calls.append({"url": url, "ask": ask, **kwargs})
-            return (text or self._ANSWER, retrievals, statuses or ["URL_RETRIEVAL_STATUS_SUCCESS"])
-
-        return _read, calls
-
-    def _session(self, *, robots: bytes = b"User-agent: *\nAllow: /\n") -> FakeSession:
-        return FakeSession(
-            {
-                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
-                "https://tracker.example.com/robots.txt": FakeResponse(200, body=robots, content_type="text/plain"),
-            }
-        )
-
-    def _arm(self, monkeypatch, reader) -> None:
-        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
-        monkeypatch.setenv("GOOGLE_API_KEY", "key")
-        monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
-        reset_robots_cache()
-
     async def test_the_flag_off_never_calls_the_reader(self, monkeypatch):
         """Ships OFF and stays off in every workflow: it is the only rung that spends money and
         the only one whose product is a model's answer rather than the host's bytes."""
-        reader, calls = self._reader()
+        reader, calls = paid_reader()
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
         monkeypatch.delenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", raising=False)
 
-        result = await _fetch_one(self._session(), _URL, {})
+        result = await _fetch_one(refused_page_with_robots(), _URL, {})
 
         assert result.status == "blocked"
         assert result.route == "direct"
         assert calls == []
 
     async def test_an_allowed_host_is_read_and_disclosed(self, monkeypatch):
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="How many stoppages?"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="How many stoppages?"))
 
         assert result.status == "success"
         assert result.route == "url_context"
@@ -94,11 +69,11 @@ class TestUrlContextRung:
     async def test_zero_retrievals_discards_the_text(self, monkeypatch, caplog):
         """Gemini answers fluently out of parametric memory when every retrieval failed (Q38195),
         and this section is captioned primary grading evidence."""
-        reader, _calls = self._reader(retrievals=0, statuses=["URL_RETRIEVAL_STATUS_ERROR"])
-        self._arm(monkeypatch, reader)
+        reader, _calls = paid_reader(retrievals=0, statuses=["URL_RETRIEVAL_STATUS_ERROR"])
+        arm_paid_rung(monkeypatch, reader)
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
-            result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+            result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "ungrounded"
         assert result.text == ""
@@ -122,11 +97,11 @@ class TestUrlContextRung:
         standing in for an absent section, the shape the PDF digest closes with
         `no_matching_passage`. The read was still paid for, so it stays on the record as the
         rung's own verdict."""
-        reader, _calls = self._reader(text="NOT_ADDRESSED. The page lists office hours only.")
-        self._arm(monkeypatch, reader)
+        reader, _calls = paid_reader(text="NOT_ADDRESSED. The page lists office hours only.")
+        arm_paid_rung(monkeypatch, reader)
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
-            result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+            result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "no_resolving_content"
         assert result.status_reason == "not_addressed"
@@ -151,10 +126,10 @@ class TestUrlContextRung:
             del url, ask, kwargs
             return ("", 0, [])
 
-        self._arm(monkeypatch, _read)
+        arm_paid_rung(monkeypatch, _read)
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
-            await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+            await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert (
             "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate statuses=none"
@@ -163,9 +138,9 @@ class TestUrlContextRung:
     async def test_a_google_extended_disallowing_host_is_skipped_before_paying(self, monkeypatch, caplog):
         """Proven live 2026-09-03: a host that disallows the token refuses the fetch server-side,
         so the read would be spend with a known-zero return."""
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
-        session = self._session(robots=b"User-agent: Google-Extended\nDisallow: /\n")
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
+        session = refused_page_with_robots(robots=b"User-agent: Google-Extended\nDisallow: /\n")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
             result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
@@ -183,9 +158,9 @@ class TestUrlContextRung:
     async def test_a_robots_file_blocking_generic_crawlers_still_pays(self, monkeypatch):
         """A different and much broader policy than the one this pre-check implements: our own
         free rungs are unaffected by robots.txt, and only the Google-Extended group is read."""
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
-        session = self._session(robots=b"User-agent: *\nDisallow: /\n")
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
+        session = refused_page_with_robots(robots=b"User-agent: *\nDisallow: /\n")
 
         result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
 
@@ -204,16 +179,15 @@ class TestUrlContextRung:
         context `_aux_ctx` builds is what keeps the page's record to the rung it actually earned.
         An unreadable policy still proceeds to pay, which is the only direction this pre-check is
         allowed to fail in, so the paid read below is what a correct run reaches."""
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
-        session = FakeSession(
-            {
-                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
-                "https://tracker.example.com/robots.txt": FakeResponse(
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
+        session = refused_page_with_robots(
+            extra={
+                _ROBOTS_URL: FakeResponse(
                     200,
                     body=build_text_pdf([["User-agent: Google-Extended", "Disallow: /"]]),
                     content_type="application/pdf",
-                ),
+                )
             }
         )
 
@@ -221,7 +195,7 @@ class TestUrlContextRung:
 
         # The pre-check really ran and really read the document: without this the assertions
         # below would also hold for a fixture that never fetched robots.txt at all.
-        assert "https://tracker.example.com/robots.txt" in session.requested
+        assert _ROBOTS_URL in session.requested
         assert len(calls) == 1
         assert result.route == "url_context"
         assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("url_context", "")]
@@ -233,8 +207,8 @@ class TestUrlContextRung:
         same PDF cannot find a passage BM25 could not — it would be spend with a known-zero
         return, which is the same test every other exclusion in that set passes. Reason-scoped,
         because `thin_page` and `embed_shell` are pages our client genuinely could not read."""
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
         pdf_url = "https://cdc.example.com/report.pdf"
         session = FakeSession(
             {
@@ -259,12 +233,12 @@ class TestUrlContextRung:
         assert result.route == "pdf_local"
 
     async def test_a_missing_api_key_skips_without_calling(self, monkeypatch):
-        reader, calls = self._reader()
+        reader, calls = paid_reader()
         monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
         monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
         monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "blocked"
         assert calls == []
@@ -274,11 +248,11 @@ class TestUrlContextRung:
         assert _rung_counts([result])["url_context_no_api_key_skips"] == 1
 
     async def test_the_rung_is_skipped_below_its_floor(self, monkeypatch):
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
         monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 9.0)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "blocked"
         assert calls == []
@@ -299,9 +273,9 @@ class TestUrlContextRung:
         """The read runs in a thread, which `wait_for` cannot cancel, so the client ceiling is the
         only thing that returns the worker — and a ceiling sized off a figure read BEFORE a real
         request went out could outlive the provider's wall while the money is spent anyway."""
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
-        session = self._session()
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
+        session = refused_page_with_robots()
         monkeypatch.setattr(
             FetchContext,
             "rung_budget_s",
@@ -315,9 +289,9 @@ class TestUrlContextRung:
         assert calls[0]["timeout_ms"] == int((16.0 - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000)
 
     async def test_a_pre_check_that_eats_the_room_skips_before_paying(self, monkeypatch):
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
-        session = self._session()
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
+        session = refused_page_with_robots()
         monkeypatch.setattr(
             FetchContext,
             "rung_budget_s",
@@ -328,7 +302,7 @@ class TestUrlContextRung:
 
         assert result.status == "blocked"
         assert calls == []
-        assert "https://tracker.example.com/robots.txt" in session.requested
+        assert _ROBOTS_URL in session.requested
         # One skip, recorded AFTER the pre-check ate the room, never two.
         assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("url_context", "wall_budget")]
 
@@ -342,15 +316,10 @@ class TestUrlContextRung:
                 await asyncio.Event().wait()
                 return b""
 
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
         monkeypatch.setattr(resolution_source, "ROBOTS_FETCH_TIMEOUT_S", 0.05)
-        session = FakeSession(
-            {
-                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
-                "https://tracker.example.com/robots.txt": _HangingResponse(200, content_type="text/plain"),
-            }
-        )
+        session = refused_page_with_robots(extra={_ROBOTS_URL: _HangingResponse(200, content_type="text/plain")})
 
         started = time.monotonic()
         result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
@@ -362,8 +331,8 @@ class TestUrlContextRung:
     @pytest.mark.parametrize("status", [404, 410])
     async def test_a_missing_page_is_never_sent_to_the_reader(self, monkeypatch, status):
         """A 404 has no page to read, so the spend would buy nothing."""
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
         session = FakeSession({_URL: FakeResponse(status, body=b"", content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
@@ -375,9 +344,9 @@ class TestUrlContextRung:
         def _boom(*_args, **_kwargs):
             raise RuntimeError("reader exploded")
 
-        self._arm(monkeypatch, _boom)
+        arm_paid_rung(monkeypatch, _boom)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "blocked"
         assert result.route == "url_context"
@@ -387,8 +356,8 @@ class TestUrlContextRung:
         dead sources pays at most RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS times inside one
         provider wall, and the read the cap declines records a `url_context_cap` skip."""
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS", 2)
-        reader, calls = self._reader()
-        self._arm(monkeypatch, reader)
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
         shared = QuestionRungBudget()
         urls = [f"https://dead{index}.example.com/page" for index in range(3)]
         handlers: dict[str, object] = {}
@@ -414,10 +383,10 @@ class TestUrlContextRung:
         bound. The shared cap helper truncates the lead instead."""
         cap = 60
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
-        reader, _calls = self._reader(text="The page reports 12 major work stoppages. " * 5)
-        self._arm(monkeypatch, reader)
+        reader, _calls = paid_reader(text="The page reports 12 major work stoppages. " * 5)
+        arm_paid_rung(monkeypatch, reader)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "success"
         assert result.route == "url_context"

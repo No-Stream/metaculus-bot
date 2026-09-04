@@ -17,13 +17,16 @@ page, so the rescue tests fake the extractor at the seam the module resolves it 
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metaculus_bot.research import rendered_fetch, resolution_source
+from metaculus_bot.research import resolution_source
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import RenderedPage
 from metaculus_bot.research.resolution_source import (
+    _WAYBACK_TRIGGER_STATUSES,
+    FetchContext,
     _fetch_one,
     _rendered_rung_applies,
     _rung_counts,
@@ -31,7 +34,15 @@ from metaculus_bot.research.resolution_source import (
     looks_like_page_chrome,
     resolution_source_provider,
 )
-from tests.resolution_source_fakes import FakeResponse, FakeSession, _escape_config, _mock_question
+from metaculus_bot.research.wayback import wayback_snapshot_url
+from tests.resolution_source_fakes import (
+    _JS_SHELL,
+    FakeResponse,
+    FakeSession,
+    _escape_config,
+    _mock_question,
+    _snapshot_url,
+)
 
 _URL = "https://stats.example.com/labour-force"
 _MONTHS = (
@@ -109,13 +120,6 @@ def _fake_extractor(default: str | None, precision: str | None):
         return precision if favor_precision else default
 
     return _extract
-
-
-@pytest.fixture(autouse=True)
-def _reset_render_state():
-    rendered_fetch.reset_render_state()
-    yield
-    rendered_fetch.reset_render_state()
 
 
 class TestContentShare:
@@ -337,3 +341,70 @@ class TestExtractorPolicyCounts:
         assert detail["sources"] == {"stats.example.com": "no_resolving_content"}
         assert detail["counts"]["chrome_metric_withholds"] == 1
         assert detail["counts"]["precision_fallback_rescues"] == 0
+
+
+class TestThePolicyTravelsWithEveryRoute:
+    """The policy is not the direct route's alone, and both other routes that reach it were
+    unpinned: a rendered DOM re-enters the same classification, and a served archive capture has
+    to carry the extractor's own decision out of it."""
+
+    async def test_a_rendered_dom_that_is_another_menu_tree_is_withheld_too(self, monkeypatch):
+        """The P3-3 shape, and the defect the policy was adopted for: the browser answered, and
+        what it answered with was navigation.
+
+        The rendered DOM goes through ``_classify_html_body`` exactly as a fetched body does, so
+        the metric withholds it and the direct ``js_wall`` stands. Scoping the metric to the direct
+        route would publish this menu under the primary-grading-evidence caption."""
+
+        async def _render(
+            url: str,
+            *,
+            memo_scope: str,
+            host_gate,
+            goto_timeout_ms: int,
+            deadline_monotonic_s: float | None = None,
+            harvest_json: bool = False,
+        ) -> RenderedPage:
+            del memo_scope, host_gate, goto_timeout_ms, deadline_monotonic_s, harvest_json
+            await asyncio.sleep(0)
+            return RenderedPage(url=url, content_type="text/html", html=_MENU_TREE.decode())
+
+        monkeypatch.setattr(resolution_source, "render_page", _render)
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        result = await _fetch_one(session, _URL, {})
+
+        assert result.status == "js_wall"
+        assert result.text == ""
+        assert "Archive release" not in result.text
+        # The rung fired and its own outcome is the withhold, which is what makes
+        # `route=rendered status=js_wall` readable as "we tried the browser and this is the answer".
+        assert result.route == "rendered"
+        assert [(a.rung, a.outcome) for a in result.rung_attempts] == [("rendered", "no_resolving_content")]
+
+    async def test_a_precision_rescue_inside_an_archived_capture_is_still_counted(self, monkeypatch):
+        """A capture is classified by the same path a live page is, so the extractor's decision
+        belongs to the result the rung serves. Without the carry, a rescue inside an archived body
+        publishes its text while `precision_fallback_rescues` reads zero, which is the count the
+        policy's own calibration is read back on."""
+        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(resolution_source, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, _STATUS_CARD))
+        # A past year, so a rung reading its own clock instead of the fetch's would ask the archive
+        # for a URL no handler serves (the same reason `TestWaybackRung._NOW` is dated back).
+        now = datetime(2025, 9, 4, tzinfo=UTC)
+        snapshot = _snapshot_url(_URL, captured=now - timedelta(days=3))
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+                wayback_snapshot_url(_URL, now=now): FakeResponse(302, headers={"Location": snapshot}),
+                snapshot: FakeResponse(200, body=_document("<p>irrelevant</p>"), content_type="text/html"),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(now=now))
+
+        assert result.status == "success"
+        assert result.route == "wayback"
+        assert "Passed House" in result.text
+        assert result.precision_rescued is True
+        assert _rung_counts([result])["precision_fallback_rescues"] == 1

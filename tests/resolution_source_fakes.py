@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
+from metaculus_bot.constants import GOOGLE_API_KEY_ENV, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.rendered_fetch import RenderedPage
 
@@ -398,3 +399,75 @@ def _fake_render(page: RenderedPage | None, calls: list[dict[str, object]]):
 def _snapshot_url(page_url: str, *, captured: datetime) -> str:
     """The final URL the archive redirects a snapshot request to (live-verified shape)."""
     return f"https://web.archive.org/web/{captured.strftime('%Y%m%d%H%M%S')}id_/{page_url}"
+
+
+# --- Paid url_context rung scaffolding (shared by the four modules that arm the rung) ---
+# Written five times before this lived here, which is how one copy came to re-declare `_URL` as
+# its own literal. The rung is the only one that spends money, so what "armed" means has to be
+# one thing every module agrees on.
+
+_ROBOTS_URL = "https://tracker.example.com/robots.txt"
+ROBOTS_ALLOW_ALL = b"User-agent: *\nAllow: /\n"
+
+_PAID_READ_ANSWER = (
+    "The Bureau of Labor Statistics work stoppages page reports 12 major work stoppages "
+    "beginning in 2026 through August, per the table dated 2026-08-28."
+)
+
+
+def paid_reader(
+    *,
+    text: str | None = None,
+    retrievals: int = 1,
+    statuses: list[str] | None = None,
+    raises: type[BaseException] | None = None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """A stand-in for ``run_url_context_read``, plus the kwargs the rung handed it.
+
+    The kwargs are the point of recording them: ``timeout_ms`` and ``attempts`` are the only
+    bounds that ever return a worker the outer ``wait_for`` cannot cancel.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def _read(url: str, ask: str, **kwargs: Any) -> tuple[str, int, list[str]]:
+        calls.append({"url": url, "ask": ask, **kwargs})
+        if raises is not None:
+            raise raises("the client ceiling fired")
+        return (
+            _PAID_READ_ANSWER if text is None else text,
+            retrievals,
+            statuses or ["URL_RETRIEVAL_STATUS_SUCCESS"],
+        )
+
+    return _read, calls
+
+
+def arm_paid_rung(monkeypatch: Any, reader: Any, *, budget_s: float | None = None) -> None:
+    """Open the flag, the key and the reader, so the only closed gate is the one under test.
+
+    Env NAMES come from ``constants.py`` rather than being spelled again here, so a rename cannot
+    leave a test arming a flag nobody reads. The robots cache is deliberately NOT reset here: the
+    package conftest's autouse fixture drops it around every test, and a second reset inside the
+    arming helper is what used to hide that.
+    """
+    monkeypatch.setenv(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV, "true")
+    monkeypatch.setenv(GOOGLE_API_KEY_ENV, "key")
+    monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
+    if budget_s is not None:
+        monkeypatch.setattr(resolution_source.FetchContext, "rung_budget_s", lambda self: budget_s)
+
+
+def refused_page_with_robots(*, robots: bytes = ROBOTS_ALLOW_ALL, extra: _Handlers | None = None) -> FakeSession:
+    """The paid rung's standard fixture: the cited page refuses us and robots.txt answers.
+
+    ``extra`` is merged LAST, so a test that needs the pre-check answered with something other
+    than a plain-text policy (a PDF, a response that never returns) overrides ``_ROBOTS_URL``
+    there rather than rebuilding the pair.
+    """
+    return FakeSession(
+        {
+            _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+            _ROBOTS_URL: FakeResponse(200, body=robots, content_type="text/plain"),
+            **(extra or {}),
+        }
+    )

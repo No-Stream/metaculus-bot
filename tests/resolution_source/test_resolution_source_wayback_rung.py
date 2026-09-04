@@ -17,17 +17,20 @@ from metaculus_bot.research.resolution_source import (
     _rung_counts,
     format_resolution_sections,
 )
-from metaculus_bot.research.robots_policy import reset_robots_cache
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _JS_SHELL,
     _RENDERED_PROSE,
+    _ROBOTS_URL,
     _URL,
+    ROBOTS_ALLOW_ALL,
     FakeResponse,
     FakeSession,
     _fake_render,
     _prose_page,
     _snapshot_url,
+    arm_paid_rung,
+    paid_reader,
 )
 from tests.test_document_text import build_text_pdf
 
@@ -36,7 +39,14 @@ class TestWaybackRung:
     """The archive is the one free route whose EGRESS IS NOT OURS, which is why a host that
     refuses our address earns it — and why a JavaScript wall never does."""
 
-    _NOW = datetime(2026, 9, 4, tzinfo=UTC)
+    # Deliberately NOT the current year. `wayback_snapshot_url` interpolates only the year, and
+    # every handler here is keyed by the URL that function returns for this instant, so a fixture
+    # dated in the running year would key the archive handler on the same string a wall-clock read
+    # produces: dropping the threaded `now=` would then keep this whole module green. Dated in a
+    # past year, a rung that reads its own clock asks for a URL no handler serves and the fake
+    # session says so. The clock has to be threaded rather than read inside the rung because the
+    # request and the age disclosure rendered off what comes back must be one instant.
+    _NOW = datetime(2025, 9, 4, tzinfo=UTC)
 
     @pytest.fixture(autouse=True)
     def _arm_the_archive(self, monkeypatch):
@@ -86,7 +96,7 @@ class TestWaybackRung:
         # for this source are filed under what the question cited.
         assert result.url == _URL
         assert result.text.startswith(
-            "[Archived copy from the Wayback Machine, captured 2026-08-29, 6 days before this "
+            "[Archived copy from the Wayback Machine, captured 2025-08-29, 6 days before this "
             "forecast; the live page could not be fetched (blocked).]"
         )
         assert "Nebraska Senate polling average" in result.text
@@ -132,24 +142,12 @@ class TestWaybackRung:
         population the paid rung was built for. Only a RESCUE ends the ladder early; the
         withhold stays the fallback when the reader is off or declines, so the `stale_data`
         marker pair above stands unchanged."""
-        calls: list[dict[str, object]] = []
-
-        def _read(url, ask, **kwargs):
-            calls.append({"url": url, "ask": ask, **kwargs})
-            return ("The page reports 12 major work stoppages.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
-
-        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
-        monkeypatch.setenv("GOOGLE_API_KEY", "key")
-        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
-        reset_robots_cache()
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
         session = self._session(
             page=FakeResponse(403, body=b"", content_type="text/html"),
             captured=self._NOW - timedelta(days=400),
-            extra={
-                "https://tracker.example.com/robots.txt": FakeResponse(
-                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
-                )
-            },
+            extra={_ROBOTS_URL: FakeResponse(200, body=ROBOTS_ALLOW_ALL, content_type="text/plain")},
         )
 
         result = await _fetch_one(session, _URL, {}, FetchContext(now=self._NOW, query="ask"))
@@ -328,7 +326,7 @@ class TestWaybackRung:
         assert result.status == "success"
         assert result.route == "wayback"
         assert [a.rung for a in result.rung_attempts] == ["wayback"]
-        assert result.text.startswith("[Archived copy from the Wayback Machine, captured 2026-09-01, 3 days before")
+        assert result.text.startswith("[Archived copy from the Wayback Machine, captured 2025-09-01, 3 days before")
         assert "922" in result.text
         counts = _rung_counts([result])
         assert counts["wayback_attempts"] == 1
