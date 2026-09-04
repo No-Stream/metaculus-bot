@@ -95,6 +95,27 @@ chat, self-contained, with a recommendation. They sign off on any paid run befor
   ogimet page that overran to 76 s in the QA sweep now returns in 42.3 s, inside the 45 s wall, recorded as
   `render_timeout` (the transport's own DOM-read cut) and memoised.
 - **PR CI on the pushed `ad9fec3` is green** (lint, test, secret scan, audit).
+- **Smoke test fired and QA'd (2026-09-04, 11:39 to 12:15 PT).** Operator pushed `cbc26bf`, PR CI green, the
+  ONE authorized `test_bot.yaml` dispatch ran as GitHub run 33907102246 (9 m 26 s). All four questions
+  researched, forecast 3 of 3, published (Metaculus API confirms new forecasts and private comments). The run
+  exited 1 by design: six alertable degradation events, all one external cause, Kalshi's events-catalogue API
+  answering HTTP 429 to three of four concurrent full paginations (the Kalshi code is unchanged since run
+  67, which paged cleanly; the stampede exposure, no single-flight on the 6-hour catalogue cache, is
+  pre-existing and a fix is in flight). Ladder telemetry complete and parseable: 4 FETCH, 5 ESCALATION (3
+  wayback, 2 url_context), 2 `NOT_ADDRESSED`, 2 `GEMINI_USAGE role=resolution_source`; one real rescue
+  (bls.gov/wsp/ for q38195 via a 6-day-old Wayback capture, as-of line and caveat once); both paid reads
+  withheld as `not_addressed`; policy D withheld and rescued nothing; the rendered rung did not fire in the
+  provider (gap-fill v2 rendered one page, so Chromium works on the runner). Spend: $10.00 in role lines
+  ($8.86 donated, $1.14 personal for the Google forecaster); donated key 1,449.19 to 1,441.54. Forecasts:
+  q38195 moved from a median near 1 to near 3 because search surfaced the Metaculus community forecast for
+  the exact question and two models anchored on it (observation for the operator; not caused by the
+  branch). QA verdict: fit to merge; no defect attributable to the branch. Report:
+  `scratch/fetch_ladder_2026-09-03/qa_smoke_2026-09-04.md`. Low items it raised: the Wayback 30-day bound
+  plus a `NOT_ADDRESSED` reply cost q20683 a static definitional page (gap-fill v2 quoted it anyway); the
+  all-failed notice still makes resolution_source `ok` with sources=0/1 (pre-existing design); personal-key
+  `CREDIT_ROLE_SPEND` shows usd = 2 x byok_usd (pre-existing, unverified); the free-text "rescued none of
+  them" line printed on a question with a rescue (fix in flight); the withheld paid reply text is not
+  persisted (fix in flight).
 
 ## What this repo is and what the work was for
 
