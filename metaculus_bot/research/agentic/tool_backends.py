@@ -39,21 +39,32 @@ from metaculus_bot.research.gemini_client_config import (
 from metaculus_bot.research.gemini_usage import log_gemini_usage
 from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
-# Client-side HTTP ceilings sized just UNDER the tools' loop budgets so the
-# underlying socket is torn down before the loop's asyncio.wait_for fires — a
-# hung endpoint then frees its slot instead of pinning it to the wall deadline.
+# Client-side HTTP ceilings sized against the tools' loop budgets so the underlying socket is
+# torn down rather than left pinned to a wall deadline — a hung endpoint then frees its slot.
+# Exa's sits strictly UNDER its tool's budget. The reader's is FIXED while the budget it runs
+# under became variable, so the two no longer nest: see the paragraph below the constant.
 _EXA_HTTP_TIMEOUT_S = 18.0  # under search_web's ToolSpec timeout_s in build_gap_fill_tools
-_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # under _READ_DOCUMENT_TIMEOUT_S, read_document's own deadline
+_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # fixed; read_document's own wait is 40-60 s (below)
 # The retry ladder has to fit INSIDE that budget rather than beside it: read_document's
 # outer ``asyncio.wait_for`` cancels the coroutine but not the ``to_thread`` worker, so a
 # retried attempt that ran past the budget would leak a pooled thread for longer than
 # today's 55s — a worse worst case, which this path will not take. So the budget stays put
 # and the ATTEMPTS divide it, after the backoff sleeps are set aside:
-# (55_000 - 2_000) // 2 = 26_500ms each, worst case 26.5 + <=2 + 26.5 = 55.0s, i.e. exactly
-# today's ceiling and comfortably under the 60s _READ_DOCUMENT_TIMEOUT_S. The cost is that
+# (55_000 - 2_000) // 2 = 26_500ms each, worst case 26.5 + <=2 + 26.5 = 55.0s. The cost is that
 # ONE attempt now gets 26.5s instead of 55s; the retry is worth it because the failure it
 # recovers (a 503 UNAVAILABLE) returns in milliseconds and leaves nearly the whole budget
 # for the second try, and the reader's thinking level dropped a tier in the same change.
+#
+# That 55 s is NOT under read_document's wait any more. Since the free local-acquisition ladder
+# landed ahead of the paid read, the coroutine waits
+# ``min(_READ_DOCUMENT_TIMEOUT_S=60, _READ_DOCUMENT_TOTAL_BUDGET_S=65 - acquisition_elapsed)``,
+# which is 55 s at 10 s of acquisition and 40 s at the 25 s acquisition cap. So past ~10 s of
+# acquisition the worker can outlive the wait by up to 15 s and finish a billed call whose
+# answer is thrown away. It cannot start a new billed request after the wait fires: the second
+# attempt begins by 26.5 + 2 = 28.5 s, inside the 40 s floor. Deriving the per-attempt timeout
+# from the variable wait instead would cut an attempt to 19 s on the 25 s-acquisition handover
+# path, failing 20-26 s reads that succeed today, so the fixed arithmetic stays and the overrun
+# is documented. ``tests/test_agentic_tools.py`` pins both halves of that claim.
 _READ_DOCUMENT_HTTP_PER_ATTEMPT_TIMEOUT_MS = int(
     (_READ_DOCUMENT_HTTP_TIMEOUT_MS - 1000 * gemini_retry_sleep_allowance_s(GAP_FILL_V2_READER_HTTP_ATTEMPTS))
     // GAP_FILL_V2_READER_HTTP_ATTEMPTS
