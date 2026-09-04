@@ -501,6 +501,44 @@ class TestDerivedApiRung:
         assert "DIFFERENT page" in second.text
         assert _URL in second.text
 
+    async def test_two_same_host_urls_fetched_concurrently_share_one_launch(self, monkeypatch):
+        """The shape prod actually takes: `fetch_resolution_sources` fans one task out per cited
+        URL, so both same-host URLs reach `endpoint_for` before either render has finished. The
+        second must wait for the first's escalation and then take the feed off an ordinary GET,
+        or the docstring's "one Chromium launch per host" is true only for sequential fetches."""
+        calls: list[dict[str, object]] = []
+        harvested = self._harvested()
+
+        async def _slow_render(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False):
+            calls.append({"url": url, "goto_timeout_ms": goto_timeout_ms, "harvest_json": harvest_json})
+            del host_gate
+            # Long enough that the sibling task reaches its own escalation while this render is
+            # still in flight, which is the interleaving the fan-out produces.
+            await asyncio.sleep(0.02)
+            return harvested
+
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(resolution_source, "render_page", _slow_render)
+        second_url = "https://tracker.example.com/house"
+        session = FakeSession(
+            {
+                _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                second_url: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                _FEED_URL: FakeResponse(200, body=self._FEED.encode(), content_type="application/json"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        question = _mock_question(resolution_criteria=f"Resolves per {_URL} and {second_url}")
+
+        section = await resolution_source_provider(is_benchmarking=False)(question)
+
+        assert len(calls) == 1, "the second same-host URL launched its own browser"
+        assert _FEED_URL in session.requested
+        counts = pop_provider_detail(question.id_of_question, "resolution_source")["counts"]
+        assert counts["rendered_attempts"] == 1
+        assert counts["derived_api_reads"] == 2
+        assert ROUTE_CAVEATS["derived_api"] in section
+
     async def test_a_feed_that_fails_hands_the_url_on_to_the_browser(self, monkeypatch):
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))

@@ -724,6 +724,8 @@ class QuestionRungBudget:
     """
 
     wayback_attempts_left: int = RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS
+    # One browser escalation per host at a time WITHIN the question, see `browser_escalation_gate`.
+    browser_escalation_gates: dict[str, asyncio.Semaphore] = field(default_factory=dict)
 
     def take_wayback_attempt(self) -> bool:
         """Claim one snapshot attempt for this question, or False when they are spent."""
@@ -731,6 +733,26 @@ class QuestionRungBudget:
             return False
         self.wayback_attempts_left -= 1
         return True
+
+    def browser_escalation_gate(self, url: str) -> asyncio.Semaphore:
+        """The ``Semaphore(1)`` that serializes this question's derived-feed-then-browser
+        escalations on ``url``'s host.
+
+        The derived-API rung exists so a host with several cited URLs pays for ONE Chromium
+        launch, but the provider fans one task out per cited URL, so every same-host URL asked
+        ``endpoint_for`` before any render had finished, got None, queued on the per-host gate
+        inside the render, and launched its own browser after the first had already recorded
+        the endpoint. Holding this gate across the pair means the second URL re-asks once the
+        first's escalation is over and takes the feed off an ordinary GET instead. Waiting here
+        costs the second URL nothing it did not already pay queueing on the host gate inside the
+        render, and the rungs behind it re-read their wall budget after the wait.
+
+        Per question rather than loop-wide on purpose: the cross-question shape still
+        serializes on the loop-wide host gate exactly as before, and a loop-wide gate here
+        would be one more unbounded process-global acquire in front of a wall that discards
+        finished work (FUTURE.md item 5, the operator's call).
+        """
+        return semaphore_for_host(url, self.browser_escalation_gates)
 
 
 @dataclass
@@ -1716,7 +1738,10 @@ async def _derived_api_rung(
     This is the whole point of remembering the endpoint: a host with several cited URLs in one
     run pays for one Chromium launch, not one per URL. It runs BEFORE the rendered rung for the
     same reason every ladder here is ordered cheapest-first — one GET against a known endpoint
-    is a rounding error next to a browser launch.
+    is a rounding error next to a browser launch. Within a question that holds even when the
+    URLs are fetched concurrently, because the dispatcher runs this rung and the browser rung
+    under one per-host gate (:meth:`QuestionRungBudget.browser_escalation_gate`), so a same-host
+    sibling asks for the endpoint only after the first render has had its chance to record it.
 
     The GET goes through :func:`_fetch_direct`, so it inherits the SSRF preflight, the
     connect-time filtering resolver, the redirect re-guard, the per-host gate and the
@@ -2111,12 +2136,17 @@ async def _escalate_unresolved(
     """
     if direct.status == "success":
         return direct
-    derived = await _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    if derived is not None:
-        return derived
-    rendered = await _rendered_rung(url, direct, host_sems, ctx)
-    if rendered is not None:
-        return rendered
+    if _rendered_rung_applies(direct):
+        # The two browser-family rungs run under one per-host gate for this question, so a
+        # same-host sibling asks `endpoint_for` only after this escalation has recorded (or
+        # failed to record) an endpoint — see `QuestionRungBudget.browser_escalation_gate`.
+        async with ctx.shared.browser_escalation_gate(url):
+            derived = await _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+            if derived is not None:
+                return derived
+            rendered = await _rendered_rung(url, direct, host_sems, ctx)
+            if rendered is not None:
+                return rendered
     # Reached only for the statuses the browser rungs do not claim — the two trigger sets are
     # disjoint by construction (see `_WAYBACK_TRIGGER_STATUSES`), so the order between them is a
     # reading choice: free-and-local first, then the route whose egress is not ours.
