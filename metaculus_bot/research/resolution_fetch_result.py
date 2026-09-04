@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urlparse
 
+from metaculus_bot.constants import RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS
 from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, DatawrapperChartRef
 
 # `stale_data` has two producers, and only one of them earns the benign diagnostics token.
@@ -529,13 +530,47 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     return sources
 
 
+def _forecaster_facing_status(r: FetchResult) -> str:
+    """The outcome token a forecaster reads for one failed CITED page.
+
+    The verbatim ``status`` for every outcome but two. Since the ladder, a cited page's status
+    can be a RUNG's verdict about an artifact the forecaster never sees: the Wayback rung's
+    ``stale_data`` for an over-age or undatable capture it withheld, and the paid reader's
+    ``ungrounded`` for a read that retrieved nothing. Rendered bare, ``www.bls.gov: stale_data``
+    asserts a false thing about the LIVE page, one a forecaster on a "will X publish by date"
+    question can act on, when the direct outcome (``blocked``) is the fact about that page. So
+    those two render the DIRECT status, taken off the ``from_status`` the verdict's own rung
+    attempt recorded (the ladder asks every rung about the direct outcome, so the attempt for
+    that rung always carries it), glossed with what the rung found. The status tokens themselves
+    are telemetry and do not move: this is the forecaster-facing line only, never the marker or
+    the diagnostics map.
+
+    Only cited pages reach here (the caller partitions datasets into their own withheld note),
+    which is what keeps the Datawrapper hop's ``stale_data`` out of this branch.
+    """
+    if r.status not in ("stale_data", "ungrounded"):
+        return r.status
+    verdict_rung: FetchRoute = "wayback" if r.status == "stale_data" else "url_context"
+    from_status = next(a.from_status for a in r.rung_attempts if a.rung == verdict_rung and not a.skipped_reason)
+    if r.status == "stale_data":
+        return (
+            f"{from_status} (live page could not be fetched; the newest archived copy is older than "
+            f"{RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS:.0f} days or undatable)"
+        )
+    return f"{from_status} (a model-mediated read retrieved nothing)"
+
+
 def _render_fetch_failures(failures: list[FetchResult]) -> str:
-    """Render failed fetches as a compact ``"domain: status, domain: status"`` list."""
+    """Render failed fetches as a compact ``"domain: status, domain: status"`` list.
+
+    Every pre-ladder status renders byte-identically; the two rung verdicts a cited page can
+    carry are glossed by :func:`_forecaster_facing_status`.
+    """
     parts: list[str] = []
     for r in failures:
         try:
             domain = urlparse(r.url).netloc or r.url
         except ValueError:
             domain = r.url
-        parts.append(f"{domain}: {r.status}")
+        parts.append(f"{domain}: {_forecaster_facing_status(r)}")
     return ", ".join(parts)

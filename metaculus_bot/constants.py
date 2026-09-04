@@ -598,6 +598,14 @@ RESOLUTION_SOURCE_PER_URL_MAX_CHARS: int = 6000  # elbow of full-extraction dist
 RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = (
     18000  # headroom so per-URL cap binds (max observed section ~11.1k at 6k/URL); ~4.5k tokens worst case
 )
+# The smallest share of the total a success may render into; under it the section is omitted and
+# counted in the "[N additional source(s) omitted]" line instead. Below the truncation marker's own
+# length `_truncate_with_marker` degrades to a bare slice, so a rescued section landing on a
+# remainder shorter than its provenance lead rendered that lead cut mid-word with no marker
+# (`[Archived copy from the Wayback M`) while the route caveat above it promised a complete
+# disclosure. Sized above the longest lead, the derived_api other-page lead at about 260 chars.
+# Reachable on prod constants: 6000 + 6000 + 5900 direct pages ahead of a rescued fourth.
+RESOLUTION_SOURCE_MIN_SECTION_CHARS: int = 300
 RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
 RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
 # An extraction at or above the JS-wall floor can still be pure page chrome: a tab list,

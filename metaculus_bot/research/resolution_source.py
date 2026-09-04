@@ -167,6 +167,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     RESOLUTION_SOURCE_MAX_URLS,
     RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S,
+    RESOLUTION_SOURCE_MIN_SECTION_CHARS,
     RESOLUTION_SOURCE_PDF_MIN_BUDGET_S,
     RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
     RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S,
@@ -572,6 +573,11 @@ def _budgeted_success_sections(
 
     Cited pages and Tier-2 datasets draw on separate allowances, so a chart's rows can
     never evict the page text the section exists to serve.
+
+    A remainder under ``RESOLUTION_SOURCE_MIN_SECTION_CHARS`` drops the section rather than
+    rendering into it: below the truncation marker's own length the truncator degrades to a bare
+    slice, so a rescued section landing on a sliver rendered its provenance lead cut mid-word with
+    no marker while the caveat block above, computed over ``kept``, promised a complete disclosure.
     """
     sections: list[str] = []
     kept: list[FetchResult] = []
@@ -586,7 +592,7 @@ def _budgeted_success_sections(
         # conservatively.
         is_dataset = r.chart_id is not None
         remaining = dataset_remaining if is_dataset else page_remaining
-        if remaining <= 0:
+        if remaining < RESOLUTION_SOURCE_MIN_SECTION_CHARS:
             dropped += 1
             continue
         body = r.text
