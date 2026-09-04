@@ -9,8 +9,14 @@
 fixed; the paid url_context rung is now ON in every bot workflow by operator instruction; the paid rung and
 the rendered rung were both verified live. Local HEAD `06b3fd9` (plus this doc's own commit) is 2 commits
 ahead of the pushed `ad9fec3`; the working tree is clean; the full free gate is green at `06b3fd9` (7,578
-passed, 14 skipped, exit 0). Nothing is in flight. Next: operator push, PR CI, then the ONE
-operator-authorized `test_bot.yaml` smoke dispatch and its QA. Every operator follow-up is gathered in
+passed, 14 skipped, exit 0). The smoke ran and passed QA (see the late-morning Update). ONE thing is in
+flight: a worktree agent (`fix-kalshi`, branch `worktree-agent-a43a11a9400a966ba`) adding a single-flight
+guard to the Kalshi and PredictIt catalogue caches in `metaculus_bot/research/market_retrieval/session_state.py`
+(the smoke's only red cause), fixing the "rescued none of them" summary-line condition in
+`resolution_source.py`, and logging the first 300 chars of a withheld paid `NOT_ADDRESSED` reply. When it
+reports: `git status` clean, merge its branch, full gate in tmux, commit, then the operator pushes and PR CI
+runs; no further smoke is needed for it (unit-tested, isolated from the ladder). If a fresh session picks
+this up and the agent is gone, re-derive from the QA report and do the same three items. Every operator follow-up is gathered in
 "Operator follow-ups" near the end of this doc; surface that list to the operator only at the very end.
 
 ## Update, 2026-09-04 morning (second review pass before the smoke)
