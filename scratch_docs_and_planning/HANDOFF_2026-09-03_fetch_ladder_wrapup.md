@@ -5,12 +5,13 @@
 `No-Stream/metaculus-bot`, `upstream` is the Metaculus template, so every `gh` call needs
 `--repo No-Stream/metaculus-bot`)
 **Repo:** `/Users/flatljan/personal/metaculus-bot`
-**Status (updated 2026-09-04 10:30 PT, see "Update" below):** a SECOND review pass over the fix wave
-(a three-lens Fable panel plus a full forge run) found 24 more items; all are fixed and merged. Local HEAD
-`3e5697f` (plus this doc's own commit) is 38 commits ahead of the pushed `e267d66`; the working tree is
-clean; the full free gate is green at `acf6b0c` (7,557 passed, 14 skipped, exit 0; the one commit after it
-is docs-only). Nothing is in flight. Next: operator push, PR CI, a free live Chromium check, then the ONE
-operator-authorized `test_bot.yaml` smoke dispatch.
+**Status (updated 2026-09-04 11:15 PT, see the two "Update" sections below):** second review pass done and
+fixed; the paid url_context rung is now ON in every bot workflow by operator instruction; the paid rung and
+the rendered rung were both verified live. Local HEAD `06b3fd9` (plus this doc's own commit) is 2 commits
+ahead of the pushed `ad9fec3`; the working tree is clean; the full free gate is green at `06b3fd9` (7,578
+passed, 14 skipped, exit 0). Nothing is in flight. Next: operator push, PR CI, then the ONE
+operator-authorized `test_bot.yaml` smoke dispatch and its QA. Every operator follow-up is gathered in
+"Operator follow-ups" near the end of this doc; surface that list to the operator only at the very end.
 
 ## Update, 2026-09-04 morning (second review pass before the smoke)
 
@@ -65,6 +66,35 @@ as `forge_fixwave_*.md` and `fable_panel_*.md` if present, else re-derive from `
 
 The operator does NOT read plan docs; every decision or approval you need from them goes inline in
 chat, self-contained, with a recommendation. They sign off on any paid run before it fires.
+
+## Update, 2026-09-04 late morning (flag on, live probes, ready for the smoke)
+
+- **The paid url_context rung is ON in production** (`06b3fd9`). The operator's rule: a feature built behind a
+  flag ships with the flag on unless stated otherwise; leaving `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` off
+  was the lead's miss, not a decision. `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED: 'true'` now sits beside the
+  sibling research flags in all five bot workflows (tournament, cup, minibench, test_bot, test_bot_basic);
+  the three paid-rung log lines are registered marker specs (`resolution_source_urlcontext_robots_skip`,
+  `resolution_source_urlcontext_ungrounded_suppressed`, `resolution_source_urlcontext_not_addressed`) with
+  fixture tests; a new test in `tests/test_workflow_reliability.py` pins the flag on and `GOOGLE_API_KEY`
+  wired in every bot step; AGENTS.md's cost gate, `docs/operations.md`, `docs/research.md`,
+  `docs/performance_analysis.md` and `.env.template` now say the resolution-source provider IS a paid
+  surface, bounded by the trigger population, the free Google-Extended robots pre-check, the 15 s floor and
+  `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` (2 paid reads per question). The two stale curl_cffi comments
+  (`fetch_diagnostic.yaml`, the AGENTS.md probe command) were fixed in the same commit.
+- **Paid rung verified live** (operator-authorized, cents; receipt
+  `scratch/fetch_ladder_2026-09-03/paid_rung_probe_2026-09-04.log`): four blocked URLs through
+  `fetch_resolution_sources` with the real Google key and the flag on, 4.5 s total. trueup.io: robots
+  Google-Extended disallow, skipped free (`ROBOTS_SKIP`). imf.org: Wayback declined, paid read fired,
+  Gemini reported `URL_RETRIEVAL_STATUS_ERROR`, withheld as `ungrounded`, `GEMINI_USAGE
+  role=resolution_source` logged (542 tokens). sagaftra.org (DataDome): paid read fired, the model opened
+  with `NOT_ADDRESSED`, withheld as `no_resolving_content` / `not_addressed` (3,100 tokens). congress.gov:
+  200 today, the extractor policy's precision fallback rescued the bill-status card
+  (`precision_fallback_rescues: 1`). Two paid reads total, the per-question cap binding. Nothing from a
+  challenge page reached forecaster text. This closes the review's "paid rung never ran live" gate.
+- **Rendered rung verified live** (free, keys blanked; receipt `ogimet_live_check_2026-09-04.log`): the
+  ogimet page that overran to 76 s in the QA sweep now returns in 42.3 s, inside the 45 s wall, recorded as
+  `render_timeout` (the transport's own DOM-read cut) and memoised.
+- **PR CI on the pushed `ad9fec3` is green** (lint, test, secret scan, audit).
 
 ## What this repo is and what the work was for
 
@@ -125,7 +155,7 @@ fixed what both found. Starting point: HEAD `16ca9ab`, gates green at 7,291 test
   **P3-5 MEDIUM**, the derived-API rung was unreachable on every corpus dashboard because their
   feeds are cross-origin; P3-6 to P3-10 low or cosmetic (a companiesmarketcap table shape, a
   served-but-thin capture logged as unserved, a zero-passage PDF digest still `status=success`,
-  two unregistered `RESOLUTION_SOURCE_URLCONTEXT_*` lines, Chromium teardown tracebacks).
+  the then-unregistered `RESOLUTION_SOURCE_URLCONTEXT_*` lines (registered 2026-09-04), Chromium teardown tracebacks).
 - **Fixes for P3-1, P3-4, P3-7 and P3-8.** `9811ca3` (P3-1) bounds the rendered rung: a DOM-read
   cap, an outer bound on the whole render at the remaining wall budget, a new skip reason
   `render_timeout` (with `render_timeout_skips`), a per-run memo so a timed-out URL is not rendered
@@ -196,7 +226,7 @@ fixed what both found. Starting point: HEAD `16ca9ab`, gates green at 7,291 test
     cache filled single-flight; R20, `url_context_no_api_key_skips` and six per-rung
     `<rung>_budget_skips` counts beside the aggregate `rung_budget_skips`; R23, the ungrounded log
     line spelled `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED` like its v2 twin, and both
-    unregistered lines pinned; R7, the url_context response text read directly.
+    URLCONTEXT lines pinned (all three registered as marker specs on 2026-09-04); R7, the url_context response text read directly.
   - *Browser transport* (`ea6d11d`, merged `2744219`): F5, the navigation budget is recomputed
     after both gate acquires (`RENDER_POST_GOTO_TAIL_MS`, `RenderBudgetExpired`), so a render
     admitted late navigates on what is actually left or declines before a launch; F8, the
@@ -353,7 +383,7 @@ Taken tonight by the session lead, and open to the operator's veto:
   landed only declines the two expensive rungs (render, paid read) when the time budget's fast
   path is on, and counts the declines.
 - **F3 makes the paid url_context rung reachable when the Wayback capture is too stale.** That is
-  a cost-policy consequence; the flag is default-off and set in no workflow, so nothing is spent
+  a cost-policy consequence; the flag defaults off in code but is ON in every bot workflow since 2026-09-04 (operator instruction), so this path is live and bounded by the 2-read cap
   until the operator turns it on.
 - **P3-8 flipped**: a zero-passage PDF digest is `no_resolving_content` / `no_matching_passage`,
   not `success`, per the prose-never-stands-in-for-an-absent-section rule.
@@ -408,6 +438,45 @@ Taken tonight by the session lead, and open to the operator's veto:
   `project_fetch_ladder_2026_09_03.md` (updated tonight), `project_minibench_cup_workflows_off.md`,
   `feedback_asks_must_be_inline.md`, `feedback_agents_md_terse.md`,
   `project_next_season_bundle_2026_09.md` (its status line predates tonight).
+
+## Operator follow-ups (surface ONLY at the very end of the session, in one list)
+
+Everything below needs the operator or is the operator's call. Do not drip these out mid-session.
+
+1. **Push** `next-season-bundle` (blocked for agents): `git push origin next-season-bundle`; then PR #66 CI.
+2. **Smoke** (already authorized ONCE, 2026-09-04 morning, to run after the flag flip is pushed and CI is
+   green): `gh workflow run test_bot.yaml --repo No-Stream/metaculus-bot --ref next-season-bundle`; 4
+   questions, about $10 at run-67 rates, mostly on the donated key; publishes 4 comments on Metaculus test
+   questions. QA it as Test Bot #67 was, plus `route=`, per-rung `RESOLUTION_SOURCE_ESCALATION`,
+   `failure_class`, the three `RESOLUTION_SOURCE_URLCONTEXT_*` markers, `GEMINI_USAGE
+   role=resolution_source`, and the counts keys.
+3. **Merge PR #66** to `main` (paste `scratch/next_season_bundle_2026-09/PR_DESCRIPTION.md`; append a line
+   for the flag flip and the two live probes).
+4. **After the merge, three commands:** `gh workflow enable "Forecast on Metaculus Cup" --repo
+   No-Stream/metaculus-bot`; `gh workflow run fetch_diagnostic.yaml --repo No-Stream/metaculus-bot` (free;
+   rows 1 to 4 of its table are the Akamai federal hosts: bot client 403 and impersonated 200 means build
+   the TLS-impersonation rung, both 403 means drop it for good); `git branch -d $(git branch --list
+   'worktree-agent-*' --merged); git branch -D worktree-agent-aed63df23d441c8e4` (the last is a superseded
+   doc revision).
+5. **Fall bot-tournament slug** when Metaculus publishes it: `TOURNAMENT_ID` and `TOURNAMENT_END_DATE` in
+   `metaculus_bot/constants.py` from the object's slug and `forecasting_end_date`; from 2026-09-20 the
+   tournament crons and one CI test go red on purpose; `make supply_probe` is the free watch.
+6. **Decisions taken by the lead that the operator may veto** (all reversible constants or small branches):
+   the rendered rung's 3 s exit reserve with the 12 s pre-gate floor left in place, so renders admitted with
+   12 to 15 s left decline at the gates (`RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` to 15 makes the pre-gate
+   check truthful at the cost of that band); the `NOT_ADDRESSED` sentinel in the shared url_context prompt,
+   visible in gap-fill v2's `read_document` tool text; chart-only publication when policy D withheld the page
+   text; extractor policy D itself (`content_share60` at 0.38); a stale Wayback capture falling through to
+   the paid read; the zero-passage PDF digest withheld; the fast-path gate on the two expensive rungs; the
+   Wayback request stamp at year granularity.
+7. **FUTURE.md items filed this session, for later rounds:** rendered-rung residuals under item 5 (unbounded
+   driver stop; the 12 to 15 s band; harvest extraction to `rendered_harvest.py`; two-place cancellation);
+   the DOM ceiling as the real bound on post-render extraction; extraction inside the per-host gate; P3-6
+   (companiesmarketcap table columns); P3-10 teardown traceback root cause; the driver-process leak on
+   cancellation inside `PlaywrightContextManager.__aenter__`; `tests/test_agentic_tools.py` and
+   `constants.py` size (own PR); Tier-1 paid rung configured by `GAP_FILL_V2_READER_*` constants (R18);
+   policy D re-calibration once a season of `chrome_metric_withholds` counts exists; Accept-Encoding
+   widening (now safe, unmeasured).
 
 ## References
 
