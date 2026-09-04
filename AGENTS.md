@@ -222,9 +222,17 @@ Each of these has cost real work at least once. The pointer is where the reasoni
 
 **Config and models**
 
-- **Model names live only in `llm_configs.py`.** Never hardcode one elsewhere, and never state
-  the current roster from memory — "latest per vendor" resolves only from a live model-list read.
-  Detail: `docs/roster_history.md`, `docs/operations.md` "Season-start checklist".
+- **Model ids live in `llm_configs.py` and `constants.py`, and the split is who builds the
+  client:** `llm_configs.py` holds the module-level `GeneralLlm` objects and config dicts, while
+  `constants.py` holds a bare id string for each support role whose consumer builds its own client
+  at call time, beside that role's env-var override, timeout and price note. Consolidating them is
+  blocked: `constants.py` is an import-linter foundation leaf that cannot import `llm_configs.py`,
+  so `tests/test_model_name_locations.py` pins the complete allowed file list instead, covering the
+  offline harnesses under `ablation/`, `benchmark/` and `ensemble_analysis/` and the routing
+  blocklist in `fallback_openrouter.py`, and failing CI on a model id in any other module. Never
+  state the current roster from memory either, because "latest per vendor" resolves only from a
+  live model-list read. Detail: `docs/roster_history.md`, `docs/operations.md` "Season-start
+  checklist".
 - **A roster or pipeline-behaviour change is a config-era boundary.** It ships in one merge,
   before the season's first question, not piecemeal.
 - **Never restate `STANDARD_PERCENTILES`** (or its count, or its CSV label) anywhere; derive from
