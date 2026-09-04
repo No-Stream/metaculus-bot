@@ -75,6 +75,11 @@ Paid or externally visible — ask before each:
   on the operator's personal AI Studio key (one grounded search plus two `url_context` reads).
   Cents, plus one prompt off the 5,000/month grounded allowance. It refuses without the flag and
   prints a cost estimate; the ask-first gate still applies.
+- `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` is the one flag that turns a free provider into a paid
+  one. It is off by default and set in no workflow yaml, so the resolution-source fetcher spends
+  nothing today; turning it on adds a Gemini `url_context` read, billed to the operator's
+  personal `GOOGLE_API_KEY`, as the last rung of its fetch ladder. Flipping it on anywhere is the
+  operator's cost decision. Detail: `docs/operations.md`.
 - Anything invoking research providers or the ensemble against real questions, including a
   one-off script an agent writes to do so.
 
@@ -150,6 +155,8 @@ Inside `metaculus_bot/`:
 | Per-question orchestration | `forecaster.py` (`_research_and_make_predictions`), `cli.py` |
 | Close-derived time budget | `time_budget.py` |
 | Research fan-out and providers | `research/` (`orchestrator.py`, `providers.py`, one module per provider) |
+| Outbound fetch transports (never hand-rolled) | `research/http_fetch.py`, `rendered_fetch.py` (headless Chromium), `url_context_reader.py` (the paid Gemini read), `robots_policy.py` |
+| Resolution-source fetcher and its escalation rungs | `research/resolution_source.py`, `resolution_fetch_result.py`, `derived_api.py`, `wayback.py` |
 | Gap-fill v1 / v2 | `research/targeted.py`, `research/agentic/` |
 | Model roster (source of truth) | `llm_configs.py` |
 | Prompts | `prompts.py` |
@@ -251,7 +258,12 @@ Each of these has cost real work at least once. The pointer is where the reasoni
   invariants: the `is_public_http_url` preflight, the connect-time `FilteringResolver` (the
   resolver, not the preflight, is the real DNS-rebinding boundary), a bounded manual redirect
   loop that re-guards every hop, the meta-refresh hop that no HTTP status announces, and the
-  per-host politeness semaphores. Do not hand-roll a fetch.
+  per-host politeness semaphores. Two transports sit beside it and are SHARED with gap-fill v2
+  rather than copied: `research/rendered_fetch.py` owns the headless-Chromium render, including
+  the DNS pin, the per-request route guard and the process-global launch cap, and
+  `research/url_context_reader.py` owns the one paid Gemini `url_context` read, with
+  `research/robots_policy.py` the per-host `Google-Extended` pre-check in front of it. Do not
+  hand-roll a fetch, a render or a reader.
 - **Timing, deadline and fallback code gets strictly-safer changes only.** A tidy-up in a
   soft-deadline, retry or key-fallback path can silently thin the ensemble or strand it on a dead
   key. If a change is not obviously safer, leave it and note it in `FUTURE.md`.

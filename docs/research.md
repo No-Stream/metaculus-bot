@@ -857,8 +857,12 @@ Fetches the exact URL(s) a question cites as its grading source
 (`research/resolution_source.py`), so forecasters read the ground truth the
 question resolves against. The page fetch is Tier-1: plain HTTP with browser-like
 headers, no LLM calls, no retries. One narrow Tier-2 hop sits beside it (the
-embedded Datawrapper dataset, below); the LLM-driven Tier-2 fetch pass the harder
-statuses are a seam for does not exist yet.
+embedded Datawrapper dataset, below). When the direct fetch cannot read a page an
+escalation ladder runs (`_escalate_unresolved`), each rung self-bounded against the same
+provider wall and each returning a result that went through the same classification path,
+so a rescued page is indistinguishable downstream from a directly-fetched one; the `route`
+on every result says which rung produced it. The four rungs added on 2026-09-03, and the
+one paid rung among them, are described under "The escalation ladder" below.
 
 It deterministically extracts URLs from resolution criteria + fine print (markdown
 links and bare URLs, order-preserving dedup, Metaculus markdown-escapes undone),
@@ -930,6 +934,89 @@ means a broken clock, not maximal freshness. The hop is bounded by
 `RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S`. A served dataset leads with a
 `Dataset published <ts>` liveness stamp.
 
+**The escalation ladder.** Four more rungs shipped on 2026-09-03, tried cheapest first behind
+the free hops above. Each declines by returning nothing, in which case the direct route's own
+status stands.
+
+`route=derived_api` (`research/derived_api.py`) serves the JSON feed a page loads its own
+figures from. A JavaScript dashboard's numbers arrive over XHR after the DOM is ready and sit
+in the served HTML at no wait condition, so the endpoint is found by the browser rung recording
+the page's own requests, then remembered per HOST for the rest of the run: a second cited URL on
+that host costs one GET (floor `RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S`, the one-request
+floor) instead of a second browser launch. Because a host's feed is usually parameterised, the
+lead on each served block names the endpoint and says whether it was discovered on that page or
+on another page of the same host, so a forecaster can check that the feed covers the quantity
+asked about.
+
+`route=rendered` re-reads the page out of a headless Chromium render
+(`research/rendered_fetch.py`, the transport shared with gap-fill v2's fetch ladder and its
+process-global two-launch cap). It triggers on `js_wall` and on the `thin_page` shape of
+`no_resolving_content`, both pages that answered 200 with nothing readable, and deliberately not
+on `embed_shell`, since `page.content()` returns the main frame's HTML and an Infogram or
+Flourish iframe comes back as a bare tag. Its floor,
+`RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S`, is far above the one-request rungs' because a launch
+plus a DOM-ready navigation costs several seconds even on a page that renders cleanly, and the
+launch slot is contended process-wide, so a question with no budget left would take a slot a
+sibling question could still land a page with. The rendered DOM re-enters `_classify_html_body`,
+so a rescued page gets the same chart read, ARIA rewrite, floors and disclosure leads as a
+directly-fetched one, and can still be withheld. A transport that declines (Playwright missing
+or broken, a host that will not pin to a public IP, a browser error, or a URL a browser already
+read to nothing this run) is recorded as a SKIP with the new reason `renderer_unavailable`
+rather than as a fired rung, because nothing was rendered and so nothing about the page changed.
+
+`route=wayback` (`research/wayback.py`) serves an archived capture. The archive earns a rung
+because it is the one free route whose EGRESS IS NOT OURS: measured 2026-09-03, the same client
+with the same headers gets 403 from a GitHub Actions runner and 200 from a residential address
+on bls.gov, cdc.gov and fsis.usda.gov alike. It triggers on `blocked` / `error` / `not_found`
+and never on `js_wall`, because the archive stores the unrendered shell. Three bounds: the
+`RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S` floor, at most
+`RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS` snapshots per QUESTION (every snapshot shares the one
+`web.archive.org` host gate, so N cited URLs would otherwise queue into N sequential archive
+fetches inside the provider wall), and the age bound
+`RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS`, which matches the Datawrapper freshness bound and is
+the same judgment rather than a measurement. A capture is admissible as primary grading evidence
+only with its age stated, which is what the lead renders. Three outcomes, in this order, and the
+order is the design. The wrapped inner URL is unwrapped and re-checked first, because
+`is_metaculus_self_ref` keys on hostname and a `web.archive.org/web/.../metaculus.com/...` URL
+sails past every self-reference filter in the pipeline, and a failed SSRF or self-ref re-check
+refuses the rung outright. Then a capture the archive never served DECLINES, leaving the direct
+status standing, because "no archived copy exists" is a different fact from a stale one and the
+direct status says more about the source. Only a capture we did read and cannot date, or can date
+and it is too old, is withheld as `stale_data`.
+
+`route=url_context` is the LAST rung and the only paid one: Gemini reads the page for us
+(`research/url_context_reader.py`, the reader shared with gap-fill v2's `read_document`),
+reaching hosts our own client cannot because Gemini dials from Google's address. It is OFF by
+default behind `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` and set in no workflow yaml, so it fires
+nowhere in production today; `docs/operations.md` covers what turning it on costs and on whose
+key. Every gate is checked in increasing cost order before a cent is spent: the trigger statuses
+(`blocked`, `js_wall`, `error`, `no_resolving_content`), the flag, the free per-host
+`Google-Extended` robots pre-check (`research/robots_policy.py`, whose cache is shared with v2's
+reader, worth a request of its own because a host disallowing that token refuses Gemini's fetch
+server-side), the API key, and the `RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S` floor. It has its
+own retry count, `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`, deliberately lower than the v2
+reader's, because a retry inside a wall shared with every other cited URL spends the budget the
+pages already fetched need in order to render. Zero successful retrievals
+DISCARDS the text under the new terminal status `ungrounded`, the same floor `gemini_search` and
+v2's `read_document` apply: Gemini answers fluently out of parametric memory when every
+retrieval failed, and a fluent unsourced answer under the primary-grading-evidence caption is
+the Q38195 failure with a forecaster-facing blast radius. A read that lands leads with a
+mandatory disclosure saying why the route was taken and that the text is a model's reading
+rather than a copy of the page. Its spend is visible as a third `GEMINI_USAGE` role,
+`resolution_source`.
+
+Every non-direct route present in the sections that will RENDER also contributes one
+forecaster-facing caveat sentence, from `ROUTE_CAVEATS` in
+`research/resolution_fetch_result.py`: where the bytes came from, and what the reader must not
+conclude from having them. The mapping is keyed by route and iterated, so it is both the
+vocabulary check and the render order, cheapest and most transparent first and model-mediated
+last. `direct` is deliberately ABSENT from it rather than mapped to an empty string, which is
+what keeps an all-direct question's section byte-identical to what it rendered before the ladder
+existed (the overwhelming majority of questions, pinned by a test). One sentence belongs to a
+rung that has not shipped: `impersonate` is in the route vocabulary and carries a caveat, but
+nothing produces that route, and a completeness test asserts every non-direct token has a
+sentence so a future rung cannot render rescued content with no disclosure at all.
+
 Every rung is self-bounding on the Datawrapper hop's pattern — wall minus elapsed
 minus `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`, skipped below its own floor — because
 the provider's outer `asyncio.wait_for` discards
@@ -937,12 +1024,23 @@ every page that already fetched when it fires, so an overrunning rung costs the 
 question's resolution evidence rather than just its own attempt. A rung that FIRED
 records itself on the result (`route=` on the fetch marker, plus one
 `RESOLUTION_SOURCE_ESCALATION` line); a rung that was SKIPPED is counted under
-`details["counts"]` instead of logged, alongside the fired counts —
-`meta_refresh_hops`, `pdf_documents_read`, `rung_budget_skips`, and
-`pdf_contention_skips`, which is its own count rather than folded into the budget
-skips because a document left unread while two others were parsing says the two-slot
-gate is the binding constraint, a different thing to fix than a question that ran
-late.
+`details["counts"]` instead of logged, alongside the fired counts. Eleven keys, and a zero
+renders nothing while still surviving into the archive, which is what makes "the rung existed
+and never fired" distinguishable from "this record predates the rung". Six of the keys count
+rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
+`derived_api_reads`, `wayback_attempts` and `url_context_reads`. The other five count rungs that
+were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
+because each names a different binding constraint. `rung_budget_skips` is the question that ran out of wall.
+`pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
+parse gate is what binds. `renderer_unavailable_skips` is a browser rung that never rendered,
+most often because Chromium is missing on the runner (the install step is `continue-on-error` in
+every workflow, so its absence is by design), and it is invisible in `rendered_attempts`.
+`wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
+per-question cap is what binds. `url_context_robots_skips` is the free `Google-Extended`
+pre-check earning its request: the host would have refused the read server-side, so that is
+spend avoided rather than a page lost and it must not read as a failure. One skip reason has no
+count of its own: the paid rung's `no_api_key`, which is a misconfiguration rather than a tuning
+signal.
 
 It is **SSRF-hardened** because these URLs are user-authored and fetches run from
 CI: a preflight `is_public_http_url` check rejects private / loopback /
@@ -959,7 +1057,7 @@ budget]` when later sections are dropped for length.
 
 The per-URL `FetchStatus` distinguishes two kinds of non-success, and only one is a
 seam. `blocked` / `js_wall` / `no_resolving_content` are pages we could not READ, and
-they remain the target of a future Tier-2 LLM-driven fetch pass, as is the `no_text_layer`
+they are what the escalation rungs above trigger on, as is the `no_text_layer`
 half of `unreadable_document` (a scan, where a model really is the only route). `empty_body`
 (a 200 whose body is empty or whitespace-only) and `unsupported_type` (including a body whose
 declared charset decodes to mojibake) are bodies that carried no information — refusals
@@ -968,6 +1066,17 @@ exist because `status="success"` has to mean CONTENT: as `success`, an empty bod
 rendered an empty section under the "primary grading evidence" caveat, suppressed the
 all-failed "yielded no usable content" notice for every sibling URL, and reported `ok`
 to provider diagnostics.
+
+`ungrounded` is the twelfth and newest status, and the only one that cost money: the paid
+url_context rung answered with zero successful retrievals, so what came back is recall rather
+than a read of the page and it is discarded rather than rendered. It has its own token because
+it says something no other status does, that the host answered a third-party fetcher's request
+with nothing while refusing ours. On the reason side, `renderer_unavailable` joins the
+`embed_shell` / `thin_page` / `no_text_layer` / `encrypted` / `malformed` /
+`no_matching_passage` / `budget_skipped` / `parse_contention` vocabulary, and it is the one that
+rides a rung attempt's `skipped_reason` rather than a result's `status_reason`, since nothing was
+rendered and so nothing about the page changed. Both live in
+`research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that
 decision is made, on every raw-body branch — Tier-1 JSON/text/CSV and the Tier-2
@@ -1061,6 +1170,15 @@ status that triggered it, the rung tried, what came back, and the wall-clock the
 cost — which is what makes "does this rung rescue anything, and is it worth its latency"
 answerable. See "Reading run logs" in `docs/operations.md` for the field meanings.
 
+The paid rung adds two greppable log lines that are deliberately NOT registered as marker specs:
+`RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...` (an INFO, the free pre-check
+avoiding a known-zero paid read) and `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED: url=...
+statuses=...` (a WARN, a paid read discarded for retrieving nothing). With the flag off in every
+workflow neither can fire in production, so a spec would only add an always-empty archive
+column; both are FUTURE marker-spec candidates, to be registered if the flag is ever turned on,
+which is when their rates start meaning something. Their `agentic_*` twins on the gap-fill v2
+reader already carry specs and are the pattern to follow.
+
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window), on the same leakage rationale. The section
 header is `## Resolution Source Snapshot`, and `RESOLUTION_SOURCE_ENABLED` was flipped
@@ -1136,7 +1254,13 @@ four tools (`research/agentic/tools.py`): `search_news` (AskNews, through the sa
 rate gate as the primary provider), `search_web` (Exa direct), `fetch` (an
 auto-escalating ladder: plain → local PDF extraction → headless Chromium →
 `read_document`), and `read_document` (acquisition-first — the free rungs, then
-`GAP_FILL_V2_READER_MODEL` via Gemini url_context). It runs under a wall deadline
+`GAP_FILL_V2_READER_MODEL` via Gemini url_context). Two of those rungs are transports shared
+with the Tier-1 resolution-source ladder rather than copies of it: the Chromium render
+(`research/rendered_fetch.py`, over which `tools._try_rendered_fetch` is now a thin mapping onto
+this ladder's own result type) and the url_context read
+(`research/url_context_reader.py`, with the `Google-Extended` pre-check in
+`research/robots_policy.py`, moved out of `research/agentic/` when the second caller arrived).
+It runs under a wall deadline
 (`GAP_FILL_V2_WALL_DEADLINE`) and a tool-call budget
 (`GAP_FILL_V2_MAX_TOOL_CALLS`), producing anytime output, and soft-fails to `""` at
 every boundary. It appends a detached
