@@ -46,6 +46,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.agentic import local_document
 from metaculus_bot.research.agentic.fetch_outcomes import (
+    _FETCH_MIN_CONTENT_CHARS,
     _HTML_CONTENT_TYPE_TOKENS,
     _RETRYABLE_FETCH_BLOCK_STATUSES,  # noqa: F401  # re-export: the suite parametrizes the blocked-status set off this module
     _TEXTUAL_CONTENT_TYPE_TOKENS,
@@ -64,6 +65,7 @@ from metaculus_bot.research.agentic.fetch_outcomes import (
     _plain_textual_outcome,
     matched_throttle_phrase,
 )
+from metaculus_bot.research.agentic.robots_policy import google_extended_disallows
 from metaculus_bot.research.agentic.tool_backends import (
     _call_asknews_search,
     _call_exa_search,
@@ -121,7 +123,22 @@ _RENDERED_FETCH_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
 _FETCH_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 _FETCH_TEXT_CACHE: OrderedDict[str, str] = OrderedDict()
 _FETCH_LINKS_CACHE: OrderedDict[str, list[str]] = OrderedDict()
+# URLs where Chromium ran and extracted nothing, so the second launch a documented escalation
+# would spend (a js-walled `fetch` the driver follows with `read_document`) is skipped: 100-300
+# MB and up to 35 s out of the process-global launch cap, to learn what this run already knows.
+# Deliberately records ONLY that outcome. A `blocked` or `error` GET is not memoized — 429 sits
+# in the retryable block set and the driver is TOLD to try those URLs again, so caching them
+# would suppress a retry the tool descriptions promise (and a throttle interstitial is exactly
+# the q45191 case that must stay re-requestable).
+_RENDERED_NO_TEXT: OrderedDict[str, None] = OrderedDict()
 _PLAYWRIGHT_WARNED = False
+
+# One robots.txt read per host, for the Google-Extended pre-check on the paid reader. The value
+# is the fetched text, or None when we could not read it (which proceeds to pay). Bounded and
+# FIFO like the two caches above rather than a plain dict, because this is process-global state
+# that outlives one question: a whole run's hosts would otherwise accumulate here.
+_ROBOTS_FETCH_TIMEOUT_S = 5.0
+_ROBOTS_TXT_CACHE: OrderedDict[str, str | None] = OrderedDict()
 
 
 def _host_gate(url: str) -> asyncio.Semaphore:
@@ -468,7 +485,42 @@ async def _navigate_and_read_dom(page: Any, url: str, playwright_error: type[Bas
     return content_type, await page.content()
 
 
+async def _vet_route(route: Any, request: Any, playwright_error: type[BaseException]) -> None:
+    """Let one request Chromium is about to make through, or abort it.
+
+    ``playwright_error`` is passed in because the class comes from the caller's function-scoped
+    optional import. A request can still be in flight when the page/context tears down (typically
+    after a goto timeout): ``continue_``/``abort`` then races the close and raises
+    ``TargetClosedError`` in this detached event-listener task — the unhandled-error storm seen
+    2026-07-25. It is swallowed because a closed target has no live socket, so an abort that
+    "fails" because the target is already gone still lets nothing through and the SSRF guarantee
+    is unaffected; ``unroute_all`` in the caller's ``finally`` is the primary drain and this is the
+    residual-race backstop. Only Playwright's own Error is caught, so a genuine bug still
+    propagates.
+    """
+    try:
+        if await resolution_source.is_public_http_url(request.url):
+            await route.continue_()
+        else:
+            await route.abort("blockedbyclient")
+    except playwright_error as exc:  # the teardown race documented above, not a broad catch
+        logger.debug("agentic route guard race during teardown: %s", exc)
+
+
+def _note_rendered_no_text(url: str) -> None:
+    """Record that Chromium rendered ``url`` and there was no text in the result."""
+    _RENDERED_NO_TEXT[url] = None
+    _RENDERED_NO_TEXT.move_to_end(url)
+    while len(_RENDERED_NO_TEXT) > _FETCH_CACHE_MAX_ENTRIES:
+        _RENDERED_NO_TEXT.popitem(last=False)
+
+
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
+    if url in _RENDERED_NO_TEXT:
+        # A browser already read this URL to nothing in this run. None is the same "the rendered
+        # rung gave us nothing" both callers already handle for a missing/failed Chromium.
+        logger.debug("agentic rendered fetch skipped (already rendered to nothing): %s", urlparse(url).netloc)
+        return None
     try:
         from playwright.async_api import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
             Error as PlaywrightError,
@@ -517,23 +569,9 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
             # Chromium's connect), so their rebinding TOCTOU is a documented residual
             # — a filtering forward proxy would close it, deferred as its own change.
             async def _guard_route(route: Any, request: Any) -> None:
-                try:
-                    if await resolution_source.is_public_http_url(request.url):
-                        await route.continue_()
-                    else:
-                        await route.abort("blockedbyclient")
-                except PlaywrightError as exc:
-                    # A request can still be in flight when the page/context tears
-                    # down (typically after a goto timeout): continue_/abort then
-                    # races the close and raises TargetClosedError in this detached
-                    # event-listener task — the unhandled-error storm seen
-                    # 2026-07-25. Swallow it: a closed target has no live socket, so
-                    # an abort that "fails" because the target is already gone still
-                    # lets nothing through — the SSRF guarantee is unaffected.
-                    # unroute_all in the finally is the primary drain; this is the
-                    # residual-race backstop. Only Playwright's own Error is caught,
-                    # so a genuine bug (a Python exception) still propagates.
-                    logger.debug("agentic route guard race during teardown: %s", exc)
+                # A thin closure so the registration keeps Playwright's expected handler shape
+                # while the vetting itself stays module-level and directly testable.
+                await _vet_route(route, request, PlaywrightError)
 
             await context.route("**/*", _guard_route)
             page = await context.new_page()
@@ -546,6 +584,7 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
                 links = _extract_links_from_html(html, url)
                 text = (extracted or "").strip()
                 if not text:
+                    _note_rendered_no_text(url)
                     return PlainFetchResult(status="error", method="rendered", text="", links=links, url=url)
                 return PlainFetchResult(
                     status="ok",
@@ -710,11 +749,35 @@ async def _acquire_local_document(url: str) -> local_document.HeldDocument:
         return local_document.HeldDocument()
 
 
-def _local_digest_outcome(url: str, ask: str, held: local_document.HeldDocument) -> ToolOutcome:
-    """Answer the ask from text we hold, deterministically and for free."""
-    digest = local_document.digest_held(
-        held, ask=ask, top_k=DOCUMENT_DIGEST_TOP_K, max_chars=_FETCH_WINDOW_CHARS, source_url=url
+async def _local_digest_outcome(url: str, ask: str, held: local_document.HeldDocument) -> ToolOutcome | None:
+    """Answer the ask from text we hold, deterministically and for free — or None to pay instead.
+
+    None is returned for the one shape where a digest would answer the ask out of furniture: a
+    sub-floor page (under the same ``_FETCH_MIN_CONTENT_CHARS`` the fetch ladder escalates on),
+    with no parse behind it, whose digest selected NO passage. That is a JavaScript shell whose
+    browser rescue already failed, and digesting its navigation chrome stamped an unread page
+    ``fetched`` — the one tier that supersedes the briefing — while the tool description tells
+    the driver a zero-passage digest means the document does not discuss the ask (D5: a Manifold
+    sidebar carrying five OTHER markets' probabilities came back as the page's content). All
+    three conditions are needed: thin-but-real short sources exist and ``fetch`` serves them as
+    successes, a held parse is a real local read of a document a browser cannot help with, and a
+    matching passage is evidence the text is the page rather than its frame.
+
+    The digest runs off the loop: ``select_passages`` tokenises every window of the whole
+    document and holds one Counter per window, which measured a 1,365 ms contiguous stall for
+    six concurrent 400-page digests — inside a research phase whose wall discards work that
+    already succeeded (F47).
+    """
+    digest = await asyncio.to_thread(
+        local_document.digest_held,
+        held,
+        ask=ask,
+        top_k=DOCUMENT_DIGEST_TOP_K,
+        max_chars=_FETCH_WINDOW_CHARS,
+        source_url=url,
     )
+    if len(held.text) < _FETCH_MIN_CONTENT_CHARS and held.pdf is None and digest.passages == 0:
+        return None
     local_document.log_local_document_read(
         url,
         method=local_document.DIGEST_LOCAL_METHOD,
@@ -738,9 +801,12 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
     if plain.method == DOCUMENT_NEEDED_METHOD:
         # Auto-escalate to the read_document backend so the driver keeps its "handled
         # automatically" contract without spending a second tool call. What reaches here is an
-        # image, or a PDF the local rung already proved has no text layer - its parse is
-        # cached, so the escalation costs neither a second request nor a second parse.
-        return await read_document(plain.url, _generic_document_ask(question_topic))
+        # image, or a PDF the local rung already proved has no text layer. Only the PDF is free
+        # of a second request: its parse is cached under the URL, whereas an image is classified
+        # on Content-Type alone and its body is never downloaded on either pass, so nothing
+        # caches it and the ladder would GET it again to re-derive the same verdict.
+        # ``ladder_exhausted`` says so directly — the free rungs just ran here.
+        return await read_document(plain.url, _generic_document_ask(question_topic), ladder_exhausted=True)
     if plain.status not in ("ok", "empty"):
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="error")
     if plain.status == "ok" and not plain.escalate_rendered:
@@ -755,7 +821,7 @@ async def _rendered_escalation_outcome(
     rendered = await _try_rendered_fetch(plain.url)
     if rendered is not None:
         if rendered.method == DOCUMENT_NEEDED_METHOD:
-            return await read_document(rendered.url, _generic_document_ask(question_topic))
+            return await read_document(rendered.url, _generic_document_ask(question_topic), ladder_exhausted=True)
         if rendered.status == "ok" and rendered.text:
             return _read_content_outcome(url, rendered.text, rendered.links, method="rendered", start_char=start_char)
     # Rendered was unavailable, errored, or itself extracted nothing. Fall back to
@@ -768,7 +834,68 @@ async def _rendered_escalation_outcome(
     return _empty_fetch_outcome(plain.url)
 
 
-async def read_document(url: str, ask: str) -> ToolOutcome:
+_ROBOTS_DISALLOWED_MSG = (
+    "Document read not attempted: {host}'s robots.txt disallows Google-Extended, the token "
+    "Gemini's url_context reader identifies as, so that read is refused at the host and returns "
+    "no content whatever it costs. Nothing from this URL was read; do NOT cite it as a fetched "
+    "source, and do NOT read it as evidence the fact is unavailable. Retrying will not help — "
+    "look for the same fact on another host."
+)
+
+
+def _robots_host(url: str) -> str:
+    """``url``'s netloc with any userinfo dropped: the robots cache key, and what gets logged.
+
+    The port stays, since a host's policy is served per origin. Userinfo goes because it must
+    reach neither a robots.txt request nor the archived telemetry line.
+    """
+    return urlparse(url).netloc.rpartition("@")[2]
+
+
+async def _robots_txt_for_host(url: str) -> str | None:
+    """``url``'s host's robots.txt, fetched at most once per host; None when we could not read it.
+
+    Goes through ``_fetch_plain`` rather than its own client so the SSRF preflight, the
+    filtering resolver, the redirect vetting and the body cap all apply unchanged. That path
+    also classifies, so a host serving robots.txt as HTML hands back trafilatura's idea of it
+    and a non-plain rung (an image, a PDF) is refused outright — both of which read as "no
+    directives", i.e. proceed and pay, which is the only direction an unreadable robots.txt is
+    allowed to fail in.
+    """
+    host = _robots_host(url)
+    if host in _ROBOTS_TXT_CACHE:
+        return _ROBOTS_TXT_CACHE[host]
+    body: str | None = None
+    try:
+        result = await asyncio.wait_for(
+            _fetch_plain(f"{urlparse(url).scheme}://{host}/robots.txt"), timeout=_ROBOTS_FETCH_TIMEOUT_S
+        )
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # pre-check soft-fail boundary: a robots.txt we cannot read must degrade to paying, never to failing the read
+        logger.debug("agentic robots.txt pre-check failed for %s: %s: %s", host, type(exc).__name__, exc)
+    else:
+        if result.status == "ok" and result.method == "plain":
+            body = result.text
+    _ROBOTS_TXT_CACHE[host] = body
+    _ROBOTS_TXT_CACHE.move_to_end(host)
+    while len(_ROBOTS_TXT_CACHE) > _FETCH_CACHE_MAX_ENTRIES:
+        _ROBOTS_TXT_CACHE.popitem(last=False)
+    return body
+
+
+async def _url_context_robots_skip(url: str) -> bool:
+    """True when this host tells ``Google-Extended`` to stay out of ``url``'s path.
+
+    Only the paid ``url_context`` rung consults this: the free rungs dial from our own client
+    under our own user agent, and this bot's reading of ``Content-Signal: use=reference`` is
+    that reference use is permitted. Proven live 2026-09-03 — see ``robots_policy``.
+    """
+    robots_txt = await _robots_txt_for_host(url)
+    if robots_txt is None:
+        return False
+    return google_extended_disallows(robots_txt, urlparse(url).path)
+
+
+async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -> ToolOutcome:
     """Answer ``ask`` about ``url``: from the page's own text where we can get it, else Gemini.
 
     Acquisition-first. The free ladder runs before anything is spent (this run's cache, then
@@ -788,9 +915,14 @@ async def read_document(url: str, ask: str) -> ToolOutcome:
     successful url_context retrievals withholds the tier, mirroring the grounded-chunk floor
     ``gemini_search`` applies. The local methods earn the same tier for the opposite reason:
     the bytes are the host's own, decoded rather than described.
+
+    ``ladder_exhausted`` is internal and hidden from the driver-facing schema (the same way
+    ``fetch`` hides ``question_topic``): ``fetch``'s own escalations set it because the free
+    rungs just ran for that URL, and running them again would re-request an image the plain rung
+    classified from its Content-Type without ever downloading it.
     """
     started = monotonic()
-    held = await _acquire_local_document(url)
+    held = local_document.HeldDocument() if ladder_exhausted else await _acquire_local_document(url)
     if held.oversize:
         return _format_fetch_error(local_document.oversize_message(url), method=local_document.OVERSIZE_DOCUMENT_METHOD)
     if held.has_text or local_document.exceeds_url_context_size_gate(held.text):
@@ -798,13 +930,34 @@ async def read_document(url: str, ask: str) -> ToolOutcome:
         # disagree: a document we hold is served from the digest whatever its size, and the
         # biggest are the clearest case — the nine archived documents past the gate carried 67%
         # of the season's reader tokens and the largest of them returned nothing for the money.
-        return _local_digest_outcome(url, ask, held)
+        # A None here is the one shape that must not be served: sub-floor chrome that no passage
+        # matched, which the paid reader below is the right rung for (see _local_digest_outcome).
+        served = await _local_digest_outcome(url, ask, held)
+        if served is not None:
+            return served
     if not os.getenv(GOOGLE_API_KEY_ENV):
         return _format_fetch_error(f"Google API key is not configured; set {GOOGLE_API_KEY_ENV}.", method="document")
+    if await _url_context_robots_skip(url):
+        # Its own status token, never mapped to a tier: nothing was read, and the reason is the
+        # host's policy rather than a failure worth retrying.
+        logger.info(f"AGENTIC_URLCONTEXT_ROBOTS_SKIP: url={url} host={_robots_host(url)}")
+        return _format_fetch_error(
+            _ROBOTS_DISALLOWED_MSG.format(host=_robots_host(url)),
+            status="robots_disallowed",
+            method="document",
+        )
     try:
         # The reader gets what the total budget has left, so a long acquisition shortens the
-        # paid attempt instead of overrunning the tool's ceiling. Acquisition is itself capped
-        # at _LOCAL_DOCUMENT_BUDGET_S, so this is never below 40 s.
+        # paid attempt instead of overrunning the tool's ceiling. Acquisition is itself capped at
+        # _LOCAL_DOCUMENT_BUDGET_S, so this wait is 40 s at that cap and 60 s when acquisition
+        # failed fast (the common case). The reader's own in-thread ceiling is FIXED at 55 s
+        # (tool_backends: 2 x 26.5 s + 2 s of backoff), so past ~10 s of acquisition this wait is
+        # the shorter of the two and a to_thread worker — which wait_for cannot cancel — can
+        # outlive it by up to 15 s, finishing a call whose answer is discarded. What that cannot
+        # do is start a NEW billed request after we stop waiting: the last attempt begins by
+        # 28.5 s in, well inside the 40 s floor. Sizing the attempts off this variable wait
+        # instead would cut one attempt to 19 s on the handover path and fail reads that succeed
+        # today, so the arithmetic stays fixed and the overrun is documented rather than traded.
         text, n_url_success, statuses = await asyncio.wait_for(
             asyncio.to_thread(_run_document_read_sync, url, ask),
             timeout=min(_READ_DOCUMENT_TIMEOUT_S, _READ_DOCUMENT_TOTAL_BUDGET_S - (monotonic() - started)),
@@ -834,6 +987,13 @@ def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
         # driver-facing schema stays (url, start_char) only.
         return await fetch(url, start_char, question_topic=question_topic)
 
+    async def _read_document_public(url: str, ask: str) -> ToolOutcome:
+        # (url, ask) only, for the same reason _fetch_with_topic hides question_topic: the loop
+        # binds handlers with **arguments straight off the model, so an advertised — or merely
+        # hallucinated — `ladder_exhausted: true` would skip the free ladder and pay. Resolves
+        # `read_document` as a module attribute at call time, so the suite's patches still land.
+        return await read_document(url, ask)
+
     return [
         ToolSpec(
             name="search_news",
@@ -862,7 +1022,7 @@ def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
             name="read_document",
             description=READ_DOCUMENT_DESCRIPTION,
             parameters=_READ_DOCUMENT_PARAMETERS,
-            handler=read_document,
+            handler=_read_document_public,
             # UNCHANGED at 70 even though the handler now runs a free local ladder before the
             # paid read: the two share _READ_DOCUMENT_TOTAL_BUDGET_S (65) and 70 stays at
             # GAP_FILL_V2_CONCLUDE_THRESHOLD, so the loop's wall discipline is untouched.

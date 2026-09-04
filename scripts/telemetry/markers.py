@@ -407,6 +407,23 @@ MARKER_SPECS: list[MarkerSpec] = [
         ),
     ),
     MarkerSpec(
+        "agentic_urlcontext_robots_skip",
+        # Per-URL: the gap-fill v2 PAID document read was skipped before it spent anything,
+        # because the host's robots.txt disallows `Google-Extended` — the product token Gemini's
+        # url_context retrieval identifies as, so that read is refused at the host and returns
+        # nothing whatever it costs (proven live 2026-09-03 on internationalaisafetyreport.org,
+        # against a robots-allowed host that retrieved on the identical call). Registered because
+        # the pre-check spends one free request per host to save a paid call, and only these lines
+        # say how often it fires: a fire is a call NOT billed, and a suspiciously high rate would
+        # mean the group parser is over-matching and withholding reads we could have had.
+        #
+        # `host` rides beside `url` because the verdict is cached and applied PER HOST, so the
+        # host is the unit any rate is computed over. No `question=` — the tool handlers run below
+        # the loop's log_prefix and have no question id, exactly like the two markers above, so a
+        # join goes through the run id.
+        re.compile(r"AGENTIC_URLCONTEXT_ROBOTS_SKIP:\s*url=(?P<url>\S+)\s+host=(?P<host>\S+)"),
+    ),
+    MarkerSpec(
         "open_bound_piling",
         re.compile(
             r"OPEN_BOUND_PILING:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"

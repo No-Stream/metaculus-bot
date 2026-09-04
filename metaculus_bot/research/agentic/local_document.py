@@ -48,7 +48,9 @@ from metaculus_bot.research.document_text import (
     extract_pdf_text,
     has_text_layer,
     joined_page_text,
+    truncation_note,
 )
+from metaculus_bot.research.http_fetch import pdf_parse_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +73,6 @@ _CHARS_PER_TOKEN_ESTIMATE = 4
 # the body itself is dropped as soon as extraction returns.
 _DOCUMENT_CACHE_MAX_ENTRIES = 20
 _DOCUMENT_CACHE: OrderedDict[str, PdfText] = OrderedDict()
-
-# Process-global cap on concurrent PDF parses, for the same reason the rendered rung caps
-# Chromium launches: pypdf decodes every content stream, so a parse is both CPU-bound and
-# holds its body for the duration. The driver's parallel_tool_calls can request several
-# fetches in one step and six questions run concurrently under the orchestrator, so an
-# unbounded fan-out is 6xN bodies of up to 40 MiB plus their parse arenas — a MemoryError no
-# soft-fail boundary can catch. Two slots covers a real burst while bounding the peak.
-_EXTRACT_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +102,25 @@ def held_pdf(pdf: PdfText) -> HeldDocument:
     A scan comes back with page structure and no text, which is the shape that tells a caller
     the free route is exhausted rather than untried.
     """
-    return HeldDocument(text=joined_page_text(pdf)[0].strip(), pdf=pdf)
+    return HeldDocument(text=_disclosed_page_text(pdf), pdf=pdf)
+
+
+def _disclosed_page_text(pdf: PdfText) -> str:
+    """The read pages as one string, led by a note when they are not the whole document.
+
+    Both writers of a PDF's flat text go through here, because that text is served to the driver
+    with no header of its own — a ``pdf_local`` fetch window, and a later digest of a page we
+    hold as text — and ``fetch``'s own description promises "A PDF is read here, in full text".
+    Extraction stops at DOCUMENT_TEXT_MAX_PAGES or DOCUMENT_TEXT_MAX_SECONDS and says which in
+    ``truncated_by``; without the note the driver pages to the end, sees ``truncated=False``, and
+    can report an absence over pages nobody read. The wording is
+    :func:`document_text.truncation_note`'s, so this and the digest header cannot drift apart.
+    """
+    text = joined_page_text(pdf)[0].strip()
+    note = truncation_note(pdf)
+    if not note:
+        return text
+    return f"[Partial document read: {pdf.page_count} pages{note}]\n\n{text}"
 
 
 def cached_document(url: str) -> PdfText | None:
@@ -144,7 +156,20 @@ async def pdf_fetch_result(body: bytes, *, url: str, content_type: str) -> Plain
     Never raises: :func:`extract_pdf_text` reports a mangled document through
     ``unreadable_reason`` instead, and that also lands as ``document_needed``.
     """
-    async with _EXTRACT_GLOBAL_SEMAPHORE:
+    # The gate bounds concurrent pypdf PARSES and their arenas (plus the two bodies being
+    # parsed), which is less than an earlier comment here claimed: each body is read to
+    # completion under DOCUMENT_TEXT_PDF_MAX_BYTES in tools.py::_plain_response_outcome BEFORE
+    # this call, and the caller's `body` local keeps it alive while its coroutine waits here, so
+    # peak resident bytes is (in-flight PDF fetches) x their size, capped only per body.
+    # Acquiring before the read would bound that too, and is deliberately not done: the
+    # acquisition wall is _LOCAL_DOCUMENT_BUDGET_S and expiring on a queue hands the document to
+    # the PAID reader, so queueing the download trades memory for spend. The two slots are shared
+    # process-wide with the Tier-1 resolution-source rung (http_fetch.pdf_parse_semaphore), since
+    # pypdf is pure Python and the two paths contend for the same GIL: six concurrent parses of a
+    # 220-page document took 10.2 s against 1.66 s solo, and each parse's max_seconds is
+    # wall-clock, so without a shared bound a parse truncates because of concurrency rather than
+    # because of the document's size.
+    async with pdf_parse_semaphore():
         # CPU-bound (pypdf parses and decodes every content stream), so it must not run on the
         # event loop. A caller whose own budget expires first cancels this coroutine but not
         # the worker thread, which finishes and drops its result — bounded by max_seconds.
@@ -154,11 +179,10 @@ async def pdf_fetch_result(body: bytes, *, url: str, content_type: str) -> Plain
     cache_document(url, pdf)
     if not has_text_layer(pdf):
         return _document_needed_result(url, content_type)
-    text, _page_breaks = joined_page_text(pdf)
     return PlainFetchResult(
         status="ok",
         method=PDF_LOCAL_METHOD,
-        text=text.strip(),
+        text=_disclosed_page_text(pdf),
         links=[],
         url=url,
         content_type=content_type or None,

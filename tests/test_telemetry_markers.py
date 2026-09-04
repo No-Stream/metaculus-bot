@@ -516,6 +516,45 @@ class TestAgenticFetchLocalDoc:
         assert "qid_kind" not in rec
 
 
+# Copied from the one emitting format string (research/agentic/tools.py:read_document). The host
+# is the 2026-09-03 receipt: the verification probe's url_context call returned
+# URL_RETRIEVAL_STATUS_ERROR on internationalaisafetyreport.org, whose robots.txt carries
+# `User-agent: Google-Extended` / `Disallow: /`, while the identical call on a robots-allowed host
+# retrieved.
+AGENTIC_URLCONTEXT_ROBOTS_SKIP_LINE = (
+    PFX + "AGENTIC_URLCONTEXT_ROBOTS_SKIP: url=https://internationalaisafetyreport.org/chapters/2/ "
+    "host=internationalaisafetyreport.org"
+)
+
+
+class TestAgenticUrlContextRobotsSkip:
+    """Per-URL record of a paid document read the robots pre-check refused to make.
+
+    Worth a spec because the pre-check trades one free request per host for a possible paid call,
+    and this line is the only measurement of that trade: each record is a call not billed, while a
+    rate far above the handful of hosts that publish the directive would mean the group parser is
+    over-matching and withholding reads we could have had.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(AGENTIC_URLCONTEXT_ROBOTS_SKIP_LINE)
+        assert rec["marker"] == "agentic_urlcontext_robots_skip"
+        assert rec["url"] == "https://internationalaisafetyreport.org/chapters/2/"
+        # The verdict is cached and applied per HOST, so the host is the unit a rate is taken over.
+        assert rec["host"] == "internationalaisafetyreport.org"
+
+    def test_a_query_string_url_survives_whole(self):
+        rec = _parse_one(
+            PFX + "AGENTIC_URLCONTEXT_ROBOTS_SKIP: url=https://x.test/a?b=1&c=2+3 host=x.test",
+        )
+        assert rec["url"] == "https://x.test/a?b=1&c=2+3"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(AGENTIC_URLCONTEXT_ROBOTS_SKIP_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+
 class TestOpenBoundPiling:
     def test_fields(self):
         rec = _parse_one(OPEN_BOUND_PILING_LINE)
