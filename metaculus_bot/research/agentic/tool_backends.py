@@ -31,13 +31,8 @@ from metaculus_bot.constants import (
     GOOGLE_API_KEY_ENV,
 )
 from metaculus_bot.research import providers as research_providers
-from metaculus_bot.research.gemini_client_config import (
-    build_gemini_http_options,
-    gemini_retry_sleep_allowance_s,
-    gemini_thinking_config,
-)
-from metaculus_bot.research.gemini_usage import log_gemini_usage
-from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
+from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
+from metaculus_bot.research.url_context_reader import run_url_context_read
 
 # Client-side HTTP ceilings sized against the tools' loop budgets so the underlying socket is
 # torn down rather than left pinned to a wall deadline — a hung endpoint then frees its slot.
@@ -249,59 +244,29 @@ async def _call_exa_search(query: str, end_published_date: str | None) -> list[A
     return []
 
 
-def _build_document_prompt(ask: str) -> str:
-    return (
-        f"{ask}\n\n"
-        "Answer using verbatim quotes from the document whenever possible. Include the document's stated dates. "
-        "If the document does not address the ask, say that plainly."
-    )
-
-
 def _run_document_read_sync(url: str, ask: str) -> tuple[str, int, list[str]]:
     """Read ``url`` via Gemini url_context. Returns ``(text, n_successful_retrievals, statuses)``.
 
-    The retrieval count is returned, not discarded, because the text alone cannot tell a
-    real document read from a fluent answer out of parametric memory — Gemini produces
-    both happily, and ``read_document`` grants the highest verification tier the artifact
-    renderer has. Same reader the grounded-search provider uses for the same reason (see
-    ``research/url_context_telemetry``).
+    A thin binding of this tool's own settings onto the shared reader
+    (``research/url_context_reader``), which the Tier-1 resolution-source ladder also calls.
+    It stays HERE, with this name, because ``tools.read_document`` resolves
+    ``_run_document_read_sync`` as a module attribute the suite monkeypatches — and because the
+    timeout arithmetic above is this tool's, not the reader's.
 
-    ``statuses`` is every reported ``url_retrieval_status`` name, in the SDK's order, so the
-    caller's suppression WARN can say WHY nothing was retrieved. A count of zero is the same
-    number whether the fetch was refused, timed out, or the tool never ran, and those are
-    different problems.
+    The retrieval count is returned, not discarded, because the text alone cannot tell a real
+    document read from a fluent answer out of parametric memory, and ``read_document`` grants
+    the highest verification tier the artifact renderer has.
     """
-    from google import genai  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-    from google.genai import types as genai_types  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-
     api_key = os.getenv(GOOGLE_API_KEY_ENV)
     if not api_key:
         raise ValueError(f"Missing Google API key: {GOOGLE_API_KEY_ENV}")
-    # Client-side per-attempt timeout (ms) so a hung Gemini endpoint returns the thread —
-    # read_document runs this sync call under asyncio.to_thread, and wait_for
-    # cancels the coroutine but can't cancel the thread; without this ceiling a
-    # stuck endpoint leaks the worker into the shared ThreadPoolExecutor. The retry ladder
-    # comes with it (the SDK retries nothing by default), sized so the attempts and their
-    # backoff still fit the same budget — see _READ_DOCUMENT_HTTP_PER_ATTEMPT_TIMEOUT_MS.
-    client = genai.Client(
+    return run_url_context_read(
+        url,
+        ask,
         api_key=api_key,
-        http_options=build_gemini_http_options(
-            timeout_ms=_READ_DOCUMENT_HTTP_PER_ATTEMPT_TIMEOUT_MS,
-            attempts=GAP_FILL_V2_READER_HTTP_ATTEMPTS,
-        ),
-    )
-    tools: list[Any] = [{"url_context": {}}]
-    config = genai_types.GenerateContentConfig(
-        tools=tools,
-        # Explicit rather than the model's default: quoting a fetched document back is the
-        # least reasoning-heavy Gemini call the bot makes (see GAP_FILL_V2_READER_THINKING_LEVEL).
-        thinking_config=gemini_thinking_config(GAP_FILL_V2_READER_THINKING_LEVEL),
-    )
-    response = client.models.generate_content(
+        role="read_document",
         model=GAP_FILL_V2_READER_MODEL,
-        contents=f"{_build_document_prompt(ask)}\n\nURL: {url}",
-        config=config,
+        thinking_level=GAP_FILL_V2_READER_THINKING_LEVEL,
+        timeout_ms=_READ_DOCUMENT_HTTP_PER_ATTEMPT_TIMEOUT_MS,
+        attempts=GAP_FILL_V2_READER_HTTP_ATTEMPTS,
     )
-    log_gemini_usage(response, role="read_document", model=GAP_FILL_V2_READER_MODEL)
-    _, _, n_url_success, entries = extract_url_context_telemetry(response)
-    return (_stringify(getattr(response, "text", "")) or "", n_url_success, [status for status, _url in entries])

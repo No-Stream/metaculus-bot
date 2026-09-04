@@ -65,6 +65,14 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 # which keeps meaning "a content type we do not read at all" — the two answer
 # different questions, and a paid document read is only ever worth spending on
 # this one.
+# `ungrounded` is the PAID reader answering without having retrieved anything: Gemini's
+# url_context tool reported zero successful retrievals, so whatever text came back is recall
+# rather than a read of the page, and it is DISCARDED rather than rendered. Its own token because
+# it is the one failure that cost money, and because it says something no other status does —
+# the host answered a third-party fetcher's request with nothing while refusing ours. Mirrors the
+# grounded-chunk floor `gemini_search` applies and the identical guard on gap-fill v2's
+# `read_document`; the receipt for why is Q38195 (2026-07-19), where 30 search queries and 0
+# grounding chunks produced a confident fabricated table with fake `[primary]` tags.
 FetchStatus = Literal[
     "success",
     "blocked",
@@ -77,6 +85,7 @@ FetchStatus = Literal[
     "empty_body",
     "no_resolving_content",
     "unreadable_document",
+    "ungrounded",
 ]
 
 # Which rule produced a status that has more than one rule behind it. A telemetry token

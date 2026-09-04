@@ -1011,20 +1011,17 @@ class TestResolutionSourceFetchMarker:
         ]
         assert not [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
-        assert counts == {
-            "meta_refresh_hops": 0,
-            "pdf_documents_read": 0,
-            "rendered_attempts": 0,
-            "rung_budget_skips": 1,
-            "derived_api_reads": 0,
-            "wayback_attempts": 0,
-            "pdf_contention_skips": 0,
-            "wayback_cap_skips": 0,
-            # The withheld page also earned a browser attempt, which this package's autouse
-            # fixture declines — so the skip that follows the meta-refresh one is the browser
-            # transport reporting itself unavailable, not a second budget skip.
-            "renderer_unavailable_skips": 1,
-        }
+        assert counts["rung_budget_skips"] == 1
+        # The rung's own FIRE count stays zero, which is the whole point: a skip must not inflate
+        # the rate at which the rung is measured to work.
+        assert counts["meta_refresh_hops"] == 0
+        # The withheld page also earned a browser attempt, which this package's autouse fixture
+        # declines — so the second skip is the transport reporting itself unavailable rather than
+        # another budget skip.
+        assert counts["renderer_unavailable_skips"] == 1
+        # A total rather than an exact dict: the key SET grows every time a rung lands, and a
+        # literal here made three unrelated commits edit this one test.
+        assert sum(counts.values()) == 2
 
 
 class TestFetchResolutionSources:

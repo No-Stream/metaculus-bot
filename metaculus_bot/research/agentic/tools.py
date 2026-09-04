@@ -69,7 +69,6 @@ from metaculus_bot.research.agentic.fetch_outcomes import (
     _plain_textual_outcome,
     matched_throttle_phrase,
 )
-from metaculus_bot.research.agentic.robots_policy import google_extended_disallows
 from metaculus_bot.research.agentic.tool_backends import (
     _call_asknews_search,
     _call_exa_search,
@@ -96,6 +95,7 @@ from metaculus_bot.research.http_fetch import (
     read_body_capped,
 )
 from metaculus_bot.research.rendered_fetch import note_rendered_no_text, render_page
+from metaculus_bot.research.robots_policy import google_extended_blocks_url, robots_host
 
 logger = logging.getLogger(__name__)
 
@@ -113,12 +113,10 @@ _FETCH_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 _FETCH_TEXT_CACHE: OrderedDict[str, str] = OrderedDict()
 _FETCH_LINKS_CACHE: OrderedDict[str, list[str]] = OrderedDict()
 
-# One robots.txt read per host, for the Google-Extended pre-check on the paid reader. The value
-# is the fetched text, or None when we could not read it (which proceeds to pay). Bounded and
-# FIFO like the two caches above rather than a plain dict, because this is process-global state
-# that outlives one question: a whole run's hosts would otherwise accumulate here.
+# Timeout for this path's robots.txt read. The per-host CACHE is shared with the Tier-1
+# resolution-source reader (``robots_policy``), because a host's policy is a property of the host
+# and the two paths routinely reach the same government domains in one run.
 _ROBOTS_FETCH_TIMEOUT_S = 5.0
-_ROBOTS_TXT_CACHE: OrderedDict[str, str | None] = OrderedDict()
 
 
 def _host_gate(url: str) -> asyncio.Semaphore:
@@ -615,17 +613,8 @@ _ROBOTS_DISALLOWED_MSG = (
 )
 
 
-def _robots_host(url: str) -> str:
-    """``url``'s netloc with any userinfo dropped: the robots cache key, and what gets logged.
-
-    The port stays, since a host's policy is served per origin. Userinfo goes because it must
-    reach neither a robots.txt request nor the archived telemetry line.
-    """
-    return urlparse(url).netloc.rpartition("@")[2]
-
-
-async def _robots_txt_for_host(url: str) -> str | None:
-    """``url``'s host's robots.txt, fetched at most once per host; None when we could not read it.
+async def _fetch_robots_txt(robots_url: str) -> str | None:
+    """Read one robots.txt through THIS path's ladder; None when we could not read it.
 
     Goes through ``_fetch_plain`` rather than its own client so the SSRF preflight, the
     filtering resolver, the redirect vetting and the body cap all apply unchanged. That path
@@ -634,24 +623,14 @@ async def _robots_txt_for_host(url: str) -> str | None:
     directives", i.e. proceed and pay, which is the only direction an unreadable robots.txt is
     allowed to fail in.
     """
-    host = _robots_host(url)
-    if host in _ROBOTS_TXT_CACHE:
-        return _ROBOTS_TXT_CACHE[host]
-    body: str | None = None
     try:
-        result = await asyncio.wait_for(
-            _fetch_plain(f"{urlparse(url).scheme}://{host}/robots.txt"), timeout=_ROBOTS_FETCH_TIMEOUT_S
-        )
+        result = await asyncio.wait_for(_fetch_plain(robots_url), timeout=_ROBOTS_FETCH_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # pre-check soft-fail boundary: a robots.txt we cannot read must degrade to paying, never to failing the read
-        logger.debug("agentic robots.txt pre-check failed for %s: %s: %s", host, type(exc).__name__, exc)
-    else:
-        if result.status == "ok" and result.method == "plain":
-            body = result.text
-    _ROBOTS_TXT_CACHE[host] = body
-    _ROBOTS_TXT_CACHE.move_to_end(host)
-    while len(_ROBOTS_TXT_CACHE) > _FETCH_CACHE_MAX_ENTRIES:
-        _ROBOTS_TXT_CACHE.popitem(last=False)
-    return body
+        logger.debug("agentic robots.txt pre-check failed for %s: %s: %s", robots_url, type(exc).__name__, exc)
+        return None
+    if result.status == "ok" and result.method == "plain":
+        return result.text
+    return None
 
 
 async def _url_context_robots_skip(url: str) -> bool:
@@ -659,12 +638,10 @@ async def _url_context_robots_skip(url: str) -> bool:
 
     Only the paid ``url_context`` rung consults this: the free rungs dial from our own client
     under our own user agent, and this bot's reading of ``Content-Signal: use=reference`` is
-    that reference use is permitted. Proven live 2026-09-03 — see ``robots_policy``.
+    that reference use is permitted. Proven live 2026-09-03 — see ``robots_policy``, which owns
+    the per-host cache this shares with the Tier-1 reader.
     """
-    robots_txt = await _robots_txt_for_host(url)
-    if robots_txt is None:
-        return False
-    return google_extended_disallows(robots_txt, urlparse(url).path)
+    return await google_extended_blocks_url(url, fetch_text=_fetch_robots_txt)
 
 
 async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -> ToolOutcome:
@@ -712,9 +689,9 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     if await _url_context_robots_skip(url):
         # Its own status token, never mapped to a tier: nothing was read, and the reason is the
         # host's policy rather than a failure worth retrying.
-        logger.info(f"AGENTIC_URLCONTEXT_ROBOTS_SKIP: url={url} host={_robots_host(url)}")
+        logger.info(f"AGENTIC_URLCONTEXT_ROBOTS_SKIP: url={url} host={robots_host(url)}")
         return _format_fetch_error(
-            _ROBOTS_DISALLOWED_MSG.format(host=_robots_host(url)),
+            _ROBOTS_DISALLOWED_MSG.format(host=robots_host(url)),
             status="robots_disallowed",
             method="document",
         )

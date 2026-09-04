@@ -762,6 +762,23 @@ RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S: float = 8.0
 # fires. Two is the documented trade — a question whose first two cited sources are both dead
 # gets both tried, and a question citing five gets its budget protected.
 RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS: int = 2
+# --- The one PAID rung: Gemini url_context, last and behind its own flag ---
+# It reaches hosts our client cannot (prod run 33775800806 read bls.gov and sagaftra.org PDFs
+# that our own fetch 403'd) because Gemini dials from Google's address, not ours. It is also the
+# only rung here that spends money and the only one that is model-MEDIATED — what comes back is
+# an answer about the page, not the page — so it ships OFF and stays off in every workflow until
+# the operator turns it on.
+RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV: str = "RESOLUTION_SOURCE_URL_CONTEXT_ENABLED"
+# Floor for the read. Well above the free rungs' because a url_context call is a model
+# round-trip that also fetches: the v2 reader's measured budget is tens of seconds, and below
+# 15 s of remaining wall this cannot land an answer before the provider's outer wait_for
+# discards every page the question already fetched.
+RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S: float = 15.0
+# ONE attempt, against gap-fill v2's two. The retry there exists because a 503 UNAVAILABLE
+# returns in milliseconds and leaves most of a 55 s budget for a second try; inside a 45 s
+# provider wall shared with every other cited URL there is no such room, and a second attempt
+# would spend the budget that renders the pages already fetched.
+RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS: int = 1
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google

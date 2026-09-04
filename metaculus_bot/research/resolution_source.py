@@ -112,6 +112,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import socket
 import time
 from dataclasses import dataclass, field
@@ -128,6 +129,9 @@ from metaculus_bot.constants import (
     DOCUMENT_TEXT_MAX_PAGES,
     DOCUMENT_TEXT_MAX_SECONDS,
     DOCUMENT_TEXT_PDF_MAX_BYTES,
+    GAP_FILL_V2_READER_MODEL,
+    GAP_FILL_V2_READER_THINKING_LEVEL,
+    GOOGLE_API_KEY_ENV,
     RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
@@ -147,6 +151,9 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S,
     RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
+    RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
+    RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV,
+    RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
     RESOLUTION_SOURCE_WALL_TIMEOUT,
     RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS,
@@ -217,6 +224,8 @@ from metaculus_bot.research.resolution_url_scan import (
     is_yahoo_ticker_url,
     strip_markdown_escapes,  # noqa: F401  # re-export: the Tier-1 suite imports the markdown unescaper from this module path
 )
+from metaculus_bot.research.robots_policy import google_extended_blocks_url
+from metaculus_bot.research.url_context_reader import run_url_context_read
 from metaculus_bot.research.wayback import (
     parse_snapshot_url,
     snapshot_age_days,
@@ -1779,6 +1788,163 @@ async def _wayback_rung(
     return await _wayback_snapshot_result(session, url, direct, host_sems=host_sems, ctx=ctx)
 
 
+# What the paid reader is allowed to be asked about. Everything the free ladder left unresolved
+# EXCEPT the outcomes where a model-mediated read cannot help or must not be tried: a 404/410 has
+# no page to read, an empty or undecodable body and an unreadable document are bytes we DID get
+# (only `no_text_layer` could ever be rescued, and that is v2's `read_document` job on a URL the
+# driver chose), a withheld archive copy is a freshness decision rather than a fetch failure, and
+# `ssrf_blocked` is a URL WE refused — handing that to a third-party fetcher is exactly the
+# bypass the guard exists to prevent, which is why it is excluded here and not merely unlisted.
+_URL_CONTEXT_TRIGGER_STATUSES: frozenset[FetchStatus] = frozenset(
+    {"blocked", "js_wall", "error", "no_resolving_content"}
+)
+
+
+def _url_context_lead(live_status: FetchStatus) -> str:
+    """The MANDATORY disclosure a model-mediated read carries.
+
+    Both clauses are the point. It says WHY this route was taken, so a forecaster knows the host
+    refused us rather than that we chose a model over a fetch. And it says the text is not a copy
+    of the page — every other section in this snapshot is bytes the host served, and reading a
+    paraphrase under the same "primary grading evidence" caption without that line would overstate
+    what was retrieved by exactly the amount that matters.
+    """
+    return (
+        f"[Read via Gemini url_context because the live page could not be fetched ({live_status}); "
+        f"model-mediated, not a byte-for-byte copy.]"
+    )
+
+
+async def _fetch_robots_txt(
+    session: Any, robots_url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> str | None:
+    """Read one robots.txt through THIS path's own fetch; None when we could not read it.
+
+    Goes through :func:`_fetch_direct` rather than a second client, so the SSRF preflight, the
+    connect-time filtering resolver, the per-hop redirect re-guard, the per-host gate and the
+    budget-clamped hop timeout all apply to a request this pre-check makes. That path also
+    CLASSIFIES, so a host serving robots.txt as HTML can come back withheld under the chrome
+    floor — which reads as "no directives", i.e. proceed and pay, the only direction an
+    unreadable robots.txt is allowed to fail in.
+    """
+    result = await _fetch_direct(session, robots_url, host_sems, ctx)
+    return result.text if result.status == "success" else None
+
+
+async def _url_context_robots_skip(
+    session: Any, url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> bool:
+    """True when ``url``'s host tells ``Google-Extended`` to stay out of that path.
+
+    Only the PAID rung consults this: the free rungs dial from our own client under our own user
+    agent, and this bot's reading of ``Content-Signal: use=reference`` is that reference use is
+    permitted. The per-host cache lives in ``robots_policy`` and is shared with gap-fill v2's
+    reader, so a host reached by both paths in one run is read once.
+    """
+    return await google_extended_blocks_url(
+        url, fetch_text=lambda robots_url: _fetch_robots_txt(session, robots_url, host_sems, ctx)
+    )
+
+
+async def _url_context_rung(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """Ask Gemini to read a page our own client could not, or decline.
+
+    The LAST rung and the only paid one, so every gate is checked before a cent is spent, in
+    increasing cost order: the trigger population, the flag (default off, and off in every
+    workflow), the free per-host ``Google-Extended`` robots pre-check, the API key, and the wall
+    budget. The robots check is worth a request of its own because a host that disallows that
+    token refuses the fetch server-side — proven live 2026-09-03, where the same call that
+    retrieved a robots-allowed host came back ``URL_RETRIEVAL_STATUS_ERROR`` on
+    internationalaisafetyreport.org — so the read would be spend with a known-zero return.
+
+    Zero successful retrievals DISCARDS the text and reports ``ungrounded``. Gemini answers
+    fluently out of parametric memory when every retrieval failed, and this section is captioned
+    primary grading evidence, so a fluent unsourced answer here is the Q38195 failure with a
+    forecaster-facing blast radius. That is the same floor ``gemini_search`` and v2's
+    ``read_document`` apply, for the same reason.
+    """
+    if direct.status not in _URL_CONTEXT_TRIGGER_STATUSES:
+        return None
+    if not env_flag_enabled(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV):
+        return None
+    api_key = os.getenv(GOOGLE_API_KEY_ENV)
+    if not api_key:
+        logger.info(
+            "resolution_source: url_context rung is enabled but %s is not set — skipping %s",
+            GOOGLE_API_KEY_ENV,
+            urlparse(url).netloc,
+        )
+        ctx.skip_rung("url_context", direct.status, url, "no_api_key")
+        return None
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the url_context rung for %s — %.1fs of wall budget left",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("url_context", direct.status, url, "wall_budget")
+        return None
+    if await _url_context_robots_skip(session, url, host_sems, ctx):
+        logger.info(f"RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url={url} host={urlparse(url).netloc}")
+        ctx.skip_rung("url_context", direct.status, url, "robots_disallowed")
+        return None
+    ctx.start_rung("url_context", direct.status, url)
+    try:
+        text, n_retrievals, statuses = await asyncio.wait_for(
+            asyncio.to_thread(
+                run_url_context_read,
+                url,
+                ctx.query,
+                api_key=api_key,
+                role="resolution_source",
+                model=GAP_FILL_V2_READER_MODEL,
+                thinking_level=GAP_FILL_V2_READER_THINKING_LEVEL,
+                # The client-side ceiling is what returns the worker: wait_for cancels this
+                # coroutine and not the thread it is waiting on. Sized off the remaining budget
+                # so the read cannot outlive the provider's own wall by more than the margin.
+                timeout_ms=int(max(0.0, budget_s - RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000),
+                attempts=RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
+            ),
+            timeout=budget_s,
+        )
+    except TimeoutError:
+        logger.warning("resolution_source url_context read timed out for %s", urlparse(url).netloc)
+        return None
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # paid-rung soft-fail boundary: a dead reader leaves the direct result, never takes the provider down
+        logger.warning(
+            "resolution_source url_context read failed for %s: %s: %s",
+            urlparse(url).netloc,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if n_retrievals == 0 or not text.strip():
+        logger.warning(f"RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED: url={url} statuses={','.join(statuses) or 'none'}")
+        return FetchResult(
+            url=url,
+            status="ungrounded",
+            text="",
+            http_status=direct.http_status,
+            content_type=direct.content_type,
+        )
+    lead = _url_context_lead(direct.status)
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    # The lead LEADS and is budgeted out of the cap, like every other lead here: the truncators
+    # are head-preserving, so a trailing disclosure is the first thing a later trim discards —
+    # and a model's answer rendered without it reads as the page itself.
+    served = lead if body_cap <= 0 else f"{lead}\n\n{_truncate_with_marker(text.strip(), body_cap, url)}"
+    return FetchResult(
+        url=url,
+        status="success",
+        text=served,
+        http_status=direct.http_status,
+        content_type="text/plain",
+    )
+
+
 async def _escalate_unresolved(
     session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
 ) -> FetchResult:
@@ -1807,6 +1973,11 @@ async def _escalate_unresolved(
     wayback = await _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
     if wayback is not None:
         return wayback
+    # Last, because it is the only rung that spends money and the only one whose product is a
+    # model's answer rather than the host's bytes. Off by default and off in every workflow.
+    read = await _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    if read is not None:
+        return read
     return direct
 
 
@@ -2354,6 +2525,7 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         "rendered_attempts": sum(1 for attempt in fired if attempt.rung == "rendered"),
         "derived_api_reads": sum(1 for attempt in fired if attempt.rung == "derived_api"),
         "wayback_attempts": sum(1 for attempt in fired if attempt.rung == "wayback"),
+        "url_context_reads": sum(1 for attempt in fired if attempt.rung == "url_context"),
         "rung_budget_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wall_budget"),
         # Its own count rather than folded into the budget skips: a document left unread
         # because two others were already parsing says the 2-slot gate is the binding
@@ -2370,6 +2542,10 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # cited URLs is a question whose per-question cap is binding, which is a different
         # thing to tune than a question that ran out of wall.
         "wayback_cap_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wayback_cap"),
+        # Its own count because it is the free pre-check EARNING its request: a host that
+        # disallows Google-Extended refuses the read server-side, so this is spend avoided
+        # rather than a page lost, and it must not read as a failure.
+        "url_context_robots_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "robots_disallowed"),
     }
 
 

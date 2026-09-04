@@ -23,10 +23,74 @@ absent group all come back "not disallowed".
 
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
+
 # The product token Google documents for generative-AI retrieval, matched exactly rather than
 # as a substring: it is a fixed token, and a loose match would let `Google-Extended-Test` or a
 # vendor's own `google-extended-crawler` speak for Gemini.
 GOOGLE_EXTENDED_AGENT = "google-extended"
+
+# One robots.txt per host per run, shared by BOTH paid readers (gap-fill v2's `read_document`
+# tool and the Tier-1 resolution-source ladder). Shared rather than one cache each, because a
+# host's policy is a property of the host: the two paths routinely reach the same government
+# domains in one run, and a second read would spend a request to learn what we already know.
+# The value is the fetched text, or None when we could not read it — which proceeds to pay.
+#
+# Bounded and FIFO rather than a plain dict, because this is process-global state that outlives
+# one question and a whole run's hosts would otherwise accumulate here.
+ROBOTS_TXT_CACHE_MAX_HOSTS = 50
+_ROBOTS_TXT_CACHE: OrderedDict[str, str | None] = OrderedDict()
+
+
+def robots_host(url: str) -> str:
+    """``url``'s netloc with any userinfo dropped: the cache key, and what gets logged.
+
+    The port stays, since a host's policy is served per origin. Userinfo goes because it must
+    reach neither a robots.txt request nor the archived telemetry line.
+    """
+    return urlparse(url).netloc.rpartition("@")[2]
+
+
+def robots_txt_url(url: str) -> str:
+    """The robots.txt URL for ``url``'s origin."""
+    return f"{urlparse(url).scheme}://{robots_host(url)}/robots.txt"
+
+
+def reset_robots_cache() -> None:
+    """Forget every host's policy. For tests, so one test's read cannot answer another's."""
+    _ROBOTS_TXT_CACHE.clear()
+
+
+async def google_extended_blocks_url(url: str, *, fetch_text: Callable[[str], Awaitable[str | None]]) -> bool:
+    """True when ``url``'s host tells ``Google-Extended`` to stay out of that path.
+
+    ``fetch_text`` is injected because the two callers own different SSRF-guarded clients, and
+    neither may be bypassed for a request this module makes: v2 hands over its plain fetch ladder
+    and Tier-1 its direct fetch, so the preflight, the filtering resolver, the redirect vetting
+    and the body cap all apply unchanged. It returns the robots.txt text, or None when the host's
+    policy could not be read.
+
+    Fails toward PAYING in every ambiguous case (see the module docstring): an unreadable
+    robots.txt, an absent Google-Extended group, and a rule this module will not judge all come
+    back False. A wrong skip loses a document we could have read; a wrong pay costs one call.
+    """
+    host = robots_host(url)
+    if host in _ROBOTS_TXT_CACHE:
+        robots_txt = _ROBOTS_TXT_CACHE[host]
+    else:
+        robots_txt = await fetch_text(robots_txt_url(url))
+        _ROBOTS_TXT_CACHE[host] = robots_txt
+        _ROBOTS_TXT_CACHE.move_to_end(host)
+        while len(_ROBOTS_TXT_CACHE) > ROBOTS_TXT_CACHE_MAX_HOSTS:
+            _ROBOTS_TXT_CACHE.popitem(last=False)
+    if robots_txt is None:
+        return False
+    return google_extended_disallows(robots_txt, urlparse(url).path)
 
 
 def google_extended_disallows(robots_txt: str, path: str) -> bool:

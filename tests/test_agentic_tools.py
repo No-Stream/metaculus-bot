@@ -24,9 +24,9 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_READER_THINKING_LEVEL,
     URL_CONTEXT_SIZE_GATE_TOKENS,
 )
-from metaculus_bot.research import http_fetch, rendered_fetch
+from metaculus_bot.research import http_fetch, rendered_fetch, robots_policy
 from metaculus_bot.research import providers as research_providers
-from metaculus_bot.research.agentic import fetch_outcomes, local_document, robots_policy, tool_backends
+from metaculus_bot.research.agentic import fetch_outcomes, local_document, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
 from metaculus_bot.research.document_text import extract_pdf_text
@@ -111,7 +111,8 @@ def _reset_tool_state() -> None:
     agentic_tools._FETCH_TEXT_CACHE.clear()
     agentic_tools._FETCH_LINKS_CACHE.clear()
     agentic_tools._FETCH_HOST_SEMAPHORES.clear()
-    agentic_tools._ROBOTS_TXT_CACHE.clear()
+    # Shared with the Tier-1 reader, so it is reset through its owning module.
+    robots_policy.reset_robots_cache()
     # Run-scoped state of the shared render transport: the rendered-to-nothing memo, the
     # one-shot playwright warn latch, and a FRESH launch semaphore (construction is loop-free
     # in 3.12, so rebinding prevents a contended acquire in one test's event loop from leaking
