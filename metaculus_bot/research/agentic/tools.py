@@ -94,10 +94,14 @@ from metaculus_bot.research.http_fetch import (
     decode_text_body,
     read_body_capped,
 )
-from metaculus_bot.research.rendered_fetch import note_rendered_no_text, render_page
+from metaculus_bot.research.rendered_fetch import MemoScope, note_rendered_no_text, render_page
 from metaculus_bot.research.robots_policy import google_extended_blocks_url, robots_host
 
 logger = logging.getLogger(__name__)
+
+# This ladder's key into the transport's render memos: its "rendered to nothing" is bare
+# trafilatura emptiness, a weaker test than Tier-1's, so the two must not answer each other.
+_RENDER_MEMO_SCOPE: MemoScope = "gap_fill_v2"
 
 _FETCH_WINDOW_CHARS = 8000
 _FETCH_CACHE_MAX_ENTRIES = 50
@@ -362,19 +366,23 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     ``fetched`` verification tier on status alone.
 
     A ``None`` from the transport (Playwright missing, host not pinnable, browser error, or a
-    URL a browser already read to nothing this run) is returned unchanged: it is the
-    graceful-failure signal both call sites already degrade on. A render the transport CUT OFF
-    (its DOM-read cap fired because the page kept navigating) raises ``TimeoutError`` instead, so
-    the Tier-1 rung can record its own reason; this ladder's callers only know ``None``, so it
-    is folded back into that signal here, and the URL is memoised the way a render that read
-    nothing is, so a second fetch of the same hostile page in this run does not pay for it again.
-    The ceilings this wrapper already runs under are unchanged: the ``fetch`` tool's
-    ``timeout_s`` and ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
+    URL a browser already read to nothing this run under THIS ladder's memo scope) is returned
+    unchanged: it is the graceful-failure signal both call sites already degrade on. A render the
+    transport CUT OFF (its DOM-read cap fired because the page kept navigating) raises
+    ``TimeoutError`` instead, so the Tier-1 rung can record its own reason; this ladder's callers
+    only know ``None``, so it is folded back into that signal here. The transport memoises the
+    cut-off itself and re-raises it on the next fetch of the same URL, so a second fetch of the
+    same hostile page in this run does not pay for it again. The ceilings this wrapper already
+    runs under are unchanged: the ``fetch`` tool's ``timeout_s`` and ``_LOCAL_DOCUMENT_BUDGET_S``
+    on the document ladder.
+
+    The memo scope is this ladder's own because "rendered to nothing" means something weaker
+    here than in Tier-1: bare trafilatura emptiness, where Tier-1 also tries the ARIA rewrite,
+    the inline-chart read and the harvested feed before it gives up on a URL.
     """
     try:
-        page = await render_page(url, host_gate=_host_gate(url))
+        page = await render_page(url, memo_scope=_RENDER_MEMO_SCOPE, host_gate=_host_gate(url))
     except TimeoutError:
-        note_rendered_no_text(url)
         return None
     if page is None:
         return None
@@ -385,7 +393,7 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     links = _extract_links_from_html(page.html, url)
     text = (extracted or "").strip()
     if not text:
-        note_rendered_no_text(url)
+        note_rendered_no_text(url, memo_scope=_RENDER_MEMO_SCOPE)
         return PlainFetchResult(status="error", method="rendered", text="", links=links, url=url)
     return PlainFetchResult(
         status="ok",

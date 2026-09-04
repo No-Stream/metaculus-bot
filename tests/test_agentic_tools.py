@@ -794,7 +794,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
 
     class FakePage:
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            return SimpleNamespace(headers={"content-type": "text/html"})
+            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
 
         async def wait_for_timeout(self, ms: float) -> None:
             settles.append(ms)
@@ -915,7 +915,7 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
 
     class FakePage:
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            return SimpleNamespace(headers={"content-type": "text/html"})
+            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
 
         async def wait_for_timeout(self, ms: float) -> None:
             settles.append(ms)
@@ -1668,7 +1668,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
             # The settle is taken OUT of the goto budget, so the rung's 35 s ceiling is
             # unchanged rather than lengthened by the wait that replaced networkidle.
             assert timeout == rendered_fetch.RENDER_TIMEOUT_MS - rendered_fetch.RENDER_SETTLE_MS
-            return SimpleNamespace(headers={"content-type": "text/html"})
+            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
 
         async def wait_for_timeout(self, ms: float) -> None:
             settles.append(ms)
@@ -1761,7 +1761,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
 
     class FakePage:
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            return SimpleNamespace(headers={"content-type": "text/html"})
+            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
 
         async def wait_for_timeout(self, ms: float) -> None:
             settles.append(ms)
@@ -1879,7 +1879,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
             await guard(main_route, main_route.request)
             private_route = FakeRoute("http://169.254.169.254/latest/meta-data/")
             await guard(private_route, private_route.request)
-            return SimpleNamespace(headers={"content-type": "text/html"})
+            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
 
         async def wait_for_timeout(self, ms: float) -> None:
             settles.append(ms)
@@ -2092,7 +2092,7 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
 
     class FakePage:
         async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-            return SimpleNamespace(headers={"content-type": "text/html"})
+            return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
 
         async def wait_for_timeout(self, ms: float) -> None:
             settles.append(ms)
@@ -3067,7 +3067,7 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
 
         class FakePage:
             async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:  # noqa: ASYNC109  # mirrors Playwright API
-                return SimpleNamespace(headers={"content-type": "text/html"})
+                return SimpleNamespace(headers={"content-type": "text/html"}, status=200)
 
             async def wait_for_timeout(self, ms: float) -> None:
                 settles.append(ms)
@@ -3369,18 +3369,20 @@ class TestRenderedRungSalvagesATimedOutNavigation:
 class TestRenderedRungTimeoutAtTheV2Wrapper:
     """P3-1's transport bound RAISES ``TimeoutError`` rather than declining with ``None``, so the
     Tier-1 rung can record its own reason. This wrapper's callers only know ``None``, so it folds
-    the timeout back into that signal and memoises the URL the way a render that read nothing
-    is, so a second fetch of the same hostile page in the run does not pay for it again. The
-    ceilings this wrapper already ran under are unchanged: the ``fetch`` tool's ``timeout_s`` and
-    ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
+    the timeout back into that signal. The memo for a cut-off render is the transport's own —
+    written only when a browser actually ran, pinned in ``tests/test_rendered_fetch.py`` — so this
+    wrapper writes neither memo on a timeout. The ceilings it already ran under are unchanged: the
+    ``fetch`` tool's ``timeout_s`` and ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
     """
 
     @pytest.mark.asyncio
-    async def test_a_transport_timeout_declines_and_memoises_the_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_transport_timeout_declines_without_memoising_the_url_itself(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         url = "https://example.com/keeps-navigating"
 
-        async def _timed_out(target: str, *, host_gate, goto_timeout_ms: int = 0, harvest_json: bool = False) -> None:
-            del target, host_gate, goto_timeout_ms, harvest_json
+        async def _timed_out(target: str, **kwargs: object) -> None:
+            del target, kwargs
             await asyncio.sleep(0)
             raise TimeoutError("rendered fetch DOM read exceeded 5000ms")
 
@@ -3389,7 +3391,7 @@ class TestRenderedRungTimeoutAtTheV2Wrapper:
         result = await agentic_tools._try_rendered_fetch(url)
 
         assert result is None
-        assert rendered_fetch.rendered_to_nothing(url) is True
+        assert rendered_fetch.rendered_to_nothing(url, memo_scope="gap_fill_v2") is False
 
 
 # ---------------------------------------------------------------------------

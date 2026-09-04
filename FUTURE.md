@@ -1295,6 +1295,21 @@ Follow-ups:
    Tier-1 fetch whose 45 s wall discards finished pages. So the merge needs either the bounded
    acquire or the wall-degradation fix above landed first, and it needs the resulting queueing
    measured rather than assumed.
+   **Two more amplifiers, added 2026-09-03 with the rendered rung's post-gate budget recompute
+   (still SKIPPED, still the operator's call).** Tier-1's own browser rung now holds the
+   loop-wide per-host gate too, and for longer than the 20 s HTTP hold this item reasons about:
+   the render re-acquires the same `Semaphore(1)` from `_rendered_rung` and keeps it across the
+   launch-cap queue, the launch, the navigation (up to 33 s), the settle and the teardown,
+   because Chromium dials the host itself. And the process-global `Semaphore(2)` Chromium launch
+   cap in `research/rendered_fetch.py` is now queued in FRONT of Tier-1's 45 s wall as well as
+   v2's driver loop, so two other renders anywhere in the process (either path, any question)
+   hold a Tier-1 render in the queue with the wall running. What landed is the strictly-safer
+   half: the navigation budget is recomputed AFTER both gates are held (`_goto_budget_ms`), so a
+   render admitted late navigates on what is actually left or declines under `RENDER_MIN_GOTO_MS`
+   before a browser is launched, and the outer cut no longer memoises a URL whose render never
+   left the queue. Neither acquire is bounded, no launch allowance is reserved, and the 12 s floor
+   is unchanged; the bounded acquire remains the reserved call above, and `render_page` is shared
+   with v2, so bounding it there would be new timeout policy for both paths at once.
 6. **MEDIUM: trafilatura silently drops MediaWiki collapsible boxes, and the surviving text can
    read as the inverse of the truth (verified 2026-08-24 on q44870; tracked here 2026-09-02).** On
    an English Wikipedia endorsements page the box renders as

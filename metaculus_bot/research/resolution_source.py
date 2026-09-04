@@ -62,9 +62,12 @@ in headless Chromium (`research/rendered_fetch.py`, the same transport and the s
 process-global Semaphore(2) launch cap the gap-fill v2 fetch ladder uses) and the DOM
 re-enters the classification path. Measured 2026-09-03: Chromium rescued 6 of the 8
 archived JS walls that still failed from a residential address. It runs from the
-escalation ladder rather than inside the response context, so a 12-35 s render never
-holds the loop-wide per-host gate — the same placement, for the same reason, as the
-local PDF parse.
+escalation ladder rather than inside the response context, so no aiohttp response is
+held open across it — but it DOES re-acquire the same loop-wide per-host gate and hold
+it across the launch-cap queue, the launch, the navigation, the settle and the teardown,
+because Chromium dials that host itself (FUTURE.md item 5 carries the amplifier). The
+transport recomputes the navigation budget once both gates are held, so a render that
+queued behind them navigates on what is actually left or declines before a launch.
 
 Inline chart configs are read straight out of the page we already hold
 (`resolution_chart_data.render_inline_chart_data`): a Highcharts `data-chart`
@@ -197,9 +200,12 @@ from metaculus_bot.research.raw_log import record_raw_research
 from metaculus_bot.research.rendered_fetch import (
     RENDER_SETTLE_MS,
     RENDER_TIMEOUT_MS,
+    MemoScope,
+    RenderBudgetExpired,
     RenderedPage,
     note_rendered_no_text,
     render_page,
+    rendered_to_nothing,
 )
 from metaculus_bot.research.resolution_body_text import (
     _truncate_csv_middle,
@@ -990,7 +996,8 @@ class _HtmlClassification:
     ``html_text`` rides along because the two callers want different things from the same
     decode: :func:`_resolution_html_outcome` looks for a refresh stub in it, while the
     rendered rung has already followed every hop a browser follows and only wants the verdict.
-    Decoding twice would double the CPU on a body up to the 5 MiB response cap.
+    Decoding twice would double the CPU on a body up to the 5 MiB response cap, or a rendered
+    DOM up to ``RENDERED_DOM_MAX_CHARS`` (sized to it).
     """
 
     result: FetchResult
@@ -1037,7 +1044,8 @@ async def _classify_html_body(
     extracted = await asyncio.to_thread(_extract_page_text, html_text, body, current_url, undecodable_ratio)
     # In a thread for the same reason the extraction is: it is sync CPU work (one
     # regex sweep plus a `json.loads` per config) over a body up to the 5 MiB
-    # response cap, and blocking the loop here would stall every sibling fetch.
+    # response cap — or a rendered DOM up to RENDERED_DOM_MAX_CHARS, the browser rung's
+    # ceiling — and blocking the loop here would stall every sibling fetch.
     # Measured 22 ms on the 1.1 MB q43949 page, but the bound is the page, not that
     # sample. The Datawrapper / embed scans above are single regex searches and stay
     # inline.
@@ -1516,6 +1524,12 @@ async def _fetch_one_hop(
     return outcome
 
 
+# This fetcher's key into the transport's render memos. Its "rendered to nothing" is the strong
+# form — the ARIA rewrite, the inline-chart read and the harvested feed all failed — so gap-fill
+# v2's weaker verdict on the same URL must never answer for it (rendered_fetch.MemoScope).
+_RENDER_MEMO_SCOPE: MemoScope = "resolution_source"
+
+
 def _rendered_rung_applies(direct: FetchResult) -> bool:
     """Whether a browser could plausibly turn ``direct`` into readable content.
 
@@ -1542,34 +1556,50 @@ async def _rendered_rung(
 ) -> FetchResult | None:
     """Render an unreadable page in headless Chromium and re-classify it, or None.
 
-    Runs OUTSIDE the per-host semaphore's hop and outside the aiohttp response context, from
-    the escalation ladder — the same placement, and for the same reason, as the local PDF
-    parse: the gate is loop-wide and a 12-35 s render held inside it would stall every other
-    concurrent question's fetch of that host.
+    Runs from the escalation ladder, outside the aiohttp response context, so no response is
+    held open across a 12-35 s render. It does NOT run outside the per-host gate: the transport
+    re-acquires the same loop-wide ``Semaphore(1)`` for the URL's host and holds it across the
+    launch-cap queue, the launch, the navigation, the settle and the teardown, because Chromium
+    dials that host itself. Both acquires are unbounded by design (FUTURE.md item 5), which is
+    why the transport recomputes the navigation budget only once both are held.
 
     Self-bounding on the shared pattern: skipped below ``RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S``
     of remaining wall, and the navigation gets the remaining budget less the settle, capped at
-    the transport's own 35 s. Degrading to the direct result costs one page; overrunning the
-    provider's outer ``wait_for`` costs every page the question already fetched.
+    the transport's own 35 s — as a CEILING. The transport tightens it after the gates to what is
+    actually left less the settle and the DOM read, or declines under its own floor before a
+    browser is launched, so a goto that runs its budget out can still be settled and read inside
+    the bound below. Degrading to the direct result costs one page; overrunning the provider's
+    outer ``wait_for`` costs every page the question already fetched.
 
-    The whole transport call is ALSO held to the remaining budget with ``asyncio.wait_for``, on
-    top of the transport's own DOM-read cap, so no Playwright call — present or future — can
-    overrun the wall from inside the rung. The receipt is ogimet.com (2026-09-03): the goto timed
-    out at 33 s as designed and ``page.content()`` then blocked for 40 s more, for a 76 s render
-    against a 45 s wall. Either bound firing is recorded as its own skip, ``render_timeout``,
-    rather than ``renderer_unavailable`` — a cut-off render says nothing about whether Chromium
-    works, and must not latch that warning — and the URL is memoised so a second question citing
-    the same hostile page does not pay for it again. The direct result is what stands.
+    The whole transport call — queue, launch, navigation, DOM read and teardown — is ALSO held
+    to the remaining budget with ``asyncio.wait_for``, on top of the transport's own DOM-read
+    and teardown caps, so nothing inside the rung can outlive the wall: a cut during teardown
+    cancels it and the transport's driver stop kills the browser. The receipt is ogimet.com
+    (2026-09-03): the goto timed out at 33 s as designed and ``page.content()`` then blocked for
+    40 s more, for a 76 s render against a 45 s wall. Either bound firing is recorded as its own
+    skip, ``render_timeout``, rather than ``renderer_unavailable`` — a cut-off render says
+    nothing about whether Chromium works, and must not latch that warning. The direct result is
+    what stands. The transport memoises a timed-out URL itself, and only when a browser actually
+    ran (the outer cut can fire while the render is still queued, which says nothing about the
+    page); a memoised URL re-raises on the next question, so it is recorded the same way again.
 
     The rendered DOM re-enters :func:`_classify_html_body`, so a rescued page gets the same
-    chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one. When the
-    DOM STILL carries nothing, the JSON the page fetched for itself is the last free route
-    (:func:`_derived_api_from_harvest`) — a JavaScript dashboard's numbers arrive over XHR and
-    are in its HTML at no wait condition. Only once that fails too is the URL memoized
+    chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one — unless the
+    browser was answered with something other than a 200. The direct GET got a 200 for this URL
+    (that is the trigger), so a non-200 main-frame status is the edge telling the browser apart,
+    and its markup (a 403 or 429 interstitial routinely clears the chrome floor) is not the page:
+    the rung leaves the direct result standing and does not memoise, because a 429 is retryable.
+    When the DOM STILL carries nothing, the JSON the page fetched for itself is the last free
+    route (:func:`_derived_api_from_harvest`) — a JavaScript dashboard's numbers arrive over XHR
+    and are in its HTML at no wait condition. Only once that fails too is the URL memoized
     (:func:`note_rendered_no_text`), so a second URL on the same page in this run does not spend
-    another launch to learn the same thing.
+    another launch to learn the same thing; that memo hit is its own skip, ``rendered_no_text``,
+    so it never inflates the count the operator reads as the Chromium install having failed.
     """
     if not _rendered_rung_applies(direct):
+        return None
+    if rendered_to_nothing(url, memo_scope=_RENDER_MEMO_SCOPE):
+        ctx.skip_rung("rendered", direct.status, url, "rendered_no_text")
         return None
     budget_s = ctx.rung_budget_s()
     if budget_s < RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S:
@@ -1586,8 +1616,10 @@ async def _rendered_rung(
         page = await asyncio.wait_for(
             render_page(
                 url,
+                memo_scope=_RENDER_MEMO_SCOPE,
                 host_gate=_sem_for_host(host_sems, url),
                 goto_timeout_ms=goto_timeout_ms,
+                deadline_monotonic_s=time.monotonic() + budget_s,
                 # Recording the page's own XHR costs one buffered body per response inside the
                 # render task, which is why the transport keeps it off by default — here it is
                 # exactly the rung's fallback, so it is worth the bytes.
@@ -1595,25 +1627,38 @@ async def _rendered_rung(
             ),
             timeout=budget_s,
         )
-    except TimeoutError:
-        # One handler for both bounds: the transport's DOM-read cap raises this itself, and the
-        # wait_for above raises it when the whole render outlived the budget.
+    except RenderBudgetExpired:
+        # The budget ran out in the queue behind the two gates: nothing rendered, so it is the same
+        # skip the pre-gate check records, not a cut-off render and not a missing browser.
+        attempt.skipped_reason = "wall_budget"
+        return None
+    except TimeoutError as exc:
+        # One handler for both bounds: the transport's DOM-read cap raises this itself (and
+        # re-raises it for a URL it already cut off this run), and the wait_for above raises it
+        # when the whole render outlived the budget. The message says which.
         logger.warning(
-            "resolution_source: the rendered rung for %s was cut off (%.1fs budget); leaving the direct result",
+            "resolution_source: the rendered rung for %s was cut off (%.1fs budget): %s; leaving the direct result",
             urlparse(url).netloc,
             budget_s,
+            exc,
         )
         attempt.skipped_reason = "render_timeout"
-        note_rendered_no_text(url)
         return None
     if page is None:
         # The transport declines with ONE signal for several causes — Playwright missing or
-        # broken, a host that will not pin to a public IP, a browser error, or a URL a browser
-        # already read to nothing this run — and its own WARN/DEBUG lines say which. Recorded
-        # as a SKIP rather than a fired rung because nothing was rendered: it then claims no
-        # `route=` and emits no escalation line, while keeping the measured wall_s that says
-        # what the declined launch cost.
+        # broken, a host that will not pin to a public IP, a DOM over its ceiling, or a browser
+        # error — and its own WARN/DEBUG lines say which. Recorded as a SKIP rather than a fired rung because nothing
+        # was rendered: it then claims no `route=` and emits no escalation line, while keeping
+        # the measured wall_s that says what the declined launch cost.
         attempt.skipped_reason = "renderer_unavailable"
+        return None
+    if page.http_status is not None and page.http_status != 200:
+        logger.warning(
+            "resolution_source: the browser was answered %d for %s where the direct GET got 200; "
+            "not reading that page as content",
+            page.http_status,
+            urlparse(url).netloc,
+        )
         return None
     classified = await _classify_html_body(
         page.html.encode("utf-8", errors="replace"),
@@ -1621,7 +1666,7 @@ async def _rendered_rung(
         page.content_type or "text/html",
         # The direct fetch's status, not the browser's: this page answered 200 and carried no
         # text, which is the fact the record should keep. Chromium reports no status at all
-        # when a goto timed out and the DOM was salvaged.
+        # when a goto timed out and the DOM was salvaged, and a non-200 never reaches here.
         http_status=direct.http_status if direct.http_status is not None else 200,
     )
     if classified.result.status == "success":
@@ -1629,7 +1674,7 @@ async def _rendered_rung(
     derived = _derived_api_from_harvest(url, direct, page, ctx)
     if derived is not None:
         return derived
-    note_rendered_no_text(url)
+    note_rendered_no_text(url, memo_scope=_RENDER_MEMO_SCOPE)
     return None
 
 
@@ -2626,6 +2671,10 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # about the question's clock. Folding it into either would hide the population the
         # ogimet receipt (2026-09-03) is the first member of.
         "render_timeout_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "render_timeout"),
+        # And its own count: a browser rung skipped because an earlier question in this run
+        # already rendered the same URL to nothing is the memo doing its job, not a runner without
+        # Chromium — folded into `renderer_unavailable_skips` it inflated the install-failed signal.
+        "rendered_no_text_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "rendered_no_text"),
         # Also its own count: a question that spent its two snapshot attempts on earlier
         # cited URLs is a question whose per-question cap is binding, which is a different
         # thing to tune than a question that ran out of wall.
