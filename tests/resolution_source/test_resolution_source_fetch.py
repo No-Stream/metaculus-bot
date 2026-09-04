@@ -1017,7 +1017,9 @@ class TestResolutionSourceFetchMarker:
             "rendered_attempts": 0,
             "rung_budget_skips": 1,
             "derived_api_reads": 0,
+            "wayback_attempts": 0,
             "pdf_contention_skips": 0,
+            "wayback_cap_skips": 0,
             # The withheld page also earned a browser attempt, which this package's autouse
             # fixture declines — so the skip that follows the meta-refresh one is the browser
             # transport reporting itself unavailable, not a second budget skip.

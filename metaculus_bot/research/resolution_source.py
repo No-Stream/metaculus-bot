@@ -148,6 +148,9 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
     RESOLUTION_SOURCE_WALL_TIMEOUT,
+    RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS,
+    RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS,
+    RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S,
     env_flag_enabled,
 )
 from metaculus_bot.research import derived_api
@@ -213,6 +216,12 @@ from metaculus_bot.research.resolution_url_scan import (
     is_metaculus_self_ref,
     is_yahoo_ticker_url,
     strip_markdown_escapes,  # noqa: F401  # re-export: the Tier-1 suite imports the markdown unescaper from this module path
+)
+from metaculus_bot.research.wayback import (
+    parse_snapshot_url,
+    snapshot_age_days,
+    wayback_lead,
+    wayback_snapshot_url,
 )
 
 
@@ -670,12 +679,33 @@ _PDF_CONTENT_TYPES = ("application/pdf", "application/x-pdf")
 
 
 @dataclass
+class QuestionRungBudget:
+    """The rung allowances one QUESTION shares across its cited URLs.
+
+    Separate from :class:`FetchContext`, which is per-URL, because the thing being bounded is
+    per-question: every Wayback snapshot shares netloc ``web.archive.org``, so the loop-wide
+    per-host ``Semaphore(1)`` turns N cited URLs into N sequential archive fetches inside a wall
+    that discards work already done when it fires. Its default is a fresh budget, so a
+    monkeypatched fetch driven with one URL and no shared state behaves exactly as it did.
+    """
+
+    wayback_attempts_left: int = RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS
+
+    def take_wayback_attempt(self) -> bool:
+        """Claim one snapshot attempt for this question, or False when they are spent."""
+        if self.wayback_attempts_left <= 0:
+            return False
+        self.wayback_attempts_left -= 1
+        return True
+
+
+@dataclass
 class FetchContext:
     """Per-URL inputs and rung bookkeeping for one :func:`_fetch_one` call.
 
     ONE per fetched URL, so ``rungs`` belongs to that URL and can be stamped onto its
-    result; ``query`` and ``started`` are the same values for every URL in a provider
-    call. Every field has a default so the monkeypatched fetch surface can still be
+    result; ``query``, ``started``, ``now`` and ``shared`` are the same for every URL in a
+    provider call. Every field has a default so the monkeypatched fetch surface can still be
     driven with three positional arguments, and a default context is simply "no
     question text, clock starts now" — which gives a direct fetch exactly the behaviour
     it had before the ladder existed.
@@ -683,11 +713,16 @@ class FetchContext:
     ``query`` is the question's title plus its resolution criteria, and it is what
     decides WHICH passages of a 220-page PDF a forecaster sees. ``started`` is the
     provider's own wall-clock origin, so every rung can bound itself against the same
-    45 s the outer ``asyncio.wait_for`` uses.
+    45 s the outer ``asyncio.wait_for`` uses. ``now`` is the WALL-CLOCK counterpart, which the
+    Wayback rung ages a capture against — a monotonic origin cannot date anything, and taking
+    the clock inside the rung would make an archived snapshot's rendered disclosure depend on
+    when it happened to run rather than on the fetch it belongs to.
     """
 
     query: str = ""
     started: float = field(default_factory=time.monotonic)
+    now: datetime = field(default_factory=lambda: datetime.now(UTC))
+    shared: QuestionRungBudget = field(default_factory=QuestionRungBudget)
     rungs: list[RungAttempt] = field(default_factory=list)
 
     def rung_budget_s(self) -> float:
@@ -1626,6 +1661,124 @@ async def _derived_api_rung(
     return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status)
 
 
+# A page the archive can plausibly substitute for: the host refused us, never answered, or says
+# the URL is gone. Deliberately NOT `js_wall` — the archive stores the unrendered shell, so it
+# rescued 0 of the 8 archived walls that still failed on 2026-09-03 while the browser rung
+# rescued 6. Nor `no_resolving_content`: a page that answered 200 with chrome is one whose live
+# markup we have and whose numbers are elsewhere, and an older copy of the same chrome adds
+# nothing. `ssrf_blocked` is excluded because WE refused that URL, and handing it to a
+# third-party fetcher is precisely the bypass the guard exists to prevent.
+_WAYBACK_TRIGGER_STATUSES: frozenset[FetchStatus] = frozenset({"blocked", "error", "not_found"})
+
+
+async def _wayback_snapshot_result(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """Fetch the archive's freshest capture of ``url`` and serve it, or withhold it.
+
+    The fetch goes through :func:`_fetch_direct`, so the snapshot is classified by exactly the
+    path a live page is — including the chart read and the chrome floor — and inherits the SSRF
+    preflight, the per-hop re-guard and the budget-clamped hop timeout. What comes back extra is
+    the FINAL URL, which is where the archive puts the 14-digit capture timestamp.
+
+    Three outcomes, in this order, and the order is the design.
+
+    The inner URL is UNWRAPPED and re-checked first, because ``is_metaculus_self_ref`` keys on
+    hostname and ``web.archive.org/web/…/metaculus.com/…`` sails past every self-reference filter
+    in the pipeline — an archived Metaculus page in front of a forecaster is the question quoting
+    itself. Then a snapshot the archive could not serve at all (no capture, or a capture that
+    404s) DECLINES: there is no archived copy, which is a different fact from a stale one, and
+    the direct route's own status says more about the source than a fact about the archive would.
+    Only a capture we actually READ and cannot date, or can date and it is too old, is withheld
+    as ``stale_data`` — because the disclosure that makes a snapshot admissible is its age, and a
+    copy with no usable date cannot carry it. The direct status is not lost by that swap either:
+    the ``RESOLUTION_SOURCE_ESCALATION`` line for this rung carries ``from_status``.
+    """
+    snapshot = await _fetch_direct(session, wayback_snapshot_url(url), host_sems, ctx)
+    parsed = parse_snapshot_url(snapshot.url)
+    if parsed is not None and (
+        is_metaculus_self_ref(parsed.inner_url) or not await is_public_http_url(parsed.inner_url)
+    ):
+        logger.warning(
+            "resolution_source wayback refused: snapshot of %s wraps a URL we do not fetch (%s)",
+            urlparse(url).netloc,
+            urlparse(parsed.inner_url).netloc,
+        )
+        return None
+    if snapshot.status != "success":
+        logger.info(
+            "resolution_source wayback: no archived copy served for %s (%s)",
+            urlparse(url).netloc,
+            snapshot.status,
+        )
+        return None
+    age_days = None if parsed is None else snapshot_age_days(parsed, ctx.now)
+    if parsed is None or age_days is None or age_days > RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS:
+        logger.warning(
+            "resolution_source wayback: capture for %s is not usable (final=%s, age=%s) — withheld as stale",
+            urlparse(url).netloc,
+            snapshot.url,
+            "undatable" if age_days is None else f"{age_days:.1f}d",
+        )
+        return FetchResult(
+            url=url,
+            status="stale_data",
+            text="",
+            http_status=snapshot.http_status,
+            content_type=snapshot.content_type,
+        )
+    lead = wayback_lead(parsed, age_days, direct.status)
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    # The lead LEADS and its cost comes out of the per-URL cap, like every other lead here: the
+    # truncators are head-preserving, so a trailing disclosure is the first thing a later trim
+    # discards — and an archived page whose age line has been trimmed off is being passed off as
+    # the live one.
+    text = lead if body_cap <= 0 else f"{lead}\n\n{_truncate_with_marker(snapshot.text, body_cap, url)}"
+    return FetchResult(
+        url=url,
+        status="success",
+        text=text,
+        http_status=snapshot.http_status,
+        content_type=snapshot.content_type,
+        datawrapper_charts=snapshot.datawrapper_charts,
+        unreadable_embeds=snapshot.unreadable_embeds,
+    )
+
+
+async def _wayback_rung(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """Try the Wayback Machine for a page our own address could not reach.
+
+    Bounded three ways, because this rung's cost is concentrated rather than spread: below
+    ``RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S`` of remaining wall it is skipped, at most
+    ``RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS`` snapshots are fetched per question, and every
+    snapshot contends on the one ``web.archive.org`` host gate — which is the documented trade
+    for the politeness that gate exists to provide.
+    """
+    if direct.status not in _WAYBACK_TRIGGER_STATUSES:
+        return None
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the wayback rung for %s — %.1fs of wall budget left",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("wayback", direct.status, url, "wall_budget")
+        return None
+    if not ctx.shared.take_wayback_attempt():
+        logger.warning(
+            "resolution_source: skipping the wayback rung for %s — this question's %d snapshot attempt(s) are spent",
+            urlparse(url).netloc,
+            RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS,
+        )
+        ctx.skip_rung("wayback", direct.status, url, "wayback_cap")
+        return None
+    ctx.start_rung("wayback", direct.status, url)
+    return await _wayback_snapshot_result(session, url, direct, host_sems=host_sems, ctx=ctx)
+
+
 async def _escalate_unresolved(
     session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
 ) -> FetchResult:
@@ -1648,6 +1801,12 @@ async def _escalate_unresolved(
     rendered = await _rendered_rung(url, direct, host_sems, ctx)
     if rendered is not None:
         return rendered
+    # Reached only for the statuses the browser rungs do not claim — the two trigger sets are
+    # disjoint by construction (see `_WAYBACK_TRIGGER_STATUSES`), so the order between them is a
+    # reading choice: free-and-local first, then the route whose egress is not ours.
+    wayback = await _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    if wayback is not None:
+        return wayback
     return direct
 
 
@@ -2041,8 +2200,14 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "") -> list[
         try:
             # One context per URL: the rung attempts belong to that URL's result, while
             # the query and the wall-clock origin are the same for all of them.
+            # ONE shared rung budget across this question's URLs, and one per-URL context each:
+            # the Wayback cap is per question (every snapshot shares one host gate), while the
+            # rung attempts belong to the URL they were spent on.
+            shared_budget = QuestionRungBudget()
             page_tasks = [
-                asyncio.create_task(_fetch_one(session, u, host_sems, FetchContext(query=query, started=started)))
+                asyncio.create_task(
+                    _fetch_one(session, u, host_sems, FetchContext(query=query, started=started, shared=shared_budget))
+                )
                 for u in urls
             ]
             tasks.extend(page_tasks)
@@ -2188,6 +2353,7 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         "pdf_documents_read": sum(1 for attempt in fired if attempt.rung == "pdf_local"),
         "rendered_attempts": sum(1 for attempt in fired if attempt.rung == "rendered"),
         "derived_api_reads": sum(1 for attempt in fired if attempt.rung == "derived_api"),
+        "wayback_attempts": sum(1 for attempt in fired if attempt.rung == "wayback"),
         "rung_budget_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wall_budget"),
         # Its own count rather than folded into the budget skips: a document left unread
         # because two others were already parsing says the 2-slot gate is the binding
@@ -2200,6 +2366,10 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         "renderer_unavailable_skips": sum(
             1 for attempt in attempts if attempt.skipped_reason == "renderer_unavailable"
         ),
+        # Also its own count: a question that spent its two snapshot attempts on earlier
+        # cited URLs is a question whose per-question cap is binding, which is a different
+        # thing to tune than a question that ran out of wall.
+        "wayback_cap_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wayback_cap"),
     }
 
 

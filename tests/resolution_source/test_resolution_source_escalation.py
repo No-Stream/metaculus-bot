@@ -13,13 +13,21 @@ package's autouse fixtures already stub DNS and reset the shared gates.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.derived_api import reset_derived_endpoints
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
-from metaculus_bot.research.resolution_source import FetchContext, _fetch_one, _rung_counts
+from metaculus_bot.research.resolution_source import (
+    _WAYBACK_TRIGGER_STATUSES,
+    FetchContext,
+    QuestionRungBudget,
+    _fetch_one,
+    _rung_counts,
+)
+from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _INFOGRAM_EMBED_MARKUP,
     FakeResponse,
@@ -449,3 +457,224 @@ class TestDerivedApiRung:
         assert len(result.text) <= 400
         # The lead LEADS, so a later trim reaches the JSON before the provenance line.
         assert result.text.startswith("[This page's own HTML carried no readable content.")
+
+
+def _snapshot_url(page_url: str, *, captured: datetime) -> str:
+    """The final URL the archive redirects a snapshot request to (live-verified shape)."""
+    return f"https://web.archive.org/web/{captured.strftime('%Y%m%d%H%M%S')}id_/{page_url}"
+
+
+class TestWaybackRung:
+    """The archive is the one free route whose EGRESS IS NOT OURS, which is why a host that
+    refuses our address earns it — and why a JavaScript wall never does."""
+
+    _NOW = datetime(2026, 9, 4, tzinfo=UTC)
+
+    @pytest.fixture(autouse=True)
+    def _arm_the_archive(self, monkeypatch):
+        """Restore the rung's own trigger set, which this package's conftest empties by default.
+
+        The module's constant OBJECT is restored rather than a copy, so the trigger population
+        these tests assert on cannot drift from the one prod uses.
+        """
+        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+
+    def _ctx(self) -> FetchContext:
+        return FetchContext(now=self._NOW)
+
+    def _archive_page(self) -> bytes:
+        return _prose_page(_RENDERED_PROSE)
+
+    def _session(self, *, page: FakeResponse, captured: datetime, archived: FakeResponse | None = None) -> FakeSession:
+        """A session where the cited URL fails and the archive redirects to a dated capture."""
+        snapshot = _snapshot_url(_URL, captured=captured)
+        return FakeSession(
+            {
+                _URL: page,
+                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": snapshot}),
+                snapshot: archived or FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+            }
+        )
+
+    async def test_a_blocked_page_is_served_from_a_fresh_capture(self):
+        session = self._session(
+            page=FakeResponse(403, body=b"denied", content_type="text/html"),
+            captured=self._NOW - timedelta(days=6),
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "success"
+        assert result.route == "wayback"
+        # The cited URL, not the archive's: the section heading and every earlier fetch record
+        # for this source are filed under what the question cited.
+        assert result.url == _URL
+        assert result.text.startswith(
+            "[Archived copy from the Wayback Machine, captured 2026-08-29, 6 days before this "
+            "forecast; the live page could not be fetched (blocked).]"
+        )
+        assert "Nebraska Senate polling average" in result.text
+        assert _rung_counts([result])["wayback_attempts"] == 1
+
+    @pytest.mark.parametrize("status", [403, 404, 500])
+    async def test_every_trigger_status_reaches_the_archive(self, status):
+        session = self._session(
+            page=FakeResponse(status, body=b"", content_type="text/html"), captured=self._NOW - timedelta(days=1)
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.route == "wayback"
+        assert result.status == "success"
+
+    async def test_a_js_wall_never_reaches_the_archive(self, monkeypatch):
+        """The archive stores the unrendered shell: it rescued 0 of 8 archived walls while the
+        browser rung rescued 6."""
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, []))
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "js_wall"
+        assert not any(request.startswith("https://web.archive.org/") for request in session.requested)
+
+    async def test_a_capture_past_the_age_bound_is_withheld_as_stale(self):
+        session = self._session(
+            page=FakeResponse(403, body=b"", content_type="text/html"),
+            captured=self._NOW - timedelta(days=400),
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "stale_data"
+        assert result.text == ""
+        # The direct route's own status is not lost by the swap: the escalation line carries it.
+        assert [(a.rung, a.from_status) for a in result.rung_attempts] == [("wayback", "blocked")]
+
+    async def test_an_undatable_snapshot_is_withheld_too(self):
+        """The archive answering our four-digit request means it never landed on a capture, and a
+        copy with no usable date cannot carry the age disclosure."""
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL): FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "stale_data"
+
+    async def test_a_snapshot_wrapping_a_metaculus_page_is_refused(self):
+        """`is_metaculus_self_ref` keys on hostname, so a wrapped metaculus.com URL sails past
+        every self-reference filter in the pipeline — the question would quote itself."""
+        captured = self._NOW - timedelta(days=2)
+        wrapped = _snapshot_url("https://www.metaculus.com/questions/45001/", captured=captured)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": wrapped}),
+                wrapped: FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "blocked"
+        assert result.route == "wayback"
+        assert result.text == ""
+
+    async def test_a_snapshot_wrapping_a_private_address_is_refused(self, monkeypatch):
+        captured = self._NOW - timedelta(days=2)
+        wrapped = _snapshot_url("http://169.254.169.254/latest/meta-data/", captured=captured)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL): FakeResponse(302, headers={"Location": wrapped}),
+                wrapped: FakeResponse(200, body=self._archive_page(), content_type="text/html"),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "blocked"
+        assert result.text == ""
+
+    async def test_a_redirect_chain_past_the_hop_cap_declines(self):
+        """The archive never served a copy, which is a different fact from a stale one — so the
+        direct route's own status stands rather than being overwritten by a fact about the
+        archive."""
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                "https://web.archive.org/": FakeResponse(
+                    302, headers={"Location": "https://web.archive.org/web/2026id_/https://x.example.com/loop"}
+                ),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "blocked"
+        assert result.route == "wayback"
+
+    async def test_no_archived_copy_at_all_declines(self):
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"", content_type="text/html"),
+                wayback_snapshot_url(_URL): FakeResponse(404, body=b"", content_type="text/html"),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "blocked"
+        assert result.route == "wayback"
+
+    async def test_the_rung_is_skipped_below_its_floor(self, monkeypatch):
+        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 4.0)
+        session = FakeSession({_URL: FakeResponse(403, body=b"", content_type="text/html")})
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "blocked"
+        assert result.route == "direct"
+        assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("wayback", "wall_budget")]
+
+    async def test_the_per_question_cap_binds_across_cited_urls(self):
+        """Every snapshot shares netloc web.archive.org, so N cited URLs would queue into N
+        sequential archive fetches behind one gate inside a 45 s wall."""
+        shared = QuestionRungBudget()
+        urls = [f"https://dead{index}.example.com/page" for index in range(3)]
+        handlers: dict[str, object] = {}
+        for url in urls:
+            snapshot = _snapshot_url(url, captured=self._NOW - timedelta(days=2))
+            handlers[url] = FakeResponse(403, body=b"", content_type="text/html")
+            handlers[wayback_snapshot_url(url)] = FakeResponse(302, headers={"Location": snapshot})
+            handlers[snapshot] = FakeResponse(200, body=self._archive_page(), content_type="text/html")
+        session = FakeSession(handlers)
+
+        # Spelled out rather than looped: the cap is order-dependent, so which call is third is
+        # the assertion.
+        first = await _fetch_one(session, urls[0], {}, FetchContext(now=self._NOW, shared=shared))
+        second = await _fetch_one(session, urls[1], {}, FetchContext(now=self._NOW, shared=shared))
+        third = await _fetch_one(session, urls[2], {}, FetchContext(now=self._NOW, shared=shared))
+        results = [first, second, third]
+
+        assert [r.route for r in results] == ["wayback", "wayback", "direct"]
+        assert results[2].status == "blocked"
+        assert [(a.rung, a.skipped_reason) for a in results[2].rung_attempts] == [("wayback", "wayback_cap")]
+        assert _rung_counts(results)["wayback_attempts"] == 2
+        assert _rung_counts(results)["wayback_cap_skips"] == 1
+
+    async def test_an_archived_page_that_is_itself_unreadable_leaves_the_direct_status(self):
+        session = self._session(
+            page=FakeResponse(403, body=b"", content_type="text/html"),
+            captured=self._NOW - timedelta(days=2),
+            archived=FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+        )
+
+        result = await _fetch_one(session, _URL, {}, self._ctx())
+
+        assert result.status == "blocked"
+        assert result.route == "wayback"

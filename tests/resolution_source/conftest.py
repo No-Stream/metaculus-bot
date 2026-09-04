@@ -63,6 +63,23 @@ def _decline_the_browser_rung(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _decline_the_wayback_rung(monkeypatch):
+    """Empty the archive rung's trigger set for every test in this package by default.
+
+    Same containment argument as the browser fixture above, one layer out: the rung fires on
+    ``blocked`` / ``error`` / ``not_found``, which is the outcome dozens of these tests
+    deliberately produce, and each fire is a real ``web.archive.org`` GET. With the trigger set
+    empty the rung declines before it looks at anything, so it records no attempt, claims no
+    ``route``, and issues no request — leaving every pre-ladder expectation in this package
+    exactly as it was.
+
+    Tests that exercise the rung restore the module's OWN constant object (imported, so the two
+    cannot drift), which reads as "these statuses trigger the archive".
+    """
+    monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", frozenset())
+
+
+@pytest.fixture(autouse=True)
 def _stub_public_dns(monkeypatch):
     """Every test hostname in this package uses ``*.example.com``, an RFC-2606
     reserved TLD with no real DNS. Without a stub, the SSRF guard's

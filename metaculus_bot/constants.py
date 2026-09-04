@@ -739,6 +739,29 @@ RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S: float = 12.0
 # as the HTTP timeout — not the browser floor above. It has its own name because the two rungs
 # are tuned independently: this one gets cheaper as a run goes on, the browser never does.
 RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S: float = 3.0
+# --- Wayback Machine snapshots ---
+# The archive is the one free route whose egress is not ours, which is the whole reason it earns
+# a rung (measured 2026-09-03: identical client, identical headers, 403 from a GitHub Actions
+# runner and 200 from a residential address on the same three government hosts).
+#
+# Age bound. A snapshot is admissible as primary grading evidence only with its age disclosed
+# (operator decision, 2026-09-03) and only inside this bound. 30 days matches the Datawrapper
+# freshness guard's, and it is the same JUDGMENT rather than a measurement: it was calibrated on
+# daily-republishing trackers, so a question resolving on a weekly series arguably wants tighter.
+# Deliberately its own constant, not an alias of the Datawrapper bound: these are two independent
+# calls about two different artifacts and tying them would make one impossible to tune.
+RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS: float = 30.0
+# Floor for the snapshot fetch, which is one GET plus one redirect hop. Above the one-request
+# rungs' 3 s because the archive is measurably slower than an ordinary host — the verification
+# probe's own response carried `LoadShardBlock;dur=1048ms` in its server-timing header, and the
+# redirect means two round trips through that.
+RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S: float = 8.0
+# Snapshot attempts per QUESTION. Every snapshot shares netloc `web.archive.org`, so Tier-1's
+# per-host Semaphore(1) serializes them: N cited URLs would queue into N sequential archive
+# fetches behind one gate, inside a 45 s wall that discards every page already fetched when it
+# fires. Two is the documented trade — a question whose first two cited sources are both dead
+# gets both tried, and a question citing five gets its budget protected.
+RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS: int = 2
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
