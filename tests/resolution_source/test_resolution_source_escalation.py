@@ -523,9 +523,17 @@ class TestDerivedApiRung:
         calls: list[dict[str, object]] = []
         harvested = self._harvested()
 
-        async def _slow_render(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False):
+        async def _slow_render(
+            url: str,
+            *,
+            memo_scope: str,
+            host_gate,
+            goto_timeout_ms: int,
+            deadline_monotonic_s: float | None = None,
+            harvest_json: bool = False,
+        ):
             calls.append({"url": url, "goto_timeout_ms": goto_timeout_ms, "harvest_json": harvest_json})
-            del host_gate
+            del host_gate, memo_scope, deadline_monotonic_s
             # Long enough that the sibling task reaches its own escalation while this render is
             # still in flight, which is the interleaving the fan-out produces.
             await asyncio.sleep(0.02)

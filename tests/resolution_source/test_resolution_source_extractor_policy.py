@@ -175,8 +175,16 @@ class TestChromeShapedPages:
         table. A withhold under any other reason would strand the page one rung short."""
         calls: list[str] = []
 
-        async def _render(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False) -> RenderedPage:
-            del host_gate, goto_timeout_ms, harvest_json
+        async def _render(
+            url: str,
+            *,
+            memo_scope: str,
+            host_gate,
+            goto_timeout_ms: int,
+            deadline_monotonic_s: float | None = None,
+            harvest_json: bool = False,
+        ) -> RenderedPage:
+            del host_gate, goto_timeout_ms, harvest_json, memo_scope, deadline_monotonic_s
             calls.append(url)
             await asyncio.sleep(0)
             return RenderedPage(url=url, content_type="text/html", html=_document(f"<p>{_RENDERED_PROSE}</p>").decode())
