@@ -5,8 +5,9 @@ reference for a human operating the bot: local setup, API keys, the environment
 flags, the GitHub Actions workflows, cost discipline, and the telemetry you can
 grep after a run.
 
-For a code-level map of the pipeline, read `AGENTS.md` at the repo root. This
-doc points at code by file and symbol name, so `rg <symbol>` takes you there.
+For a code-level map of the pipeline, read `docs/architecture.md`; `AGENTS.md` at
+the repo root is the terse agent-facing starting point and indexes both. This doc
+points at code by file and symbol name, so `rg <symbol>` takes you there.
 
 ## Setup
 
@@ -18,9 +19,10 @@ uv sync --dev        # create/update .venv from uv.lock (or: make install)
 cp .env.template .env
 ```
 
-Then fill in `.env` with your keys (see below). Run any command inside the
-project environment with `uv run <cmd>` — uv resolves the in-project `.venv`
-automatically, so you never activate it by hand.
+Then fill in `.env` with your keys (see below). Never commit secrets: `.env` is
+gitignored and is the only place real keys should live locally. Run any command
+inside the project environment with `uv run <cmd>` — uv resolves the in-project
+`.venv` automatically, so you never activate it by hand.
 
 Quick sanity checks (all free, no paid APIs):
 
@@ -233,7 +235,8 @@ people up is the two OpenRouter keys.
 - **`OPENROUTER_API_KEY` — personal.** Pays for what the donated key can't
   (Grok, Qwen, Perplexity-via-OpenRouter) and serves as the fallback when the
   donated key hits a credential, credit, or allowed-providers error. The
-  fallback wrapper is `metaculus_bot/fallback_openrouter.py`.
+  fallback wrapper is `FallbackOpenRouterLlm` in
+  `metaculus_bot/fallback_openrouter.py`.
 - **`GOOGLE_API_KEY` — personal.** The operator's Google AI Studio key on a
   billing-enabled project. Powers the Gemini grounded-search provider and gap-
   fill v2's document reads. There is no donated Google AI Studio path. In CI
@@ -244,13 +247,34 @@ Gemini has two separate routes, which is the other easy thing to confuse:
 
 - **OpenRouter Gemini** (forecaster / stacker / summarizer slots) routes
   donated-key-first with personal-key fallback, controlled by
-  `GEMINI_USE_DONATED_OPENROUTER_KEY` (default `true`). The Gemini Pro
-  forecaster slot is pinned to the personal key by the
-  `DONATED_KEY_BLOCKED_GOOGLE_MODELS` blocklist in `fallback_openrouter.py` (no
-  donated attempt), so a credit error on a Pro call is always a personal-key
-  issue.
+  `GEMINI_USE_DONATED_OPENROUTER_KEY` (default `true`, since 2026-06-16). It is on
+  by default because Metaculus raised the Google rate limits, so the donated key
+  now serves most Gemini models — verified by live call, `gemini-3.5-flash` and
+  `gemini-3.1-flash-lite` both succeed on it. Setting the toggle to a false-y
+  value (`false`/`0`/`no`) forces personal-key-only routing for ALL Gemini; the
+  three prod workflow YAMLs and `test_bot.yaml` pin it to `'true'` explicitly.
+
+  **Known exception:** the Gemini Pro forecaster slot is PINNED to the personal
+  key by the `DONATED_KEY_BLOCKED_GOOGLE_MODELS` blocklist in
+  `fallback_openrouter.py` (read the blocklist for which models it currently
+  covers). `should_route_via_donated_key` returns `False` for anything on it even
+  with the toggle ON, so there is no donated attempt, no 429, and no
+  personal-key-fallback-counter bump — which would otherwise redden CI on every
+  question — and a credit error on one of those models is always a personal-key
+  issue. It is pinned rather than falling back because that model routes through a
+  free-tier Google AI Studio BYOK key on the donated account with no Pro free tier
+  (quota 0 → `is_byok:true` + `FreeTier limit: 0`). This is a temporary workaround
+  tagged `TODO(gemini-3.1-pro-donated)` in code: remove the blocklist entry once
+  Metaculus fixes the BYOK routing — enable Cloud billing on the BYOK key's GCP
+  project, remove the Google AI Studio BYOK integration so native OpenRouter
+  Google credits are used, or disable "Always use for this provider" on that BYOK
+  key — then re-verify with one live call. See
+  `metaculus_bot/fallback_openrouter.py:should_route_via_donated_key` and
+  `FUTURE.md` "Gemini on the donated OpenRouter key".
 - **Gemini grounded search** (`research/gemini_search.py`) always uses the
-  personal `GOOGLE_API_KEY`. The donated toggle does not touch it.
+  personal `GOOGLE_API_KEY`. The donated toggle does not touch it, and neither
+  does anything else on the OpenRouter side — what that key costs is its own
+  subsection below.
 
 Other keys, all personal, no shared variants: `METACULUS_TOKEN`, `ASKNEWS_CLIENT_ID`
 + `ASKNEWS_SECRET`, `EXA_API_KEY`, `PERPLEXITY_API_KEY`, `FRED_API_KEY`,
@@ -260,9 +284,16 @@ them.
 
 Diagnosing auth errors: an OpenRouter 401/402 on an OpenAI or Anthropic call
 means suspect the donated key first (it's always tried first for those
-providers). A 401/402 on Grok, Qwen, or Perplexity is always the personal key
+providers). A 401/402/credit error on an OpenRouter Gemini call also means the
+donated key first, since OpenRouter Gemini routes donated-first by default with
+personal fallback — unless `GEMINI_USE_DONATED_OPENROUTER_KEY` has been forced
+OFF, in which case suspect `OPENROUTER_API_KEY`; and anything on
+`DONATED_KEY_BLOCKED_GOOGLE_MODELS` is pinned to the personal key with no donated
+attempt, so a credit error on one of those models is always a personal-key issue.
+A 401/402 on Grok, Qwen, or Perplexity is always the personal key
 (the donated key 404s on those). A `google-genai` 401 or quota error is always
-`GOOGLE_API_KEY`. A `403` splits three ways:
+`GOOGLE_API_KEY`. A `403` splits three ways, with the reported status deciding the
+branch and the spend-cap phrase outranking it:
 
 - Body says `Key limit exceeded` — a drained spend cap. Falls back to the
   personal key and is credit-classified, whatever status came with it.
@@ -276,8 +307,70 @@ providers). A 401/402 on Grok, Qwen, or Perplexity is always the personal key
   least trustworthy input we have (see the `flagged_input` prompt replay below),
   and credit wording there classifies as neither credit nor a key issue.
 
+The routing half of that decision — fall back to the personal key, or don't —
+lives in `should_retry_with_general_key` (`fallback_openrouter.py`); the credit
+classification is `_is_credit_failure`. Whether a spend-cap 403 is additionally
+SUPPRESSED from CI alerting is a third, separate question, answered by the
+`/auth/key` probe described below.
+
 A `429 rate limit` is not a key defect but does fall back, since BYOK quotas are
 per-key. See "What a dry donated key actually returns" below.
+
+### Google AI Studio billing and the grounded-search allowance
+
+`GOOGLE_API_KEY` is the operator's personal Google AI Studio key on a
+BILLING-ENABLED (paid-tier, prepaid-credit) project, and marginal cost at current
+usage is near zero. In CI it is stored as `secrets.GEMINI_API_KEY` and surfaced to
+the workflow env as `GOOGLE_API_KEY` so the `google-genai` SDK picks it up. There
+is NO Metaculus-donated Google AI Studio key.
+
+Billing mechanics, verified against the ai.google.dev pricing / billing /
+google-search docs on 2026-07-17 — don't re-litigate without fetching them again:
+Gemini 3.x grounding is paid-tier-ONLY (the free-tier column reads "Not
+available") and includes **5,000 free grounded prompts/month shared across all
+Gemini 3 models per project, then $14/1k individual search queries**. Multi-query
+prompts bill per QUERY on overage, and deep-research prompts fire several.
+
+**Count queries, never prompts.** Current usage is ≈ 70-110 grounded PROMPTS per
+month, but the pool is counted per search QUERY and the measured profile is 12.7
+queries per prompt (`usage_metadata` plus
+`grounding_metadata.web_search_queries` over 113 archived calls, 2026-07-20 →
+08-28), so the real draw is ≈ 850-1,400 queries/month, ≈ 17-28% of the allowance.
+
+The spring-2026 billing arc, explained: gap-fill's 5x grounded-call multiplier
+plus backtest volume (`backtest_large` = 600 grounded prompts/run) blew past
+5,000/month → per-query overage → prepaid-credit top-up debits ("started getting
+billed"); the 2026-06-25 resolver migration (`a51617e`) cut the multiplier and new
+charges stopped, with a residual ~$1/month of token spend silently drawing down
+the prepaid balance. A reconstruction of the whole summer season
+(`scratch/fetch_ladder_2026-09-03/`, plan doc
+`scratch_docs_and_planning/fetch_ladder_plan_2026-09-03.md`) puts June 2026 alone
+at ≈ 6,600 queries, because the pre-06-25 gap-fill resolver added ≈ 4 grounded
+calls per question. Any future feature that multiplies grounded-call counts — or
+Gemini-grounded backtests at scale — re-eats the same monthly pool.
+
+**Watch item: prepaid-balance exhaustion produces 429s, not surprise charges.** If
+Gemini grounded search starts soft-failing across a run, check the AI Studio credit
+balance FIRST (`docs/research.md` § Gemini grounded search says the same from the
+provider side).
+
+Model prices, read from ai.google.dev on 2026-09-03: both native surfaces —
+grounded search and gap-fill v2's `read_document` — run `gemini-3.8-flash` since
+2026-09-03, verified live on the google-genai SDK. It draws the same grounding
+pool (grounding costs $0 to switch) and its tokens are $0.75/$3.75 per M through
+2026-12-31, then $1.50/$7.50 — against $0.50/$3.00 for the
+`gemini-3-flash-preview` it replaced on search and $1.50/$9.00 for the
+`gemini-3.5-flash` it replaced on the reader. Either way that is a few dollars a
+month, from prepaid credits. `url_context` carries no per-request fee; retrieved
+documents bill as input tokens.
+
+Don't confuse the OpenRouter Gemini path (donated route via
+`OAI_ANTH_OPENROUTER_KEY`, minus whatever `DONATED_KEY_BLOCKED_GOOGLE_MODELS`
+excepts) with this google-genai path: separate keys, separate billing. The
+grounded-search side is `research/gemini_search.py`; v2's `read_document` /
+`url_context` path is `research/agentic/tool_backends.py`. What a run actually drew
+on this key is readable from the `GEMINI_USAGE` marker in its log (see "Reading run
+logs").
 
 ## Environment flags
 
@@ -358,13 +451,34 @@ retention.
 | Workflow | Trigger | Mode | What it does |
 |---|---|---|---|
 | `run_bot_on_tournament.yaml` | cron at :03/:23/:43 hourly, plus manual | `tournament` | Forecasts new questions in the current AI benchmark tournament (`TOURNAMENT_ID` in `constants.py`); publishes to Metaculus |
-| `run_bot_on_minibench.yaml` | cron at :08/:38 hourly, plus manual | `minibench` | Forecasts the current MiniBench question set; publishes |
+| `run_bot_on_minibench.yaml` | cron at :08/:38 hourly in the YAML, but the workflow is disabled on GitHub — see below | `minibench` | Forecasts the current MiniBench question set; publishes |
 | `run_bot_on_metaculus_cup.yaml` | cron at :13/:33/:53 hourly, plus manual | `metaculus_cup` | Forecasts open Metaculus Cup questions (`METACULUS_CUP_ID` in `constants.py`, the season's dated slug); publishes |
 | `test_bot.yaml` | manual only (`workflow_dispatch`) | `test_questions` | Runs a fixed handful of example questions end-to-end in prod mode; publishes comments |
 | `test_bot_basic.yaml` | manual only (`workflow_dispatch`) | `test_questions` | One-question smoke test; publishes one comment. See below |
 
 The three prod workflows are the only ones with a `schedule:` block; both test
 workflows are `workflow_dispatch` and never fire on their own.
+
+**A `schedule:` block in the YAML is not the same as a workflow that runs.**
+GitHub carries a per-workflow enabled/disabled state that no file in this repo can
+set, and `run_bot_on_minibench.yaml` is `disabled_manually` there by operator
+design — it has NEVER been enabled (confirmed 2026-09-03), so despite the :08/:38
+crons above the bot does not forecast MiniBench at all. Read the row above as
+"would fire hourly if enabled". The practical consequence is that a
+`make supply_probe` row showing minibench posts closed with zero bot forecasts is
+the EXPECTED state, not a forfeit and not a `METACULUS_TOKEN` problem. The same
+mechanism currently applies to `run_bot_on_metaculus_cup.yaml` (see the
+season-start checklist above), with the difference that the cup one is meant to be
+enabled and is waiting on the operator; minibench is off on purpose. To check the
+live state rather than the YAML:
+
+```bash
+gh workflow list --repo No-Stream/metaculus-bot --all
+```
+
+`--repo` is required: `origin` is the fork, `upstream` is the Metaculus template,
+and no default repo is configured, so a bare `gh workflow` command silently
+targets upstream.
 
 All five skip already-forecasted questions
 (`skip_previously_forecasted_questions`) except in `test_questions` mode, where
@@ -641,6 +755,16 @@ each run's role-ledger total beside its settled per-key spend — the two measur
 the same money from opposite ends, so their ratio is the ledger's own coverage
 check — plus a per-role table over the selected runs.
 
+**The per-question spend figure to quote is `$0.38–0.41`**, measured over 29
+triple-era runs across 33 questions, and it is an OpenRouter-only LOWER bound: it
+excludes Google AI Studio prepaid (Gemini grounded search and gap-fill v2 document
+reads), the AskNews subscription, and Exa. The older "~$3.05 → ~$1.65 after the
+6→3 roster drop" estimate was never measured, is an order of magnitude too high,
+and is superseded — it must not appear in a roster re-add decision. `FUTURE.md`'s
+"Cost context for the re-add decision" holds the receipt path, and
+`CREDIT_ROLE_SPEND` plus `scripts/reconcile_credit_spend.py --roles` is how a
+re-add gets priced per role rather than estimated.
+
 A floor breach does not abort the run. Forecasting and publishing complete
 normally, and outside a suppression window `cli.py` then exits non-zero so the
 GitHub Actions check turns red as a reminder to ask Metaculus to top the donated
@@ -812,12 +936,27 @@ that date on is what it was before the suppression. `credit_alerts_active()` in
 `constants.py` takes an optional `today` so tests pin both sides of the
 boundary.
 
-Balances outside a run:
+### Checking balances
+
+The donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) is shared and
+rate-limited, so its burn rate is worth checking periodically rather than only
+when a run complains. `make check_credits` prints `limit` / `limit_remaining` /
+`usage` for both `OAI_ANTH_OPENROUTER_KEY` (donated) and `OPENROUTER_API_KEY`
+(personal); pass `ARGS="--key donated"` to check just one.
 
 ```bash
 make check_credits                    # both keys
 make check_credits ARGS="--key donated"
 ```
+
+Raw curl backup, which avoids putting the key on disk by pulling it from `.env`:
+
+```bash
+curl -s -H "Authorization: Bearer $OAI_ANTH_OPENROUTER_KEY" \
+  https://openrouter.ai/api/v1/auth/key | jq
+```
+
+Never paste a full key into chat and never commit one; `.env` is gitignored.
 
 ## Backtesting
 
@@ -848,6 +987,13 @@ The old `community_benchmark.py` path is deprecated: Metaculus removed the
 `make benchmark_display` still views old results.
 
 ## Performance analysis and the width monitor (read-only, free)
+
+This section is the runbook — the commands, and what each one prints. The
+methodology and the conventions that make a number trustworthy (era bucketing and
+the merge-to-main rule, the exclusion cohorts, the PIT convention, the starved
+outer tail, the supply probe, per-model recovery, the spot-peer rule,
+`spot_peer_delta`, and the clip-threshold sweep) live in
+`docs/performance_analysis.md`.
 
 `metaculus_bot/performance_analysis/` evaluates the live bot's calibration
 against actual resolutions. The pull hits only the Metaculus API (resolved
