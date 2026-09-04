@@ -10,6 +10,7 @@ import pytest
 
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
+from metaculus_bot.research.rendered_fetch import RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.resolution_source import (
     FetchContext,
@@ -339,6 +340,41 @@ class TestRenderedRungTimeout:
         result = await _fetch_one(session, _URL, {})
 
         _assert_recorded_as_a_render_timeout(result)
+
+
+class TestRenderedRungRefusedByTheEdge:
+    """The direct GET got a 200 for the URL (that is the trigger), so a non-200 main-frame status
+    from the browser is the edge telling Chromium apart, and its interstitial markup is not the
+    page. Recorded as its own skip: counted with the fired renders it was byte-identical on the
+    escalation line to a render that ran and produced chrome again, and "how often is the runner's
+    browser refused where its GET was not" is the rate the ladder's case rests on."""
+
+    async def test_a_browser_targeted_403_is_its_own_skip_and_claims_no_route(self, monkeypatch, caplog):
+        challenge = RenderedPage(
+            url=_URL,
+            content_type="text/html",
+            html=_rendered_document("<h1>Checking your browser</h1><p>" + "Please wait. " * 60 + "</p>").html,
+            http_status=403,
+        )
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(challenge, []))
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(session, _URL, {})
+            resolution_source._log_fetch_outcome_markers(1, [result])
+
+        assert result.status == "js_wall"
+        assert result.route == "direct"
+        attempts = [a for a in result.rung_attempts if a.rung == "rendered"]
+        assert [a.skipped_reason for a in attempts] == ["render_non_200"]
+        counts = _rung_counts([result])
+        assert counts["render_non_200_skips"] == 1
+        assert counts["rendered_attempts"] == 0
+        assert counts["renderer_unavailable_skips"] == 0
+        # A 403 or 429 is retryable, so the URL stays live for the next question.
+        assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is False
+        # A skip emits no escalation line, so nothing claims the browser rung fired.
+        assert not [message for message in caplog.messages if "RESOLUTION_SOURCE_ESCALATION" in message]
 
 
 class TestASlowRenderLeavesTheSiblingPagesStanding:

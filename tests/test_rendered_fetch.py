@@ -933,6 +933,8 @@ class TestTheMainFrameStatus:
         # A 403 or 429 is retryable, so the URL is not memoised as rendered-to-nothing.
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
         assert [message for message in caplog.messages if "403" in message]
+        # Its own skip token, so the refusal is not counted as a render that read chrome.
+        assert [attempt.skipped_reason for attempt in ctx.rungs] == ["render_non_200"]
 
     async def test_a_200_from_the_browser_still_classifies(self, monkeypatch):
         async def _ok_render(url: str, **_kwargs: Any) -> RenderedPage:

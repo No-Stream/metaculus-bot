@@ -1994,6 +1994,10 @@ async def _rendered_rung(
             page.http_status,
             urlparse(url).netloc,
         )
+        # Its own skip, not a fired rung: nothing about the page was read, so the attempt claims
+        # no route and emits no escalation line, and the count keeps "Chromium refused where our
+        # GET was not" measurable. No memo, because a 429 has to stay re-requestable.
+        attempt.skipped_reason = "render_non_200"
         return None
     classified = await _classify_html_body(
         page.html.encode("utf-8", errors="replace"),
@@ -3156,6 +3160,11 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # Folding it into either would hide the population the ogimet receipt (2026-09-03) is
         # the first member of.
         "render_timeout_skips": skips_by_reason["render_timeout"],
+        # Its own count: the browser was answered a non-200 where the direct GET got a 200, the
+        # edge telling Chromium apart. Counted with the fired renders it read as a render that
+        # produced chrome again, and the rate at which the runner's browser is refused is the
+        # question the escalation ladder's case rests on.
+        "render_non_200_skips": skips_by_reason["render_non_200"],
         # And its own count: a browser rung skipped because an earlier question in this run
         # already rendered the same URL to nothing is the memo doing its job, not a runner without
         # Chromium — folded into `renderer_unavailable_skips` it inflated the install-failed signal.

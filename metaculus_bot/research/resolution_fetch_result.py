@@ -186,6 +186,13 @@ FetchStatusReason = Literal[
 #   — the receipt is ogimet.com (2026-09-03), where a 76 s render was recorded as the renderer
 #   being unavailable and latched the once-per-run warning, so a real outage later would have
 #   logged nothing.
+# `render_non_200` — the browser rendered the page and the main frame was answered with something
+#   other than a 200 where the direct GET got one: the edge telling the browser apart, whose
+#   interstitial markup (a 403 or 429 challenge) is not the page. A skip rather than a fired rung
+#   because nothing about the page was read; its own token because "Chromium is refused where our
+#   GET was not" is the rate a residual round asks for, and folded into the fired count it was
+#   byte-identical to a render that ran and produced chrome again. The URL is deliberately NOT
+#   memoised, because a 429 is retryable.
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",
@@ -197,6 +204,7 @@ RungSkipReason = Literal[
     "rendered_no_text",
     "renderer_unavailable",
     "render_timeout",
+    "render_non_200",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the
