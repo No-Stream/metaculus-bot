@@ -108,9 +108,8 @@ agentic research loop (`metaculus_bot/research/agentic/`) whose driver LLM has `
   pre-existing marker tests launched a real browser when the Tier-1 rendered rung landed. The
   resolution-source test package now declines the browser and empties the Wayback trigger set by
   default via autouse conftest fixtures; widening the global guard is the proper fix.
-- **Gates:** every free gate was green at `6716c53` and on the Phase 3 branch tip; the full gate on the
-  merged `dd1074b` was launched in tmux session `p5gate` (log `/tmp/p5gate.log`; read `EXITCODE=`) —
-  if that log is gone, re-run step 1's gate command. Previously (`make lint`, `make typecheck`,
+- **Gates: the full gate on the merged `dd1074b` is GREEN** (lint, typecheck, import contracts, deptry,
+  test_fast: 7,291 passed, exit 0; log `/tmp/p5gate.log`). Previously (`make lint`, `make typecheck`,
   `make lint_imports`, `make deps`, `make test_fast`, 7,191 passed) and the docs-only `c87a5be`
   ran lint + test_fast green. Not yet re-run on anything merged after.
 - **Pushed vs local:** `origin/next-season-bundle` = `ea1d558`; local is 30 ahead. Pushing is the
@@ -125,7 +124,7 @@ agentic research loop (`metaculus_bot/research/agentic/`) whose driver LLM has `
 
 ## What's left to do (in order; 1–3 sequential, 4 and 5 parallel, 6–8 need the operator)
 
-1. **Confirm the full gate on `dd1074b`** (see Current state); if not green, fix first. Gate command, in tmux:
+1. Gates are green at `dd1074b`; re-run after any further merge with this command, in tmux:
    `tmux new-session -d -s gate "(make lint && make typecheck && make lint_imports && make deps && make test_fast) > /tmp/gate.log 2>&1; echo EXITCODE=\$? >> /tmp/gate.log"`
    and poll `tail /tmp/gate.log` (test_fast takes ~150 s; never `sleep` in a foreground Bash).
 2. **Forge the Phase 3 diff** (`git diff 6716c53..HEAD -- . ':(exclude)uv.lock'`) with the NEW
