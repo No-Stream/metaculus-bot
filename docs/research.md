@@ -1011,10 +1011,16 @@ reaching hosts our own client cannot because Gemini dials from Google's address.
 default behind `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` and set in no workflow yaml, so it fires
 nowhere in production today; `docs/operations.md` covers what turning it on costs and on whose
 key. Every gate is checked in increasing cost order before a cent is spent: the trigger statuses
-(`blocked`, `js_wall`, `error`, `no_resolving_content`), the flag, the free per-host
-`Google-Extended` robots pre-check (`research/robots_policy.py`, whose cache is shared with v2's
-reader, worth a request of its own because a host disallowing that token refuses Gemini's fetch
-server-side), the API key, and the `RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S` floor. It has its
+(`blocked`, `js_wall`, `error`, `no_resolving_content`, tested against the DIRECT outcome, so a
+withheld Wayback capture on the way down does not close the rung), the flag, the API key, the
+`RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S` floor, then the per-host `Google-Extended` robots
+pre-check (`research/robots_policy.py`, whose cache and `ROBOTS_FETCH_TIMEOUT_S` bound are shared
+with v2's reader; worth a request of its own because a host disallowing that token refuses
+Gemini's fetch server-side), and the budget floor a SECOND time. The pre-check is the one gate
+that costs a request, and the paid read runs in a thread that `asyncio.wait_for` cannot cancel, so
+the client-side ceiling sized off the remaining budget is the only bound that can stop it; re-reading
+the budget after the pre-check is what keeps that ceiling honest, and a pre-check that ate the room
+records a `wall_budget` skip rather than a paid call nothing reads. It has its
 own retry count, `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`, deliberately lower than the v2
 reader's, because a retry inside a wall shared with every other cited URL spends the budget the
 pages already fetched need in order to render. Zero successful retrievals

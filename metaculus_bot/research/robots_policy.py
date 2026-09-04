@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # vendor's own `google-extended-crawler` speak for Gemini.
 GOOGLE_EXTENDED_AGENT = "google-extended"
 
+# Bound on the one request the pre-check makes, shared by both callers. Fixed rather than derived
+# from a caller's remaining budget because the read is a pre-check on a PAID call: a robots.txt
+# that has not answered in five seconds is a host that is not going to make the paid read any
+# cheaper, and the caller's own wall budget is re-read after this returns.
+ROBOTS_FETCH_TIMEOUT_S: float = 5.0
+
 # One robots.txt per host per run, shared by BOTH paid readers (gap-fill v2's `read_document`
 # tool and the Tier-1 resolution-source ladder). Shared rather than one cache each, because a
 # host's policy is a property of the host: the two paths routinely reach the same government

@@ -95,7 +95,7 @@ from metaculus_bot.research.http_fetch import (
     read_body_capped,
 )
 from metaculus_bot.research.rendered_fetch import note_rendered_no_text, render_page
-from metaculus_bot.research.robots_policy import google_extended_blocks_url, robots_host
+from metaculus_bot.research.robots_policy import ROBOTS_FETCH_TIMEOUT_S, google_extended_blocks_url, robots_host
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +112,6 @@ _READ_DOCUMENT_TOTAL_BUDGET_S = 65.0
 _FETCH_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 _FETCH_TEXT_CACHE: OrderedDict[str, str] = OrderedDict()
 _FETCH_LINKS_CACHE: OrderedDict[str, list[str]] = OrderedDict()
-
-# Timeout for this path's robots.txt read. The per-host CACHE is shared with the Tier-1
-# resolution-source reader (``robots_policy``), because a host's policy is a property of the host
-# and the two paths routinely reach the same government domains in one run.
-_ROBOTS_FETCH_TIMEOUT_S = 5.0
 
 
 def _host_gate(url: str) -> asyncio.Semaphore:
@@ -631,10 +626,12 @@ async def _fetch_robots_txt(robots_url: str) -> str | None:
     also classifies, so a host serving robots.txt as HTML hands back trafilatura's idea of it
     and a non-plain rung (an image, a PDF) is refused outright — both of which read as "no
     directives", i.e. proceed and pay, which is the only direction an unreadable robots.txt is
-    allowed to fail in.
+    allowed to fail in. The bound and the per-host cache are ``robots_policy``'s, shared with
+    the Tier-1 resolution-source reader, because a host's policy is a property of the host and
+    the two paths routinely reach the same government domains in one run.
     """
     try:
-        result = await asyncio.wait_for(_fetch_plain(robots_url), timeout=_ROBOTS_FETCH_TIMEOUT_S)
+        result = await asyncio.wait_for(_fetch_plain(robots_url), timeout=ROBOTS_FETCH_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # pre-check soft-fail boundary: a robots.txt we cannot read must degrade to paying, never to failing the read
         logger.debug("agentic robots.txt pre-check failed for %s: %s: %s", robots_url, type(exc).__name__, exc)
         return None

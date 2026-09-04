@@ -1088,6 +1088,81 @@ class TestUrlContextRung:
         assert calls == []
         assert ("url_context", "wall_budget") in [(a.rung, a.skipped_reason) for a in result.rung_attempts]
 
+    def _budget_that_drops_after_the_robots_read(self, session: FakeSession, *, before: float, after: float):
+        """A wall budget that reads ``before`` until the robots.txt GET has gone out, then ``after``.
+
+        The pre-check is the one gate that costs a request, so it is the one place the budget
+        can move between being read and being spent."""
+
+        def _budget(_self: FetchContext) -> float:
+            return after if any(url.endswith("/robots.txt") for url in session.requested) else before
+
+        return _budget
+
+    async def test_the_reader_is_sized_off_the_budget_left_after_the_robots_pre_check(self, monkeypatch):
+        """The read runs in a thread, which `wait_for` cannot cancel, so the client ceiling is the
+        only thing that returns the worker — and a ceiling sized off a figure read BEFORE a real
+        request went out could outlive the provider's wall while the money is spent anyway."""
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        session = self._session()
+        monkeypatch.setattr(
+            FetchContext,
+            "rung_budget_s",
+            self._budget_that_drops_after_the_robots_read(session, before=20.0, after=16.0),
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+
+        assert result.status == "success"
+        assert calls[0]["attempts"] == resolution_source.RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS
+        assert calls[0]["timeout_ms"] == int((16.0 - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000)
+
+    async def test_a_pre_check_that_eats_the_room_skips_before_paying(self, monkeypatch):
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        session = self._session()
+        monkeypatch.setattr(
+            FetchContext,
+            "rung_budget_s",
+            self._budget_that_drops_after_the_robots_read(session, before=20.0, after=5.0),
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+
+        assert result.status == "blocked"
+        assert calls == []
+        assert "https://tracker.example.com/robots.txt" in session.requested
+        # One skip, recorded AFTER the pre-check ate the room, never two.
+        assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("url_context", "wall_budget")]
+
+    async def test_the_robots_pre_check_is_bounded_and_fails_toward_paying(self, monkeypatch):
+        """A robots.txt that never answers must neither hold the paid rung nor withhold it: the
+        pre-check gets the same fixed bound gap-fill v2 gives it, and an unreadable policy
+        proceeds to pay, the only direction it is allowed to fail in."""
+
+        class _HangingResponse(FakeResponse):
+            async def read(self) -> bytes:
+                await asyncio.Event().wait()
+                return b""
+
+        reader, calls = self._reader()
+        self._arm(monkeypatch, reader)
+        monkeypatch.setattr(resolution_source, "ROBOTS_FETCH_TIMEOUT_S", 0.05)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+                "https://tracker.example.com/robots.txt": _HangingResponse(200, content_type="text/plain"),
+            }
+        )
+
+        started = time.monotonic()
+        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+
+        assert time.monotonic() - started < 2.0
+        assert result.status == "success"
+        assert len(calls) == 1
+
     @pytest.mark.parametrize("status", [404, 410])
     async def test_a_missing_page_is_never_sent_to_the_reader(self, monkeypatch, status):
         """A 404 has no page to read, so the spend would buy nothing."""

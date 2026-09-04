@@ -229,7 +229,7 @@ from metaculus_bot.research.resolution_url_scan import (
     is_yahoo_ticker_url,
     strip_markdown_escapes,  # noqa: F401  # re-export: the Tier-1 suite imports the markdown unescaper from this module path
 )
-from metaculus_bot.research.robots_policy import google_extended_blocks_url
+from metaculus_bot.research.robots_policy import ROBOTS_FETCH_TIMEOUT_S, google_extended_blocks_url
 from metaculus_bot.research.url_context_reader import run_url_context_read
 from metaculus_bot.research.wayback import (
     innermost_url,
@@ -1940,8 +1940,21 @@ async def _fetch_robots_txt(
     CLASSIFIES, so a host serving robots.txt as HTML can come back withheld under the chrome
     floor — which reads as "no directives", i.e. proceed and pay, the only direction an
     unreadable robots.txt is allowed to fail in.
+
+    Bounded at ``ROBOTS_FETCH_TIMEOUT_S`` on top of the hop's own clamp, the same bound gap-fill
+    v2 gives the identical read: the hop clamp is the remaining WALL (up to 20 s) and the
+    per-host gate in front of it is an unbounded acquire, and neither is a sensible price for a
+    pre-check whose only job is to avoid one paid call. A timeout reads as unreadable.
     """
-    result = await _fetch_direct(session, robots_url, host_sems, _aux_ctx(ctx))
+    try:
+        result = await asyncio.wait_for(
+            _fetch_direct(session, robots_url, host_sems, _aux_ctx(ctx)), ROBOTS_FETCH_TIMEOUT_S
+        )
+    except TimeoutError:
+        logger.info(
+            "resolution_source: robots.txt pre-check for %s did not answer in %.1fs", robots_url, ROBOTS_FETCH_TIMEOUT_S
+        )
+        return None
     return result.text if result.status == "success" else None
 
 
@@ -1967,11 +1980,20 @@ async def _url_context_rung(
 
     The LAST rung and the only paid one, so every gate is checked before a cent is spent, in
     increasing cost order: the trigger population, the flag (default off, and off in every
-    workflow), the free per-host ``Google-Extended`` robots pre-check, the API key, and the wall
-    budget. The robots check is worth a request of its own because a host that disallows that
-    token refuses the fetch server-side — proven live 2026-09-03, where the same call that
-    retrieved a robots-allowed host came back ``URL_RETRIEVAL_STATUS_ERROR`` on
-    internationalaisafetyreport.org — so the read would be spend with a known-zero return.
+    workflow), the API key, the wall budget, then the per-host ``Google-Extended`` robots
+    pre-check — the one gate that costs a request — and the wall budget AGAIN. The robots check
+    is worth a request of its own because a host that disallows that token refuses the fetch
+    server-side — proven live 2026-09-03, where the same call that retrieved a robots-allowed
+    host came back ``URL_RETRIEVAL_STATUS_ERROR`` on internationalaisafetyreport.org — so the
+    read would be spend with a known-zero return.
+
+    The budget is checked twice because the pre-check sits between reading it and spending it,
+    and it can eat real time: an unbounded per-host gate acquire and then up to
+    ``ROBOTS_FETCH_TIMEOUT_S``. The read below runs in a thread, which ``wait_for`` cannot
+    cancel, so the client-side ceiling is the only thing that returns the worker — and a ceiling
+    sized off the figure read BEFORE the pre-check could outlive the provider's wall while the
+    money is spent on a result nothing reads. The second check costs nothing (the read has not
+    started), and both the ceiling and the ``wait_for`` are sized off the figure it returns.
 
     Zero successful retrievals DISCARDS the text and reports ``ungrounded``. Gemini answers
     fluently out of parametric memory when every retrieval failed, and this section is captioned
@@ -2004,6 +2026,18 @@ async def _url_context_rung(
     if await _url_context_robots_skip(session, url, host_sems, ctx):
         logger.info(f"RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url={url} host={urlparse(url).netloc}")
         ctx.skip_rung("url_context", direct.status, url, "robots_disallowed")
+        return None
+    # Re-read AFTER the pre-check, which is the one gate above that spent wall time (see the
+    # docstring): the figure below sizes the in-thread client ceiling, the only bound that can
+    # actually stop the paid read.
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the url_context rung for %s — %.1fs of wall budget left after the robots pre-check",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("url_context", direct.status, url, "wall_budget")
         return None
     ctx.start_rung("url_context", direct.status, url)
     try:
