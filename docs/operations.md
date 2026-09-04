@@ -491,7 +491,9 @@ ladder and the Tier-1 resolution-source ladder, which share the transport in
 step that raises a GitHub warning annotation when it failed, because both callers degrade
 gracefully without a browser. The cost of a missing browser is visible per question in the
 resolution-source provider's `renderer_unavailable_skips` count, so a run whose install failed
-is readable from the archive rather than only from the annotation.
+is readable from the archive rather than only from the annotation. That count now excludes a URL
+an earlier question already rendered to nothing this run (its own `rendered_no_text_skips`), so a
+memo hit cannot inflate the install-failed signal.
 
 | Workflow | Trigger | Mode | What it does |
 |---|---|---|---|
@@ -1334,7 +1336,7 @@ the telemetry markers:
   for keeping a rung on a question under a close-derived time budget gets made. A rung that
   never RAN (no wall budget, no browser, the per-question snapshot cap, the robots pre-check)
   emits no line here by design and is counted in the provider's `details["counts"]` instead;
-  `docs/research.md` lists the eleven count keys.
+  `docs/research.md` lists every count key.
   Harvested as `resolution_source_escalation`.
 - `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]` — a WARN, one per
   gap-fill v2 `read_document` call whose `url_context` retrieval brought back nothing,

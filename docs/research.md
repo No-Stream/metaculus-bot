@@ -1000,11 +1000,15 @@ launch slot is contended process-wide, so a question with no budget left would t
 sibling question could still land a page with. The rendered DOM re-enters `_classify_html_body`,
 so a rescued page gets the same chart read, ARIA rewrite, floors and disclosure leads as a
 directly-fetched one, and can still be withheld. A transport that declines (Playwright missing
-or broken, a host that will not pin to a public IP, a browser error, or a URL a browser already
-read to nothing this run) is recorded as a SKIP with the new reason `renderer_unavailable`
-rather than as a fired rung, because nothing was rendered and so nothing about the page changed.
-Two bounds hold the rung inside the wall, and a render cut off by either is recorded as a SKIP
-with its own reason, `render_timeout`, rather than as the renderer being unavailable. Inside the
+or broken, a host that will not pin to a public IP, or a browser error) is recorded as a SKIP
+with the reason `renderer_unavailable` rather than as a fired rung, because nothing was rendered
+and so nothing about the page changed. Two nearby cases are kept OUT of that reason so a memo
+hit or a queue timeout cannot read as the Chromium install having failed: a URL an earlier
+question already rendered to nothing this run is `rendered_no_text` (the memo doing its job),
+and a render that ran out of budget queued behind the launch gates, which the transport signals
+with `RenderBudgetExpired`, is `wall_budget` (the same reason the pre-gate floor check records).
+Two more bounds hold the rung inside the wall, and a render cut off by either is recorded as a
+SKIP with its own reason, `render_timeout`, rather than as the renderer being unavailable. Inside the
 transport, `page.content()` is capped at `RENDER_DOM_READ_TIMEOUT_MS`: on a settled DOM it is a
 sub-second round trip, and it runs long only when the page keeps navigating after the settle
 (measured 2026-09-03 on ogimet.com, where the goto timed out at 33 s as designed and the
@@ -1111,7 +1115,9 @@ by the pages before it" is the question the flag's rollout asks.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
 parse gate is what binds. `renderer_unavailable_skips` is a browser rung that never rendered,
 most often because Chromium is missing on the runner (the install step is `continue-on-error` in
-every workflow, so its absence is by design), and it is invisible in `rendered_attempts`.
+every workflow, so its absence is by design), and it is invisible in `rendered_attempts`; it no
+longer includes a URL an earlier question rendered to nothing, which is its own
+`rendered_no_text_skips` so a memo hit cannot inflate the install-failed signal.
 `render_timeout_skips` is a browser rung that launched and was cut off, by the transport's
 DOM-read cap or by the question's remaining wall budget: a page that keeps navigating, which is a
 fact about the page rather than about the runner or the question's clock, and also invisible in
