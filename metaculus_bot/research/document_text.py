@@ -459,6 +459,14 @@ def _read_pages(
     bounds the decoded bytes a single page's content stream can cost; without it one page can
     outrun any budget (F44's receipt: 9 MB of decoded operators for ~7 s of CPU). A
     before-each-page check would add nothing, since the same page still has to finish.
+
+    The clock also starts here, which is late. ``extract_pdf_text`` reads the declared page count
+    and walks the whole bookmark outline first, and neither of those steps is inside this budget;
+    call them the prologue. pypdf's own caps keep the prologue finite (100,000 outline entries,
+    100 levels of nesting), and a body built to maximize both measured a ceiling around 16 s. So
+    the real worst case for one parse is the prologue plus ``max_seconds`` plus one page, and a
+    caller that cancels the surrounding coroutine stops none of it, because the worker runs in a
+    thread. Recorded in FUTURE.md under "The PDF parse overruns ``max_seconds``".
     """
     deadline = monotonic() + max_seconds
     limit = min(page_count, max_pages)
@@ -498,6 +506,10 @@ def _read_outline(reader: PdfReader) -> tuple[tuple[str, int], ...]:
         return ()
 
 
+# Counts entries APPENDED, so a nested list or an untitled Destination is popped without
+# incrementing it. That makes this a cap on what the walk can hand the digest, and not a cap on
+# how much of pypdf's tree the walk visits; pypdf's own OUTLINE_MAX_ENTRIES = 100_000 is the only
+# bound on the visit itself. Recorded in FUTURE.md under "The PDF parse overruns `max_seconds`".
 OUTLINE_MAX_ENTRIES_WALKED = 2_000
 
 
@@ -507,7 +519,7 @@ def _walk_outline(reader: PdfReader, items: Sequence[object]) -> list[tuple[str,
     Iterative on purpose: the bookmark tree is attacker-shaped input, and a recursive walk over
     a pathologically deep tree raises RecursionError, which is not a pypdf error and would break
     this module's never-raises contract. The explicit stack cannot exhaust the interpreter's, and
-    the entry cap bounds a tree that is wide instead of deep; the digest shows
+    the entry cap bounds how many titled entries a wide tree can produce; the digest shows
     DIGEST_MAX_OUTLINE_ENTRIES of these anyway.
 
     An untitled entry is skipped: the digest renders the outline as "title (p.N)", and a

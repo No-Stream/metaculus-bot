@@ -514,7 +514,14 @@ async def _acquire_local_document(url: str) -> local_document.HeldDocument:
     Bounded by ``_LOCAL_DOCUMENT_BUDGET_S`` so a slow host cannot spend the paid reader's
     budget as well as its own; on expiry we hold nothing and the reader gets its turn. The
     cancelled work includes at most one in-flight extraction thread, which finishes and drops
-    its result (a thread cannot be cancelled) inside its own ``max_seconds``.
+    its result, because a thread cannot be cancelled.
+
+    That thread does NOT finish inside its own ``max_seconds``. The clock for that budget starts
+    only once ``extract_pdf_text`` has read the declared page count and the whole bookmark
+    outline, and the page in flight always completes, so the worker outlives this cancellation by
+    that un-clocked prologue plus one page. It also hands its slot in the shared two-slot parse
+    gate back as it unwinds, so a fresh parse can start alongside the abandoned one. Recorded in
+    FUTURE.md under "The PDF parse overruns ``max_seconds``".
     """
     cached_pdf = local_document.cached_document(url)
     if cached_pdf is not None:

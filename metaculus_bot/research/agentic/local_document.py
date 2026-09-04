@@ -168,11 +168,16 @@ async def pdf_fetch_result(body: bytes, *, url: str, content_type: str) -> Plain
     # pypdf is pure Python and the two paths contend for the same GIL: six concurrent parses of a
     # 220-page document took 10.2 s against 1.66 s solo, and each parse's max_seconds is
     # wall-clock, so without a shared bound a parse truncates because of concurrency rather than
-    # because of the document's size.
+    # because of the document's size. What the gate bounds is ADMISSION, not the number of parses
+    # actually running: cancelling this coroutine releases its slot immediately while the worker
+    # thread keeps parsing, so a third parse can start alongside the abandoned one (FUTURE.md,
+    # "The PDF parse overruns max_seconds").
     async with pdf_parse_semaphore():
         # CPU-bound (pypdf parses and decodes every content stream), so it must not run on the
-        # event loop. A caller whose own budget expires first cancels this coroutine but not
-        # the worker thread, which finishes and drops its result — bounded by max_seconds.
+        # event loop. A caller whose own budget expires first cancels this coroutine but not the
+        # worker thread, which finishes and drops its result. max_seconds does not say when that
+        # is: its clock starts after extract_pdf_text has read the page count and the outline,
+        # and the page in flight always completes.
         pdf = await asyncio.to_thread(
             extract_pdf_text, body, max_pages=DOCUMENT_TEXT_MAX_PAGES, max_seconds=DOCUMENT_TEXT_MAX_SECONDS
         )

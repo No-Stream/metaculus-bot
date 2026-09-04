@@ -1289,8 +1289,9 @@ Follow-ups:
    politeness map moved from a fresh dict per provider call to the loop-wide
    `http_fetch.host_semaphores()`, so same-host requests now serialize ACROSS the
    `DEFAULT_MAX_CONCURRENT_RESEARCH = 6` questions researching at once rather than only within one
-   question. Each hold covers the GET, the body read and the trafilatura extraction (and, until the
-   F45 PDF-parse split lands, the PDF parse), the acquire wait is unbounded, and each request may
+   question. Each hold covers the GET, the body read and the trafilatura extraction (the F45 split
+   has since landed, so the PDF parse now runs in `_finish_document` after this gate has been
+   released and no longer holds it), the acquire wait is unbounded, and each request may
    take `RESOLUTION_SOURCE_HTTP_TIMEOUT = 20.0` — so six questions citing one slow host (the
    worked cases q44873/q44874 both cite cdc.gov) can queue past the 45 s wall, at which point the
    question that lost the queue discards every page it had ALREADY fetched, not just the contended
@@ -2829,3 +2830,105 @@ rank cell carrying a second inline element. Deferred as LOW because the fix is a
 pass before extraction that wants a corpus of rendered tables to calibrate against rather than
 one page, and the ARIA rewrite does not apply (this is a real `<table>`). Revisit if a
 resolution criterion keys on a ranking.
+
+### The PDF parse overruns `max_seconds`, and a cancelled parse hands its gate permit back while the worker runs (added 2026-09-04; LOW)
+
+`extract_pdf_text` (`research/document_text.py`) takes a `max_seconds` budget, and three steps run
+before the clock for that budget exists. Call those three steps the prologue. First, `_page_count`
+is `len(reader.pages)` (:250), which measured 2.365 s on the operator's laptop for a PDF declaring
+100,000 pages in a 12.78 MB body, and `DOCUMENT_TEXT_MAX_PAGES = 400` does not bound it. Second,
+`_read_outline` (:254) walks the whole bookmark tree, and it runs before `_read_pages` (:255),
+which is where `deadline = monotonic() + max_seconds` is finally computed (:471). Third, on the
+resolution-source route the same worker runs `digest_pdf` after the pages
+(`research/resolution_source.py:1568-1592`, 96 ms to 235 ms per 400-page document by that
+function's own measurement). The page loop then reads its deadline only after `_page_text` returns
+(:476), so the page in flight always completes. The module docstring (:451-469) and the
+`DOCUMENT_TEXT_MAX_SECONDS` note in `constants.py` (:730-740) described the between-pages
+checkpoint and the single-page overrun and said nothing about the prologue; both were corrected on
+2026-09-04, which is the only change this finding landed.
+
+The prologue's cost is seconds rather than indefinite, because pypdf 6.16.2 caps its own outline
+traversal at `OUTLINE_MAX_ENTRIES = 100_000` and `OUTLINE_MAX_DEPTH = 100`
+(`pypdf/_doc_common.py:91-92`), caps form-XObject recursion at
+`MAX_XFORM_INVOCATIONS_PER_EXTRACTION = 5_000` (`pypdf/_page.py:101`), and
+`research/document_text.py:74-98` lowers every pypdf decoded-stream cap to 8 MB. The tree's shape
+decides its cost, so measure a NESTED tree: `_get_outline` copies its `visited` set for every
+sibling that has children (`pypdf/_doc_common.py:936-938`), which makes the walk superlinear.
+Measured in memory with pypdf 6.16.2 on the operator's laptop on 2026-09-04, nested: 20,000
+entries 1.105 s, 40,000 entries 3.279 s, 80,000 entries 11.623 s, and 100,000 entries in a
+20.57 MB file 13.7 s. The same sizes flat: 0.757 s, 1.960 s, 4.047 s. A bound derived from the flat
+figures comes out about 3x too optimistic. One body under `DOCUMENT_TEXT_PDF_MAX_BYTES` = 40 MB can
+carry both a page-bloated tree and a 100,000-entry nested outline, so the prologue's measured
+ceiling is about 16 s, and an abandoned worker's whole life is the prologue plus `max_seconds` plus
+one page plus the digest, about 36 s to 40 s worst case on that laptop.
+
+The second half of the finding is what happens to the parse gate. Both PDF routes take the shared
+two-slot `http_fetch.pdf_parse_semaphore()` (:234-272), and one of its two slots is a gate permit.
+`asyncio.to_thread` cannot cancel a worker that has already started, since
+`concurrent.futures.Future.cancel` refuses a RUNNING future, so a cancellation discards the result
+and nothing else. The resolution-source route releases the permit in a `finally`
+(`research/resolution_source.py:1707-1725`) and the gap-fill v2 route uses a bare `async with`
+(`research/agentic/local_document.py:175-184`), so on both routes the permit comes back at once
+while the worker keeps burning the GIL. Reproduced empirically on 2026-09-04 in this repo's venv:
+cancelling a coroutine that held an `asyncio.Semaphore(2)` around `asyncio.to_thread` returned the
+permit immediately and the worker ran its full body afterwards. So the gate stops bounding parse
+concurrency exactly when the run is loaded, which is the job it exists for. Six concurrent parses
+of a 220-page document took 10.20 s against 1.66 s solo, and each parse's `max_seconds` is
+wall-clock, so a live parse alongside an abandoned one truncates because of concurrency rather than
+because of its own document's size. The visible symptom is a digest built from fewer pages, so the
+cost is research recall and latency. Nothing raises, no forecast is corrupted, and no money is
+spent.
+
+Gap-fill v2 is the exposed route. Its parse gets the full `DOCUMENT_TEXT_MAX_SECONDS` = 20.0 behind
+an unbounded acquire, under the 25 s `_LOCAL_DOCUMENT_BUDGET_S` wall
+(`research/agentic/tools.py:114,534`), so cancellation partway through a parse is the ordinary case
+there. The resolution-source route is defended by construction: the parse is pre-skipped below
+`RESOLUTION_SOURCE_PDF_MIN_BUDGET_S` = 3.0, the acquire is bounded and degrades to a labelled
+`parse_contention` skip, and `max_seconds` is `min(DOCUMENT_TEXT_MAX_SECONDS, budget_s)` inside the
+45 s wall, so a cancellation there needs a genuine overrun, which only the prologue and the last
+page can produce.
+
+One adjacent weakness, recorded because the name is misleading. `OUTLINE_MAX_ENTRIES_WALKED` =
+2,000 (`research/document_text.py:513,530`) counts entries APPENDED, so a nested list or an
+untitled `Destination` is popped without incrementing it and the walk can traverse pypdf's whole
+tree. pypdf's own 100,000-entry cap is what ends it. Counting every popped item instead would
+tighten the bound in one line, and it was left alone on 2026-09-04 because
+`tests/test_document_text.py::TestOutline::test_a_pathologically_deep_outline_does_not_raise` sizes
+its fixture from `sys.getrecursionlimit()` plus 200, which would couple that test to the cap, and
+because a legitimately deep tree would then yield fewer titled entries than today.
+
+Four remedies, all deferred, in the order a follow-up should consider them. (1) Lower pypdf's
+`OUTLINE_MAX_ENTRIES` at import, the way this module already lowers four decoded-stream caps.
+Verified on 2026-09-04 that with the cap at 2,000 a 40,000-entry nested tree raised
+`LimitReachedError` in 0.076 s instead of costing 2.994 s, and `LimitReachedError` is a
+`PyPdfError`, already listed in `_PDF_ERRORS`, so `_read_outline` degrades it to `()` with no other
+change and no clock plumbing. A cap of 20,000 would hold the walk near 1 s and keep every
+realistic government report. It is a real bound, and it still loses the outline lines of a document
+above the cap, so it needs sign-off. (2) Compute one deadline at the top of `extract_pdf_text`,
+read the pages first, and read the outline only if the deadline has not passed. About 25 lines plus
+two tests using the existing `_FakeClock`, and it stops the un-clocked step from front-running the
+clocked one. Deferred for two reasons: it drops the outline whenever the page read consumed the
+budget, and `truncation_note` has no clause for that, so the loss is undisclosed, which is the
+ambiguity the module's own docstring refuses; and it only moves the cost, since the outline still
+runs its full walk un-clocked whenever the pages finish early. (3) Hold the gate permit until the
+abandoned worker finishes. Shielding stretches the 45 s provider wall to as much as 65 s, and
+releasing from a done-callback leaks the permit whenever the callback never fires, which wedges a
+gate every question's PDF read passes through. Item 5 of the resolution-source list earlier in this
+file (FUTURE.md:1272) already rejected a hand-rolled acquire and release on a process-wide permit
+for that reason. (4) Run the parse in a
+subprocess for a hard kill. The only true bound, and a large build with its own failure modes:
+pickling up to 40 MB of body per parse, spawn cost on macOS and in the suite, a child that does not
+inherit the import-time pypdf caps under spawn, and extra resident memory on a runner.
+
+Measure before picking one. On the resolution-source route the figure already exists: `attempt.wall_s`
+is stamped around exactly the `to_thread` parse and digest (`research/resolution_source.py:1713-1723`,
+deliberately excluding the queue wait) and rides the registered `RESOLUTION_SOURCE_ESCALATION`
+marker, whose `rung` domain includes `pdf_local`, so the fall season's archive answers how often a
+parse overruns `min(20, budget)` with no code change. Only gap-fill v2 lacks it:
+`AGENTIC_FETCH_LOCAL_DOC` carries url, method, chars, pages and passages and no elapsed figure
+(`scripts/telemetry/markers.py:416-418`, emitted at `research/agentic/local_document.py:254`), so
+appending an `elapsed_s=` field there is the additive marker change that closes the measurement
+gap. Two costs to price at the same time: bounding v2's currently-bare acquire hands the document
+to the PAID Gemini `url_context` reader on expiry, as that module's own comment at :164-167 says,
+so any v2 gate tightening is a cost-gate item; and nothing today records that a worker was
+abandoned at all, so the frequency of the whole failure is unmeasured.

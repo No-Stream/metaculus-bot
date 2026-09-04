@@ -733,7 +733,11 @@ DOCUMENT_TEXT_MAX_PAGES: int = 400  # ~2x the 220-page document behind the measu
 # single page can overrun it and no page is ever interrupted mid-parse (the extraction runs in a
 # thread that cannot be cancelled). What bounds one page is the decoded-bytes-per-stream cap set
 # at import in `research/document_text.py`, which turns a page whose content stream decompresses
-# past the cap into that page's `''` rather than an unbounded parse.
+# past the cap into that page's `''` rather than an unbounded parse. The clock also starts late:
+# `extract_pdf_text` reads the declared page count and walks the whole bookmark outline before
+# `_read_pages` computes any deadline, and this budget covers neither (measured ceiling about 16 s
+# for a body built to maximize both, so the real worst case is that prologue plus this budget plus
+# one page; FUTURE.md, "The PDF parse overruns `max_seconds`").
 DOCUMENT_TEXT_MAX_SECONDS: float = 20.0
 DOCUMENT_TEXT_PDF_MAX_BYTES: int = (
     40 * 1024 * 1024
