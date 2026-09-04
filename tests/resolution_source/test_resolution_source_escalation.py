@@ -1493,6 +1493,154 @@ class TestFastPath:
         assert [(a.rung, a.skipped_reason) for a in derived.rung_attempts] == [("derived_api", "")]
 
 
+class TestProviderLevelRungMarkers:
+    """Each new rung, driven through ``resolution_source_provider`` end to end.
+
+    The `_fetch_one`-seam tests above pin a rung's behaviour; none of them exercise the provider,
+    which is the only place the `RESOLUTION_SOURCE_FETCH` line's `route=`, the
+    `RESOLUTION_SOURCE_ESCALATION` line and the `details["counts"]` the rung's keys ride are all
+    produced together — and the only place the one-shared-`QuestionRungBudget`-per-question
+    wiring exists (dropping `shared=` in the provider would keep every seam test green while
+    turning the per-question Wayback cap into a per-URL one). One test per rung, in the style of
+    the meta_refresh / pdf_local pair in ``test_resolution_source_fetch.py``.
+
+    Fast-path declines (``TestFastPath``) and the Wayback capture-timestamp shape
+    (``TestWaybackRung``) are already covered; these do not repeat them.
+    """
+
+    async def test_the_rendered_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(
+            resolution_source,
+            "render_page",
+            _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), []),
+        )
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=rendered"
+        ]
+        assert re.fullmatch(
+            rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
+            r"from_status=js_wall rung=rendered outcome=success wall_s=\d+\.\d\d",
+            next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
+        )
+        counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
+        assert counts["rendered_attempts"] == 1
+
+    async def test_the_derived_api_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        harvested = RenderedPage(
+            url=_URL,
+            content_type="text/html",
+            html=_JS_SHELL.decode(),
+            json_responses=(HarvestedJson(url=_FEED_URL, body=b'{"series":[{"v":1}]}'),),
+        )
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(harvested, []))
+        session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            section = await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=derived_api"
+        ]
+        # Two escalation lines: the render fired (found the endpoint) and the derived-feed read
+        # produced the text, and only the second is the route.
+        escalations = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
+        assert [re.findall(r"rung=(\S+) outcome=(\S+)", m)[0] for m in escalations] == [
+            ("rendered", "js_wall"),
+            ("derived_api", "success"),
+        ]
+        counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
+        assert counts["derived_api_reads"] == 1
+        assert counts["rendered_attempts"] == 1
+        assert ROUTE_CAVEATS["derived_api"] in section
+
+    async def test_the_wayback_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
+        """The one rung whose per-question cap lives only at the provider seam: the shared budget
+        is built in ``fetch_resolution_sources``, so this is what pins that a second cited URL on
+        one question counts against the same cap rather than getting its own."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        # Real now, so the capture stays inside the age bound regardless of when the suite runs;
+        # the provider builds the request URL off its own `datetime.now(UTC)`, same year, so the
+        # prefix-keyed handler matches.
+        now = datetime.now(UTC)
+        captured = now - timedelta(days=2)
+        snapshot = _snapshot_url(_URL, captured=captured)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+                wayback_snapshot_url(_URL, now=now): FakeResponse(302, headers={"Location": snapshot}),
+                snapshot: FakeResponse(200, body=_prose_page(_RENDERED_PROSE), content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            section = await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=wayback"
+        ]
+        assert re.fullmatch(
+            rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
+            r"from_status=blocked rung=wayback outcome=success wall_s=\d+\.\d\d",
+            next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
+        )
+        counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
+        assert counts["wayback_attempts"] == 1
+        assert ROUTE_CAVEATS["wayback"] in section
+
+    async def test_the_url_context_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+
+        def _read(url, ask, **kwargs):
+            del url, ask, kwargs
+            return ("The page reports 12 major work stoppages.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
+
+        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
+        reset_robots_cache()
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
+                "https://tracker.example.com/robots.txt": FakeResponse(
+                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
+                ),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            section = await resolution_source_provider(is_benchmarking=False)(q)
+
+        # http=403: the paid read keeps the direct fetch's HTTP status (the host refused us),
+        # since a model-mediated read has no status of its own.
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=403 embeds=none route=url_context"
+        ]
+        assert re.fullmatch(
+            rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
+            r"from_status=blocked rung=url_context outcome=success wall_s=\d+\.\d\d",
+            next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
+        )
+        counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
+        assert counts["url_context_reads"] == 1
+        assert ROUTE_CAVEATS["url_context"] in section
+
+
 def _success(route: FetchRoute, url: str = _URL) -> FetchResult:
     return FetchResult(
         url=url, status="success", text="body text", http_status=200, content_type="text/html", route=route
