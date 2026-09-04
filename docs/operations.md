@@ -364,14 +364,31 @@ rung is a `url_context` read on this same key, gated by
 shares the reader (`research/url_context_reader.py`) and the model with v2's `read_document`, so
 turning it on adds token spend on the operator's personal key rather than a new billing
 relationship, and it draws no grounded queries because it retrieves a URL instead of searching.
-What it would cost is bounded by how often the free rungs fail: one read per cited URL that no
-free rung could read, and a free `Google-Extended` robots pre-check declines the hosts that would
-refuse Gemini anyway. There is no per-question cap on this rung the way there is on the Wayback
-one, and `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS` is the SDK retry count for a single read rather
-than a per-question budget, so a question citing several dead sources can pay several times
-inside the provider's wall. Flipping it on is the operator's cost decision (see
-`AGENTS.md` "Cost discipline"), and its spend is separable in the archive by the `GEMINI_USAGE`
-role `resolution_source`.
+What it would cost is bounded twice over. First by how often the free rungs fail, since a read
+happens only for a cited URL no free rung could read and the free `Google-Extended` robots
+pre-check declines the hosts that would refuse Gemini anyway. Second by a per-question cap:
+`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` allows at most two paid reads per question across all
+of its cited URLs, the analogue of the Wayback per-question cap. The cap slot is claimed LAST of
+all the gates, so a read the wall budget or the robots pre-check declined spends no slot, and a
+read the cap itself declines is recorded as a `url_context_cap` skip. That is a different quantity
+from `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`, which is the SDK retry count for one read.
+
+One change on 2026-09-03 widened the population that reaches this rung, and it is worth knowing
+before the flag is flipped. The extractor policy now withholds a page whose extraction clears the
+400-character chrome floor on short lines alone, and that withhold is `no_resolving_content` with
+reason `thin_page`, which is one of the paid rung's trigger statuses. On the calibration corpus
+(`scratch/fetch_ladder_2026-09-03/chrome_calibration.md`) that is 9 of the 59 labelled bodies, 6
+chrome and 3 ambiguous, which the previous default-only extraction published, against a census of
+68 cited successes; each of them reaches the paid rung only when the free rendered rung fails to
+rescue it first. The sharper consequence is crowd-out rather than volume: with two paid reads per
+question, these new candidates can take both slots ahead of the `blocked` pages whose Google-egress
+advantage is the rung's whole reason to exist. If that ordering matters once the flag is on, the
+honest fix is to prefer `blocked` and `error` over `thin_page` when the cap binds, not to drop the
+population, because the withhold came from our own extractor's output rather than from the page and
+Gemini reading the same URL is a different extractor.
+
+Flipping it on is the operator's cost decision (see `AGENTS.md` "Cost discipline"), and its spend
+is separable in the archive by the `GEMINI_USAGE` role `resolution_source`.
 
 Model prices, read from ai.google.dev on 2026-09-03: the two live native surfaces —
 grounded search and gap-fill v2's `read_document` — run `gemini-3.8-flash` since
@@ -431,7 +448,7 @@ other than the live page: `RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS` (an archived 
 than this is withheld as `stale_data` rather than served, matching the Datawrapper freshness
 bound), `RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS` (snapshot fetches per question, since every
 snapshot contends on one host gate) and `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS` (the SDK retry
-count for one paid read, deliberately fewer than gap-fill v2 allows its reader). Two more bound
+count for one paid read, deliberately fewer than gap-fill v2 allows its reader). One more bounds
 the paid rung's spend per question: `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` caps how many
 paid reads one question may pay for across its cited URLs (the analogue of the Wayback cap, a
 distinct quantity from the SDK retry count above, recorded as a `url_context_cap` skip when it
@@ -1307,10 +1324,14 @@ the telemetry markers:
   failure diagnostics on a non-success fetch, so the archive can separate an egress-reputation
   refusal from a host fault (the archived Akamai 403s reproduce only from the GitHub runner
   IP): `failure_class` is a small token vocabulary (`http_403`, `http_4xx`, `http_5xx` off the
-  response, or `tls`, `dns`, `timeout`, `connection`, `decode` off the transport exception),
-  `exc` is that exception's class name, and `server` is the `Server` response header
-  lower-cased with internal spaces collapsed to `_` (the strongest tell of which CDN refused
-  us). All optional fields are keyed and sit at the end of the line in a fixed order
+  response, or `tls`, `dns`, `timeout`, `connection`, `decode`, `malformed_response` off the
+  transport exception), `exc` is that exception's class name, and `server` is the `Server`
+  response header lower-cased with internal spaces collapsed to `_` (the strongest tell of which
+  CDN refused us). `malformed_response` is the one our own client raised rather than the host:
+  aiohttp reports a body whose `Content-Encoding` it cannot decode as a 400 `ClientResponseError`,
+  which is a response we refused, and it used to fall into the catch-all `connection` bucket
+  alongside genuine connect failures. All optional fields are keyed and sit at the end of the
+  line in a fixed order
   (`reason`, `route`, `failure_class`, `exc`, `server`), so a line carrying a later field but
   not an earlier one parses correctly and every archived line still parses byte-identically.
   Tier-2 Datawrapper dataset hops ride the same line and are identifiable by their url
