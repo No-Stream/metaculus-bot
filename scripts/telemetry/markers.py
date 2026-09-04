@@ -116,15 +116,17 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   sibling ``RESOLUTION_SOURCE_FETCH`` records the FINAL outcome per URL and so is
   silent on the path taken to it, which is what decides whether a rung earns its
   latency)
-* ``GEMINI_USAGE`` — ``metaculus_bot/research/gemini_search.py`` and
-  ``metaculus_bot/research/agentic/tool_backends.py`` (per-CALL google-genai token
-  and grounded-query accounting for both Gemini surfaces: grounded search and
-  gap-fill v2's ``read_document``. Neither bills through OpenRouter, so neither
+* ``GEMINI_USAGE`` — ``metaculus_bot/research/gemini_search.py``,
+  ``metaculus_bot/research/agentic/tool_backends.py`` and
+  ``metaculus_bot/research/resolution_source.py`` (per-CALL google-genai token
+  and grounded-query accounting for all three Gemini surfaces: grounded search,
+  gap-fill v2's ``read_document``, and the resolution-source ladder's paid
+  ``url_context`` rung. None bills through OpenRouter, so none
   appears in ``CREDIT_ROLE_SPEND`` — before this marker the Google AI Studio side of
   a run's spend was unmeasurable from the archive, and the monthly grounded-prompt
   allowance is what a feature multiplying grounded calls eats. ``role`` is the
-  surface; the ``question=`` ref is optional because ``read_document`` runs below the
-  loop's log prefix with no question in scope)
+  surface; the ``question=`` ref is optional because ``read_document`` and the
+  resolution-source rung both run with no question in scope)
 * ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
   ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
   whether it counted toward the exit code)
@@ -1186,14 +1188,18 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "gemini_usage",
-        # Per-CALL google-genai accounting for BOTH Gemini surfaces: grounded search
-        # (research/gemini_search.py) and gap-fill v2's read_document
-        # (research/agentic/tool_backends.py). Neither routes through OpenRouter, so neither
+        # Per-CALL google-genai accounting for ALL THREE Gemini surfaces: grounded search
+        # (research/gemini_search.py, role ``grounded_search``), gap-fill v2's read_document
+        # (research/agentic/tool_backends.py, role ``read_document``) and the resolution-source
+        # ladder's paid url_context rung (research/resolution_source.py, role
+        # ``resolution_source``, which cannot emit at all while
+        # RESOLUTION_SOURCE_URL_CONTEXT_ENABLED is off, as it is in every workflow). None routes
+        # through OpenRouter, so none
         # shows up in CREDIT_ROLE_SPEND and the whole Google AI Studio side of a run's spend
         # was unmeasurable from the archive — which matters because grounding is metered
         # against a monthly grounded-prompt allowance per project, billed per QUERY on
         # overage, and any feature that multiplies grounded calls re-eats that pool (the
-        # spring-2026 billing arc). ``role`` names the surface, so the two are separable
+        # spring-2026 billing arc). ``role`` names the surface, so they are separable
         # without keying on the model.
         #
         # Every token field can read ``n/a``: the SDK's usage_metadata fields are individually
@@ -1202,9 +1208,10 @@ MARKER_SPECS: list[MarkerSpec] = [
         # ``search_queries`` is the grounded-query count (the billable unit on overage). On the
         # read_document surface it reads a genuine ``0``, NOT ``n/a``: the SDK omits
         # ``web_search_queries`` when the search tool issued none, and an absent list IS a count
-        # of none, which is the honest reading for a url_context-only read. It reads ``n/a`` only
+        # of none, which is the honest reading for a url_context-only read. The resolution-source
+        # rung reads it the same way, being url_context-only too. It reads ``n/a`` only
         # when the grounding metadata could not be walked at all. So a spend query filters the
-        # two surfaces on ``role``, never on 0-versus-n/a in this field.
+        # surfaces on ``role``, never on 0-versus-n/a in this field.
         #
         # The ledger covers COMPLETED responses only. ``log_gemini_usage`` runs after the SDK
         # returns, so a Gemini call that timed out or raised billed unknown tokens and emitted no
@@ -1216,8 +1223,9 @@ MARKER_SPECS: list[MarkerSpec] = [
         # ``question`` is OPTIONAL and last: the grounded-search call site has the question in
         # scope and passes ``question.id_of_question`` (hence ``qid_kind``, matching its
         # ``gemini_grounding_density`` sibling), while read_document runs as a per-URL tool
-        # below the loop's log prefix with no question at all. A keyed tail group is what lets
-        # one spec serve both without recording None for a field that WAS emitted.
+        # below the loop's log prefix with no question at all, and the resolution-source rung
+        # runs per cited URL inside its provider with none either. A keyed tail group is what
+        # lets one spec serve all three without recording None for a field that WAS emitted.
         re.compile(
             r"GEMINI_USAGE:\s*role=(?P<role>\S+)\s+model=(?P<model>\S+)"
             r"\s+prompt_tokens=(?P<prompt_tokens>\S+)"
