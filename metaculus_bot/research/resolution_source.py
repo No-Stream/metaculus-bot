@@ -825,6 +825,18 @@ class QuestionRungBudget:
         return semaphore_for_host(url, self.browser_escalation_gates)
 
 
+# The human phrase each rung's wall-budget skip logs, keyed by route so the one message template
+# in `FetchContext.claim_rung_budget` reads the same as the six hand-copied lines it replaced.
+_RUNG_WALL_SKIP_PHRASE: dict[FetchRoute, str] = {
+    "meta_refresh": "the meta-refresh hop",
+    "pdf_local": "the local PDF read",
+    "derived_api": "the derived-feed GET",
+    "rendered": "the rendered rung",
+    "wayback": "the wayback rung",
+    "url_context": "the url_context rung",
+}
+
+
 @dataclass
 class FetchContext:
     """Per-URL inputs and rung bookkeeping for one :func:`_fetch_one` call.
@@ -866,6 +878,32 @@ class FetchContext:
         whole question's resolution evidence rather than just its own attempt.
         """
         return RESOLUTION_SOURCE_WALL_TIMEOUT - (time.monotonic() - self.started) - RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+
+    def claim_rung_budget(
+        self, rung: FetchRoute, from_status: FetchStatus, url: str, floor_s: float, *, note: str = ""
+    ) -> float | None:
+        """The remaining wall budget for ``rung``, or None once it has recorded the skip.
+
+        The one home for the wall-budget preamble every rung copied: read the remaining wall,
+        and below the rung's own floor log once, record a ``wall_budget`` skip on this context and
+        return None; otherwise hand back the budget the rung sizes its work off. Structural rather
+        than stylistic — an incomplete copy still returned None and simply never appeared in the
+        ``rung_budget_skips`` count, so the archive under-reported how often the wall is the
+        binding constraint. ``note`` is the one place the message varies (the paid rung's second
+        check adds " after the robots pre-check", the PDF read's re-check " after queueing").
+        """
+        budget_s = self.rung_budget_s()
+        if budget_s < floor_s:
+            logger.warning(
+                "resolution_source: skipping %s for %s — %.1fs of wall budget left%s",
+                _RUNG_WALL_SKIP_PHRASE[rung],
+                urlparse(url).netloc,
+                budget_s,
+                note,
+            )
+            self.skip_rung(rung, from_status, url, "wall_budget")
+            return None
+        return budget_s
 
     def start_rung(self, rung: FetchRoute, from_status: FetchStatus, url: str) -> RungAttempt:
         attempt = RungAttempt(rung=rung, from_status=from_status, url=url, started_at=time.monotonic())
@@ -1172,14 +1210,10 @@ async def _meta_refresh_hop(
     target = meta_refresh_target(html_text)
     if target is None:
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the meta-refresh hop for %s — %.1fs of wall budget left",
-            urlparse(current_url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("meta_refresh", from_status, current_url, "wall_budget")
+    if (
+        ctx.claim_rung_budget("meta_refresh", from_status, current_url, RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S)
+        is None
+    ):
         return None
     ctx.start_rung("meta_refresh", from_status, current_url)
     logger.info(
@@ -1508,16 +1542,9 @@ async def _resolution_pdf_outcome(
         content_type=content_type,
         from_status=from_status,
     )
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
-        # Checked here, before the response context closes, so a question with no budget
-        # left never even queues for a parse slot it would have to give back.
-        logger.warning(
-            "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left",
-            netloc,
-            budget_s,
-        )
-        ctx.skip_rung("pdf_local", from_status, current_url, "wall_budget")
+    # Checked here, before the response context closes, so a question with no budget left never
+    # even queues for a parse slot it would have to give back.
+    if ctx.claim_rung_budget("pdf_local", from_status, current_url, RESOLUTION_SOURCE_PDF_MIN_BUDGET_S) is None:
         return _document_not_parsed(pending, "budget_skipped")
     return pending
 
@@ -1562,14 +1589,10 @@ async def _finish_document(pending: _PendingDocument, ctx: FetchContext) -> Fetc
     try:
         # Re-read after the wait: the queue itself consumed budget, and `max_seconds` is
         # wall-clock, so a stale figure would hand pypdf a bound that already expired.
-        budget_s = ctx.rung_budget_s()
-        if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
-            logger.warning(
-                "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left after queueing",
-                netloc,
-                budget_s,
-            )
-            ctx.skip_rung("pdf_local", pending.from_status, pending.url, "wall_budget")
+        budget_s = ctx.claim_rung_budget(
+            "pdf_local", pending.from_status, pending.url, RESOLUTION_SOURCE_PDF_MIN_BUDGET_S, note=" after queueing"
+        )
+        if budget_s is None:
             return _document_not_parsed(pending, "budget_skipped")
         attempt = ctx.start_rung("pdf_local", pending.from_status, pending.url)
         pdf, digest = await asyncio.to_thread(
@@ -1807,14 +1830,8 @@ async def _rendered_rung(
     if rendered_to_nothing(url, memo_scope=_RENDER_MEMO_SCOPE):
         ctx.skip_rung("rendered", direct.status, url, "rendered_no_text")
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the rendered rung for %s — %.1fs of wall budget left",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("rendered", direct.status, url, "wall_budget")
+    budget_s = ctx.claim_rung_budget("rendered", direct.status, url, RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S)
+    if budget_s is None:
         return None
     attempt = ctx.start_rung("rendered", direct.status, url)
     goto_timeout_ms = int(min(RENDER_TIMEOUT_MS, budget_s * 1000) - RENDER_SETTLE_MS)
@@ -1954,14 +1971,7 @@ async def _derived_api_rung(
     endpoint = derived_api.endpoint_for(url)
     if endpoint is None:
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the derived-feed GET for %s — %.1fs of wall budget left",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("derived_api", direct.status, url, "wall_budget")
+    if ctx.claim_rung_budget("derived_api", direct.status, url, RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S) is None:
         return None
     ctx.start_rung("derived_api", direct.status, url)
     logger.info(
@@ -2086,14 +2096,7 @@ async def _wayback_rung(
     """
     if direct.status not in _WAYBACK_TRIGGER_STATUSES:
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the wayback rung for %s — %.1fs of wall budget left",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("wayback", direct.status, url, "wall_budget")
+    if ctx.claim_rung_budget("wayback", direct.status, url, RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S) is None:
         return None
     if not ctx.shared.take_wayback_attempt():
         logger.warning(
@@ -2236,27 +2239,20 @@ async def _url_context_admission(
         )
         ctx.skip_rung("url_context", direct.status, url, "no_api_key")
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the url_context rung for %s — %.1fs of wall budget left",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("url_context", direct.status, url, "wall_budget")
+    if ctx.claim_rung_budget("url_context", direct.status, url, RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S) is None:
         return None
     if await _url_context_robots_skip(session, url, host_sems, ctx):
         logger.info(f"RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url={url} host={urlparse(url).netloc}")
         ctx.skip_rung("url_context", direct.status, url, "robots_disallowed")
         return None
-    budget_s = ctx.rung_budget_s()
-    if budget_s < RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S:
-        logger.warning(
-            "resolution_source: skipping the url_context rung for %s — %.1fs of wall budget left after the robots pre-check",
-            urlparse(url).netloc,
-            budget_s,
-        )
-        ctx.skip_rung("url_context", direct.status, url, "wall_budget")
+    budget_s = ctx.claim_rung_budget(
+        "url_context",
+        direct.status,
+        url,
+        RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
+        note=" after the robots pre-check",
+    )
+    if budget_s is None:
         return None
     return api_key, budget_s
 
