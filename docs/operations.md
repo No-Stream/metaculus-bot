@@ -380,9 +380,10 @@ reason `thin_page`, which is one of the paid rung's trigger statuses. On the cal
 (`scratch/fetch_ladder_2026-09-03/chrome_calibration.md`) that is 9 of the 59 labelled bodies, 6
 chrome and 3 ambiguous, which the previous default-only extraction published, against a census of
 68 cited successes; each of them reaches the paid rung only when the free rendered rung fails to
-rescue it first. The sharper consequence is crowd-out rather than volume: with two paid reads per
-question, these new candidates can take both slots ahead of the `blocked` pages whose Google-egress
-advantage is the rung's whole reason to exist. If that ordering matters once the flag is on, the
+rescue it first. The sharper consequence is crowd-out rather than volume: the two slots go to
+whichever of a question's concurrently fetched URLs reaches the gate first, so these new candidates
+can take both of them ahead of the `blocked` pages whose Google-egress advantage is the rung's whole
+reason to exist. If that ordering matters once the flag is on, the
 honest fix is to prefer `blocked` and `error` over `thin_page` when the cap binds, not to drop the
 population, because the withhold came from our own extractor's output rather than from the page and
 Gemini reading the same URL is a different extractor.

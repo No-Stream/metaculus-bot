@@ -1087,9 +1087,10 @@ a read the cap declines records a `url_context_cap` skip. Two facts about the tr
 belong with that cap. The `no_resolving_content` trigger now includes the extractor policy's
 chrome-metric withholds (reason `thin_page`), so a page whose default extraction was navigation and
 whose precision fallback failed the same line-shape metric is a paid-read candidate rather than a
-page we gave up on. And because the cap is two reads claimed in citation order, those candidates can
-take both slots ahead of a `blocked` page, whose Google-egress advantage is the rung's whole reason
-to exist. `docs/operations.md` prices both against the calibration census, which is what the
+page we gave up on. And because the cap is two reads with no ordering over the candidates, claimed
+by whichever of the question's concurrently fetched URLs reaches the gate first, those candidates
+can take both slots ahead of a `blocked` page, whose Google-egress advantage is the rung's whole
+reason to exist. `docs/operations.md` prices both against the calibration census, which is what the
 operator reads before flipping the flag. Zero successful retrievals
 DISCARDS the text under the new terminal status `ungrounded`, the same floor `gemini_search` and
 v2's `read_document` apply: Gemini answers fluently out of parametric memory when every
