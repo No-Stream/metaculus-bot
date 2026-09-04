@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import re
 from datetime import UTC, datetime
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -40,7 +39,7 @@ import aiohttp
 from metaculus_bot.constants import RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
 from metaculus_bot.research.http_fetch import read_body_capped
 from metaculus_bot.research.resolution_source import _get_session, is_public_http_url
-from metaculus_bot.research.wayback import wayback_snapshot_url
+from metaculus_bot.research.wayback import parse_snapshot_url, snapshot_age_days, wayback_snapshot_url
 
 _HOST_SPACING_S = 1.0
 # The Server header is the informative part of a row's note ("AkamaiGHost",
@@ -50,8 +49,6 @@ _HOST_SPACING_S = 1.0
 _SERVER_HEADER_MAX_CHARS = 20
 _IMPERSONATE_TIMEOUT_S = 25.0
 _EGRESS_IP_URL = "https://api.ipify.org"
-
-_WAYBACK_TIMESTAMP_RE = re.compile(r"/web/(\d{14})")
 
 
 class ProbeUrl(NamedTuple):
@@ -163,9 +160,10 @@ async def probe_bot_client(session: aiohttp.ClientSession, url: str) -> ProbeOut
 def probe_impersonated(url: str) -> ProbeOutcome:
     """Probe B: the same GET with a real Chrome TLS/HTTP2 fingerprint."""
     try:
-        # Genuinely optional dependency: curl_cffi is not declared in pyproject
-        # (it arrives transitively via yfinance, and the workflow supplies it with
-        # `uv run --with curl_cffi`), so this rung has to degrade rather than crash.
+        # Genuinely optional dependency: curl_cffi is declared only in pyproject's dev group
+        # (for tests/conftest.py's egress guard), and this probe's workflow syncs `--no-dev`
+        # and supplies it with `uv run --with curl_cffi`, so this rung has to degrade rather
+        # than crash when it is absent.
         from curl_cffi import requests as curl_requests  # noqa: PLC0415
     except ImportError:
         return ProbeOutcome(None, 0, "curl_cffi absent")
@@ -181,7 +179,8 @@ def probe_wayback(url: str) -> ProbeOutcome:
     """Probe C: the Wayback Machine copy, reported with its snapshot age.
 
     The request URL comes from the rung's own ``wayback_snapshot_url`` rather than a template
-    here, so what the probe measures cannot drift from what production asks the archive for.
+    here, so what the probe measures cannot drift from what production asks the archive for; the
+    stamp and age in the note are read back through the rung's own parser too (``_snapshot_note``).
     """
     try:
         from curl_cffi import requests as curl_requests  # noqa: PLC0415  # optional, see probe_impersonated
@@ -198,14 +197,26 @@ def probe_wayback(url: str) -> ProbeOutcome:
 
 
 def _snapshot_note(final_url: str) -> str:
-    """Render the snapshot stamp Wayback redirected to, plus its age in days."""
-    match = _WAYBACK_TIMESTAMP_RE.search(final_url or "")
-    if match is None:
+    """Render the capture stamp Wayback redirected to, plus its age in days, as the rung reads them.
+
+    Both the parse and the age rule are production's — ``parse_snapshot_url`` and
+    ``snapshot_age_days`` in ``metaculus_bot/research/wayback.py`` — rather than a regex kept
+    here, so a stamp this probe reports as usable is one the rung would accept. The two ways a
+    local copy drifted: an unanchored ``/web/(\\d{14})`` search could lift a stamp out of a nested
+    or unrelated URL that the rung, anchored on the archive's own host, would refuse; and a plain
+    ``now - stamp`` reported a capture dated in the FUTURE as the freshest possible copy, where the
+    rung's clock-skew rule (``RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE``) treats it as a broken
+    clock or a misparse and refuses it. That case gets its own note so the operator can tell it
+    from a fresh capture.
+    """
+    snapshot = parse_snapshot_url(final_url)
+    if snapshot is None:
         return "no snapshot stamp"
-    stamp = match.group(1)
-    snapshot_at = datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=UTC)
-    age_days = (datetime.now(UTC) - snapshot_at).days
-    return f"{stamp} ({age_days}d old)"
+    stamp = f"{snapshot.captured_at:%Y%m%d%H%M%S}"
+    age_days = snapshot_age_days(snapshot, datetime.now(UTC))
+    if age_days is None:
+        return f"{stamp} (future-dated; the rung would refuse it)"
+    return f"{stamp} ({int(age_days)}d old)"
 
 
 class ProbeRow(NamedTuple):

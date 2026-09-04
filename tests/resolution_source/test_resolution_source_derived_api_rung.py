@@ -21,6 +21,7 @@ from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
     _fake_render,
+    _meta_refresh_stub,
     _mock_question,
     _prose_page,
 )
@@ -180,6 +181,47 @@ class TestDerivedApiRung:
         assert second.route == "derived_api"
         assert "session has expired" not in second.text
         assert second.text.startswith("[This page's own HTML carried no readable content.")
+
+    async def test_a_remembered_endpoint_that_redirects_keeps_its_hops_off_the_pages_record(self, monkeypatch):
+        """The feed GET is a request made on the CITED URL's behalf, so the rungs inside it belong
+        to the feed and not to the page.
+
+        `_fetch_direct` follows a meta-refresh stub for up to `MAX_REDIRECTS` hops and stamps a
+        `meta_refresh` attempt per hop onto whatever context it is handed. Handed the PAGE's
+        context, a remembered endpoint answering the session-expired-portal shape pushes hops
+        onto a page that never redirected: `meta_refresh_hops` climbs off zero and `route` lands
+        on the hop rather than on the rung that answered. The child context `_aux_ctx` builds is
+        what keeps the page's own record to the rungs the page itself earned."""
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))
+        second_url = "https://tracker.example.com/house"
+        login_url = "https://tracker.example.com/login"
+        session = FakeSession(
+            {
+                _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                second_url: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                _FEED_URL: FakeResponse(200, body=_meta_refresh_stub(login_url), content_type="text/html"),
+                login_url: FakeResponse(
+                    200, body=_prose_page("Your session has expired. " * 30), content_type="text/html"
+                ),
+            }
+        )
+
+        await _fetch_one(session, _URL, {})
+        second = await _fetch_one(session, second_url, {})
+
+        # The hop DID happen, on the feed's behalf: without this the assertions below would also
+        # hold for a fixture that never redirected at all.
+        assert login_url in session.requested
+        # The feed's own rungs, and only the page's: the reused endpoint declined (the portal is
+        # not JSON), the browser ran, and its harvest served the feed.
+        assert [(a.rung, a.skipped_reason) for a in second.rung_attempts] == [
+            ("derived_api", ""),
+            ("rendered", ""),
+            ("derived_api", ""),
+        ]
+        assert _rung_counts([second])["meta_refresh_hops"] == 0
+        assert second.route == "derived_api"
 
     async def test_the_derived_get_is_skipped_below_its_floor(self, monkeypatch):
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), []))

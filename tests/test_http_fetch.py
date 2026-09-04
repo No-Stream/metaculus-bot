@@ -3,9 +3,10 @@
 Covers:
 - `BROWSER_HEADERS` completeness (Safari-like UA + Accept / Accept-Language / Accept-Encoding)
 - `build_session` config plumbing (ClientTimeout total+sock_read, TCPConnector limit, headers, resolver)
-- `Content-Encoding` decoding of a body we never advertised (brotli, zstd), against a loopback
-  server, because the Wayback rung's `id_` replay carries the origin's encoding regardless of
-  what we asked for
+- `Content-Encoding` decoding of a body a BROWSER_HEADERS session never advertised (brotli,
+  zstd), against a loopback server, because the Wayback rung's `id_` replay carries the
+  origin's encoding regardless of what we asked for; and the counterpart, that a session built
+  with `headers=None` inherits aiohttp's default `Accept-Encoding`, which DOES advertise both
 - `read_body_capped` under/at/over the byte cap (over -> None + WARNING), including
   multi-chunk streaming and mid-stream abort without consuming the remaining stream
 - `FilteringResolver` filters private IPs, raises OSError when everything is filtered,
@@ -35,8 +36,9 @@ from typing import Any
 
 import certifi
 import pytest
-from aiohttp import web
+from aiohttp import hdrs, web
 from aiohttp.abc import AbstractResolver
+from aiohttp.client_reqrep import ClientRequest
 from aiohttp.compression_utils import HAS_BROTLI, HAS_ZSTD
 from aiohttp.test_utils import TestServer
 
@@ -254,6 +256,12 @@ class TestUnadvertisedContentEncoding:
     zstandard (zstd)`, the hop landed as `error` and the rung reported "no archived copy served"
     for a capture the archive had served in full. Both decoders are declared dependencies so the
     replay decodes instead of being lost.
+
+    "Never advertised" is a property of the BROWSER_HEADERS session, whose explicit `gzip, deflate`
+    is what keeps the encoding unasked-for; a session built with `headers=None` (the
+    prediction-market JSON-API providers) inherits aiohttp's own default `Accept-Encoding`, which
+    advertises `br` and `zstd` as soon as both decoders are importable, and the last test here
+    pins that.
     """
 
     def test_both_decoders_are_available_to_aiohttp(self):
@@ -262,7 +270,7 @@ class TestUnadvertisedContentEncoding:
         assert HAS_BROTLI, "aiohttp has no brotli decoder — is `Brotli` still a dependency?"
         assert HAS_ZSTD, "aiohttp has no zstd decoder — is `backports.zstd` still a dependency?"
 
-    async def test_zstd_encoded_body_decodes(self):
+    async def test_browser_headers_session_decodes_zstd_it_never_advertised(self):
         async with (
             _encoded_body_server(_zstd_compress(_REPLAYED_PAGE.encode()), "zstd") as (url, accept_encodings),
             build_session(timeout_s=5.0, headers=BROWSER_HEADERS) as session,
@@ -271,9 +279,9 @@ class TestUnadvertisedContentEncoding:
             assert resp.status == 200
             assert await resp.text() == _REPLAYED_PAGE
 
-        assert "zstd" not in accept_encodings[0], "the point is that we never asked for zstd"
+        assert "zstd" not in accept_encodings[0], "the point is that BROWSER_HEADERS never asked for zstd"
 
-    async def test_brotli_encoded_body_decodes(self):
+    async def test_browser_headers_session_decodes_brotli_it_never_advertised(self):
         import brotli
 
         async with (
@@ -284,7 +292,31 @@ class TestUnadvertisedContentEncoding:
             assert resp.status == 200
             assert await resp.text() == _REPLAYED_PAGE
 
-        assert "br" not in accept_encodings[0], "the point is that we never asked for brotli"
+        assert "br" not in accept_encodings[0], "the point is that BROWSER_HEADERS never asked for brotli"
+
+    async def test_default_headers_session_advertises_br_and_zstd(self):
+        """A session built WITHOUT explicit headers advertises the installed decoders on the wire.
+
+        aiohttp fills in its own `Accept-Encoding` when the caller sets none, and
+        `_gen_default_accept_encoding()` appends `br` and `zstd` whenever the decoders import, so
+        this is the header the prediction-market fetches really send. Two assertions on purpose:
+        the wire value equals aiohttp's `DEFAULT_HEADERS` entry, which proves the widening is
+        aiohttp's automatic header and not something of ours; and `br` / `zstd` are each present
+        as tokens, which is the part that fails if either decoder dependency is dropped or aiohttp
+        stops advertising them — the derived comparison alone would follow aiohttp down.
+        """
+        async with (
+            _encoded_body_server(_zstd_compress(_REPLAYED_PAGE.encode()), "zstd") as (url, accept_encodings),
+            build_session(timeout_s=5.0, headers=None) as session,
+            session.get(url) as resp,
+        ):
+            assert resp.status == 200
+            assert await resp.text() == _REPLAYED_PAGE
+
+        assert accept_encodings[0] == ClientRequest.DEFAULT_HEADERS[hdrs.ACCEPT_ENCODING]
+        advertised = [token.strip() for token in accept_encodings[0].split(",")]
+        assert "br" in advertised, f"aiohttp's automatic Accept-Encoding no longer advertises brotli: {advertised}"
+        assert "zstd" in advertised, f"aiohttp's automatic Accept-Encoding no longer advertises zstd: {advertised}"
 
 
 class TestReadBodyCapped:

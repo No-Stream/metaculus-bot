@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 
 from metaculus_bot.constants import (
     RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
@@ -31,47 +30,11 @@ from metaculus_bot.constants import (
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
 from metaculus_bot.research.resolution_source import FetchContext, _fetch_one, _rung_counts
-from tests.resolution_source_fakes import FakeResponse, FakeSession
-
-_URL = "https://tracker.example.com/senate"
+from tests.resolution_source_fakes import _URL, arm_paid_rung, paid_reader, refused_page_with_robots
 
 # Comfortably above the rung's floor, so the read runs and the kwargs are observable. Chosen
 # distinct from every constant involved, so an assertion cannot pass by coincidence.
 _ROOMY_BUDGET_S = 20.0
-
-_ANSWER = "The table dated 2026-08-28 reports 12 major work stoppages beginning in 2026."
-
-
-def _reader(*, raises: type[BaseException] | None = None):
-    """A stand-in for ``run_url_context_read`` that records the kwargs the rung passes it."""
-    calls: list[dict[str, Any]] = []
-
-    def _read(url, ask, **kwargs):
-        calls.append({"url": url, "ask": ask, **kwargs})
-        if raises is not None:
-            raise raises("the client ceiling fired")
-        return (_ANSWER, 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
-
-    return _read, calls
-
-
-def _session() -> FakeSession:
-    """A refused page plus an allowing robots.txt: every gate open except the ones under test."""
-    return FakeSession(
-        {
-            _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
-            "https://tracker.example.com/robots.txt": FakeResponse(
-                200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
-            ),
-        }
-    )
-
-
-def _arm(monkeypatch, reader, *, budget_s: float) -> None:
-    monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
-    monkeypatch.setenv("GOOGLE_API_KEY", "key")
-    monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
-    monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: budget_s)
 
 
 class TestThePaidReadIsBoundedByTheRemainingWall:
@@ -81,10 +44,10 @@ class TestThePaidReadIsBoundedByTheRemainingWall:
         """The ceiling is the remaining budget less the margin the rung owes the outer wait, so
         the read returns its worker before the provider's own ``wait_for`` fires rather than
         after it — the margin is what makes "the rung returns first" true."""
-        reader, calls = _reader()
-        _arm(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
 
-        result = await _fetch_one(_session(), _URL, {}, FetchContext(query="How many stoppages?"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="How many stoppages?"))
 
         assert result.status == "success"
         assert calls[0]["attempts"] == RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS
@@ -107,11 +70,11 @@ class TestThePaidReadIsBoundedByTheRemainingWall:
             waits.append(timeout)
             return await real_wait_for(awaitable, timeout=timeout)
 
-        reader, _calls = _reader()
-        _arm(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
+        reader, _calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
         monkeypatch.setattr(resolution_source.asyncio, "wait_for", _recording_wait_for)
 
-        result = await _fetch_one(_session(), _URL, {}, FetchContext(query="ask"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert result.status == "success"
         assert _ROOMY_BUDGET_S in waits
@@ -126,16 +89,18 @@ class TestThePaidReadIsBoundedByTheRemainingWall:
         has to fit inside the wait.
 
         At the floor today: one attempt of 13 s inside a 15 s wait. Raising
-        ``RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`` to 2 makes it 13 + 1 + 13 s against the same
-        15 s, which is what this fails on rather than silently dispatching the second request.
+        ``RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`` to 2 makes it 13 + 2 + 13 s against the same
+        15 s (``gemini_retry_sleep_allowance_s(2)`` is 2.0 s, the one retry's worst-case backoff
+        including jitter), which is what this fails on rather than silently dispatching the second
+        request.
 
         The per-attempt ceiling is read back off the call rather than recomputed here, so the
         formula stays in one place and this test asserts the invariant instead of the spelling.
         """
-        reader, calls = _reader()
-        _arm(monkeypatch, reader, budget_s=RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S)
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader, budget_s=RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S)
 
-        await _fetch_one(_session(), _URL, {}, FetchContext(query="ask"))
+        await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         attempts = calls[0]["attempts"]
         per_attempt_timeout_ms = calls[0]["timeout_ms"]
@@ -159,11 +124,11 @@ class TestATimedOutReadPublishesNothing:
         time and the branch cannot tell the two apart — ``wait_for`` re-raises an inner
         ``TimeoutError`` unchanged.
         """
-        reader, calls = _reader(raises=TimeoutError)
-        _arm(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
+        reader, calls = paid_reader(raises=TimeoutError)
+        arm_paid_rung(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
-            result = await _fetch_one(_session(), _URL, {}, FetchContext(query="ask"))
+            result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
 
         assert len(calls) == 1
         assert result.status == "blocked"

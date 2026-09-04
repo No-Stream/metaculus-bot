@@ -8,6 +8,7 @@ import logging
 import re
 from datetime import UTC, datetime, timedelta
 
+from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
@@ -18,7 +19,6 @@ from metaculus_bot.research.resolution_source import (
     _fetch_one,
     resolution_source_provider,
 )
-from metaculus_bot.research.robots_policy import reset_robots_cache
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _FEED_URL,
@@ -33,6 +33,9 @@ from tests.resolution_source_fakes import (
     _prose_page,
     _rendered_document,
     _snapshot_url,
+    arm_paid_rung,
+    paid_reader,
+    refused_page_with_robots,
 )
 
 
@@ -186,27 +189,13 @@ class TestFastPath:
     async def test_the_paid_reader_declines_on_the_fast_path_only_when_it_was_armed(self, monkeypatch):
         """Recorded only when the rung would otherwise have been considered: with the flag off a
         fast-path skip would read as spend avoided on a rung that could never have fired."""
-        calls: list[dict[str, object]] = []
+        reader, calls = paid_reader()
+        session = refused_page_with_robots()
 
-        def _read(url, ask, **kwargs):
-            calls.append({"url": url, "ask": ask, **kwargs})
-            return ("text", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
-
-        monkeypatch.setenv("GOOGLE_API_KEY", "key")
-        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
-        reset_robots_cache()
-        session = FakeSession(
-            {
-                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
-                "https://tracker.example.com/robots.txt": FakeResponse(
-                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
-                ),
-            }
-        )
-
-        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
+        # Armed, then disarmed by dropping the flag alone, so the two runs differ in nothing else.
+        arm_paid_rung(monkeypatch, reader)
         armed = await _fetch_one(session, _URL, {}, FetchContext(query="ask", fast_path=True))
-        monkeypatch.delenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED")
+        monkeypatch.delenv(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV)
         unarmed = await _fetch_one(session, _URL, {}, FetchContext(query="ask", fast_path=True))
 
         assert calls == []
@@ -303,21 +292,40 @@ class TestProviderLevelRungMarkers:
             f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=derived_api"
         ]
         # Two escalation lines: the render fired (found the endpoint) and the derived-feed read
-        # produced the text, and only the second is the route.
+        # produced the text, and only the second is the route. Matched whole, like the sibling
+        # rungs' single-line assertions, because this is the one URL that emits two lines and
+        # `question`, `url`, `from_status` and `wall_s` went unpinned on both of them.
         escalations = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
-        assert [re.findall(r"rung=(\S+) outcome=(\S+)", m)[0] for m in escalations] == [
-            ("rendered", "js_wall"),
-            ("derived_api", "success"),
-        ]
+        assert len(escalations) == 2
+        assert re.fullmatch(
+            rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
+            r"from_status=js_wall rung=rendered outcome=js_wall wall_s=\d+\.\d\d",
+            escalations[0],
+        )
+        assert re.fullmatch(
+            rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
+            r"from_status=js_wall rung=derived_api outcome=success wall_s=\d+\.\d\d",
+            escalations[1],
+        )
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
         assert counts["derived_api_reads"] == 1
         assert counts["rendered_attempts"] == 1
         assert ROUTE_CAVEATS["derived_api"] in section
 
     async def test_the_wayback_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
-        """The one rung whose per-question cap lives only at the provider seam: the shared budget
-        is built in ``fetch_resolution_sources``, so this is what pins that a second cited URL on
-        one question counts against the same cap rather than getting its own."""
+        """One cited URL through the provider: ``route=wayback`` on the FETCH line, the escalation
+        line's ``from_status`` / ``outcome`` / ``wall_s``, ``counts["wayback_attempts"]``, and the
+        archived-copy caveat in the rendered section.
+
+        It says nothing about the per-question cap, which one URL cannot: the shared
+        ``QuestionRungBudget`` the provider builds is pinned by
+        ``test_two_same_host_urls_fetched_concurrently_share_one_launch``
+        (``test_resolution_source_derived_api_rung.py``), whose single-launch assertion rides that
+        budget's browser gate and goes red when ``shared=`` is dropped, and the cap arithmetic
+        itself by ``test_the_per_question_cap_binds_across_cited_urls``
+        (``test_resolution_source_wayback_rung.py``) and its paid-rung twin
+        ``test_the_per_question_paid_read_cap_binds_across_cited_urls``
+        (``test_resolution_source_url_context_rung.py``)."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
         # Real now, so the capture stays inside the age bound regardless of when the suite runs;
@@ -386,23 +394,9 @@ class TestProviderLevelRungMarkers:
 
     async def test_the_url_context_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
-        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
-        monkeypatch.setenv("GOOGLE_API_KEY", "key")
-
-        def _read(url, ask, **kwargs):
-            del url, ask, kwargs
-            return ("The page reports 12 major work stoppages.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
-
-        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
-        reset_robots_cache()
-        session = FakeSession(
-            {
-                _URL: FakeResponse(403, body=b"denied", content_type="text/html"),
-                "https://tracker.example.com/robots.txt": FakeResponse(
-                    200, body=b"User-agent: *\nAllow: /\n", content_type="text/plain"
-                ),
-            }
-        )
+        reader, _calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
+        session = refused_page_with_robots()
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 

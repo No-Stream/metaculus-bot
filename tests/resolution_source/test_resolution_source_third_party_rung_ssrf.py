@@ -34,7 +34,7 @@ from metaculus_bot.research.resolution_source import (
     FetchContext,
     _fetch_one,
 )
-from tests.resolution_source_fakes import FakeResponse, FakeSession, _prose_page
+from tests.resolution_source_fakes import FakeResponse, FakeSession, _prose_page, arm_paid_rung, paid_reader
 
 _NOW = datetime(2026, 9, 4, tzinfo=UTC)
 
@@ -122,16 +122,13 @@ class TestThePaidReaderNeverSeesAUrlWeRefused:
 
     @pytest.fixture
     def armed_reader(self, monkeypatch) -> list[dict[str, object]]:
-        """Flag on, key present, reader faked. Returns the call log the assertion reads."""
-        reads: list[dict[str, object]] = []
+        """Flag on, key present, reader faked. Returns the call log the assertion reads.
 
-        def _read(url, ask, **kwargs):
-            reads.append({"url": url, "ask": ask, **kwargs})
-            return ("Whatever the model would have said.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
-
-        monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
-        monkeypatch.setenv("GOOGLE_API_KEY", "key")
-        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
+        Shared arming (``tests/resolution_source_fakes.py``), so "armed" means here exactly what
+        it means in the three other modules that drive this rung.
+        """
+        reader, reads = paid_reader(text="Whatever the model would have said.")
+        arm_paid_rung(monkeypatch, reader)
         return reads
 
     @pytest.mark.parametrize("url", _REFUSED_URLS)

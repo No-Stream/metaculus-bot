@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-08-28T03:01:43.444948Z"
+exclude-newer = "2026-08-28T16:12:43.025602Z"
 exclude-newer-span = "P1W"
 
 [manifest]
@@ -2578,6 +2578,7 @@ dependencies = [
 dev = [
     { name = "arviz" },
     { name = "basedpyright" },
+    { name = "curl-cffi" },
     { name = "deptry" },
     { name = "h5netcdf" },
     { name = "h5py" },
@@ -2635,6 +2636,7 @@ requires-dist = [
 dev = [
     { name = "arviz", specifier = ">=1.2.0" },
     { name = "basedpyright", specifier = ">=1.25" },
+    { name = "curl-cffi", specifier = ">=0.15.0" },
     { name = "deptry", specifier = ">=0.25.1" },
     { name = "h5netcdf", specifier = ">=1.8.1" },
     { name = "h5py", specifier = ">=3.16.0" },

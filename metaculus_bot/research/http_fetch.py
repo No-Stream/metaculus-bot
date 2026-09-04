@@ -122,11 +122,18 @@ BROWSER_HEADERS: dict[str, str] = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    # The pair the measurement above was taken with, kept as measured. `br` and `zstd` became
+    # The pair the measurement above was taken with, pinned as measured for the resolution-source
+    # fetcher: widening what THIS header set asks for would change the negotiation on every fetch
+    # the 38/50 figure covers, and no measurement covers the wider set. `br` and `zstd` became
     # DECODABLE when both decoders were declared in pyproject — needed for a body we never
     # negotiate at all, the Wayback rung's `id_` replay, which carries whatever encoding the
-    # origin sent the archive's crawler — but widening what we ASK for changes every live
-    # fetch's negotiation and no measurement covers it.
+    # origin sent the archive's crawler. Pinning here does NOT mean nothing we send asks for
+    # them: a session built without explicit headers (`build_session(headers=None)`, which is
+    # what the prediction-market JSON-API providers use) inherits aiohttp's own default
+    # `Accept-Encoding`, and `_gen_default_accept_encoding()` widens that to
+    # `gzip, deflate, br, zstd` the moment both decoders are importable (aiohttp 3.14.3,
+    # measured 2026-09-04). Both facts are pinned by
+    # tests/test_http_fetch.py::TestUnadvertisedContentEncoding.
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -141,7 +148,10 @@ def build_session(
     """Construct a fresh aiohttp session with total + sock_read timeouts and a connection cap.
 
     ``headers=None`` (the default) adds no session-level headers — prediction_market's
-    JSON-API calls rely on that; the resolution-source fetcher passes BROWSER_HEADERS.
+    JSON-API calls rely on that; the resolution-source fetcher passes BROWSER_HEADERS. "No
+    session-level headers" is not "no headers": each request then carries aiohttp's own
+    defaults, whose ``Accept-Encoding`` advertises ``br`` and ``zstd`` as well as the
+    ``gzip, deflate`` pair now that both decoders are installed (see ``BROWSER_HEADERS``).
 
     ``resolver=None`` (the default) uses aiohttp's built-in ThreadedResolver.
     Callers that need to vet resolved IPs (SSRF-sensitive fetchers) pass a
