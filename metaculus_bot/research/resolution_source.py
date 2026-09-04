@@ -133,6 +133,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
     RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S,
     RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS,
+    RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S,
     RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS,
     RESOLUTION_SOURCE_ENABLED_ENV,
     RESOLUTION_SOURCE_GLOBAL_CONCURRENCY,
@@ -149,6 +150,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_WALL_TIMEOUT,
     env_flag_enabled,
 )
+from metaculus_bot.research import derived_api
 from metaculus_bot.research.document_text import (
     DocumentDigest,
     PdfText,
@@ -182,6 +184,7 @@ from metaculus_bot.research.raw_log import record_raw_research
 from metaculus_bot.research.rendered_fetch import (
     RENDER_SETTLE_MS,
     RENDER_TIMEOUT_MS,
+    RenderedPage,
     note_rendered_no_text,
     render_page,
 )
@@ -1472,9 +1475,12 @@ async def _rendered_rung(
     provider's outer ``wait_for`` costs every page the question already fetched.
 
     The rendered DOM re-enters :func:`_classify_html_body`, so a rescued page gets the same
-    chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one. A render
-    that still yields no content is memoized (:func:`note_rendered_no_text`), so a second URL
-    on the same page in this run does not spend another launch to learn the same thing.
+    chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one. When the
+    DOM STILL carries nothing, the JSON the page fetched for itself is the last free route
+    (:func:`_derived_api_from_harvest`) — a JavaScript dashboard's numbers arrive over XHR and
+    are in its HTML at no wait condition. Only once that fails too is the URL memoized
+    (:func:`note_rendered_no_text`), so a second URL on the same page in this run does not spend
+    another launch to learn the same thing.
     """
     if not _rendered_rung_applies(direct):
         return None
@@ -1489,7 +1495,15 @@ async def _rendered_rung(
         return None
     attempt = ctx.start_rung("rendered", direct.status, url)
     goto_timeout_ms = int(min(RENDER_TIMEOUT_MS, budget_s * 1000) - RENDER_SETTLE_MS)
-    page = await render_page(url, host_gate=_sem_for_host(host_sems, url), goto_timeout_ms=goto_timeout_ms)
+    page = await render_page(
+        url,
+        host_gate=_sem_for_host(host_sems, url),
+        goto_timeout_ms=goto_timeout_ms,
+        # Recording the page's own XHR costs one buffered body per response inside the render
+        # task, which is why the transport keeps it off by default — here it is exactly the
+        # rung's fallback, so it is worth the bytes.
+        harvest_json=True,
+    )
     if page is None:
         # The transport declines with ONE signal for several causes — Playwright missing or
         # broken, a host that will not pin to a public IP, a browser error, or a URL a browser
@@ -1508,10 +1522,108 @@ async def _rendered_rung(
         # when a goto timed out and the DOM was salvaged.
         http_status=direct.http_status if direct.http_status is not None else 200,
     )
-    if classified.result.status != "success":
-        note_rendered_no_text(url)
+    if classified.result.status == "success":
+        return classified.result
+    derived = _derived_api_from_harvest(url, direct, page, ctx)
+    if derived is not None:
+        return derived
+    note_rendered_no_text(url)
+    return None
+
+
+def _derived_api_from_harvest(
+    url: str, direct: FetchResult, page: RenderedPage, ctx: FetchContext
+) -> FetchResult | None:
+    """Serve the JSON the rendered page fetched for itself, when the DOM carried nothing.
+
+    Its own rung attempt rather than part of the render's, because ``route`` is the LAST rung
+    that fired and ``derived_api`` is what actually produced the text — the render only found
+    the endpoint. The endpoint is also remembered for the host, so a later cited URL on it can
+    GET the feed without a second launch (:func:`_derived_api_rung`).
+
+    Declines silently when nothing was harvested or the biggest body carries no usable content
+    (:func:`vacuous_body_status`): a body we could not decode must never become the page's
+    content on a section captioned primary grading evidence.
+    """
+    harvested = derived_api.largest_json(page.json_responses)
+    if harvested is None:
         return None
-    return classified.result
+    raw, undecodable_ratio = decode_text_body(harvested.body, "application/json")
+    if vacuous_body_status(raw, undecodable_ratio, require_csv_rows=False) is not None:
+        return None
+    derived_api.remember_endpoint(url, harvested.url)
+    endpoint = derived_api.DerivedEndpoint(endpoint_url=harvested.url, discovered_on=url)
+    ctx.start_rung("derived_api", direct.status, url)
+    return _derived_api_result(url, endpoint, raw, http_status=direct.http_status)
+
+
+def _derived_api_result(
+    url: str, endpoint: derived_api.DerivedEndpoint, raw: str, *, http_status: int | None
+) -> FetchResult:
+    """One derived-feed result: the provenance lead, then the budgeted JSON.
+
+    The lead LEADS, like every other lead this module renders, because each truncator here is
+    head-preserving and anything at the tail is the first thing a later trim discards — and a
+    feed served with its provenance line trimmed off is a JSON blob nobody can check. Its cost
+    comes out of the per-URL cap rather than being added on top, so the section budget still
+    binds.
+    """
+    lead = derived_api.derived_api_lead(endpoint, url)
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    if body_cap <= 0:
+        return FetchResult(
+            url=url,
+            status="success",
+            text=_truncate_with_marker(lead, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url),
+            http_status=http_status,
+            content_type="application/json",
+        )
+    return FetchResult(
+        url=url,
+        status="success",
+        text=f"{lead}\n\n{_truncate_with_marker(raw, body_cap, url)}",
+        http_status=http_status,
+        content_type="application/json",
+    )
+
+
+async def _derived_api_rung(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """GET a JSON feed an earlier render on this host already found, before launching a browser.
+
+    This is the whole point of remembering the endpoint: a host with several cited URLs in one
+    run pays for one Chromium launch, not one per URL. It runs BEFORE the rendered rung for the
+    same reason every ladder here is ordered cheapest-first — one GET against a known endpoint
+    is a rounding error next to a browser launch.
+
+    The GET goes through :func:`_fetch_direct`, so it inherits the SSRF preflight, the
+    connect-time filtering resolver, the redirect re-guard, the per-host gate and the
+    budget-clamped hop timeout unchanged. A feed that fails hands the URL on to the browser.
+    """
+    if not _rendered_rung_applies(direct):
+        return None
+    endpoint = derived_api.endpoint_for(url)
+    if endpoint is None:
+        return None
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the derived-feed GET for %s — %.1fs of wall budget left",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("derived_api", direct.status, url, "wall_budget")
+        return None
+    ctx.start_rung("derived_api", direct.status, url)
+    logger.info(
+        f"resolution_source derived_api: {urlparse(url).netloc} -> {endpoint.endpoint_url} "
+        f"(found on {endpoint.discovered_on}, direct read was {direct.status})"
+    )
+    feed = await _fetch_direct(session, endpoint.endpoint_url, host_sems, ctx)
+    if feed.status != "success":
+        return None
+    return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status)
 
 
 async def _escalate_unresolved(
@@ -1525,12 +1637,14 @@ async def _escalate_unresolved(
     browser and this is still the answer" — the same convention the meta-refresh hop already
     follows.
 
-    ``session`` is unused by the browser rung (Chromium brings its own transport) and is
-    threaded through for the rungs that issue an ordinary GET.
+    ``session`` is the aiohttp session the rungs that issue an ordinary GET use; the browser
+    rung ignores it, because Chromium brings its own transport.
     """
-    del session  # the rungs that need it land in later commits; the signature is the seam
     if direct.status == "success":
         return direct
+    derived = await _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    if derived is not None:
+        return derived
     rendered = await _rendered_rung(url, direct, host_sems, ctx)
     if rendered is not None:
         return rendered
@@ -2073,6 +2187,7 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         "meta_refresh_hops": sum(1 for attempt in fired if attempt.rung == "meta_refresh"),
         "pdf_documents_read": sum(1 for attempt in fired if attempt.rung == "pdf_local"),
         "rendered_attempts": sum(1 for attempt in fired if attempt.rung == "rendered"),
+        "derived_api_reads": sum(1 for attempt in fired if attempt.rung == "derived_api"),
         "rung_budget_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wall_budget"),
         # Its own count rather than folded into the budget skips: a document left unread
         # because two others were already parsing says the 2-slot gate is the binding

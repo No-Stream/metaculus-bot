@@ -1016,6 +1016,7 @@ class TestResolutionSourceFetchMarker:
             "pdf_documents_read": 0,
             "rendered_attempts": 0,
             "rung_budget_skips": 1,
+            "derived_api_reads": 0,
             "pdf_contention_skips": 0,
             # The withheld page also earned a browser attempt, which this package's autouse
             # fixture declines — so the skip that follows the meta-refresh one is the browser

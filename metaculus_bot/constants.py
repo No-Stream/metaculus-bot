@@ -734,6 +734,11 @@ RESOLUTION_SOURCE_PDF_MIN_BUDGET_S: float = 3.0
 # slot is contended process-wide, so a question with no budget left would take a slot a sibling
 # question could still land a page with. 12 s admits the 2 s settle plus a 10 s navigation.
 RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S: float = 12.0
+# The derived-feed GET is one request against a JSON endpoint an earlier render on the same host
+# already found, so its floor is the meta-refresh hop's, on the same "0-2 s typical" probe basis
+# as the HTTP timeout — not the browser floor above. It has its own name because the two rungs
+# are tuned independently: this one gets cheaper as a run goes on, the browser never does.
+RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S: float = 3.0
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
