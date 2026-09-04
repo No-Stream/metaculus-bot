@@ -128,7 +128,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -230,6 +230,7 @@ from metaculus_bot.research.resolution_fetch_result import (
     FetchStatus,
     FetchStatusReason,
     RungAttempt,
+    RungSkipReason,
     _fetch_result_sources,
     _render_fetch_failures,
     fetch_outcome_token,
@@ -910,7 +911,7 @@ class FetchContext:
         self.rungs.append(attempt)
         return attempt
 
-    def skip_rung(self, rung: FetchRoute, from_status: FetchStatus, url: str, reason: str) -> None:
+    def skip_rung(self, rung: FetchRoute, from_status: FetchStatus, url: str, reason: RungSkipReason) -> None:
         self.rungs.append(
             RungAttempt(
                 rung=rung,
@@ -2943,7 +2944,11 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
     """
     attempts = [attempt for r in results for attempt in r.rung_attempts]
     fired_by_rung = Counter(attempt.rung for attempt in attempts if not attempt.skipped_reason)
-    skips_by_reason = Counter(attempt.skipped_reason for attempt in attempts if attempt.skipped_reason)
+    # Typed on `RungSkipReason` so every literal key indexed below is checked: a misspelt reason
+    # is a type error rather than a permanently-zero count silently absent from the archive.
+    skips_by_reason: Counter[RungSkipReason | Literal[""]] = Counter(
+        attempt.skipped_reason for attempt in attempts if attempt.skipped_reason
+    )
     budget_skips_by_rung = Counter(attempt.rung for attempt in attempts if attempt.skipped_reason == "wall_budget")
     return {
         "meta_refresh_hops": fired_by_rung["meta_refresh"],

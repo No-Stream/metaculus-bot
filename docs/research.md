@@ -1158,17 +1158,23 @@ to provider diagnostics.
 url_context rung answered with zero successful retrievals, so what came back is recall rather
 than a read of the page and it is discarded rather than rendered. It has its own token because
 it says something no other status does, that the host answered a third-party fetcher's request
-with nothing while refusing ours. On the reason side, `renderer_unavailable` and
-`render_timeout` join the `embed_shell` / `thin_page` / `no_text_layer` / `encrypted` /
-`malformed` / `no_matching_passage` / `budget_skipped` / `parse_contention` vocabulary, and they
-are the two that ride a rung attempt's `skipped_reason` rather than a result's `status_reason`,
-since nothing was rendered and so nothing about the page changed. `renderer_unavailable` is the
-browser declining (missing, broken, unpinnable host, memoised URL); `render_timeout` is a render
-that launched and was cut off because the page kept navigating, and the two are kept apart
-because only the first says anything about Chromium. `no_resolving_content` now has three reasons
-rather than two (`embed_shell`, `thin_page` and `no_matching_passage`), and the third is the
-only one that is a document rather than a page. All of them live in
-`research/resolution_fetch_result.py` with the rest of the vocabulary.
+with nothing while refusing ours. On the reason side there are now two vocabularies rather than
+one, split by what each qualifies. `FetchStatusReason` qualifies a result's STATUS —
+`embed_shell` / `thin_page` / `no_matching_passage` under `no_resolving_content`, `no_text_layer`
+/ `encrypted` / `malformed` under `unreadable_document`, and `budget_skipped` / `parse_contention`
+under the `unsupported_type` a held-but-unparsed document earns. `RungSkipReason` qualifies a
+rung ATTEMPT that never ran (`RungAttempt.skipped_reason`), which produced no result and so has
+nowhere else to record its reason: `wall_budget`, `wayback_cap`, `fast_path`, `no_api_key`,
+`robots_disallowed`, `rendered_no_text`, `renderer_unavailable`, `render_timeout`, and
+`parse_contention` again (a held document declined for want of a parse slot records the skip AND
+stamps the withheld result's `status_reason`, the one token shared by both Literals). Both are a
+closed `Literal`, so a misspelt reason is a type error rather than a permanently-zero count.
+`renderer_unavailable` is the browser declining before it rendered anything (missing, broken,
+unpinnable host); `render_timeout` is a render that launched and was cut off because the page
+kept navigating, and the two are kept apart because only the first says anything about Chromium.
+`no_resolving_content` has three reasons rather than two (`embed_shell`, `thin_page` and
+`no_matching_passage`), and the third is the only one that is a document rather than a page. All
+of them live in `research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that
 decision is made, on every raw-body branch — Tier-1 JSON/text/CSV and the Tier-2

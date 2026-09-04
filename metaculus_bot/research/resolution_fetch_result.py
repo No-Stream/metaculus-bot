@@ -126,21 +126,6 @@ FetchStatus = Literal[
 # belong to the `unsupported_type` a held-but-unparsed document earns, and say which rule
 # declined: the question ran out of wall, or every parse slot was taken. Without them a
 # skipped document is indistinguishable from a body that was never a document at all.
-#
-# `renderer_unavailable` is the browser rung declining before it rendered anything: Playwright
-# missing or broken, a host that will not pin to a public IP, a browser error, or a URL a
-# browser already read to nothing this run. It rides a rung attempt's `skipped_reason` rather
-# than a result's `status_reason` — nothing was rendered, so nothing about the page changed —
-# and it is here so the whole reason vocabulary has one home.
-#
-# `render_timeout` is the browser rung CUT OFF: Chromium launched and navigated, and either the
-# DOM read outlived the transport's `RENDER_DOM_READ_TIMEOUT_MS` because the page kept
-# navigating, or the whole render outlived the question's remaining wall budget. Its own token
-# rather than `renderer_unavailable` because it says nothing about whether Chromium works — the
-# receipt is ogimet.com (2026-09-03), where a 76 s render was recorded as the renderer being
-# unavailable and latched the once-per-run warning, so a real outage later would have logged
-# nothing. Same carriage as `renderer_unavailable`: a rung attempt's `skipped_reason`, since
-# nothing was rendered.
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -150,6 +135,45 @@ FetchStatusReason = Literal[
     "no_matching_passage",
     "budget_skipped",
     "parse_contention",
+]
+
+# Why a RUNG ATTEMPT never ran, carried on `RungAttempt.skipped_reason` (empty when the rung
+# fired). A closed vocabulary rather than bare strings so a typo is a type error instead of a
+# permanently-zero count: `_rung_counts` indexes a `Counter` keyed on this Literal, so a
+# misspelt reason cannot silently vanish from `details["counts"]`. Distinct from
+# `FetchStatusReason`, which qualifies a result's STATUS — a skip produced no result, so its
+# reason has nowhere else to live. `parse_contention` is the one member shared with
+# `FetchStatusReason`: a held document declined for want of a parse slot both records the skip
+# here and stamps the withheld result's `status_reason` there.
+#
+# `wall_budget` — the rung's own floor was below the remaining provider wall (`claim_rung_budget`).
+# `wayback_cap` — the question spent its per-question snapshot attempts on earlier cited URLs.
+# `fast_path` — an expensive rung (the browser, the paid reader) declined because the question's
+#   close-derived time budget put it on the fast path, a fact about the window not the 45 s wall.
+# `no_api_key` — the paid rung is flag-on but `GOOGLE_API_KEY` is unset, a misconfiguration that
+#   is otherwise byte-identical in the archive to the flag being off.
+# `robots_disallowed` — the paid rung's `Google-Extended` pre-check found the host refuses that
+#   token, so the read would be spend with a known-zero return: spend AVOIDED, not a page lost.
+# `parse_contention` — a held document left unread because both parse slots were taken.
+# `rendered_no_text` — the browser rung skipped because an earlier question in this run already
+#   rendered the same URL to nothing (the memo doing its job, not a runner without Chromium).
+# `renderer_unavailable` — the browser declined before rendering anything: Playwright missing or
+#   broken, a host that will not pin to a public IP, or a browser error. Nothing was rendered, so
+#   nothing about the page changed, which is why it is a skip reason and not a `status_reason`.
+# `render_timeout` — the browser rung CUT OFF: Chromium launched and navigated, and either the
+#   DOM read outlived `RENDER_DOM_READ_TIMEOUT_MS` because the page kept navigating, or the whole
+#   render outlived the remaining wall. Its own token rather than `renderer_unavailable` because
+#   it says nothing about whether Chromium works — the receipt is ogimet.com (2026-09-03), where
+#   a 76 s render was recorded as the renderer being unavailable and latched the once-per-run
+#   warning, so a real outage later would have logged nothing.
+RungSkipReason = Literal[
+    "wall_budget",
+    "wayback_cap",
+    "fast_path",
+    "no_api_key",
+    "robots_disallowed",
+    "parse_contention",
+    "rendered_no_text",
     "renderer_unavailable",
     "render_timeout",
 ]
@@ -278,7 +302,7 @@ class RungAttempt:
     started_at: float
     wall_s: float | None = None
     outcome: FetchStatus | None = None
-    skipped_reason: str = ""
+    skipped_reason: RungSkipReason | Literal[""] = ""
 
     def finish(self, now: float) -> None:
         """Stamp the elapsed wall-clock, unless the rung already measured its own."""
