@@ -13,7 +13,8 @@ import asyncio
 
 import pytest
 
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import rendered_fetch, resolution_source
+from metaculus_bot.research.derived_api import reset_derived_endpoints
 from metaculus_bot.research.http_fetch import reset_host_semaphores, reset_pdf_parse_semaphore
 from metaculus_bot.research.robots_policy import reset_robots_cache
 from tests.resolution_source_fakes import _INFOGRAM_EMBED_MARKUP, _embed_shell_page
@@ -170,3 +171,19 @@ def tracker_with_infogram_html() -> bytes:
         "opportunities are Maine and North Carolina, with Ohio and Alaska also competitive.</p>"
         "</article></body></html>"
     ).encode()
+
+
+@pytest.fixture(autouse=True)
+def _reset_render_state():
+    """Drop the render memo, the launch gate and the derived-endpoint map around every test.
+
+    All three outlive one provider call by design — that is what makes a second cited URL on a
+    host cheap — so without a reset a test that inherited another's finds would pass or fail on
+    order. Moved here from the escalation test module when it was split by rung, so every module
+    that touches a render or a derived feed gets the isolation without redeclaring it.
+    """
+    rendered_fetch.reset_render_state()
+    reset_derived_endpoints()
+    yield
+    rendered_fetch.reset_render_state()
+    reset_derived_endpoints()

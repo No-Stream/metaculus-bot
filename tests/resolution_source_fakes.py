@@ -16,8 +16,10 @@ that package. Same division as ``tests/ablation/``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
+from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,7 @@ from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.rendered_fetch import RenderedPage
 
 
 class _FakeContent:
@@ -328,3 +331,70 @@ def _meta_refresh_stub(target: str) -> bytes:
         f'<meta http-equiv="refresh" content="0; url={target}">'
         "</head><body></body></html>"
     ).encode()
+
+
+# --- Escalation-ladder shared builders (moved from the escalation test module when it was
+# split by rung; imported by the per-rung modules plus the dispatch and route-caveats modules). ---
+_URL = "https://tracker.example.com/senate"
+_FEED_URL = "https://tracker.example.com/api/series"
+
+# A body under RESOLUTION_SOURCE_JS_WALL_MIN_CHARS extracts to nothing: the direct route
+# calls that `js_wall`, which is the rendered rung's primary trigger population.
+_JS_SHELL = b'<!doctype html><html><body><div id="root"></div><script src="/app.js"></script></body></html>'
+
+
+# Deliberately well ABOVE RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS (400) once extracted: the
+# rendered DOM has to clear the same chrome floor a directly-fetched page does, so a fixture
+# sized just under it would test the floor rather than the rung.
+_RENDERED_PROSE = (
+    "The Nebraska Senate polling average stands at 47.2 percent for Osborn and 45.8 percent "
+    "for Ricketts as of September 2, 2026, across the eleven qualifying polls released since "
+    "the primary. The average is recomputed whenever a new qualifying poll is published, and "
+    "the trend over the last three weeks has been a narrowing of the gap by roughly a point. "
+    "Polls are weighted by sample size, recency and the pollster's historic accuracy, and "
+    "partisan-sponsored surveys are included at half weight with an adjustment for house "
+    "effects. The eleven polls in the current average were fielded between August 4 and "
+    "September 1 and carry sample sizes between 480 and 1,320 likely voters."
+)
+
+
+def _rendered(html: str, *, content_type: str = "text/html") -> RenderedPage:
+    return RenderedPage(url=_URL, content_type=content_type, html=html)
+
+
+def _rendered_document(inner: str) -> RenderedPage:
+    """A rendered DOM shaped like a real document.
+
+    Trafilatura discards a bare ``<article>`` with no head element ("discarding data"), so a
+    fixture that skipped the head would test the extractor's give-up path rather than the
+    rung. What a browser hands us is always a whole document, so the fixture is one too.
+    """
+    return _rendered(
+        "<!doctype html><html><head><title>Nebraska Senate polling average</title></head><body>"
+        f"<nav>Home | Senate</nav><article>{inner}</article><footer>&copy; 2026</footer></body></html>"
+    )
+
+
+def _fake_render(page: RenderedPage | None, calls: list[dict[str, object]]):
+    async def _render(
+        url: str,
+        *,
+        memo_scope: str,
+        host_gate,
+        goto_timeout_ms: int,
+        deadline_monotonic_s: float | None = None,
+        harvest_json: bool = False,
+    ):
+        calls.append({"url": url, "goto_timeout_ms": goto_timeout_ms, "harvest_json": harvest_json})
+        del memo_scope, host_gate, deadline_monotonic_s
+        # A real yield point, so the fake schedules like the browser rung it replaces and a
+        # test that races two escalations sees the same interleaving the transport would give.
+        await asyncio.sleep(0)
+        return page
+
+    return _render
+
+
+def _snapshot_url(page_url: str, *, captured: datetime) -> str:
+    """The final URL the archive redirects a snapshot request to (live-verified shape)."""
+    return f"https://web.archive.org/web/{captured.strftime('%Y%m%d%H%M%S')}id_/{page_url}"

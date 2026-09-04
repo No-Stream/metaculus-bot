@@ -16,7 +16,7 @@ whole point of the guard.
 
 Its own module because the invariant is one security property shared by two rungs, rather than a
 fact about how either rung behaves; the rungs' own behaviour stays in
-``test_resolution_source_escalation.py``.
+``test_resolution_source_wayback_rung.py`` and ``test_resolution_source_url_context_rung.py``.
 """
 
 from __future__ import annotations
