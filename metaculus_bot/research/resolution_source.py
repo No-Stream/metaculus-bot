@@ -220,6 +220,7 @@ from metaculus_bot.research.rendered_fetch import (
     RENDER_TIMEOUT_MS,
     MemoScope,
     RenderBudgetExpired,
+    RenderDomOverCeiling,
     RenderedPage,
     RenderTimeout,
     _is_json_content_type,
@@ -1909,12 +1910,18 @@ async def _render_or_record_the_skip(
         )
         attempt.skipped_reason = "wall_budget"
         return None
+    except RenderDomOverCeiling:
+        # Chromium rendered the page and the DOM is over `RENDERED_DOM_MAX_CHARS`: a fact about
+        # the page, kept out of `renderer_unavailable` so the install-failed signal stays clean.
+        # The transport already logged the size.
+        attempt.skipped_reason = "render_dom_too_large"
+        return None
     if page is None:
         # The transport declines with ONE signal for several causes — Playwright missing or
-        # broken, a host that will not pin to a public IP, a DOM over its ceiling, or a browser
-        # error — and its own WARN/DEBUG lines say which. Recorded as a SKIP rather than a fired
-        # rung because nothing was rendered: it then claims no `route=` and emits no escalation
-        # line, while keeping the measured wall_s that says what the declined launch cost.
+        # broken, a host that will not pin to a public IP, or a browser error — and its own
+        # WARN/DEBUG lines say which. Recorded as a SKIP rather than a fired rung because nothing
+        # was rendered: it then claims no `route=` and emits no escalation line, while keeping
+        # the measured wall_s that says what the declined launch cost.
         attempt.skipped_reason = "renderer_unavailable"
     return page
 
@@ -1967,7 +1974,10 @@ async def _rendered_rung(
     browser was answered with something other than a 200. The direct GET got a 200 for this URL
     (that is the trigger), so a non-200 main-frame status is the edge telling the browser apart,
     and its markup (a 403 or 429 interstitial routinely clears the chrome floor) is not the page:
-    the rung leaves the direct result standing and does not memoise, because a 429 is retryable.
+    the rung leaves the direct result standing and does not memoise, because a 429 is retryable;
+    that is its own skip, ``render_non_200``. A DOM over ``RENDERED_DOM_MAX_CHARS`` is likewise a
+    fact about the page and its own skip, ``render_dom_too_large`` (the transport raises
+    :class:`RenderDomOverCeiling` for it), so neither inflates ``renderer_unavailable``.
     When the DOM STILL carries nothing, the JSON the page fetched for itself is the last free
     route (:func:`_derived_api_from_harvest`) — a JavaScript dashboard's numbers arrive over XHR
     and are in its HTML at no wait condition. Only once that fails too is the URL memoized
@@ -3165,6 +3175,10 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # produced chrome again, and the rate at which the runner's browser is refused is the
         # question the escalation ladder's case rests on.
         "render_non_200_skips": skips_by_reason["render_non_200"],
+        # Its own count: Chromium rendered the page and the DOM was over `RENDERED_DOM_MAX_CHARS`,
+        # a fact about the page that used to be folded into `renderer_unavailable_skips`, where it
+        # pointed triage at the Playwright install.
+        "render_dom_too_large_skips": skips_by_reason["render_dom_too_large"],
         # And its own count: a browser rung skipped because an earlier question in this run
         # already rendered the same URL to nothing is the memo doing its job, not a runner without
         # Chromium — folded into `renderer_unavailable_skips` it inflated the install-failed signal.

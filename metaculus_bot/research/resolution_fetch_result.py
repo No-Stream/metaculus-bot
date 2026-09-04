@@ -193,6 +193,9 @@ FetchStatusReason = Literal[
 #   GET was not" is the rate a residual round asks for, and folded into the fired count it was
 #   byte-identical to a render that ran and produced chrome again. The URL is deliberately NOT
 #   memoised, because a 429 is retryable.
+# `render_dom_too_large` — the browser rendered the page and its DOM is over `RENDERED_DOM_MAX_CHARS`
+#   (`rendered_fetch.RenderDomOverCeiling`), so it was declined unread. A fact about the page,
+#   kept out of `renderer_unavailable` whose comment points triage at the Playwright install.
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",
@@ -205,6 +208,7 @@ RungSkipReason = Literal[
     "renderer_unavailable",
     "render_timeout",
     "render_non_200",
+    "render_dom_too_large",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the

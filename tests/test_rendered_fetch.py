@@ -822,17 +822,45 @@ class TestTheDomCeiling:
     characters so the check does not itself make the copy it exists to prevent."""
 
     async def test_a_dom_over_the_ceiling_is_declined_and_the_browser_torn_down(self, monkeypatch, caplog):
+        """Its own exception rather than the shared ``None``: the page RENDERED, so the caller must
+        be able to count it apart from a browser that is missing, and it is not memoised, because
+        "rendered to nothing" would be false."""
         monkeypatch.setattr(rendered_fetch, "RENDERED_DOM_MAX_CHARS", 100)
         page = _FakePage([], html="<html><body>" + "x" * 200 + "</body></html>")
 
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"):
-            rendered = await _render(monkeypatch, page)
+        with (
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"),
+            pytest.raises(rendered_fetch.RenderDomOverCeiling),
+        ):
+            await _render(monkeypatch, page)
 
-        assert rendered is None
         assert page.teardown == ["unroute_all", "context.close", "browser.close"]
         assert rendered_fetch._PLAYWRIGHT_WARNED is False
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
         assert [message for message in caplog.messages if "over the" in message and "ceiling" in message]
+
+    async def test_the_tier_1_rung_records_a_dom_over_the_ceiling_as_its_own_skip(self, monkeypatch):
+        """Folded into ``renderer_unavailable`` it pointed triage at the Playwright install."""
+
+        async def _too_large(url: str, **_kwargs: Any) -> None:
+            await asyncio.sleep(0)
+            raise rendered_fetch.RenderDomOverCeiling(f"the rendered DOM of {url} is over the ceiling")
+
+        monkeypatch.setattr(resolution_source, "render_page", _too_large)
+        direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
+        ctx = FetchContext()
+
+        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+
+        assert result is None
+        assert [attempt.skipped_reason for attempt in ctx.rungs] == ["render_dom_too_large"]
+        direct.rung_attempts = list(ctx.rungs)
+        counts = resolution_source._rung_counts([direct])
+        assert counts["render_dom_too_large_skips"] == 1
+        assert counts["renderer_unavailable_skips"] == 0
+        assert counts["rendered_attempts"] == 0
+        assert rendered_fetch._PLAYWRIGHT_WARNED is False
 
     async def test_a_dom_at_the_ceiling_is_read(self, monkeypatch):
         html = "<html><body>" + "x" * 50 + "</body></html>"

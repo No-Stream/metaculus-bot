@@ -770,7 +770,8 @@ RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S: float = 12.0
 # copies the DOM: the Tier-1 caller encodes it, decodes it back, ARIA-rewrites it and hands
 # trafilatura a tree several times its size, all while the 100-300 MB browser is still resident,
 # so an 8 MB dashboard DOM was ~60-110 MB per in-flight classification. A DOM over the ceiling is
-# declined with the transport's `None` signal; the harvested JSON is declined with it.
+# declined with the transport's own `RenderDomOverCeiling` (the rung's `render_dom_too_large`
+# skip, kept apart from a missing browser); the harvested JSON is declined with it.
 RENDERED_DOM_MAX_CHARS: int = RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
 # The derived-feed GET is one request against a JSON endpoint an earlier render on the same host
 # already found, so its floor is the meta-refresh hop's, on the same "0-2 s typical" probe basis

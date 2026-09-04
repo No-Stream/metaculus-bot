@@ -176,6 +176,18 @@ class RenderBudgetExpired(TimeoutError):
     """
 
 
+class RenderDomOverCeiling(Exception):
+    """Chromium rendered the page and its DOM is over ``RENDERED_DOM_MAX_CHARS``.
+
+    Raised instead of returning ``None`` so the caller can record it as what it is, a fact about
+    the page (it rendered, and it is too big to read safely), rather than as the renderer being
+    unavailable, the count the operator reads as the Chromium install having failed. Not a
+    ``TimeoutError``: no clock ran out. Not memoised: the DOM had content, so "rendered to
+    nothing" would be false, and a size is not something a retry changes within a run either
+    way. Both callers decline on it the way they decline on ``None``.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class HarvestedJson:
     """One JSON response the rendered page fetched for itself."""
@@ -475,8 +487,8 @@ async def _navigate_and_read_dom(
     goto_timeout_ms: int,
     deadline_monotonic_s: float | None,
     harvest: _JsonHarvest | None,
-) -> RenderedPage | None:
-    """Navigate to ``url``, let it settle, and return the rendered page, or None above the DOM ceiling.
+) -> RenderedPage:
+    """Navigate to ``url``, let it settle, and return the rendered page.
 
     Two departures from a plain ``networkidle`` navigation, both measured 2026-09-03. The wait
     condition is ``domcontentloaded`` plus a fixed settle, because network idle never arrives on
@@ -505,7 +517,8 @@ async def _navigate_and_read_dom(
     The DOM is measured in characters against ``RENDERED_DOM_MAX_CHARS`` before anything copies
     it, because the copies are the hazard: the Tier-1 caller encodes it, decodes it back,
     rewrites it and hands trafilatura a tree several times its size, all while the browser is
-    still resident. A DOM over the ceiling is declined with the transport's ``None`` signal.
+    still resident. A DOM over the ceiling raises :class:`RenderDomOverCeiling`, its own decline,
+    so the caller can count it apart from a browser that is missing.
     """
     try:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
@@ -532,7 +545,9 @@ async def _navigate_and_read_dom(
             len(html),
             RENDERED_DOM_MAX_CHARS,
         )
-        return None
+        raise RenderDomOverCeiling(
+            f"the rendered DOM of {urlparse(url).netloc} is {len(html)} chars, over the {RENDERED_DOM_MAX_CHARS}-char ceiling"
+        )
     json_responses: tuple[HarvestedJson, ...] = ()
     if harvest is not None:
         drain_until_s = read_deadline_s if deadline_monotonic_s is None else min(read_deadline_s, deadline_monotonic_s)
@@ -690,11 +705,14 @@ async def render_page(
     """Render ``url`` in headless Chromium and return its DOM, or None when the rung declines.
 
     ``None`` is the one graceful-failure signal both callers already handle, and it covers
-    every way this rung can DECLINE: a URL a browser already read to nothing in this run under
-    the caller's own ``memo_scope``, Playwright missing or broken, a host that cannot be pinned
-    to a public IP, a DOM over the ceiling, and any error out of the browser. A navigation budget
-    under the floor once the gates are held is the one decline that is NOT ``None``: it raises
-    :class:`RenderBudgetExpired` so the caller can record its own wall budget running out. A caller that wants to tell those apart reads
+    every way this rung can DECLINE with nothing rendered: a URL a browser already read to
+    nothing in this run under the caller's own ``memo_scope``, Playwright missing or broken, a
+    host that cannot be pinned to a public IP, and any error out of the browser. Two declines are
+    NOT ``None``, because each is a fact the caller counts apart from a missing browser: a
+    navigation budget under the floor once the gates are held raises :class:`RenderBudgetExpired`
+    (the caller's wall budget ran out in the queue), and a rendered DOM over
+    ``RENDERED_DOM_MAX_CHARS`` raises :class:`RenderDomOverCeiling` (the page rendered and is too
+    big to read safely). A caller that wants to tell the ``None`` causes apart reads
     :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
 
     A render that ran and was CUT OFF is different, and raises :class:`RenderTimeout` (a
@@ -783,8 +801,9 @@ async def render_page(
                 deadline_monotonic_s=deadline_monotonic_s,
                 harvest_json=harvest_json,
             )
-    # Nothing ran and nothing is memoised; the caller records its own wall budget running out.
-    except RenderBudgetExpired:
+    # The two declines the caller records under their own tokens: nothing is memoised for either
+    # (nothing ran for the first; the second rendered content, just too much of it).
+    except (RenderBudgetExpired, RenderDomOverCeiling):
         raise
     # Ordered before Playwright's Error deliberately, though the order is not load-bearing:
     # Playwright's TimeoutError derives from its own Error, not the builtin, so this clause never
@@ -818,7 +837,7 @@ async def _render_in_browser(
     goto_timeout_ms: int,
     deadline_monotonic_s: float | None,
     harvest_json: bool,
-) -> RenderedPage | None:
+) -> RenderedPage:
     """Recompute the budget, launch, render inside a guarded context, tear both down bounded.
 
     Split out of :func:`render_page` so the gates it runs under, and the soft-fail boundary
@@ -883,7 +902,7 @@ async def _render_in_context(
     deadline_monotonic_s: float | None,
     harvest_json: bool,
     teardown: _TeardownBudget,
-) -> RenderedPage | None:
+) -> RenderedPage:
     """Guard the context, open the page, navigate and read; leave the closes to the caller."""
 
     # Defense-in-depth on top of the main-frame pin above. The route guard re-checks every HTTP

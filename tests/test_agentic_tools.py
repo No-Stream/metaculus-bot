@@ -3393,6 +3393,27 @@ class TestRenderedRungTimeoutAtTheV2Wrapper:
         assert result is None
         assert rendered_fetch.rendered_to_nothing(url, memo_scope="gap_fill_v2") is False
 
+    @pytest.mark.asyncio
+    async def test_a_dom_over_the_ceiling_declines_without_memoising_the_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The transport's other non-``None`` decline. The page rendered, so it is not "rendered
+        to nothing" and must not be memoised as such; this wrapper folds it into ``None`` like the
+        timeout, because its callers know no other signal."""
+        url = "https://example.com/five-megabyte-dashboard"
+
+        async def _too_large(target: str, **kwargs: object) -> None:
+            del kwargs
+            await asyncio.sleep(0)
+            raise rendered_fetch.RenderDomOverCeiling(f"the rendered DOM of {target} is over the ceiling")
+
+        monkeypatch.setattr(agentic_tools, "render_page", _too_large)
+
+        result = await agentic_tools._try_rendered_fetch(url)
+
+        assert result is None
+        assert rendered_fetch.rendered_to_nothing(url, memo_scope="gap_fill_v2") is False
+
 
 # ---------------------------------------------------------------------------
 # The Google-Extended robots pre-check on the paid reader (2026-09-03). Proven live: the
