@@ -1402,8 +1402,8 @@ Follow-ups:
    path's all-direct output is byte-identically pinned. If a residual round ever finds a
    forecaster misreading a cited capture as live, the fix is a separate lead for the cited-capture
    shape, rendered from `parse_snapshot_url` on the cited URL.
-8. **MEDIUM: the browser transport's SSRF guard has three blind request channels, and one of them
-   is a main-frame redirect to a private address (added 2026-09-04; the prose corrections landed in
+8. **MEDIUM: the browser transport's SSRF guard has three blind request channels, and one of them is
+   a main-frame redirect to a private address (added 2026-09-04; the prose corrections landed in
    this bundle, the code is a follow-up PR).** Two terms first, because the rest of this item leans
    on them. The DNS PIN is the `--host-resolver-rules=MAP <host> <ip>` argument
    `research/rendered_fetch.py` passes at launch: it forces Chromium's own resolution of the ONE
@@ -1413,9 +1413,9 @@ Follow-ups:
    the attacker's DNS answers a public address to our Python preflight and a private one to
    Chromium's connect a moment later, so the check and the connect see different addresses. **The
    three channels the route handler never sees.** All three were read out of the pinned Playwright
-   1.61 driver source on 2026-09-04. First, a SERVER-SIDE redirect hop: the driver
-   constructs a Route only in the else branch of `if (redirectedFrom || ...)`, there is exactly one
-   `new RouteImpl(` in the whole bundle, and Playwright's own `page.route` documentation says "The
+   1.61 driver source on 2026-09-04. First, a SERVER-SIDE redirect hop: the driver constructs a
+   Route only in the else branch of `if (redirectedFrom || ...)`, there is exactly one `new
+   RouteImpl(` in the whole bundle, and Playwright's own `page.route` documentation says "The
    handler will only be called for the first url if the response is a redirect". So a 3xx that sends
    the main frame somewhere else is dialed with no check of ours at all. Until 2026-09-04 the
    transport's route-guard comment claimed the guard re-checked "server and client-side redirects",
@@ -1537,15 +1537,19 @@ Follow-ups:
    `connect_to_server`; what it cannot show is Chromium actually intercepting `ws://127.0.0.1`,
    because `tests/conftest.py` refuses every real launch. And the block is an in-page mitigation
    rather than a boundary: Playwright implements it by injecting an init script that replaces
-   `globalThis.WebSocket` per frame, so a dedicated Web Worker keeps the native constructor, and the
-   injection adds two enumerable `__pw*` globals to every frame on the one rung whose job is getting
-   past hostile edges. **Measure first, and the measurement is free.** Re-render the 2026-09-03
-   replay's rendered-route URLs locally with a logging WebSocket handler installed, and compare
-   extracted character counts with the block on and off. Those are public GETs with no LLM call and
-   no paid API, so the probe spends nothing; the one thing to say before running it is that it makes
-   outbound requests to third-party hosts from the operator's own address. That prices the WebSocket
-   recall cost, which is the only unmeasured axis of that half, and the same probe can record each
-   render's final URL, which is the measurement candidate (b) needs and the replay never captured.
+   `globalThis.WebSocket` per frame, so a dedicated Web Worker very likely keeps the native
+   constructor (that consequence is inferred from the injection mechanism, which was read from
+   source; no Playwright doc states it, and whether HTTP route interception reaches a dedicated
+   Worker's own `fetch` is a second open question worth settling before anyone treats the WebSocket
+   block as closing the channel). The injection also adds two enumerable `__pw*` globals to every
+   frame, on the one rung whose job is getting past hostile edges. **Measure first, and the
+   measurement is free.** Re-render the 2026-09-03 replay's rendered-route URLs locally with a
+   logging WebSocket handler installed, and compare extracted character counts with the block on and
+   off. Those are public GETs with no LLM call and no paid API, so the probe spends nothing; the one
+   thing to say before running it is that it makes outbound requests to third-party hosts from the
+   operator's own address. That prices the WebSocket recall cost, which is the only unmeasured axis
+   of that half, and the same probe can record each render's final URL, which is the measurement
+   candidate (b) needs and the replay never captured.
 
 ### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
 
