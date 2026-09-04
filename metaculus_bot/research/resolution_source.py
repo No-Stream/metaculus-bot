@@ -15,10 +15,15 @@ criteria (or fine print), extracts main content with trafilatura, and returns
 a compact markdown section that every forecaster reads as the ground truth
 the question will be graded against.
 
-Tier 1 is plain HTTP with browser-like headers, no LLM calls, no retries.
-Sites behind JS walls / heavy anti-bot remain deferred (see `FetchStatus` —
-`blocked` / `js_wall` / `no_resolving_content` results are retained in the
-returned list as that seam).
+Tier 1 is plain HTTP with browser-like headers, no LLM calls, no retries. When it
+cannot read a page, an ESCALATION LADDER runs (`_escalate_unresolved`), each rung
+self-bounded against the same provider wall and each returning a result that went
+through the SAME classification path (`_classify_html_body`), so a rescued page is
+indistinguishable downstream from a directly-fetched one. The `route` on every
+result says which rung produced it. Heavy anti-bot on a host that refuses our
+address is the one shape no rung here fixes (see `FetchStatus` — `blocked` /
+`js_wall` / `no_resolving_content` results are retained in the returned list as
+that seam).
 
 A 200-OK page whose extraction is under `RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS`
 is page CHROME and is withheld as `no_resolving_content` rather than published as
@@ -47,6 +52,16 @@ not turn into text are `unreadable_document`, which is a different fact from
 `unsupported_type` and the only one a paid document read could ever rescue. Each rung is
 self-bounding against the provider wall the way the Datawrapper hop is, because the
 outer `asyncio.wait_for` discards every page that already fetched when it fires.
+
+A fourth rung leaves our own aiohttp client: a page that answered 200 with nothing
+readable (`js_wall`, or the `thin_page` shape of `no_resolving_content`) is RENDERED
+in headless Chromium (`research/rendered_fetch.py`, the same transport and the same
+process-global Semaphore(2) launch cap the gap-fill v2 fetch ladder uses) and the DOM
+re-enters the classification path. Measured 2026-09-03: Chromium rescued 6 of the 8
+archived JS walls that still failed from a residential address. It runs from the
+escalation ladder rather than inside the response context, so a 12-35 s render never
+holds the loop-wide per-host gate — the same placement, for the same reason, as the
+local PDF parse.
 
 Inline chart configs are read straight out of the page we already hold
 (`resolution_chart_data.render_inline_chart_data`): a Highcharts `data-chart`
@@ -97,6 +112,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import socket
 import time
 from dataclasses import dataclass, field
@@ -113,11 +129,15 @@ from metaculus_bot.constants import (
     DOCUMENT_TEXT_MAX_PAGES,
     DOCUMENT_TEXT_MAX_SECONDS,
     DOCUMENT_TEXT_PDF_MAX_BYTES,
+    GAP_FILL_V2_READER_MODEL,
+    GAP_FILL_V2_READER_THINKING_LEVEL,
+    GOOGLE_API_KEY_ENV,
     RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
     RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S,
     RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS,
+    RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S,
     RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS,
     RESOLUTION_SOURCE_ENABLED_ENV,
     RESOLUTION_SOURCE_GLOBAL_CONCURRENCY,
@@ -128,11 +148,19 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S,
     RESOLUTION_SOURCE_PDF_MIN_BUDGET_S,
     RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+    RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S,
     RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
+    RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
+    RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV,
+    RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
     RESOLUTION_SOURCE_WALL_TIMEOUT,
+    RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS,
+    RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS,
+    RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S,
     env_flag_enabled,
 )
+from metaculus_bot.research import derived_api
 from metaculus_bot.research.document_text import (
     DocumentDigest,
     PdfText,
@@ -163,6 +191,13 @@ from metaculus_bot.research.http_fetch import (
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
+from metaculus_bot.research.rendered_fetch import (
+    RENDER_SETTLE_MS,
+    RENDER_TIMEOUT_MS,
+    RenderedPage,
+    note_rendered_no_text,
+    render_page,
+)
 from metaculus_bot.research.resolution_body_text import (
     _truncate_csv_middle,
     _truncate_with_marker,
@@ -171,6 +206,7 @@ from metaculus_bot.research.resolution_body_text import (
 from metaculus_bot.research.resolution_chart_data import render_inline_chart_data
 from metaculus_bot.research.resolution_fetch_result import (
     _NON_OK_FETCH_STATUS,
+    ROUTE_CAVEATS,
     FetchResult,
     FetchRoute,
     FetchStatus,
@@ -188,6 +224,14 @@ from metaculus_bot.research.resolution_url_scan import (
     is_metaculus_self_ref,
     is_yahoo_ticker_url,
     strip_markdown_escapes,  # noqa: F401  # re-export: the Tier-1 suite imports the markdown unescaper from this module path
+)
+from metaculus_bot.research.robots_policy import google_extended_blocks_url
+from metaculus_bot.research.url_context_reader import run_url_context_read
+from metaculus_bot.research.wayback import (
+    parse_snapshot_url,
+    snapshot_age_days,
+    wayback_lead,
+    wayback_snapshot_url,
 )
 
 
@@ -485,6 +529,20 @@ def _budgeted_success_sections(successes: list[FetchResult], fetched_iso: str) -
     return sections, dropped
 
 
+def _route_caveats(successes: list[FetchResult]) -> list[str]:
+    """One sentence per non-direct route present in the sections that will RENDER.
+
+    Computed over the successes rather than over every result, because a caveat describes an
+    artifact a forecaster can see: a rung that fired and failed left the direct route's own
+    outcome, which the failure notice already names. Order comes from ``ROUTE_CAVEATS``' own
+    insertion order, so it is stable across questions rather than following fetch order.
+
+    Empty for an all-direct question, which is the overwhelming majority and the case whose
+    rendered section has to stay byte-identical to what it was before the ladder existed.
+    """
+    return [caveat for route, caveat in ROUTE_CAVEATS.items() if any(r.route == route for r in successes)]
+
+
 def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
     """Render fetch results as a markdown body block (orchestrator adds the ``##`` header).
 
@@ -549,7 +607,12 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
         return notice
 
     fetched_iso = fetched_at.strftime("%Y-%m-%d")
-    caveat = f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence."
+    caveat = "\n".join(
+        [
+            f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence.",
+            *_route_caveats(successes),
+        ]
+    )
 
     sections, dropped = _budgeted_success_sections(successes, fetched_iso)
 
@@ -645,12 +708,33 @@ _PDF_CONTENT_TYPES = ("application/pdf", "application/x-pdf")
 
 
 @dataclass
+class QuestionRungBudget:
+    """The rung allowances one QUESTION shares across its cited URLs.
+
+    Separate from :class:`FetchContext`, which is per-URL, because the thing being bounded is
+    per-question: every Wayback snapshot shares netloc ``web.archive.org``, so the loop-wide
+    per-host ``Semaphore(1)`` turns N cited URLs into N sequential archive fetches inside a wall
+    that discards work already done when it fires. Its default is a fresh budget, so a
+    monkeypatched fetch driven with one URL and no shared state behaves exactly as it did.
+    """
+
+    wayback_attempts_left: int = RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS
+
+    def take_wayback_attempt(self) -> bool:
+        """Claim one snapshot attempt for this question, or False when they are spent."""
+        if self.wayback_attempts_left <= 0:
+            return False
+        self.wayback_attempts_left -= 1
+        return True
+
+
+@dataclass
 class FetchContext:
     """Per-URL inputs and rung bookkeeping for one :func:`_fetch_one` call.
 
     ONE per fetched URL, so ``rungs`` belongs to that URL and can be stamped onto its
-    result; ``query`` and ``started`` are the same values for every URL in a provider
-    call. Every field has a default so the monkeypatched fetch surface can still be
+    result; ``query``, ``started``, ``now`` and ``shared`` are the same for every URL in a
+    provider call. Every field has a default so the monkeypatched fetch surface can still be
     driven with three positional arguments, and a default context is simply "no
     question text, clock starts now" — which gives a direct fetch exactly the behaviour
     it had before the ladder existed.
@@ -658,11 +742,16 @@ class FetchContext:
     ``query`` is the question's title plus its resolution criteria, and it is what
     decides WHICH passages of a 220-page PDF a forecaster sees. ``started`` is the
     provider's own wall-clock origin, so every rung can bound itself against the same
-    45 s the outer ``asyncio.wait_for`` uses.
+    45 s the outer ``asyncio.wait_for`` uses. ``now`` is the WALL-CLOCK counterpart, which the
+    Wayback rung ages a capture against — a monotonic origin cannot date anything, and taking
+    the clock inside the rung would make an archived snapshot's rendered disclosure depend on
+    when it happened to run rather than on the fetch it belongs to.
     """
 
     query: str = ""
     started: float = field(default_factory=time.monotonic)
+    now: datetime = field(default_factory=lambda: datetime.now(UTC))
+    shared: QuestionRungBudget = field(default_factory=QuestionRungBudget)
     rungs: list[RungAttempt] = field(default_factory=list)
 
     def rung_budget_s(self) -> float:
@@ -891,10 +980,29 @@ async def _meta_refresh_hop(
     )
 
 
-async def _resolution_html_outcome(
-    resp: Any, current_url: str, content_type: str, ctx: FetchContext
-) -> FetchResult | str:
+@dataclass(frozen=True, slots=True)
+class _HtmlClassification:
+    """One classified HTML body, plus the decoded text the meta-refresh rung still needs.
+
+    ``html_text`` rides along because the two callers want different things from the same
+    decode: :func:`_resolution_html_outcome` looks for a refresh stub in it, while the
+    rendered rung has already followed every hop a browser follows and only wants the verdict.
+    Decoding twice would double the CPU on a body up to the 5 MiB response cap.
+    """
+
+    result: FetchResult
+    html_text: str
+
+
+async def _classify_html_body(
+    body: bytes, current_url: str, content_type: str, *, http_status: int
+) -> _HtmlClassification:
     """Trafilatura extraction plus the inline-chart rung and the chrome / JS-wall checks.
+
+    The ONE classification path for an HTML body, whichever rung obtained it: the direct
+    fetch, a meta-refresh hop, or a headless-Chromium render. That is what makes a rescued
+    page indistinguishable from a directly-fetched one downstream — same chart read, same ARIA
+    rewrite, same floors, same disclosure leads.
 
     Order of the three verdicts, and why:
 
@@ -911,26 +1019,7 @@ async def _resolution_html_outcome(
        including a JS-walled one, where the config in the raw HTML is precisely the
        data the wall was hiding. That is the one place the `js_wall` outcome moves,
        and it moves only when we actually recovered the numbers.
-    4. Only once there is no content anywhere does the meta-refresh rung look for a
-       redirect no HTTP status announced. It returns the target as the next hop, so
-       this function's return type is ``FetchResult | str`` exactly like the redirect
-       dispatcher's.
     """
-    status = resp.status
-    netloc = urlparse(current_url).netloc
-    body = await read_body_capped(
-        resp,
-        max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
-        label=f"resolution_source {netloc}",
-    )
-    if body is None:
-        return FetchResult(
-            url=current_url,
-            status="error",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-        )
     # Both embed scans are only possible on the RAW HTML —
     # trafilatura drops iframes and embed scripts at every
     # setting — so they run on the raw body, before (and
@@ -952,39 +1041,76 @@ async def _resolution_html_outcome(
     chart_block = await asyncio.to_thread(render_inline_chart_data, html_text)
     if looks_like_page_chrome(extracted or "") and not chart_block:
         # No content anywhere. Which of the three withholds applies is a disclosure
-        # question, not a routing one — all three retain the result as the Tier-2
-        # escalation seam and none of them render. A walled page still exposes its
+        # question, not a routing one — all three retain the result as the escalation
+        # seam and none of them render. A walled page still exposes its
         # embeds, so the charts ride along on every one of them.
         verdict, reason = _no_content_verdict(extracted, unreadable_embeds)
-        hop = await _meta_refresh_hop(
-            html_text,
-            current_url,
-            ctx,
-            from_status=verdict,
-            http_status=status,
-            content_type=content_type,
+        return _HtmlClassification(
+            result=FetchResult(
+                url=current_url,
+                status=verdict,
+                text="",
+                http_status=http_status,
+                content_type=content_type or None,
+                status_reason=reason,
+                datawrapper_charts=charts,
+                unreadable_embeds=unreadable_embeds,
+            ),
+            html_text=html_text,
         )
-        if hop is not None:
-            return hop
+    return _HtmlClassification(
+        result=FetchResult(
+            url=current_url,
+            status="success",
+            text=_page_text_with_leads(extracted or "", current_url, unreadable_embeds, chart_block),
+            http_status=http_status,
+            content_type=content_type or None,
+            datawrapper_charts=charts,
+            unreadable_embeds=unreadable_embeds,
+        ),
+        html_text=html_text,
+    )
+
+
+async def _resolution_html_outcome(
+    resp: Any, current_url: str, content_type: str, ctx: FetchContext
+) -> FetchResult | str:
+    """Classify the HTML body, then let the meta-refresh rung look for a hop no status announced.
+
+    Only once there is no content anywhere does the meta-refresh rung run. It returns the
+    target as the next hop, so this function's return type is ``FetchResult | str`` exactly
+    like the redirect dispatcher's, and a refresh chain is bounded by the same
+    ``MAX_REDIRECTS`` cap with the same per-hop SSRF re-guard.
+    """
+    status = resp.status
+    netloc = urlparse(current_url).netloc
+    body = await read_body_capped(
+        resp,
+        max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+        label=f"resolution_source {netloc}",
+    )
+    if body is None:
         return FetchResult(
             url=current_url,
-            status=verdict,
+            status="error",
             text="",
             http_status=status,
             content_type=content_type or None,
-            status_reason=reason,
-            datawrapper_charts=charts,
-            unreadable_embeds=unreadable_embeds,
         )
-    return FetchResult(
-        url=current_url,
-        status="success",
-        text=_page_text_with_leads(extracted or "", current_url, unreadable_embeds, chart_block),
+    classified = await _classify_html_body(body, current_url, content_type, http_status=status)
+    if classified.result.status == "success":
+        return classified.result
+    hop = await _meta_refresh_hop(
+        classified.html_text,
+        current_url,
+        ctx,
+        from_status=classified.result.status,
         http_status=status,
-        content_type=content_type or None,
-        datawrapper_charts=charts,
-        unreadable_embeds=unreadable_embeds,
+        content_type=content_type,
     )
+    if hop is not None:
+        return hop
+    return classified.result
 
 
 async def _resolution_text_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult:
@@ -1376,10 +1502,525 @@ async def _fetch_one_hop(
     return outcome
 
 
+def _rendered_rung_applies(direct: FetchResult) -> bool:
+    """Whether a browser could plausibly turn ``direct`` into readable content.
+
+    Two triggers, both pages that answered 200 with nothing we could read: ``js_wall`` (the
+    population the rung was measured on — Chromium rescued 6 of the 8 archived walls that
+    still failed from a residential address on 2026-09-03) and the ``thin_page`` shape of
+    ``no_resolving_content``, where the extraction cleared the JS-wall floor and still carried
+    only chrome, which is the same client-side-assembly failure one floor up.
+
+    ``embed_shell`` is deliberately NOT a trigger, and that is a fact about the browser rather
+    than a policy choice: ``page.content()`` returns the MAIN FRAME's HTML, so an Infogram or
+    Flourish iframe comes back as an ``<iframe>`` tag whose document Chromium rendered
+    somewhere we never read. Rendering that page spends a 100-300 MB launch to re-derive the
+    same verdict. ``blocked`` is not a trigger either: the edge refused our address before any
+    HTML existed, and Chromium dials from the same address.
+    """
+    if direct.status == "js_wall":
+        return True
+    return direct.status == "no_resolving_content" and direct.status_reason == "thin_page"
+
+
+async def _rendered_rung(
+    url: str, direct: FetchResult, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """Render an unreadable page in headless Chromium and re-classify it, or None.
+
+    Runs OUTSIDE the per-host semaphore's hop and outside the aiohttp response context, from
+    the escalation ladder — the same placement, and for the same reason, as the local PDF
+    parse: the gate is loop-wide and a 12-35 s render held inside it would stall every other
+    concurrent question's fetch of that host.
+
+    Self-bounding on the shared pattern: skipped below ``RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S``
+    of remaining wall, and the navigation gets the remaining budget less the settle, capped at
+    the transport's own 35 s. Degrading to the direct result costs one page; overrunning the
+    provider's outer ``wait_for`` costs every page the question already fetched.
+
+    The rendered DOM re-enters :func:`_classify_html_body`, so a rescued page gets the same
+    chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one. When the
+    DOM STILL carries nothing, the JSON the page fetched for itself is the last free route
+    (:func:`_derived_api_from_harvest`) — a JavaScript dashboard's numbers arrive over XHR and
+    are in its HTML at no wait condition. Only once that fails too is the URL memoized
+    (:func:`note_rendered_no_text`), so a second URL on the same page in this run does not spend
+    another launch to learn the same thing.
+    """
+    if not _rendered_rung_applies(direct):
+        return None
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the rendered rung for %s — %.1fs of wall budget left",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("rendered", direct.status, url, "wall_budget")
+        return None
+    attempt = ctx.start_rung("rendered", direct.status, url)
+    goto_timeout_ms = int(min(RENDER_TIMEOUT_MS, budget_s * 1000) - RENDER_SETTLE_MS)
+    page = await render_page(
+        url,
+        host_gate=_sem_for_host(host_sems, url),
+        goto_timeout_ms=goto_timeout_ms,
+        # Recording the page's own XHR costs one buffered body per response inside the render
+        # task, which is why the transport keeps it off by default — here it is exactly the
+        # rung's fallback, so it is worth the bytes.
+        harvest_json=True,
+    )
+    if page is None:
+        # The transport declines with ONE signal for several causes — Playwright missing or
+        # broken, a host that will not pin to a public IP, a browser error, or a URL a browser
+        # already read to nothing this run — and its own WARN/DEBUG lines say which. Recorded
+        # as a SKIP rather than a fired rung because nothing was rendered: it then claims no
+        # `route=` and emits no escalation line, while keeping the measured wall_s that says
+        # what the declined launch cost.
+        attempt.skipped_reason = "renderer_unavailable"
+        return None
+    classified = await _classify_html_body(
+        page.html.encode("utf-8", errors="replace"),
+        url,
+        page.content_type or "text/html",
+        # The direct fetch's status, not the browser's: this page answered 200 and carried no
+        # text, which is the fact the record should keep. Chromium reports no status at all
+        # when a goto timed out and the DOM was salvaged.
+        http_status=direct.http_status if direct.http_status is not None else 200,
+    )
+    if classified.result.status == "success":
+        return classified.result
+    derived = _derived_api_from_harvest(url, direct, page, ctx)
+    if derived is not None:
+        return derived
+    note_rendered_no_text(url)
+    return None
+
+
+def _derived_api_from_harvest(
+    url: str, direct: FetchResult, page: RenderedPage, ctx: FetchContext
+) -> FetchResult | None:
+    """Serve the JSON the rendered page fetched for itself, when the DOM carried nothing.
+
+    Its own rung attempt rather than part of the render's, because ``route`` is the LAST rung
+    that fired and ``derived_api`` is what actually produced the text — the render only found
+    the endpoint. The endpoint is also remembered for the host, so a later cited URL on it can
+    GET the feed without a second launch (:func:`_derived_api_rung`).
+
+    Declines silently when nothing was harvested or the biggest body carries no usable content
+    (:func:`vacuous_body_status`): a body we could not decode must never become the page's
+    content on a section captioned primary grading evidence.
+    """
+    harvested = derived_api.largest_json(page.json_responses)
+    if harvested is None:
+        return None
+    raw, undecodable_ratio = decode_text_body(harvested.body, "application/json")
+    if vacuous_body_status(raw, undecodable_ratio, require_csv_rows=False) is not None:
+        return None
+    derived_api.remember_endpoint(url, harvested.url)
+    endpoint = derived_api.DerivedEndpoint(endpoint_url=harvested.url, discovered_on=url)
+    ctx.start_rung("derived_api", direct.status, url)
+    return _derived_api_result(url, endpoint, raw, http_status=direct.http_status)
+
+
+def _derived_api_result(
+    url: str, endpoint: derived_api.DerivedEndpoint, raw: str, *, http_status: int | None
+) -> FetchResult:
+    """One derived-feed result: the provenance lead, then the budgeted JSON.
+
+    The lead LEADS, like every other lead this module renders, because each truncator here is
+    head-preserving and anything at the tail is the first thing a later trim discards — and a
+    feed served with its provenance line trimmed off is a JSON blob nobody can check. Its cost
+    comes out of the per-URL cap rather than being added on top, so the section budget still
+    binds.
+    """
+    lead = derived_api.derived_api_lead(endpoint, url)
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    if body_cap <= 0:
+        return FetchResult(
+            url=url,
+            status="success",
+            text=_truncate_with_marker(lead, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url),
+            http_status=http_status,
+            content_type="application/json",
+        )
+    return FetchResult(
+        url=url,
+        status="success",
+        text=f"{lead}\n\n{_truncate_with_marker(raw, body_cap, url)}",
+        http_status=http_status,
+        content_type="application/json",
+    )
+
+
+async def _derived_api_rung(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """GET a JSON feed an earlier render on this host already found, before launching a browser.
+
+    This is the whole point of remembering the endpoint: a host with several cited URLs in one
+    run pays for one Chromium launch, not one per URL. It runs BEFORE the rendered rung for the
+    same reason every ladder here is ordered cheapest-first — one GET against a known endpoint
+    is a rounding error next to a browser launch.
+
+    The GET goes through :func:`_fetch_direct`, so it inherits the SSRF preflight, the
+    connect-time filtering resolver, the redirect re-guard, the per-host gate and the
+    budget-clamped hop timeout unchanged. A feed that fails hands the URL on to the browser.
+    """
+    if not _rendered_rung_applies(direct):
+        return None
+    endpoint = derived_api.endpoint_for(url)
+    if endpoint is None:
+        return None
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the derived-feed GET for %s — %.1fs of wall budget left",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("derived_api", direct.status, url, "wall_budget")
+        return None
+    ctx.start_rung("derived_api", direct.status, url)
+    logger.info(
+        f"resolution_source derived_api: {urlparse(url).netloc} -> {endpoint.endpoint_url} "
+        f"(found on {endpoint.discovered_on}, direct read was {direct.status})"
+    )
+    feed = await _fetch_direct(session, endpoint.endpoint_url, host_sems, ctx)
+    if feed.status != "success":
+        return None
+    return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status)
+
+
+# A page the archive can plausibly substitute for: the host refused us, never answered, or says
+# the URL is gone. Deliberately NOT `js_wall` — the archive stores the unrendered shell, so it
+# rescued 0 of the 8 archived walls that still failed on 2026-09-03 while the browser rung
+# rescued 6. Nor `no_resolving_content`: a page that answered 200 with chrome is one whose live
+# markup we have and whose numbers are elsewhere, and an older copy of the same chrome adds
+# nothing. `ssrf_blocked` is excluded because WE refused that URL, and handing it to a
+# third-party fetcher is precisely the bypass the guard exists to prevent.
+_WAYBACK_TRIGGER_STATUSES: frozenset[FetchStatus] = frozenset({"blocked", "error", "not_found"})
+
+
+async def _wayback_snapshot_result(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """Fetch the archive's freshest capture of ``url`` and serve it, or withhold it.
+
+    The fetch goes through :func:`_fetch_direct`, so the snapshot is classified by exactly the
+    path a live page is — including the chart read and the chrome floor — and inherits the SSRF
+    preflight, the per-hop re-guard and the budget-clamped hop timeout. What comes back extra is
+    the FINAL URL, which is where the archive puts the 14-digit capture timestamp.
+
+    Three outcomes, in this order, and the order is the design.
+
+    The inner URL is UNWRAPPED and re-checked first, because ``is_metaculus_self_ref`` keys on
+    hostname and ``web.archive.org/web/…/metaculus.com/…`` sails past every self-reference filter
+    in the pipeline — an archived Metaculus page in front of a forecaster is the question quoting
+    itself. Then a snapshot the archive could not serve at all (no capture, or a capture that
+    404s) DECLINES: there is no archived copy, which is a different fact from a stale one, and
+    the direct route's own status says more about the source than a fact about the archive would.
+    Only a capture we actually READ and cannot date, or can date and it is too old, is withheld
+    as ``stale_data`` — because the disclosure that makes a snapshot admissible is its age, and a
+    copy with no usable date cannot carry it. The direct status is not lost by that swap either:
+    the ``RESOLUTION_SOURCE_ESCALATION`` line for this rung carries ``from_status``.
+    """
+    snapshot = await _fetch_direct(session, wayback_snapshot_url(url), host_sems, ctx)
+    parsed = parse_snapshot_url(snapshot.url)
+    if parsed is not None and (
+        is_metaculus_self_ref(parsed.inner_url) or not await is_public_http_url(parsed.inner_url)
+    ):
+        logger.warning(
+            "resolution_source wayback refused: snapshot of %s wraps a URL we do not fetch (%s)",
+            urlparse(url).netloc,
+            urlparse(parsed.inner_url).netloc,
+        )
+        return None
+    if snapshot.status != "success":
+        logger.info(
+            "resolution_source wayback: no archived copy served for %s (%s)",
+            urlparse(url).netloc,
+            snapshot.status,
+        )
+        return None
+    age_days = None if parsed is None else snapshot_age_days(parsed, ctx.now)
+    if parsed is None or age_days is None or age_days > RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS:
+        logger.warning(
+            "resolution_source wayback: capture for %s is not usable (final=%s, age=%s) — withheld as stale",
+            urlparse(url).netloc,
+            snapshot.url,
+            "undatable" if age_days is None else f"{age_days:.1f}d",
+        )
+        return FetchResult(
+            url=url,
+            status="stale_data",
+            text="",
+            http_status=snapshot.http_status,
+            content_type=snapshot.content_type,
+        )
+    lead = wayback_lead(parsed, age_days, direct.status)
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    # The lead LEADS and its cost comes out of the per-URL cap, like every other lead here: the
+    # truncators are head-preserving, so a trailing disclosure is the first thing a later trim
+    # discards — and an archived page whose age line has been trimmed off is being passed off as
+    # the live one.
+    text = lead if body_cap <= 0 else f"{lead}\n\n{_truncate_with_marker(snapshot.text, body_cap, url)}"
+    return FetchResult(
+        url=url,
+        status="success",
+        text=text,
+        http_status=snapshot.http_status,
+        content_type=snapshot.content_type,
+        datawrapper_charts=snapshot.datawrapper_charts,
+        unreadable_embeds=snapshot.unreadable_embeds,
+    )
+
+
+async def _wayback_rung(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """Try the Wayback Machine for a page our own address could not reach.
+
+    Bounded three ways, because this rung's cost is concentrated rather than spread: below
+    ``RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S`` of remaining wall it is skipped, at most
+    ``RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS`` snapshots are fetched per question, and every
+    snapshot contends on the one ``web.archive.org`` host gate — which is the documented trade
+    for the politeness that gate exists to provide.
+    """
+    if direct.status not in _WAYBACK_TRIGGER_STATUSES:
+        return None
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the wayback rung for %s — %.1fs of wall budget left",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("wayback", direct.status, url, "wall_budget")
+        return None
+    if not ctx.shared.take_wayback_attempt():
+        logger.warning(
+            "resolution_source: skipping the wayback rung for %s — this question's %d snapshot attempt(s) are spent",
+            urlparse(url).netloc,
+            RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS,
+        )
+        ctx.skip_rung("wayback", direct.status, url, "wayback_cap")
+        return None
+    ctx.start_rung("wayback", direct.status, url)
+    return await _wayback_snapshot_result(session, url, direct, host_sems=host_sems, ctx=ctx)
+
+
+# What the paid reader is allowed to be asked about. Everything the free ladder left unresolved
+# EXCEPT the outcomes where a model-mediated read cannot help or must not be tried: a 404/410 has
+# no page to read, an empty or undecodable body and an unreadable document are bytes we DID get
+# (only `no_text_layer` could ever be rescued, and that is v2's `read_document` job on a URL the
+# driver chose), a withheld archive copy is a freshness decision rather than a fetch failure, and
+# `ssrf_blocked` is a URL WE refused — handing that to a third-party fetcher is exactly the
+# bypass the guard exists to prevent, which is why it is excluded here and not merely unlisted.
+_URL_CONTEXT_TRIGGER_STATUSES: frozenset[FetchStatus] = frozenset(
+    {"blocked", "js_wall", "error", "no_resolving_content"}
+)
+
+
+def _url_context_lead(live_status: FetchStatus) -> str:
+    """The MANDATORY disclosure a model-mediated read carries.
+
+    Both clauses are the point. It says WHY this route was taken, so a forecaster knows the host
+    refused us rather than that we chose a model over a fetch. And it says the text is not a copy
+    of the page — every other section in this snapshot is bytes the host served, and reading a
+    paraphrase under the same "primary grading evidence" caption without that line would overstate
+    what was retrieved by exactly the amount that matters.
+    """
+    return (
+        f"[Read via Gemini url_context because the live page could not be fetched ({live_status}); "
+        f"model-mediated, not a byte-for-byte copy.]"
+    )
+
+
+async def _fetch_robots_txt(
+    session: Any, robots_url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> str | None:
+    """Read one robots.txt through THIS path's own fetch; None when we could not read it.
+
+    Goes through :func:`_fetch_direct` rather than a second client, so the SSRF preflight, the
+    connect-time filtering resolver, the per-hop redirect re-guard, the per-host gate and the
+    budget-clamped hop timeout all apply to a request this pre-check makes. That path also
+    CLASSIFIES, so a host serving robots.txt as HTML can come back withheld under the chrome
+    floor — which reads as "no directives", i.e. proceed and pay, the only direction an
+    unreadable robots.txt is allowed to fail in.
+    """
+    result = await _fetch_direct(session, robots_url, host_sems, ctx)
+    return result.text if result.status == "success" else None
+
+
+async def _url_context_robots_skip(
+    session: Any, url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> bool:
+    """True when ``url``'s host tells ``Google-Extended`` to stay out of that path.
+
+    Only the PAID rung consults this: the free rungs dial from our own client under our own user
+    agent, and this bot's reading of ``Content-Signal: use=reference`` is that reference use is
+    permitted. The per-host cache lives in ``robots_policy`` and is shared with gap-fill v2's
+    reader, so a host reached by both paths in one run is read once.
+    """
+    return await google_extended_blocks_url(
+        url, fetch_text=lambda robots_url: _fetch_robots_txt(session, robots_url, host_sems, ctx)
+    )
+
+
+async def _url_context_rung(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult | None:
+    """Ask Gemini to read a page our own client could not, or decline.
+
+    The LAST rung and the only paid one, so every gate is checked before a cent is spent, in
+    increasing cost order: the trigger population, the flag (default off, and off in every
+    workflow), the free per-host ``Google-Extended`` robots pre-check, the API key, and the wall
+    budget. The robots check is worth a request of its own because a host that disallows that
+    token refuses the fetch server-side — proven live 2026-09-03, where the same call that
+    retrieved a robots-allowed host came back ``URL_RETRIEVAL_STATUS_ERROR`` on
+    internationalaisafetyreport.org — so the read would be spend with a known-zero return.
+
+    Zero successful retrievals DISCARDS the text and reports ``ungrounded``. Gemini answers
+    fluently out of parametric memory when every retrieval failed, and this section is captioned
+    primary grading evidence, so a fluent unsourced answer here is the Q38195 failure with a
+    forecaster-facing blast radius. That is the same floor ``gemini_search`` and v2's
+    ``read_document`` apply, for the same reason.
+    """
+    if direct.status not in _URL_CONTEXT_TRIGGER_STATUSES:
+        return None
+    if not env_flag_enabled(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV):
+        return None
+    api_key = os.getenv(GOOGLE_API_KEY_ENV)
+    if not api_key:
+        logger.info(
+            "resolution_source: url_context rung is enabled but %s is not set — skipping %s",
+            GOOGLE_API_KEY_ENV,
+            urlparse(url).netloc,
+        )
+        ctx.skip_rung("url_context", direct.status, url, "no_api_key")
+        return None
+    budget_s = ctx.rung_budget_s()
+    if budget_s < RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S:
+        logger.warning(
+            "resolution_source: skipping the url_context rung for %s — %.1fs of wall budget left",
+            urlparse(url).netloc,
+            budget_s,
+        )
+        ctx.skip_rung("url_context", direct.status, url, "wall_budget")
+        return None
+    if await _url_context_robots_skip(session, url, host_sems, ctx):
+        logger.info(f"RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url={url} host={urlparse(url).netloc}")
+        ctx.skip_rung("url_context", direct.status, url, "robots_disallowed")
+        return None
+    ctx.start_rung("url_context", direct.status, url)
+    try:
+        text, n_retrievals, statuses = await asyncio.wait_for(
+            asyncio.to_thread(
+                run_url_context_read,
+                url,
+                ctx.query,
+                api_key=api_key,
+                role="resolution_source",
+                model=GAP_FILL_V2_READER_MODEL,
+                thinking_level=GAP_FILL_V2_READER_THINKING_LEVEL,
+                # The client-side ceiling is what returns the worker: wait_for cancels this
+                # coroutine and not the thread it is waiting on. Sized off the remaining budget
+                # so the read cannot outlive the provider's own wall by more than the margin.
+                timeout_ms=int(max(0.0, budget_s - RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000),
+                attempts=RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
+            ),
+            timeout=budget_s,
+        )
+    except TimeoutError:
+        logger.warning("resolution_source url_context read timed out for %s", urlparse(url).netloc)
+        return None
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # paid-rung soft-fail boundary: a dead reader leaves the direct result, never takes the provider down
+        logger.warning(
+            "resolution_source url_context read failed for %s: %s: %s",
+            urlparse(url).netloc,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if n_retrievals == 0 or not text.strip():
+        logger.warning(f"RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED: url={url} statuses={','.join(statuses) or 'none'}")
+        return FetchResult(
+            url=url,
+            status="ungrounded",
+            text="",
+            http_status=direct.http_status,
+            content_type=direct.content_type,
+        )
+    lead = _url_context_lead(direct.status)
+    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    # The lead LEADS and is budgeted out of the cap, like every other lead here: the truncators
+    # are head-preserving, so a trailing disclosure is the first thing a later trim discards —
+    # and a model's answer rendered without it reads as the page itself.
+    served = lead if body_cap <= 0 else f"{lead}\n\n{_truncate_with_marker(text.strip(), body_cap, url)}"
+    return FetchResult(
+        url=url,
+        status="success",
+        text=served,
+        http_status=direct.http_status,
+        content_type="text/plain",
+    )
+
+
+async def _escalate_unresolved(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult:
+    """Run the escalation rungs a direct fetch's outcome earns, cheapest first.
+
+    Returns the FIRST rung's rescue, or ``direct`` unchanged when every rung declines or fails.
+    A rung that fired and produced nothing still leaves its attempt on the context, which is
+    what makes ``route=rendered status=js_wall`` readable in the archive as "we tried the
+    browser and this is still the answer" — the same convention the meta-refresh hop already
+    follows.
+
+    ``session`` is the aiohttp session the rungs that issue an ordinary GET use; the browser
+    rung ignores it, because Chromium brings its own transport.
+    """
+    if direct.status == "success":
+        return direct
+    derived = await _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    if derived is not None:
+        return derived
+    rendered = await _rendered_rung(url, direct, host_sems, ctx)
+    if rendered is not None:
+        return rendered
+    # Reached only for the statuses the browser rungs do not claim — the two trigger sets are
+    # disjoint by construction (see `_WAYBACK_TRIGGER_STATUSES`), so the order between them is a
+    # reading choice: free-and-local first, then the route whose egress is not ours.
+    wayback = await _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    if wayback is not None:
+        return wayback
+    # Last, because it is the only rung that spends money and the only one whose product is a
+    # model's answer rather than the host's bytes. Off by default and off in every workflow.
+    read = await _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    if read is not None:
+        return read
+    return direct
+
+
 async def _fetch_one(
     session: Any, url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext | None = None
 ) -> FetchResult:
-    """Fetch a single URL, holding the per-host politeness semaphore hop by hop.
+    """Fetch a single URL directly, then escalate what the direct route could not read.
+
+    ``ctx`` carries the question text a PDF digest ranks passages against, the wall-clock
+    origin each rung bounds itself with, and the rung attempts stamped onto the returned
+    result. It defaults to a fresh one so the fetch surface can still be driven with three
+    arguments, which is what every existing caller and test does.
+    """
+    ctx = FetchContext() if ctx is None else ctx
+    direct = await _fetch_direct(session, url, host_sems, ctx)
+    escalated = await _escalate_unresolved(session, url, direct, host_sems=host_sems, ctx=ctx)
+    return _stamped_with_route(escalated, ctx)
+
+
+async def _fetch_direct(
+    session: Any, url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
+) -> FetchResult:
+    """Fetch a single URL directly, holding the per-host politeness semaphore hop by hop.
 
     Content-type routing:
       * HTML → ARIA-table rewrite + trafilatura extraction (via to_thread), the
@@ -1389,11 +2030,6 @@ async def _fetch_one(
       * anything else, including a missing/empty Content-Type header → capped read,
         then the ``%PDF-`` magic check: a document is read locally and rendered as a
         query-relevant digest, and anything else is ``unsupported_type`` as before.
-
-    ``ctx`` carries the question text the PDF digest ranks passages against, the
-    wall-clock origin each rung bounds itself with, and the rung attempts stamped onto
-    the returned result. It defaults to a fresh one so the fetch surface can still be
-    driven with three arguments, which is what every existing caller and test does.
 
     Politeness: each hop acquires the semaphore for THAT hop's host around its single GET,
     the body read on a terminal response, and the HTML branch's extraction, and releases it
@@ -1414,9 +2050,10 @@ async def _fetch_one(
     observability so we surface ``ssrf_blocked`` without opening a session. Hops of
     both shapes are followed in-band and share the one ``MAX_REDIRECTS`` cap.
 
-    No retries (Tier 1 anti-goal). Any aiohttp/asyncio error becomes ``error``.
+    No retries (Tier 1 anti-goal). Any aiohttp/asyncio error becomes ``error``. Escalation
+    beyond this route is :func:`_escalate_unresolved`'s job, so this function stays exactly
+    what it always was: the plain fetch, terminal on its own outcome.
     """
-    ctx = FetchContext() if ctx is None else ctx
     # Guard the initial URL before any network I/O.
     if not await is_public_http_url(url):
         logger.warning(f"resolution_source ssrf_blocked (initial url): {urlparse(url).netloc}")
@@ -1438,20 +2075,17 @@ async def _fetch_one(
     for _hop in range(MAX_REDIRECTS + 1):
         outcome = await _fetch_one_hop(session, current_url, host_sems, ctx)
         if isinstance(outcome, FetchResult):
-            return _stamped_with_route(outcome, ctx)
+            return outcome
         current_url = outcome
 
     # Fell out of the loop -> exceeded MAX_REDIRECTS.
     logger.info(f"resolution_source redirect chain exceeded {MAX_REDIRECTS} hops (final={current_url})")
-    return _stamped_with_route(
-        FetchResult(
-            url=current_url,
-            status="error",
-            text="",
-            http_status=None,
-            content_type=None,
-        ),
-        ctx,
+    return FetchResult(
+        url=current_url,
+        status="error",
+        text="",
+        http_status=None,
+        content_type=None,
     )
 
 
@@ -1757,8 +2391,14 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "") -> list[
         try:
             # One context per URL: the rung attempts belong to that URL's result, while
             # the query and the wall-clock origin are the same for all of them.
+            # ONE shared rung budget across this question's URLs, and one per-URL context each:
+            # the Wayback cap is per question (every snapshot shares one host gate), while the
+            # rung attempts belong to the URL they were spent on.
+            shared_budget = QuestionRungBudget()
             page_tasks = [
-                asyncio.create_task(_fetch_one(session, u, host_sems, FetchContext(query=query, started=started)))
+                asyncio.create_task(
+                    _fetch_one(session, u, host_sems, FetchContext(query=query, started=started, shared=shared_budget))
+                )
                 for u in urls
             ]
             tasks.extend(page_tasks)
@@ -1902,11 +2542,30 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
     return {
         "meta_refresh_hops": sum(1 for attempt in fired if attempt.rung == "meta_refresh"),
         "pdf_documents_read": sum(1 for attempt in fired if attempt.rung == "pdf_local"),
+        "rendered_attempts": sum(1 for attempt in fired if attempt.rung == "rendered"),
+        "derived_api_reads": sum(1 for attempt in fired if attempt.rung == "derived_api"),
+        "wayback_attempts": sum(1 for attempt in fired if attempt.rung == "wayback"),
+        "url_context_reads": sum(1 for attempt in fired if attempt.rung == "url_context"),
         "rung_budget_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wall_budget"),
         # Its own count rather than folded into the budget skips: a document left unread
         # because two others were already parsing says the 2-slot gate is the binding
         # constraint, which is a different thing to fix than a question that ran late.
         "pdf_contention_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "parse_contention"),
+        # Also its own count, for the same reason: a browser rung that never rendered because
+        # Chromium is missing on the runner (the install step is `continue-on-error` in every
+        # workflow, so its absence is by design) says something different from a question that
+        # ran out of wall, and both are invisible in `rendered_attempts`.
+        "renderer_unavailable_skips": sum(
+            1 for attempt in attempts if attempt.skipped_reason == "renderer_unavailable"
+        ),
+        # Also its own count: a question that spent its two snapshot attempts on earlier
+        # cited URLs is a question whose per-question cap is binding, which is a different
+        # thing to tune than a question that ran out of wall.
+        "wayback_cap_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wayback_cap"),
+        # Its own count because it is the free pre-check EARNING its request: a host that
+        # disallows Google-Extended refuses the read server-side, so this is spend avoided
+        # rather than a page lost, and it must not read as a failure.
+        "url_context_robots_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "robots_disallowed"),
     }
 
 

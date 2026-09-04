@@ -726,6 +726,60 @@ RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S: float = (
 # rather than not at all.
 RESOLUTION_SOURCE_PDF_MIN_BUDGET_S: float = 3.0
 
+# --- Resolution-source escalation rungs that need a browser -------------------
+# The rendered rung launches headless Chromium (`research/rendered_fetch.py`, shared with the
+# gap-fill v2 fetch ladder and its process-global Semaphore(2) launch cap). Two reasons its
+# floor is far above the one-request rungs' 3 s: a launch plus a DOM-ready navigation measured
+# 3-8 s across the 2026-09-03 replay corpus even on pages that rendered cleanly, and the launch
+# slot is contended process-wide, so a question with no budget left would take a slot a sibling
+# question could still land a page with. 12 s admits the 2 s settle plus a 10 s navigation.
+RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S: float = 12.0
+# The derived-feed GET is one request against a JSON endpoint an earlier render on the same host
+# already found, so its floor is the meta-refresh hop's, on the same "0-2 s typical" probe basis
+# as the HTTP timeout — not the browser floor above. It has its own name because the two rungs
+# are tuned independently: this one gets cheaper as a run goes on, the browser never does.
+RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S: float = 3.0
+# --- Wayback Machine snapshots ---
+# The archive is the one free route whose egress is not ours, which is the whole reason it earns
+# a rung (measured 2026-09-03: identical client, identical headers, 403 from a GitHub Actions
+# runner and 200 from a residential address on the same three government hosts).
+#
+# Age bound. A snapshot is admissible as primary grading evidence only with its age disclosed
+# (operator decision, 2026-09-03) and only inside this bound. 30 days matches the Datawrapper
+# freshness guard's, and it is the same JUDGMENT rather than a measurement: it was calibrated on
+# daily-republishing trackers, so a question resolving on a weekly series arguably wants tighter.
+# Deliberately its own constant, not an alias of the Datawrapper bound: these are two independent
+# calls about two different artifacts and tying them would make one impossible to tune.
+RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS: float = 30.0
+# Floor for the snapshot fetch, which is one GET plus one redirect hop. Above the one-request
+# rungs' 3 s because the archive is measurably slower than an ordinary host — the verification
+# probe's own response carried `LoadShardBlock;dur=1048ms` in its server-timing header, and the
+# redirect means two round trips through that.
+RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S: float = 8.0
+# Snapshot attempts per QUESTION. Every snapshot shares netloc `web.archive.org`, so Tier-1's
+# per-host Semaphore(1) serializes them: N cited URLs would queue into N sequential archive
+# fetches behind one gate, inside a 45 s wall that discards every page already fetched when it
+# fires. Two is the documented trade — a question whose first two cited sources are both dead
+# gets both tried, and a question citing five gets its budget protected.
+RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS: int = 2
+# --- The one PAID rung: Gemini url_context, last and behind its own flag ---
+# It reaches hosts our client cannot (prod run 33775800806 read bls.gov and sagaftra.org PDFs
+# that our own fetch 403'd) because Gemini dials from Google's address, not ours. It is also the
+# only rung here that spends money and the only one that is model-MEDIATED — what comes back is
+# an answer about the page, not the page — so it ships OFF and stays off in every workflow until
+# the operator turns it on.
+RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV: str = "RESOLUTION_SOURCE_URL_CONTEXT_ENABLED"
+# Floor for the read. Well above the free rungs' because a url_context call is a model
+# round-trip that also fetches: the v2 reader's measured budget is tens of seconds, and below
+# 15 s of remaining wall this cannot land an answer before the provider's outer wait_for
+# discards every page the question already fetched.
+RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S: float = 15.0
+# ONE attempt, against gap-fill v2's two. The retry there exists because a 503 UNAVAILABLE
+# returns in milliseconds and leaves most of a 55 s budget for a second try; inside a 45 s
+# provider wall shared with every other cited URL there is no such room, and a second attempt
+# would spend the budget that renders the pages already fetched.
+RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS: int = 1
+
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
 # Search results (distinct from OpenRouter's Exa-backed :online plugin). Adds a

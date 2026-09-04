@@ -65,6 +65,14 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 # which keeps meaning "a content type we do not read at all" — the two answer
 # different questions, and a paid document read is only ever worth spending on
 # this one.
+# `ungrounded` is the PAID reader answering without having retrieved anything: Gemini's
+# url_context tool reported zero successful retrievals, so whatever text came back is recall
+# rather than a read of the page, and it is DISCARDED rather than rendered. Its own token because
+# it is the one failure that cost money, and because it says something no other status does —
+# the host answered a third-party fetcher's request with nothing while refusing ours. Mirrors the
+# grounded-chunk floor `gemini_search` applies and the identical guard on gap-fill v2's
+# `read_document`; the receipt for why is Q38195 (2026-07-19), where 30 search queries and 0
+# grounding chunks produced a confident fabricated table with fake `[primary]` tags.
 FetchStatus = Literal[
     "success",
     "blocked",
@@ -77,6 +85,7 @@ FetchStatus = Literal[
     "empty_body",
     "no_resolving_content",
     "unreadable_document",
+    "ungrounded",
 ]
 
 # Which rule produced a status that has more than one rule behind it. A telemetry token
@@ -98,6 +107,12 @@ FetchStatus = Literal[
 # belong to the `unsupported_type` a held-but-unparsed document earns, and say which rule
 # declined: the question ran out of wall, or every parse slot was taken. Without them a
 # skipped document is indistinguishable from a body that was never a document at all.
+#
+# `renderer_unavailable` is the browser rung declining before it rendered anything: Playwright
+# missing or broken, a host that will not pin to a public IP, a browser error, or a URL a
+# browser already read to nothing this run. It rides a rung attempt's `skipped_reason` rather
+# than a result's `status_reason` — nothing was rendered, so nothing about the page changed —
+# and it is here so the whole reason vocabulary has one home.
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -107,6 +122,7 @@ FetchStatusReason = Literal[
     "no_matching_passage",
     "budget_skipped",
     "parse_contention",
+    "renderer_unavailable",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the
@@ -124,6 +140,58 @@ FetchRoute = Literal[
     "wayback",
     "url_context",
 ]
+
+# One forecaster-facing sentence per non-direct route, rendered under the "primary grading
+# evidence" caveat for every route present in a question's snapshot. Keyed by `FetchRoute` and
+# ITERATED, so the mapping is both the vocabulary check and the render order: cheapest and most
+# transparent first, model-mediated last.
+#
+# `direct` is deliberately ABSENT rather than mapped to "". A route that adds nothing must be
+# unrepresentable here, because that is what makes an all-direct question's section
+# byte-identical to what it rendered before the ladder existed — the overwhelming majority of
+# questions, and the thing a diff against the archive has to keep clean.
+#
+# Each sentence says the same two things in its own terms: where the bytes came from, and what
+# the reader must not conclude from having them. The section they sit in is captioned primary
+# grading evidence, so a rung that quietly substituted one artifact for another would overstate
+# what was retrieved by exactly the amount that decides a forecast.
+ROUTE_CAVEATS: dict[FetchRoute, str] = {
+    "meta_refresh": (
+        "One or more sections below came from the page a cited URL redirected to through a "
+        "`<meta refresh>` tag rather than an HTTP redirect; the content is the target page's, "
+        "fetched normally."
+    ),
+    "pdf_local": (
+        "One or more sections below are the query-relevant passages of a cited PDF, extracted "
+        "locally — not the whole document. A figure that does not appear was not selected by that "
+        "extraction, which is different from being absent from the document."
+    ),
+    "impersonate": (
+        "One or more sections below were fetched on a retry that presented a different client "
+        "fingerprint after the host refused ours; the content is the page's own."
+    ),
+    "rendered": (
+        "One or more sections below were read from a page rendered in a headless browser, because "
+        "a plain fetch of it returned no text; the content is the page's own after its scripts ran."
+    ),
+    "derived_api": (
+        "One or more sections below are the JSON data feed a page loads its figures from rather "
+        "than page text, because the page itself carried no readable content. The lead on each "
+        "names the endpoint and says whether it was found on that page or on another page of the "
+        "same host."
+    ),
+    "wayback": (
+        "One or more sections below are ARCHIVED copies from the Wayback Machine rather than the "
+        "live page, because the live page could not be fetched. Each states its capture date and "
+        "its age in days: a quantity that has moved since that capture will not be in it."
+    ),
+    "url_context": (
+        "One or more sections below are a model's reading of a page this bot could not fetch, not "
+        "a copy of that page. Treat figures in them as REPORTED rather than retrieved, and weight "
+        "them below sections quoted from bytes the host served."
+    ),
+}
+
 
 # HTTP status -> FetchStatus for non-OK terminal responses — the ONE table both the
 # Tier-1 page fetch (_resolution_status_outcome) and the Tier-2 Datawrapper CDN hop

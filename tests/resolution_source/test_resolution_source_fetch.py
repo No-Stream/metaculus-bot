@@ -1011,12 +1011,17 @@ class TestResolutionSourceFetchMarker:
         ]
         assert not [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
-        assert counts == {
-            "meta_refresh_hops": 0,
-            "pdf_documents_read": 0,
-            "rung_budget_skips": 1,
-            "pdf_contention_skips": 0,
-        }
+        assert counts["rung_budget_skips"] == 1
+        # The rung's own FIRE count stays zero, which is the whole point: a skip must not inflate
+        # the rate at which the rung is measured to work.
+        assert counts["meta_refresh_hops"] == 0
+        # The withheld page also earned a browser attempt, which this package's autouse fixture
+        # declines — so the second skip is the transport reporting itself unavailable rather than
+        # another budget skip.
+        assert counts["renderer_unavailable_skips"] == 1
+        # A total rather than an exact dict: the key SET grows every time a rung lands, and a
+        # literal here made three unrelated commits edit this one test.
+        assert sum(counts.values()) == 2
 
 
 class TestFetchResolutionSources:
@@ -1274,8 +1279,14 @@ class TestMetaRefreshHop:
         assert result.status == "js_wall"
         assert result.route == "direct"
         assert session.requested == ["https://cdc.example.com/surveillance"]
-        assert [a.skipped_reason for a in result.rung_attempts] == ["wall_budget"]
+        # Two skips, both for want of wall: the meta-refresh hop and then the browser rung,
+        # each self-bounded against the same spent budget.
+        assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [
+            ("meta_refresh", "wall_budget"),
+            ("rendered", "wall_budget"),
+        ]
         assert any("skipping the meta-refresh hop" in m for m in caplog.messages)
+        assert any("skipping the rendered rung" in m for m in caplog.messages)
 
 
 class TestLocalPdfReading:

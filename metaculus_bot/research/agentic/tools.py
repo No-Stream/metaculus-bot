@@ -2,32 +2,36 @@
 
 This module owns the handlers (``search_news``, ``search_web``, ``fetch``,
 ``read_document``), the ladder spine they run on — the plain hop loop with its redirect
-vetting, the headless-Chromium rendered rung with its DNS pinning, the window cache that
-serves ``start_char`` continuations — and ``build_gap_fill_tools``, whose list order is the
-order the driver sees.
+vetting, the mapping of a rendered page onto this ladder's result type, the window cache
+that serves ``start_char`` continuations — and ``build_gap_fill_tools``, whose list order is
+the order the driver sees.
 
 Support pieces live next door: ``tool_descriptions`` (driver-facing text + JSON schemas),
 ``tool_backends`` (the AskNews / Exa / Gemini calls and their result formatting),
 ``fetch_outcomes`` (classifying one plain HTTP response), ``local_document`` (the local PDF
-rung, the run's document cache, and the passage digest ``read_document`` serves).
+rung, the run's document cache, and the passage digest ``read_document`` serves). The
+headless-Chromium TRANSPORT moved out one level, to ``research.rendered_fetch``, when the
+Tier-1 resolution-source fetcher gained the same rung — the DNS pin, the route guard and the
+process-global launch cap are all load-bearing and a second copy of any of them would drift.
+``_try_rendered_fetch`` stays here because what a rendered page MEANS is this ladder's
+business: extracted text plus outbound links for a driver model.
 
 The seams the suite monkeypatches
-— ``_read_response_body``, ``_fetch_plain``, ``_try_rendered_fetch``, ``_resolve_pinned_host``,
+— ``_read_response_body``, ``_fetch_plain``, ``_try_rendered_fetch``,
 ``_acquire_local_document``, ``_run_document_read_sync``, ``read_document``,
-``_READ_DOCUMENT_TIMEOUT_S``, ``_RENDERED_FETCH_GLOBAL_SEMAPHORE`` — are attributes of THIS
-module and are resolved here at call time, so their callers stay here even where the callee
-moved out.
+``_READ_DOCUMENT_TIMEOUT_S`` — are attributes of THIS module and are resolved here at call
+time, so their callers stay here even where the callee moved out. The render transport's own
+seams (``_resolve_pinned_host``, the launch semaphore) are attributes of ``rendered_fetch``
+and are patched there.
 """
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import logging
 import os
 from collections import OrderedDict
 from time import monotonic
-from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
@@ -65,7 +69,6 @@ from metaculus_bot.research.agentic.fetch_outcomes import (
     _plain_textual_outcome,
     matched_throttle_phrase,
 )
-from metaculus_bot.research.agentic.robots_policy import google_extended_disallows
 from metaculus_bot.research.agentic.tool_backends import (
     _call_asknews_search,
     _call_exa_search,
@@ -86,25 +89,18 @@ from metaculus_bot.research.agentic.tool_descriptions import (
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.document_text import is_pdf_body
 from metaculus_bot.research.http_fetch import (
-    BROWSER_HEADERS,
     MAX_REDIRECTS,
     REDIRECT_STATUSES,
     decode_text_body,
     read_body_capped,
 )
+from metaculus_bot.research.rendered_fetch import note_rendered_no_text, render_page
+from metaculus_bot.research.robots_policy import google_extended_blocks_url, robots_host
 
 logger = logging.getLogger(__name__)
 
 _FETCH_WINDOW_CHARS = 8000
 _FETCH_CACHE_MAX_ENTRIES = 50
-_RENDERED_FETCH_TIMEOUT_MS = 35_000
-# Fixed settle after the DOM is ready, in place of waiting for network idle. Measured
-# 2026-09-03: 4 of the replay's 10 render rescues came from pages where ``page.goto`` raised
-# TimeoutError with the DOM fully rendered (both ballotpedia questions, both fts.unocha.org
-# summaries) - network idle never arrives on a page carrying a long-poll widget or an
-# analytics beacon, so waiting for it discarded content Chromium already had. The worst case
-# is unchanged rather than longer: the goto budget below is the 35 s cap MINUS this settle.
-_RENDERED_SETTLE_MS = 2_000
 _READ_DOCUMENT_TIMEOUT_S = 60.0
 # read_document is acquisition-first, so its budget holds two rungs: the free local ladder,
 # then the paid reader on what the total leaves it. The ToolSpec ceiling stays 70 s (see
@@ -113,32 +109,14 @@ _READ_DOCUMENT_TIMEOUT_S = 60.0
 # common case for the URLs that reach it (archived all-fail p50 0.3 s).
 _LOCAL_DOCUMENT_BUDGET_S = 25.0
 _READ_DOCUMENT_TOTAL_BUDGET_S = 65.0
-# Process-global cap on concurrent headless Chromium launches. Module-level, so
-# the bound spans all questions running under the orchestrator's Semaphore(6):
-# each Chromium is ~100-300MB, the driver's parallel_tool_calls can request many
-# fetches in one step, and an unbounded 6·N launch would OOM the runner (an
-# escape try/except cannot catch). Cap 2 covers real bursts of 1-3 rendered
-# pages while bounding worst-case memory.
-_RENDERED_FETCH_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
 _FETCH_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 _FETCH_TEXT_CACHE: OrderedDict[str, str] = OrderedDict()
 _FETCH_LINKS_CACHE: OrderedDict[str, list[str]] = OrderedDict()
-# URLs where Chromium ran and extracted nothing, so the second launch a documented escalation
-# would spend (a js-walled `fetch` the driver follows with `read_document`) is skipped: 100-300
-# MB and up to 35 s out of the process-global launch cap, to learn what this run already knows.
-# Deliberately records ONLY that outcome. A `blocked` or `error` GET is not memoized — 429 sits
-# in the retryable block set and the driver is TOLD to try those URLs again, so caching them
-# would suppress a retry the tool descriptions promise (and a throttle interstitial is exactly
-# the q45191 case that must stay re-requestable).
-_RENDERED_NO_TEXT: OrderedDict[str, None] = OrderedDict()
-_PLAYWRIGHT_WARNED = False
 
-# One robots.txt read per host, for the Google-Extended pre-check on the paid reader. The value
-# is the fetched text, or None when we could not read it (which proceeds to pay). Bounded and
-# FIFO like the two caches above rather than a plain dict, because this is process-global state
-# that outlives one question: a whole run's hosts would otherwise accumulate here.
+# Timeout for this path's robots.txt read. The per-host CACHE is shared with the Tier-1
+# resolution-source reader (``robots_policy``), because a host's policy is a property of the host
+# and the two paths routinely reach the same government domains in one run.
 _ROBOTS_FETCH_TIMEOUT_S = 5.0
-_ROBOTS_TXT_CACHE: OrderedDict[str, str | None] = OrderedDict()
 
 
 def _host_gate(url: str) -> asyncio.Semaphore:
@@ -250,14 +228,6 @@ def _empty_fetch_outcome(url: str) -> ToolOutcome:
     fetched-tier method) and re-launder the tier.
     """
     return ToolOutcome(content_markdown=_NO_CONTENT_FETCH_MSG.format(url=url), method="empty", status="empty")
-
-
-def _warn_playwright_unavailable_once(exc: BaseException) -> None:
-    global _PLAYWRIGHT_WARNED  # noqa: PLW0603  # one-shot process-wide warn latch so the rendered rung logs once per run
-    if _PLAYWRIGHT_WARNED:
-        return
-    _PLAYWRIGHT_WARNED = True
-    logger.warning("agentic fetch rendered rung unavailable: %s: %s", type(exc).__name__, exc)
 
 
 async def _read_response_body(
@@ -381,240 +351,40 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
     return PlainFetchResult(status="error", method="plain", text="Redirect limit exceeded.", links=[], url=url)
 
 
-def _host_resolver_rule(host: str, ip: str) -> str:
-    """Build the Chromium ``--host-resolver-rules`` MAP value pinning ``host`` to ``ip``.
-
-    IPv6 literals must be bracketed in the MAP target per Chromium's rule parser
-    (``MAP host [dead::beef]``); IPv4 literals are bare. A malformed ``ip`` is
-    passed through unbracketed — callers only ever feed this a value already
-    vetted by :func:`_resolve_pinned_host`, so that branch is defensive only.
-    """
-    try:
-        parsed_ip = ipaddress.ip_address(ip)
-    except ValueError:
-        target = ip
-    else:
-        target = f"[{ip}]" if parsed_ip.version == 6 else ip
-    return f"--host-resolver-rules=MAP {host} {target}"
-
-
-def _pinnable_url_host(url: str) -> str | None:
-    """Hostname of a URL eligible for DNS pinning, or None when the URL itself disqualifies it."""
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return None
-    if parsed.scheme.lower() not in ("http", "https"):
-        return None
-    # Userinfo defeats hostname-based trust (`https://trusted@10.0.0.1/`).
-    if parsed.username is not None or parsed.password is not None:
-        return None
-    return parsed.hostname or None
-
-
-async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
-    """Vet ``url``'s host and resolve it to ONE public IP for Chromium DNS pinning.
-
-    Returns ``(host, vetted_ip)`` — the ``--host-resolver-rules=MAP`` operands — or
-    ``None`` when the URL is non-public, unresolvable, or ANY resolved address is
-    disallowed. Mirrors :func:`resolution_source.is_public_http_url`'s classification
-    (scheme, userinfo, and the shared :func:`resolution_source.resolve_vetted_public_ip`
-    predicate) so Chromium can only dial an address the airtight aiohttp
-    ``FilteringResolver`` path would also accept.
-
-    This is what closes the DNS-rebinding TOCTOU on the rendered rung: the per-request
-    ``_guard_route`` preflight runs its own ``getaddrinfo`` independently of Chromium's
-    socket connect, so a rebinding host (TTL 0) can pass the preflight and connect to a
-    private IP. Pinning the main-frame host to a single pre-vetted IP removes that
-    second resolution entirely — Chromium's connect can only reach the vetted address.
-
-    Fails CLOSED: on any rejection the caller skips Chromium for that host and the
-    fetch ladder degrades to plain / read_document.
-    """
-    host = _pinnable_url_host(url)
-    if not host:
-        return None
-
-    # IP-literal host: no DNS to rebind. Vet directly and pin to itself.
-    try:
-        literal = ipaddress.ip_address(host)
-    except ValueError:
-        literal = None
-    if literal is not None:
-        if resolution_source._ip_is_disallowed(literal):
-            return None
-        return host, str(literal)
-
-    vetted_ip = await resolution_source.resolve_vetted_public_ip(host)
-    if vetted_ip is None:
-        return None
-    return host, vetted_ip
-
-
-async def _navigate_and_read_dom(page: Any, url: str, playwright_error: type[BaseException]) -> tuple[str, str]:
-    """Navigate to ``url``, let it settle, and return ``(content_type, html)``.
-
-    Two changes from the original ``networkidle`` navigation, both measured 2026-09-03. The
-    wait condition is ``domcontentloaded`` plus a fixed settle, because network idle never
-    arrives on a page carrying a long-poll widget or an analytics beacon. And a goto failure is
-    SALVAGED rather than treated as a dead rung: Playwright's ``TimeoutError`` subclasses
-    ``Error``, and a timed-out goto routinely leaves a fully rendered DOM behind — 4 of the
-    replay's 10 render rescues came from exactly that (both ballotpedia questions, both
-    fts.unocha.org summaries). A genuine navigation error lands here too and salvages an empty
-    ``about:blank``, which reaches the ladder as the same "rendered read nothing" as before.
-
-    The worst case is unchanged rather than longer: the goto budget is
-    ``_RENDERED_FETCH_TIMEOUT_MS`` MINUS the settle, so goto (33 s) plus settle (2 s) still
-    tops out at the same 35 s cap, and on the common path DOM-ready returns far sooner than
-    network idle did. ``playwright_error`` is passed in because the class comes from the
-    function-scoped optional import in the caller.
-    """
-    try:
-        response = await page.goto(
-            url, wait_until="domcontentloaded", timeout=_RENDERED_FETCH_TIMEOUT_MS - _RENDERED_SETTLE_MS
-        )
-    except playwright_error as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # the salvage above: Playwright's own Error class, passed in from the optional import
-        logger.debug("agentic rendered fetch goto failed, salvaging DOM: %s: %s", type(exc).__name__, exc)
-        response = None
-    await page.wait_for_timeout(_RENDERED_SETTLE_MS)
-    content_type = (
-        (response.headers.get("content-type") or "").lower()
-        if response is not None and hasattr(response, "headers")
-        else ""
-    )
-    return content_type, await page.content()
-
-
-async def _vet_route(route: Any, request: Any, playwright_error: type[BaseException]) -> None:
-    """Let one request Chromium is about to make through, or abort it.
-
-    ``playwright_error`` is passed in because the class comes from the caller's function-scoped
-    optional import. A request can still be in flight when the page/context tears down (typically
-    after a goto timeout): ``continue_``/``abort`` then races the close and raises
-    ``TargetClosedError`` in this detached event-listener task — the unhandled-error storm seen
-    2026-07-25. It is swallowed because a closed target has no live socket, so an abort that
-    "fails" because the target is already gone still lets nothing through and the SSRF guarantee
-    is unaffected; ``unroute_all`` in the caller's ``finally`` is the primary drain and this is the
-    residual-race backstop. Only Playwright's own Error is caught, so a genuine bug still
-    propagates.
-    """
-    try:
-        if await resolution_source.is_public_http_url(request.url):
-            await route.continue_()
-        else:
-            await route.abort("blockedbyclient")
-    except playwright_error as exc:  # the teardown race documented above, not a broad catch
-        logger.debug("agentic route guard race during teardown: %s", exc)
-
-
-def _note_rendered_no_text(url: str) -> None:
-    """Record that Chromium rendered ``url`` and there was no text in the result."""
-    _RENDERED_NO_TEXT[url] = None
-    _RENDERED_NO_TEXT.move_to_end(url)
-    while len(_RENDERED_NO_TEXT) > _FETCH_CACHE_MAX_ENTRIES:
-        _RENDERED_NO_TEXT.popitem(last=False)
-
-
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
-    if url in _RENDERED_NO_TEXT:
-        # A browser already read this URL to nothing in this run. None is the same "the rendered
-        # rung gave us nothing" both callers already handle for a missing/failed Chromium.
-        logger.debug("agentic rendered fetch skipped (already rendered to nothing): %s", urlparse(url).netloc)
-        return None
-    try:
-        from playwright.async_api import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-            Error as PlaywrightError,
-        )
-        from playwright.async_api import async_playwright  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # optional-dep import boundary: playwright missing/broken degrades the rendered rung, never the run
-        _warn_playwright_unavailable_once(exc)
-        return None
+    """Render ``url`` in headless Chromium and read it as this ladder does a plain page.
 
-    # Pin Chromium's DNS to a single pre-vetted public IP BEFORE launch. If the
-    # host can't be resolved to a public address, fail closed: skip Chromium and
-    # let the ladder fall back to plain / read_document (same graceful-failure
-    # signal as a playwright-unavailable / render-error return).
-    pinned = await _resolve_pinned_host(url)
-    if pinned is None:
-        logger.warning("agentic rendered fetch skipped (host not pinnable to a public IP): %s", urlparse(url).netloc)
+    The transport is ``research.rendered_fetch`` (shared with the Tier-1 resolution-source
+    rung); what stays here is the MAPPING onto ``PlainFetchResult``, which is this ladder's
+    own contract: a document content type re-enters the ``read_document`` escalation, an
+    extraction with text is an ``ok`` page for the driver, and an extraction with none is an
+    ``error`` whose method is still ``rendered`` — never ``ok``, because the loop grants the
+    ``fetched`` verification tier on status alone.
+
+    A ``None`` from the transport (Playwright missing, host not pinnable, browser error, or a
+    URL a browser already read to nothing this run) is returned unchanged: it is the
+    graceful-failure signal both call sites already degrade on.
+    """
+    page = await render_page(url, host_gate=_host_gate(url))
+    if page is None:
         return None
-    host, vetted_ip = pinned
-
-    try:
-        async with _host_gate(url), _RENDERED_FETCH_GLOBAL_SEMAPHORE, async_playwright() as playwright:
-            # --host-resolver-rules pins the browser's own resolution to the IP we
-            # vetted above, so Chromium's socket connect cannot independently
-            # re-resolve `host` to a private address (the DNS-rebinding TOCTOU that
-            # the per-request preflight in _guard_route alone cannot close). A fresh
-            # browser is launched per call, so per-launch host-resolver-rules is clean.
-            browser = await playwright.chromium.launch(
-                headless=True,
-                args=[_host_resolver_rule(host, vetted_ip)],
-            )
-            context = await browser.new_context(
-                user_agent=BROWSER_HEADERS["User-Agent"],
-                extra_http_headers={key: value for key, value in BROWSER_HEADERS.items() if key != "User-Agent"},
-            )
-
-            # Defense-in-depth on top of the main-frame pin above. The route guard
-            # re-checks EVERY request Chromium makes (main-frame goto, server and
-            # client-side redirects, subresources) against is_public_http_url.
-            # Threat model: these fetches run on GitHub-hosted Azure runners, where a
-            # request to a link-local / RFC1918 host (Azure IMDS at 169.254.169.254,
-            # localhost services, the internal runner network) would exfiltrate
-            # internal content into the research prompt AND the public Metaculus
-            # comment. The main-frame host is now pinned, so its rebinding TOCTOU is
-            # closed; subresource / redirect hosts remain guarded only by this
-            # per-request preflight (whose getaddrinfo resolves independently of
-            # Chromium's connect), so their rebinding TOCTOU is a documented residual
-            # — a filtering forward proxy would close it, deferred as its own change.
-            async def _guard_route(route: Any, request: Any) -> None:
-                # A thin closure so the registration keeps Playwright's expected handler shape
-                # while the vetting itself stays module-level and directly testable.
-                await _vet_route(route, request, PlaywrightError)
-
-            await context.route("**/*", _guard_route)
-            page = await context.new_page()
-            try:
-                content_type, html = await _navigate_and_read_dom(page, url, PlaywrightError)
-                if _content_type_is_document(content_type):
-                    return _document_needed_result(url, content_type)
-                body = html.encode("utf-8", errors="replace")
-                extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, url)
-                links = _extract_links_from_html(html, url)
-                text = (extracted or "").strip()
-                if not text:
-                    _note_rendered_no_text(url)
-                    return PlainFetchResult(status="error", method="rendered", text="", links=links, url=url)
-                return PlainFetchResult(
-                    status="ok",
-                    method="rendered",
-                    text=text,
-                    links=links,
-                    url=url,
-                    content_type=content_type or None,
-                )
-            finally:
-                # Drain in-flight route handlers BEFORE teardown. Without this, a
-                # request still in flight when we close (common after a goto
-                # timeout) fires _guard_route against the closing context and raises
-                # TargetClosedError in a detached event listener — the unhandled
-                # traceback storm seen 2026-07-25 that buries real fetch failures in
-                # the logs. unroute_all(ignoreErrors) removes the handlers and
-                # silently swallows any still mid-flight (Playwright's own remedy for
-                # this exact message). SSRF is unaffected: the guard already ran for
-                # every request dialed while the page was live, and a request racing
-                # teardown has no live target to exfiltrate through. Guarded so a
-                # teardown-race error here can't skip context/browser close (leak).
-                try:
-                    await context.unroute_all(behavior="ignoreErrors")
-                except PlaywrightError as exc:
-                    logger.debug("agentic rendered fetch unroute_all race: %s", exc)
-                await context.close()
-                await browser.close()
-    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # top-level soft-fail for the rendered fetch rung: any browser failure falls back to plain / read_document
-        _warn_playwright_unavailable_once(exc)
-        return None
+    if _content_type_is_document(page.content_type):
+        return _document_needed_result(url, page.content_type)
+    body = page.html.encode("utf-8", errors="replace")
+    extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, url)
+    links = _extract_links_from_html(page.html, url)
+    text = (extracted or "").strip()
+    if not text:
+        note_rendered_no_text(url)
+        return PlainFetchResult(status="error", method="rendered", text="", links=links, url=url)
+    return PlainFetchResult(
+        status="ok",
+        method="rendered",
+        text=text,
+        links=links,
+        url=url,
+        content_type=page.content_type or None,
+    )
 
 
 async def search_news(query: str) -> ToolOutcome:
@@ -843,17 +613,8 @@ _ROBOTS_DISALLOWED_MSG = (
 )
 
 
-def _robots_host(url: str) -> str:
-    """``url``'s netloc with any userinfo dropped: the robots cache key, and what gets logged.
-
-    The port stays, since a host's policy is served per origin. Userinfo goes because it must
-    reach neither a robots.txt request nor the archived telemetry line.
-    """
-    return urlparse(url).netloc.rpartition("@")[2]
-
-
-async def _robots_txt_for_host(url: str) -> str | None:
-    """``url``'s host's robots.txt, fetched at most once per host; None when we could not read it.
+async def _fetch_robots_txt(robots_url: str) -> str | None:
+    """Read one robots.txt through THIS path's ladder; None when we could not read it.
 
     Goes through ``_fetch_plain`` rather than its own client so the SSRF preflight, the
     filtering resolver, the redirect vetting and the body cap all apply unchanged. That path
@@ -862,24 +623,14 @@ async def _robots_txt_for_host(url: str) -> str | None:
     directives", i.e. proceed and pay, which is the only direction an unreadable robots.txt is
     allowed to fail in.
     """
-    host = _robots_host(url)
-    if host in _ROBOTS_TXT_CACHE:
-        return _ROBOTS_TXT_CACHE[host]
-    body: str | None = None
     try:
-        result = await asyncio.wait_for(
-            _fetch_plain(f"{urlparse(url).scheme}://{host}/robots.txt"), timeout=_ROBOTS_FETCH_TIMEOUT_S
-        )
+        result = await asyncio.wait_for(_fetch_plain(robots_url), timeout=_ROBOTS_FETCH_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # pre-check soft-fail boundary: a robots.txt we cannot read must degrade to paying, never to failing the read
-        logger.debug("agentic robots.txt pre-check failed for %s: %s: %s", host, type(exc).__name__, exc)
-    else:
-        if result.status == "ok" and result.method == "plain":
-            body = result.text
-    _ROBOTS_TXT_CACHE[host] = body
-    _ROBOTS_TXT_CACHE.move_to_end(host)
-    while len(_ROBOTS_TXT_CACHE) > _FETCH_CACHE_MAX_ENTRIES:
-        _ROBOTS_TXT_CACHE.popitem(last=False)
-    return body
+        logger.debug("agentic robots.txt pre-check failed for %s: %s: %s", robots_url, type(exc).__name__, exc)
+        return None
+    if result.status == "ok" and result.method == "plain":
+        return result.text
+    return None
 
 
 async def _url_context_robots_skip(url: str) -> bool:
@@ -887,12 +638,10 @@ async def _url_context_robots_skip(url: str) -> bool:
 
     Only the paid ``url_context`` rung consults this: the free rungs dial from our own client
     under our own user agent, and this bot's reading of ``Content-Signal: use=reference`` is
-    that reference use is permitted. Proven live 2026-09-03 — see ``robots_policy``.
+    that reference use is permitted. Proven live 2026-09-03 — see ``robots_policy``, which owns
+    the per-host cache this shares with the Tier-1 reader.
     """
-    robots_txt = await _robots_txt_for_host(url)
-    if robots_txt is None:
-        return False
-    return google_extended_disallows(robots_txt, urlparse(url).path)
+    return await google_extended_blocks_url(url, fetch_text=_fetch_robots_txt)
 
 
 async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -> ToolOutcome:
@@ -940,9 +689,9 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     if await _url_context_robots_skip(url):
         # Its own status token, never mapped to a tier: nothing was read, and the reason is the
         # host's policy rather than a failure worth retrying.
-        logger.info(f"AGENTIC_URLCONTEXT_ROBOTS_SKIP: url={url} host={_robots_host(url)}")
+        logger.info(f"AGENTIC_URLCONTEXT_ROBOTS_SKIP: url={url} host={robots_host(url)}")
         return _format_fetch_error(
-            _ROBOTS_DISALLOWED_MSG.format(host=_robots_host(url)),
+            _ROBOTS_DISALLOWED_MSG.format(host=robots_host(url)),
             status="robots_disallowed",
             method="document",
         )
