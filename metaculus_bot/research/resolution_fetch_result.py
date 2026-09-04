@@ -242,9 +242,20 @@ class RungAttempt:
     rather than the page it led to: the stub is the URL the QUESTION cited and the one
     every earlier fetch record is filed under, so it is what a "which cited sources need
     this rung" cut has to key on.
-    ``wall_s`` is None until the attempt finishes: a rung whose cost is a local parse
-    knows it immediately, while the meta-refresh hop is only over once the followed
-    request comes back, which happens a layer above where the attempt is created.
+    ``wall_s`` and ``outcome`` are THIS rung's own: what the attempt cost, and the status
+    that stood once it was over — its rescue, its verdict (the Wayback withhold, the paid
+    reader's ``ungrounded``), or the direct status it left standing when it declined. Both
+    are None until the dispatcher closes the rung (``FetchContext.close_rungs``), because a
+    rung is only over once its result is known a layer above where the attempt is created:
+    the meta-refresh hop ends when the followed request comes back, the browser rung when
+    its harvest fallback has been tried. A rung that measures something finer stamps itself
+    and the closer leaves the stamp alone: the local PDF read stamps ``wall_s`` inside the
+    parse gate so queueing for a slot is not billed to the parse, and the browser rung
+    stamps ``outcome`` with the rendered DOM's own verdict before the harvested feed gets
+    its turn, so a feed that rescues the page does not read as the render having done so.
+    Before the closer existed both fields were whole-ladder values stamped once at the end,
+    which billed every rung for the latency of the rungs after it and made a rung that fired
+    and failed read as having rescued the page.
 
     ``skipped_reason`` marks an attempt that never ran (no wall budget left). Those are
     NOT escalation lines — the marker means "a rung fired" — so they ride the provider's
@@ -257,6 +268,7 @@ class RungAttempt:
     url: str
     started_at: float
     wall_s: float | None = None
+    outcome: FetchStatus | None = None
     skipped_reason: str = ""
 
     def finish(self, now: float) -> None:

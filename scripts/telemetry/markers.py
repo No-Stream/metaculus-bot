@@ -815,8 +815,16 @@ MARKER_SPECS: list[MarkerSpec] = [
         # ``from_status`` is the verbatim ``FetchStatus`` that triggered the escalation (the
         # unreadable-page family: ``blocked`` / ``js_wall`` / ``no_resolving_content``), so the
         # trigger population is queryable without joining back to the fetch marker. ``rung``
-        # names the route tried and ``outcome`` what came back, which keeps a rung that fires
-        # often but rescues nothing distinguishable from one that never fires at all.
+        # names the route tried. ``outcome`` and ``wall_s`` are THAT RUNG's own, stamped as it
+        # closes (``RungAttempt``): ``outcome`` is the status that stood once the rung was over
+        # — its rescue, its verdict (``stale_data``, ``ungrounded``), or the direct status it
+        # left standing when it declined — and ``wall_s`` is what that rung alone cost. So on a
+        # page where a dead feed GET was followed by a rescuing render, the first line reads the
+        # direct status and the second reads ``success``, which is what keeps a rung that fires
+        # often but rescues nothing distinguishable from one that never fires at all. (Before
+        # the per-rung close existed — never on main — both fields were whole-ladder values,
+        # so every line for a URL carried the FINAL status and each rung was billed for the
+        # latency of the rungs after it.)
         #
         # The token cannot collide with ``RESOLUTION_SOURCE_FETCH``: both specs match on their
         # own full marker word plus the colon, and neither word is a prefix of the other, so

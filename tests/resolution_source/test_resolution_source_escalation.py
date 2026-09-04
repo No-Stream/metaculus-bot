@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from typing import get_args
@@ -41,6 +42,7 @@ from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
     _embed_shell_page,
+    _meta_refresh_stub,
     _mock_question,
     _prose_page,
 )
@@ -523,9 +525,17 @@ class TestDerivedApiRung:
         calls: list[dict[str, object]] = []
         harvested = self._harvested()
 
-        async def _slow_render(url: str, *, host_gate, goto_timeout_ms: int, harvest_json: bool = False):
+        async def _slow_render(
+            url: str,
+            *,
+            memo_scope: str,
+            host_gate,
+            goto_timeout_ms: int,
+            deadline_monotonic_s: float | None = None,
+            harvest_json: bool = False,
+        ):
             calls.append({"url": url, "goto_timeout_ms": goto_timeout_ms, "harvest_json": harvest_json})
-            del host_gate
+            del host_gate, memo_scope, deadline_monotonic_s
             # Long enough that the sibling task reaches its own escalation while this render is
             # still in flight, which is the interleaving the fan-out produces.
             await asyncio.sleep(0.02)
@@ -659,6 +669,106 @@ class TestDerivedApiRung:
         assert len(result.text) <= 400
         # The lead LEADS, so a later trim reaches the JSON before the provenance line.
         assert result.text.startswith("[This page's own HTML carried no readable content.")
+
+
+class TestEscalationLinesArePerRung:
+    """``outcome`` and ``wall_s`` on the ``RESOLUTION_SOURCE_ESCALATION`` line belong to the rung
+    the line is about, not to the ladder.
+
+    Before the per-rung close, both were stamped once after the whole ladder: every line for a
+    URL carried the FINAL status, so a rung that fired and failed read as having rescued the
+    page, and each attempt's wall ran to the end of the last rung. Reproduced on the repo's own
+    dead-feed-then-browser shape — three lines for one URL, all ``outcome=success``, the first a
+    feed GET that answered 503.
+    """
+
+    _FEED = '{"series":[{"date":"2026-09-01","osborn":47.2,"ricketts":45.8}]}'
+    _SECOND_URL = "https://tracker.example.com/house"
+
+    def _harvested(self) -> RenderedPage:
+        return RenderedPage(
+            url=_URL,
+            content_type="text/html",
+            html=_JS_SHELL.decode(),
+            json_responses=(HarvestedJson(url=_FEED_URL, body=self._FEED.encode()),),
+        )
+
+    async def test_a_dead_feed_get_then_a_rescuing_render_read_as_two_outcomes(self, monkeypatch, caplog):
+        harvested = self._harvested()
+
+        async def _slow_render(url: str, **kwargs: object) -> RenderedPage:
+            del url, kwargs
+            # Measurable, so the feed GET's wall is provably NOT the ladder's.
+            await asyncio.sleep(0.02)
+            return harvested
+
+        monkeypatch.setattr(resolution_source, "render_page", _slow_render)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                self._SECOND_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+                # Reached only by the second URL's derived-feed GET (the first is served straight
+                # off its render), and dead.
+                _FEED_URL: FakeResponse(503, body=b"", content_type="text/html"),
+            }
+        )
+
+        await _fetch_one(session, _URL, {})
+        second = await _fetch_one(session, self._SECOND_URL, {})
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            resolution_source._log_fetch_outcome_markers(999, [second])
+
+        feed_get, render, harvest = second.rung_attempts
+        assert [(a.rung, a.outcome) for a in (feed_get, render, harvest)] == [
+            ("derived_api", "js_wall"),
+            # The render's OWN verdict: the DOM was still empty, and the harvested feed is what
+            # rescued the page.
+            ("rendered", "js_wall"),
+            ("derived_api", "success"),
+        ]
+        escalations = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
+        assert [re.findall(r"rung=(\S+) outcome=(\S+)", m) for m in escalations] == [
+            [("derived_api", "js_wall")],
+            [("rendered", "js_wall")],
+            [("derived_api", "success")],
+        ]
+        # Per-rung walls: the feed GET was closed before the render opened, so it is not billed
+        # for the launch that followed it; the render's wall is at least its own sleep.
+        assert feed_get.wall_s is not None
+        assert render.wall_s is not None
+        assert feed_get.started_at + feed_get.wall_s <= render.started_at
+        assert render.wall_s >= 0.02
+        assert feed_get.wall_s < render.wall_s
+
+    async def test_the_direct_fetchs_own_rungs_are_closed_with_its_status(self, monkeypatch, caplog):
+        """A meta-refresh hop that led to a JS wall, then a browser that rescued it: the hop's
+        line reads the status it left standing, the render's reads the rescue."""
+        target = "https://cdc.example.com/data/current"
+        stub = "https://cdc.example.com/surveillance"
+        monkeypatch.setattr(
+            resolution_source,
+            "render_page",
+            _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), []),
+        )
+        session = FakeSession(
+            {
+                stub: FakeResponse(200, body=_meta_refresh_stub("/data/current")),
+                target: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
+            }
+        )
+
+        result = await _fetch_one(session, stub, {})
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            resolution_source._log_fetch_outcome_markers(999, [result])
+
+        assert result.status == "success"
+        assert [(a.rung, a.outcome) for a in result.rung_attempts] == [
+            ("meta_refresh", "js_wall"),
+            ("rendered", "success"),
+        ]
+        escalations = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
+        assert "rung=meta_refresh outcome=js_wall" in escalations[0]
+        assert "rung=rendered outcome=success" in escalations[1]
 
 
 def _snapshot_url(page_url: str, *, captured: datetime) -> str:

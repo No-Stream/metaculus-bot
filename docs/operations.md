@@ -1308,9 +1308,14 @@ the telemetry markers:
   the escalation, and which statuses appear depends on the rung: the unreadable-page family
   (`blocked`, `js_wall`, `no_resolving_content`) for the browser and derived-feed rungs, plus
   `error` and `not_found` for the Wayback rung, whose whole point is a page our address never
-  reached. `rung` is the route tried, `outcome` is what came back, and
-  `wall_s` is what that rung cost. The `RESOLUTION_SOURCE_FETCH` line above records only
-  the FINAL outcome per URL, so on its own it cannot say how many rungs were spent or
+  reached. `rung` is the route tried. `outcome` and `wall_s` are that RUNG's own, stamped as
+  the dispatcher closes it: `outcome` is the status that stood once the rung was over (its
+  rescue, its own verdict such as `stale_data` or `ungrounded`, or the direct status it left
+  standing when it declined) and `wall_s` is what that rung alone cost. A URL with several
+  lines therefore reads as a sequence, and on a page where a dead feed GET was followed by a
+  rescuing render the first line carries the direct status and the second carries `success`,
+  with neither billed for the other's latency. The `RESOLUTION_SOURCE_FETCH` line above records
+  only the FINAL outcome per URL, so on its own it cannot say how many rungs were spent or
   which one rescued the page; this marker is where a rung that fires often and rescues
   nothing becomes distinguishable from one that never fires, and where the latency case
   for keeping a rung on a question under a close-derived time budget gets made. A rung that

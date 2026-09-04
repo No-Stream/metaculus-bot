@@ -869,6 +869,24 @@ class FetchContext:
             )
         )
 
+    def close_rungs(self, first_new: int, outcome: FetchStatus) -> None:
+        """Close every attempt opened since ``first_new`` with ONE clock reading and one outcome.
+
+        The dispatcher calls this the moment a rung's result is known — ``first_new`` is
+        ``len(ctx.rungs)`` read before the rung ran — so each attempt's ``wall_s`` measures
+        that rung alone and its ``outcome`` is the status that stood once it was over: the
+        rescue it returned, or the direct status it left standing when it declined. A rung
+        that already stamped either field for itself keeps its stamp (``finish`` respects the
+        PDF read's own ``wall_s``; the browser rung's own ``outcome`` is the rendered DOM's
+        verdict), which is what keeps a harvested feed's rescue from being credited to the
+        render that only found the endpoint.
+        """
+        now = time.monotonic()
+        for attempt in self.rungs[first_new:]:
+            attempt.finish(now)
+            if attempt.outcome is None and not attempt.skipped_reason:
+                attempt.outcome = outcome
+
 
 def _aux_ctx(ctx: FetchContext) -> FetchContext:
     """A child context for a request a rung makes on the cited URL's BEHALF.
@@ -912,10 +930,13 @@ def _stamped_with_route(result: FetchResult, ctx: FetchContext) -> FetchResult:
     ``route`` is the LAST rung that fired, which is the one that produced this outcome
     (a meta-refresh hop onto a PDF reads ``pdf_local``: the hop got us the bytes, the
     local read is what the text came from). Skipped rungs never claim the route.
+
+    Every rung the dispatcher ran has already been closed with its own wall and outcome
+    (:meth:`FetchContext.close_rungs`); the close here is the last resort for an attempt a
+    future rung opens without bracketing, and stamps it with the final status rather than
+    leaving the marker to print ``None``.
     """
-    now = time.monotonic()
-    for attempt in ctx.rungs:
-        attempt.finish(now)
+    ctx.close_rungs(0, result.status)
     result.rung_attempts = list(ctx.rungs)
     fired: list[FetchRoute] = [attempt.rung for attempt in ctx.rungs if not attempt.skipped_reason]
     if fired:
@@ -1839,6 +1860,10 @@ async def _rendered_rung(
         # when a goto timed out and the DOM was salvaged, and a non-200 never reaches here.
         http_status=direct.http_status if direct.http_status is not None else 200,
     )
+    # The render's own verdict, stamped before the harvest gets its turn: when the harvested
+    # feed rescues the page, the ladder's result is `success` and the closer would otherwise
+    # credit the render with a rescue the DOM never delivered.
+    attempt.outcome = classified.result.status
     if classified.result.status == "success":
         return classified.result
     derived = _derived_api_from_harvest(url, direct, page, ctx)
@@ -2330,6 +2355,10 @@ async def _escalate_unresolved(
     (``stale_data``, a capture we read and will not serve); it is kept as the fallback rather
     than as an early return, so the paid rung below is still reachable for that page.
 
+    Each rung is closed the moment its result is known (:meth:`FetchContext.close_rungs`), so
+    the attempts it opened carry that rung's own wall and outcome rather than the ladder's:
+    the status it returned, or the direct status it left standing when it declined.
+
     ``session`` is the aiohttp session the rungs that issue an ordinary GET use; the browser
     rung ignores it, because Chromium brings its own transport.
     """
@@ -2340,7 +2369,9 @@ async def _escalate_unresolved(
         # same-host sibling asks `endpoint_for` only after this escalation has recorded (or
         # failed to record) an endpoint — see `QuestionRungBudget.browser_escalation_gate`.
         async with ctx.shared.browser_escalation_gate(url):
+            first_new = len(ctx.rungs)
             derived = await _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+            ctx.close_rungs(first_new, (derived or direct).status)
             if derived is not None:
                 return derived
             # Declined HERE rather than inside the rung: the rung's own gates all cost something
@@ -2349,13 +2380,17 @@ async def _escalate_unresolved(
             if ctx.fast_path:
                 _skip_for_fast_path(ctx, "rendered", direct, url)
             else:
+                first_new = len(ctx.rungs)
                 rendered = await _rendered_rung(url, direct, host_sems, ctx)
+                ctx.close_rungs(first_new, (rendered or direct).status)
                 if rendered is not None:
                     return rendered
     # Reached only for the statuses the browser rungs do not claim — the two trigger sets are
     # disjoint by construction (see `_WAYBACK_TRIGGER_STATUSES`), so the order between them is a
     # reading choice: free-and-local first, then the route whose egress is not ours.
+    first_new = len(ctx.rungs)
     wayback = await _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    ctx.close_rungs(first_new, (wayback or direct).status)
     if wayback is not None and wayback.status == "success":
         return wayback
     # Last, because it is the only rung that spends money and the only one whose product is a
@@ -2364,7 +2399,9 @@ async def _escalate_unresolved(
     # capture too old to serve is still a page we could not read fresh, which is exactly the
     # population this rung exists for. The withhold stays the fallback below, so with the flag
     # off (or the reader declining) a stale capture still reports `stale_data`.
+    first_new = len(ctx.rungs)
     read = await _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+    ctx.close_rungs(first_new, (read or wayback or direct).status)
     if read is not None:
         return read
     return wayback if wayback is not None else direct
@@ -2382,6 +2419,9 @@ async def _fetch_one(
     """
     ctx = FetchContext() if ctx is None else ctx
     direct = await _fetch_direct(session, url, host_sems, ctx)
+    # The rungs inside the direct fetch (the meta-refresh hop, the local PDF read) are over
+    # once it returns, and its status is what they left standing.
+    ctx.close_rungs(0, direct.status)
     escalated = await _escalate_unresolved(session, url, direct, host_sems=host_sems, ctx=ctx)
     return _stamped_with_route(escalated, ctx)
 
@@ -2875,9 +2915,13 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     Each rung that FIRED also gets one ``RESOLUTION_SOURCE_ESCALATION`` line. The
     fetch line above carries only the final outcome, so on its own it cannot say
     whether a rung rescued the page or what the attempt cost — and ``wall_s`` is what
-    decides whether a rung earns its latency under a close-derived time budget. The
-    ``url`` on an escalation line is the URL the rung was invoked ON, which for a
-    meta-refresh hop is the stub rather than the target the fetch line names.
+    decides whether a rung earns its latency under a close-derived time budget. Both
+    ``outcome`` and ``wall_s`` are the RUNG's own (``RungAttempt``): the status that stood
+    once that rung was over and what that rung alone cost, so on a page where a dead feed
+    GET was followed by a rescuing render the first line reads the direct status and the
+    second reads ``success``, and neither is billed for the other's latency. The ``url``
+    on an escalation line is the URL the rung was invoked ON, which for a meta-refresh hop
+    is the stub rather than the target the fetch line names.
     """
     for r in results:
         reason = f" reason={r.status_reason}" if r.status_reason else ""
@@ -2893,7 +2937,7 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
                 continue
             logger.info(
                 f"RESOLUTION_SOURCE_ESCALATION: question={qid} url={attempt.url} "
-                f"from_status={attempt.from_status} rung={attempt.rung} outcome={r.status} "
+                f"from_status={attempt.from_status} rung={attempt.rung} outcome={attempt.outcome} "
                 f"wall_s={attempt.wall_s if attempt.wall_s is not None else 0.0:.2f}"
             )
 
