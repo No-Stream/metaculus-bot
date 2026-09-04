@@ -627,14 +627,18 @@ RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host se
 # table). So this is the observed elbow, and it stays deliberately below it: a page above
 # the floor keeps its text (plus the embed disclosure where one applies), because
 # withholding a terse-but-real data table costs more than leaving one shell visible.
-# UNMOVED but re-read 2026-09-03, when `_extract_main_text` dropped `favor_precision=True`:
-# that census was measured on the precision extractor, and dropping the flag only ever
-# LENGTHENS an extraction, so the floor now binds on strictly fewer pages. Live over 149
-# archived HTML URLs, 10 crossed the floor upward and 9 of them carry the resolving content
-# (funding tables, two Yahoo history tables, a market's own resolution rules); the tenth is
-# a JS flight board whose column headers plus disclaimer now total 644, i.e. one shell
-# published where one was withheld. Left where it is: the elbow it was fitted to is a
-# property of what chrome weighs, not of the extractor, and refitting it against a
+# UNMOVED but re-read 2026-09-03, when the extractor policy changed under it. That census was
+# measured on the precision extractor alone. The floor is now applied twice per page
+# (`resolution_source._extract_page_text`): first to the default (recall) extraction, which
+# only ever LENGTHENS a text relative to precision, so on that pass the floor binds on strictly
+# fewer pages — live over 149 archived HTML URLs, 10 crossed it upward and 9 of them carry the
+# resolving content (funding tables, two Yahoo history tables, a market's own resolution
+# rules); the tenth is a JS flight board whose column headers plus disclaimer total 644, i.e.
+# one shell published where one was withheld. Then, when the default text clears the floor on
+# chrome alone (the line-shape metric below), to the `favor_precision` re-extraction of the same
+# bytes, which is the extractor the census was fitted on, so a precision text under the floor
+# is withheld as `thin_page` exactly as before. Left where it is: the elbow it was fitted to is
+# a property of what chrome weighs, not of the extractor, and refitting it against a
 # recall-era census is its own measurement.
 RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
 # The line-shape check on an extraction that clears the floor (`resolution_source.content_share`):
@@ -643,6 +647,18 @@ RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
 # 2026-09-03 on 118 bodies, receipt `scratch/fetch_ladder_2026-09-03/chrome_calibration.md`.
 RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS: int = 60  # a non-table line at least this long is content, shorter is chrome
 RESOLUTION_SOURCE_CONTENT_SHARE_MIN: float = 0.38
+# Wall budget under which the `favor_precision` re-extraction is skipped and the default text is
+# withheld as it would be had that pass failed (`resolution_source._extract_page_text`). The pass
+# is CPU, runs after the body is already in hand — on the rendered rung after the browser has
+# spent the whole remaining budget — and costs a little more than the default pass did on the
+# same bytes: on a synthetic div-soup dashboard DOM on the operator's laptop (2026-09-04) the
+# precision pass took 1.5 s at 1 MiB, 3.2 s at 2 MiB and 9.7 s at 5 MiB (nested list menus run
+# 5-10x cheaper; the second review pass measured 42 s at 5.2 MiB on a heavier synthetic tree),
+# against the 2 s margin the rung leaves the provider's wall. Sized so a body around 1-2 MiB
+# still gets its second pass on a slower GitHub runner; a bigger body near the wall is withheld
+# rather than published, and the real lever for those is `RENDERED_DOM_MAX_CHARS` (FUTURE.md).
+# Read against the wall remaining AFTER the default pass, so that pass's own cost counts.
+RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S: float = 5.0
 # --- Inline chart configs (Highcharts), read straight out of the page we already hold ---
 # qid 43949: the resolving IOM page fetched 200 and extracted ~80k chars of incident rows
 # and prose carrying none of the resolving figures, because the annual series lives in

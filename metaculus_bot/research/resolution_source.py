@@ -133,6 +133,7 @@ import os
 import socket
 import time
 from collections import Counter
+from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -170,6 +171,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MIN_SECTION_CHARS,
     RESOLUTION_SOURCE_PDF_MIN_BUDGET_S,
     RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+    RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S,
     RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S,
     RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
@@ -730,15 +732,15 @@ def _extract_main_text(body: bytes | str, url: str, *, favor_precision: bool = F
     (a body this module already decoded and rewrote — see :func:`_extract_page_text`).
 
     Default recall is the primary extraction and ``favor_precision=True`` the fallback, under
-    the policy :func:`_extract_page_text` applies. Precision alone shipped here until
-    2026-09-03 and withheld readable pages (kasa.go.kr pruned to 78 chars, two tracxn funding
-    tables, manifold's market body). Default alone then shipped for a day, measured by
-    character count, which is the wrong metric under a head-preserving cap: on congress.gov
-    it swaps the 2,411-char bill-status card for 54,393 chars of a member-name dropdown
-    (trafilatura's readability fallback replaces the main extraction when readability's
-    text is over twice as long, and only precision prunes the dropdown out of that backup
-    tree first), and menu trees (abs.gov.au, kasa.go.kr) clear the chrome floor as
-    `success`. The receipt for running both is the 2026-09-03 calibration
+    the policy :func:`_extract_page_text` applies, because each setting alone loses pages the
+    other reads. Precision alone withholds readable pages (kasa.go.kr pruned to 78 chars, two
+    tracxn funding tables, manifold's market body). Default alone publishes chrome: on
+    congress.gov it swaps the 2,411-char bill-status card for 54,393 chars of a member-name
+    dropdown (trafilatura's readability fallback replaces the main extraction when
+    readability's text is over twice as long, and only precision prunes the dropdown out of
+    that backup tree first), and menu trees (abs.gov.au, kasa.go.kr) clear the chrome floor as
+    `success` — and character count, the metric that once picked it, is the wrong one under a
+    head-preserving cap. The receipt for running both is the 2026-09-03 calibration
     (`scratch/fetch_ladder_2026-09-03/chrome_calibration.md`: 118 bodies, five extractor
     variants on identical bytes, texts labelled by hand). ``include_comments=False`` stays
     at both settings.
@@ -1012,17 +1014,20 @@ def _stamped_with_route(result: FetchResult, ctx: FetchContext) -> FetchResult:
 
     ``route`` is the LAST rung that fired, which is the one that produced this outcome
     (a meta-refresh hop onto a PDF reads ``pdf_local``: the hop got us the bytes, the
-    local read is what the text came from). Skipped rungs never claim the route.
+    local read is what the text came from). Skipped rungs never claim the route. The one
+    exception is a result that already names its rung: a rung's VERDICT (the Wayback
+    ``stale_data`` withhold) can be returned as the ladder's fallback after a later rung
+    fired and failed, and the last rung to fire is then not the one that produced it.
 
     Every rung the dispatcher ran has already been closed with its own wall and outcome
-    (:meth:`FetchContext.close_rungs`); the close here is the last resort for an attempt a
-    future rung opens without bracketing, and stamps it with the final status rather than
-    leaving the marker to print ``None``.
+    (:func:`_run_rung`); the close here is the last resort for an attempt a future rung
+    opens without bracketing, and stamps it with the final status rather than leaving the
+    marker to print ``None``.
     """
     ctx.close_rungs(0, result.status)
     result.rung_attempts = list(ctx.rungs)
     fired: list[FetchRoute] = [attempt.rung for attempt in ctx.rungs if not attempt.skipped_reason]
-    if fired:
+    if fired and result.route == "direct":
         result.route = fired[-1]
     return result
 
@@ -1088,7 +1093,7 @@ async def _vetted_hop_target(
 async def _resolution_redirect_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult | str:
     """Vet a 3xx hop: the next URL to follow, or a terminal error/blocked result."""
     status = resp.status
-    location = resp.headers.get("Location") if resp.headers else None
+    location = resp.headers.get("Location")
     if not location:
         # Malformed redirect — no Location header.
         logger.info(f"resolution_source {urlparse(current_url).netloc}: {status} redirect with no Location header")
@@ -1112,6 +1117,17 @@ def _network_failure_class(exc: BaseException) -> str:
     them — and the whole point of the field is to tell a host that refused our TLS from one our
     egress IP could not resolve. ``exc`` on the same line keeps the exact class name for anything
     this coarse vocabulary lumps together.
+
+    ``malformed_response`` is a response aiohttp's parser refused before the body was ours: a
+    ``Content-Encoding`` it cannot decode (the trueup.io zstd failure that had the brotli and zstd
+    decoders added, 2026-09-03), a header past the session's size caps, a bad status line. The
+    parser raises those as ``HttpProcessingError`` and the client re-raises them as
+    ``ClientResponseError(status=400)``, a SIBLING of ``ClientPayloadError`` under ``ClientError``
+    rather than a subclass, so ``decode`` cannot claim them and ``connection`` used to. Its own
+    token rather than a wider ``decode`` because the two say different things: ``decode`` is a
+    body that arrived and could not be read, this is a response that never got that far. Nothing
+    on this path calls ``raise_for_status`` or follows redirects through aiohttp, so a
+    ``ClientResponseError`` here is always the parser's.
     """
     if isinstance(exc, TimeoutError):
         return "timeout"
@@ -1123,6 +1139,8 @@ def _network_failure_class(exc: BaseException) -> str:
         return "dns"
     if isinstance(exc, aiohttp.ClientPayloadError):
         return "decode"
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return "malformed_response"
     return "connection"
 
 
@@ -1161,12 +1179,25 @@ class _PageExtraction:
     precision_rescued: bool = False
 
 
-def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio: float) -> _PageExtraction:
+def _extract_page_text(
+    html_text: str, body: bytes, url: str, undecodable_ratio: float, *, remaining_wall_s: float | None = None
+) -> _PageExtraction:
     """The publishable extraction of an HTML body: ARIA tables rewritten first, default
     recall as the primary extractor, precision as the fallback, both scored by line shape.
 
     All of it is CPU-bound sync work over a body up to the response cap, so it runs in one
     ``asyncio.to_thread`` hop rather than several.
+
+    The precision pass is the one part of it that is skippable, and it is skipped when
+    ``remaining_wall_s`` — the provider wall the caller had left when it handed the body over,
+    less what the default pass has since spent — is under
+    ``RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S``. Nothing budgets this work otherwise: the
+    rendered rung gives the browser its whole remaining budget and classifies the DOM afterwards,
+    and a 5 MiB navigation tree costs seconds per pass against the 2 s margin the rung leaves the
+    outer ``wait_for``, which discards every page the question already fetched when it fires. A
+    skipped pass takes the exit a FAILED pass takes, the default text withheld under the metric,
+    so the wall can only ever withhold a page here, never publish one the metric refused. None,
+    the default, means unbounded, which is what the direct-path tests drive it with.
 
     The policy, calibrated 2026-09-03 (receipt on ``RESOLUTION_SOURCE_CONTENT_SHARE_MIN``):
     the default extraction publishes when it clears the chrome floor and
@@ -1201,6 +1232,7 @@ def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio:
     accents. Any U+FFFD at all means this decode lost information trafilatura might not
     have, and the rewrite is the only thing that forecloses its own encoding detection.
     """
+    started = time.monotonic()
     rewritten = rewrite_aria_tables(html_text) if undecodable_ratio == 0.0 else None
     source = body if rewritten is None else rewritten
     default = _extract_main_text(source, url)
@@ -1210,6 +1242,16 @@ def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio:
         or content_share(default) >= RESOLUTION_SOURCE_CONTENT_SHARE_MIN
     ):
         return _PageExtraction(text=default)
+    if remaining_wall_s is not None:
+        wall_left_s = remaining_wall_s - (time.monotonic() - started)
+        if wall_left_s < RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S:
+            logger.info(
+                "resolution_source: skipping the precision re-extraction for %s — %.1fs of wall budget left; "
+                "withholding the default text",
+                urlparse(url).netloc,
+                wall_left_s,
+            )
+            return _PageExtraction(text=default, chrome_metric_withheld=True)
     precision = _extract_main_text(source, url, favor_precision=True)
     if (
         precision is not None
@@ -1297,7 +1339,7 @@ class _HtmlClassification:
 
 
 async def _classify_html_body(
-    body: bytes, current_url: str, content_type: str, *, http_status: int
+    body: bytes, current_url: str, content_type: str, *, http_status: int, remaining_wall_s: float | None = None
 ) -> _HtmlClassification:
     """Trafilatura extraction plus the inline-chart rung and the chrome / JS-wall checks.
 
@@ -1305,6 +1347,10 @@ async def _classify_html_body(
     fetch, a meta-refresh hop, or a headless-Chromium render. That is what makes a rescued
     page indistinguishable from a directly-fetched one downstream — same chart read, same ARIA
     rewrite, same floors, same disclosure leads.
+
+    ``remaining_wall_s`` is the provider wall the caller has left (``FetchContext.rung_budget_s``),
+    handed through to :func:`_extract_page_text` so its optional second pass can decline under
+    the floor; both production callers pass it, and None keeps the pass unbounded.
 
     Order of the three verdicts, and why:
 
@@ -1340,7 +1386,9 @@ async def _classify_html_body(
     html_text, undecodable_ratio = decode_text_body(body, content_type)
     charts = extract_datawrapper_charts(html_text)
     unreadable_embeds = unreadable_data_embed_providers(html_text)
-    extraction = await asyncio.to_thread(_extract_page_text, html_text, body, current_url, undecodable_ratio)
+    extraction = await asyncio.to_thread(
+        _extract_page_text, html_text, body, current_url, undecodable_ratio, remaining_wall_s=remaining_wall_s
+    )
     extracted = extraction.text
     # In a thread for the same reason the extraction is: it is sync CPU work (one
     # regex sweep plus a `json.loads` per config) over a body up to the 5 MiB
@@ -1414,7 +1462,9 @@ async def _resolution_html_outcome(
             http_status=status,
             content_type=content_type or None,
         )
-    classified = await _classify_html_body(body, current_url, content_type, http_status=status)
+    classified = await _classify_html_body(
+        body, current_url, content_type, http_status=status, remaining_wall_s=ctx.rung_budget_s()
+    )
     if classified.result.status == "success":
         return classified.result
     hop = await _meta_refresh_hop(
@@ -1742,14 +1792,14 @@ async def _resolution_response_outcome(
     caller to run outside the host semaphore; every other branch is terminal or a hop.
     """
     status = resp.status
-    content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
+    content_type = (resp.headers.get("Content-Type") or "").lower()
 
     if status in REDIRECT_STATUSES:
         return await _resolution_redirect_outcome(resp, current_url, content_type)
 
     # Non-redirect response — same status routing as before. The `Server` header rides the
     # non-200 result so a 403 can be attributed to the CDN that served it (Akamai / Cloudflare).
-    server = resp.headers.get("Server") if resp.headers else None
+    server = resp.headers.get("Server")
     non_ok = _resolution_status_outcome(status, current_url, content_type, server=server)
     if non_ok is not None:
         return non_ok
@@ -1795,8 +1845,12 @@ async def _fetch_one_hop(
     comes back as a :class:`_PendingDocument` and is parsed after both have exited, because
     that parse is seconds of CPU and the host gate is loop-wide (see
     :class:`_PendingDocument`). The HTML branch's ``to_thread`` hops still run inside the
-    semaphore — trafilatura on a capped page is short next to the request it follows, and
-    moving it would trade a measured hazard for an unmeasured restructure.
+    semaphore and the open response, and since the extractor policy they can be TWO
+    trafilatura passes rather than one: the second is skipped under
+    ``RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S`` of remaining wall, which bounds the
+    worst case without moving the work. Moving it would trade a measured hazard for an
+    unmeasured restructure (FUTURE.md carries the entry); the meta-refresh hop that follows
+    the classification needs the decoded text inside this loop either way.
     """
     async with _sem_for_host(host_sems, current_url):
         hop_timeout_s = min(RESOLUTION_SOURCE_HTTP_TIMEOUT, max(ctx.rung_budget_s(), _MIN_HOP_TIMEOUT_S))
@@ -2017,6 +2071,9 @@ async def _rendered_rung(
         # text, which is the fact the record should keep. Chromium reports no status at all
         # when a goto timed out and the DOM was salvaged, and a non-200 never reaches here.
         http_status=direct.http_status if direct.http_status is not None else 200,
+        # What the browser left of the wall: the render spent the rest, and the extractor's
+        # optional second pass declines under its floor rather than overrunning the provider.
+        remaining_wall_s=ctx.rung_budget_s(),
     )
     # The render's own verdict, stamped before the harvest gets its turn: when the harvested
     # feed rescues the page, the ladder's result is `success` and the closer would otherwise
@@ -2204,6 +2261,11 @@ async def _wayback_snapshot_result(
             failure_class=direct.failure_class,
             exc=direct.exc,
             server=direct.server,
+            # A verdict names its own rung. The dispatcher otherwise stamps the LAST rung that
+            # fired, and the paid rung fires after this one: a stale capture the reader then
+            # failed to improve on came back `route=url_context status=stale_data`, a status that
+            # rung cannot produce, on the field that partitions the archive by route.
+            route="wayback",
         )
     # The lead LEADS and its cost comes out of the per-URL cap (:func:`_lead_then_capped_body`):
     # an archived page whose age line has been trimmed off is being passed off as the live one.
@@ -2514,6 +2576,27 @@ async def _url_context_rung(
     )
 
 
+async def _run_rung(
+    ctx: FetchContext, fallback: FetchStatus, rung: Awaitable[FetchResult | None]
+) -> FetchResult | None:
+    """Await one rung and close the attempts it opened with that rung's own wall and outcome.
+
+    The one home for the bracket every dispatcher site used to copy by hand: read
+    ``len(ctx.rungs)`` before the rung runs, await it, then close every attempt opened since
+    with the status that stood once it was over — its result's, or ``fallback`` (the status it
+    left standing) when it declined (:meth:`FetchContext.close_rungs`). Structural rather than
+    stylistic: a rung awaited without the bracket still returned its result, and its attempt fell
+    through to :func:`_stamped_with_route`'s last-resort close, which stamps the ladder's FINAL
+    status and the whole-ladder wall — the two figures the per-rung close exists to keep apart,
+    with the marker parsing either way. ``rung`` is the coroutine created at the call site, which
+    runs none of its code until it is awaited here, so the length is read first.
+    """
+    first_new = len(ctx.rungs)
+    result = await rung
+    ctx.close_rungs(first_new, fallback if result is None else result.status)
+    return result
+
+
 async def _escalate_unresolved(
     session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
 ) -> FetchResult:
@@ -2527,9 +2610,9 @@ async def _escalate_unresolved(
     (``stale_data``, a capture we read and will not serve); it is kept as the fallback rather
     than as an early return, so the paid rung below is still reachable for that page.
 
-    Each rung is closed the moment its result is known (:meth:`FetchContext.close_rungs`), so
-    the attempts it opened carry that rung's own wall and outcome rather than the ladder's:
-    the status it returned, or the direct status it left standing when it declined.
+    Each rung is closed the moment its result is known (:func:`_run_rung`), so the attempts it
+    opened carry that rung's own wall and outcome rather than the ladder's: the status it
+    returned, or the direct status it left standing when it declined.
 
     ``session`` is the aiohttp session the rungs that issue an ordinary GET use; the browser
     rung ignores it, because Chromium brings its own transport.
@@ -2541,9 +2624,9 @@ async def _escalate_unresolved(
         # same-host sibling asks `endpoint_for` only after this escalation has recorded (or
         # failed to record) an endpoint — see `QuestionRungBudget.browser_escalation_gate`.
         async with ctx.shared.browser_escalation_gate(url):
-            first_new = len(ctx.rungs)
-            derived = await _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-            ctx.close_rungs(first_new, (derived or direct).status)
+            derived = await _run_rung(
+                ctx, direct.status, _derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+            )
             if derived is not None:
                 return derived
             # Declined HERE rather than inside the rung: the rung's own gates all cost something
@@ -2552,17 +2635,13 @@ async def _escalate_unresolved(
             if ctx.fast_path:
                 _skip_for_fast_path(ctx, "rendered", direct, url)
             else:
-                first_new = len(ctx.rungs)
-                rendered = await _rendered_rung(url, direct, host_sems, ctx)
-                ctx.close_rungs(first_new, (rendered or direct).status)
+                rendered = await _run_rung(ctx, direct.status, _rendered_rung(url, direct, host_sems, ctx))
                 if rendered is not None:
                     return rendered
     # Reached only for the statuses the browser rungs do not claim — the two trigger sets are
     # disjoint by construction (see `_WAYBACK_TRIGGER_STATUSES`), so the order between them is a
     # reading choice: free-and-local first, then the route whose egress is not ours.
-    first_new = len(ctx.rungs)
-    wayback = await _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    ctx.close_rungs(first_new, (wayback or direct).status)
+    wayback = await _run_rung(ctx, direct.status, _wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx))
     if wayback is not None and wayback.status == "success":
         return wayback
     # Last, because it is the only rung that spends money and the only one whose product is a
@@ -2570,10 +2649,11 @@ async def _escalate_unresolved(
     # It is asked about the DIRECT outcome, and an archive WITHHOLD does not stand in its way: a
     # capture too old to serve is still a page we could not read fresh, which is exactly the
     # population this rung exists for. The withhold stays the fallback below, so with the flag
-    # off (or the reader declining) a stale capture still reports `stale_data`.
-    first_new = len(ctx.rungs)
-    read = await _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    ctx.close_rungs(first_new, (read or wayback or direct).status)
+    # off (or the reader declining) a stale capture still reports `stale_data`. The paid rung's
+    # own attempt closes on the DIRECT status when it declines, like every other rung: the
+    # archive's verdict is not an outcome a model read can produce, and on the escalation line
+    # `rung=url_context outcome=stale_data` read as if it had.
+    read = await _run_rung(ctx, direct.status, _url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx))
     if read is not None:
         return read
     return wayback if wayback is not None else direct
@@ -2595,6 +2675,12 @@ async def _fetch_one(
     # once it returns, and its status is what they left standing.
     ctx.close_rungs(0, direct.status)
     escalated = await _escalate_unresolved(session, url, direct, host_sems=host_sems, ctx=ctx)
+    if direct.chrome_metric_withheld:
+        # The withhold is a fact about this URL's ladder, carried onto whatever the ladder
+        # returns for it: a rung's rescue has its own extraction, which the metric never
+        # withheld, so summed off final results alone the withholds the ladder then paid off
+        # — the policy's whole point — reached no count at all (`chrome_metric_withholds`).
+        escalated.chrome_metric_withheld = True
     return _stamped_with_route(escalated, ctx)
 
 
@@ -2677,7 +2763,7 @@ def _datawrapper_hop_status(status: int) -> FetchStatus:
 
 def _datawrapper_last_modified(resp: Any) -> datetime | None:
     """The dataset's parsed ``Last-Modified``, or None when absent or unparseable."""
-    raw = resp.headers.get("Last-Modified") if resp.headers else None
+    raw = resp.headers.get("Last-Modified")
     return parse_http_last_modified(raw) if raw else None
 
 
@@ -2726,7 +2812,7 @@ def _datawrapper_success_text(
 async def _datawrapper_dataset_outcome(resp: Any, chart: DatawrapperChartRef, parent_url: str, url: str) -> FetchResult:
     """Turn the CDN response into a FetchResult, serving the dataset live or not at all."""
     status = resp.status
-    content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
+    content_type = (resp.headers.get("Content-Type") or "").lower()
     hop_status = _datawrapper_hop_status(status)
     if hop_status != "success":
         return FetchResult(
@@ -2739,7 +2825,7 @@ async def _datawrapper_dataset_outcome(resp: Any, chart: DatawrapperChartRef, pa
             chart_title=chart.title,
             parent_url=parent_url,
             failure_class=http_failure_class(status),
-            server=server_header_token(resp.headers.get("Server") if resp.headers else None),
+            server=server_header_token(resp.headers.get("Server")),
         )
 
     body = await read_body_capped(
@@ -3202,25 +3288,31 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # flag on and GOOGLE_API_KEY unset the paid rung fires nowhere, and without this key
         # that run is byte-identical in the archive to one with the flag off.
         "url_context_no_api_key_skips": skips_by_reason["no_api_key"],
-        # The extractor policy's two decisions, per final result: an extraction the line-shape
-        # metric withheld because it cleared the chrome floor on navigation alone (including a
-        # chart-rescued page, whose chart block still published), and a page published from
-        # the precision re-extraction after the default one failed the same metric.
+        # The extractor policy's decisions, per cited URL. `chrome_metric_withholds`: the
+        # line-shape metric withheld an HTML extraction of the URL somewhere on its ladder — the
+        # final result's own (including a chart-rescued page, whose chart block still published
+        # without that text) or the direct fetch's, carried onto the rung result that replaced it
+        # (`_fetch_one`). `chrome_metric_withholds_rescued`: the subset a rung past the direct
+        # fetch then served (`route` is not `direct` and the result is a success) — the policy's
+        # headline win, a menu tree withheld and the price table rendered, which summed off the
+        # rescue's own flag alone reached neither key. `precision_fallback_rescues`: the published
+        # text is the precision re-extraction, taken after the default one failed the metric.
         "chrome_metric_withholds": sum(1 for r in results if r.chrome_metric_withheld),
+        "chrome_metric_withholds_rescued": sum(
+            1 for r in results if r.chrome_metric_withheld and r.status == "success" and r.route != "direct"
+        ),
         "precision_fallback_rescues": sum(1 for r in results if r.precision_rescued),
     }
 
 
 # Every rung with a wall-budget floor, i.e. every rung that can record a `wall_budget` skip, in
-# ladder order. `_rung_counts` breaks the aggregate `rung_budget_skips` out per member.
-_BUDGET_GATED_RUNGS: tuple[FetchRoute, ...] = (
-    "meta_refresh",
-    "pdf_local",
-    "derived_api",
-    "rendered",
-    "wayback",
-    "url_context",
-)
+# ladder order. `_rung_counts` breaks the aggregate `rung_budget_skips` out per member. Derived
+# from the skip-phrase map rather than spelled a second time, because the two drifted in
+# opposite directions: a rung phrased but not listed here silently lost its `<rung>_budget_skips`
+# key from the archive, and a rung listed but not phrased raised `KeyError` from inside
+# `claim_rung_budget`, which the provider's `gather(return_exceptions=False)` turns into losing
+# every page of the question. Dict insertion order is the ladder order, so the keys are unchanged.
+_BUDGET_GATED_RUNGS: tuple[FetchRoute, ...] = tuple(_RUNG_WALL_SKIP_PHRASE)
 
 
 def _document_query(question: MetaculusQuestion) -> str:

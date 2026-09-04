@@ -351,14 +351,17 @@ class RungAttempt:
     parse gate so queueing for a slot is not billed to the parse, and the browser rung
     stamps ``outcome`` with the rendered DOM's own verdict before the harvested feed gets
     its turn, so a feed that rescues the page does not read as the render having done so.
-    Before the closer existed both fields were whole-ladder values stamped once at the end,
-    which billed every rung for the latency of the rungs after it and made a rung that fired
-    and failed read as having rescued the page.
 
-    ``skipped_reason`` marks an attempt that never ran (no wall budget left). Those are
-    NOT escalation lines — the marker means "a rung fired" — so they ride the provider's
-    ``details["counts"]`` instead, where a zero renders nothing but survives into the
-    archive.
+    ``skipped_reason`` marks an attempt that produced no result for the page. Most never
+    ran: no wall budget left, a per-question cap spent, the fast path, a memo hit, no
+    browser, no key, a robots refusal. Two DID run and were thrown away — ``render_timeout``
+    is a render cut off before its DOM could be read, ``render_non_200`` one whose main frame
+    the edge answered with something other than a 200 — so a skip means "nothing came of this
+    rung", not "no work was done". Skips are NOT escalation lines — the marker means "a rung
+    fired and finished" — so they ride the provider's ``details["counts"]`` instead, where a
+    zero renders nothing but survives into the archive; that is also why the most expensive
+    render the ladder produces, a cut-off one, shows up in ``render_timeout_skips`` and never
+    on the latency marker.
     """
 
     rung: FetchRoute
@@ -410,14 +413,20 @@ class FetchResult:
     # majority and renders no extra telemetry at all.
     route: FetchRoute = "direct"
     rung_attempts: list[RungAttempt] = field(default_factory=list)
-    # The HTML extractor policy's decision (`resolution_source._extract_page_text`); False off
-    # the HTML path. `chrome_metric_withheld`: the extraction cleared the chrome floor on
-    # navigation alone and the line-shape metric withheld it. That is an extraction the metric
-    # withheld, not necessarily a page: on a chart-rescued page the chart block still publishes
-    # alone and this stays True, while on a page with no chart block the `thin_page` reason
-    # covers this and the under-floor case alike. `precision_rescued`: the published text is the
-    # `favor_precision` re-extraction, taken after the default one failed that metric. Both
-    # ride `details["counts"]`, so no status or reason token moved.
+    # The HTML extractor policy's decisions (`resolution_source._extract_page_text`); False off
+    # the HTML path. `chrome_metric_withheld`: the line-shape metric withheld an HTML extraction
+    # of this URL somewhere on its ladder — an extraction that cleared the chrome floor on
+    # navigation alone. That is a fact about the URL's ladder, not necessarily about this
+    # result's text: on a chart-rescued page the chart block still publishes alone and this
+    # stays True; on a page with no chart block the `thin_page` reason covers this and the
+    # under-floor case alike; and on a page a later rung rescued (the rendered DOM, a derived
+    # feed, the paid reader) the flag is CARRIED from the direct fetch onto the rescue
+    # (`_fetch_one`), whose own extraction the metric never saw, so the withholds the ladder
+    # then paid off are counted rather than lost. `precision_rescued`: the published text is the
+    # `favor_precision` re-extraction, taken after the default one failed that metric (this
+    # result's own; an archived copy carries the snapshot's). Both ride `details["counts"]`
+    # (`chrome_metric_withholds`, `chrome_metric_withholds_rescued`,
+    # `precision_fallback_rescues`), so no status or reason token moved.
     chrome_metric_withheld: bool = False
     precision_rescued: bool = False
     # Provenance for Tier-2 dataset results (None on ordinary page fetches).
@@ -430,7 +439,10 @@ class FetchResult:
     # own case rests on (the archived Akamai 403s reproduce only from the GitHub runner). All None
     # on a success and on every path that never touched a response. `failure_class` is a small
     # token vocabulary: `http_403` / `http_4xx` / `http_5xx` off the response, or `tls` / `dns` /
-    # `timeout` / `connection` / `decode` off the transport exception. `exc` is that exception's
+    # `timeout` / `connection` / `decode` / `malformed_response` off the transport exception
+    # (`resolution_source._network_failure_class`; the last is a response aiohttp's parser refused,
+    # an undecodable Content-Encoding or an oversized header, which is neither a connection fault
+    # nor a body we held and could not decode). `exc` is that exception's
     # class name. `server` is the `Server` response header, lower-cased and truncated — the
     # strongest tell of which CDN refused us. A rung verdict that REPLACES a failed direct fetch
     # on the marker line (the Wayback `stale_data` withhold, the paid reader's `ungrounded`)

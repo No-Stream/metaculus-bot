@@ -2760,3 +2760,55 @@ timing code with no fake-driven test that can prove it (the suite refuses real l
 more un-timed IPC in the rung's tail; it needs a live render against a busy page to verify.
 Since 2026-09-03 the rung is bounded at the remaining wall budget either way, so the noise costs
 log readability, not pages.
+
+### The rendered DOM ceiling is the real bound on post-render extraction cost (added 2026-09-04; LOW)
+
+`RENDERED_DOM_MAX_CHARS` is 5 MiB, sized to the response cap for memory. The rendered rung hands
+the browser its whole remaining wall budget and classifies the DOM afterwards, and every
+trafilatura pass over that DOM is unbudgeted CPU inside the 2 s margin the rung leaves the
+provider's outer `wait_for`, which discards every page the question already fetched when it
+fires. Measured 2026-09-04 on the operator's laptop, synthetic div-soup dashboard DOM: the
+default pass 1.1 / 2.6 / 8.3 s and the precision pass 1.5 / 3.2 / 9.7 s at 1 / 2 / 5 MiB
+(nested menu lists run 5-10x cheaper; the second forge pass measured 42 s for both passes at
+5.2 MiB on a heavier synthetic tree). The same-day fix bounds only the SECOND pass
+(`RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S`: skipped under the floor, with the default
+text withheld as if the pass had failed), which can only ever withhold. The first pass is still
+unbounded, and at 5 MiB it alone overruns the margin on this laptop, let alone on a GitHub
+runner sharing its thread pool with up to five sibling URLs. The lever is the ceiling: 1-2 MiB
+would hold the default pass to a few seconds. Not moved in this bundle because nothing measures
+how many rescuable DOMs sit between 1 and 5 MiB (the phase-3 QA sweep's 12 rendered successes
+were all far smaller). Read the fall season's `route=rendered` successes first; if none of them
+needed the band, lower the ceiling, and if some did, the alternative is a reserve inside the
+render budget sized to the DOM the browser actually returned.
+
+### The HTML extraction runs inside the per-host gate and the open response (added 2026-09-04; LOW)
+
+`_fetch_one_hop` holds the loop-wide per-host `Semaphore(1)` and the aiohttp response context
+across the HTML branch's `to_thread` extraction, on the grounds that trafilatura on a capped page
+is short next to the request it follows. Since extractor policy D (2026-09-03) that branch can
+run TWO trafilatura passes, and since the same day the gate is process-wide, so a second pass on
+a large body holds every other question's request to that host and keeps the connection open
+meanwhile. The 2026-09-04 wall-budget floor on the second pass bounds the worst case; it does not
+move the work. The structural fix is the one the PDF branch already has: hand the body back as a
+pending classification (`_PendingDocument`'s shape) and extract after both contexts have exited.
+Not done in this bundle because it re-orders the meta-refresh hop (which needs the decoded text
+inside the loop) around the release, in the one choke point every hop passes through, for a
+hazard nothing has yet measured. Measure first: the `RESOLUTION_SOURCE_FETCH` line has no
+per-fetch extraction time, so add one before deciding.
+
+### Rendered companiesmarketcap table drops the company names and corrupts the rank cell (QA P3-6, added 2026-09-04; LOW)
+
+From the phase-3 QA sweep (`/tmp/fetchprobe/qa_report_phase3.md`, P3-6): the rendered
+`https://companiesmarketcap.com/` page (`route=rendered`, 5,589 chars) extracts every row as
+`| <rank> | <market cap> | <price> | <today %> | <country> |` with the Name column empty, and
+ranks 16, 21, 25, 29 read `116`, `221`, `925`, `329` because a movement badge is concatenated
+onto the rank. The market caps are present and in order, so the question it served ("How many
+trillion-dollar companies...") stays answerable; a question about which company holds which rank
+would not be. Extraction quality, not routing: the rung fetched and classified the right page,
+and what is wrong is how trafilatura flattened two of its cells. The DOM has not been examined
+(the QA sweep recorded the rendered text, not the markup), so the cause is unconfirmed; the
+shape suggests a name cell whose only text is inside a nested element trafilatura drops and a
+rank cell carrying a second inline element. Deferred as LOW because the fix is a cell-flattening
+pass before extraction that wants a corpus of rendered tables to calibrate against rather than
+one page, and the ARIA rewrite does not apply (this is a real `<table>`). Revisit if a
+resolution criterion keys on a ranking.
