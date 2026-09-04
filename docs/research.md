@@ -890,7 +890,13 @@ publishes. A text that clears the floor on short lines alone is chrome, and the 
 re-extracted with `favor_precision=True`, which is the one trafilatura setting that prunes
 navigation out of the backup tree its readability fallback swaps in; that text publishes only
 if it clears the floor and the same metric. Otherwise the page is withheld as
-`no_resolving_content` with reason `thin_page`, so the rendered rung still fires. The two
+`no_resolving_content` with reason `thin_page`, so the rendered rung still fires. That second
+pass is unbudgeted CPU on a body already in hand, so it is skipped when the default pass leaves
+less than `RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S` (5 s) of the provider wall: a 5 MiB
+navigation-tree DOM measured 42 s in one pass, and an overrun there discards every page the
+question already fetched. A skipped pass withholds the page exactly
+as a failed one does, so the rendered rung still gets its turn and the counts read the same. The
+two
 cases that fixed the policy: congress.gov, where the default extraction replaces the 2,411-char
 bill-status card ("Latest Action", "Passed House") with 54,393 chars of a member-name
 dropdown and precision restores the card; and uk.finance.yahoo.com, whose 1,191-char direct
@@ -907,8 +913,9 @@ metric, and kasa's ticker line is withheld with its menu. Precision alone shippe
 tables, manifold's market body); default alone shipped for one day on a character-count
 measurement, which under a head-preserving 6,000-char cap is the wrong metric, and the
 earlier claim that its biggest gainers had been read by hand and were all content was
-wrong. Both decisions ride `details["counts"]` as `chrome_metric_withholds` and
-`precision_fallback_rescues`; no status or reason token changed.
+wrong. The policy's decisions ride `details["counts"]` as `chrome_metric_withholds`,
+`chrome_metric_withholds_rescued` and `precision_fallback_rescues`; no status or reason token
+changed.
 
 Two free rungs sit under the HTML path, both reached only when the page carried nothing
 readable. A **meta-refresh hop** follows the redirect no HTTP status announces:
@@ -1129,13 +1136,19 @@ records itself on the result (`route=` on the fetch marker, plus one
 renders nothing while still surviving into the archive, which is what makes "the rung existed
 and never fired" distinguishable from "this record predates the rung". Six of the keys count
 rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
-`derived_api_reads`, `wayback_attempts` and `url_context_reads`. Two count the extractor
-policy's decisions rather than rungs, per final result: `chrome_metric_withholds` is an
-extraction the line-shape metric withheld because it cleared the chrome floor on navigation
-alone, including a chart-rescued page whose chart block still published without that text (on
-a page with no chart block its `reason` is the same `thin_page` an under-floor page carries, so
-this count is what separates the two), and `precision_fallback_rescues` is a page published from the
-`favor_precision` re-extraction after the default one failed that metric. The rest count rungs that
+`derived_api_reads`, `wayback_attempts` and `url_context_reads`. Three count the extractor
+policy's decisions rather than rungs. `chrome_metric_withholds` is a cited URL somewhere on whose
+ladder the line-shape metric withheld an HTML extraction, because that extraction cleared the
+chrome floor on navigation alone: the withhold flag is carried onto a later rung's rescue, so a
+direct body the metric withheld still counts here when the rendered or Wayback rung goes on to
+serve the page, and it counts a chart-rescued page whose chart block published without that text
+(on a page with no chart block its `reason` is the same `thin_page` an under-floor page carries, so
+this count is what separates the two). `chrome_metric_withholds_rescued` is the subset a later rung
+then served, that is a withheld extraction on a URL whose final result is `success` on a route
+other than `direct`, which is what makes "the metric cost us the page" separable from "the metric
+sent the page one rung further and the ladder delivered it". `precision_fallback_rescues` is a page
+published from the `favor_precision` re-extraction after the default one failed that metric. The
+rest count rungs that
 were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
 because each names a different binding constraint. `rung_budget_skips` is the question that ran
 out of wall, summed over every rung; the same skips are broken out per rung as
@@ -1205,13 +1218,15 @@ one, split by what each qualifies. `FetchStatusReason` qualifies a result's STAT
 `embed_shell` / `thin_page` / `no_matching_passage` / `not_addressed` under
 `no_resolving_content`, `no_text_layer`
 / `encrypted` / `malformed` under `unreadable_document`, and `budget_skipped` / `parse_contention`
-under the `unsupported_type` a held-but-unparsed document earns. `RungSkipReason` qualifies a
-rung ATTEMPT that never ran (`RungAttempt.skipped_reason`), which produced no result and so has
-nowhere else to record its reason: `wall_budget`, `wayback_cap`, `url_context_cap`, `fast_path`,
-`no_api_key`, `robots_disallowed`, `rendered_no_text`, `renderer_unavailable`, `render_timeout`,
-`render_non_200`, and
-`parse_contention` again (a held document declined for want of a parse slot records the skip AND
-stamps the withheld result's `status_reason`, the one token shared by both Literals). Both are a
+under the `unsupported_type` a held-but-unparsed document earns. `RungSkipReason` qualifies a rung
+attempt that PRODUCED NO RESULT (`RungAttempt.skipped_reason`), which is why it has nowhere else to
+record its reason. Most of those attempts never ran at all; two of them did run and came back with
+nothing usable, `render_timeout` and `render_non_200`, so "skip" here means "produced nothing"
+rather than "never started". The vocabulary is `wall_budget`, `wayback_cap`, `url_context_cap`,
+`fast_path`, `no_api_key`, `robots_disallowed`, `rendered_no_text`, `renderer_unavailable`,
+`render_timeout`, `render_non_200`, and `parse_contention` again (a held document declined for want
+of a parse slot records the skip AND stamps the withheld result's `status_reason`, the one token
+shared by both Literals). Both are a
 closed `Literal`, so a misspelt reason is a type error rather than a permanently-zero count.
 `renderer_unavailable` is the browser declining before it rendered anything (missing, broken,
 unpinnable host); `render_timeout` is a render the transport's own DOM-read cap cut off because the

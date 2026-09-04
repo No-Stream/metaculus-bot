@@ -453,7 +453,11 @@ count for one paid read, deliberately fewer than gap-fill v2 allows its reader).
 the paid rung's spend per question: `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` caps how many
 paid reads one question may pay for across its cited URLs (the analogue of the Wayback cap, a
 distinct quantity from the SDK retry count above, recorded as a `url_context_cap` skip when it
-binds). `docs/research.md` has the reasoning behind each. Read the values off `constants.py`; that
+binds). One floor bounds CPU rather than a rung:
+`RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S` (5 s) is what the extractor policy needs left on
+the wall to run its second, `favor_precision` pass over a body already in hand, and below it the
+page is withheld exactly as a failed precision pass would withhold it. `docs/research.md` has the
+reasoning behind each. Read the values off `constants.py`; that
 is the only authoritative copy.
 
 ### Gap-fill
@@ -1328,11 +1332,11 @@ the telemetry markers:
   response, or `tls`, `dns`, `timeout`, `connection`, `decode`, `malformed_response` off the
   transport exception), `exc` is that exception's class name, and `server` is the `Server`
   response header lower-cased with internal spaces collapsed to `_` (the strongest tell of which
-  CDN refused us). `malformed_response` is the one our own client raised rather than the host:
-  aiohttp reports a body whose `Content-Encoding` it cannot decode as a 400 `ClientResponseError`,
-  which is a response we refused, and it used to fall into the catch-all `connection` bucket
-  alongside genuine connect failures. All optional fields are keyed and sit at the end of the
-  line in a fixed order
+  CDN refused us). `malformed_response` is the one our own client raised rather than the host: a
+  `ClientResponseError` on the fetch path, which aiohttp uses for a response it will not accept at
+  all (a `Content-Encoding` it cannot decode, a header over the byte cap, a bad status line), and
+  which used to fall into the catch-all `connection` bucket alongside genuine connect failures.
+  All optional fields are keyed and sit at the end of the line in a fixed order
   (`reason`, `route`, `failure_class`, `exc`, `server`), so a line carrying a later field but
   not an earlier one parses correctly and every archived line still parses byte-identically.
   Tier-2 Datawrapper dataset hops ride the same line and are identifiable by their url
@@ -1345,16 +1349,29 @@ the telemetry markers:
   wall_s=...` — one line per escalated rung attempt, emitted by
   `research/resolution_source.py` when the direct fetch could not read a page and a
   heavier route was tried. `from_status` is the verbatim `FetchStatus` that triggered
-  the escalation, and which statuses appear depends on the rung: the unreadable-page family
-  (`blocked`, `js_wall`, `no_resolving_content`) for the browser and derived-feed rungs, plus
-  `error` and `not_found` for the Wayback rung, whose whole point is a page our address never
-  reached. `rung` is the route tried. `outcome` and `wall_s` are that RUNG's own, stamped as
+  the escalation, and its domain is per rung rather than shared, because each rung's trigger set
+  is: `js_wall` or `no_resolving_content` for `meta_refresh`, `derived_api` and `rendered`, the
+  200s that carried nothing readable; `unsupported_type` for `pdf_local`, a body we held and had
+  not parsed; `blocked`, `error` or `not_found` for `wayback`, whose whole point is a page our
+  address never reached; and those three plus `js_wall` and `no_resolving_content` for
+  `url_context`, the only rung that draws from both families. A pair outside that table (a
+  `blocked` render, say) is a defect rather than a rare case. `rung` is the route tried. `outcome`
+  and `wall_s` are that RUNG's own, stamped as
   the dispatcher closes it: `outcome` is the status that stood once the rung was over (its
   rescue, its own verdict such as `stale_data` or `ungrounded`, or the direct status it left
-  standing when it declined) and `wall_s` is what that rung alone cost. A URL with several
+  standing when it declined) and `wall_s` is what that rung alone cost. Two exclusions in `wall_s`
+  are worth knowing before it is read as latency: the `url_context` line excludes the free robots
+  pre-check that runs in front of the paid read, and the `pdf_local` line excludes time the
+  document spent queued for a parse slot. A URL with several
   lines therefore reads as a sequence, and on a page where a dead feed GET was followed by a
   rescuing render the first line carries the direct status and the second carries `success`,
-  with neither billed for the other's latency. The `RESOLUTION_SOURCE_FETCH` line above records
+  with neither billed for the other's latency. One combination reads oddly until you know the
+  order it comes from: after the Wayback rung withheld a capture as `stale_data`, a paid attempt
+  that then declines records `outcome=<the direct fetch's status>` rather than the withhold, while
+  the `RESOLUTION_SOURCE_FETCH` line for that URL keeps `route=wayback` and the `stale_data` verdict
+  that replaced the direct result. The two lines disagree by design, so take the page's own outcome
+  from the FETCH line or from `from_status`, never from the last escalation line. Dormant while the
+  paid flag is off. The `RESOLUTION_SOURCE_FETCH` line above records
   only the FINAL outcome per URL, so on its own it cannot say how many rungs were spent or
   which one rescued the page; this marker is where a rung that fires often and rescues
   nothing becomes distinguishable from one that never fires, and where the latency case
