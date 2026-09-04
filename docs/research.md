@@ -573,9 +573,9 @@ Four stages per question:
    check cannot see a pull that has started and not finished, so a run's concurrent
    questions used to open one whole pagination each against the same venue and be
    rate-limited for it. Callers arriving while a pull is in flight await that pull and
-   share its outcome, including a failure — re-asking a rate limiter from three more
-   questions is a second violation rather than a retry — so one lost pull bumps
-   `kalshi_catalogue_fetch_failures` once rather than once per waiting question.
+   share its outcome, a failure included, since re-asking a rate limiter from three
+   more questions is a second violation rather than a retry. One lost pull therefore
+   bumps `kalshi_catalogue_fetch_failures` once rather than once per waiting question.
    PredictIt's whole ~197-market dump is one GET, and all ~197 go into the pool
    UNFILTERED: its old fuzzy pre-filter ranked "Will the Pope visit Cuba" above the
    on-topic market. Neither venue needs a query, which is
