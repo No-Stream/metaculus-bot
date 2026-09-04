@@ -1090,7 +1090,7 @@ async def _vetted_hop_target(
 async def _resolution_redirect_outcome(resp: Any, current_url: str, content_type: str) -> FetchResult | str:
     """Vet a 3xx hop: the next URL to follow, or a terminal error/blocked result."""
     status = resp.status
-    location = resp.headers.get("Location") if resp.headers else None
+    location = resp.headers.get("Location")
     if not location:
         # Malformed redirect — no Location header.
         logger.info(f"resolution_source {urlparse(current_url).netloc}: {status} redirect with no Location header")
@@ -1789,14 +1789,14 @@ async def _resolution_response_outcome(
     caller to run outside the host semaphore; every other branch is terminal or a hop.
     """
     status = resp.status
-    content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
+    content_type = (resp.headers.get("Content-Type") or "").lower()
 
     if status in REDIRECT_STATUSES:
         return await _resolution_redirect_outcome(resp, current_url, content_type)
 
     # Non-redirect response — same status routing as before. The `Server` header rides the
     # non-200 result so a 403 can be attributed to the CDN that served it (Akamai / Cloudflare).
-    server = resp.headers.get("Server") if resp.headers else None
+    server = resp.headers.get("Server")
     non_ok = _resolution_status_outcome(status, current_url, content_type, server=server)
     if non_ok is not None:
         return non_ok
@@ -2703,7 +2703,7 @@ def _datawrapper_hop_status(status: int) -> FetchStatus:
 
 def _datawrapper_last_modified(resp: Any) -> datetime | None:
     """The dataset's parsed ``Last-Modified``, or None when absent or unparseable."""
-    raw = resp.headers.get("Last-Modified") if resp.headers else None
+    raw = resp.headers.get("Last-Modified")
     return parse_http_last_modified(raw) if raw else None
 
 
@@ -2752,7 +2752,7 @@ def _datawrapper_success_text(
 async def _datawrapper_dataset_outcome(resp: Any, chart: DatawrapperChartRef, parent_url: str, url: str) -> FetchResult:
     """Turn the CDN response into a FetchResult, serving the dataset live or not at all."""
     status = resp.status
-    content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
+    content_type = (resp.headers.get("Content-Type") or "").lower()
     hop_status = _datawrapper_hop_status(status)
     if hop_status != "success":
         return FetchResult(
@@ -2765,7 +2765,7 @@ async def _datawrapper_dataset_outcome(resp: Any, chart: DatawrapperChartRef, pa
             chart_title=chart.title,
             parent_url=parent_url,
             failure_class=http_failure_class(status),
-            server=server_header_token(resp.headers.get("Server") if resp.headers else None),
+            server=server_header_token(resp.headers.get("Server")),
         )
 
     body = await read_body_capped(

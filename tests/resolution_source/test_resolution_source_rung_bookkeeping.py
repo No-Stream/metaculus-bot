@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import get_args
 
 import pytest
 
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import RenderedPage
+from metaculus_bot.research.resolution_fetch_result import RungSkipReason
 from metaculus_bot.research.resolution_source import (
+    _BUDGET_GATED_RUNGS,
+    _RUNG_WALL_SKIP_PHRASE,
     _WAYBACK_TRIGGER_STATUSES,
     FetchContext,
     FetchResult,
@@ -181,6 +185,57 @@ class TestAVerdictKeepsItsOwnRoute:
             ("wayback", "stale_data", ""),
             ("url_context", None, "no_api_key"),
         ]
+
+
+class TestRungSkipReasonCounts:
+    """Every member of the closed `RungSkipReason` vocabulary reaches `details["counts"]`.
+
+    The counts are how a skip survives into the archive (skips emit no escalation line), and
+    `_rung_counts` reads the members into keys by hand, so a member added to the Literal without
+    a key would type-check and then be permanently invisible. Read off the Literal, like the
+    repo's other closed vocabularies (`ROUTE_CAVEATS`, `RunMode`, `McMissingKind`).
+    """
+
+    @pytest.mark.parametrize("reason", get_args(RungSkipReason))
+    def test_every_skip_reason_moves_a_counts_key(self, reason: RungSkipReason):
+        ctx = FetchContext()
+        ctx.skip_rung("rendered", "js_wall", _URL, reason)
+        skipped = _result("js_wall")
+        skipped.rung_attempts = list(ctx.rungs)
+
+        baseline = _rung_counts([])
+        counts = _rung_counts([skipped])
+
+        assert set(counts) == set(baseline)
+        moved = {key for key in counts if counts[key] != baseline[key]}
+        assert moved, f"{reason!r} reaches no counts key"
+        assert all(counts[key] == baseline[key] + 1 for key in moved)
+
+    @pytest.mark.parametrize("rung", _BUDGET_GATED_RUNGS)
+    def test_every_budget_gated_rung_has_its_own_budget_skip_key(self, rung):
+        ctx = FetchContext()
+        ctx.skip_rung(rung, "blocked", _URL, "wall_budget")
+        skipped = _result("blocked")
+        skipped.rung_attempts = list(ctx.rungs)
+
+        counts = _rung_counts([skipped])
+
+        assert counts["rung_budget_skips"] == 1
+        assert counts[f"{rung}_budget_skips"] == 1
+
+    def test_the_budget_gated_rungs_are_the_phrased_rungs(self):
+        """Derived, not restated: `claim_rung_budget` indexes the phrase map, so a rung gated on
+        the wall without a phrase raises inside a budget guard, and one phrased without a count
+        key loses its per-rung budget skips from the archive."""
+        assert tuple(_RUNG_WALL_SKIP_PHRASE) == _BUDGET_GATED_RUNGS
+
+    def test_the_keys_are_stable_with_no_results(self):
+        """Zeroes are kept so 'the rung existed and never fired' stays distinguishable from
+        'this record predates the rung'."""
+        counts = _rung_counts([])
+
+        assert all(value == 0 for value in counts.values())
+        assert {"rung_budget_skips", "chrome_metric_withholds", "chrome_metric_withholds_rescued"} <= set(counts)
 
 
 # The abs.gov.au shape the extractor policy was calibrated on: about 2,000 chars of 48-char
