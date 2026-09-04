@@ -563,7 +563,7 @@ def _harvestable_json_host(response_host: str, page_host: str) -> bool:
     """True when ``response_host`` may serve harvestable JSON for a page on ``page_host``.
 
     Same publisher, by registrable domain: the public suffix plus one label, from the
-    public-suffix list the market-retrieval join already vendors (``registrable_domain``). A page
+    public-suffix list vendored by ``research/public_suffix.py`` (``registrable_domain``). A page
     on ``www.x.gov`` whose data endpoint is ``api.x.gov`` or ``data.x.gov`` is the ordinary
     dashboard shape, and a page on ``forest-fire.emergency.copernicus.eu`` fed by
     ``api2.effis.emergency.copernicus.eu`` is the sibling-subdomain shape live QA found
