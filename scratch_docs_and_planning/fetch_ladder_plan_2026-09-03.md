@@ -444,6 +444,17 @@ caching, and a `rung=` field so prod flakiness is a query rather than a guess.
   archive cannot see; PR #49 `goog-cost` (merged 2026-06-26) is the "made some changes" the
   operator half-remembers — it moved the gap-fill resolver off grounded Gemini.
 
+- **D3 resolved 2026-09-03 evening: the Google-Extended hypothesis is PROVEN** (`scripts/probes/gemini_verify.py`,
+  three live calls on `gemini-3.8-flash`: the robots-allowed control retrieved, `internationalaisafetyreport.org`
+  returned `URL_RETRIEVAL_STATUS_ERROR`). The robots pre-check ships with the agentic fix wave as a per-host cached
+  robots.txt read through the SSRF-guarded plain fetch, skipping url_context with status `robots_disallowed` and the
+  `AGENTIC_URLCONTEXT_ROBOTS_SKIP` marker. D7 done: both native Gemini surfaces run `gemini-3.8-flash` (`c670015`).
+- **Forge (salvaged from a wedged triage) + live QA fix wave merged 2026-09-03 evening:** `favor_precision` dropped
+  (149-URL sweep: +70k chars, 10 pages cross the floor upward, 0 real losses), certifi CA pin, 64 KB header caps, shared
+  loop-scoped PDF-parse gate, parse moved out of the host-gate hold, hop timeouts clamped to the remaining wall,
+  `no_matching_passage` / `budget_skipped` / `parse_contention` reasons, pypdf decoded-stream cap 8 MB, BM25 b=0,
+  query stopwords, `truncation_note()`. Merges `06ded11` (docs/telemetry), `a98a2b2` (doctext/gemini), `15d6c04` (Tier-1).
+
 ## Sequencing
 
 Phase 1, no gates, independent of the egress question — the URL-extractor fix, meta-refresh plus
