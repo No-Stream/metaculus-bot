@@ -1406,6 +1406,154 @@ Follow-ups:
    path's all-direct output is byte-identically pinned. If a residual round ever finds a
    forecaster misreading a cited capture as live, the fix is a separate lead for the cited-capture
    shape, rendered from `parse_snapshot_url` on the cited URL.
+8. **MEDIUM: the browser transport's SSRF guard has three blind request channels, and one of them is
+   a main-frame redirect to a private address (added 2026-09-04; the prose corrections landed in
+   this bundle, the code is a follow-up PR).** Two terms first, because the rest of this item leans
+   on them. The DNS PIN is the `--host-resolver-rules=MAP <host> <ip>` argument
+   `research/rendered_fetch.py` passes at launch: it forces Chromium's own resolution of the ONE
+   hostname the render was asked for to a single pre-vetted public IP. The ROUTE HANDLER is the
+   callback `context.route("**/*", _guard_route)` registers, which re-runs `is_public_http_url` on a
+   request Chromium is about to make. DNS REBINDING is the attack the pin closes for that one host:
+   the attacker's DNS answers a public address to our Python preflight and a private one to
+   Chromium's connect a moment later, so the check and the connect see different addresses. **The
+   three channels the route handler never sees.** All three were read out of the pinned Playwright
+   1.61 driver source on 2026-09-04. First, a SERVER-SIDE redirect hop: the driver constructs a
+   Route only in the else branch of `if (redirectedFrom || ...)`, there is exactly one `new
+   RouteImpl(` in the whole bundle, and Playwright's own `page.route` documentation says "The
+   handler will only be called for the first url if the response is a redirect". So a 3xx that sends
+   the main frame somewhere else is dialed with no check of ours at all. Until 2026-09-04 the
+   transport's route-guard comment claimed the guard re-checked "server and client-side redirects",
+   which was false; correcting that comment, the matching sentence in `docs/agentic_gap_fill.md` and
+   one clause in `docs/research.md` is the half of this item that shipped in the merge bundle.
+   Second, a request Playwright cannot attribute to a frame is auto-continued the same way. Third, a
+   WebSocket handshake is invisible to `context.route` by construction: HTTP interception is the CDP
+   `Fetch.enable` domain, WebSockets surface only on the report-only `Network.webSocket*` events,
+   Playwright routes them through a separate `route_web_socket` API that nothing here registers, and
+   an IP-literal target such as ws://127.0.0.1 never consults the resolver the pin rewrites. Service
+   workers were a fourth such channel and are the one already closed, by `service_workers="block"`
+   on the context. One shape that looks like a hole and is not: a CORS preflight OPTIONS is
+   auto-fulfilled by the driver with a synthetic 204 and never reaches the network. **Chromium's own
+   mitigation, and the gap it leaves.** Playwright 1.61 pins Chromium 149.0.7827.55, which enforces
+   Local Network Access: a public page's subresource requests, and since Chrome 147 its WebSocket
+   handshakes, to loopback, RFC1918 and link-local addresses are gated behind a permission this
+   render never grants (the context passes only `user_agent`, `extra_http_headers` and
+   `service_workers`, nothing calls `grant_permissions`, and an http render target cannot even
+   request the permission, since Local Network Access prompts are restricted to secure contexts).
+   Playwright disables no Local Network Access feature, and the WebSocket half was default-enabled
+   in Chromium source rather than through the experiment platform, which matters because Playwright
+   launches with `--disable-field-trial-config` and that would have neutralised an experiment-only
+   rollout. Two caveats keep this from being a fix. It is INFERRED from Chromium's feature lists and
+   vendor docs rather than observed, because `tests/conftest.py` refuses every real browser launch,
+   and it is a browser default we neither pin nor assert. And per the WICG Local Network Access spec
+   it does NOT cover a main-frame navigation, which is exactly the channel the unguarded redirect
+   hop uses. **The exploitable path.** The rendered rung fires only on `js_wall` or the `thin_page`
+   shape of `no_resolving_content`, both of which mean a page answered our aiohttp GET with 200 and
+   nothing readable. So an attacker who wants the browser serves exactly that to aiohttp and a 302
+   to a private address to Chromium, which User-Agent alone separates. Chromium follows the hop
+   unchecked, `page.content()` reads the internal response, `_navigate_and_read_dom` hands it back
+   with the ORIGINAL cited url attached, and Tier-1 re-classifies it as page text that can be
+   captioned as primary grading evidence and published in the Metaculus comment. Two partial brakes.
+   Tier-1 refuses any main-frame status other than 200 as `render_non_200`, which blanks the obvious
+   Azure IMDS probe, since IMDS requires a `Metadata: true` header a navigation cannot send and
+   answers 400 without it. Gap-fill v2's `_try_rendered_fetch` has no status check at all, and it is
+   also the wider trigger surface, because it renders URLs its own agentic loop discovered rather
+   than only URLs a question's resolution criteria cite. Exploitation still needs the whole chain (a
+   URL the attacker controls in front of one of those two paths, the 200 wall, a browser-only 3xx,
+   and an internal host answering 200 with text that clears the extraction floors) on a runner with
+   little to serve, so the honest label is a missing defense-in-depth layer rather than a live hole.
+   **Why the code is not in the merge bundle, with the recall numbers inline** (inline because the
+   replay artifact lives under gitignored `scratch/`, so a path citation would be unreadable to
+   whoever picks this up). Of the 47 URLs in the 2026-09-03 fetch-ladder replay, 17 reached the
+   browser arm, 13 rendered readably, and 2 were readable ONLY through the browser. The plain
+   aiohttp arm's final URL was on the requested host for 47 of 47, so that arm saw no cross-host
+   redirect at all. The browser arm recorded no final URL, so how often a page redirects CHROMIUM
+   cross-host is UNMEASURED, and any claim that demanding host equality costs no recall is an
+   inference from the wrong arm. That is what makes every candidate below something other than
+   strictly safer on a surface AGENTS.md reserves for strictly-safer changes. **Five candidates,
+   ranked.** (a) Re-run `is_public_http_url` on the render's final URL after the goto and refuse the
+   DOM when it fails, as a new decline class with its own skip token. Closes an IP-literal or
+   plainly private redirect target, costs near-zero recall, and does NOT close a rebinding hostname,
+   whose final host resolves public for our check and private for Chromium's connect. (b) Require
+   the final host to equal the pinned host. Closes rebinding too, but its recall cost is unmeasured,
+   and what it refuses includes the ordinary hops (`example.com` to `www.example.com`, country
+   redirects, shorteners). (c) Hand the browser the post-redirect final URL the aiohttp fetch
+   already followed and re-guarded (`direct.url`, already threaded as `current_url` through the
+   manual redirect loop and simply unused for the render) instead of the original cited URL, so the
+   pin covers the host that actually serves the content. It does not close the hole by itself,
+   because the attacker serves the redirect only to Chromium, and it moves the memo key,
+   `RenderedPage.url`, the harvest's `page_host` and the classifier's base URL for link resolution
+   all at once; what it buys is making (b) cheap. (d) Fulfil every browser request from Python
+   through `research/http_fetch.py` with `route.fulfill`. Airtight in principle and by far the
+   largest change: cookies, auth, ranges, streaming and CORS semantics all move into our code, page
+   fidelity drops, and it undermines the reason a browser is launched at all. Reject. (e) A local
+   filtering forward proxy (`--proxy-server` pointed at a loopback proxy that resolves and vets
+   every CONNECT and GET target). The only candidate that is a real connect-time boundary: it covers
+   the redirect hop, the subresource rebinding window, the WebSocket channel and a dedicated Web
+   Worker in one move, and it makes `--host-resolver-rules` unnecessary. Its own project with its
+   own failure modes and its own QA pass. RECOMMENDED PAIRING: build (a) now, and (c) together with
+   (b) once the browser's cross-host redirect rate has been measured. **Implementation notes for
+   (a).** `page.url` is load-bearing rather than a convenience. On the salvage path, where
+   `response` is None because the goto raised, it is the only source of the final URL, and 4 of the
+   10 render rescues the 2026-09-03 replay recorded came from that path, which is also where a
+   timed-out navigation may already have landed on a redirect target. So read `page.url`
+   unconditionally and `response.url` additionally when a response exists. Do NOT change
+   `RenderedPage.url` itself: it is the base for link resolution
+   (`_extract_links_from_html(page.html, url)` in `agentic/tools.py`) and for both memo keys. Two
+   test-fake edits are mandatory rather than optional, because the `SimpleNamespace` that
+   `FakePage.goto` returns has no `url` and `FakePage` has no `url` attribute either, so without
+   both every test that reaches `_navigate_and_read_dom` dies with AttributeError. The new decline
+   class should mirror `RenderDomOverCeiling` so it does not fold into the `renderer_unavailable`
+   count the module keeps clean, and it must be added to the `except (TimeoutError,
+   RenderDomOverCeiling)` tuple in `agentic/tools.py` in the same commit or gap-fill v2 gains a new
+   escape path. `RungSkipReason` is a Literal consumed by a typed Counter, so basedpyright forces
+   the new reason and its `_rung_counts` key to land together; no marker spec enumerates those count
+   keys, so the new one rides additively into the archive. Test homes: `TestTheMainFrameStatus` in
+   `tests/test_rendered_fetch.py` for transport behaviour, the DOM-over-the-ceiling skip test in the
+   same file as the skip-token template, and `TestRenderedRungRefusedByTheEdge` in
+   `tests/resolution_source/test_resolution_source_rendered_rung.py` for the rung-level skip. One
+   recall bug shares this root cause and is worth folding in: `_render_in_context` builds the JSON
+   harvest with `page_host` taken from the PRE-redirect URL, so on a benign cross-host redirect the
+   same-publisher filter judges the page's own data endpoint against a host the page is no longer on
+   and rejects it. **The WebSocket block, and every gotcha it carries.**
+   `BrowserContext.route_web_socket("**/*", handler)` exists in Playwright 1.61, and a routed socket
+   does not dial the server unless the handler calls `connect_to_server()`, so a handler that does
+   nothing blocks the handshake. Registration must happen BEFORE `context.new_page()`, because only
+   sockets created after registration are routed. The handler must be provably raise-free, since
+   Playwright dispatches it on a task it creates itself, which is the detached-listener shape behind
+   the 2026-07-25 traceback storm the unroute drain exists to prevent; a pure debug log is the safe
+   body, and `close()` is a variant to measure rather than ship. `unroute_all` clears only the HTTP
+   routes (`_unroute_internal(self._routes, ...)`), never `self._web_socket_routes`, and Playwright
+   exposes no `unroute_web_socket` at all, so the WebSocket handler stays live across the unroute,
+   the context close and the browser close, and the transport's teardown comment (accurate today)
+   has to be amended in the same diff or it becomes false. The registration is one more
+   pre-`new_page` driver call, so a Playwright-class error there routes to
+   `_warn_playwright_unavailable_once`, the process-wide latch that logs one line per run and has
+   already hidden a programming error in this path once; do not wrap the registration, and pin the
+   registration order in a test so a bug is loud. Both fakes need work: `FakeContext` has no
+   `route_web_socket`, and the diff wants a small WebSocketRoute double whose `close` takes `code`
+   and `reason` positionally like the real one, plus a recorded setup order so the before-`new_page`
+   ordering can be asserted. The silent-pass trap to know about:
+   `test_an_os_timeout_under_the_render_is_a_logged_decline_not_a_cut_off` (around line 1005 of
+   `tests/test_rendered_fetch.py`) asserts only that the render returned None and that some log
+   record carries `exc_info`, both of which an AttributeError raised one line earlier satisfies, so
+   an unfaked method would leave that test green while it silently stopped pinning what it exists to
+   pin. What the suite can show is the registration order and that the handler never calls
+   `connect_to_server`; what it cannot show is Chromium actually intercepting `ws://127.0.0.1`,
+   because `tests/conftest.py` refuses every real launch. And the block is an in-page mitigation
+   rather than a boundary: Playwright implements it by injecting an init script that replaces
+   `globalThis.WebSocket` per frame, so a dedicated Web Worker very likely keeps the native
+   constructor (that consequence is inferred from the injection mechanism, which was read from
+   source; no Playwright doc states it, and whether HTTP route interception reaches a dedicated
+   Worker's own `fetch` is a second open question worth settling before anyone treats the WebSocket
+   block as closing the channel). The injection also adds two enumerable `__pw*` globals to every
+   frame, on the one rung whose job is getting past hostile edges. **Measure first, and the
+   measurement is free.** Re-render the 2026-09-03 replay's rendered-route URLs locally with a
+   logging WebSocket handler installed, and compare extracted character counts with the block on and
+   off. Those are public GETs with no LLM call and no paid API, so the probe spends nothing; the one
+   thing to say before running it is that it makes outbound requests to third-party hosts from the
+   operator's own address. That prices the WebSocket recall cost, which is the only unmeasured axis
+   of that half, and the same probe can record each render's final URL, which is the measurement
+   candidate (b) needs and the replay never captured.
 
 ### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
 

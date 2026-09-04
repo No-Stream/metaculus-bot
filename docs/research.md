@@ -1234,7 +1234,11 @@ link-local / non-global IPs, userinfo tricks, and non-HTTP schemes, and a
 connect-time `FilteringResolver` (the actual DNS-rebinding boundary, not the
 preflight) re-checks every resolved IP. Redirects are followed manually under the
 `MAX_REDIRECTS` hop cap (`research/http_fetch.py`, shared with the v2 agentic
-tools), re-guarding each `Location`. Per-URL truncation appends a
+tools), re-guarding each `Location`. That per-hop re-guard is the aiohttp path's;
+the `route=rendered` rung guards its requests differently and less completely,
+because Playwright's request interception never sees a server-side redirect hop,
+and the route-guard comment in `research/rendered_fetch.py` is the authority on
+what that transport does and does not cover. Per-URL truncation appends a
 `[truncated at N chars — full source at URL]` marker, the aggregate section-budget
 trim routes through the same marker-emitting truncator (a bare slice could cut
 mid-sentence and eat that marker, so an already-truncated page rendered as
