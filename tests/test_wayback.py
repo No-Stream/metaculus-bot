@@ -26,14 +26,39 @@ class TestSnapshotRequestUrl:
     def test_the_original_url_is_carried_verbatim(self):
         """The archive's path format carries the original URL as-is; percent-encoding it makes
         the archive treat it as a different resource."""
-        assert wayback_snapshot_url("https://www.bls.gov/wsp/") == (
+        assert wayback_snapshot_url("https://www.bls.gov/wsp/", now=_NOW) == (
             "https://web.archive.org/web/2026id_/https://www.bls.gov/wsp/"
         )
 
     def test_a_query_string_survives(self):
-        assert wayback_snapshot_url("https://x.gov/data?series=CPI&y=2026").endswith(
+        assert wayback_snapshot_url("https://x.gov/data?series=CPI&y=2026", now=_NOW).endswith(
             "https://x.gov/data?series=CPI&y=2026"
         )
+
+    def test_the_request_stamp_follows_the_clock(self):
+        """The year is read off the caller's clock and cannot be a literal.
+
+        The archive pads a bare year UP to that year's end, so a year written into the source
+        asks every run after it for a capture from a year that has already finished — and the
+        freshness bound then withholds every one of those captures, retiring the rung silently
+        while it still spends two archive round trips per question.
+        """
+        this_year = wayback_snapshot_url("https://x.gov/p", now=_NOW)
+        next_year = wayback_snapshot_url("https://x.gov/p", now=_NOW.replace(year=_NOW.year + 1))
+
+        assert this_year != next_year
+        assert this_year == "https://web.archive.org/web/2026id_/https://x.gov/p"
+        assert next_year == "https://web.archive.org/web/2027id_/https://x.gov/p"
+
+    def test_the_request_url_is_not_itself_a_datable_capture(self):
+        """Year granularity rather than a full 14-digit stamp, and that is load-bearing.
+
+        The rung tells "the archive never landed on a capture" apart from "it served one we
+        cannot use" by whether the FINAL url parses as a capture. A 14-digit request url would
+        parse as one dated at the request instant, so an archive 404 — or an unredirected 200 —
+        would read as a capture taken seconds ago and be served as brand new.
+        """
+        assert parse_snapshot_url(wayback_snapshot_url("https://x.gov/p", now=_NOW)) is None
 
 
 class TestParseSnapshotUrl:

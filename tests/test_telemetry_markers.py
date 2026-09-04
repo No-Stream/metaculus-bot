@@ -14,8 +14,10 @@ tests loudly instead of silently dropping records from the archive:
 * MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
 * RESOLUTION_SOURCE_FETCH -> metaculus_bot/research/resolution_source.py:_log_fetch_outcome_markers
 * RESOLUTION_SOURCE_ESCALATION -> metaculus_bot/research/resolution_source.py (per escalated rung)
-* GEMINI_USAGE       -> metaculus_bot/research/gemini_search.py and
-  metaculus_bot/research/agentic/tool_backends.py (one emitter shape, two surfaces)
+* GEMINI_USAGE       -> metaculus_bot/research/gemini_search.py,
+  metaculus_bot/research/agentic/tool_backends.py and
+  metaculus_bot/research/resolution_source.py (one emitter shape, three surfaces,
+  told apart by the role field)
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
 * STACKER_OUTCOME/TOOLS_USED -> metaculus_bot/comment/markers.py (HTML-comment
   markers; see module docstring in markers.py for why they rarely appear in run logs).

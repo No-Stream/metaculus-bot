@@ -1240,7 +1240,13 @@ that expire from GHA at 90 days. Because that line carries only the FINAL outcom
 URL, each escalated rung additionally emits `RESOLUTION_SOURCE_ESCALATION` with the
 status that triggered it, the rung tried, what came back, and the wall-clock the rung
 cost — which is what makes "does this rung rescue anything, and is it worth its latency"
-answerable. See "Reading run logs" in `docs/operations.md` for the field meanings.
+answerable. The two lines spell one state two ways: a fetch that worked is
+`status=ok` on the fetch line (the shared `fetch_outcome_token`, whose `ok` is what the
+diagnostics formatter reads as "this source contributed") and `outcome=success` on the
+escalation line (the verbatim `FetchStatus`), so a query joining the two has to treat
+`ok` and `success` as the same outcome. Both are data contracts, so the difference is
+documented here rather than re-spelled on either side. See "Reading run logs" in
+`docs/operations.md` for the field meanings.
 
 The paid rung adds two greppable log lines that are deliberately NOT registered as marker specs:
 `RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...` (an INFO, the free pre-check
