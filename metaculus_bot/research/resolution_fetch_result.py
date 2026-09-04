@@ -47,7 +47,7 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 #
 # `no_resolving_content` is the 200 whose extracted text carries no content worth
 # grading against — page chrome, and nothing else, or a document that discusses
-# nothing the question asks about. Three ways a fetch earns it, told apart by
+# nothing the question asks about. Four ways a fetch earns it, told apart by
 # `FetchResult.status_reason`:
 #
 #   `embed_shell` — the page's numbers exist but live inside a third-party data
@@ -71,6 +71,13 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 #   population (`_url_context_rung_applies`): the bytes were never the problem, so a
 #   model re-reading the same PDF buys nothing. See the reason table below for what
 #   publishing it as `success` cost.
+#
+#   `not_addressed` — the PAID reader retrieved the page and its answer opened with the
+#   prompt's `NOT_ADDRESSED` sentinel, the designed reply for a document that does not
+#   discuss the ask. The read was paid for and the page WAS retrieved (so it is not
+#   `ungrounded`), but the answer is a non-answer, and rendered under the url_context lead
+#   it was prose standing in for an absent section: the paid rung's twin of
+#   `no_matching_passage`.
 #
 # Distinct from `empty_body` (nothing was there at all) and from `js_wall` (the
 # page needs JS to assemble ANY content, i.e. under the much lower JS-wall floor):
@@ -112,11 +119,11 @@ FetchStatus = Literal[
 # generalised thin-page one, so a later "how often does the floor withhold a page
 # nothing else would have caught?" cut is a query rather than a re-derivation.
 #
-# `embed_shell` / `thin_page` / `no_matching_passage` belong to `no_resolving_content`;
-# `no_text_layer` / `encrypted` / `malformed` to `unreadable_document`, where the split is
-# what says whether a paid document read could ever help (only `no_text_layer` — the other
-# two are bytes no reader gets text out of, and `no_matching_passage` is a document whose
-# text we already hold).
+# `embed_shell` / `thin_page` / `no_matching_passage` / `not_addressed` belong to
+# `no_resolving_content`; `no_text_layer` / `encrypted` / `malformed` to `unreadable_document`,
+# where the split is what says whether a paid document read could ever help (only
+# `no_text_layer` — the other two are bytes no reader gets text out of, and
+# `no_matching_passage` is a document whose text we already hold).
 #
 # The document rung adds three. `no_matching_passage` is a document we DID read whose BM25
 # selection matched no query term: the digest renders its header, its outline and the "no
@@ -127,6 +134,12 @@ FetchStatus = Literal[
 # belong to the `unsupported_type` a held-but-unparsed document earns, and say which rule
 # declined: the question ran out of wall, or every parse slot was taken. Without them a
 # skipped document is indistinguishable from a body that was never a document at all.
+#
+# The paid rung adds one. `not_addressed` is a page Gemini DID retrieve whose answer opened with
+# the prompt's `NOT_ADDRESSED` sentinel, the designed reply for a document that does not discuss
+# the ask; the same prose-for-an-absent-section shape as `no_matching_passage`, one rung over,
+# and the token that keeps "we paid and the page has nothing on this" distinguishable from
+# "we paid and Gemini retrieved nothing" (`ungrounded`).
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -136,6 +149,7 @@ FetchStatusReason = Literal[
     "no_matching_passage",
     "budget_skipped",
     "parse_contention",
+    "not_addressed",
 ]
 
 # Why a RUNG ATTEMPT never ran, carried on `RungAttempt.skipped_reason` (empty when the rung
@@ -352,7 +366,8 @@ class FetchResult:
     # ACCOUNTING NOTE for anyone bucketing statuses by era: since the escalation ladder, a
     # `status` may be a RUNG's verdict rather than the direct fetch's outcome — the Wayback
     # rung's `stale_data` in place of the `blocked` / `error` / `not_found` that triggered it,
-    # the paid reader's `ungrounded` in place of its trigger. An era-bucketed `blocked` rate
+    # the paid reader's `ungrounded` or `no_resolving_content` / `not_addressed` in place of its
+    # trigger. An era-bucketed `blocked` rate
     # taken off this field alone will therefore show a drop at the ladder's merge that is a
     # bookkeeping change, not hosts refusing us less. Take the direct outcome from
     # `from_status` on the `RESOLUTION_SOURCE_ESCALATION` line, or partition `status` by
@@ -370,8 +385,10 @@ class FetchResult:
     # disclosure appended to its rendered text.
     unreadable_embeds: list[str] = field(default_factory=list)
     # Which rule produced the status, where the status alone is ambiguous. Set on
-    # `no_resolving_content` (`embed_shell` / `thin_page` / `no_matching_passage`) and
-    # `unreadable_document` (`no_text_layer` / `encrypted` / `malformed`); None everywhere else.
+    # `no_resolving_content` (`embed_shell` / `thin_page` / `no_matching_passage` /
+    # `not_addressed`), `unreadable_document` (`no_text_layer` / `encrypted` / `malformed`) and
+    # the `unsupported_type` of a held-but-unparsed document (`budget_skipped` /
+    # `parse_contention`); None everywhere else.
     status_reason: FetchStatusReason | None = None
     # Which rung of the ladder produced this result, and the per-rung attempts behind
     # it. `direct` plus an empty list is the plain fetch, which is the overwhelming

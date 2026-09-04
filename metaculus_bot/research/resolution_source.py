@@ -256,7 +256,7 @@ from metaculus_bot.research.resolution_url_scan import (
     strip_markdown_escapes,  # noqa: F401  # re-export: the Tier-1 suite imports the markdown unescaper from this module path
 )
 from metaculus_bot.research.robots_policy import ROBOTS_FETCH_TIMEOUT_S, google_extended_blocks_url
-from metaculus_bot.research.url_context_reader import run_url_context_read
+from metaculus_bot.research.url_context_reader import NOT_ADDRESSED_SENTINEL, run_url_context_read
 from metaculus_bot.research.wayback import (
     innermost_url,
     parse_snapshot_url,
@@ -2351,6 +2351,14 @@ async def _url_context_rung(
     primary grading evidence, so a fluent unsourced answer here is the Q38195 failure with a
     forecaster-facing blast radius. That is the same floor ``gemini_search`` and v2's
     ``read_document`` apply, for the same reason.
+
+    An answer that opens with ``NOT_ADDRESSED_SENTINEL`` is WITHHELD as ``no_resolving_content``
+    / ``not_addressed``. The prompt asks for that opening when the retrieved page does not discuss
+    the ask, so it is the designed non-answer, and rendered under the url_context lead it was
+    prose standing in for an absent section, the shape :func:`_finish_document` closes for a PDF
+    with ``no_matching_passage``. The page was retrieved (so it is not ``ungrounded``) and the
+    read was paid for, so the verdict stays on the record as this rung's own rather than declining
+    to the direct result.
     """
     admitted = await _url_context_admission(session, url, direct, host_sems=host_sems, ctx=ctx)
     if admitted is None:
@@ -2408,13 +2416,30 @@ async def _url_context_rung(
             exc=direct.exc,
             server=direct.server,
         )
+    answer = text.strip()
+    if answer.startswith(NOT_ADDRESSED_SENTINEL):
+        # Unregistered like its two URLCONTEXT siblings while the flag is off in every workflow
+        # (docs/research.md); `host=` because the rollout question is which hosts Gemini can
+        # reach but finds nothing on.
+        logger.warning(f"RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url={url} host={urlparse(url).netloc}")
+        return FetchResult(
+            url=url,
+            status="no_resolving_content",
+            text="",
+            http_status=direct.http_status,
+            content_type=direct.content_type,
+            status_reason="not_addressed",
+            failure_class=direct.failure_class,
+            exc=direct.exc,
+            server=direct.server,
+        )
     # The lead LEADS and is budgeted out of the cap (:func:`_lead_then_capped_body`): a model's
     # answer rendered without the disclosure reads as the page itself.
     lead = _url_context_lead(direct.status)
     return FetchResult(
         url=url,
         status="success",
-        text=_lead_then_capped_body(lead, text.strip(), url),
+        text=_lead_then_capped_body(lead, answer, url),
         http_status=direct.http_status,
         content_type="text/plain",
     )
@@ -2986,7 +3011,8 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     ``reason`` is appended only where the status alone is ambiguous —
     ``no_resolving_content``'s ``embed_shell`` vs ``thin_page`` vs the
     ``no_matching_passage`` of a document read in full that discusses nothing the question
-    asks about, ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs
+    asks about vs the paid reader's ``not_addressed``, ``unreadable_document``'s
+    ``no_text_layer`` vs ``encrypted`` vs
     ``malformed``, and the ``budget_skipped`` / ``parse_contention`` that say an
     ``unsupported_type`` was a document we were holding.
     ``route`` is appended only when a ladder rung produced the outcome. Both are
