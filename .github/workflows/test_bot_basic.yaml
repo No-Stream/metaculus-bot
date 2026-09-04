@@ -159,6 +159,12 @@ jobs:
           # Tier-1 resolution-source fetcher: deterministically fetches URLs cited
           # in the resolution criteria (plain HTTP + trafilatura), no LLM calls.
           RESOLUTION_SOURCE_ENABLED: 'true'
+          # The ladder's one PAID rung: when every free rung has failed to read a
+          # cited page, Gemini's url_context reader is asked to read it, billed to
+          # GOOGLE_API_KEY above. ON since 2026-09-04. Bounded by the free
+          # Google-Extended robots pre-check, the rung's wall-budget floor and
+          # RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS paid reads per question.
+          RESOLUTION_SOURCE_URL_CONTEXT_ENABLED: 'true'
           # Time-series anchor: deterministic empirical P10/P50/P90 band from a
           # question's own resolution series (FRED/yfinance). Text anchor ON since
           # 2026-07-17 (post smoke validation; see FUTURE.md "Time-series anchor").

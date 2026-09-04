@@ -47,10 +47,11 @@ jobs:
         # provider and cannot publish to Metaculus even if the code changed under
         # it. The only env var here controls stdout buffering.
         #
-        # curl_cffi arrives via `--with` rather than as a declared dependency: it is
-        # only needed by this probe (it reaches the venv transitively through
-        # yfinance today, which is not something the diagnostic should rely on), and
-        # adding it to pyproject would put a prod dependency on a debugging tool.
+        # curl_cffi is declared only in pyproject's dev group (the root conftest's
+        # egress guard imports it), and this job syncs `--no-dev`, so `--with
+        # curl_cffi` is still what supplies it here. It stays out of the prod
+        # dependency set: the probe is a debugging tool, and yfinance pulling it in
+        # transitively today is not something the diagnostic should rely on.
         #
         # The script prints the runner's egress IP first (api.ipify.org), since the
         # IP is what the both-403 verdict is about. Nothing is uploaded: the table in

@@ -366,3 +366,42 @@ class TestFetchDiagnosticCannotSpend:
             "run federal-host probes from the runner IP on somebody else's cadence; every fire of "
             "this workflow is meant to be a deliberate choice"
         )
+
+
+class TestPaidUrlContextRungIsArmedInEveryBotWorkflow:
+    """The resolution-source ladder's one paid rung ships ON, and only where its key is wired.
+
+    ``RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`` defaults off in code, so a bot workflow that forgets
+    the line runs the whole ladder free and silently forfeits the pages only Gemini's egress can
+    read, while the flag WITHOUT ``GOOGLE_API_KEY`` in the same step is the ``no_api_key``
+    misconfiguration, byte-identical in the archive to a flag-off run. Both halves are pinned per
+    workflow, so a new bot workflow has to make the same choice deliberately rather than inherit
+    the code default. The operator turned the flag on in every bot workflow on 2026-09-04; turning
+    it off anywhere is a cost-gate decision (AGENTS.md), not a tidy-up.
+    """
+
+    @staticmethod
+    def _bot_step_env(workflow: dict[str, Any]) -> dict[str, Any]:
+        # The one step that invokes main.py, not a flattened merge across steps: a flag set on
+        # the checkout or uv-setup step would satisfy a merged assertion while the bot never saw it.
+        bot_steps = [step for step in _steps(workflow) if "main.py" in str(step.get("run", ""))]
+        assert len(bot_steps) == 1, f"expected exactly one step invoking main.py, got {len(bot_steps)}"
+        return bot_steps[0].get("env") or {}
+
+    @pytest.mark.parametrize("rel_path", _BOT_WORKFLOWS)
+    def test_the_flag_is_on_in_the_bot_step(self, rel_path: str) -> None:
+        env = self._bot_step_env(_workflow(rel_path))
+        assert env.get("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED") == "true", (
+            f"{rel_path} does not set RESOLUTION_SOURCE_URL_CONTEXT_ENABLED: 'true' on its bot step, so "
+            "its resolution-source ladder runs without the paid url_context rung the other bot "
+            "workflows have on"
+        )
+
+    @pytest.mark.parametrize("rel_path", _BOT_WORKFLOWS)
+    def test_the_key_the_rung_bills_to_is_wired_in_the_same_step(self, rel_path: str) -> None:
+        env = self._bot_step_env(_workflow(rel_path))
+        assert "secrets." in str(env.get("GOOGLE_API_KEY", "")), (
+            f"{rel_path} arms the paid url_context rung but wires no GOOGLE_API_KEY secret on the bot "
+            "step, so every admitted read would be a no_api_key skip and the run would read in the "
+            "archive exactly like one with the flag off"
+        )

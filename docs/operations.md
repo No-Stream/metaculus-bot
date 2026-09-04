@@ -358,13 +358,14 @@ Gemini grounded search starts soft-failing across a run, check the AI Studio cre
 balance FIRST (`docs/research.md` § Gemini grounded search says the same from the
 provider side).
 
-**A third native surface exists but is off.** The resolution-source fetcher's last escalation
+**A third native surface is live.** The resolution-source fetcher's last escalation
 rung is a `url_context` read on this same key, gated by
-`RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`, which defaults off and is set in no workflow yaml. It
+`RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`, which defaults off in code and is set to `true` in every
+bot workflow yaml since 2026-09-04. It
 shares the reader (`research/url_context_reader.py`) and the model with v2's `read_document`, so
-turning it on adds token spend on the operator's personal key rather than a new billing
+it adds token spend on the operator's personal key rather than a new billing
 relationship, and it draws no grounded queries because it retrieves a URL instead of searching.
-What it would cost is bounded twice over. First by how often the free rungs fail, since a read
+What it costs is bounded twice over. First by how often the free rungs fail, since a read
 happens only for a cited URL no free rung could read and the free `Google-Extended` robots
 pre-check declines the hosts that would refuse Gemini anyway. Second by a per-question cap:
 `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` allows at most two paid reads per question across all
@@ -374,7 +375,7 @@ read the cap itself declines is recorded as a `url_context_cap` skip. That is a 
 from `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`, which is the SDK retry count for one read.
 
 One change on 2026-09-03 widened the population that reaches this rung, and it is worth knowing
-before the flag is flipped. The extractor policy now withholds a page whose extraction clears the
+now that the flag is on. The extractor policy now withholds a page whose extraction clears the
 400-character chrome floor on short lines alone, and that withhold is `no_resolving_content` with
 reason `thin_page`, which is one of the paid rung's trigger statuses. On the calibration corpus
 (`scratch/fetch_ladder_2026-09-03/chrome_calibration.md`) that is 9 of the 59 labelled bodies, 6
@@ -383,13 +384,17 @@ chrome and 3 ambiguous, which the previous default-only extraction published, ag
 rescue it first. The sharper consequence is crowd-out rather than volume: the two slots go to
 whichever of a question's concurrently fetched URLs reaches the gate first, so these new candidates
 can take both of them ahead of the `blocked` pages whose Google-egress advantage is the rung's whole
-reason to exist. If that ordering matters once the flag is on, the
+reason to exist. If that ordering turns out to matter in the archive, the
 honest fix is to prefer `blocked` and `error` over `thin_page` when the cap binds, not to drop the
 population, because the withhold came from our own extractor's output rather than from the page and
 Gemini reading the same URL is a different extractor.
 
-Flipping it on is the operator's cost decision (see `AGENTS.md` "Cost discipline"), and its spend
-is separable in the archive by the `GEMINI_USAGE` role `resolution_source`.
+Turning it off again, or widening its trigger population, is the operator's cost decision (see
+`AGENTS.md` "Cost discipline"). Its spend is separable in the archive by the `GEMINI_USAGE` role
+`resolution_source`, and its three own markers (`RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP`,
+`RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED` and
+`RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED`, under "Reading run logs") say how often the free
+pre-check saved a read and how often a paid read served nothing.
 
 Model prices, read from ai.google.dev on 2026-09-03: the two live native surfaces —
 grounded search and gap-fill v2's `read_document` — run `gemini-3.8-flash` since
@@ -426,7 +431,7 @@ CI.
 | `FINANCIAL_DATA_ENABLED` | off | `true` | yfinance + FRED data for questions an LLM classifier tags as financial |
 | `PREDICTION_MARKETS_ENABLED` | off | `true` | Polymarket / Kalshi / Manifold / PredictIt snapshot (suppressed under `is_benchmarking=True`) |
 | `RESOLUTION_SOURCE_ENABLED` | off | `true` | Tier-1 fetcher of URLs cited in the resolution criteria (plain HTTP + trafilatura, plus the free escalation rungs; no LLM call and no spend of its own) |
-| `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` | off | unset (set in NO workflow yaml) | The one PAID rung of that fetcher's escalation ladder: when every free rung has failed to read a cited page, Gemini's `url_context` reader is asked to read it, billed to the operator's personal `GOOGLE_API_KEY`. Turning it on makes the resolution-source provider a paid surface, so it is a cost-gate decision for the operator, not an agent |
+| `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` | off | `true` | The one PAID rung of that fetcher's escalation ladder: when every free rung has failed to read a cited page, Gemini's `url_context` reader is asked to read it, billed to the operator's personal `GOOGLE_API_KEY`. ON in every bot workflow since 2026-09-04, so the resolution-source provider is a paid surface; changing it anywhere is a cost-gate decision for the operator, not an agent |
 | `TS_ANCHOR_ENABLED` | off | `true` | Time-series empirical P10/P50/P90 band from a question's own resolution series |
 | `TS_ANCHOR_CHART_ENABLED` | off | `false` | Chart-image side-channel for the anchor (vision message to base models); held off pending a text-vs-image A/B |
 | `RESEARCH_PROVIDER` | `auto` | unset | Forces one primary provider (`asknews`/`exa`/`perplexity`/`openrouter`) instead of the priority order |
@@ -1379,8 +1384,8 @@ the telemetry markers:
   that then declines records `outcome=<the direct fetch's status>` rather than the withhold, while
   the `RESOLUTION_SOURCE_FETCH` line for that URL keeps `route=wayback` and the `stale_data` verdict
   that replaced the direct result. The two lines disagree by design, so take the page's own outcome
-  from the FETCH line or from `from_status`, never from the last escalation line. Dormant while the
-  paid flag is off. The `RESOLUTION_SOURCE_FETCH` line above records
+  from the FETCH line or from `from_status`, never from the last escalation line. Live since the
+  paid flag went on in every bot workflow. The `RESOLUTION_SOURCE_FETCH` line above records
   only the FINAL outcome per URL, so on its own it cannot say how many rungs were spent or
   which one rescued the page; this marker is where a rung that fires often and rescues
   nothing becomes distinguishable from one that never fires, and where the latency case
@@ -1389,6 +1394,34 @@ the telemetry markers:
   emits no line here by design and is counted in the provider's `details["counts"]` instead;
   `docs/research.md` lists every count key.
   Harvested as `resolution_source_escalation`.
+- `RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...`, an INFO, one per paid
+  `url_context` read the resolution-source ladder skipped because the host's robots.txt disallows
+  `Google-Extended` (`research/resolution_source.py`; the same pre-check and per-host cache as
+  `AGENTIC_URLCONTEXT_ROBOTS_SKIP` below, through `research/robots_policy.py`). A fire is a paid
+  call NOT billed, so it is not a failure; the rate against the handful of hosts publishing the
+  directive is what says whether the group parser is over-matching. No question id: the rung runs
+  per cited URL inside its provider, so a join goes through the run id. Registered on 2026-09-04
+  together with the flag flip that put `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` on in every bot
+  workflow, so no archived run from before that merge carries one. Harvested as
+  `resolution_source_urlcontext_robots_skip`.
+- `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=... statuses=...`, a WARN, one per
+  paid `url_context` read on the ladder that came back with zero successful retrievals and was
+  discarded as `ungrounded` rather than rendered under the primary-grading-evidence caption: the
+  same floor `GEMINI_UNGROUNDED_SUPPRESSED` and `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` apply, so
+  the three suppression rates read as one family. The read WAS billed, so each record is money
+  spent on nothing served. `statuses` is the comma-joined list of `url_retrieval_status` values
+  the SDK reported, or `none` (harvested as null) when it attached no entry at all, which splits a
+  retrieval that failed for a nameable reason from one that never happened. Same registration
+  date and no question id, as above. Harvested as
+  `resolution_source_urlcontext_ungrounded_suppressed`.
+- `RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url=... host=...`, a WARN, one per paid
+  `url_context` read that retrieved the page but answered with the prompt's `NOT_ADDRESSED`
+  sentinel, the model's designed reply when the page does not discuss the ask, so the read was
+  withheld as `no_resolving_content` / `not_addressed` instead of rendered as prose standing in
+  for an absent section. Distinct from the ungrounded line: the page WAS retrieved, so Gemini
+  reaches the host, and the money bought a true negative. `host` because the rollout question is
+  which hosts Gemini reaches but finds nothing on. Same registration date and no question id.
+  Harvested as `resolution_source_urlcontext_not_addressed`.
 - `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]` — a WARN, one per
   gap-fill v2 `read_document` call whose `url_context` retrieval brought back nothing,
   so the answer would have been unsourced recall and the `fetched` verification tier is
@@ -1435,9 +1468,10 @@ the telemetry markers:
   any formatting branch, so an ungrounded-and-suppressed response still records what it
   cost), `research/agentic/tool_backends.py` (`read_document`, which carries no question
   id, hence the trailing field's absence there), and the resolution-source ladder's paid
-  url_context rung (`resolution_source`, which likewise carries no question id and cannot
-  appear at all while `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` is off, as it is in every
-  workflow). No surface here bills through OpenRouter,
+  url_context rung (`resolution_source`, which likewise carries no question id and appears
+  only from runs with `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` on: every bot workflow since
+  2026-09-04, so an archived run from before that merge has no rows in this role). No surface
+  here bills through OpenRouter,
   so none shows up in `CREDIT_ROLE_SPEND`, and before this marker the whole Google AI
   Studio side of a run's spend was invisible to the archive. That side is metered against a
   monthly grounded-prompt allowance per project and billed per QUERY on overage, which makes

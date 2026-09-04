@@ -821,8 +821,8 @@ RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS: int = 2
 # It reaches hosts our client cannot (prod run 33775800806 read bls.gov and sagaftra.org PDFs
 # that our own fetch 403'd) because Gemini dials from Google's address, not ours. It is also the
 # only rung here that spends money and the only one that is model-MEDIATED — what comes back is
-# an answer about the page, not the page — so it ships OFF and stays off in every workflow until
-# the operator turns it on.
+# an answer about the page, not the page — so it defaults OFF in code and is turned on explicitly
+# per workflow yaml (on in every bot workflow since 2026-09-04, by the operator's decision).
 RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV: str = "RESOLUTION_SOURCE_URL_CONTEXT_ENABLED"
 # Floor for the read. Well above the free rungs' because a url_context call is a model
 # round-trip that also fetches: the v2 reader's measured budget is tens of seconds, and below

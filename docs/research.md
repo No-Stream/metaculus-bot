@@ -1100,10 +1100,10 @@ direct outcome from `from_status` on the `RESOLUTION_SOURCE_ESCALATION` line, or
 
 `route=url_context` is the LAST rung and the only paid one: Gemini reads the page for us
 (`research/url_context_reader.py`, the reader shared with gap-fill v2's `read_document`),
-reaching hosts our own client cannot because Gemini dials from Google's address. It is OFF by
-default behind `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` and set in no workflow yaml, so it fires
-nowhere in production today; `docs/operations.md` covers what turning it on costs and on whose
-key. Every gate is checked in increasing cost order before a cent is spent: the trigger statuses
+reaching hosts our own client cannot because Gemini dials from Google's address. It defaults off
+in code behind `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` and is set to `true` in every bot workflow
+yaml since 2026-09-04, so it is live in production; `docs/operations.md` covers what it costs and
+on whose key. Every gate is checked in increasing cost order before a cent is spent: the trigger statuses
 (`blocked`, `js_wall`, `error`, `no_resolving_content`, tested against the DIRECT outcome, so a
 withheld Wayback capture on the way down does not close the rung), the flag, the question's
 time-budget fast path (recorded as a `fast_path` skip, and placed after the flag rather than before
@@ -1129,10 +1129,10 @@ whose precision fallback failed the same line-shape metric is a paid-read candid
 page we gave up on. And because the cap is two reads with no ordering over the candidates, claimed
 by whichever of the question's concurrently fetched URLs reaches the gate first, those candidates
 can take both slots ahead of a `blocked` page, whose Google-egress advantage is the rung's whole
-reason to exist. `docs/operations.md` prices both against the calibration census, which is what the
-operator reads before flipping the flag. Zero successful retrievals
-DISCARDS the text under the new terminal status `ungrounded`, the same floor `gemini_search` and
-v2's `read_document` apply: Gemini answers fluently out of parametric memory when every
+reason to exist. `docs/operations.md` prices both against the calibration census. Zero successful
+retrievals DISCARDS the text under the new terminal status `ungrounded`, the same floor
+`gemini_search` and v2's `read_document` apply: Gemini answers fluently out of parametric memory
+when every
 retrieval failed, and a fluent unsourced answer under the primary-grading-evidence caption is
 the Q38195 failure with a forecaster-facing blast radius. A read whose answer opens with the
 prompt's `NOT_ADDRESSED` sentinel (`research/url_context_reader.py`, the model's designed reply
@@ -1388,20 +1388,23 @@ escalation line (the verbatim `FetchStatus`), so a query joining the two has to 
 documented here rather than re-spelled on either side. See "Reading run logs" in
 `docs/operations.md` for the field meanings.
 
-The paid rung adds three greppable log lines that are deliberately NOT registered as marker
-specs: `RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...` (an INFO, the free pre-check
-avoiding a known-zero paid read), `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=...
-statuses=...` (a WARN, a paid read discarded for retrieving nothing; `statuses` is every reported
-`url_retrieval_status`, `none` when the SDK attached no entry) and
+The paid rung adds three greppable log lines, each a registered marker spec since 2026-09-04,
+when `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` went on in every bot workflow (until that merge none
+of them could fire in production, and a spec would only have added an always-empty archive
+column): `RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...` (an INFO, the free pre-check
+avoiding a known-zero paid read; harvested as `resolution_source_urlcontext_robots_skip`),
+`RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=... statuses=...` (a WARN, a paid read
+discarded for retrieving nothing; `statuses` is every reported `url_retrieval_status`, `none` when
+the SDK attached no entry; harvested as `resolution_source_urlcontext_ungrounded_suppressed`) and
 `RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url=... host=...` (a WARN, a paid read withheld
 because its answer opened with the `NOT_ADDRESSED` sentinel, so the page was retrieved and has
-nothing on the ask). With the flag off in every workflow none of them can fire in production, so
-a spec would only add an always-empty archive column; all three are FUTURE marker-spec
-candidates, to be registered if the flag is ever turned on, which is when their rates start
-meaning something. Their spellings are pinned by tests so the eventual spec matches the lines,
-and the first two are parallel to their `AGENTIC_URLCONTEXT_ROBOTS_SKIP` /
-`AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` twins on the gap-fill v2 reader, which already carry
-specs and are the pattern to follow.
+nothing on the ask; harvested as `resolution_source_urlcontext_not_addressed`). Their spellings
+are pinned twice, by the rung's own tests and by the spec tests in
+`tests/test_telemetry_markers.py`, so the emitter and the archive cannot drift apart, and the
+first two are parallel to their `AGENTIC_URLCONTEXT_ROBOTS_SKIP` /
+`AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` twins on the gap-fill v2 reader. No archived run from
+before that merge carries any of the three, so an era-bucketed rate starts there.
+`docs/operations.md` "Reading run logs" has the field meanings.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window), on the same leakage rationale. The section

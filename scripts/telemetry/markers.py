@@ -116,6 +116,15 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   sibling ``RESOLUTION_SOURCE_FETCH`` records the FINAL outcome per URL and so is
   silent on the path taken to it, which is what decides whether a rung earns its
   latency)
+* ``RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP`` / ``RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED``
+  / ``RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED`` — ``metaculus_bot/research/resolution_source.py``
+  ``_url_context_admission`` and ``_url_context_rung`` (per-URL accounting for the ladder's
+  one PAID rung: a read the free robots pre-check refused to make, a paid read discarded
+  for retrieving nothing, and a paid read that retrieved the page and found nothing on
+  the ask. Registered when ``RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`` went on in every bot
+  workflow; before that none of the three could fire in production. Parallel to the
+  gap-fill v2 reader's ``AGENTIC_URLCONTEXT_ROBOTS_SKIP`` /
+  ``AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED``)
 * ``GEMINI_USAGE`` — ``metaculus_bot/research/gemini_search.py``,
   ``metaculus_bot/research/agentic/tool_backends.py`` and
   ``metaculus_bot/research/resolution_source.py`` (per-CALL google-genai token
@@ -866,6 +875,67 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),
     MarkerSpec(
+        "resolution_source_urlcontext_robots_skip",
+        # Per-URL: the resolution-source ladder's PAID url_context read was skipped before it
+        # spent anything, because the host's robots.txt disallows ``Google-Extended``, the product
+        # token Gemini's retrieval identifies as, so the read would have been spend with a
+        # known-zero return (research/resolution_source.py _url_context_admission). The
+        # resolution-source twin of ``agentic_urlcontext_robots_skip`` above: the same pre-check
+        # and the same per-host cache (research/robots_policy.py), kept as a separate spec because
+        # the two surfaces have different trigger populations, and this one fires only for a cited
+        # resolution URL every free rung failed to read. Registered on 2026-09-04, when
+        # RESOLUTION_SOURCE_URL_CONTEXT_ENABLED went on in every bot workflow; until then the line
+        # could not fire in production and a spec would have archived an always-empty column, so
+        # no run from before that merge carries a record.
+        #
+        # A fire is a paid call NOT billed, so it must not read as a failure; a rate far above the
+        # handful of hosts publishing the directive would mean the group parser is over-matching
+        # and withholding reads we could have had. ``host`` rides beside ``url`` because the
+        # verdict is cached and applied per host, so the host is the unit any rate is taken over.
+        # No ``question=``: the rung runs per cited URL inside its provider with no question in
+        # scope, exactly like the GEMINI_USAGE row for the same read, so a join goes through the
+        # run id.
+        re.compile(r"RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP:\s*url=(?P<url>\S+)\s+host=(?P<host>\S+)"),
+    ),
+    MarkerSpec(
+        "resolution_source_urlcontext_ungrounded_suppressed",
+        # Per-URL: a PAID url_context read on the resolution-source ladder came back with zero
+        # successful retrievals, so its text was discarded as ``ungrounded`` rather than rendered
+        # under the primary-grading-evidence caption (research/resolution_source.py
+        # _url_context_rung). Gemini answers fluently out of parametric memory when every
+        # retrieval failed, and this section tells the forecasters what the resolution source
+        # says, so the suppression is the same floor ``gemini_ungrounded_suppressed`` and
+        # ``agentic_document_ungrounded_suppressed`` apply, and the three rates read as one
+        # family. The read WAS billed, so each record is money spent on nothing served, which is
+        # the figure that says whether the rung's trigger population earns its cost. Registered
+        # with its two siblings on 2026-09-04, for the same reason.
+        #
+        # ``statuses`` is the comma-joined list of ``url_retrieval_status`` values the SDK
+        # reported, or the ``none`` sentinel when it attached no url_metadata at all (which
+        # harvests as None through ``coerce_value``). It splits a retrieval that was attempted and
+        # failed for a nameable reason from one the tool never made. Required rather than optional
+        # (the v2 twin's tail is optional for archived pre-field lines): the emitter has always
+        # written it, and no production line exists from before this spec. No ``question=``, for
+        # the same reason as the robots-skip line above.
+        re.compile(
+            r"RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED:\s*url=(?P<url>\S+)\s+statuses=(?P<statuses>\S+)"
+        ),
+    ),
+    MarkerSpec(
+        "resolution_source_urlcontext_not_addressed",
+        # Per-URL: a PAID url_context read retrieved the page but answered with the prompt's
+        # ``NOT_ADDRESSED`` sentinel, the model's designed reply when the page does not discuss
+        # the ask, so the read was withheld as ``no_resolving_content`` / ``not_addressed``
+        # instead of rendered (research/resolution_source.py _url_context_rung). Rendered, it was
+        # prose standing in for an absent section, the shape the PDF digest closes with
+        # ``no_matching_passage``. Distinct from the ungrounded line above: the page WAS
+        # retrieved, so Gemini can reach the host, and the money bought a true negative rather
+        # than nothing. ``host`` because the rollout question is which hosts Gemini reaches but
+        # finds nothing on, the population a sharper ask or a different rung would recover.
+        # Registered with its two siblings on 2026-09-04; no ``question=``, as on both of them.
+        re.compile(r"RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED:\s*url=(?P<url>\S+)\s+host=(?P<host>\S+)"),
+    ),
+    MarkerSpec(
         "forecaster_drops",
         # Per-run ensemble-drop summary emitted by
         # drop_telemetry.py:emit_drop_telemetry. No per-question ref (it
@@ -1233,9 +1303,9 @@ MARKER_SPECS: list[MarkerSpec] = [
         # (research/gemini_search.py, role ``grounded_search``), gap-fill v2's read_document
         # (research/agentic/tool_backends.py, role ``read_document``) and the resolution-source
         # ladder's paid url_context rung (research/resolution_source.py, role
-        # ``resolution_source``, which cannot emit at all while
-        # RESOLUTION_SOURCE_URL_CONTEXT_ENABLED is off, as it is in every workflow). None routes
-        # through OpenRouter, so none
+        # ``resolution_source``, which emits only from runs with
+        # RESOLUTION_SOURCE_URL_CONTEXT_ENABLED on: every bot workflow since 2026-09-04, and no
+        # run from before that merge). None routes through OpenRouter, so none
         # shows up in CREDIT_ROLE_SPEND and the whole Google AI Studio side of a run's spend
         # was unmeasurable from the archive — which matters because grounding is metered
         # against a monthly grounded-prompt allowance per project, billed per QUERY on

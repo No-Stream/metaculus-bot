@@ -14,6 +14,8 @@ tests loudly instead of silently dropping records from the archive:
 * MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
 * RESOLUTION_SOURCE_FETCH -> metaculus_bot/research/resolution_source.py:_log_fetch_outcome_markers
 * RESOLUTION_SOURCE_ESCALATION -> metaculus_bot/research/resolution_source.py (per escalated rung)
+* RESOLUTION_SOURCE_URLCONTEXT_{ROBOTS_SKIP,UNGROUNDED_SUPPRESSED,NOT_ADDRESSED}
+  -> metaculus_bot/research/resolution_source.py (the paid rung's three per-URL lines)
 * GEMINI_USAGE       -> metaculus_bot/research/gemini_search.py,
   metaculus_bot/research/agentic/tool_backends.py and
   metaculus_bot/research/resolution_source.py (one emitter shape, three surfaces,
@@ -1378,6 +1380,144 @@ class TestResolutionSourceEscalation:
         )
         assert len(harvested["resolution_source_escalation"]) == 1
         assert len(harvested["resolution_source_fetch"]) == 1
+
+
+# Copied from the three emitting format strings in metaculus_bot/research/resolution_source.py
+# (_url_context_admission for the robots skip, _url_context_rung for the other two). The URL is
+# the one tests/resolution_source/test_resolution_source_url_context_rung.py pins the spellings
+# on, so the emitter and the spec are checked against the same bytes. All three were registered
+# on 2026-09-04, when RESOLUTION_SOURCE_URL_CONTEXT_ENABLED went on in every bot workflow; until
+# then none could fire in production, so no archived run from before that merge carries one.
+RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE = (
+    PFX + "RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=https://tracker.example.com/senate host=tracker.example.com"
+)
+RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE = (
+    PFX_WARN + "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate "
+    "statuses=URL_RETRIEVAL_STATUS_ERROR"
+)
+RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_NO_STATUSES_LINE = (
+    PFX_WARN + "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate "
+    "statuses=none"
+)
+RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED_LINE = (
+    PFX_WARN + "RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url=https://tracker.example.com/senate "
+    "host=tracker.example.com"
+)
+
+
+class TestResolutionSourceUrlContextRobotsSkip:
+    """The resolution-source ladder's paid read, refused by the free robots pre-check.
+
+    Each record is a paid call NOT billed, and the rate against the handful of hosts publishing
+    the Google-Extended directive is what says whether the group parser is over-matching and
+    withholding reads we could have had.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE)
+        assert rec["marker"] == "resolution_source_urlcontext_robots_skip"
+        assert rec["url"] == "https://tracker.example.com/senate"
+        # The verdict is cached and applied per HOST, so the host is the unit a rate is taken over.
+        assert rec["host"] == "tracker.example.com"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_collide_with_the_gap_fill_twin_or_the_ladder_markers(self):
+        # The gap-fill twin shares this token's suffix and the two ladder markers share its
+        # prefix, and the one-marker-per-line break routes a line to the FIRST spec that matches,
+        # so each spec has to claim only its own full word.
+        harvested = parse_log_text(
+            "\n".join(
+                [
+                    RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE,
+                    AGENTIC_URLCONTEXT_ROBOTS_SKIP_LINE,
+                    RESOLUTION_SOURCE_FETCH_OK_LINE,
+                    RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE,
+                ]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["resolution_source_urlcontext_robots_skip"]) == 1
+        assert len(harvested["agentic_urlcontext_robots_skip"]) == 1
+        assert len(harvested["resolution_source_fetch"]) == 1
+        assert len(harvested["resolution_source_escalation"]) == 1
+
+
+class TestResolutionSourceUrlContextUngroundedSuppressed:
+    """A paid read discarded for retrieving nothing: money spent on nothing served."""
+
+    def test_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE)
+        assert rec["marker"] == "resolution_source_urlcontext_ungrounded_suppressed"
+        assert rec["url"] == "https://tracker.example.com/senate"
+        assert rec["statuses"] == "URL_RETRIEVAL_STATUS_ERROR"
+
+    def test_the_none_sentinel_harvests_as_none(self):
+        # `none` is the emitter's word for "the SDK attached no url_metadata at all", which is the
+        # no-data reading rather than a status called none.
+        assert _parse_one(RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_NO_STATUSES_LINE)["statuses"] is None
+
+    def test_several_statuses_survive_as_one_comma_joined_string(self):
+        rec = _parse_one(
+            PFX_WARN + "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://x.test/a "
+            "statuses=URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+        )
+        assert rec["statuses"] == "URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_collide_with_the_other_two_ungrounded_markers(self):
+        # Three tokens end in UNGROUNDED_SUPPRESSED; each spec must claim only its own line or the
+        # archive would count one suppression family as another.
+        harvested = parse_log_text(
+            "\n".join(
+                [RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE, GEMINI_UNGROUNDED_LINE, AGENTIC_DOCUMENT_UNGROUNDED_LINE]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["resolution_source_urlcontext_ungrounded_suppressed"]) == 1
+        assert len(harvested["gemini_ungrounded_suppressed"]) == 1
+        assert len(harvested["agentic_document_ungrounded_suppressed"]) == 1
+
+
+class TestResolutionSourceUrlContextNotAddressed:
+    """A paid read that retrieved the page and found nothing on the ask: a true negative, bought."""
+
+    def test_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED_LINE)
+        assert rec["marker"] == "resolution_source_urlcontext_not_addressed"
+        assert rec["url"] == "https://tracker.example.com/senate"
+        # The rollout question is which hosts Gemini reaches but finds nothing on.
+        assert rec["host"] == "tracker.example.com"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_the_three_paid_rung_lines_are_told_apart(self):
+        harvested = parse_log_text(
+            "\n".join(
+                [
+                    RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE,
+                    RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE,
+                    RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED_LINE,
+                ]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["resolution_source_urlcontext_robots_skip"]) == 1
+        assert len(harvested["resolution_source_urlcontext_ungrounded_suppressed"]) == 1
+        assert len(harvested["resolution_source_urlcontext_not_addressed"]) == 1
 
 
 class TestCredit:

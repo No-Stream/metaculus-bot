@@ -81,9 +81,10 @@ class TestUrlContextRung:
         # FETCH line it replaces the direct result on still says which host refused us.
         assert result.http_status == 403
         assert result.failure_class == "http_403"
-        # Deliberately unregistered while the flag is off everywhere, so the spelling is pinned
-        # HERE: parallel to AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED, the v2 reader's twin, so the
-        # spec that eventually registers it matches the lines already in the logs.
+        # A registered marker spec (scripts/telemetry/markers.py) since the flag went on in every
+        # bot workflow, and the spelling stays pinned HERE too, parallel to
+        # AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED, the v2 reader's twin, so the emitter and the spec
+        # are checked against the same bytes.
         assert (
             "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate "
             "statuses=URL_RETRIEVAL_STATUS_ERROR"
@@ -112,7 +113,7 @@ class TestUrlContextRung:
         assert result.failure_class == "http_403"
         assert _rung_counts([result])["url_context_reads"] == 1
         assert [(a.rung, a.outcome) for a in result.rung_attempts] == [("url_context", "no_resolving_content")]
-        # Unregistered while the flag is off everywhere, like its two URLCONTEXT siblings.
+        # A registered marker spec like its two URLCONTEXT siblings; the spelling is pinned here too.
         assert (
             "RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url=https://tracker.example.com/senate host=tracker.example.com"
         ) in caplog.messages
@@ -149,8 +150,8 @@ class TestUrlContextRung:
         assert result.route == "direct"
         assert calls == []
         assert _rung_counts([result])["url_context_robots_skips"] == 1
-        # Unregistered while the flag is off everywhere, so pinned here; parallel to the v2
-        # reader's AGENTIC_URLCONTEXT_ROBOTS_SKIP.
+        # A registered marker spec since the flag went on in every bot workflow, and pinned here
+        # too; parallel to the v2 reader's AGENTIC_URLCONTEXT_ROBOTS_SKIP.
         assert (
             "RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=https://tracker.example.com/senate host=tracker.example.com"
         ) in caplog.messages

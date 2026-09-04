@@ -83,9 +83,15 @@ did not fetch. Three archives:
   `RESOLUTION_SOURCE_ESCALATION` (one line per escalated fetch rung, with what
   triggered it and what it cost), `AGENTIC_FETCH_LOCAL_DOC` (one line per gap-fill v2
   document read served from the host's own bytes instead of the paid reader — fires only
-  where text was actually served, so its absence measures nothing) and
+  where text was actually served, so its absence measures nothing),
   `AGENTIC_URLCONTEXT_ROBOTS_SKIP` (one line per paid read skipped because the host's
-  robots.txt disallows `Google-Extended`). `scripts/telemetry/markers.py` is the registry.
+  robots.txt disallows `Google-Extended`) and the paid resolution-source rung's own three
+  lines (`RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP`,
+  `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED`,
+  `RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED`: a read the pre-check refused, a paid read that
+  retrieved nothing, and a paid read that retrieved a page with nothing on the ask; registered
+  with the 2026-09-04 flag flip, so no run from before that merge carries any).
+  `scripts/telemetry/markers.py` is the registry.
 - **The raw research-provider payload archive**
   (`backtests/research_archive/raw/<run_id>.jsonl`, one file per run) — each provider's
   RAW return before formatting: AskNews article dicts per HOT/HISTORICAL phase,

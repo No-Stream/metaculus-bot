@@ -75,11 +75,13 @@ Paid or externally visible — ask before each:
   on the operator's personal AI Studio key (one grounded search plus two `url_context` reads).
   Cents, plus one prompt off the 5,000/month grounded allowance. It refuses without the flag and
   prints a cost estimate; the ask-first gate still applies.
-- `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` is the one flag that turns a free provider into a paid
-  one. It is off by default and set in no workflow yaml, so the resolution-source fetcher spends
-  nothing today; turning it on adds a Gemini `url_context` read, billed to the operator's
-  personal `GOOGLE_API_KEY`, as the last rung of its fetch ladder. Flipping it on anywhere is the
-  operator's cost decision. Detail: `docs/operations.md`.
+- `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` is ON in every bot workflow (since 2026-09-04), so the
+  resolution-source provider IS a paid surface: when every free rung of its fetch ladder has
+  failed to read a cited page, Gemini's `url_context` reader reads it, billed to the operator's
+  personal `GOOGLE_API_KEY`. That spend is bounded by the trigger population (only pages no free
+  rung could read), the free `Google-Extended` robots pre-check, the 15 s budget floor and
+  `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` (2 paid reads per question). Detail:
+  `docs/operations.md`.
 - Anything invoking research providers or the ensemble against real questions, including a
   one-off script an agent writes to do so.
 
@@ -97,8 +99,8 @@ Free and safe — run freely:
   `make supply_probe`, `make benchmark_display`. These hit only the Metaculus API and GitHub
   artifacts.
 - `make check_credits` — reads both OpenRouter key balances.
-- `uv run --with curl_cffi python scripts/probes/fetch_diagnostic.py` — public GETs only, no LLM
-  and no key.
+- `uv run python scripts/probes/fetch_diagnostic.py` — public GETs only, no LLM and no key
+  (`curl_cffi` is in the dev group, so a `uv sync --dev` checkout already has it).
 
 ## Repo overrides
 

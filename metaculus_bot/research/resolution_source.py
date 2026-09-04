@@ -2410,7 +2410,7 @@ async def _url_context_admission(
 ) -> tuple[str, float] | None:
     """Every gate the paid read has to clear, in increasing cost order; ``(api_key, budget_s)`` or None.
 
-    The trigger population, the flag (default off, and off in every workflow), the question's
+    The trigger population, the flag (default off in code, on in every bot workflow), the question's
     time-budget fast path, the API key, the wall budget, then the per-host ``Google-Extended``
     robots pre-check — the one gate that costs a request — and the wall budget AGAIN. The robots
     check is worth a request of its own because a host that disallows that token refuses the
@@ -2535,8 +2535,9 @@ async def _url_context_rung(
         # Spelled parallel to the gap-fill v2 reader's AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED (and
         # gemini_search's GEMINI_UNGROUNDED_SUPPRESSED), so the three suppression rates read as
         # one family. `statuses` carries every reported url_retrieval_status; `none` means the
-        # SDK attached no url_metadata entry at all. Deliberately not a registered marker spec
-        # while the flag is off in every workflow — see docs/research.md.
+        # SDK attached no url_metadata entry at all. A registered marker spec, named
+        # resolution_source_urlcontext_ungrounded_suppressed in scripts/telemetry/markers.py, so
+        # the spelling and the always-present `statuses=` field are a data contract.
         logger.warning(
             f"RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url={url} statuses={','.join(statuses) or 'none'}"
         )
@@ -2555,8 +2556,9 @@ async def _url_context_rung(
         )
     answer = text.strip()
     if answer.startswith(NOT_ADDRESSED_SENTINEL):
-        # Unregistered like its two URLCONTEXT siblings while the flag is off in every workflow
-        # (docs/research.md); `host=` because the rollout question is which hosts Gemini can
+        # A registered marker spec like its two URLCONTEXT siblings, named
+        # resolution_source_urlcontext_not_addressed in scripts/telemetry/markers.py; `host=`
+        # because the rollout question is which hosts Gemini can
         # reach but finds nothing on.
         logger.warning(f"RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url={url} host={urlparse(url).netloc}")
         return FetchResult(
@@ -2651,7 +2653,7 @@ async def _escalate_unresolved(
     if wayback is not None and wayback.status == "success":
         return wayback
     # Last, because it is the only rung that spends money and the only one whose product is a
-    # model's answer rather than the host's bytes. Off by default and off in every workflow.
+    # model's answer rather than the host's bytes. Off by default in code, on in every bot workflow.
     # It is asked about the DIRECT outcome, and an archive WITHHOLD does not stand in its way: a
     # capture too old to serve is still a page we could not read fresh, which is exactly the
     # population this rung exists for. The withhold stays the fallback below, so with the flag
