@@ -776,9 +776,14 @@ MARKER_SPECS: list[MarkerSpec] = [
         #
         # ``reason`` (optional, 2026-09-02) disambiguates a status that has more than one
         # rule behind it: ``no_resolving_content`` is ``embed_shell`` when the page named a
-        # routeless data embed and ``thin_page`` when the extraction was simply under the
-        # chrome floor, which is the population the floor gained when it stopped being gated
-        # on a named provider. The provider appends it only where it applies, so the group
+        # routeless data embed, ``thin_page`` when the extraction was simply under the
+        # chrome floor (the population the floor gained when it stopped being gated on a
+        # named provider), and ``no_matching_passage`` when a cited document read in full
+        # discusses nothing the question asks about — the one member that is a document
+        # rather than a page. ``unreadable_document`` splits into ``no_text_layer`` /
+        # ``encrypted`` / ``malformed``, and ``unsupported_type`` carries
+        # ``budget_skipped`` / ``parse_contention`` when it was a document we were holding
+        # and declined to parse. The provider appends it only where it applies, so the group
         # is optional in BOTH directions — absent on every line the archive already holds,
         # and absent on a fresh line whose status carries no reason.
         #

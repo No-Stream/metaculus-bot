@@ -1153,6 +1153,10 @@ RESOLUTION_SOURCE_FETCH_THIN_PAGE_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=45088 url=https://data.wastewaterscan.org/ "
     "status=no_resolving_content http=200 embeds=none reason=thin_page"
 )
+RESOLUTION_SOURCE_FETCH_NO_MATCHING_PASSAGE_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=45363 url=https://www.bls.gov/news.release/pdf/wkstp.pdf "
+    "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local"
+)
 RESOLUTION_SOURCE_FETCH_BLOCKED_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
     "status=blocked http=403 embeds=none"
@@ -1221,6 +1225,18 @@ class TestResolutionSourceFetch:
         assert rec["status"] == "no_resolving_content"
         assert rec["embeds"] is None
         assert rec["reason"] == "thin_page"
+
+    def test_the_no_matching_passage_reason_separates_a_document_from_a_page(self):
+        # The third `no_resolving_content` reason, and the only one that is a DOCUMENT we read
+        # end to end rather than a page we could not read. Without it a withheld PDF is one
+        # bucket with the chrome floor's pages, and "how often does a cited document not
+        # discuss its own question?" stops being answerable from the archive.
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_NO_MATCHING_PASSAGE_LINE)
+        assert rec["status"] == "no_resolving_content"
+        assert rec["http"] == 200  # the fetch and the READ both succeeded; the content did not
+        assert rec["reason"] == "no_matching_passage"
+        assert rec["route"] == "pdf_local"
+        assert rec["qid"] == 45363
 
     def test_lines_without_a_reason_still_parse_and_harvest_it_as_none(self):
         # Back-compat in both directions: every line the archive already holds predates

@@ -122,11 +122,11 @@ BROWSER_HEADERS: dict[str, str] = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    # Advertise only codecs the runtime can decode: aiohttp needs the `brotli`
-    # package for `br` (HAS_BROTLI=False here — not a project dep). If we
-    # advertised `br` anyway, a Brotli-preferring server would send it and
-    # aiohttp would raise ClientResponseError on decode, silently dropping the
-    # source. Servers fall back to gzip/deflate cleanly.
+    # The pair the measurement above was taken with, kept as measured. `br` and `zstd` became
+    # DECODABLE when both decoders were declared in pyproject — needed for a body we never
+    # negotiate at all, the Wayback rung's `id_` replay, which carries whatever encoding the
+    # origin sent the archive's crawler — but widening what we ASK for changes every live
+    # fetch's negotiation and no measurement covers it.
     "Accept-Encoding": "gzip, deflate",
 }
 

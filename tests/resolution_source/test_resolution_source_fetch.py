@@ -973,7 +973,9 @@ class TestResolutionSourceFetchMarker:
 
     async def test_a_document_whose_passages_matched_nothing_says_so_on_the_line(self, monkeypatch, caplog):
         """`status=ok` on a zero-passage digest was byte-identical to one carrying the
-        resolving paragraph, on the surface whose contract is that success means CONTENT."""
+        resolving paragraph, on the surface whose contract is that success means CONTENT. The
+        line now carries both halves: the withholding status AND the reason it was withheld,
+        which is what separates it from a page whose chrome we could not read."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         body = build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2 as of August 24"]])
         session = FakeSession(
@@ -987,8 +989,15 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/r.pdf "
-            "status=ok http=200 embeds=none reason=no_matching_passage route=pdf_local"
+            "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local"
         ]
+        # The rung FIRED and the withhold is its outcome, which is the convention that keeps a
+        # rung that fires often and rescues nothing distinguishable from one that never fires.
+        assert re.fullmatch(
+            r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/r\.pdf "
+            r"from_status=unsupported_type rung=pdf_local outcome=no_resolving_content wall_s=\d+\.\d\d",
+            next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
+        )
 
     async def test_a_skipped_rung_is_counted_but_not_reported_as_an_escalation(self, monkeypatch, caplog):
         """The marker means "a rung fired". A rung that never ran for want of wall budget
@@ -1422,22 +1431,41 @@ class TestLocalPdfReading:
             "in the per-fetch marker to a body that was never a document"
         )
 
-    async def test_a_query_no_passage_matches_renders_the_document_without_inventing_relevance(self):
+    async def test_a_query_no_passage_matches_withholds_the_document(self):
+        """A document read END TO END that discusses nothing the question asks about is
+        content-free, so it is withheld like any other 200 that carried nothing. Published as
+        `success` its block was the header, the outline and one sentence saying nothing matched
+        — prose standing in for an absent section under the "primary grading evidence" caption,
+        and byte-identical in the run log to a document carrying the resolving paragraph."""
         session = self._session()
 
         result = await _fetch_one(
             session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="corn futures settlement")
         )
 
-        assert result.status == "success"
-        assert "No passage in this document matched the query" in result.text
-        assert "922" not in result.text
-        # A zero-passage digest and one carrying the resolving paragraph render the same
-        # header and outline, so nothing in the run log or the archive separated them.
+        assert result.status == "no_resolving_content"
         assert result.status_reason == "no_matching_passage"
-        assert result.text.startswith("Document: https://cdc.example.com/report.pdf"), (
-            "the header is still published — this is a document we read, not a failure"
+        assert result.text == ""
+        # The rung still fired and still owns the outcome, so "what did the ladder buy" stays a
+        # query and the withhold is not filed as a direct fetch.
+        assert result.route == "pdf_local"
+
+    async def test_a_withheld_document_is_named_in_the_failure_notice(self):
+        """The forecaster-facing half: withholding must not be silent. The domain and its status
+        go into the all-failed notice, which is the same treatment a chrome-only page gets."""
+        session = self._session()
+
+        result = await _fetch_one(
+            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="corn futures settlement")
         )
+        rendered = format_resolution_sections([result], datetime(2026, 9, 3, tzinfo=UTC))
+
+        assert "1 resolution source(s) yielded no usable content" in rendered
+        assert "cdc.example.com: no_resolving_content" in rendered
+        # Nothing from the document is published, so neither is the caveat that describes how a
+        # published PDF was extracted.
+        assert "No passage in this document matched the query" not in rendered
+        assert "query-relevant passages of a cited PDF" not in rendered
 
     async def test_a_matched_digest_carries_no_reason(self):
         """The reason is the exception, so its ABSENCE has to mean the selection found

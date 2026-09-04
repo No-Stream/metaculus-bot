@@ -31,9 +31,12 @@ grading evidence. `status_reason` says which shape: `embed_shell` when the raw
 HTML names a routeless data embed (Infogram / Flourish / Tableau), so we know the
 numbers exist and we have no route to them (qids 44554/44556, whose tracker
 rendered 2.9k chars of forecast background as "primary grading evidence" with
-zero polling numbers in it); `thin_page` otherwise (q45088's 127-char SPA tab
-list, q45215's 385 chars of region names — five such renders in the 2026-09-01
-round, none naming a provider, which is why the floor is no longer gated on one).
+zero polling numbers in it); `no_matching_passage` when a cited document read in full
+discusses nothing the question asks about, the one shape that is a document rather than
+a page and the one the paid rung is not allowed to re-read; `thin_page` otherwise
+(q45088's 127-char SPA tab list, q45215's 385 chars of region names — five such renders
+in the 2026-09-01 round, none naming a provider, which is why the floor is no longer
+gated on one).
 A page ABOVE the floor keeps its text, plus a one-line disclosure where an embed
 hid figures from it.
 
@@ -1381,18 +1384,29 @@ async def _finish_document(pending: _PendingDocument, ctx: FetchContext) -> Fetc
             content_type=pending.content_type or None,
             status_reason=reason,
         )
+    if not digest.passages:
+        # A document we read END TO END that does not discuss the ask. Its block is the header,
+        # the outline and one sentence saying nothing matched, which under the "primary grading
+        # evidence" caption is prose standing in for an absent section: it counted the provider
+        # as succeeded, defeated every downstream empty guard, and read in the run log exactly
+        # like a document that handed the forecasters the resolving paragraph. Withheld like any
+        # other content-free 200, with `no_matching_passage` saying which rule withheld it —
+        # a document we DID read, which is why it is excluded from the paid rung's population
+        # (:func:`_url_context_rung_applies`) that every other `no_resolving_content` is in.
+        return FetchResult(
+            url=pending.url,
+            status="no_resolving_content",
+            text="",
+            http_status=pending.http_status,
+            content_type=pending.content_type or None,
+            status_reason="no_matching_passage",
+        )
     return FetchResult(
         url=pending.url,
         status="success",
         text=digest.block,
         http_status=pending.http_status,
         content_type=pending.content_type or None,
-        # A zero-passage digest is a document we read that does not discuss the ask, and its
-        # block reads identically to one carrying the resolving paragraph — same header, same
-        # outline, plus a sentence saying nothing matched. No status flip (it IS a successful
-        # read, and a loss token here would move `sources=ok/total` and drag every sibling
-        # into the "yielded no usable content" notice), just the reason that separates them.
-        status_reason=None if digest.passages else "no_matching_passage",
     )
 
 
@@ -1759,8 +1773,14 @@ async def _wayback_snapshot_result(
         )
         return None
     if snapshot.status != "success":
+        # Two different facts, and the archive's own redirect is what tells them apart: a
+        # request it never redirected onto a dated capture URL means it holds no capture, while
+        # a capture URL we did land on and could not use means it holds one we cannot read.
+        # Both used to log "no archived copy served", so apnews.com — a capture served in full
+        # whose extraction was 355 chars of AP boilerplate — read as an empty archive.
         logger.info(
-            "resolution_source wayback: no archived copy served for %s (%s)",
+            "resolution_source wayback: %s for %s (%s)",
+            "no archived copy served" if parsed is None else "an archived capture was served but is unusable",
             urlparse(url).netloc,
             snapshot.status,
         )
@@ -1839,9 +1859,27 @@ async def _wayback_rung(
 # driver chose), a withheld archive copy is a freshness decision rather than a fetch failure, and
 # `ssrf_blocked` is a URL WE refused — handing that to a third-party fetcher is exactly the
 # bypass the guard exists to prevent, which is why it is excluded here and not merely unlisted.
+# One member of the set is narrowed further by REASON rather than by status — see
+# :func:`_url_context_rung_applies` — so this set is the ceiling on the population, not the
+# population itself.
 _URL_CONTEXT_TRIGGER_STATUSES: frozenset[FetchStatus] = frozenset(
     {"blocked", "js_wall", "error", "no_resolving_content"}
 )
+
+
+def _url_context_rung_applies(direct: FetchResult) -> bool:
+    """Whether a model-mediated read could plausibly resolve ``direct``.
+
+    The trigger statuses above, minus the one outcome inside them a paid read cannot help
+    with: a document we read END TO END whose passage selection matched no query term
+    (``no_matching_passage``). Its bytes were never the problem — we hold its full text and
+    its outline — so paying Gemini to re-read the same PDF buys nothing. Scoped on the REASON
+    rather than by dropping the status, because ``embed_shell`` and ``thin_page`` are pages our
+    client genuinely could not read and are exactly what this rung exists for.
+    """
+    if direct.status not in _URL_CONTEXT_TRIGGER_STATUSES:
+        return False
+    return direct.status_reason != "no_matching_passage"
 
 
 def _url_context_lead(live_status: FetchStatus) -> str:
@@ -1909,7 +1947,7 @@ async def _url_context_rung(
     forecaster-facing blast radius. That is the same floor ``gemini_search`` and v2's
     ``read_document`` apply, for the same reason.
     """
-    if direct.status not in _URL_CONTEXT_TRIGGER_STATUSES:
+    if not _url_context_rung_applies(direct):
         return None
     if not env_flag_enabled(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV):
         return None
@@ -2518,11 +2556,11 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     when its prose made it a success.
 
     ``reason`` is appended only where the status alone is ambiguous —
-    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page``,
-    ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs ``malformed``, the
-    ``no_matching_passage`` that separates a document we read and whose passage selection
-    matched nothing from one that answered the ask, and the ``budget_skipped`` /
-    ``parse_contention`` that say an ``unsupported_type`` was a document we were holding.
+    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page`` vs the
+    ``no_matching_passage`` of a document read in full that discusses nothing the question
+    asks about, ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs
+    ``malformed``, and the ``budget_skipped`` / ``parse_contention`` that say an
+    ``unsupported_type`` was a document we were holding.
     ``route`` is appended only when a ladder rung produced the outcome. Both are
     appended rather than always emitted so every line the archive already holds stays
     byte-identical and an absent field keeps meaning "this does not apply", not "old

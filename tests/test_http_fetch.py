@@ -3,6 +3,9 @@
 Covers:
 - `BROWSER_HEADERS` completeness (Safari-like UA + Accept / Accept-Language / Accept-Encoding)
 - `build_session` config plumbing (ClientTimeout total+sock_read, TCPConnector limit, headers, resolver)
+- `Content-Encoding` decoding of a body we never advertised (brotli, zstd), against a loopback
+  server, because the Wayback rung's `id_` replay carries the origin's encoding regardless of
+  what we asked for
 - `read_body_capped` under/at/over the byte cap (over -> None + WARNING), including
   multi-chunk streaming and mid-stream abort without consuming the remaining stream
 - `FilteringResolver` filters private IPs, raises OSError when everything is filtered,
@@ -24,13 +27,18 @@ import ipaddress
 import logging
 import socket
 import ssl
+import sys
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
 import certifi
 import pytest
+from aiohttp import web
 from aiohttp.abc import AbstractResolver
+from aiohttp.compression_utils import HAS_BROTLI, HAS_ZSTD
+from aiohttp.test_utils import TestServer
 
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
@@ -126,13 +134,12 @@ class TestBrowserHeaders:
     def test_accept_negotiates_html(self):
         assert "text/html" in BROWSER_HEADERS["Accept"]
 
-    def test_accept_encoding_excludes_brotli(self):
-        # aiohttp's brotli decoder isn't a project dep (HAS_BROTLI=False), so
-        # advertising `br` would have Brotli-preferring servers return content
-        # aiohttp can't decode -> ClientResponseError -> silent source drop.
-        # We advertise only gzip/deflate.
+    def test_accept_encoding_stays_the_measured_pair(self):
+        """The advertised set is the one the 38/50-vs-32/50 header measurement was taken with,
+        so it is pinned rather than widened. Brotli and zstd decoders ARE installed now (see
+        `TestUnadvertisedContentEncoding`), which is what makes a body we did not ask for
+        readable; asking for one is a separate, unmeasured change to every live fetch."""
         assert BROWSER_HEADERS["Accept-Encoding"] == "gzip, deflate"
-        assert "br" not in BROWSER_HEADERS["Accept-Encoding"]
 
 
 class TestBuildSession:
@@ -189,6 +196,95 @@ class TestBuildSession:
             # a private attribute — we peek at it as the only reliable way to
             # assert wiring without opening a real connection.
             assert getattr(session.connector, "_resolver", None) is resolver
+
+
+# The body a capture replays, shaped like the tracker page the defect was found on.
+_REPLAYED_PAGE = "<html><body><p>Layoff tracker: 1,234 employees affected in August 2026.</p></body></html>"
+
+
+def _zstd_compress(payload: bytes) -> bytes:
+    """Compress with the zstd encoder aiohttp's decoder is paired with.
+
+    Mirrors aiohttp's own conditional import: `compression.zstd` is stdlib from 3.14 on, and
+    `backports.zstd` is the declared dependency that supplies it below that, which is where
+    CI and every bot workflow sit (`python-version: "3.12"`).
+    """
+    if sys.version_info >= (3, 14):
+        from compression.zstd import compress
+    else:
+        from backports.zstd import compress
+
+    return compress(payload)
+
+
+@asynccontextmanager
+async def _encoded_body_server(body: bytes, encoding: str) -> AsyncIterator[tuple[str, list[str]]]:
+    """A loopback server answering every GET with `body` under `Content-Encoding: encoding`.
+
+    Yields the URL and the list of `Accept-Encoding` values the server saw, so a test can
+    assert the encoding arrived UNASKED-FOR — which is the whole shape of the defect.
+    """
+    accept_encodings: list[str] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        accept_encodings.append(request.headers.get("Accept-Encoding", ""))
+        return web.Response(
+            body=body,
+            headers={"Content-Encoding": encoding, "Content-Type": "text/html; charset=utf-8"},
+        )
+
+    app = web.Application()
+    app.router.add_get("/layoffs", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        yield str(server.make_url("/layoffs")), accept_encodings
+    finally:
+        await server.close()
+
+
+class TestUnadvertisedContentEncoding:
+    """Decoding a `Content-Encoding` we never advertised.
+
+    `Accept-Encoding` does not bound what arrives on every route. The Wayback rung fetches
+    captures in `id_` raw mode, which replays whatever encoding the ORIGIN sent the archive's
+    crawler, so our `gzip, deflate` is not a contract there. Measured 2026-09-03: trueup.io's
+    21-day-old capture (inside the rung's age bound, the one fresh capture of a host four
+    archived questions cite) replays as `zstd`, aiohttp raised `Can not decode content-encoding:
+    zstandard (zstd)`, the hop landed as `error` and the rung reported "no archived copy served"
+    for a capture the archive had served in full. Both decoders are declared dependencies so the
+    replay decodes instead of being lost.
+    """
+
+    def test_both_decoders_are_available_to_aiohttp(self):
+        """The dependency-level pin, separate from the wire tests so a dropped dependency names
+        itself instead of surfacing as a 400 from the decode path."""
+        assert HAS_BROTLI, "aiohttp has no brotli decoder — is `Brotli` still a dependency?"
+        assert HAS_ZSTD, "aiohttp has no zstd decoder — is `backports.zstd` still a dependency?"
+
+    async def test_zstd_encoded_body_decodes(self):
+        async with (
+            _encoded_body_server(_zstd_compress(_REPLAYED_PAGE.encode()), "zstd") as (url, accept_encodings),
+            build_session(timeout_s=5.0, headers=BROWSER_HEADERS) as session,
+            session.get(url) as resp,
+        ):
+            assert resp.status == 200
+            assert await resp.text() == _REPLAYED_PAGE
+
+        assert "zstd" not in accept_encodings[0], "the point is that we never asked for zstd"
+
+    async def test_brotli_encoded_body_decodes(self):
+        import brotli
+
+        async with (
+            _encoded_body_server(brotli.compress(_REPLAYED_PAGE.encode()), "br") as (url, accept_encodings),
+            build_session(timeout_s=5.0, headers=BROWSER_HEADERS) as session,
+            session.get(url) as resp,
+        ):
+            assert resp.status == 200
+            assert await resp.text() == _REPLAYED_PAGE
+
+        assert "br" not in accept_encodings[0], "the point is that we never asked for brotli"
 
 
 class TestReadBodyCapped:
