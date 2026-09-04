@@ -1046,8 +1046,9 @@ below is still asked about the DIRECT outcome (a stale archive is still a page w
 fresh), and the withhold is what stands when that rung is off or declines. This rung is NOT
 flag-gated, so from its merge a cited page's `status` can be a rung's verdict where it used to
 be the direct outcome: `stale_data` where the direct fetch said `blocked` / `error` /
-`not_found`, and (flag on) `ungrounded` where it said `blocked` / `js_wall` / `error` /
-`no_resolving_content`. An era-bucketed `blocked` or `error` rate read off `status` alone will
+`not_found`, and (flag on) `ungrounded`, or `no_resolving_content` with reason `not_addressed`,
+where it said `blocked` / `js_wall` / `error` / `no_resolving_content`. An era-bucketed
+`blocked` or `error` rate read off `status` alone will
 show a drop at that merge that is a bookkeeping change, not hosts refusing us less; take the
 direct outcome from `from_status` on the `RESOLUTION_SOURCE_ESCALATION` line, or partition
 `status` by `route`, where `direct` rows are unchanged.
@@ -1078,7 +1079,13 @@ a read the cap declines records a `url_context_cap` skip. Zero successful retrie
 DISCARDS the text under the new terminal status `ungrounded`, the same floor `gemini_search` and
 v2's `read_document` apply: Gemini answers fluently out of parametric memory when every
 retrieval failed, and a fluent unsourced answer under the primary-grading-evidence caption is
-the Q38195 failure with a forecaster-facing blast radius. A read that lands leads with a
+the Q38195 failure with a forecaster-facing blast radius. A read whose answer opens with the
+prompt's `NOT_ADDRESSED` sentinel (`research/url_context_reader.py`, the model's designed reply
+when the retrieved page does not discuss the ask) is withheld as `no_resolving_content` /
+`not_addressed` rather than rendered: the page WAS retrieved, so it is not `ungrounded`, but under
+the url_context lead the non-answer was prose standing in for an absent section, the shape the
+PDF digest closes with `no_matching_passage`. The read stays on the record as the rung's own
+verdict, since it was paid for. A read that lands leads with a
 mandatory disclosure saying why the route was taken and that the text is a model's reading
 rather than a copy of the page. Its spend is visible as a third `GEMINI_USAGE` role,
 `resolution_source`.
@@ -1107,10 +1114,11 @@ renders nothing while still surviving into the archive, which is what makes "the
 and never fired" distinguishable from "this record predates the rung". Six of the keys count
 rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
 `derived_api_reads`, `wayback_attempts` and `url_context_reads`. Two count the extractor
-policy's decisions rather than rungs, per final result: `chrome_metric_withholds` is a page whose
-extraction cleared the chrome floor on navigation alone and was withheld by the line-shape
-metric (its `reason` is the same `thin_page` an under-floor page carries, so this count is
-what separates the two), and `precision_fallback_rescues` is a page published from the
+policy's decisions rather than rungs, per final result: `chrome_metric_withholds` is an
+extraction the line-shape metric withheld because it cleared the chrome floor on navigation
+alone, including a chart-rescued page whose chart block still published without that text (on
+a page with no chart block its `reason` is the same `thin_page` an under-floor page carries, so
+this count is what separates the two), and `precision_fallback_rescues` is a page published from the
 `favor_precision` re-extraction after the default one failed that metric. The rest count rungs that
 were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
 because each names a different binding constraint. `rung_budget_skips` is the question that ran
@@ -1176,7 +1184,8 @@ than a read of the page and it is discarded rather than rendered. It has its own
 it says something no other status does, that the host answered a third-party fetcher's request
 with nothing while refusing ours. On the reason side there are now two vocabularies rather than
 one, split by what each qualifies. `FetchStatusReason` qualifies a result's STATUS —
-`embed_shell` / `thin_page` / `no_matching_passage` under `no_resolving_content`, `no_text_layer`
+`embed_shell` / `thin_page` / `no_matching_passage` / `not_addressed` under
+`no_resolving_content`, `no_text_layer`
 / `encrypted` / `malformed` under `unreadable_document`, and `budget_skipped` / `parse_contention`
 under the `unsupported_type` a held-but-unparsed document earns. `RungSkipReason` qualifies a
 rung ATTEMPT that never ran (`RungAttempt.skipped_reason`), which produced no result and so has
@@ -1188,8 +1197,9 @@ closed `Literal`, so a misspelt reason is a type error rather than a permanently
 `renderer_unavailable` is the browser declining before it rendered anything (missing, broken,
 unpinnable host); `render_timeout` is a render that launched and was cut off because the page
 kept navigating, and the two are kept apart because only the first says anything about Chromium.
-`no_resolving_content` has three reasons rather than two (`embed_shell`, `thin_page` and
-`no_matching_passage`), and the third is the only one that is a document rather than a page. All
+`no_resolving_content` has four reasons (`embed_shell`, `thin_page`, `no_matching_passage` and
+`not_addressed`): the third is the only one that is a document rather than a page, and the fourth
+is the paid reader's, a page Gemini retrieved whose answer said it does not discuss the ask. All
 of them live in `research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that
@@ -1242,7 +1252,9 @@ that scan since the Tier-2 hop reaches it. `thin_page` means no such provider wa
 The status's third reason is not a shape of chrome at all: `no_matching_passage` is a cited
 document we read in full that discusses nothing the question asks about, withheld under the
 same status because the outcome for a forecaster is the same, a section with nothing in it to
-grade against.
+grade against. Its fourth, `not_addressed`, is the paid url_context rung's equivalent: a page
+Gemini retrieved whose answer opened with the prompt's `NOT_ADDRESSED` sentinel, withheld for
+the same reason.
 That distinction used to be a GATE rather than a label, and the gate was removed on
 2026-09-02 because it was wrong: the
 2026-09-01 residual round found five content-free `success` renders and not one of them
@@ -1298,16 +1310,19 @@ escalation line (the verbatim `FetchStatus`), so a query joining the two has to 
 documented here rather than re-spelled on either side. See "Reading run logs" in
 `docs/operations.md` for the field meanings.
 
-The paid rung adds two greppable log lines that are deliberately NOT registered as marker specs:
-`RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...` (an INFO, the free pre-check
-avoiding a known-zero paid read) and `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=...
+The paid rung adds three greppable log lines that are deliberately NOT registered as marker
+specs: `RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=... host=...` (an INFO, the free pre-check
+avoiding a known-zero paid read), `RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=...
 statuses=...` (a WARN, a paid read discarded for retrieving nothing; `statuses` is every reported
-`url_retrieval_status`, `none` when the SDK attached no entry). With the flag off in every
-workflow neither can fire in production, so a spec would only add an always-empty archive
-column; both are FUTURE marker-spec candidates, to be registered if the flag is ever turned on,
-which is when their rates start meaning something. Their spellings are pinned by tests so the
-eventual spec matches the lines, and they are parallel to their `AGENTIC_URLCONTEXT_ROBOTS_SKIP`
-/ `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` twins on the gap-fill v2 reader, which already carry
+`url_retrieval_status`, `none` when the SDK attached no entry) and
+`RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url=... host=...` (a WARN, a paid read withheld
+because its answer opened with the `NOT_ADDRESSED` sentinel, so the page was retrieved and has
+nothing on the ask). With the flag off in every workflow none of them can fire in production, so
+a spec would only add an always-empty archive column; all three are FUTURE marker-spec
+candidates, to be registered if the flag is ever turned on, which is when their rates start
+meaning something. Their spellings are pinned by tests so the eventual spec matches the lines,
+and the first two are parallel to their `AGENTIC_URLCONTEXT_ROBOTS_SKIP` /
+`AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` twins on the gap-fill v2 reader, which already carry
 specs and are the pattern to follow.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page

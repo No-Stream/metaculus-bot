@@ -279,8 +279,12 @@ class TestChromeShapedPages:
 
     async def test_chart_data_still_rescues_a_chrome_shaped_page(self):
         """Chart data counts as content on every page, and a menu tree carrying a Highcharts
-        config is a page whose numbers we DID read. The chrome text rides along under the
-        chart block, as it does for a page under the floor."""
+        config is a page whose numbers we DID read. The chart block publishes ALONE: the menu
+        text failed the line-shape metric, which is the policy's definition of chrome, and the
+        same text is withheld one branch over when no chart block is present. Riding along it
+        filled the per-URL cap with up to 6,000 chars of navigation under the primary grading
+        evidence caption and ate the aggregate budget sibling pages could use. The withhold is
+        still counted, so the archive sees the metric fire on a page that published."""
         config = {
             "xAxis": [{"categories": ["2024", "2025", "2026"]}],
             "series": [{"name": "Unemployed persons", "data": [612_300, 598_100, 604_900]}],
@@ -295,7 +299,9 @@ class TestChromeShapedPages:
         assert result.status == "success"
         assert "Unemployed persons" in result.text
         assert "604,900" in result.text or "604900" in result.text
-        assert result.chrome_metric_withheld is False
+        assert "Archive release" not in result.text
+        assert result.chrome_metric_withheld is True
+        assert _rung_counts([result])["chrome_metric_withholds"] == 1
 
 
 class TestExtractorPolicyCounts:

@@ -351,6 +351,39 @@ class TestProviderLevelRungMarkers:
         assert counts["wayback_attempts"] == 1
         assert ROUTE_CAVEATS["wayback"] in section
 
+    async def test_a_withheld_capture_keeps_the_direct_fetchs_diagnostics_on_the_fetch_line(self, monkeypatch, caplog):
+        """The Wayback withhold REPLACES the direct result on the FETCH line, and it used to carry
+        the archive's `http=200` with no `failure_class` or `server`: the blocked population the
+        ladder was justified on, undercounted by every withheld capture. A rung verdict that served
+        nothing keeps the cited host's own status and diagnostics; only the success path reports
+        the snapshot's status, because those bytes are the archive's."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        now = datetime.now(UTC)
+        snapshot = _snapshot_url(_URL, captured=now - timedelta(days=400))
+        session = FakeSession(
+            {
+                _URL: FakeResponse(403, body=b"denied", headers={"Server": "AkamaiGHost"}, content_type="text/html"),
+                wayback_snapshot_url(_URL, now=now): FakeResponse(302, headers={"Location": snapshot}),
+                snapshot: FakeResponse(200, body=_prose_page(_RENDERED_PROSE), content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=stale_data http=403 embeds=none "
+            "route=wayback failure_class=http_403 server=akamaighost"
+        ]
+        assert re.fullmatch(
+            rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
+            r"from_status=blocked rung=wayback outcome=stale_data wall_s=\d+\.\d\d",
+            next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
+        )
+
     async def test_the_url_context_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")

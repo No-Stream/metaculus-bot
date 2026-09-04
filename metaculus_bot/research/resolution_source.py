@@ -167,6 +167,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     RESOLUTION_SOURCE_MAX_URLS,
     RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S,
+    RESOLUTION_SOURCE_MIN_SECTION_CHARS,
     RESOLUTION_SOURCE_PDF_MIN_BUDGET_S,
     RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
     RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S,
@@ -255,7 +256,7 @@ from metaculus_bot.research.resolution_url_scan import (
     strip_markdown_escapes,  # noqa: F401  # re-export: the Tier-1 suite imports the markdown unescaper from this module path
 )
 from metaculus_bot.research.robots_policy import ROBOTS_FETCH_TIMEOUT_S, google_extended_blocks_url
-from metaculus_bot.research.url_context_reader import run_url_context_read
+from metaculus_bot.research.url_context_reader import NOT_ADDRESSED_SENTINEL, run_url_context_read
 from metaculus_bot.research.wayback import (
     innermost_url,
     parse_snapshot_url,
@@ -572,6 +573,11 @@ def _budgeted_success_sections(
 
     Cited pages and Tier-2 datasets draw on separate allowances, so a chart's rows can
     never evict the page text the section exists to serve.
+
+    A remainder under ``RESOLUTION_SOURCE_MIN_SECTION_CHARS`` drops the section rather than
+    rendering into it: below the truncation marker's own length the truncator degrades to a bare
+    slice, so a rescued section landing on a sliver rendered its provenance lead cut mid-word with
+    no marker while the caveat block above, computed over ``kept``, promised a complete disclosure.
     """
     sections: list[str] = []
     kept: list[FetchResult] = []
@@ -586,7 +592,7 @@ def _budgeted_success_sections(
         # conservatively.
         is_dataset = r.chart_id is not None
         remaining = dataset_remaining if is_dataset else page_remaining
-        if remaining <= 0:
+        if remaining < RESOLUTION_SOURCE_MIN_SECTION_CHARS:
             dropped += 1
             continue
         body = r.text
@@ -1142,8 +1148,9 @@ class _PageExtraction:
     ``text`` is what the classifier sees: the precision re-extraction when it rescued the
     page, else the default one (None when nothing extracted). ``chrome_metric_withheld``
     marks a default extraction that cleared the chrome floor and failed the line-shape
-    metric with no rescue, so the classifier withholds it; ``precision_rescued`` marks a
-    text that came from the fallback. Both ride the result into ``details["counts"]``.
+    metric with no rescue, so the classifier withholds that text (the page itself still
+    publishes when a chart block carries its numbers); ``precision_rescued`` marks a text
+    that came from the fallback. Both ride the result into ``details["counts"]``.
     """
 
     text: str | None
@@ -1312,7 +1319,12 @@ async def _classify_html_body(
     3. Chart data therefore rescues a page the chrome floor would have withheld —
        including a JS-walled one, where the config in the raw HTML is precisely the
        data the wall was hiding. That is the one place the `js_wall` outcome moves,
-       and it moves only when we actually recovered the numbers.
+       and it moves only when we actually recovered the numbers. A body the line-shape
+       metric withheld does not ride along under the chart block: the metric's verdict is
+       that the text is chrome, the same text is withheld one branch up when no chart
+       block is present, and published it filled the per-URL cap with up to 6,000 chars
+       of navigation. The chart block publishes alone, and the withhold is still counted.
+       The under-floor rider (`looks_like_page_chrome`, under 400 chars) is unchanged.
     """
     # Both embed scans are only possible on the RAW HTML —
     # trafilatura drops iframes and embed scripts at every
@@ -1355,15 +1367,19 @@ async def _classify_html_body(
             ),
             html_text=html_text,
         )
+    # Reachable only with a non-empty chart block, so a blank body still renders the lead alone
+    # (`_lead_then_capped_body`) and the blank-success guard on `FetchResult` cannot trip.
+    published_text = "" if extraction.chrome_metric_withheld else (extracted or "")
     return _HtmlClassification(
         result=FetchResult(
             url=current_url,
             status="success",
-            text=_page_text_with_leads(extracted or "", current_url, unreadable_embeds, chart_block),
+            text=_page_text_with_leads(published_text, current_url, unreadable_embeds, chart_block),
             http_status=http_status,
             content_type=content_type or None,
             datawrapper_charts=charts,
             unreadable_embeds=unreadable_embeds,
+            chrome_metric_withheld=extraction.chrome_metric_withheld,
             precision_rescued=extraction.precision_rescued,
         ),
         html_text=html_text,
@@ -1861,7 +1877,10 @@ async def _rendered_rung(
     nothing about whether Chromium works, and must not latch that warning. The direct result is
     what stands. The transport memoises a timed-out URL itself, and only when a browser actually
     ran (the outer cut can fire while the render is still queued, which says nothing about the
-    page); a memoised URL re-raises on the next question, so it is recorded the same way again.
+    page), and only when its own DOM-read bound fires before this rung's outer cut; in the
+    salvage shape (goto ran its budget out) the outer cut lands first by the launch time, so
+    that URL is not memoised. A memoised URL re-raises on the next question, so it is recorded
+    the same way again.
 
     The rendered DOM re-enters :func:`_classify_html_body`, so a rescued page gets the same
     chart read, ARIA rewrite, floors and disclosure leads as a directly-fetched one — unless the
@@ -2079,7 +2098,10 @@ async def _wayback_snapshot_result(
     Only a capture we actually READ and cannot date, or can date and it is too old, is withheld
     as ``stale_data`` — because the disclosure that makes a snapshot admissible is its age, and a
     copy with no usable date cannot carry it. The direct status is not lost by that swap either:
-    the ``RESOLUTION_SOURCE_ESCALATION`` line for this rung carries ``from_status``.
+    the ``RESOLUTION_SOURCE_ESCALATION`` line for this rung carries ``from_status``, and the
+    withhold keeps the direct fetch's HTTP status and failure diagnostics, so the
+    ``RESOLUTION_SOURCE_FETCH`` line it replaces the direct result on still says which host
+    refused us and from which CDN.
     """
     snapshot = await _fetch_direct(session, wayback_snapshot_url(url, now=ctx.now), host_sems, _aux_ctx(ctx))
     parsed = parse_snapshot_url(snapshot.url)
@@ -2116,8 +2138,16 @@ async def _wayback_snapshot_result(
             url=url,
             status="stale_data",
             text="",
-            http_status=snapshot.http_status,
-            content_type=snapshot.content_type,
+            # The cited HOST's status and diagnostics, not the archive's: this verdict replaces
+            # the direct result on the FETCH line, where `http=200` was the archive answering
+            # and the missing `failure_class` / `server` undercounted the blocked population
+            # the ladder exists for. Only the success below reports the snapshot's own status,
+            # because those bytes are the archive's.
+            http_status=direct.http_status,
+            content_type=direct.content_type,
+            failure_class=direct.failure_class,
+            exc=direct.exc,
+            server=direct.server,
         )
     # The lead LEADS and its cost comes out of the per-URL cap (:func:`_lead_then_capped_body`):
     # an archived page whose age line has been trimmed off is being passed off as the live one.
@@ -2334,6 +2364,14 @@ async def _url_context_rung(
     primary grading evidence, so a fluent unsourced answer here is the Q38195 failure with a
     forecaster-facing blast radius. That is the same floor ``gemini_search`` and v2's
     ``read_document`` apply, for the same reason.
+
+    An answer that opens with ``NOT_ADDRESSED_SENTINEL`` is WITHHELD as ``no_resolving_content``
+    / ``not_addressed``. The prompt asks for that opening when the retrieved page does not discuss
+    the ask, so it is the designed non-answer, and rendered under the url_context lead it was
+    prose standing in for an absent section, the shape :func:`_finish_document` closes for a PDF
+    with ``no_matching_passage``. The page was retrieved (so it is not ``ungrounded``) and the
+    read was paid for, so the verdict stays on the record as this rung's own rather than declining
+    to the direct result.
     """
     admitted = await _url_context_admission(session, url, direct, host_sems=host_sems, ctx=ctx)
     if admitted is None:
@@ -2382,8 +2420,31 @@ async def _url_context_rung(
             url=url,
             status="ungrounded",
             text="",
+            # The host's status and diagnostics stay on a verdict that served nothing: a
+            # model-mediated read has no status of its own, and the FETCH line this result
+            # replaces the direct one on is where "which host refused us" is counted.
             http_status=direct.http_status,
             content_type=direct.content_type,
+            failure_class=direct.failure_class,
+            exc=direct.exc,
+            server=direct.server,
+        )
+    answer = text.strip()
+    if answer.startswith(NOT_ADDRESSED_SENTINEL):
+        # Unregistered like its two URLCONTEXT siblings while the flag is off in every workflow
+        # (docs/research.md); `host=` because the rollout question is which hosts Gemini can
+        # reach but finds nothing on.
+        logger.warning(f"RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url={url} host={urlparse(url).netloc}")
+        return FetchResult(
+            url=url,
+            status="no_resolving_content",
+            text="",
+            http_status=direct.http_status,
+            content_type=direct.content_type,
+            status_reason="not_addressed",
+            failure_class=direct.failure_class,
+            exc=direct.exc,
+            server=direct.server,
         )
     # The lead LEADS and is budgeted out of the cap (:func:`_lead_then_capped_body`): a model's
     # answer rendered without the disclosure reads as the page itself.
@@ -2391,7 +2452,7 @@ async def _url_context_rung(
     return FetchResult(
         url=url,
         status="success",
-        text=_lead_then_capped_body(lead, text.strip(), url),
+        text=_lead_then_capped_body(lead, answer, url),
         http_status=direct.http_status,
         content_type="text/plain",
     )
@@ -2963,7 +3024,8 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     ``reason`` is appended only where the status alone is ambiguous —
     ``no_resolving_content``'s ``embed_shell`` vs ``thin_page`` vs the
     ``no_matching_passage`` of a document read in full that discusses nothing the question
-    asks about, ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs
+    asks about vs the paid reader's ``not_addressed``, ``unreadable_document``'s
+    ``no_text_layer`` vs ``encrypted`` vs
     ``malformed``, and the ``budget_skipped`` / ``parse_contention`` that say an
     ``unsupported_type`` was a document we were holding.
     ``route`` is appended only when a ladder rung produced the outcome. Both are
@@ -3074,8 +3136,9 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # flag on and GOOGLE_API_KEY unset the paid rung fires nowhere, and without this key
         # that run is byte-identical in the archive to one with the flag off.
         "url_context_no_api_key_skips": skips_by_reason["no_api_key"],
-        # The extractor policy's two decisions, per final result: a page withheld because its
-        # extraction cleared the chrome floor on navigation alone, and a page published from
+        # The extractor policy's two decisions, per final result: an extraction the line-shape
+        # metric withheld because it cleared the chrome floor on navigation alone (including a
+        # chart-rescued page, whose chart block still published), and a page published from
         # the precision re-extraction after the default one failed the same metric.
         "chrome_metric_withholds": sum(1 for r in results if r.chrome_metric_withheld),
         "precision_fallback_rescues": sum(1 for r in results if r.precision_rescued),

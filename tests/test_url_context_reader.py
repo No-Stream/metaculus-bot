@@ -53,7 +53,19 @@ class TestTheDocumentPromptKeepsAReadCheckable:
     def test_a_document_that_does_not_answer_must_say_so_plainly(self):
         """Without an explicit out, the fluent answer from parametric memory is the likeliest
         thing to come back, which is the failure this whole path is guarded against."""
-        assert "If the document does not address the ask, say that plainly." in build_document_prompt(_ASK)
+        assert (
+            "If the document does not address the ask, begin your reply with NOT_ADDRESSED and say so plainly."
+            in build_document_prompt(_ASK)
+        )
+
+    def test_the_non_answer_opens_with_a_machine_readable_sentinel(self):
+        """The plain "this does not address the ask" is the DESIGNED answer for a retrieved page
+        that does not discuss the question, and rendered under the primary-grading-evidence
+        caption it is prose standing in for an absent section. The sentinel is what lets the
+        ladder withhold it instead of publishing it; the constant is what the ladder matches on,
+        so the prompt has to carry that exact spelling."""
+        assert url_context_reader.NOT_ADDRESSED_SENTINEL == "NOT_ADDRESSED"
+        assert url_context_reader.NOT_ADDRESSED_SENTINEL in build_document_prompt(_ASK)
 
 
 def _document_response(text: str) -> Any:

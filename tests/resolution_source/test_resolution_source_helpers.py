@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from metaculus_bot.constants import RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import (
     MAX_UNDECODABLE_CHAR_RATIO,
@@ -23,6 +24,7 @@ from metaculus_bot.research.http_fetch import (
     meta_refresh_target,
     rewrite_aria_tables,
 )
+from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS, RungAttempt
 from metaculus_bot.research.resolution_source import (
     FetchResult,
     extract_source_urls,
@@ -37,6 +39,7 @@ from metaculus_bot.research.resolution_source import (
     strip_markdown_escapes,
     vacuous_body_status,
 )
+from metaculus_bot.research.wayback import WaybackSnapshot, wayback_lead
 from tests.resolution_source_fakes import cdc_aria_stat_block_page, cp1252_aria_stat_block_page
 
 
@@ -80,7 +83,7 @@ class TestExtractSourceUrls:
         assert extract_source_urls(text) == ["https://ok.com/z"]
 
     def test_dedup_collapses_bare_host_and_trailing_slash(self):
-        # Real questions cite both root-page forms (2026-07-09 smoke test, Q41581:
+        # Real questions cite both root-page forms (Q41581 on a smoke test:
         # childmortality.org vs childmortality.org/) — one fetch slot, not two.
         text = "See https://x.org and also https://x.org/ for data."
         assert extract_source_urls(text) == ["https://x.org"]
@@ -612,6 +615,132 @@ class TestFormatResolutionSections:
         ]
         out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         assert "omitted" not in out
+
+    def test_a_remainder_under_the_section_floor_omits_the_section_rather_than_a_lead_stub(self):
+        """Below the truncation marker's own length the truncator degrades to a bare slice, so a
+        rescued section landing on a remainder shorter than its provenance lead rendered that
+        lead cut mid-word (`[Archived copy from the Wayback M`) with no marker, while the route
+        caveat above, computed over the kept results, promised every archived section states its
+        capture date and age. Reachable on prod constants: three full direct pages ahead of a
+        rescued fourth leave a remainder under the floor. Sizes derive from the constants so the
+        scenario stays the reachable one."""
+        total = resolution_source.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+        per_url = resolution_source.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        leftover = resolution_source.RESOLUTION_SOURCE_MIN_SECTION_CHARS // 3
+        fillers = [
+            FetchResult(
+                url=f"https://p{i}.example.com/x", status="success", text="F" * size, http_status=200, content_type=None
+            )
+            for i, size in enumerate((per_url, per_url, total - 2 * per_url - leftover))
+        ]
+        url = "https://www.bls.gov/wsp/"
+        snapshot = WaybackSnapshot(captured_at=datetime(2026, 8, 29, tzinfo=UTC), inner_url=url)
+        archived = FetchResult(
+            url=url,
+            status="success",
+            text=resolution_source._lead_then_capped_body(wayback_lead(snapshot, 6.0, "blocked"), "x" * 8000, url),
+            http_status=200,
+            content_type="text/html",
+            route="wayback",
+        )
+
+        out = format_resolution_sections([*fillers, archived], datetime(2026, 9, 4, tzinfo=UTC))
+
+        assert f"### {url}" not in out
+        assert "[Archived copy" not in out
+        assert "[1 additional source(s) omitted — section budget]" in out
+        assert ROUTE_CAVEATS["wayback"] not in out
+
+
+class TestRungVerdictsAreGlossedForForecasters:
+    """The per-domain token in both failure notices exists to tell "the tracker was down" from
+    "the tracker has no reading". Since the ladder, a cited page's status can be a RUNG's verdict
+    about an artifact the forecaster never sees: the Wayback rung's ``stale_data`` for a capture
+    it withheld, the paid reader's ``ungrounded`` for a read that retrieved nothing. Rendered
+    bare, ``www.bls.gov: stale_data`` asserts a false thing about the LIVE page. The notice
+    renders the direct outcome the rung's attempt recorded, glossed with what the rung found;
+    the status tokens themselves are telemetry and do not move."""
+
+    _AT = datetime(2026, 9, 4, tzinfo=UTC)
+    _BLS = "https://www.bls.gov/wsp/"
+    _WALLED = "https://x.example.com/dashboard"
+    _STALE_GLOSS = (
+        "www.bls.gov: blocked (live page could not be fetched; the newest archived copy is older than "
+        f"{RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS:.0f} days or undatable)"
+    )
+    _UNGROUNDED_GLOSS = "x.example.com: js_wall (a model-mediated read retrieved nothing)"
+
+    def _withheld_capture(self) -> FetchResult:
+        return FetchResult(
+            url=self._BLS,
+            status="stale_data",
+            text="",
+            http_status=403,
+            content_type=None,
+            route="wayback",
+            rung_attempts=[
+                RungAttempt(
+                    rung="wayback",
+                    from_status="blocked",
+                    url=self._BLS,
+                    started_at=0.0,
+                    wall_s=0.1,
+                    outcome="stale_data",
+                )
+            ],
+        )
+
+    def _ungrounded_read(self) -> FetchResult:
+        return FetchResult(
+            url=self._WALLED,
+            status="ungrounded",
+            text="",
+            http_status=200,
+            content_type="text/html",
+            route="url_context",
+            rung_attempts=[
+                RungAttempt(
+                    rung="url_context",
+                    from_status="js_wall",
+                    url=self._WALLED,
+                    started_at=0.0,
+                    wall_s=4.2,
+                    outcome="ungrounded",
+                )
+            ],
+        )
+
+    def _blocked_sibling(self) -> FetchResult:
+        return FetchResult(url="https://bad.com/y", status="blocked", text="", http_status=403, content_type=None)
+
+    def _success_sibling(self) -> FetchResult:
+        return FetchResult(
+            url="https://ok.com/data", status="success", text="the reading is 3.2%", http_status=200, content_type=None
+        )
+
+    def test_a_withheld_capture_renders_the_direct_outcome_in_the_all_failed_notice(self):
+        out = format_resolution_sections([self._withheld_capture(), self._blocked_sibling()], self._AT)
+
+        assert self._STALE_GLOSS in out
+        assert ": stale_data" not in out
+        # A plain direct failure beside it is byte-identical to what it rendered before the ladder.
+        assert "bad.com: blocked" in out
+        assert "2 resolution source(s) yielded no usable content" in out
+
+    def test_a_withheld_capture_renders_the_direct_outcome_in_the_mixed_note(self):
+        out = format_resolution_sections([self._success_sibling(), self._withheld_capture()], self._AT)
+
+        assert self._STALE_GLOSS in out
+        assert ": stale_data" not in out
+        assert "1 other cited resolution source(s) yielded no usable content" in out
+        assert "### https://ok.com/data" in out
+
+    def test_an_ungrounded_read_renders_the_direct_outcome(self):
+        out = format_resolution_sections([self._ungrounded_read(), self._blocked_sibling()], self._AT)
+
+        assert self._UNGROUNDED_GLOSS in out
+        assert ": ungrounded" not in out
+        assert "bad.com: blocked" in out
 
 
 class TestAriaTableRewrite:

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urlparse
 
+from metaculus_bot.constants import RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS
 from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, DatawrapperChartRef
 
 # `stale_data` has two producers, and only one of them earns the benign diagnostics token.
@@ -46,7 +47,7 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 #
 # `no_resolving_content` is the 200 whose extracted text carries no content worth
 # grading against — page chrome, and nothing else, or a document that discusses
-# nothing the question asks about. Three ways a fetch earns it, told apart by
+# nothing the question asks about. Four ways a fetch earns it, told apart by
 # `FetchResult.status_reason`:
 #
 #   `embed_shell` — the page's numbers exist but live inside a third-party data
@@ -70,6 +71,13 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 #   population (`_url_context_rung_applies`): the bytes were never the problem, so a
 #   model re-reading the same PDF buys nothing. See the reason table below for what
 #   publishing it as `success` cost.
+#
+#   `not_addressed` — the PAID reader retrieved the page and its answer opened with the
+#   prompt's `NOT_ADDRESSED` sentinel, the designed reply for a document that does not
+#   discuss the ask. The read was paid for and the page WAS retrieved (so it is not
+#   `ungrounded`), but the answer is a non-answer, and rendered under the url_context lead
+#   it was prose standing in for an absent section: the paid rung's twin of
+#   `no_matching_passage`.
 #
 # Distinct from `empty_body` (nothing was there at all) and from `js_wall` (the
 # page needs JS to assemble ANY content, i.e. under the much lower JS-wall floor):
@@ -111,11 +119,11 @@ FetchStatus = Literal[
 # generalised thin-page one, so a later "how often does the floor withhold a page
 # nothing else would have caught?" cut is a query rather than a re-derivation.
 #
-# `embed_shell` / `thin_page` / `no_matching_passage` belong to `no_resolving_content`;
-# `no_text_layer` / `encrypted` / `malformed` to `unreadable_document`, where the split is
-# what says whether a paid document read could ever help (only `no_text_layer` — the other
-# two are bytes no reader gets text out of, and `no_matching_passage` is a document whose
-# text we already hold).
+# `embed_shell` / `thin_page` / `no_matching_passage` / `not_addressed` belong to
+# `no_resolving_content`; `no_text_layer` / `encrypted` / `malformed` to `unreadable_document`,
+# where the split is what says whether a paid document read could ever help (only
+# `no_text_layer` — the other two are bytes no reader gets text out of, and
+# `no_matching_passage` is a document whose text we already hold).
 #
 # The document rung adds three. `no_matching_passage` is a document we DID read whose BM25
 # selection matched no query term: the digest renders its header, its outline and the "no
@@ -126,6 +134,12 @@ FetchStatus = Literal[
 # belong to the `unsupported_type` a held-but-unparsed document earns, and say which rule
 # declined: the question ran out of wall, or every parse slot was taken. Without them a
 # skipped document is indistinguishable from a body that was never a document at all.
+#
+# The paid rung adds one. `not_addressed` is a page Gemini DID retrieve whose answer opened with
+# the prompt's `NOT_ADDRESSED` sentinel, the designed reply for a document that does not discuss
+# the ask; the same prose-for-an-absent-section shape as `no_matching_passage`, one rung over,
+# and the token that keeps "we paid and the page has nothing on this" distinguishable from
+# "we paid and Gemini retrieved nothing" (`ungrounded`).
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -135,6 +149,7 @@ FetchStatusReason = Literal[
     "no_matching_passage",
     "budget_skipped",
     "parse_contention",
+    "not_addressed",
 ]
 
 # Why a RUNG ATTEMPT never ran, carried on `RungAttempt.skipped_reason` (empty when the rung
@@ -351,7 +366,8 @@ class FetchResult:
     # ACCOUNTING NOTE for anyone bucketing statuses by era: since the escalation ladder, a
     # `status` may be a RUNG's verdict rather than the direct fetch's outcome — the Wayback
     # rung's `stale_data` in place of the `blocked` / `error` / `not_found` that triggered it,
-    # the paid reader's `ungrounded` in place of its trigger. An era-bucketed `blocked` rate
+    # the paid reader's `ungrounded` or `no_resolving_content` / `not_addressed` in place of its
+    # trigger. An era-bucketed `blocked` rate
     # taken off this field alone will therefore show a drop at the ladder's merge that is a
     # bookkeeping change, not hosts refusing us less. Take the direct outcome from
     # `from_status` on the `RESOLUTION_SOURCE_ESCALATION` line, or partition `status` by
@@ -369,8 +385,10 @@ class FetchResult:
     # disclosure appended to its rendered text.
     unreadable_embeds: list[str] = field(default_factory=list)
     # Which rule produced the status, where the status alone is ambiguous. Set on
-    # `no_resolving_content` (`embed_shell` / `thin_page` / `no_matching_passage`) and
-    # `unreadable_document` (`no_text_layer` / `encrypted` / `malformed`); None everywhere else.
+    # `no_resolving_content` (`embed_shell` / `thin_page` / `no_matching_passage` /
+    # `not_addressed`), `unreadable_document` (`no_text_layer` / `encrypted` / `malformed`) and
+    # the `unsupported_type` of a held-but-unparsed document (`budget_skipped` /
+    # `parse_contention`); None everywhere else.
     status_reason: FetchStatusReason | None = None
     # Which rung of the ladder produced this result, and the per-rung attempts behind
     # it. `direct` plus an empty list is the plain fetch, which is the overwhelming
@@ -379,8 +397,10 @@ class FetchResult:
     rung_attempts: list[RungAttempt] = field(default_factory=list)
     # The HTML extractor policy's decision (`resolution_source._extract_page_text`); False off
     # the HTML path. `chrome_metric_withheld`: the extraction cleared the chrome floor on
-    # navigation alone and the line-shape metric withheld it (the `thin_page` reason covers
-    # this and the under-floor case alike). `precision_rescued`: the published text is the
+    # navigation alone and the line-shape metric withheld it. That is an extraction the metric
+    # withheld, not necessarily a page: on a chart-rescued page the chart block still publishes
+    # alone and this stays True, while on a page with no chart block the `thin_page` reason
+    # covers this and the under-floor case alike. `precision_rescued`: the published text is the
     # `favor_precision` re-extraction, taken after the default one failed that metric. Both
     # ride `details["counts"]`, so no status or reason token moved.
     chrome_metric_withheld: bool = False
@@ -397,7 +417,10 @@ class FetchResult:
     # token vocabulary: `http_403` / `http_4xx` / `http_5xx` off the response, or `tls` / `dns` /
     # `timeout` / `connection` / `decode` off the transport exception. `exc` is that exception's
     # class name. `server` is the `Server` response header, lower-cased and truncated — the
-    # strongest tell of which CDN refused us.
+    # strongest tell of which CDN refused us. A rung verdict that REPLACES a failed direct fetch
+    # on the marker line (the Wayback `stale_data` withhold, the paid reader's `ungrounded`)
+    # keeps the direct fetch's diagnostics and `http_status`: they are facts about the cited host
+    # that triggered the rung, and only a rung that served bytes reports its own status.
     failure_class: str | None = None
     exc: str | None = None
     server: str | None = None
@@ -529,13 +552,47 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     return sources
 
 
+def _forecaster_facing_status(r: FetchResult) -> str:
+    """The outcome token a forecaster reads for one failed CITED page.
+
+    The verbatim ``status`` for every outcome but two. Since the ladder, a cited page's status
+    can be a RUNG's verdict about an artifact the forecaster never sees: the Wayback rung's
+    ``stale_data`` for an over-age or undatable capture it withheld, and the paid reader's
+    ``ungrounded`` for a read that retrieved nothing. Rendered bare, ``www.bls.gov: stale_data``
+    asserts a false thing about the LIVE page, one a forecaster on a "will X publish by date"
+    question can act on, when the direct outcome (``blocked``) is the fact about that page. So
+    those two render the DIRECT status, taken off the ``from_status`` the verdict's own rung
+    attempt recorded (the ladder asks every rung about the direct outcome, so the attempt for
+    that rung always carries it), glossed with what the rung found. The status tokens themselves
+    are telemetry and do not move: this is the forecaster-facing line only, never the marker or
+    the diagnostics map.
+
+    Only cited pages reach here (the caller partitions datasets into their own withheld note),
+    which is what keeps the Datawrapper hop's ``stale_data`` out of this branch.
+    """
+    if r.status not in ("stale_data", "ungrounded"):
+        return r.status
+    verdict_rung: FetchRoute = "wayback" if r.status == "stale_data" else "url_context"
+    from_status = next(a.from_status for a in r.rung_attempts if a.rung == verdict_rung and not a.skipped_reason)
+    if r.status == "stale_data":
+        return (
+            f"{from_status} (live page could not be fetched; the newest archived copy is older than "
+            f"{RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS:.0f} days or undatable)"
+        )
+    return f"{from_status} (a model-mediated read retrieved nothing)"
+
+
 def _render_fetch_failures(failures: list[FetchResult]) -> str:
-    """Render failed fetches as a compact ``"domain: status, domain: status"`` list."""
+    """Render failed fetches as a compact ``"domain: status, domain: status"`` list.
+
+    Every pre-ladder status renders byte-identically; the two rung verdicts a cited page can
+    carry are glossed by :func:`_forecaster_facing_status`.
+    """
     parts: list[str] = []
     for r in failures:
         try:
             domain = urlparse(r.url).netloc or r.url
         except ValueError:
             domain = r.url
-        parts.append(f"{domain}: {r.status}")
+        parts.append(f"{domain}: {_forecaster_facing_status(r)}")
     return ", ".join(parts)

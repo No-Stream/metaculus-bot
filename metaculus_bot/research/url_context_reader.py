@@ -26,19 +26,32 @@ from metaculus_bot.research.gemini_client_config import build_gemini_http_option
 from metaculus_bot.research.gemini_usage import log_gemini_usage
 from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
+# The token the model is asked to OPEN its reply with when the document does not address the ask.
+# The plain non-answer is the designed reply for a retrieved page that does not discuss the
+# question, and prose it is indistinguishable from an answer: rendered under the resolution
+# ladder's "primary grading evidence" caption it counted the provider as succeeded and stood in for
+# the section it should have been withheld from. A leading sentinel makes that reply
+# machine-readable, so the ladder withholds it (`no_resolving_content` / `not_addressed`) the way
+# the PDF digest withholds a document whose passages matched nothing. Gap-fill v2's
+# `read_document` renders the reader's text verbatim into its tool result, so its non-answers now
+# open with this token too; nothing in v2 parses the text.
+NOT_ADDRESSED_SENTINEL = "NOT_ADDRESSED"
+
 
 def build_document_prompt(ask: str) -> str:
     """Wrap a caller's ask in the three instructions that keep a read checkable.
 
     Verbatim quotes, because a paraphrase of a document we cannot see is unverifiable. The
     document's own stated dates, because both callers render into evidence whose age decides how
-    much it is worth. And a plain "this does not address the ask", because the alternative is a
-    fluent answer assembled out of recall — the failure this whole path is guarded against.
+    much it is worth. And a plain "this does not address the ask" opening with
+    ``NOT_ADDRESSED_SENTINEL``, because the alternative is a fluent answer assembled out of recall
+    (the failure this whole path is guarded against), and a non-answer a caller cannot recognise
+    renders as evidence.
     """
     return (
         f"{ask}\n\n"
         "Answer using verbatim quotes from the document whenever possible. Include the document's stated dates. "
-        "If the document does not address the ask, say that plainly."
+        f"If the document does not address the ask, begin your reply with {NOT_ADDRESSED_SENTINEL} and say so plainly."
     )
 
 

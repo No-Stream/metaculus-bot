@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import UTC, datetime
 
 import pytest
 
@@ -14,6 +15,7 @@ from metaculus_bot.research.resolution_source import (
     QuestionRungBudget,
     _fetch_one,
     _rung_counts,
+    format_resolution_sections,
 )
 from metaculus_bot.research.robots_policy import reset_robots_cache
 from tests.resolution_source_fakes import (
@@ -100,6 +102,10 @@ class TestUrlContextRung:
 
         assert result.status == "ungrounded"
         assert result.text == ""
+        # A verdict that served nothing keeps the cited host's status and diagnostics, so the
+        # FETCH line it replaces the direct result on still says which host refused us.
+        assert result.http_status == 403
+        assert result.failure_class == "http_403"
         # Deliberately unregistered while the flag is off everywhere, so the spelling is pinned
         # HERE: parallel to AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED, the v2 reader's twin, so the
         # spec that eventually registers it matches the lines already in the logs.
@@ -107,6 +113,38 @@ class TestUrlContextRung:
             "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate "
             "statuses=URL_RETRIEVAL_STATUS_ERROR"
         ) in caplog.messages
+
+    async def test_an_answer_that_does_not_address_the_ask_is_withheld(self, monkeypatch, caplog):
+        """The prompt asks the model to open with NOT_ADDRESSED when the retrieved page does not
+        discuss the ask, so that answer is the DESIGNED non-answer. Published as `success` it
+        rendered under the url_context lead and the primary-grading-evidence caption, counted the
+        provider as succeeded and suppressed the all-failed notice for sibling URLs: prose
+        standing in for an absent section, the shape the PDF digest closes with
+        `no_matching_passage`. The read was still paid for, so it stays on the record as the
+        rung's own verdict."""
+        reader, _calls = self._reader(text="NOT_ADDRESSED. The page lists office hours only.")
+        self._arm(monkeypatch, reader)
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(self._session(), _URL, {}, FetchContext(query="ask"))
+
+        assert result.status == "no_resolving_content"
+        assert result.status_reason == "not_addressed"
+        assert result.route == "url_context"
+        assert result.text == ""
+        # The cited host's status and diagnostics, as on every verdict that served nothing.
+        assert result.http_status == 403
+        assert result.failure_class == "http_403"
+        assert _rung_counts([result])["url_context_reads"] == 1
+        assert [(a.rung, a.outcome) for a in result.rung_attempts] == [("url_context", "no_resolving_content")]
+        # Unregistered while the flag is off everywhere, like its two URLCONTEXT siblings.
+        assert (
+            "RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url=https://tracker.example.com/senate host=tracker.example.com"
+        ) in caplog.messages
+        rendered = format_resolution_sections([result], datetime(2026, 9, 4, tzinfo=UTC))
+        assert "Read via Gemini url_context" not in rendered
+        assert "office hours" not in rendered
+        assert "tracker.example.com: no_resolving_content" in rendered
 
     async def test_the_ungrounded_line_says_none_when_the_sdk_reported_no_statuses(self, monkeypatch, caplog):
         def _read(url, ask, **kwargs):

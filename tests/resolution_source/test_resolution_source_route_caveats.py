@@ -17,10 +17,8 @@ from tests.resolution_source_fakes import (
 )
 
 
-def _success(route: FetchRoute, url: str = _URL) -> FetchResult:
-    return FetchResult(
-        url=url, status="success", text="body text", http_status=200, content_type="text/html", route=route
-    )
+def _success(route: FetchRoute, url: str = _URL, text: str = "body text") -> FetchResult:
+    return FetchResult(url=url, status="success", text=text, http_status=200, content_type="text/html", route=route)
 
 
 class TestRouteCaveats:
@@ -73,10 +71,11 @@ class TestRouteCaveats:
         """The caveat describes an artifact a forecaster can SEE. Computed over every success, it
         told forecasters a section below was rendered in a browser when the aggregate budget had
         already dropped that section (reproduced on prod constants: 5 x 6000 per-URL pages
-        against an 18000 total, with the rendered page cited last)."""
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 40)
+        against an 18000 total, with the rendered page cited last). The first page fills the
+        whole total, so the second lands on a zero remainder, under the section floor."""
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
         first = FetchResult(
-            url="https://a.example.com/p", status="success", text="x" * 60, http_status=200, content_type="text/html"
+            url="https://a.example.com/p", status="success", text="x" * 600, http_status=200, content_type="text/html"
         )
         rendered_last = _success("rendered", "https://b.example.com/p")
 
@@ -87,16 +86,18 @@ class TestRouteCaveats:
         assert ROUTE_CAVEATS["rendered"] not in rendered
 
     def test_a_kept_section_keeps_its_caveat_when_a_sibling_is_dropped(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 40)
-        rendered_first = _success("rendered", "https://b.example.com/p")
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        rendered_first = _success("rendered", "https://b.example.com/p", text="y" * 400)
         dropped = FetchResult(
-            url="https://a.example.com/p", status="success", text="x" * 60, http_status=200, content_type="text/html"
+            url="https://a.example.com/p", status="success", text="x" * 600, http_status=200, content_type="text/html"
         )
 
         rendered = format_resolution_sections([rendered_first, dropped], self._AT)
 
         assert "### https://b.example.com/p" in rendered
         assert ROUTE_CAVEATS["rendered"] in rendered
+        assert "[1 additional source(s) omitted — section budget]" in rendered
+        assert "### https://a.example.com/p" not in rendered
 
     def test_a_failed_rung_adds_no_caveat(self):
         """A caveat describes an artifact a forecaster can see; a rung that fired and failed left
