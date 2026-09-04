@@ -239,13 +239,16 @@ under its role (`forecaster:<vendor>`, `native_search`, `gap_fill_resolver`, `pa
 re-add off those rows, not off this paragraph. A re-add must clear both the score bar above *and*
 justify the cost it brings back.
 
-**Coverage caveat on those role rows (added 2026-09-01, forge F1/R18).** The same bundle bounded
-litellm's end-of-run callback drain at `LITELLM_CALLBACK_DRAIN_TIMEOUT_S` (10 s) so telemetry can
-never hold a finished run hostage, and a drain that times out logs a
+**Coverage caveat on those role rows (added 2026-09-01, forge F1/R18; registered 2026-09-04).** The
+same bundle bounded litellm's end-of-run callback drain at `LITELLM_CALLBACK_DRAIN_TIMEOUT_S` (10 s)
+so telemetry can never hold a finished run hostage, and a drain that times out logs a
 `LITELLM_CALLBACK_DRAIN_TIMEOUT` WARN saying in as many words that the `CREDIT_ROLE_SPEND` ledger
-under-counts that run's last completions. That WARN is deliberately not a harvested MarkerSpec, so
-the one thing that would explain a low `reconcile_credit_spend.py --roles` coverage ratio is
-invisible in the telemetry archive. Register it if a coverage ratio is ever puzzling.
+under-counts that run's last completions. That WARN is now a harvested MarkerSpec,
+`litellm_callback_drain_timeout`: at most one row per run, carrying the `timeout_s` bound the run
+used. A row means that run's role ledger is a lower bound and its
+`reconcile_credit_spend.py --roles` coverage ratio should read low for a benign reason; a run with
+no row covers every completion, so a low ratio there is a genuine gap in OpenRouter's per-call cost
+data. The line has never fired, so a first record is itself the finding.
 
 **Discrete-calibration note (2026-08-24).** The post-fix (`9f1175c`) discrete cohort has ZERO
 max-step-bug exposure by composition: all four resolved triple-era discretes are fine-grid
