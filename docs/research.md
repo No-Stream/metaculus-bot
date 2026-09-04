@@ -962,8 +962,10 @@ the version-free `static.dwcdn.net/data/<chart_id>.csv` route, because the page 
 pins a stale chart version whose `datawrapper.dwcdn.net/<id>/<version>/dataset.csv`
 form keeps serving 5-14-month-old snapshots as HTTP 200 (the naive fix the 2026-08-24
 verifications refuted). A `Last-Modified` freshness guard then withholds anything
-outside the window under a Tier-2-only `stale_data` status rather than serving stale
-data as live: older than `RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS`, undatable, or
+outside the window under the `stale_data` status rather than serving stale data as live
+(the Wayback rung below uses the same status for an over-age archived capture of a cited
+page; the two are told apart by `chart_id`): older than
+`RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS`, undatable, or
 implausibly far in the FUTURE — a future date past a six-hour clock-skew tolerance
 means a broken clock, not maximal freshness. The hop is bounded by
 `RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS`,
@@ -1034,7 +1036,14 @@ status standing, because "no archived copy exists" is a different fact from a st
 direct status says more about the source. Only a capture we did read and cannot date, or can date
 and it is too old, is withheld as `stale_data`. A withhold does not end the ladder: the paid rung
 below is still asked about the DIRECT outcome (a stale archive is still a page we could not read
-fresh), and the withhold is what stands when that rung is off or declines.
+fresh), and the withhold is what stands when that rung is off or declines. This rung is NOT
+flag-gated, so from its merge a cited page's `status` can be a rung's verdict where it used to
+be the direct outcome: `stale_data` where the direct fetch said `blocked` / `error` /
+`not_found`, and (flag on) `ungrounded` where it said `blocked` / `js_wall` / `error` /
+`no_resolving_content`. An era-bucketed `blocked` or `error` rate read off `status` alone will
+show a drop at that merge that is a bookkeeping change, not hosts refusing us less; take the
+direct outcome from `from_status` on the `RESOLUTION_SOURCE_ESCALATION` line, or partition
+`status` by `route`, where `direct` rows are unchanged.
 
 `route=url_context` is the LAST rung and the only paid one: Gemini reads the page for us
 (`research/url_context_reader.py`, the reader shared with gap-fill v2's `read_document`),
@@ -1170,8 +1179,10 @@ like `0�.�4�2�` type-checks as text and rendered as grading evidence. It
 whitespace-only, which is `empty_body`. Or — datasets only — it is not row-shaped, so
 nothing may claim it is the chart's live series. That third check is deliberately
 ordered BEFORE the freshness verdict, so an empty CDN body cannot borrow
-`stale_data`'s benign diagnostics token (`stale_data` reports to diagnostics as the
-benign "guard working as designed", which would hide a broken hop). Row shape is also
+`stale_data`'s benign diagnostics token (a DATASET's `stale_data`, the one carrying a
+`chart_id`, reports to diagnostics as the benign "guard working as designed", which would
+hide a broken hop; a cited page's `stale_data` from the Wayback rung is a lost source and
+keeps its loss token). Row shape is also
 decided on the PRE-strip text, because `looks_like_csv_rows` rejects markup by its
 leading `<` and stripping first would remove exactly the allow-listed fragment tags
 (`<p>`, `<div>`) a CDN soft-404 opens with, letting an error page carry the

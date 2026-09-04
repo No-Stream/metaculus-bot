@@ -1275,7 +1275,13 @@ the telemetry markers:
   [route=...]` — one line per URL the resolution-source provider fetched, emitted by
   `_log_fetch_outcome_markers` in `research/resolution_source.py`. `status` is `ok`
   for a success and the verbatim `FetchStatus` otherwise (`blocked`, `js_wall`,
-  `no_resolving_content`, `stale_data`, `ungrounded`, ...); `http` is `n/a` when no response ever
+  `no_resolving_content`, `stale_data`, `ungrounded`, ...). Since the escalation ladder it may
+  be a RUNG's verdict rather than the direct fetch's: the Wayback rung's `stale_data` where the
+  direct fetch said `blocked` / `error` / `not_found`, the paid reader's `ungrounded` where it
+  said `blocked` / `js_wall` / `error` / `no_resolving_content`. An era-bucketed `blocked` rate
+  off this field alone shows a drop at that merge that is bookkeeping, not hosts refusing us
+  less; the direct outcome is `from_status` on the sibling `RESOLUTION_SOURCE_ESCALATION` line,
+  and `route` partitions the two populations. `http` is `n/a` when no response ever
   arrived; `embeds` names the routeless data-embed providers (Infogram / Flourish /
   Tableau) found in the page's raw HTML, which is what makes an unreadable-embed
   page queryable even when its prose made the fetch a legitimate `ok`. `reason` is

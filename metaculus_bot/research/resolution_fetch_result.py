@@ -24,9 +24,18 @@ from urllib.parse import urlparse
 
 from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, DatawrapperChartRef
 
-# `stale_data` is Tier-2-only: the Datawrapper hop reached a dataset whose
-# Last-Modified is outside the freshness window — older than the bound, missing,
-# unparseable, or implausibly far in the FUTURE — withheld rather than served as live.
+# `stale_data` has two producers, and only one of them earns the benign diagnostics token.
+# The Tier-2 Datawrapper hop reached a dataset whose Last-Modified is outside the freshness
+# window — older than the bound, missing, unparseable, or implausibly far in the FUTURE —
+# and withheld it rather than serve it as live; that result carries `chart_id`, is a hop
+# artifact rather than a cited source, and maps to `none` in the diagnostics source map.
+# The Tier-1 Wayback rung read an archived capture of a CITED page and withheld it because
+# the capture is past `RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS` or carries no datable stamp
+# (`_wayback_snapshot_result`); that result has no `chart_id`, IS a lost cited source, and
+# keeps `stale_data` as its loss token. The Wayback rung is not flag-gated, so from its
+# merge a cited page's `status` can be this verdict where it used to be the direct
+# `blocked` / `error` / `not_found`, which survives only as `from_status` on the sibling
+# escalation line — see the accounting note on `FetchResult.status` below.
 #
 # `empty_body` is the 200-with-nothing-in-it case: a body that is empty or
 # whitespace-only carries no information, so calling it `success` published an
@@ -280,6 +289,14 @@ class RungAttempt:
 @dataclass
 class FetchResult:
     url: str
+    # ACCOUNTING NOTE for anyone bucketing statuses by era: since the escalation ladder, a
+    # `status` may be a RUNG's verdict rather than the direct fetch's outcome — the Wayback
+    # rung's `stale_data` in place of the `blocked` / `error` / `not_found` that triggered it,
+    # the paid reader's `ungrounded` in place of its trigger. An era-bucketed `blocked` rate
+    # taken off this field alone will therefore show a drop at the ladder's merge that is a
+    # bookkeeping change, not hosts refusing us less. Take the direct outcome from
+    # `from_status` on the `RESOLUTION_SOURCE_ESCALATION` line, or partition `status` by
+    # `route` (`direct` rows are unchanged).
     status: FetchStatus
     text: str  # extracted + truncated; "" unless status == "success"
     http_status: int | None
@@ -399,8 +416,12 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     diagnostics formatter recognizes); every other ``FetchStatus``
     (``blocked`` / ``js_wall`` / ``not_found`` / ``error`` / ``unsupported_type`` /
     ``ssrf_blocked`` / ``empty_body`` / ``no_resolving_content`` /
-    ``unreadable_document``) is kept verbatim
-    as the loss token so the reason survives into the ``lost=`` segment. Duplicate
+    ``unreadable_document`` / ``ungrounded``, and ``stale_data`` on a CITED page) is kept
+    verbatim as the loss token so the reason survives into the ``lost=`` segment. The last
+    two are rung verdicts standing in for the direct outcome: ``ungrounded`` is the paid
+    reader retrieving nothing, and a chart_id-less ``stale_data`` is the Wayback rung
+    withholding an over-age or undatable capture of a page our own address could not
+    reach — a lost cited source either way, so neither takes the amnesty below. Duplicate
     domains are disambiguated with a ``#N`` suffix so no per-URL outcome is silently
     overwritten.
 
@@ -410,11 +431,12 @@ def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     ``stale_data`` verdict maps to the benign ``"none"``: that is the freshness
     guard REFUSING to serve months-old data as live, i.e. the feature working as
     designed, and reporting it in ``lost=`` would dress a by-design withhold as a
-    lost cited source. A genuinely failed hop (``error``/``blocked``/``not_found``/
-    ``empty_body``/``unsupported_type``) keeps its verbatim loss token — that is
-    real signal about the CDN, and it is the reason the content check runs BEFORE
-    the freshness guard: an empty CDN body must not borrow ``stale_data``'s
-    by-design amnesty.
+    lost cited source. The ``chart_id`` is what tells the two ``stale_data`` producers
+    apart, which is why the amnesty is keyed on it and not on the status. A genuinely
+    failed hop (``error``/``blocked``/``not_found``/``empty_body``/``unsupported_type``)
+    keeps its verbatim loss token — that is real signal about the CDN, and it is the reason
+    the content check runs BEFORE the freshness guard: an empty CDN body must not borrow
+    ``stale_data``'s by-design amnesty.
     """
     sources: dict[str, str] = {}
     for r in results:

@@ -764,6 +764,13 @@ MARKER_SPECS: list[MarkerSpec] = [
         # (``blocked`` / ``js_wall`` / ``no_resolving_content`` / ``stale_data`` / ...), the
         # same token the provider-diagnostics source map uses, minus that map's
         # dataset-``stale_data``-to-``none`` amnesty — telemetry keeps the reason verbatim.
+        # Since the escalation ladder (2026-09-03) it may be a RUNG's verdict rather than the
+        # direct fetch's: the Wayback rung's ``stale_data`` where the direct fetch said
+        # ``blocked`` / ``error`` / ``not_found``, the paid reader's ``ungrounded`` where it
+        # said ``blocked`` / ``js_wall`` / ``error`` / ``no_resolving_content``. An
+        # era-bucketed ``blocked`` rate off this field alone shows a drop at that merge that is
+        # bookkeeping, not hosts refusing us less; the direct outcome is ``from_status`` on the
+        # sibling escalation line, and ``route`` partitions the two populations.
         # ``http`` is ``n/a`` when no response ever arrived (timeout, client error, SSRF
         # rejection). ``embeds`` names the routeless data-embed providers found in the
         # page's raw HTML, or the ``none`` sentinel (which harvests as None); it is what
