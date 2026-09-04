@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import io
 import sys
+import time
+import zlib
 from typing import cast
 
 import pytest
 from pypdf import PdfReader, PdfWriter
+from pypdf import filters as pypdf_filters
 from pypdf.errors import PdfReadError
 from pypdf.generic import Destination, Fit, NullObject
 
@@ -26,6 +29,7 @@ from metaculus_bot.constants import DOCUMENT_DIGEST_WINDOW_CHARS
 from metaculus_bot.research import document_text
 from metaculus_bot.research.document_text import (
     DEFAULT_WINDOW_CHARS,
+    PDF_MAX_DECODED_STREAM_BYTES,
     TEXT_LAYER_MIN_CHARS,
     PdfText,
     digest_pdf,
@@ -36,6 +40,7 @@ from metaculus_bot.research.document_text import (
     joined_page_text,
     render_document_digest,
     select_passages,
+    truncation_note,
 )
 
 
@@ -102,6 +107,35 @@ def build_text_pdf(pages: list[list[str]]) -> bytes:
         catalog_num,
         xref_at,
     )
+    return bytes(out)
+
+
+def build_flate_page_pdf(decoded: bytes) -> bytes:
+    """A one-page PDF whose content stream is ``decoded``, Flate-compressed.
+
+    Separate from ``build_text_pdf``, which writes its streams uncompressed: the decoded-size
+    cap can only be exercised by a stream whose DECODED size is what matters, and a repetitive
+    operator run compresses ~340:1, which is exactly the amplification the cap exists to bound.
+    """
+    stream = zlib.compress(decoded, 9)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>",
+        b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 3 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, raw in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + raw + b"\nendobj\n"
+    xref_at = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref_at)
     return bytes(out)
 
 
@@ -294,13 +328,76 @@ class TestUnreadableDocuments:
         assert result.page_count == 0
         assert result.outline == ()
 
-    def test_a_corrupt_stream_length_costs_only_that_page(self) -> None:
-        """A partial read keeps the pages that worked — one bad page must not cost the rest."""
+    def test_a_corrupt_content_stream_costs_only_that_page(self) -> None:
+        """A partial read keeps the pages that worked — one bad page must not cost the rest.
+
+        Page 2's text-drawing operator loses the closing paren of its string, so pypdf's
+        content-stream tokeniser runs off the end of the stream and raises ``PdfStreamError``
+        (verified: without ``_page_text``'s guard this call propagates it, and that guard is
+        what the module's never-raises contract rests on — a resolution-source research leg
+        would go down on one malformed page). The substituted byte keeps the stream the same
+        length, so ``/Length`` and the xref table stay valid and the corruption is confined to
+        the one content stream rather than to the file's structure.
+        """
         data = build_text_pdf([["alpha alpha alpha"], ["beta beta beta"]])
-        result = _extract(data)
+        corrupt = data.replace(b"(beta beta beta) Tj", b"(beta beta beta( Tj", 1)
+        assert corrupt != data, "the fixture has to corrupt something"
+        assert len(corrupt) == len(data), "same length, so /Length and the xref stay valid"
+
+        result = _extract(corrupt)
 
         assert result.unreadable_reason == ""
+        assert result.pages == ("alpha alpha alpha", "")
         assert result.pages_read == 2
+        assert result.page_count == 2
+
+
+class TestDecodedStreamCap:
+    """One page's decode work is bounded by pypdf's decoded-output caps, which this module lowers.
+
+    The bound that matters is not the file size: a 27 KB PDF can carry 9 MB of decompressed
+    operators, which pypdf parses into Python objects at roughly 0.5-0.8 s of CPU and 35-55 MB of
+    RSS per decoded megabyte. Neither the caller's body-size limit (compressed bytes), nor
+    ``max_pages`` (one page can hold the whole stream), nor ``max_seconds`` (read between pages)
+    reaches inside a single page, so the module sets pypdf's own limits at import.
+    """
+
+    OPERATOR = b"BT /F1 12 Tf 72 720 Td (alpha) Tj ET\n"
+
+    def test_the_cap_is_installed_on_every_decoded_output_knob(self) -> None:
+        for name in (
+            "ZLIB_MAX_OUTPUT_LENGTH",
+            "LZW_MAX_OUTPUT_LENGTH",
+            "RUN_LENGTH_MAX_OUTPUT_LENGTH",
+            "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH",
+        ):
+            assert getattr(pypdf_filters, name) == PDF_MAX_DECODED_STREAM_BYTES, name
+        assert PDF_MAX_DECODED_STREAM_BYTES < 75_000_000, "pypdf's own default; ours has to sit below it"
+
+    def test_a_page_decoding_past_the_cap_costs_that_page_and_bounded_work(self) -> None:
+        """The breach arrives as a pypdf error, so it reads exactly like any failed decode."""
+        oversized = self.OPERATOR * ((PDF_MAX_DECODED_STREAM_BYTES + 1_000_000) // len(self.OPERATOR))
+        assert len(oversized) > PDF_MAX_DECODED_STREAM_BYTES
+        body = build_flate_page_pdf(oversized)
+        assert len(body) < 100_000, "the point of the fixture is that the compressed file is small"
+
+        started = time.monotonic()
+        result = _extract(body)
+        elapsed = time.monotonic() - started
+
+        assert result.pages == ("",), "an over-large page costs that page, like any decode failure"
+        assert result.page_count == 1
+        assert result.pages_read == 1
+        assert result.unreadable_reason == "", "the document parsed; only its one stream was refused"
+        # Measured on this same fixture: 6.95 s and 1.2 M chars of extracted text without the
+        # cap, 0.003 s with it. The bound is loose enough to survive a loaded machine and still
+        # three times under the uncapped cost.
+        assert elapsed < 2.0, f"the decode should be refused, not performed ({elapsed:.2f}s)"
+
+    def test_a_normal_flate_page_still_reads(self) -> None:
+        body = build_flate_page_pdf(b"BT /F1 12 Tf 72 720 Td (alpha beta) Tj ET\n")
+
+        assert _extract(body).pages == ("alpha beta",)
 
 
 class TestOutline:
@@ -469,9 +566,112 @@ class TestSelectPassages:
 
         passages = select_passages(text, "shuttle", top_k=5, page_breaks=breaks)
 
-        assert [passage.page for passage in passages] == [1, 2, 3]
+        # Sorted: the three pages carry the term once each and so score identically, and the
+        # tiebreak is the longer window first ("three" is two chars more than "one"). What this
+        # test is about is that each page is its own window, not what order equal ones land in.
+        pages = [passage.page for passage in passages]
+        assert None not in pages, "page offsets were supplied, so every passage carries a page"
+        assert sorted(cast(list[int], pages)) == [1, 2, 3]
         for passage in passages:
             assert "\n\n" not in passage.text, "a page separator inside a window means it merged pages"
+
+    PARAGRAPH = (
+        "In the reporting week the department recorded a further rise in hospitalizations across "
+        "the northern districts, and the weekly bulletin notes that the figure has now risen for "
+        "four consecutive weeks, that bed occupancy in the same districts is up by a fifth over "
+        "the same period, and that the seasonal wave is expected to continue for several more "
+        "weeks before it turns down again as it did in each of the two previous years."
+    )
+
+    def test_a_bare_heading_does_not_outrank_the_paragraph_under_it(self) -> None:
+        """A page break ends a window wherever it falls, so fragments are ours, not the author's.
+
+        The heading page and the paragraph page carry the query term exactly once each, which
+        is the shape length normalisation used to decide: measured under b=0.75 the one-token
+        heading scored 0.3245 against the 75-token paragraph's 0.1268, took the top digest slot
+        and displaced the passage that actually reports the figure. At b=0 the two score equal
+        and the tiebreak hands the slot to the window carrying the context.
+        """
+        pdf = PdfText(2, 2, ("Hospitalizations", self.PARAGRAPH), "", ())
+        text, breaks = joined_page_text(pdf)
+
+        passages = select_passages(text, "hospitalizations", top_k=2, page_breaks=breaks)
+
+        assert [passage.page for passage in passages] == [2, 1]
+        assert passages[0].score == pytest.approx(passages[1].score), "no length bonus either way"
+
+    def test_a_page_footer_stamp_does_not_take_the_top_slot(self) -> None:
+        """ "Page 5" is matchable at all because "5,000" in the query tokenises to "5" and "000".
+
+        The stamp is a real window (every page's footer is one), and it shares a term with any
+        query carrying a comma-grouped number, so what has to hold is that it ranks below the
+        row that reports the figure rather than never scoring.
+        """
+        row = "Total units delivered in the quarter were 5,000 against a plan of 4,600."
+        pdf = PdfText(2, 2, ("Page 5", row), "", ())
+        text, breaks = joined_page_text(pdf)
+
+        passages = select_passages(text, "5,000 units delivered", top_k=2, page_breaks=breaks)
+
+        assert "5,000" in passages[0].text
+        assert [passage.page for passage in passages] == [2, 1]
+
+    def test_criteria_boilerplate_does_not_crowd_out_the_resolving_row(self) -> None:
+        """The query is question text plus resolution criteria, and its procedural words are rare.
+
+        IDF here is computed over one document's own windows, so the topical terms of an on-topic
+        report are common and near-weightless while the criteria's vocabulary ("published",
+        "according", "criteria") is rare and heavily weighted. Measured on this fixture before
+        the filter: the four notes pages scored 28.57 each and took every one of the top four
+        slots, with the row carrying the resolving number fifth — on a report whose front matter
+        runs longer, it never reaches the forecaster at all.
+        """
+        topic = (
+            "Regional plant capacity continued to grow through the year, and total capacity in "
+            "the eastern interconnection rose in line with the additions commissioned during "
+            "the spring. Capacity retirements were concentrated in the older coal fleet."
+        )
+        notes = (
+            "Notes. Figures are published according to the reporting criteria; reported values "
+            "are revised as the source data are reported, and any resolution of a discrepancy "
+            "follows the criteria published on the source page."
+        )
+        pages = [topic] * 30
+        for at in (2, 9, 17, 25):
+            pages[at] = notes
+        pages.append("Total plant capacity 17,180 megawatts")
+        text, breaks = joined_page_text(PdfText(len(pages), len(pages), tuple(pages), "", ()))
+
+        query = (
+            "What will the total plant capacity in megawatts be? This question resolves "
+            "according to the capacity total published on the source page; the resolution "
+            "criteria are the reported figures as published."
+        )
+        passages = select_passages(text, query, top_k=4, page_breaks=breaks)
+
+        assert "17,180" in passages[0].text, "the resolving row is what the digest exists to carry"
+
+    def test_stopwords_are_dropped_from_the_scoring_terms_only(self) -> None:
+        assert document_text._unique_tokens(  # pyright: ignore[reportPrivateUsage]
+            "This question resolves according to the total capacity published on the source page"
+        ) == ["total", "capacity"]
+
+    def test_a_query_of_only_stopwords_keeps_its_raw_terms(self) -> None:
+        """Filtering a query to nothing would report that the document does not discuss it.
+
+        Scoring "will it resolve" on procedural words is weak, but it is what this selector did
+        before the filter existed, and a silent no-match on a query we simply refused to score
+        is the one outcome that misinforms a reader.
+        """
+        text = "The committee will resolve the matter at its next sitting.\n\nUnrelated appendix."
+
+        assert document_text._unique_tokens("will it resolve") == [  # pyright: ignore[reportPrivateUsage]
+            "will",
+            "it",
+            "resolve",
+        ]
+        assert select_passages(text, "will it resolve", top_k=2), "an all-stopword query still scores"
+        assert select_passages(text, "!!! ???", top_k=2) == [], "a query with no tokens at all still matches nothing"
 
     def test_default_window_mirrors_the_configured_constant(self) -> None:
         assert DEFAULT_WINDOW_CHARS == DOCUMENT_DIGEST_WINDOW_CHARS, (
@@ -479,7 +679,15 @@ class TestSelectPassages:
         )
 
 
-class TestRenderDocumentDigest:
+class TestDigestBlockRendering:
+    """The rendered block: what the document is, then what it says about the ask.
+
+    Written against ``digest_pdf(...).block`` rather than the ``render_document_digest``
+    wrapper, which is on its way out — the Tier-1 fetcher is the only caller left and it needs
+    the passage count the wrapper throws away. One test in ``TestDigestCounts`` pins the wrapper
+    as that block while it survives.
+    """
+
     URL = "https://example.org/annual-report.pdf"
 
     def _pdf(self) -> PdfText:
@@ -494,9 +702,9 @@ class TestRenderDocumentDigest:
         )
 
     def test_header_outline_and_passages(self) -> None:
-        digest = render_document_digest(
+        digest = digest_pdf(
             self._pdf(), query=TestSelectPassages.QUERY, top_k=2, max_chars=8000, source_url=self.URL
-        )
+        ).block
 
         assert digest.startswith(f"Document: {self.URL}")
         assert "9 pages, 6 read," in digest
@@ -515,41 +723,41 @@ class TestRenderDocumentDigest:
             outline=tuple((f"Section {n}", 1) for n in range(1, 41)),
         )
 
-        digest = render_document_digest(pdf, query="shuttle", top_k=1, max_chars=8000, source_url=self.URL)
+        digest = digest_pdf(pdf, query="shuttle", top_k=1, max_chars=8000, source_url=self.URL).block
 
         assert "  Section 25 (p.1)" in digest
         assert "  Section 26 (p.1)" not in digest
         assert "... 15 further outline entries" in digest
 
     def test_truncation_marker_is_visible_and_bounds_the_block(self) -> None:
-        digest = render_document_digest(
+        digest = digest_pdf(
             self._pdf(), query=TestSelectPassages.QUERY, top_k=6, max_chars=300, source_url=self.URL
-        )
+        ).block
 
         assert len(digest) <= 300
         assert digest.endswith("[digest truncated at 300 chars]")
 
     def test_marker_survives_an_absurd_budget(self) -> None:
-        digest = render_document_digest(
+        digest = digest_pdf(
             self._pdf(), query=TestSelectPassages.QUERY, top_k=6, max_chars=5, source_url=self.URL
-        )
+        ).block
 
         assert digest == "[digest truncated at 5 chars]", "a silent empty digest would read as a real one"
 
     def test_deterministic(self) -> None:
-        first = render_document_digest(
+        first = digest_pdf(
             self._pdf(), query=TestSelectPassages.QUERY, top_k=3, max_chars=4000, source_url=self.URL
-        )
-        second = render_document_digest(
+        ).block
+        second = digest_pdf(
             self._pdf(), query=TestSelectPassages.QUERY, top_k=3, max_chars=4000, source_url=self.URL
-        )
+        ).block
 
         assert first == second
 
     def test_unreadable_document_says_why(self) -> None:
         pdf = PdfText(0, 0, (), "", (), unreadable_reason="encrypted")
 
-        digest = render_document_digest(pdf, query="anything", top_k=3, max_chars=2000, source_url=self.URL)
+        digest = digest_pdf(pdf, query="anything", top_k=3, max_chars=2000, source_url=self.URL).block
 
         assert "could not be parsed (encrypted)" in digest
         assert "Most relevant passages" not in digest
@@ -557,7 +765,7 @@ class TestRenderDocumentDigest:
     def test_scanned_document_says_there_is_no_text_layer(self) -> None:
         pdf = PdfText(4, 4, ("", "", "", ""), "", (("Cover", 1),))
 
-        digest = render_document_digest(pdf, query="anything", top_k=3, max_chars=2000, source_url=self.URL)
+        digest = digest_pdf(pdf, query="anything", top_k=3, max_chars=2000, source_url=self.URL).block
 
         assert "No extractable text layer" in digest
         assert "Cover (p.1)" in digest, "the outline is still evidence about what the scan contains"
@@ -572,16 +780,41 @@ class TestRenderDocumentDigest:
         """
         pdf = PdfText(1, 1, ("Q3 unemployment rate: 4.1%",), "", ())
 
-        digest = render_document_digest(pdf, query="unemployment rate", top_k=2, max_chars=2000, source_url=self.URL)
+        digest = digest_pdf(pdf, query="unemployment rate", top_k=2, max_chars=2000, source_url=self.URL).block
 
         assert has_text_layer(pdf) is False, "the fixture is deliberately under the floor"
         assert "No extractable text layer" not in digest
         assert "[p.1] Q3 unemployment rate: 4.1%" in digest
 
+    def test_a_blank_query_leaves_no_dangling_colon(self) -> None:
+        """The sentence is a statement about the document, so it cannot trail an empty ask.
+
+        A blank query reaches here from a caller with no criteria text to hand over; rendering
+        "matched the query:" with nothing after it reads as a digest that lost its own text
+        rather than as "this document does not discuss what was asked".
+        """
+        digest = digest_pdf(self._pdf(), query="   ", top_k=3, max_chars=4000, source_url=self.URL)
+
+        assert "No passage in this document matched the query." in digest.block
+        assert "the query:" not in digest.block
+        assert digest.passages == 0
+
+    def test_the_header_takes_its_truncation_clause_from_the_shared_helper(self) -> None:
+        """One derivation, because gap-fill v2's pdf_local body has to say this identically."""
+        pages_capped = self._pdf()
+        seconds_capped = PdfText(9, 6, pages_capped.pages, "seconds", ())
+
+        assert truncation_note(pages_capped) == "; stopped at the 6-page read cap"
+        assert truncation_note(seconds_capped) == "; stopped after 6 pages on the extraction time budget"
+        assert truncation_note(PdfText(6, 6, pages_capped.pages, "", ())) == "", "a complete read discloses nothing"
+        for pdf in (pages_capped, seconds_capped):
+            block = digest_pdf(pdf, query="shuttle", top_k=1, max_chars=8000, source_url=self.URL).block
+            assert truncation_note(pdf) in block
+
     def test_no_matching_passage_says_so(self) -> None:
-        digest = render_document_digest(
+        digest = digest_pdf(
             self._pdf(), query="hydroelectric turbine commissioning", top_k=3, max_chars=4000, source_url=self.URL
-        )
+        ).block
 
         assert "No passage in this document matched the query" in digest
 
@@ -598,9 +831,9 @@ class TestRenderDocumentDigest:
         )
 
         pdf = _extract(data)
-        digest = render_document_digest(
+        digest = digest_pdf(
             pdf, query="how many passengers did the shuttle carry", top_k=2, max_chars=4000, source_url=self.URL
-        )
+        ).block
 
         assert is_pdf_body(data)
         assert pdf.outline == (("Cover", 1), ("Ridership", 2))
@@ -612,8 +845,9 @@ class TestDigestCounts:
 
     The count is what says whether a digest ANSWERED the ask — zero passages means the document
     does not discuss it, which in the block itself reads exactly like a successful read. The
-    gap-fill v2 loop logs it per document, so a caller that only wants the text keeps using
-    ``render_document_digest``.
+    gap-fill v2 loop logs it per document, and the Tier-1 fetcher needs it for the same reason,
+    which is why ``render_document_digest`` is on its way out; the equality test below is what
+    keeps the wrapper honest while it survives.
     """
 
     URL = "https://example.gov/report.pdf"
@@ -625,7 +859,8 @@ class TestDigestCounts:
         )
         return PdfText(len(pages), len(pages), pages, "", ())
 
-    def test_render_document_digest_is_the_digest_block(self) -> None:
+    def test_render_document_digest_is_exactly_the_digest_block(self) -> None:
+        """The surviving wrapper adds nothing; delete it with its caller, not before."""
         kwargs = {"query": "passengers", "top_k": 2, "max_chars": 4000, "source_url": self.URL}
         assert render_document_digest(self._pdf(), **kwargs) == digest_pdf(self._pdf(), **kwargs).block
 

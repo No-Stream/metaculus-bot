@@ -39,6 +39,7 @@ from time import monotonic
 from typing import Literal
 
 from pypdf import PdfReader
+from pypdf import filters as pypdf_filters
 from pypdf.errors import DependencyError, PyPdfError
 from pypdf.generic import Destination
 
@@ -50,8 +51,15 @@ from pypdf.generic import Destination
 # ValueError x23, TypeError x12, NotImplementedError x6, KeyError x5, IndexError x3, and the
 # two Unicode errors under UnicodeError). The handful of bare `raise Exception` sites in
 # pypdf are deliberately NOT in here: those are pypdf bugs and swallowing one would hide a
-# real defect. Every guarded block below wraps exactly one pypdf call with none of this
-# module's own logic inside it, so a KeyError from our code still crashes the way it should.
+# real defect. Four of the five guarded blocks below wrap exactly one pypdf call with none
+# of this module's own logic inside it, so a KeyError from our code still crashes the way it
+# should. _read_outline is the exception: its guard spans _walk_outline, twenty lines of our
+# own traversal. That is sound today because every raise site inside the walk is pypdf's (the
+# Destination attribute reads and get_destination_page_number), while the walk's own
+# statements — the explicit stack, the isinstance dispatch, the entry-cap comparison — can
+# raise none of these types. The maintenance rule that keeps it sound: a subscript, an index
+# or arithmetic added to that walk belongs OUTSIDE the try, or a bug in our own code starts
+# degrading to an empty outline instead of crashing.
 _PDF_ERRORS: tuple[type[Exception], ...] = (
     PyPdfError,
     DependencyError,
@@ -63,6 +71,32 @@ _PDF_ERRORS: tuple[type[Exception], ...] = (
     UnicodeError,
 )
 
+# pypdf decodes a page's whole content stream into memory before tokenising it, and the cost
+# is linear in the DECODED size, at roughly 0.5-0.8 s of CPU and 35-55 MB of RSS per decoded
+# megabyte: a 27 KB file carrying 9 MB of compressed-away operators took 6.95 s here and
+# yielded 1.2 M chars of "text". None of the module's other bounds catch that. The caller's
+# body-size limit caps the COMPRESSED bytes, max_pages does not help when one page carries the
+# whole stream, and max_seconds is only checked between pages (see _read_pages), so the one
+# bound that reaches inside a single page is pypdf's own decoded-output cap, which its
+# `filters.decompress` docstring documents as ours to lower. A breach arrives as
+# LimitReachedError, a PyPdfError already in _PDF_ERRORS, so an over-large page costs that page
+# ("") exactly like a decode failure and its siblings still read.
+#
+# 8 MB bounds one page's parse arena to ~300 MB at that slope, and sits far above any real
+# content stream: the 6.7 MB / 220-page document this module was measured on yielded 833,450
+# chars in total, ~3.8 KB a page. pypdf's MAX_DECLARED_STREAM_LENGTH is deliberately left
+# alone: it caps the declared /Length, which is ENCODED bytes — the wrong quantity, and an
+# encoded cap below the caller's body limit would refuse streams whose decoded size is fine.
+#
+# Set once at import and process-global, which is what pypdf's knobs are; every consumer of
+# this module wants the same bound, and nothing else in the bot reads PDFs.
+PDF_MAX_DECODED_STREAM_BYTES = 8_000_000
+
+pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = PDF_MAX_DECODED_STREAM_BYTES
+pypdf_filters.LZW_MAX_OUTPUT_LENGTH = PDF_MAX_DECODED_STREAM_BYTES
+pypdf_filters.RUN_LENGTH_MAX_OUTPUT_LENGTH = PDF_MAX_DECODED_STREAM_BYTES
+pypdf_filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH = PDF_MAX_DECODED_STREAM_BYTES
+
 _PDF_MAGIC = b"%PDF-"
 
 # A page carrying fewer than this many non-whitespace chars is running-header noise (a page
@@ -70,19 +104,65 @@ _PDF_MAGIC = b"%PDF-"
 # glyph still reads as "no text layer" rather than as a readable document.
 TEXT_LAYER_MIN_CHARS = 40
 
-# Okapi BM25 at its standard parameters, hand-rolled because the whole retrieval step is
-# ~40 lines and a search dependency for that is not worth the supply-chain surface.
+# Okapi BM25, hand-rolled because the whole retrieval step is ~40 lines and a search dependency
+# for that is not worth the supply-chain surface. k1 is standard; b is 0, which turns length
+# normalisation OFF. BM25's b rewards a short unit for the same term frequency, which is right
+# when the units are documents of genuinely different size and wrong here: our windows are
+# uniform by construction (``_segment_windows`` caps each at ``window_chars``), so the length
+# differences left are our own segmentation residue — a page break ends a window wherever it
+# falls, so a 220-page PDF yields roughly one short tail window per page (a heading, a footer
+# stamp, a one-line page). At b=0.75 those fragments outrank the paragraphs that carry the
+# figure: a one-token heading page scored 0.3245 against 0.1268 for the 75-token paragraph
+# holding the same term once, and took the top digest slot.
 BM25_K1 = 1.5
-BM25_B = 0.75
+BM25_B = 0.0
 
-# Mirrors DOCUMENT_DIGEST_WINDOW_CHARS in constants.py, which is the knob callers pass;
-# the two are pinned equal by a test so the default can never drift from the configured one.
+# Query terms carrying no retrieval signal, dropped before scoring. Two families, one reason:
+# IDF here is computed over the windows of the SINGLE document being read, so a term present in
+# most windows is driven to ~0 and a verbose query ends up scored by whichever of its words
+# happen to be rare in this document. The query is the question text plus its resolution
+# criteria, so the rare words are the procedural vocabulary every criteria carries ("resolves",
+# "according", "published") and the URL scaffolding of its cited sources ("https", "www"), while
+# the topical terms — the ones that say what the document must be about — are the common ones.
+# Measured: four criteria-boilerplate pages took all four top slots on a 31-page report with the
+# row carrying the resolving figure fifth, and on a real EIA outlook PDF the windows holding it
+# ranked 152nd. Only structural and procedural words are listed; domain nouns a criteria happens
+# to use ("total", "revised", "surveillance") stay in, because they are what a table row
+# carrying the answer says. Quoted block rather than a set literal (hence the SIM905 exemption
+# below): a 150-word literal formats to one word per line, where the block keeps each family on
+# its own line and a diff shows which family a word joined.
+_QUERY_STOPWORDS = frozenset(
+    """
+    a an the and or but if then than so as of to in on at by for from with within without
+    into over under between before after during about above below up down out off again
+    is are was were be been being am do does did doing has have had having will would shall
+    should can could may might must not no nor only also very more most other others such
+    any all each both few some same too own per via
+    this that these those it its they them their there here which who whom whose what when
+    where why how
+    question questions resolve resolves resolved resolution resolutions criteria criterion
+    metaculus
+    according publish published publishes publishing report reported reporting reports
+    source sources page pages date dates data
+    yes maybe
+    https http www com org gov net html htm pdf aspx index php
+    """.split()  # noqa: SIM905
+)
+
+# The default in effect: nothing passes ``window_chars`` today, so this is the window size the
+# digest actually uses. It mirrors DOCUMENT_DIGEST_WINDOW_CHARS in constants.py, which is the
+# knob a caller would pass, and a test pins the two equal so the default can never drift from
+# the configured one.
 DEFAULT_WINDOW_CHARS = 600
 
 # Outline entries the digest renders before collapsing the rest into a count. A 220-page
 # report's bookmark tree runs to hundreds of entries, which would crowd out the passages
 # the digest exists to carry.
 DIGEST_MAX_OUTLINE_ENTRIES = 25
+
+# One wording for "we read this document and it does not discuss the ask", used with the
+# query appended and, on a blank query, alone.
+_NO_MATCH_SENTENCE = "No passage in this document matched the query"
 
 UnreadableReason = Literal["", "encrypted", "malformed"]
 TruncationCause = Literal["", "pages", "seconds"]
@@ -152,7 +232,7 @@ def is_pdf_body(body: bytes) -> bool:
 
 
 def extract_pdf_text(body: bytes, *, max_pages: int, max_seconds: float) -> PdfText:
-    """Per-page text of ``body``, bounded by page count and wall-clock, never raising.
+    """Per-page text of ``body``, bounded by page count and a page-boundary clock, never raising.
 
     Both bounds are the caller's: a resolution source we cannot read in ``max_seconds``
     costs the research phase more than it is worth, and ``max_pages`` bounds the pathological
@@ -192,6 +272,25 @@ def has_text_layer(pdf: PdfText) -> bool:
     return any(_visible_char_count(page) >= TEXT_LAYER_MIN_CHARS for page in pdf.pages)
 
 
+def truncation_note(pdf: PdfText) -> str:
+    """What stopped the read, as one clause to append to a line, or ``""`` when nothing did.
+
+    Public because two renderers have to say this the same way. The digest header appends it
+    to its own page counts here; gap-fill v2's ``pdf_local`` fetch result serves the joined
+    page text with no header at all, and a partial read that does not say so reads as the whole
+    document — a driver then reports an absence over pages nobody read. Sharing one derivation
+    is what keeps the two wordings from drifting apart.
+
+    The leading ``"; "`` is part of the clause, so a caller rendering it as its own line brings
+    its own lead-in; ``pages_read`` rides inside the wording because the bound that bit is only
+    meaningful next to how far the read got.
+    """
+    return {
+        "pages": f"; stopped at the {pdf.pages_read}-page read cap",
+        "seconds": f"; stopped after {pdf.pages_read} pages on the extraction time budget",
+    }.get(pdf.truncated_by, "")
+
+
 def joined_page_text(pdf: PdfText) -> tuple[str, tuple[int, ...]]:
     """The read pages as one string, plus each page's start offset in it.
 
@@ -219,9 +318,12 @@ def select_passages(
 
     Deterministic and lexical on purpose: the selection step decides which few hundred words
     of a 220-page document a forecaster or the research driver sees, and a model call there
-    would put an unauditable choice on the critical path of every PDF. Ties break on
-    position, earliest first, so re-running on the same inputs returns the same passages in
-    the same order.
+    would put an unauditable choice on the critical path of every PDF. Ties break on the
+    LONGER window first and then on position, earliest first, so re-running on the same inputs
+    returns the same passages in the same order. Length is the first tiebreak because with
+    length normalisation off (see ``BM25_B``) a heading and the paragraph under it can score
+    exactly equal, and of two equally-scoring windows the one carrying more context is the
+    more useful passage.
 
     Returns ``[]`` when no window contains any query term — an empty result means "this
     document does not discuss what you asked", which is information, where handing back the
@@ -248,7 +350,7 @@ def select_passages(
     scores = _bm25_scores(window_tokens, query_tokens)
     ranked = sorted(
         ((score, spans[i]) for i, score in enumerate(scores) if score > 0.0),
-        key=lambda item: (-item[0], item[1][0]),
+        key=lambda item: (-item[0], -(item[1][1] - item[1][0]), item[1][0]),
     )
     return [
         Passage(
@@ -263,7 +365,11 @@ def select_passages(
 
 
 def render_document_digest(pdf: PdfText, *, query: str, top_k: int, max_chars: int, source_url: str) -> str:
-    """:func:`digest_pdf`'s block, for a caller that needs only the text."""
+    """:func:`digest_pdf`'s block, for a caller that needs only the text.
+
+    Kept only until the Tier-1 resolution-source fetcher moves to :func:`digest_pdf`, which it
+    has to in order to record whether the digest matched anything; delete it then.
+    """
     return digest_pdf(pdf, query=query, top_k=top_k, max_chars=max_chars, source_url=source_url).block
 
 
@@ -344,9 +450,15 @@ def _read_pages(
 ) -> tuple[tuple[str, ...], TruncationCause]:
     """Text of the first ``max_pages`` pages, stopping early once ``max_seconds`` elapses.
 
-    The clock is checked AFTER each page so a budget too small for even one page still
-    returns that page: forward progress beats an empty result, and the caller learns the
-    budget bound anyway from ``truncated_by``.
+    ``max_seconds`` is a BETWEEN-PAGES CHECKPOINT, not an elapsed bound: the clock is read
+    after each page returns, so a page already in progress runs to completion however long it
+    takes and the total can overrun the budget by one page's work. That is deliberate for the
+    small-budget case — a budget too small for even one page still returns that page, because
+    forward progress beats an empty result and the caller learns the bound bit anyway from
+    ``truncated_by``. What keeps the overrun finite is PDF_MAX_DECODED_STREAM_BYTES, which
+    bounds the decoded bytes a single page's content stream can cost; without it one page can
+    outrun any budget (F44's receipt: 9 MB of decoded operators for ~7 s of CPU). A
+    before-each-page check would add nothing, since the same page still has to finish.
     """
     deadline = monotonic() + max_seconds
     limit = min(page_count, max_pages)
@@ -445,48 +557,47 @@ def _tokenise(text: str) -> list[str]:
 
 
 def _unique_tokens(query: str) -> list[str]:
-    """Query terms, deduplicated in first-appearance order.
+    """Scoring terms of ``query``: deduplicated, in first-appearance order, stopwords dropped.
 
     A repeated term in a short query is emphasis a user did not mean to encode as a weight,
-    and dedup keeps the score independent of how the ask was phrased.
+    and dedup keeps the score independent of how the ask was phrased. The stopword filter is
+    ``_QUERY_STOPWORDS``, and it applies HERE only — ``select_passages`` is the single
+    consumer, and the digest header still renders the caller's query verbatim, so what the
+    reader is told was asked stays exactly what was asked.
+
+    A query made ENTIRELY of stopwords keeps its raw tokens: filtering it to nothing would
+    turn "will this resolve yes" into a query that matches nothing at all, silently reporting
+    that the document does not discuss it. Scoring such a query on procedural words is weak,
+    but it is what this selector did before the filter existed, so nothing regresses.
     """
-    return list(dict.fromkeys(_tokenise(query)))
+    tokens = list(dict.fromkeys(_tokenise(query)))
+    scoring = [token for token in tokens if token not in _QUERY_STOPWORDS]
+    return scoring or tokens
 
 
 def _bm25_scores(window_tokens: list[list[str]], query_tokens: list[str]) -> list[float]:
-    """Okapi BM25 of every window against the query terms."""
+    """Okapi BM25 of every window against the query terms. No window length is read: b is 0."""
     n_windows = len(window_tokens)
-    lengths = [len(tokens) for tokens in window_tokens]
-    total_length = sum(lengths)
-    if not total_length:
+    if not any(window_tokens):
         return [0.0] * n_windows
-    avg_length = total_length / n_windows
 
     counters = [Counter(tokens) for tokens in window_tokens]
     idf = {
         term: log(1 + (n_windows - df + 0.5) / (df + 0.5))
         for term, df in ((term, sum(1 for c in counters if term in c)) for term in query_tokens)
     }
-    return [
-        _window_score(counter, length, query_tokens=query_tokens, idf=idf, avg_length=avg_length)
-        for counter, length in zip(counters, lengths, strict=True)
-    ]
+    return [_window_score(counter, query_tokens=query_tokens, idf=idf) for counter in counters]
 
 
-def _window_score(
-    counter: Counter[str],
-    length: int,
-    *,
-    query_tokens: list[str],
-    idf: dict[str, float],
-    avg_length: float,
-) -> float:
+def _window_score(counter: Counter[str], *, query_tokens: list[str], idf: dict[str, float]) -> float:
     score = 0.0
     for term in query_tokens:
         freq = counter.get(term, 0)
         if not freq:
             continue  # a term absent from this window contributes nothing, absent everywhere or not
-        denominator = freq + BM25_K1 * (1 - BM25_B + BM25_B * length / avg_length)
+        # BM25's length-normalisation factor, (1 - b + b * length / avg_length), is exactly
+        # (1 - b) at b=0, so no window length is read at all. See BM25_B for why b is 0.
+        denominator = freq + BM25_K1 * (1 - BM25_B)
         score += idf[term] * freq * (BM25_K1 + 1) / denominator
     return score
 
@@ -618,10 +729,7 @@ def _page_for_offset(offset: int, page_breaks: Sequence[int] | None) -> int | No
 
 def _digest_header(pdf: PdfText, *, source_url: str) -> str:
     chars = sum(len(page) for page in pdf.pages)
-    note = {
-        "pages": f"; stopped at the {pdf.pages_read}-page read cap",
-        "seconds": f"; stopped after {pdf.pages_read} pages on the extraction time budget",
-    }.get(pdf.truncated_by, "")
+    note = truncation_note(pdf)
     return (
         f"Document: {source_url}\n{pdf.page_count} pages, {pdf.pages_read} read, {chars} chars of text extracted{note}"
     )
@@ -639,7 +747,11 @@ def _digest_outline(outline: tuple[tuple[str, int], ...]) -> list[str]:
 
 def _digest_passages(passages: list[Passage], *, query: str) -> str:
     if not passages:
-        return f"No passage in this document matched the query: {query}"
+        # The sentence has to read as a statement about the DOCUMENT either way: a blank query
+        # left "matched the query:" dangling, which reads as a render that lost its own text
+        # rather than as "this document does not discuss what was asked".
+        asked = query.strip()
+        return f"{_NO_MATCH_SENTENCE}: {asked}" if asked else f"{_NO_MATCH_SENTENCE}."
     header = f"Most relevant passages for: {query}"
     # A page-less passage is labelled "[passage]" rather than "[p.?]": the flat-text digest has
     # no pages to number at all, and "?" would read as a page we failed to identify.

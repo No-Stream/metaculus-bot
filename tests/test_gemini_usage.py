@@ -11,8 +11,9 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from google.genai import types as genai_types
 
-from metaculus_bot.research.gemini_usage import log_gemini_usage
+from metaculus_bot.research.gemini_usage import _TOKEN_FIELDS, log_gemini_usage
 
 
 def _usage(**counts: object) -> SimpleNamespace:
@@ -141,7 +142,7 @@ class TestGeminiUsageNeverRaises:
         assert "prompt_tokens=n/a" in line
 
     def test_unreadable_grounding_metadata_does_not_cost_the_token_counts(self) -> None:
-        """The tokens are the reason the marker exists, so the two reads are guarded apart.
+        """The tokens are the reason the marker exists, so the two reads stay independent.
 
         This is the real ``read_document`` shape at one remove: its candidates carry
         url_context metadata and the grounding fields the query count walks are absent, and
@@ -167,3 +168,28 @@ class TestGeminiUsageNeverRaises:
 
         assert "model=gemini-3.5-flash " in line
         assert "MagicMock" not in line
+
+
+class TestTheNamesThisModuleReadsAreDeclaredSdkFields:
+    """Every name read off a response is a declared field on the installed google-genai models.
+
+    This is the price of degrading to ``n/a`` instead of crashing. The reads are ``getattr``
+    with defaults, so an SDK rename cannot raise here — it would report ``n/a`` for the rest of
+    the season on a marker whose whole purpose is answering how much Google spend a run made.
+    The sibling ``url_context_telemetry`` can afford direct field reads because it decides
+    whether research is TRUSTED and so must fail loudly; this one records spend on a path that
+    also returns the research, so the loud failure belongs in CI instead.
+    """
+
+    def test_the_token_counts_are_usage_metadata_fields(self) -> None:
+        declared = set(genai_types.GenerateContentResponseUsageMetadata.model_fields)
+        read = {attribute for _field, attribute in _TOKEN_FIELDS}
+
+        assert read <= declared, f"renamed or removed on the SDK: {sorted(read - declared)}"
+
+    def test_the_response_and_grounding_names_are_declared_fields(self) -> None:
+        assert {"usage_metadata", "model_version", "candidates"} <= set(
+            genai_types.GenerateContentResponse.model_fields
+        )
+        assert "grounding_metadata" in genai_types.Candidate.model_fields
+        assert "web_search_queries" in genai_types.GroundingMetadata.model_fields
