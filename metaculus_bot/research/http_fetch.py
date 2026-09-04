@@ -19,6 +19,7 @@ import ipaddress
 import logging
 import re
 import socket
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ from urllib.parse import urlparse
 import aiohttp
 import aiohttp.abc
 import aiohttp.resolver
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,15 @@ MAX_REDIRECTS: int = 5
 REDIRECT_STATUSES: frozenset[int] = frozenset({301, 302, 303, 307, 308})
 
 
+# Per-header and per-status-line byte cap for every session this module builds. aiohttp's
+# default is 8,190 B, which is smaller than the Content-Security-Policy header real sources
+# send (measured: who.int 8,765 B, visitwales.com 9,697 B) — and a header over the cap
+# rejects the response before any body is read, so the page arrives as `error http=None`,
+# indistinguishable from a host that never answered. 64 KiB is far above anything observed
+# while still bounding what one response's headers can buffer.
+_MAX_HEADER_BYTES: int = 65536
+
+
 # Safari-like UA + full Accept / Accept-Language / Accept-Encoding.
 # FINDINGS (resolution_source_probe): this exact header set recovered
 # 6 extra sources vs Chrome-UA-only (38/50 vs 32/50).
@@ -137,13 +148,36 @@ def build_session(
     :class:`FilteringResolver` so aiohttp's own connect-time DNS lookup goes
     through the same predicate as the preflight guard — closing the classic
     DNS-rebinding TOCTOU.
+
+    TLS trust is pinned to certifi's bundle rather than left to whatever store the
+    machine happens to carry. Measured 2026-09-03: trade.gov, a cited government source
+    that fetched fine when it was archived, failed the handshake here with
+    ``CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain`` against
+    the default store and succeeded against certifi's — so which sources are reachable
+    was a property of the machine, and a source lost that way is indistinguishable in
+    telemetry from a dead host.
+
+    The header-size caps are raised from aiohttp's 8,190-byte default because two
+    corpus hosts send a Content-Security-Policy header larger than that (who.int
+    8,765 B, visitwales.com 9,697 B) and aiohttp rejects the whole response before any
+    body is read, landing as ``error http=None``. At 64 KiB who.int returns a readable
+    200 and visitwales an honest 404.
     """
     timeout = aiohttp.ClientTimeout(total=timeout_s, sock_read=timeout_s)
-    connector_kwargs: dict[str, Any] = {"limit": connector_limit}
+    connector_kwargs: dict[str, Any] = {
+        "limit": connector_limit,
+        "ssl": ssl.create_default_context(cafile=certifi.where()),
+    }
     if resolver is not None:
         connector_kwargs["resolver"] = resolver
     connector = aiohttp.TCPConnector(**connector_kwargs)
-    return aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers)
+    return aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        headers=headers,
+        max_line_size=_MAX_HEADER_BYTES,
+        max_field_size=_MAX_HEADER_BYTES,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +195,12 @@ def build_session(
 # in the same process (a backtest question loop, the test suite) would otherwise crash
 # on contention. Clearing on a loop change keeps "shared across every concurrent
 # question", which is what one loop means here, without that hazard.
+#
+# The tradeoff, priced after the fact: sharing the map serializes same-host requests ACROSS
+# the concurrent questions, inside a per-question wall that was not raised and that discards
+# pages which already fetched when it fires — so a question that loses the queue can lose its
+# whole section rather than one page. The acquire wait is deliberately unbounded; FUTURE.md
+# item 5 holds both remedies (partial harvest, or a budget-bounded wait) as operator calls.
 _HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 _HOST_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
 
@@ -180,6 +220,53 @@ def reset_host_semaphores() -> None:
     global _HOST_SEMAPHORE_LOOP  # noqa: PLW0603  # paired with host_semaphores' cache
     _HOST_SEMAPHORES.clear()
     _HOST_SEMAPHORE_LOOP = None
+
+
+# ---------------------------------------------------------------------------
+# Shared PDF-parse gate (at most two documents parsing at once, loop-wide)
+# ---------------------------------------------------------------------------
+#
+# Every route that parses a fetched document contends here — the Tier-1 resolution-source
+# rung and the gap-fill v2 local-document ladder — because the bound has to hold across
+# them, not inside each. The rationale is the one `agentic/local_document.py` states for
+# its own cap verbatim: pypdf decodes every content stream, so a parse is CPU-bound AND
+# holds its body for the duration; a Tier-1 fan-out is up to RESOLUTION_SOURCE_MAX_URLS
+# per question across DEFAULT_MAX_CONCURRENT_RESEARCH questions, so unbounded that is
+# ~30 bodies of up to DOCUMENT_TEXT_PDF_MAX_BYTES plus their parse arenas — a MemoryError
+# no soft-fail boundary catches. Two slots covers a real burst while bounding the peak,
+# and measurement says more would not buy throughput anyway: pypdf is pure Python, so six
+# concurrent parses of a 220-page document took 10.20 s against 1.66 s solo (6.13x on a
+# 10-core machine) while starving the loop that every other provider's I/O runs on.
+#
+# Deliberately hardcoded rather than a constants.py entry: it is a property of pypdf and
+# the default ThreadPoolExecutor's width, not a tuning knob anyone should reach for
+# without re-measuring the numbers above.
+_PDF_PARSE_SLOTS = 2
+_PDF_PARSE_SEMAPHORE: asyncio.Semaphore | None = None
+_PDF_PARSE_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def pdf_parse_semaphore() -> asyncio.Semaphore:
+    """The shared ``Semaphore(2)`` bounding concurrent document parses on the running loop.
+
+    Loop-scoped for the same reason :func:`host_semaphores` is: an ``asyncio.Semaphore``
+    binds to the loop that first blocks on it and raises from any other, so a second
+    ``asyncio.run`` in one process (a backtest's question loop, the test suite) would
+    otherwise crash on contention.
+    """
+    global _PDF_PARSE_SEMAPHORE, _PDF_PARSE_SEMAPHORE_LOOP  # noqa: PLW0603  # module-level cache of the loop's gate
+    loop = asyncio.get_running_loop()
+    if _PDF_PARSE_SEMAPHORE is None or loop is not _PDF_PARSE_SEMAPHORE_LOOP:
+        _PDF_PARSE_SEMAPHORE = asyncio.Semaphore(_PDF_PARSE_SLOTS)
+        _PDF_PARSE_SEMAPHORE_LOOP = loop
+    return _PDF_PARSE_SEMAPHORE
+
+
+def reset_pdf_parse_semaphore() -> None:
+    """Drop the cached parse gate. For tests, so one test's held slot can't gate another's."""
+    global _PDF_PARSE_SEMAPHORE, _PDF_PARSE_SEMAPHORE_LOOP  # noqa: PLW0603  # paired with pdf_parse_semaphore's cache
+    _PDF_PARSE_SEMAPHORE = None
+    _PDF_PARSE_SEMAPHORE_LOOP = None
 
 
 def semaphore_for_host(url: str, sems: dict[str, asyncio.Semaphore]) -> asyncio.Semaphore:

@@ -20,7 +20,7 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import resolution_chart_data, resolution_source
-from metaculus_bot.research.http_fetch import host_semaphores
+from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore, semaphore_for_host
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_chart_data import CHART_DATA_LEAD, render_inline_chart_data
 from metaculus_bot.research.resolution_source import (
@@ -28,6 +28,7 @@ from metaculus_bot.research.resolution_source import (
     FetchResult,
     _fetch_one,
     _fetch_result_sources,
+    _rung_counts,
     _unreadable_embed_disclosure,
     fetch_resolution_sources,
     format_resolution_sections,
@@ -970,6 +971,25 @@ class TestResolutionSourceFetchMarker:
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
 
+    async def test_a_document_whose_passages_matched_nothing_says_so_on_the_line(self, monkeypatch, caplog):
+        """`status=ok` on a zero-passage digest was byte-identical to one carrying the
+        resolving paragraph, on the surface whose contract is that success means CONTENT."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        body = build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2 as of August 24"]])
+        session = FakeSession(
+            {"https://cdc.example.com/r.pdf": FakeResponse(200, body=body, content_type="application/pdf")}
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria="Resolves per https://cdc.example.com/r.pdf corn futures settlement")
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/r.pdf "
+            "status=ok http=200 embeds=none reason=no_matching_passage route=pdf_local"
+        ]
+
     async def test_a_skipped_rung_is_counted_but_not_reported_as_an_escalation(self, monkeypatch, caplog):
         """The marker means "a rung fired". A rung that never ran for want of wall budget
         rides `details["counts"]` instead, where it stays queryable without inflating the
@@ -991,7 +1011,12 @@ class TestResolutionSourceFetchMarker:
         ]
         assert not [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
-        assert counts == {"meta_refresh_hops": 0, "pdf_documents_read": 0, "rung_budget_skips": 1}
+        assert counts == {
+            "meta_refresh_hops": 0,
+            "pdf_documents_read": 0,
+            "rung_budget_skips": 1,
+            "pdf_contention_skips": 0,
+        }
 
 
 class TestFetchResolutionSources:
@@ -1381,6 +1406,10 @@ class TestLocalPdfReading:
         assert result.route == "direct"
         assert [a.skipped_reason for a in result.rung_attempts] == ["wall_budget"]
         assert any("skipping the local PDF read" in m for m in caplog.messages)
+        assert result.status_reason == "budget_skipped", (
+            "without the reason, a document we held and declined to read is byte-identical "
+            "in the per-fetch marker to a body that was never a document"
+        )
 
     async def test_a_query_no_passage_matches_renders_the_document_without_inventing_relevance(self):
         session = self._session()
@@ -1392,6 +1421,132 @@ class TestLocalPdfReading:
         assert result.status == "success"
         assert "No passage in this document matched the query" in result.text
         assert "922" not in result.text
+        # A zero-passage digest and one carrying the resolving paragraph render the same
+        # header and outline, so nothing in the run log or the archive separated them.
+        assert result.status_reason == "no_matching_passage"
+        assert result.text.startswith("Document: https://cdc.example.com/report.pdf"), (
+            "the header is still published — this is a document we read, not a failure"
+        )
+
+    async def test_a_matched_digest_carries_no_reason(self):
+        """The reason is the exception, so its ABSENCE has to mean the selection found
+        something rather than 'this record predates the token'."""
+        session = self._session()
+
+        result = await _fetch_one(
+            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations reported")
+        )
+
+        assert result.status == "success"
+        assert result.status_reason is None
+
+
+class TestPdfParseGate:
+    """At most two documents parse at once, loop-wide.
+
+    pypdf decodes every content stream, so a parse is CPU-bound and holds its body for the
+    duration. A Tier-1 fan-out alone is up to RESOLUTION_SOURCE_MAX_URLS documents per
+    question across DEFAULT_MAX_CONCURRENT_RESEARCH questions, and the same gate is shared
+    with the gap-fill v2 local-document ladder because the bound has to hold across both."""
+
+    _PAGES: ClassVar[list[list[str]]] = [
+        ["Annual Surveillance Summary", "Contents: methods, tables, appendix"],
+        ["Hospitalizations reported: 922", "Deaths reported: 2"],
+    ]
+
+    def _session(self, url: str) -> FakeSession:
+        return FakeSession({url: FakeResponse(200, body=build_text_pdf(self._PAGES), content_type="application/pdf")})
+
+    async def test_the_host_gate_is_released_before_the_parse_runs(self, monkeypatch):
+        """The per-host gate is loop-wide, so a parse held inside it blocks every other
+        concurrent question's fetch of that host for the whole parse — and this population
+        is a handful of government hosts, so same-host collisions are the expected case."""
+        url = "https://cdc.example.com/report.pdf"
+        sems = host_semaphores()
+        # Get-or-create up front: the stub reads `.locked()` off this object rather than
+        # looking the map up, because it runs in the parse's worker thread where there is
+        # no running loop — which is itself the point of the split.
+        host_gate = semaphore_for_host(url, sems)
+        locked_during_parse = None
+        real_extract = resolution_source.extract_pdf_text
+
+        def observing_extract(body: bytes, **kwargs):
+            nonlocal locked_during_parse
+            locked_during_parse = host_gate.locked()
+            return real_extract(body, **kwargs)
+
+        monkeypatch.setattr(resolution_source, "extract_pdf_text", observing_extract)
+
+        result = await _fetch_one(self._session(url), url, sems, FetchContext(query="hospitalizations"))
+
+        assert locked_during_parse is False, "the parse ran while the host was still gated"
+        # The rung's own telemetry is unchanged by moving where the parse happens.
+        assert result.status == "success"
+        assert result.route == "pdf_local"
+        assert [(a.rung, a.from_status) for a in result.rung_attempts] == [("pdf_local", "unsupported_type")]
+        assert result.rung_attempts[0].wall_s is not None
+
+    async def test_no_more_than_two_documents_parse_at_once(self, monkeypatch):
+        in_flight = 0
+        peak = 0
+        real_extract = resolution_source.extract_pdf_text
+
+        def counting_extract(body: bytes, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                time.sleep(0.05)
+                return real_extract(body, **kwargs)
+            finally:
+                in_flight -= 1
+
+        monkeypatch.setattr(resolution_source, "extract_pdf_text", counting_extract)
+        hosts = [f"https://h{i}.example.com/report.pdf" for i in range(5)]
+
+        results = await asyncio.gather(
+            *(_fetch_one(self._session(url), url, {}, FetchContext(query="hospitalizations")) for url in hosts)
+        )
+
+        assert peak <= 2, f"the gate admitted {peak} concurrent parses"
+        assert [r.status for r in results] == ["success"] * 5, "the bound queues parses, it does not drop them"
+
+    async def test_a_parse_that_cannot_win_a_slot_inside_the_budget_is_skipped(self, monkeypatch, caplog):
+        """Queueing behind other documents until the outer wall fires would discard every
+        sibling page this question already fetched, which costs more than one unread doc."""
+        gate = None
+
+        async def hold_the_gate():
+            nonlocal gate
+            gate = pdf_parse_semaphore()
+            await gate.acquire()
+            await gate.acquire()
+
+        await hold_the_gate()
+        # Budget just above the floor, so the bounded acquire gives up almost immediately.
+        spent = FetchContext(
+            query="hospitalizations",
+            started=time.monotonic()
+            - (
+                resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
+                - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+                - resolution_source.RESOLUTION_SOURCE_PDF_MIN_BUDGET_S
+                - 0.05
+            ),
+        )
+        url = "https://busy.example.com/report.pdf"
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+            result = await _fetch_one(self._session(url), url, {}, spent)
+
+        assert result.status == "unsupported_type"
+        assert result.status_reason == "parse_contention"
+        assert [a.skipped_reason for a in result.rung_attempts] == ["parse_contention"]
+        assert any("no parse slot" in m for m in caplog.messages)
+        assert _rung_counts([result])["pdf_contention_skips"] == 1
+        assert gate is not None
+        gate.release()
+        gate.release()
 
 
 class TestSharedHostGate:
@@ -1422,3 +1577,55 @@ class TestSharedHostGate:
 
         assert session.host_peak["a.example.com"] == 1
         assert list(host_semaphores()) == ["a.example.com"], "one gate for the host, not one per call"
+
+
+class TestPerHopRequestTimeout:
+    """Every GET is bounded by what is left of the provider's 45 s wall, not by a flat 20 s.
+
+    A hop admitted with a few seconds of budget left used to be free to run the session's
+    full `RESOLUTION_SOURCE_HTTP_TIMEOUT`, overshoot the outer `wait_for` and take down every
+    sibling page that had already fetched — the exact loss the rest of the ladder's budget
+    arithmetic exists to prevent."""
+
+    def _session(self, article_html: bytes) -> FakeSession:
+        return FakeSession(
+            {"https://slow.example.com/page": FakeResponse(200, body=article_html, content_type="text/html")}
+        )
+
+    async def test_a_fresh_fetch_still_gets_the_full_per_request_timeout(self, article_html):
+        session = self._session(article_html)
+
+        await _fetch_one(session, "https://slow.example.com/page", {}, FetchContext())
+
+        assert session.get_kwargs[0]["timeout"].total == resolution_source.RESOLUTION_SOURCE_HTTP_TIMEOUT
+
+    async def test_a_hop_late_in_the_wall_is_clamped_to_the_remaining_budget(self, article_html):
+        session = self._session(article_html)
+        elapsed = 35.0
+        expected = (
+            resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
+            - elapsed
+            - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+        )
+
+        await _fetch_one(session, "https://slow.example.com/page", {}, FetchContext(started=time.monotonic() - elapsed))
+
+        timeout = session.get_kwargs[0]["timeout"]
+        assert timeout.total == pytest.approx(expected, abs=0.5)
+        assert timeout.total < resolution_source.RESOLUTION_SOURCE_HTTP_TIMEOUT
+        assert timeout.sock_read == timeout.total, "a per-request ClientTimeout replaces the session's, so both fields"
+
+    async def test_a_spent_budget_still_gets_a_token_attempt_rather_than_a_zero_timeout(self, article_html):
+        """A guaranteed-expired request tells us nothing a 0.5 s one does not, and a fast host
+        answering inside the floor is a page we would otherwise refuse for free."""
+        session = self._session(article_html)
+
+        result = await _fetch_one(
+            session,
+            "https://slow.example.com/page",
+            {},
+            FetchContext(started=time.monotonic() - 2 * resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT),
+        )
+
+        assert session.get_kwargs[0]["timeout"].total == resolution_source._MIN_HOP_TIMEOUT_S
+        assert result.status == "success", "the floor is a real attempt, not a formality"

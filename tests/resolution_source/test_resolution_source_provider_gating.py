@@ -26,6 +26,7 @@ from tests.resolution_source_fakes import (
     FakeSession,
     _mock_question,
 )
+from tests.test_document_text import build_text_pdf
 
 
 class TestResolutionSourceProvider:
@@ -60,6 +61,44 @@ class TestResolutionSourceProvider:
         assert "### https://www.bls.gov/cpi/" in out
         assert "Bureau of Labor Statistics" in out
         assert session.closed is True
+
+    async def test_the_questions_criteria_reach_a_cited_documents_passage_selection(self, monkeypatch):
+        """Nothing else pins that the question's own text gets as far as BM25.
+
+        `fetch_resolution_sources` defaults `query=""`, every PDF test drives `_fetch_one`
+        with a hand-built FetchContext, and no test references `_document_query` — so a
+        dropped or misspelled kwarg here type-checks, passes the whole suite, and renders
+        every cited document's header and outline with the "no passage matched" sentence and
+        none of the resolving figures. The vocabulary below appears ONLY in the resolution
+        criteria: not in the question title, not in the document's front matter, and not in
+        the decoy pages, so this fails if the query is empty OR title-only.
+        """
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        pages = [
+            ["Annual Surveillance Report", "Contents: methods, tables, appendix, acknowledgements"],
+            *[[f"Chapter {n}: vector control programs and municipal drainage works."] for n in range(1, 7)],
+            ["Laboratory-confirmed cyclosporiasis hospitalizations reached 922 during the reporting period."],
+        ]
+        session = FakeSession(
+            {
+                "https://cdc.example.com/report.pdf": FakeResponse(
+                    200, body=build_text_pdf(pages), content_type="application/pdf"
+                )
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(
+            resolution_criteria=(
+                "Resolves per the laboratory-confirmed cyclosporiasis hospitalizations "
+                "reported at https://cdc.example.com/report.pdf"
+            )
+        )
+
+        out = await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert "922" in out
+        assert "No passage in this document matched the query" not in out
+        assert "municipal drainage works" not in out, "non-vacuity: the decoys are ranked out, not all included"
 
     async def test_all_fetches_fail_surfaces_notice_end_to_end(self, monkeypatch):
         # Non-benchmarking: a 403 on the sole resolution URL must surface the
@@ -121,7 +160,12 @@ class TestResolutionSourceProvider:
         # diagnostics line (so a healthy provider's line is byte-identical to what it was
         # before the ladder existed) while the archive keeps it, which is what makes "the
         # rung ran and never fired" distinguishable from "this record predates the rung".
-        assert detail["counts"] == {"meta_refresh_hops": 0, "pdf_documents_read": 0, "rung_budget_skips": 0}
+        assert detail["counts"] == {
+            "meta_refresh_hops": 0,
+            "pdf_documents_read": 0,
+            "rung_budget_skips": 0,
+            "pdf_contention_skips": 0,
+        }
         assert _counts_suffix(detail) == ""
 
     def test_duplicate_domains_keep_both_outcomes(self):

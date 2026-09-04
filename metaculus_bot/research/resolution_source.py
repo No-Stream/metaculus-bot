@@ -134,16 +134,16 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.research.document_text import (
+    DocumentDigest,
     PdfText,
+    digest_pdf,
     extract_pdf_text,
     has_text_layer,
     is_pdf_body,
-    render_document_digest,
 )
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     MAX_REDIRECTS,
-    MAX_UNDECODABLE_CHAR_RATIO,
     REDIRECT_STATUSES,
     DatawrapperChartRef,
     FilteringResolver,
@@ -154,6 +154,7 @@ from metaculus_bot.research.http_fetch import (
     host_semaphores,
     meta_refresh_target,
     parse_http_last_modified,
+    pdf_parse_semaphore,
     read_body_capped,
     rewrite_aria_tables,
     semaphore_for_host,
@@ -576,13 +577,21 @@ def _extract_main_text(body: bytes | str, url: str) -> str | None:
     Takes bytes (the response body, letting trafilatura detect the encoding) or text
     (a body this module already decoded and rewrote — see :func:`_extract_page_text`).
 
+    Runs at trafilatura's DEFAULT recall. ``favor_precision=True`` shipped here until
+    2026-09-03 and was the single largest source of withheld-but-readable pages: measured
+    over 97 archived resolution-source URLs it lost text on some pages and gained it on
+    none, and three pages it pruned below the floors (kasa.go.kr 78 chars against 6,567,
+    two tracxn pages) were classified `js_wall` and published to nobody. Precision exists
+    to suppress boilerplate, which is a real cost on a section captioned primary grading
+    evidence, so ``include_comments=False`` stays and the biggest gainers were read by hand
+    for chrome before this flipped — the gains were article bodies and data tables.
+
     Returns None on empty/failed extraction so callers can classify.
     """
     try:
         out = trafilatura.extract(
             body,
             url=url,
-            favor_precision=True,
             include_comments=False,
             include_tables=True,
             output_format="txt",
@@ -621,6 +630,13 @@ def _get_session() -> aiohttp.ClientSession:
         resolver=_make_filtering_resolver(),
     )
 
+
+# Floor under the per-hop timeout `_fetch_one_hop` derives from the remaining wall budget.
+# A hop reached with the budget already spent still gets a token attempt rather than a
+# guaranteed-expired one: nothing downstream distinguishes "timed out at 0.0 s" from "timed
+# out at 0.5 s", and a fast host answering in 200 ms is a page we would otherwise refuse for
+# free. Small enough that the overshoot stays well inside RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S.
+_MIN_HOP_TIMEOUT_S: float = 0.5
 
 _HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 _RAW_TEXT_CONTENT_TYPES = ("text/plain", "text/csv")
@@ -797,10 +813,17 @@ def _extract_page_text(html_text: str, body: bytes, url: str, undecodable_ratio:
     declares its encoding only in a ``<meta charset>`` decodes as UTF-8 here and comes
     back as mojibake, while trafilatura reading the bytes would have found the meta
     declaration. Handing it the rewritten mojibake instead would lose a page we can read
-    today, so above the shared undecodable bound the rewrite is skipped rather than
-    trusted.
+    today, so the rewrite is trusted ONLY on a body that decoded cleanly.
+
+    That is why the gate is ``== 0.0`` and not ``MAX_UNDECODABLE_CHAR_RATIO``: the shared
+    bound is the refuse-the-whole-body threshold and is far too loose for this decision. A
+    mostly-ASCII cp1252 page whose only non-UTF-8 bytes are accented characters scores
+    around 0.01 against a bound of 0.10, so under the old gate it took the rewrite and
+    reached forecasters as ``R<?>sum<?> ... Qu<?>bec`` where the bytes path returns the
+    accents. Any U+FFFD at all means this decode lost information trafilatura might not
+    have, and the rewrite is the only thing that forecloses its own encoding detection.
     """
-    rewritten = None if undecodable_ratio > MAX_UNDECODABLE_CHAR_RATIO else rewrite_aria_tables(html_text)
+    rewritten = rewrite_aria_tables(html_text) if undecodable_ratio == 0.0 else None
     return _extract_main_text(body if rewritten is None else rewritten, url)
 
 
@@ -1029,9 +1052,56 @@ def _pdf_unreadable_reason(pdf: PdfText) -> FetchStatusReason:
     return "no_text_layer"
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingDocument:
+    """A PDF whose bytes we hold and whose parse has not started yet.
+
+    Exists so the parse happens OUTSIDE the per-host politeness semaphore. That map is
+    loop-wide, so a 20 s parse held inside it blocked every other concurrent question's
+    fetch of any URL on that host — and this population is concentrated on a handful of
+    government hosts, so same-host collisions across questions in one round are the
+    expected case. Two questions queued behind one parse of a shared host exhaust their own
+    ``RESOLUTION_SOURCE_WALL_TIMEOUT``, and the outer ``wait_for`` then discards every page
+    they had already fetched.
+    """
+
+    url: str
+    body: bytes
+    http_status: int
+    content_type: str
+    from_status: FetchStatus
+
+
+def _parse_and_digest(
+    body: bytes, *, max_seconds: float, query: str, source_url: str
+) -> tuple[PdfText, DocumentDigest | None]:
+    """pypdf parse plus BM25 passage selection: both CPU-bound, so ONE thread hop, never two.
+
+    The digest is as CPU-bound as the parse and was running inline on the loop two lines
+    below a call carefully threaded for exactly that reason: ``select_passages`` tokenises
+    every window of the joined document and holds a ``Counter`` per window alive at once,
+    measured at 96-235 ms per 400-page document and additive across the six concurrent
+    questions — a stall that lands inside the 2 s ``RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S``
+    and delays every sibling provider's I/O, not just this fetch.
+
+    ``None`` for the digest means the document carried no text layer, which the caller
+    reports rather than digests.
+    """
+    pdf = extract_pdf_text(body, max_pages=DOCUMENT_TEXT_MAX_PAGES, max_seconds=max_seconds)
+    if not has_text_layer(pdf):
+        return pdf, None
+    return pdf, digest_pdf(
+        pdf,
+        query=query,
+        top_k=DOCUMENT_DIGEST_TOP_K,
+        max_chars=RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+        source_url=source_url,
+    )
+
+
 async def _resolution_pdf_outcome(
     resp: Any, current_url: str, content_type: str, ctx: FetchContext, *, from_status: FetchStatus
-) -> FetchResult:
+) -> FetchResult | _PendingDocument:
     """Read a PDF we are already holding, locally, and render the query-relevant passages.
 
     Free and deterministic: pypdf plus BM25 passage selection (``research/document_text``),
@@ -1055,6 +1125,11 @@ async def _resolution_pdf_outcome(
     remaining budget capped at ``DOCUMENT_TEXT_MAX_SECONDS``, so a 900-page document
     comes back partial-and-labelled rather than taking the outer wall down with every
     sibling page that already succeeded.
+
+    This half runs INSIDE the response context, so it does only what needs the open
+    response: the capped read, the ``%PDF-`` check and the budget-floor skip. A real
+    document comes back as a :class:`_PendingDocument` and :func:`_finish_document` parses
+    it once the host semaphore has been released.
     """
     status = resp.status
     netloc = urlparse(current_url).netloc
@@ -1083,61 +1158,146 @@ async def _resolution_pdf_outcome(
             http_status=status,
             content_type=content_type or None,
         )
+    pending = _PendingDocument(
+        url=current_url,
+        body=body,
+        http_status=status,
+        content_type=content_type,
+        from_status=from_status,
+    )
     budget_s = ctx.rung_budget_s()
     if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
+        # Checked here, before the response context closes, so a question with no budget
+        # left never even queues for a parse slot it would have to give back.
         logger.warning(
             "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left",
             netloc,
             budget_s,
         )
         ctx.skip_rung("pdf_local", from_status, current_url, "wall_budget")
-        return FetchResult(
-            url=current_url,
-            status="unsupported_type",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
+        return _document_not_parsed(pending, "budget_skipped")
+    return pending
+
+
+async def _finish_document(pending: _PendingDocument, ctx: FetchContext) -> FetchResult:
+    """Parse a held PDF and render its digest, with no host semaphore and no response held.
+
+    Runs after :func:`_fetch_one_hop` has left both the ``session.get`` context and the
+    per-host gate, which is the whole point: the parse is up to
+    ``min(DOCUMENT_TEXT_MAX_SECONDS, budget)`` of CPU, and holding a loop-wide
+    ``Semaphore(1)`` for a host through it stalls every other concurrent question's fetch of
+    that host (see :class:`_PendingDocument`).
+
+    The parse contends instead for :func:`http_fetch.pdf_parse_semaphore`, the loop-wide
+    2-slot gate this route shares with the gap-fill v2 local-document ladder — the bound has
+    to hold across the two routes, not inside each, because a Tier-1 fan-out alone is up to
+    ``RESOLUTION_SOURCE_MAX_URLS`` documents per question across
+    ``DEFAULT_MAX_CONCURRENT_RESEARCH`` questions. The wait is bounded by the remaining
+    budget less the floor and degrades to the same leave-it-unread skip, since queueing until
+    the outer wall fires would discard every sibling page that already succeeded.
+
+    Never raises: ``extract_pdf_text`` returns a ``PdfText`` carrying ``unreadable_reason``
+    rather than throwing, and the digest is pure.
+    """
+    netloc = urlparse(pending.url).netloc
+    gate = pdf_parse_semaphore()
+    budget_s = ctx.rung_budget_s()
+    try:
+        # Bounded, not a bare acquire: queueing behind two other documents until the outer
+        # wall fires would discard every sibling page this question already fetched, which
+        # costs strictly more than leaving one document unread. Leaving the floor unspent
+        # means a slot won at the last moment still has time to parse something.
+        await asyncio.wait_for(gate.acquire(), timeout=max(0.0, budget_s - RESOLUTION_SOURCE_PDF_MIN_BUDGET_S))
+    except TimeoutError:
+        logger.warning(
+            "resolution_source: skipping the local PDF read for %s — no parse slot within %.1fs of wall budget",
+            netloc,
+            budget_s,
         )
-    attempt = ctx.start_rung("pdf_local", from_status, current_url)
-    # CPU-bound (pypdf decodes every content stream), so never inline on the loop.
-    pdf = await asyncio.to_thread(
-        extract_pdf_text,
-        body,
-        max_pages=DOCUMENT_TEXT_MAX_PAGES,
-        max_seconds=min(DOCUMENT_TEXT_MAX_SECONDS, budget_s),
-    )
-    attempt.wall_s = max(0.0, time.monotonic() - attempt.started_at)
-    if not has_text_layer(pdf):
+        ctx.skip_rung("pdf_local", pending.from_status, pending.url, "parse_contention")
+        return _document_not_parsed(pending, "parse_contention")
+    try:
+        # Re-read after the wait: the queue itself consumed budget, and `max_seconds` is
+        # wall-clock, so a stale figure would hand pypdf a bound that already expired.
+        budget_s = ctx.rung_budget_s()
+        if budget_s < RESOLUTION_SOURCE_PDF_MIN_BUDGET_S:
+            logger.warning(
+                "resolution_source: skipping the local PDF read for %s — %.1fs of wall budget left after queueing",
+                netloc,
+                budget_s,
+            )
+            ctx.skip_rung("pdf_local", pending.from_status, pending.url, "wall_budget")
+            return _document_not_parsed(pending, "budget_skipped")
+        attempt = ctx.start_rung("pdf_local", pending.from_status, pending.url)
+        pdf, digest = await asyncio.to_thread(
+            _parse_and_digest,
+            pending.body,
+            max_seconds=min(DOCUMENT_TEXT_MAX_SECONDS, budget_s),
+            query=ctx.query,
+            source_url=pending.url,
+        )
+        # Stamped inside the gate so wall_s measures the parse this rung actually did, not
+        # the time it spent queueing for a slot.
+        attempt.wall_s = max(0.0, time.monotonic() - attempt.started_at)
+    finally:
+        gate.release()
+    if digest is None:
         reason = _pdf_unreadable_reason(pdf)
         logger.warning(
             f"resolution_source {netloc}: PDF carried no readable text ({reason}, "
             f"{pdf.page_count} pages, {pdf.pages_read} read)"
         )
         return FetchResult(
-            url=current_url,
+            url=pending.url,
             status="unreadable_document",
             text="",
-            http_status=status,
-            content_type=content_type or None,
+            http_status=pending.http_status,
+            content_type=pending.content_type or None,
             status_reason=reason,
         )
     return FetchResult(
-        url=current_url,
+        url=pending.url,
         status="success",
-        text=render_document_digest(
-            pdf,
-            query=ctx.query,
-            top_k=DOCUMENT_DIGEST_TOP_K,
-            max_chars=RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
-            source_url=current_url,
-        ),
-        http_status=status,
-        content_type=content_type or None,
+        text=digest.block,
+        http_status=pending.http_status,
+        content_type=pending.content_type or None,
+        # A zero-passage digest is a document we read that does not discuss the ask, and its
+        # block reads identically to one carrying the resolving paragraph — same header, same
+        # outline, plus a sentence saying nothing matched. No status flip (it IS a successful
+        # read, and a loss token here would move `sources=ok/total` and drag every sibling
+        # into the "yielded no usable content" notice), just the reason that separates them.
+        status_reason=None if digest.passages else "no_matching_passage",
     )
 
 
-async def _resolution_response_outcome(resp: Any, current_url: str, ctx: FetchContext) -> FetchResult | str:
-    """Classify one response: a terminal FetchResult, or the next URL on a vetted hop."""
+def _document_not_parsed(pending: _PendingDocument, reason: FetchStatusReason) -> FetchResult:
+    """The result for a document we held and chose not to parse.
+
+    ``unsupported_type`` rather than ``unreadable_document``: nothing read the bytes, so
+    nothing established they carry no text, and only the latter is worth a paid document
+    read later. ``reason`` says which rule declined — the same token the rung attempt's
+    ``skipped_reason`` carries, repeated here because the two ride different markers
+    (``RESOLUTION_SOURCE_ESCALATION`` versus ``RESOLUTION_SOURCE_FETCH``) and a reader of
+    the per-fetch line should not have to join to learn we were holding a document.
+    """
+    return FetchResult(
+        url=pending.url,
+        status="unsupported_type",
+        text="",
+        http_status=pending.http_status,
+        content_type=pending.content_type or None,
+        status_reason=reason,
+    )
+
+
+async def _resolution_response_outcome(
+    resp: Any, current_url: str, ctx: FetchContext
+) -> FetchResult | _PendingDocument | str:
+    """Classify one response: a terminal FetchResult, a held document, or the next hop's URL.
+
+    The :class:`_PendingDocument` case is the PDF branch handing its parse back to the
+    caller to run outside the host semaphore; every other branch is terminal or a hop.
+    """
     status = resp.status
     content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
 
@@ -1170,11 +1330,38 @@ async def _resolution_response_outcome(resp: Any, current_url: str, ctx: FetchCo
 async def _fetch_one_hop(
     session: Any, current_url: str, host_sems: dict[str, asyncio.Semaphore], ctx: FetchContext
 ) -> FetchResult | str:
-    """ONE GET against ``current_url`` under its host semaphore: terminal result or next URL."""
+    """ONE GET against ``current_url`` under its host semaphore: terminal result or next URL.
+
+    The request's timeout is the REMAINING wall budget rather than the session's flat
+    ``RESOLUTION_SOURCE_HTTP_TIMEOUT``, and it is computed AFTER the semaphore is acquired so
+    a hop that queued behind a slow host does not then help itself to a fresh 20 s. This is
+    the one choke point every hop passes through — the initial GET, each 3xx hop and the
+    meta-refresh hop — so clamping here is what makes the budget arithmetic the rest of the
+    ladder does actually bind: a hop admitted with 3 s left (the meta-refresh rung's floor)
+    could otherwise run the full 20 s, overshoot ``RESOLUTION_SOURCE_WALL_TIMEOUT`` and let
+    the provider's outer ``wait_for`` discard every sibling page that had already fetched.
+    Monotonically <= the old 20 s, and an expiry lands on the existing ``TimeoutError`` path,
+    so overrunning costs this one URL rather than the question.
+
+    BOTH ``ClientTimeout`` fields are set because a per-request timeout REPLACES the
+    session's wholesale rather than merging with it.
+
+    A cited PDF is the one branch whose work does NOT finish inside the two contexts: it
+    comes back as a :class:`_PendingDocument` and is parsed after both have exited, because
+    that parse is seconds of CPU and the host gate is loop-wide (see
+    :class:`_PendingDocument`). The HTML branch's ``to_thread`` hops still run inside the
+    semaphore — trafilatura on a capped page is short next to the request it follows, and
+    moving it would trade a measured hazard for an unmeasured restructure.
+    """
     async with _sem_for_host(host_sems, current_url):
+        hop_timeout_s = min(RESOLUTION_SOURCE_HTTP_TIMEOUT, max(ctx.rung_budget_s(), _MIN_HOP_TIMEOUT_S))
         try:
-            async with session.get(current_url, allow_redirects=False) as resp:
-                return await _resolution_response_outcome(resp, current_url, ctx)
+            async with session.get(
+                current_url,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=hop_timeout_s, sock_read=hop_timeout_s),
+            ) as resp:
+                outcome = await _resolution_response_outcome(resp, current_url, ctx)
         except (TimeoutError, aiohttp.ClientError) as e:
             logger.info(f"resolution_source fetch error for {current_url}: {type(e).__name__}: {e}")
             return FetchResult(
@@ -1184,6 +1371,9 @@ async def _fetch_one_hop(
                 http_status=None,
                 content_type=None,
             )
+    if isinstance(outcome, _PendingDocument):
+        return await _finish_document(outcome, ctx)
+    return outcome
 
 
 async def _fetch_one(
@@ -1205,13 +1395,15 @@ async def _fetch_one(
     the returned result. It defaults to a fresh one so the fetch surface can still be
     driven with three arguments, which is what every existing caller and test does.
 
-    Politeness: each hop acquires the semaphore for THAT hop's host around its
-    single GET (+ body read on terminal responses) and releases it before
-    following a redirect. Keying per hop — not on the original URL's host —
-    preserves one-request-per-host when chains from different initial hosts
-    converge on the same final host; the strict per-hop acquire/release
-    pairing means an A→B→A chain never re-acquires a semaphore it still holds
-    (asyncio semaphores are not reentrant).
+    Politeness: each hop acquires the semaphore for THAT hop's host around its single GET,
+    the body read on a terminal response, and the HTML branch's extraction, and releases it
+    before following a redirect. A cited PDF's parse is the one thing deliberately outside
+    the hold — it comes back as a ``_PendingDocument`` and is parsed after the semaphore is
+    released, because the gate is loop-wide and the parse is seconds of CPU. Keying per hop
+    — not on the original URL's host — preserves one-request-per-host when chains from
+    different initial hosts converge on the same final host; the strict per-hop
+    acquire/release pairing means an A→B→A chain never re-acquires a semaphore it still
+    holds (asyncio semaphores are not reentrant).
 
     SSRF guard: rejects non-public URLs (private / loopback / link-local IPs,
     userinfo tricks, non-http(s) schemes) BEFORE any network I/O and again on
@@ -1537,6 +1729,15 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "") -> list[
     serialize there; the Tier-2 dataset fetches contend on the dwcdn host's semaphore
     the same way. Session is closed in ``finally``.
 
+    Sharing the map buys that politeness at the cost of CROSS-QUESTION serialization: a
+    same-host queue now forms across the concurrent questions, inside a
+    ``RESOLUTION_SOURCE_WALL_TIMEOUT`` that was not raised and that discards work which
+    already succeeded when it fires, so a question that loses the queue can lose every
+    page it had already fetched rather than just the contended one (reproduced; the
+    archived tail says 3 of 23 all-fail fetches ran the full per-request timeout). The
+    acquire wait itself is deliberately unbounded — see FUTURE.md item 5, where both
+    remedies (partial harvest, or a budget-bounded wait) are the operator's call.
+
     Teardown race guard (F5): the outer factory wraps this call in
     ``asyncio.wait_for``. When the wall-clock timeout fires, wait_for cancels
     this coroutine — but if a gather is still in flight we'd exit the
@@ -1653,8 +1854,11 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     when its prose made it a success.
 
     ``reason`` is appended only where the status alone is ambiguous —
-    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page``, and
-    ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs ``malformed``.
+    ``no_resolving_content``'s ``embed_shell`` vs ``thin_page``,
+    ``unreadable_document``'s ``no_text_layer`` vs ``encrypted`` vs ``malformed``, the
+    ``no_matching_passage`` that separates a document we read and whose passage selection
+    matched nothing from one that answered the ask, and the ``budget_skipped`` /
+    ``parse_contention`` that say an ``unsupported_type`` was a document we were holding.
     ``route`` is appended only when a ladder rung produced the outcome. Both are
     appended rather than always emitted so every line the archive already holds stays
     byte-identical and an absent field keeps meaning "this does not apply", not "old
@@ -1699,6 +1903,10 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         "meta_refresh_hops": sum(1 for attempt in fired if attempt.rung == "meta_refresh"),
         "pdf_documents_read": sum(1 for attempt in fired if attempt.rung == "pdf_local"),
         "rung_budget_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "wall_budget"),
+        # Its own count rather than folded into the budget skips: a document left unread
+        # because two others were already parsing says the 2-slot gate is the binding
+        # constraint, which is a different thing to fix than a question that ran late.
+        "pdf_contention_skips": sum(1 for attempt in attempts if attempt.skipped_reason == "parse_contention"),
     }
 
 

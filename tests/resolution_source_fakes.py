@@ -105,9 +105,13 @@ class FakeSession:
         # Every URL requested, in order — lets tests pin which routes were
         # (and, critically for the Datawrapper hop, were NOT) fetched.
         self.requested: list[str] = []
+        # Per-request kwargs, parallel to `requested` — the per-hop ClientTimeout the
+        # fetcher derives from the remaining wall budget is only observable here.
+        self.get_kwargs: list[dict[str, Any]] = []
 
-    def get(self, url: str, **_kwargs: Any) -> _TrackingResponse:
+    def get(self, url: str, **kwargs: Any) -> _TrackingResponse:
         self.requested.append(url)
+        self.get_kwargs.append(dict(kwargs))
         for prefix, handler_list in self._handlers.items():
             if url.startswith(prefix):
                 idx = min(self._call_counts[prefix], len(handler_list) - 1)
@@ -282,6 +286,35 @@ CDC_ARIA_STAT_BLOCK_PATH = _TEST_DATA_DIR / "cdc_aria_stat_block.html"
 
 def cdc_aria_stat_block_page() -> bytes:
     return CDC_ARIA_STAT_BLOCK_PATH.read_bytes()
+
+
+def cp1252_aria_stat_block_page() -> bytes:
+    """A windows-1252 page declaring its charset ONLY in a `<meta charset>`, with an ARIA table.
+
+    The combination is what defeats the ARIA rewrite: `decode_text_body` honours a BOM and
+    the HTTP header's charset and cannot see a meta declaration, so our decode replaces
+    every accented byte with U+FFFD — while trafilatura reading the raw bytes finds the
+    declaration and returns the accents. Mostly ASCII on purpose, so the undecodable ratio
+    lands far below the shared refuse-the-body bound, which is the whole point: keying the
+    rewrite's gate on that bound admitted this page and shipped the mojibake.
+    """
+    return (
+        '<!doctype html><html><head><meta charset="windows-1252">'
+        "<title>Bilan hebdomadaire</title></head><body>"
+        "<article><h1>Résumé de l'éclosion au Québec</h1>"
+        "<p>Résumé de l'éclosion au Québec, préparé par André Maître pour le Comité de "
+        "surveillance. Les données ci-dessous couvrent la période du 1er mai au 24 août 2026 "
+        "et proviennent des laboratoires provinciaux, qui les transmettent chaque semaine au "
+        "registre national des maladies à déclaration obligatoire.</p>"
+        '<div role="table"><div role="row"><div role="rowheader">Cas confirmés</div>'
+        '<div role="cell">17 180</div></div>'
+        '<div role="row"><div role="rowheader">Hospitalisations</div>'
+        '<div role="cell">922</div></div>'
+        '<div role="row"><div role="rowheader">Décès</div><div role="cell">2</div></div></div>'
+        "<p>Les chiffres sont révisés à mesure que les enquêtes épidémiologiques progressent, "
+        "de sorte que le total des cas confirmés peut augmenter après la publication.</p>"
+        "</article></body></html>"
+    ).encode("windows-1252")
 
 
 def _meta_refresh_stub(target: str) -> bytes:

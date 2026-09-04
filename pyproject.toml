@@ -29,6 +29,7 @@ dependencies = [
     "json-repair>=0.61.1",
     "ijson>=3.5.1",
     "pypdf>=6.16.2",
+    "certifi>=2026.5.20",
 ]
 # supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 # The freshness window is enforced at lock time via `uv lock --exclude-newer <ts>`

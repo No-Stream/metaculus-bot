@@ -23,10 +23,12 @@ import codecs
 import ipaddress
 import logging
 import socket
+import ssl
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
+import certifi
 import pytest
 from aiohttp.abc import AbstractResolver
 
@@ -107,6 +109,10 @@ class FakeStreamResponse:
         self.content = FakeStreamContent(chunks)
 
 
+def _certifi_context() -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 class TestBrowserHeaders:
     def test_contains_required_keys(self):
         for key in ("User-Agent", "Accept", "Accept-Language", "Accept-Encoding"):
@@ -148,6 +154,29 @@ class TestBuildSession:
             # No headers arg -> no session-level User-Agent (aiohttp adds its own
             # at request time; prediction_market relies on this no-header default).
             assert "User-Agent" not in session.headers
+
+    async def test_tls_trust_is_pinned_to_certifis_bundle(self):
+        """Which sources are reachable must not depend on the machine's CA store: trade.gov
+        failed CERTIFICATE_VERIFY_FAILED against the default store on 2026-09-03 and
+        succeeded against certifi's, and a source lost that way reads as a dead host."""
+        expected = {(cert.get("serialNumber"), cert.get("issuer")) for cert in _certifi_context().get_ca_certs()}
+
+        async with build_session(timeout_s=5.0) as session:
+            assert session.connector is not None
+            # aiohttp keeps the connector's TLS config on the private `_ssl`; peeking is the
+            # only way to assert the wiring without opening a real connection.
+            context = getattr(session.connector, "_ssl", None)
+            assert isinstance(context, ssl.SSLContext)
+            assert {(cert.get("serialNumber"), cert.get("issuer")) for cert in context.get_ca_certs()} == expected
+            assert expected, "a context loading no CA at all would verify nothing"
+
+    async def test_header_size_caps_are_raised_above_aiohttps_default(self):
+        """who.int (8,765 B) and visitwales.com (9,697 B) send a Content-Security-Policy
+        header over aiohttp's 8,190-byte default, and the response is rejected before any
+        body is read — arriving as `error http=None`, same as a host that never answered."""
+        async with build_session(timeout_s=5.0) as session:
+            assert session._max_line_size == 65536
+            assert session._max_field_size == 65536
 
     async def test_resolver_kwarg_flows_into_connector(self):
         # build_session must plumb the resolver into TCPConnector so aiohttp's

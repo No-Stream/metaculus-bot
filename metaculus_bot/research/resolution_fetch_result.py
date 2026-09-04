@@ -89,7 +89,25 @@ FetchStatus = Literal[
 # `encrypted` / `malformed` to `unreadable_document`, where the split is what says
 # whether a paid document read could ever help (only `no_text_layer` — the other two
 # are bytes no reader gets text out of).
-FetchStatusReason = Literal["embed_shell", "thin_page", "no_text_layer", "encrypted", "malformed"]
+#
+# The document rung adds three. `no_matching_passage` is a `success` we DID read whose BM25
+# selection matched no query term: the digest renders its header, its outline and the "no
+# passage matched" sentence, which in the run log and the archive was byte-identical to a
+# document that handed the forecasters the resolving paragraph — on the one surface whose
+# stated contract is that `success` means CONTENT. `budget_skipped` and `parse_contention`
+# belong to the `unsupported_type` a held-but-unparsed document earns, and say which rule
+# declined: the question ran out of wall, or every parse slot was taken. Without them a
+# skipped document is indistinguishable from a body that was never a document at all.
+FetchStatusReason = Literal[
+    "embed_shell",
+    "thin_page",
+    "no_text_layer",
+    "encrypted",
+    "malformed",
+    "no_matching_passage",
+    "budget_skipped",
+    "parse_contention",
+]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the
 # `route=` group of the `resolution_source_fetch` marker spec
