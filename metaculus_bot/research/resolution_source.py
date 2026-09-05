@@ -1049,20 +1049,45 @@ def _sem_for_host(host_sems: dict[str, asyncio.Semaphore], url: str) -> asyncio.
     return semaphore_for_host(url, host_sems)
 
 
+HopRefusal = Literal["ssrf_blocked", "metaculus_self_ref"]
+
+
+async def _hop_refusal(candidate_url: str) -> HopRefusal | None:
+    """Why this module must not fetch a URL it DERIVED, or None when it may.
+
+    The ONE home of the two checks every derived URL owes before anything dials it: a
+    ``Location`` header, a meta-refresh target, the innermost URL of a Wayback capture, and
+    the URL the direct fetch landed on that the browser rung is about to render. The
+    ``is_public_http_url`` preflight runs FIRST (the fast-fail SSRF view; the connect-time
+    resolver stays the real boundary), then the Metaculus self-reference refusal, and that
+    order is a telemetry contract: a URL that is both non-public and a self-reference has always
+    been recorded as ``ssrf_blocked``, never as the self-reference's ``blocked``. Shared so a rung
+    cannot ship with one of the checks missing, and so a third check added here reaches every
+    site at once; the callers own their log lines and what they return, because a hop that is
+    refused is terminal for the redirect loop (:func:`_vetted_hop_target`) and a decline for the
+    render and Wayback rungs (:func:`_rendered_rung`, :func:`_wayback_snapshot_result`).
+    """
+    if not await is_public_http_url(candidate_url):
+        return "ssrf_blocked"
+    if is_metaculus_self_ref(candidate_url):
+        return "metaculus_self_ref"
+    return None
+
+
 async def _vetted_hop_target(
     target: str, current_url: str, *, http_status: int, content_type: str, kind: str
 ) -> FetchResult | str:
     """The absolute next URL for a derived hop, or the terminal refusal it earns.
 
-    The ONE place a URL this module derived from a response — a ``Location`` header, a
-    meta-refresh tag — passes the two checks every hop owes: the ``is_public_http_url``
-    preflight (the fast-fail SSRF view; the connect-time resolver stays the real
-    boundary) and the Metaculus self-reference refusal. Shared so a third rung cannot
-    ship with one of them missing, and ``kind`` is only there to say which hop shape a
-    log line came from.
+    The terminal-result form of :func:`_hop_refusal`, for a URL this module derived from a
+    response inside the redirect loop, a ``Location`` header or a meta-refresh tag: the
+    refusal token is mapped onto the ``FetchResult`` the loop ends on, and the two status
+    strings it produces, ``ssrf_blocked`` and ``blocked``, are telemetry contracts. ``kind``
+    is only there to say which hop shape a log line came from.
     """
     next_url = urljoin(current_url, target)
-    if not await is_public_http_url(next_url):
+    refusal = await _hop_refusal(next_url)
+    if refusal == "ssrf_blocked":
         logger.warning(
             f"resolution_source ssrf_blocked ({kind}): {urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
         )
@@ -1073,7 +1098,7 @@ async def _vetted_hop_target(
             http_status=http_status,
             content_type=content_type or None,
         )
-    if is_metaculus_self_ref(next_url):
+    if refusal == "metaculus_self_ref":
         # The URL pre-filter drops metaculus self-refs, but a redirect (of either
         # shape) can still land on metaculus.com; don't follow it (no new info,
         # and keeps our IP off the same host the critical API uses).
@@ -2056,8 +2081,9 @@ async def _rendered_rung(
     host that actually serves the content, which is also the host the landing check holds the
     browser to, and a page whose canonical form is one ordinary hop away (``example.com`` to
     ``www.example.com``) is not refused for taking it. When the two differ, the landing is
-    re-vetted here with the same two checks every derived hop owes (:func:`_vetted_hop_target`),
-    because this is where the URL the browser dials is decided. The render memos are keyed on
+    re-vetted here through :func:`_hop_refusal`, the one home of the two checks every derived
+    URL owes, because this is where the URL the browser dials is decided; the refusal is a
+    decline rather than a terminal result, so this site logs and returns None. The render memos are keyed on
     the URL rendered; the rung's attempt stays keyed on the cited ``url``, which is what the
     escalation line names, and the harvested feed is remembered for the cited URL's host, which
     is the host the next cited URL asks :func:`_derived_api_rung` about.
@@ -2065,7 +2091,7 @@ async def _rendered_rung(
     if not _rendered_rung_applies(direct):
         return None
     render_url = direct.url
-    if render_url != url and (is_metaculus_self_ref(render_url) or not await is_public_http_url(render_url)):
+    if render_url != url and await _hop_refusal(render_url) is not None:
         logger.warning(
             "resolution_source: not rendering %s, where the cited %s landed: a host we do not fetch",
             urlparse(render_url).netloc,
@@ -2240,10 +2266,11 @@ async def _wayback_snapshot_result(
     Three outcomes, in this order, and the order is the design.
 
     The inner URL is UNWRAPPED — repeatedly, since a capture OF a capture presents
-    ``web.archive.org`` as its own inner host — and re-checked first, because a hostname check
-    on ``web.archive.org/web/…/metaculus.com/…`` sails past every self-reference filter in the
-    pipeline — an archived Metaculus page in front of a forecaster is the question quoting
-    itself. Then a snapshot the archive could not serve at all (no capture, or a capture that
+    ``web.archive.org`` as its own inner host — and re-checked first through
+    :func:`_hop_refusal`, the one home of the two checks every derived URL owes, because a
+    hostname check on ``web.archive.org/web/…/metaculus.com/…`` sails past every self-reference
+    filter in the pipeline — an archived Metaculus page in front of a forecaster is the question
+    quoting itself. Then a snapshot the archive could not serve at all (no capture, or a capture that
     404s) DECLINES: there is no archived copy, which is a different fact from a stale one, and
     the direct route's own status says more about the source than a fact about the archive would.
     Only a capture we actually READ and cannot date, or can date and it is too old, is withheld
@@ -2257,7 +2284,7 @@ async def _wayback_snapshot_result(
     snapshot = await _fetch_direct(session, wayback_snapshot_url(url, now=ctx.now), host_sems, _aux_ctx(ctx))
     parsed = parse_snapshot_url(snapshot.url)
     captured_of = None if parsed is None else innermost_url(parsed.inner_url)
-    if captured_of is not None and (is_metaculus_self_ref(captured_of) or not await is_public_http_url(captured_of)):
+    if captured_of is not None and await _hop_refusal(captured_of) is not None:
         logger.warning(
             "resolution_source wayback refused: snapshot of %s wraps a URL we do not fetch (%s)",
             urlparse(url).netloc,
@@ -2776,7 +2803,8 @@ async def _fetch_direct(
     SSRF guard: rejects non-public URLs (private / loopback / link-local IPs,
     userinfo tricks, non-http(s) schemes) BEFORE any network I/O and again on
     every hop target, whether it came from a ``Location`` header or a meta-refresh
-    tag (:func:`_vetted_hop_target` is the one place both are checked). The
+    tag (:func:`_hop_refusal` is the one place both checks live, and
+    :func:`_vetted_hop_target` maps its verdict onto the terminal result). The
     connect-time :class:`FilteringResolver` (see :func:`_get_session`) provides the
     actual DNS-rebinding boundary; these preflight checks are fast-fail
     observability so we surface ``ssrf_blocked`` without opening a session. Hops of

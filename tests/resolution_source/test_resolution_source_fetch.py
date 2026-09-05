@@ -38,10 +38,12 @@ from metaculus_bot.research.resolution_source import (
 )
 from scripts.telemetry.markers import MARKER_SPECS
 from tests.resolution_source_fakes import (
+    _URL,
     FakeResponse,
     FakeSession,
     _embed_shell_page,
     _escape_config,
+    _fake_render,
     _iom_shaped_page,
     _meta_refresh_stub,
     _mid_band_chart_page,
@@ -1351,6 +1353,68 @@ class TestMetaRefreshHop:
         ]
         assert any("skipping the meta-refresh hop" in m for m in caplog.messages)
         assert any("skipping the rendered rung" in m for m in caplog.messages)
+
+
+class TestTheHopRefusalPolicy:
+    """The two checks every URL this module DERIVED owes before anything dials it, the public-URL
+    preflight and the Metaculus self-reference refusal, have one home, ``_hop_refusal``. The
+    terminal-result sites (a ``Location`` header, a meta-refresh tag) map its token onto a
+    ``FetchResult``; the decline-shaped sites (the render landing, a Wayback capture's innermost
+    URL) log and return None. Before the helper, the rendered rung shipped a third hand-rolled copy
+    of the pair, and a third check added under `_vetted_hop_target`'s "the ONE place" contract would
+    silently have missed the one site that decides which URL Chromium dials."""
+
+    # Userinfo makes a URL non-public (`https://trusted@10.0.0.1/` defeats hostname trust) and the
+    # host makes it a self-reference, so this one URL fails both checks with nothing patched.
+    _BOTH = "https://user@www.metaculus.com/questions/999/"
+
+    async def test_publicness_is_checked_first(self):
+        """The order is a telemetry contract: a URL that is both non-public and a self-reference
+        has always been recorded as ``ssrf_blocked``, never as the self-reference's ``blocked``."""
+        assert await resolution_source._hop_refusal(self._BOTH) == "ssrf_blocked"
+        assert await resolution_source._hop_refusal("https://www.metaculus.com/questions/999/") == "metaculus_self_ref"
+        assert await resolution_source._hop_refusal("https://tracker.example.com/senate") is None
+
+    async def test_the_terminal_site_keeps_its_status_strings(self):
+        blocked_both_ways = await resolution_source._vetted_hop_target(
+            self._BOTH, "https://tracker.example.com/p", http_status=302, content_type="", kind="redirect"
+        )
+        self_ref_only = await resolution_source._vetted_hop_target(
+            "https://www.metaculus.com/questions/999/",
+            "https://tracker.example.com/p",
+            http_status=302,
+            content_type="",
+            kind="redirect",
+        )
+
+        assert isinstance(blocked_both_ways, FetchResult)
+        assert blocked_both_ways.status == "ssrf_blocked"
+        assert isinstance(self_ref_only, FetchResult)
+        assert self_ref_only.status == "blocked"
+
+    async def test_the_render_landing_is_decided_by_the_same_helper(self, monkeypatch, caplog):
+        """The decline site with the highest stakes routes through the helper rather than a copy: a
+        refusal the helper returns for a public, non-Metaculus landing still stops the render."""
+        calls: list[str] = []
+
+        async def _refuse(candidate_url: str) -> str:
+            calls.append(candidate_url)
+            await asyncio.sleep(0)
+            return "ssrf_blocked"
+
+        monkeypatch.setattr(resolution_source, "_hop_refusal", _refuse)
+        renders: list[dict[str, object]] = []
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, renders))
+        landed = "https://www.tracker.example.com/senate"
+        direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+            result = await resolution_source._rendered_rung(_URL, direct, {}, FetchContext())
+
+        assert result is None
+        assert calls == [landed]
+        assert renders == []
+        assert [message for message in caplog.messages if "not rendering" in message]
 
 
 class TestLocalPdfReading:
