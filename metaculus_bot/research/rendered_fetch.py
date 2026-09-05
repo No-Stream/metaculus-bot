@@ -798,32 +798,46 @@ async def _navigate_and_read_dom(
     )
 
 
+def _same_publisher(host: str | None, other: str) -> bool:
+    """True when ``host`` and ``other`` belong to one publisher, by registrable domain.
+
+    The public suffix plus one label, from the public-suffix list vendored by
+    ``research/public_suffix.py`` (``registrable_domain``). A page on ``www.x.gov`` whose data
+    endpoint is ``api.x.gov`` or ``data.x.gov`` is the ordinary dashboard shape, and a page on
+    ``forest-fire.emergency.copernicus.eu`` fed by ``api2.effis.emergency.copernicus.eu`` is the
+    sibling-subdomain shape live QA found (2026-09-03); a bare ``endswith`` relation matched
+    neither. The PSL is also what makes ``a.co.uk`` and ``b.co.uk`` strangers and a stranger's site
+    on a shared suffix (``x.github.io`` against ``github.io``) no match. IP literals have no
+    registrable domain and the PSL algorithm would collapse two of them to their last two octets,
+    so they are compared exactly and never otherwise, and a missing hostname is nobody's publisher.
+
+    Two readers, one judgment: the XHR harvest deciding whose JSON a page fetched
+    (:func:`_harvestable_json_host`), and the ``RENDERED_FETCH_OFF_HOST`` marker's
+    ``same_publisher`` field, which tells a benign hop inside the publisher's own domain from a
+    landing on a stranger's.
+    """
+    if not host or not other:
+        return False
+    if host == other:
+        return True
+    if _ip_literal(host) is not None or _ip_literal(other) is not None:
+        return False
+    publisher = registrable_domain(other)
+    return publisher is not None and registrable_domain(host) == publisher
+
+
 def _harvestable_json_host(response_host: str, page_host: str) -> bool:
     """True when ``response_host`` may serve harvestable JSON for a page on ``page_host``.
 
-    Same publisher, by registrable domain: the public suffix plus one label, from the
-    public-suffix list vendored by ``research/public_suffix.py`` (``registrable_domain``). A page
-    on ``www.x.gov`` whose data endpoint is ``api.x.gov`` or ``data.x.gov`` is the ordinary
-    dashboard shape, and a page on ``forest-fire.emergency.copernicus.eu`` fed by
-    ``api2.effis.emergency.copernicus.eu`` is the sibling-subdomain shape live QA found
-    (2026-09-03); a bare ``endswith`` relation matched neither. The PSL is also what makes
-    ``a.co.uk`` and ``b.co.uk`` strangers and a stranger's site on a shared suffix
-    (``x.github.io`` against ``github.io``) no match, which is exactly where a wrong answer reads
-    someone else's JSON as the cited page's content. IP literals have no registrable domain and
-    the PSL algorithm would collapse two of them to their last two octets, so they are compared
-    exactly and never otherwise. The explicitly allow-listed CDNs are the one exception to
-    same-publisher.
+    Same publisher (:func:`_same_publisher`), which is exactly where a wrong answer reads someone
+    else's JSON as the cited page's content, or one of the explicitly allow-listed CDNs, the one
+    exception to same-publisher.
     """
     if not response_host or not page_host:
         return False
-    if response_host == page_host:
-        return True
     if response_host in HARVEST_ALLOWED_CDN_HOSTS:
         return True
-    if _ip_literal(response_host) is not None or _ip_literal(page_host) is not None:
-        return False
-    publisher = registrable_domain(page_host)
-    return publisher is not None and registrable_domain(response_host) == publisher
+    return _same_publisher(response_host, page_host)
 
 
 def is_json_content_type(content_type: str) -> bool:
@@ -1078,12 +1092,18 @@ async def render_page(
         # free-text WARNING is gone once the GitHub Actions logs expire at 90 days. ``scope`` names
         # which caller's render it was, since the two have different URL populations.
         # Hostnames only: the landing URL can carry a session token or a credential. A landing URL
-        # with no hostname at all renders as ``None``, which harvests as no data.
+        # with no hostname at all renders as ``None``, which harvests as no data. ``same_publisher``
+        # is the registrable-domain judgment the harvest makes about a page's own JSON, applied to
+        # the landing: strict hostname equality also refuses a benign hop inside the publisher's own
+        # domain (``example.com`` to ``www.example.com``), and without the field every such record
+        # read as a security event. ``true`` prices the strictness; ``false`` is the signal.
+        landed_host = urlparse(exc.final_url).hostname
         logger.warning(
-            "RENDERED_FETCH_OFF_HOST: scope=%s pinned_host=%s landed_host=%s",
+            "RENDERED_FETCH_OFF_HOST: scope=%s pinned_host=%s landed_host=%s same_publisher=%s",
             memo_scope,
             exc.pinned_host,
-            urlparse(exc.final_url).hostname,
+            landed_host,
+            "true" if _same_publisher(landed_host, exc.pinned_host) else "false",
         )
         raise
     # Ordered before Playwright's Error deliberately, though the order is not load-bearing:

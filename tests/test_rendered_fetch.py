@@ -339,6 +339,28 @@ class TestHarvestableHost:
         assert rendered_fetch._harvestable_json_host(response_host, page_host) is expected
 
 
+class TestSamePublisher:
+    """The one registrable-domain judgment behind the harvest's host rule and the off-host marker's
+    ``same_publisher`` field: the public suffix plus one label, IP literals compared exactly, and no
+    hostname never the same publisher."""
+
+    @pytest.mark.parametrize(
+        ("host", "other", "expected"),
+        [
+            ("www.dashboard.example.com", "dashboard.example.com", True),
+            ("api.x.gov", "www.x.gov", True),
+            ("internal.example.net", "dashboard.example.com", False),
+            ("a.co.uk", "b.co.uk", False),
+            ("169.254.169.254", "dashboard.example.com", False),
+            ("chromewebdata", "dashboard.example.com", False),
+            (None, "dashboard.example.com", False),
+            ("", "dashboard.example.com", False),
+        ],
+    )
+    def test_the_rule(self, host, other, expected):
+        assert rendered_fetch._same_publisher(host, other) is expected
+
+
 class TestDerivedFeedSelection:
     """Size is the only signal available without knowing a dashboard's schema: a page fetches
     its config, its flags and its data, and the data is the big one."""
@@ -1022,7 +1044,7 @@ class TestTheLandingHost:
         (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
         assert (
             message == "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
-            "landed_host=internal.example.net"
+            "landed_host=internal.example.net same_publisher=false"
         )
         assert "/admin" not in message
         spec = next(s for s in MARKER_SPECS if s.name == "rendered_fetch_off_host")
@@ -1031,6 +1053,32 @@ class TestTheLandingHost:
         assert match.group("scope") == _TIER1_SCOPE
         assert match.group("pinned_host") == "dashboard.example.com"
         assert match.group("landed_host") == "internal.example.net"
+        assert match.group("same_publisher") == "false"
+
+    async def test_a_hop_inside_the_publisher_is_still_refused_and_the_marker_says_so(self, monkeypatch, caplog):
+        """Strict hostname equality is the rule, so ``example.com`` to ``www.example.com`` is refused
+        like a stranger; without this field every such record read as a security-relevant event and
+        diluted the signal. ``same_publisher`` is the registrable-domain judgment the harvest already
+        makes (``registrable_domain`` over the vendored public-suffix list), so a ``true`` record
+        prices the strictness and a ``false`` one is the signal."""
+        page = FakePage([], land_on="https://www.dashboard.example.com/senate?session=abc")
+
+        with (
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"),
+            pytest.raises(rendered_fetch.RenderOffHost),
+        ):
+            await _render(monkeypatch, page)
+
+        assert page.content_reads == 0
+        (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
+        assert (
+            message == "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+            "landed_host=www.dashboard.example.com same_publisher=true"
+        )
+        assert "session" not in message
+        # A benign hop is still not memoised: it is an http(s) landing, and the memo is the
+        # transport's judgment about the page, not about the strictness of its own rule.
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
 
     async def test_an_ip_literal_landing_is_off_host(self, monkeypatch):
         """The IMDS shape: the hostname compare refuses a literal like any other stranger."""
@@ -1108,7 +1156,7 @@ class TestTheLandingHost:
         assert page.content_reads == 0
         assert raised.value.final_url == "chrome-error://chromewebdata/"
         (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
-        assert "landed_host=chromewebdata" in message
+        assert "landed_host=chromewebdata same_publisher=false" in message
 
     @pytest.mark.parametrize(
         "landed",
@@ -1233,7 +1281,7 @@ class TestTheLandingHost:
         assert raised.value.pinned_host == "dashboard.example.com"
         assert page.teardown == ["unroute_all", "context.close", "browser.close"]
         (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
-        assert "landed_host=169.254.169.254" in message
+        assert "landed_host=169.254.169.254 same_publisher=false" in message
         assert not [message for message in caplog.messages if "ami-0abc" in message]
 
     async def test_the_final_url_is_the_post_read_landing(self, monkeypatch):

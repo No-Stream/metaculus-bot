@@ -1474,8 +1474,15 @@ Follow-ups:
    its sibling declines. A skipped attempt emits no `RESOLUTION_SOURCE_ESCALATION` line, so the
    per-event record is the transport's own WARNING, registered as the marker
    `RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host>
-   landed_host=<host>` (spec `rendered_fetch_off_host`), which names hostnames only because a
-   landing URL can carry a session token. **What the probe measured, free and local, on
+   landed_host=<host> same_publisher=<true|false>` (spec `rendered_fetch_off_host`), which names
+   hostnames only because a landing URL can carry a session token. `same_publisher`, added in the
+   second fix wave the same day, is `registrable_domain(landed_host) ==
+   registrable_domain(pinned_host)` over the vendored public-suffix list, the judgment the XHR
+   harvest already makes about a page's own JSON: `true` is a benign client-side hop inside the
+   publisher's own registrable domain (`example.com` to `www.example.com`) that strict hostname
+   equality refused, so its rate prices the strictness of the rule, and `false`, which every landing
+   with no hostname also is, is the security signal. No record had been archived when the field was
+   added, so extending the line broke no contract. **What the probe measured, free and local, on
    2026-09-04.** Playwright 1.61 was driven directly with the transport's navigation shape and no
    pin, over the 106-URL Phase 3 QA sweep united with the 47-URL replay, one page at a time. 103 of
    the 106 navigations committed, and 0 of the 103 landed on a different host. Of the 22 render
