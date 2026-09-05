@@ -150,7 +150,22 @@ escalates when the lighter one comes up short:
 2. **Plain HTTP** (`_fetch_plain`). An aiohttp GET with browser-like headers,
    SSRF-hardened: a `is_public_http_url` preflight, a connect-time filtering
    resolver, and a bounded manual redirect loop that re-guards every hop.
-   Trafilatura extracts the main text.
+   Trafilatura extracts the main text. A plain GET a host answers 403 is re-dialed
+   once (`_try_impersonated_fetch`, since 2026-09-04) through the TLS-impersonating
+   transport Tier 1 shares, `metaculus_bot/research/impersonated_fetch.py`, which
+   presents a real Chrome fingerprint and carries its own DNS pin and per-hop re-guard
+   because libcurl never passes aiohttp's filtering resolver. The trigger is the host's
+   403 alone: `PlainFetchResult.http_status` is set only by a non-200 response, so the
+   `blocked` this ladder produces itself for a non-public URL or a Metaculus
+   self-reference (no `http_status`) can never reach the second transport. The body
+   goes through `_plain_body_outcome`, the same classification a plain body gets (the
+   local PDF rung included), and a page-shaped result carries `method=impersonate`,
+   which `provenance._METHOD_TO_TIER` grants the `fetched` tier; a document keeps its
+   own rung's method. Every decline (the default-on kill switch
+   `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, the per-run host memo shared with Tier 1,
+   a still-refused host, any transport refusal) leaves the `blocked` outcome exactly
+   as it was. Bounded to one plain hop's `RESOLUTION_SOURCE_HTTP_TIMEOUT` for the whole
+   retry.
 3. **Local PDF extraction** (`local_document.pdf_fetch_result`). A body that is
    a PDF — by content type or by magic bytes — is decoded with pypdf in a worker
    thread and served as its own full text (`method=pdf_local`), which paginates

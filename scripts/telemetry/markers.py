@@ -852,8 +852,14 @@ MARKER_SPECS: list[MarkerSpec] = [
         # trigger population is queryable without joining back to the fetch marker. Its domain
         # is per rung, and the pairs are disjoint by construction: ``js_wall`` /
         # ``no_resolving_content`` for ``meta_refresh``, ``derived_api`` and ``rendered`` (a page
-        # that answered 200 with nothing readable); ``unsupported_type`` for ``pdf_local`` (the
-        # content-type router's verdict before the ``%PDF-`` sniff); ``blocked`` / ``error`` /
+        # that answered 200 with nothing readable); ``blocked`` for ``impersonate`` (a direct 403
+        # re-dialed under a browser's TLS fingerprint, since 2026-09-04; its ``outcome`` is
+        # ``blocked`` again for a host that refused the impersonated client too, ``success`` for a
+        # rescue, or the classification an impersonated 200 earned, ``js_wall`` for one, while the
+        # direct status stands); ``unsupported_type`` for ``pdf_local`` (the
+        # content-type router's verdict before the ``%PDF-`` sniff, including a document the
+        # impersonated retry fetched, which pairs its own ``pdf_local`` line with the
+        # ``impersonate`` one); ``blocked`` / ``error`` /
         # ``not_found`` for ``wayback`` (a page our address never read); and ``blocked`` /
         # ``js_wall`` / ``error`` / ``no_resolving_content`` for ``url_context``. ``blocked``
         # never pairs with a browser rung, since Chromium dials from the same address. ``rung``

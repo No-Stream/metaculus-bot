@@ -143,7 +143,8 @@ Top level:
   `residual_analysis_playbook.md` (the per-round residual procedure),
   `probabilistic_tools_activation.md` (activation pending) and
   `fetch_escalation_ladder_design.md` (superseded by `fetch_ladder_plan_2026-09-03.md`, whose
-  ladder is built except the TLS-impersonation rung). `metaculus_api_doc_LARGE_FILE.yml` there is the full Metaculus
+  ladder is built; the TLS-impersonation rung it deferred is built per
+  `impersonate_rung_plan_2026-09-04.md`). `metaculus_api_doc_LARGE_FILE.yml` there is the full Metaculus
   API spec — read it with offset/limit.
 - `REFERENCE_COPY_OF_forecasting_tools*/` — read-only copy of the framework source; edits do not
   affect the installed package. `REFERENCE_COPY_OF_panchul*/` — a Q2 2025 competition winner,
@@ -157,7 +158,7 @@ Inside `metaculus_bot/`:
 | Per-question orchestration | `forecaster.py` (`_research_and_make_predictions`), `cli.py` |
 | Close-derived time budget | `time_budget.py` |
 | Research fan-out and providers | `research/` (`orchestrator.py`, `providers.py`, one module per provider) |
-| Outbound fetch transports (never hand-rolled) | `research/http_fetch.py`, `rendered_fetch.py` (headless Chromium), `url_context_reader.py` (the paid Gemini read), `robots_policy.py` |
+| Outbound fetch transports (never hand-rolled) | `research/http_fetch.py`, `impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry), `rendered_fetch.py` (headless Chromium), `url_context_reader.py` (the paid Gemini read), `robots_policy.py` |
 | Resolution-source fetcher and its escalation rungs | `research/resolution_source.py`, `resolution_fetch_result.py`, `derived_api.py`, `wayback.py` |
 | Gap-fill v1 / v2 | `research/targeted.py`, `research/agentic/` |
 | Model roster (source of truth) | `llm_configs.py` |
@@ -338,7 +339,9 @@ Each of these has cost real work at least once. The pointer is where the reasoni
 - **Lint and format**: `make lint` (Ruff check), `make format` (Ruff format + autofix).
 - **Typecheck**: `make typecheck` (basedpyright), `make typecheck_ty` (secondary).
 - **Coverage**: `make cov` (branch coverage is on). **Audit**: `make audit` (osv-scanner over
-  `uv.lock`; `brew install osv-scanner` locally, CI runs it via `google/osv-scanner-action`).
+  `uv.lock`; `brew install osv-scanner` locally, CI runs it via `google/osv-scanner-action`). It
+  cannot see the libcurl and BoringSSL binaries vendored inside the `curl_cffi` wheel, so a
+  libcurl CVE surfaces only through a `curl_cffi` bump.
 - **Dependency hygiene**: `make deps` (deptry). **Import contracts**: `make lint_imports`
   (import-linter; the contracts live in `pyproject.toml` `[tool.importlinter]`). Both are free
   and both run in CI's lint job and in `make all`.

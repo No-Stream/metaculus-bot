@@ -40,8 +40,8 @@ class TestRouteCaveats:
             assert caveat not in rendered
 
     def test_every_route_token_except_direct_has_a_caveat(self):
-        """The completeness guard, and the reason `impersonate` carries a sentence for a rung
-        that has not shipped: a future route token added to `FetchRoute` without a caveat would
+        """The completeness guard. It is why `impersonate` carried a sentence for a day before its
+        rung shipped (2026-09-04): a route token added to `FetchRoute` without a caveat would
         otherwise render rescued content with no disclosure at all, silently."""
         routes = set(get_args(FetchRoute))
 

@@ -743,7 +743,10 @@ The paid run is the operator's last step.
 
 - Gates and formatting: `make test`, `make test_fast`, `make test_e2e`,
   `make lint`, `make format`, `make typecheck`, `make typecheck_ty`, `make cov`,
-  `make audit`, `make precommit*`.
+  `make audit`, `make precommit*`. One blind spot in `make audit`: osv-scanner reads
+  `uv.lock`, and the `curl_cffi` wheel behind the impersonated retry vendors its own
+  libcurl and BoringSSL binaries that no lockfile entry names, so a libcurl CVE is not
+  reported by that gate and is picked up only by bumping `curl_cffi`.
 - Read-only Metaculus and GitHub-artifact pulls: `make sync_all` and its parts
   (`sync_research`, `sync_telemetry`, `sync_raw_research`, the `download_*` and
   `backfill_*` targets), the `performance_analysis` package and its width
@@ -1337,9 +1340,11 @@ the telemetry markers:
   `unsupported_type` carries `budget_skipped` / `parse_contention` when it was a document
   we held and declined to parse. Its absence means no reason applies, on a fresh line as much as on an
   archived one. `route` names which rung of the escalation ladder produced the recorded
-  outcome: `direct` for the plain fetch, and `meta_refresh`, `pdf_local`, `derived_api`,
-  `rendered`, `wayback` or `url_context` for an escalated one (`impersonate` is reserved in
-  the vocabulary for a rung that is not built). Without it
+  outcome: `direct` for the plain fetch, and `meta_refresh`, `impersonate`, `pdf_local`,
+  `derived_api`, `rendered`, `wayback` or `url_context` for an escalated one (`impersonate`
+  is the TLS-impersonating retry of a 403, live since 2026-09-04 behind the default-on
+  `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`; an impersonated PDF reads `pdf_local`, since the
+  local read is what produced the text). Without it
   a rescued page reads exactly like one the direct route managed on its own, so "what
   did the ladder actually buy" would not be a query. Three more optional keyed fields carry
   failure diagnostics on a non-success fetch, so the archive can separate an egress-reputation
