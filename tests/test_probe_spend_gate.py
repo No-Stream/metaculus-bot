@@ -1,27 +1,50 @@
-"""The spend gate on `scripts/probes/gemini_verify.py` is the only thing that makes it safe to keep.
+"""The spend gates on the committed probe scripts are the only thing that makes them safe to keep.
 
-Every credit spend in this repo goes through the operator (AGENTS.md, "Cost discipline"), and
-`gemini_verify.py` is the one committed script whose whole purpose is to spend: three live calls on
-the operator's personal Google AI Studio key, which is why it sits in the PAID list. Between a bare
+Every credit spend in this repo goes through the operator (AGENTS.md, "Cost discipline"), so a
+script anyone may run must be structurally incapable of spending. Two probes have a gate worth
+pinning, one class each below.
+
+`gemini_verify.py` is the one script whose whole purpose is to spend: three live calls on the
+operator's personal Google AI Studio key, which is why it sits in the PAID list. Between a bare
 `uv run python scripts/probes/gemini_verify.py` and those three billed calls there is exactly one
 guard, the `--i-accept-spend` refusal, and it was asserted nowhere. So this module pins both halves:
 the refusal must exit before the client is even constructed, and the accepted path must make three
 calls and no more — a fourth call added later would spend more than the flag's own cost estimate,
 and the operator's "go" was given against that estimate.
 
-Nothing here touches the network. The client is replaced with a fake whose `generate_content`
-returns real `google.genai` response objects, so `tests/conftest.py`'s autouse
+`fetch_diagnostic.py` is on the FREE list, but its column D runs the production escalation ladder,
+whose one paid rung (the Gemini `url_context` read) is gated only on an env flag and a key that a
+laptop mirroring prod supplies. `main` forces that flag off before any probe runs; the last class
+here pins that the paid reader is never invoked even with the flag and a key set and the rung's
+403 trigger population deliberately forced, so the free property is structural rather than a matter
+of the environment.
+
+Nothing here touches the network. The gemini client is replaced with a fake whose
+`generate_content` returns real `google.genai` response objects, so `tests/conftest.py`'s autouse
 `_block_network_egress` fixture has nothing to block and the shapes the probe reads
 (`model_version`, `usage_metadata`, `grounding_metadata`, `url_context_metadata`) come from the
-SDK's own models rather than from a hand-rolled stub that could drift from them.
+SDK's own models rather than from a hand-rolled stub that could drift from them. The fetch-diagnostic
+class drives the real provider ladder against a fake refused session, so its 403 is produced by the
+fetch layer rather than by the egress guard, whose `ssrf_blocked` status is not a url_context trigger
+and would make the assertion pass vacuously.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
+from typing import Any
+
 import pytest
 from google.genai import types as genai_types
 
-from scripts.probes import gemini_verify
+from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
+from metaculus_bot.research import resolution_source
+from metaculus_bot.research.http_fetch import reset_host_semaphores
+from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
+from metaculus_bot.research.robots_policy import reset_robots_cache
+from scripts.probes import fetch_diagnostic, gemini_verify
+from tests.resolution_source_fakes import _URL, _impersonated, arm_paid_rung, paid_reader, refused_page_with_robots
 
 
 def _probe_response() -> genai_types.GenerateContentResponse:
@@ -138,3 +161,120 @@ class TestGeminiVerifySpendsExactlyThreeCalls:
         gemini_verify.main()
 
         assert {c["model"] for c in client.models.calls} == {"candidate-9"}
+
+
+class TestFetchDiagnosticForcesThePaidRungOff:
+    """Column D runs the production ladder, whose last rung is the paid Gemini ``url_context``
+    read. ``main`` forces the flag off before probing, so even a laptop with the flag and key set
+    cannot spend. The trigger population is forced deliberately: the fetch layer returns a 403, the
+    ``blocked`` status the paid rung fires on, rather than the egress guard's ``ssrf_blocked``,
+    which the rung does not trigger on and which would make the assertion pass vacuously.
+    """
+
+    @pytest.fixture
+    def forced_403_ladder(self, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+        """Arm the paid rung, force the 403 population, and neutralise the intervening free rungs.
+
+        The reader spy is armed (flag on, key set, budget granted) so a call would be recorded; the
+        cited page answers 403 via ``refused_page_with_robots`` so the ladder reaches the paid gate;
+        and the impersonation, browser and Wayback rungs are stubbed to decline without a network
+        hop so the only rung whose gate is under test is ``url_context``. Returns the reader's
+        recorded calls.
+        """
+        reset_host_semaphores()
+        reset_robots_cache()
+        reset_impersonation_memo()
+
+        def _getaddrinfo(host: str, port: Any, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+            del host, port, args, kwargs
+            return [(0, 0, 0, "", ("8.8.8.8", 0))]
+
+        monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _getaddrinfo)
+
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader, budget_s=30.0)
+
+        session = refused_page_with_robots()
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        # The impersonated retry fires on the 403; make it decline without a network dial. The
+        # ``**kwargs`` swallows ``document_max_bytes`` whether or not the caller passes it yet.
+        async def _still_refused(url: str, **kwargs: Any) -> Any:
+            del kwargs
+            await asyncio.sleep(0)  # a real yield point, so the stub schedules like the transport
+            return _impersonated(403, url=url)
+
+        monkeypatch.setattr(resolution_source, "fetch_impersonated", _still_refused)
+
+        async def _no_browser(*args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            await asyncio.sleep(0)  # the browser rung's declined signal, scheduled like the render
+
+        monkeypatch.setattr(resolution_source, "render_page", _no_browser)
+        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", frozenset())
+        return calls
+
+    async def test_the_forced_population_would_otherwise_reach_the_paid_reader(
+        self, forced_403_ladder: list[dict[str, Any]]
+    ) -> None:
+        """The control: with the flag left on, the 403 population reaches the paid reader, so the
+        guard test below is not passing vacuously on a population that never triggers the rung."""
+        result = await fetch_diagnostic.probe_ladder(_URL)
+
+        assert result.status == "success"
+        assert result.route == "url_context"
+        assert len(forced_403_ladder) == 1
+
+    async def test_main_forcing_the_flag_off_keeps_the_paid_reader_unspent(
+        self, forced_403_ladder: list[dict[str, Any]]
+    ) -> None:
+        """The guard: once ``main`` has forced the flag off, the same 403 population never spends,
+        because the rung declines on its flag before it looks for its key or its robots policy."""
+        fetch_diagnostic._disable_the_paid_rung()
+
+        assert os.environ[RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV] == "false"
+        result = await fetch_diagnostic.probe_ladder(_URL)
+
+        assert result.status == "blocked"
+        assert forced_403_ladder == []
+
+    async def test_main_runs_the_force_off_before_any_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The placement: ``main`` disables the paid rung before it opens a session or probes, so
+        the force-off cannot be raced by a probe that ran first."""
+        order: list[str] = []
+        monkeypatch.setenv(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV, "true")
+
+        def _record_force() -> None:
+            order.append("force")
+            os.environ[RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV] = "false"
+
+        monkeypatch.setattr(fetch_diagnostic, "_disable_the_paid_rung", _record_force)
+
+        class _NoSession:
+            async def __aenter__(self) -> _NoSession:
+                await asyncio.sleep(0)
+                order.append("session")
+                return self
+
+            async def __aexit__(self, *_exc: Any) -> None:
+                await asyncio.sleep(0)
+
+        monkeypatch.setattr(fetch_diagnostic, "_get_session", _NoSession)
+
+        async def _no_egress_ip(_session: Any) -> str:
+            await asyncio.sleep(0)
+            return "203.0.113.7"
+
+        async def _no_probes(_session: Any, _pacer: Any) -> list[Any]:
+            await asyncio.sleep(0)
+            order.append("probes")
+            return []
+
+        monkeypatch.setattr(fetch_diagnostic, "read_egress_ip", _no_egress_ip)
+        monkeypatch.setattr(fetch_diagnostic, "run_probes", _no_probes)
+
+        await fetch_diagnostic.main()
+
+        assert order[0] == "force"
+        assert order.index("force") < order.index("probes")
+        assert os.environ[RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV] == "false"
