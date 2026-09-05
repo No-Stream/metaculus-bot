@@ -2163,9 +2163,11 @@ async def _impersonate_rung(
     landing is re-vetted through :func:`_landing_refused`, and a refusal is a decline with no
     attempt, the same helper :func:`_rendered_rung` runs. The rung's ATTEMPT stays keyed on the
     cited ``url``, which is what the escalation line names. The per-run memo
-    (``impersonated_fetch.impersonation_refused``, keyed by HOST) records ``impersonate_host_refused``: a host
-    that answered the impersonated client with a block status is not going to answer the next
-    cited URL on it differently in the same run. The memo is process-global and shared with
+    (``impersonated_fetch.impersonation_refused``, keyed by the HOST that answered a block plus the
+    exact URL dialed to reach it) records ``impersonate_host_refused``: a host that answered the
+    impersonated client with a block status is not going to answer the next cited URL on it
+    differently in the same run, and a chain that ended in one is not walked twice, while a host
+    that merely redirected into the block keeps its other URLs. The memo is process-global and shared with
     gap-fill v2, whose ``fetch`` and ``read_document`` ladders write it too, so the earlier
     refusal it records may have been a v2 fetch of a URL no question ever cited. Then the wall
     budget, through :meth:`FetchContext.claim_rung_budget` with the meta-refresh hop's floor: one
@@ -2223,8 +2225,9 @@ async def _impersonate_rung(
         outcome = _NON_OK_FETCH_STATUS.get(response.status, "error")
         # The memo write is the transport's rule (`IMPERSONATE_BLOCK_STATUSES`: a 404 says the path
         # is gone, which says nothing about the host's view of our fingerprint), keyed on the host
-        # dialed AND the host that answered: the impersonated client follows redirects itself, so
-        # the block can come from a later hop's netloc, and that is the host that refused us.
+        # that ANSWERED plus the exact URL dialed: the impersonated client follows redirects itself,
+        # so the block can come from a later hop's netloc, and that is the host that refused us,
+        # while the dialed host merely redirected and keeps its other URLs.
         impersonated_fetch.note_refusal_if_block_shaped(
             dialed_url=retry_url, answered_url=response.url, status=response.status
         )

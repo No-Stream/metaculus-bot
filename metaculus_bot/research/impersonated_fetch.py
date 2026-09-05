@@ -300,7 +300,7 @@ class ImpersonateBudgetExhausted(ImpersonateDeclined):
 # The memo
 # ---------------------------------------------------------------------------
 
-# Hosts whose edge answered our impersonated client with a block status this run, keyed by
+# Hosts whose edge ANSWERED our impersonated client with a block status this run, keyed by
 # NETLOC (host and port, lower-cased): what was learned is the edge's policy toward our
 # fingerprint from this address, a property of the host, so the next cited URL on it is not
 # going to be answered differently. Written only for a block-shaped answer, through
@@ -309,6 +309,10 @@ class ImpersonateBudgetExhausted(ImpersonateDeclined):
 # switches the host off. Unscoped, unlike the render memos, because the fact is identical for
 # both callers, so gap-fill v2 saves a request on a host Tier-1 already probed.
 _REFUSED_HOSTS: set[str] = set()
+# The exact URLs DIALED whose redirect chain ended in a block-shaped answer from some other host.
+# Keyed by the full URL, not the netloc: the dialed host merely redirected and never refused us,
+# so its other URLs stay dialable, while this one chain is not walked again this run.
+_REFUSED_URLS: set[str] = set()
 
 
 def _memo_key(url: str) -> str:
@@ -316,8 +320,8 @@ def _memo_key(url: str) -> str:
 
 
 def impersonation_refused(url: str) -> bool:
-    """Whether a host on ``url`` already refused our impersonated client this run."""
-    return _memo_key(url) in _REFUSED_HOSTS
+    """Whether ``url``'s host, or ``url`` itself, already refused our impersonated client this run."""
+    return _memo_key(url) in _REFUSED_HOSTS or url in _REFUSED_URLS
 
 
 def note_impersonation_refused(url: str) -> None:
@@ -326,28 +330,32 @@ def note_impersonation_refused(url: str) -> None:
 
 
 def reset_impersonation_memo() -> None:
-    """Forget every refused host. For tests: the memo outlives one provider call by design."""
+    """Forget every refused host and URL. For tests: the memo outlives one provider call by design."""
     _REFUSED_HOSTS.clear()
+    _REFUSED_URLS.clear()
 
 
 def note_refusal_if_block_shaped(*, dialed_url: str, answered_url: str, status: int) -> bool:
-    """Memoise the hosts behind a block-shaped impersonated answer; True when the memo was written.
+    """Memoise a block-shaped impersonated answer; True when the memo was written.
 
     The one memo-write rule for both callers. ``answered_url`` is the hop that produced
     ``status`` (:attr:`ImpersonatedResponse.url`) and ``dialed_url`` the hop the caller asked
     for; they differ when the impersonated client was redirected and the block came from a later
-    hop. BOTH netlocs are memoised then: the answering host because it is the one whose edge
-    refused our fingerprint, and the dialed host so the same chain is not walked again this run
-    for the next cited URL on it. Memoising the dialed host alone, as the first version did,
-    banned a netloc that never refused us and left the refusing one earning a full dial per URL.
+    hop. The ANSWERING host is memoised as a host, because its edge is the one that refused our
+    fingerprint and will refuse the next URL on it the same way. The DIALED URL is memoised as
+    that one URL, so the same chain is not walked again this run; its host is not, because a host
+    that merely redirected never refused us. Memoising the dialed host alone, as the first version
+    did, banned a netloc that never refused us and left the refusing one earning a full dial per
+    URL; memoising both hosts, as the second did, switched off a recoverable host (www.bls.gov
+    redirecting one path to a refusing sibling) for every other URL cited on it.
     """
     if status not in IMPERSONATE_BLOCK_STATUSES:
         return False
     answered_netloc = urlparse(answered_url).netloc
     dialed_netloc = urlparse(dialed_url).netloc
     note_impersonation_refused(answered_url)
-    note_impersonation_refused(dialed_url)
-    via = f", reached from {dialed_netloc}" if _memo_key(dialed_url) != _memo_key(answered_url) else ""
+    _REFUSED_URLS.add(dialed_url)
+    via = f", reached by redirect from {dialed_netloc}" if _memo_key(dialed_url) != _memo_key(answered_url) else ""
     logger.info(
         f"impersonated client answered {status} by {answered_netloc}{via}; no further impersonated dial "
         "of that host this run"

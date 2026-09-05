@@ -223,9 +223,10 @@ FetchStatusReason = Literal[
 #   us; a later-hop failure is a redirect target the direct fetch never resolved, so that reading
 #   does not apply to it.
 # `impersonate_host_refused`: the impersonated retry skipped because an earlier impersonated fetch
-#   of the same host this run already answered with a block status, by this fetcher or by gap-fill
-#   v2 (the memo is process-global and shared, keyed by host, so the earlier fetch may have been a
-#   v2 `fetch` or `read_document` of a URL no question cited). The memo doing its job rather than a
+#   this run already answered with a block status from the same host, or dialed this exact URL into
+#   one, by this fetcher or by gap-fill v2 (the memo is process-global and shared, keyed by the
+#   answering host plus the dialed URL, so the earlier fetch may have been a v2 `fetch` or
+#   `read_document` of a URL no question cited). The memo doing its job rather than a
 #   failure, the same distinction `rendered_no_text` draws for the browser; folded into the fired
 #   count it would read as a host refusing us twice.
 RungSkipReason = Literal[

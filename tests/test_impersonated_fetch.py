@@ -322,16 +322,20 @@ class TestPolicy:
         monkeypatch.setenv("RESOLUTION_SOURCE_IMPERSONATE_ENABLED", "true")
         assert impersonation_enabled() is True
 
-    def test_a_block_shaped_answer_memoises_both_netlocs(self) -> None:
-        """The host that ANSWERED the block is memoised, and the host that was DIALED, so a
-        redirect-hop block bans the refusing host and does not re-walk the same chain this run."""
+    def test_a_block_shaped_answer_memoises_the_answering_host_and_the_dialed_url(self) -> None:
+        """The host that ANSWERED the block is memoised as a host, so every URL on it is skipped;
+        the URL that was DIALED is memoised as that one URL, so the same chain is not walked again.
+        The dialed HOST stays dialable: a host that merely redirected never refused us, and
+        banning it (as the first version did) switched off a recoverable host for every other
+        URL cited on it when one of its paths redirected to a refusing sibling."""
         wrote = note_refusal_if_block_shaped(
             dialed_url="https://first.example.com/x", answered_url="https://final.example.com/y", status=403
         )
 
         assert wrote is True
         assert impersonation_refused("https://final.example.com/z")
-        assert impersonation_refused("https://first.example.com/w")
+        assert impersonation_refused("https://first.example.com/x")
+        assert not impersonation_refused("https://first.example.com/w")
         assert not impersonation_refused("https://elsewhere.example.com/")
 
     @pytest.mark.parametrize("status", sorted(IMPERSONATE_BLOCK_STATUSES))
@@ -1456,6 +1460,15 @@ class TestMemo:
         reset_impersonation_memo()
 
         assert not impersonation_refused("https://www.bls.gov/wsp/")
+
+    def test_reset_clears_the_dialed_url_memo_too(self) -> None:
+        note_refusal_if_block_shaped(
+            dialed_url="https://www.bls.gov/wsp/", answered_url="https://edge.example.net/denied", status=403
+        )
+        reset_impersonation_memo()
+
+        assert not impersonation_refused("https://www.bls.gov/wsp/")
+        assert not impersonation_refused("https://edge.example.net/other")
 
     async def test_the_transport_never_writes_the_memo_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Only the caller knows whether an answer was block-shaped; a 403 through the transport

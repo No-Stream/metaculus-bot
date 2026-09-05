@@ -1023,9 +1023,11 @@ status (`IMPERSONATE_BLOCK_STATUSES`: the three `blocked` rows of the status tab
 429, plus 401 and 503, which the fetch line still records as `error` because the status table is
 a telemetry contract and the memo is a policy; the memo is process-global and shared with
 gap-fill v2, which dials the same transport from both of its free ladders, the `fetch` tool's
-and `read_document`'s local acquisition; the transport writes it for the host dialed AND the
-host that answered, since the impersonated client follows redirects itself and the block can
-come from a later hop), and behind a kill
+and `read_document`'s local acquisition; the transport writes the host memo for the host that
+ANSWERED, since the impersonated client follows redirects itself and the block can come from a
+later hop, and a separate per-URL memo for the exact URL dialed so that chain is not walked
+again, while the dialed host itself stays dialable because a host that merely redirected never
+refused us), and behind a kill
 switch that is ON by default in code, `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, unlike the paid
 rung's default-off. The trigger set, the block-shaped set the memo keys on and the kill switch
 all live on the transport (`IMPERSONATE_TRIGGER_STATUSES`, `IMPERSONATE_BLOCK_STATUSES`,

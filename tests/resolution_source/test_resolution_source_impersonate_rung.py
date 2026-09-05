@@ -291,11 +291,16 @@ class TestImpersonateRungStillRefused:
         # A skip emits no escalation line: the memo hit rides the counts.
         assert _escalation_lines(caplog) == []
 
-    async def test_a_block_answered_by_a_redirect_target_memoizes_both_hosts(self, monkeypatch, caplog):
+    async def test_a_block_answered_by_a_redirect_target_memoizes_the_answering_host_and_the_dialed_url(
+        self, monkeypatch, caplog
+    ):
         """The transport follows redirects itself, so the block can come from a later hop's netloc.
         Memoizing only the host DIALED would ban a host that never refused us and keep dialing the
-        one that did, so the rung hands the transport both URLs and the memo covers both; the log
-        line names the host that answered."""
+        one that did; memoizing BOTH hosts (the first version) switched off a recoverable host for
+        every other URL cited on it when one path redirected to a refusing sibling. So the rung hands
+        the transport both URLs, the memo bans the answering host and the one dialed URL, and the
+        dialed host's other URLs still earn their own dial; the log line names the host that
+        answered."""
         answered = "https://edge.example.net/denied"
         _transport(monkeypatch, _impersonated(403, body=b"denied", url=answered))
 
@@ -306,6 +311,7 @@ class TestImpersonateRungStillRefused:
         assert [a.outcome for a in result.rung_attempts] == ["blocked"]
         assert impersonation_refused(answered) is True
         assert impersonation_refused(_URL) is True
+        assert impersonation_refused(_SECOND_URL) is False
         assert any("answered 403 by edge.example.net (blocked)" in message for message in caplog.messages)
 
     @pytest.mark.parametrize(("status", "outcome"), [(404, "not_found"), (410, "not_found"), (500, "error")])

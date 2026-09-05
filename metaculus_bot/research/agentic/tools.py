@@ -462,8 +462,8 @@ async def _try_impersonated_fetch(url: str) -> PlainFetchResult | None:
     the next URL on it differently), every :class:`ImpersonateDeclined` (a host that will not pin,
     a refused hop, an oversized body, a transport failure), and a non-200 answer, which the
     transport's ``note_refusal_if_block_shaped`` memoizes when it is block-shaped, for the host
-    dialed and the host that answered. The direct ``blocked`` result then stands, byte for byte
-    what it was before the rung existed.
+    that answered and for the exact URL dialed. The direct ``blocked`` result then stands, byte
+    for byte what it was before the rung existed.
 
     ``url`` is the plain rung's ``url``, the last hop of its own guarded redirect loop, the same
     choice :func:`_try_rendered_fetch` documents; the trigger (a host's 403) is the caller's test,

@@ -3602,10 +3602,13 @@ class TestGapFillV2ImpersonatedRetry:
         assert impersonation_refused(self._URL) is True
 
     @pytest.mark.asyncio
-    async def test_a_block_answered_by_a_redirect_target_memoizes_both_hosts(self, monkeypatch) -> None:
+    async def test_a_block_answered_by_a_redirect_target_memoizes_the_answering_host_and_the_dialed_url(
+        self, monkeypatch
+    ) -> None:
         """The transport follows redirects itself, so the block can come from a later hop's netloc;
-        the memo is written for the host dialed and the host that answered, through the same
-        transport rule Tier 1 uses."""
+        through the same transport rule Tier 1 uses, the memo bans the host that answered and the
+        one URL that was dialed, and leaves the dialed host's other URLs dialable, since a host that
+        merely redirected never refused us."""
         answered = "https://edge.example.net/denied"
         self._transport(monkeypatch, self._response(403, url=answered))
 
@@ -3613,6 +3616,7 @@ class TestGapFillV2ImpersonatedRetry:
 
         assert impersonation_refused(answered) is True
         assert impersonation_refused(self._URL) is True
+        assert impersonation_refused(self._SECOND_URL) is False
 
     @pytest.mark.asyncio
     async def test_a_404_under_impersonation_declines_without_memoizing(self, monkeypatch) -> None:
