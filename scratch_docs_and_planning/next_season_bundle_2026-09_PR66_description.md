@@ -1331,7 +1331,7 @@ navigating mid-read raises, is classified as `render_timeout` instead of `render
 longer burns the once-per-run install warning; a failed-navigation landing writes the timed-out memo so
 a run does not relaunch Chromium for the same dead URL; the marker gained `same_publisher=true|false`
 so a benign hop inside the publisher's registrable domain is distinguishable from a hostile landing;
-and the fake browser context accepts only real keyword names. The full free gate on the merged tree, with these documentation edits in the working tree, is green: `make lint`, `make typecheck` at 0 errors, `make lint_imports` with 6 contracts kept, `make deps`, and `make test_fast` at 7,673 passed, 14 skipped, 33 deselected, exit 0 (`~/logs/gate19.log`). The code tip is df05c8c; the commit above it carries only this documentation and one docstring.
+and the fake browser context accepts only real keyword names. The full free gate on the merged tree, with these documentation edits in the working tree, is green: `make lint`, `make typecheck` at 0 errors, `make lint_imports` with 6 contracts kept, `make deps`, and `make test_fast` at 7,673 passed, 14 skipped, 33 deselected, exit 0 (`~/logs/gate19.log`). The code tip is df05c8c; the commits above it carry only this documentation and one docstring.
 PR CI on the pushed 1f2b504 (run 33917127083: lint, test, secret scan, audit) completed green at
 20:43 UTC on 2026-09-04; the commits after it carry the Codex triage's documentation, comments and
 tests,
