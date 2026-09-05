@@ -16,29 +16,29 @@ the memo write (:func:`note_impersonation_refused`): only the caller knows wheth
 was block-shaped, because a 403 through this transport is DATA (the fingerprint was not the
 problem), not a failure.
 
-The SSRF invariants are carried here rather than inherited. libcurl never touches aiohttp's
-connect-time ``FilteringResolver``, so every hop is pre-resolved through the repo's one vetting
-predicate (:func:`rendered_fetch.resolve_pinned_host`, which rejects the whole hostname if ANY
-resolved address is disallowed), pinned to that address with ``CURLOPT_RESOLVE`` so libcurl
-cannot resolve it again, and checked after the fact against the address libcurl reports it
-connected to. No automatic redirects: every hop is re-guarded through
+The SSRF invariants are carried here, because libcurl never touches aiohttp's connect-time
+``FilteringResolver``. Every hop is pre-resolved through the repo's one vetting predicate,
+:func:`rendered_fetch.resolve_pinned_host`, which rejects the whole hostname if ANY resolved
+address is disallowed. The hop is then pinned to that address with ``CURLOPT_RESOLVE``, so
+libcurl cannot resolve it again, and checked after the fact against the address libcurl
+reports it connected to. No automatic redirects: every hop is re-guarded through
 ``resolution_source._hop_refusal``, re-resolved and re-pinned, under the shared ``MAX_REDIRECTS``
 cap. A guard here fails SHUT: every refusal raises, and nothing from a refused response is
 returned.
 
-Two deliberate divergences from the aiohttp path. No ``BROWSER_HEADERS`` are sent: the
+Two deliberate divergences from the aiohttp path. No ``BROWSER_HEADERS`` are sent. The
 impersonation profile supplies Chrome's complete header set (``Accept``, ``Accept-Language``,
 ``Priority``, the ``Sec-Fetch-*`` family, the ``sec-ch-ua*`` client hints), and overriding it
 with the Safari-like set would present a Chrome TLS fingerprint under Safari headers, which is
-precisely the incoherence an edge scores. A consequence is that ``Accept-Encoding`` becomes the
-profile's ``gzip, deflate, br, zstd`` rather than the pinned ``gzip, deflate``; that is safe
-here because libcurl's bundled decoders decompress in process before the write callback, so
-the body cap counts DECOMPRESSED bytes exactly as ``read_body_capped`` does and the aiohttp
-path's ``Accept-Encoding`` measurement is undisturbed. And one short-lived ``AsyncSession`` is
-built per pinned hop, because ``curl_options`` (the only route to ``CURLOPT_RESOLVE``) is a
-constructor parameter, not a request parameter, so a pin cannot be set per request on a shared
-session without a race; a session is also bound to the first loop that drives it and spawns a
-polling task for its lifetime, so none is ever cached at module scope.
+precisely the incoherence an edge scores. One consequence is that ``Accept-Encoding`` becomes the
+profile's ``gzip, deflate, br, zstd`` instead of the pinned ``gzip, deflate``. That is safe here:
+libcurl's bundled decoders decompress in process before the write callback, so the body cap
+counts DECOMPRESSED bytes exactly as ``read_body_capped`` does, and the aiohttp path's
+``Accept-Encoding`` measurement is undisturbed. The second divergence is one short-lived
+``AsyncSession`` per pinned hop. ``curl_options``, the only route to ``CURLOPT_RESOLVE``, is a
+constructor parameter and not a request parameter, so a pin cannot be set per request on a
+shared session without a race. A session is also bound to the first loop that drives it and
+spawns a polling task for its lifetime, so none is ever cached at module scope.
 """
 
 from __future__ import annotations
