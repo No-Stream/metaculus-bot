@@ -25,8 +25,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import pytest
+from playwright.async_api import Browser, WebSocketRoute
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import WebSocketRoute
 
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -36,6 +36,7 @@ from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.resolution_source import FetchContext
 from scripts.telemetry.markers import MARKER_SPECS
 from tests.playwright_fakes import (
+    FakeBrowser,
     FakePage,
     FakeResponse,
     FakeWebSocketRoute,
@@ -912,6 +913,29 @@ class TestTheSharedPlaywrightFake:
                 assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
             with pytest.raises(TypeError):
                 signature.bind(None, 1008, "blocked")
+
+    async def test_the_context_double_takes_only_the_real_option_names(self, monkeypatch):
+        """A ``new_context(**kwargs)`` double accepted any keyword, so a misspelled context option
+        in the transport (``service_worker="block"``, which would silently stop blocking service
+        workers) kept every assertion green. The double now names its options, each checked here
+        against the real ``Browser.new_context`` signature, and records anything else apart, which
+        a render must leave empty."""
+        real = inspect.signature(Browser.new_context).parameters
+        named = [
+            name
+            for name, parameter in inspect.signature(FakeBrowser.new_context).parameters.items()
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        ]
+        assert named
+        for name in named:
+            assert real[name].kind is inspect.Parameter.KEYWORD_ONLY
+        page = FakePage([])
+
+        rendered = await _render(monkeypatch, page)
+
+        assert rendered is not None
+        assert page.unknown_context_kwargs == {}
+        assert page.context_kwargs["service_workers"] == "block"
 
 
 class TestDnsPinEligibility:
