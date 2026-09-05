@@ -26,18 +26,19 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
+from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
 
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import resolution_datawrapper, resolution_source
 from metaculus_bot.research.http_fetch import DatawrapperChartRef
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
+from metaculus_bot.research.resolution_body_text import _truncate_csv_middle, _truncate_with_marker
+from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from metaculus_bot.research.resolution_source import (
     _fetch_datawrapper_dataset,
-    _truncate_csv_middle,
-    _truncate_with_marker,
     fetch_resolution_sources,
     resolution_source_provider,
 )
@@ -62,7 +63,7 @@ def _fresh_last_modified() -> str:
 
 
 def _stale_last_modified() -> str:
-    bound = resolution_source.RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS
+    bound = resolution_datawrapper.RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS
     return _http_date(datetime.now(UTC) - timedelta(days=bound + 15))
 
 
@@ -364,7 +365,7 @@ class TestDatawrapperHop:
         assert results[1].status == "success"
 
     async def test_dataset_just_inside_bound_is_served(self, monkeypatch):
-        bound = resolution_source.RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS
+        bound = resolution_datawrapper.RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS
         recent = _http_date(datetime.now(UTC) - timedelta(days=bound - 1))
         session = FakeSession(
             {
@@ -401,7 +402,7 @@ class TestDatawrapperHop:
         assert "js_wall" in out  # the walled page is still reported as unreachable
 
     async def test_chart_cap_bounds_dataset_fetches(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS", 2)
+        monkeypatch.setattr(resolution_datawrapper, "RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS", 2)
         page = _tracker_page_html("Aaaa1", "Bbbb2", "Cccc3", "Dddd4")
         session = FakeSession(
             {
@@ -470,7 +471,7 @@ class TestDatawrapperHop:
     async def test_long_dataset_keeps_most_recent_rows(self, monkeypatch):
         # Datasets truncate against their OWN cap, not the page cap — the dataset
         # allowance is what keeps a chart's rows from evicting cited page text.
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS", 900)
+        monkeypatch.setattr(resolution_datawrapper, "RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS", 900)
         session = FakeSession(
             {
                 PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
@@ -615,6 +616,27 @@ class TestDatawrapperHopFailureModes:
     def _chart() -> DatawrapperChartRef:
         return DatawrapperChartRef(chart_id=CHART_ID, title="Tracker chart")
 
+    async def test_fetch_resolves_dataset_outcome_on_policy_module(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        expected = FetchResult(
+            url=DATASET_URL,
+            status="success",
+            text="intercepted",
+            http_status=200,
+            content_type="text/csv",
+            chart_id=CHART_ID,
+            chart_title="Tracker chart",
+            parent_url=PAGE_URL,
+        )
+        outcome = AsyncMock(return_value=expected)
+        monkeypatch.setattr(resolution_datawrapper, "_datawrapper_dataset_outcome", outcome)
+        response = FakeResponse(200, body=b"ignored", content_type="text/csv")
+        session = FakeSession({DATASET_URL: response})
+
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+
+        assert result is expected
+        outcome.assert_awaited_once_with(response, self._chart(), PAGE_URL, DATASET_URL)
+
     async def test_cdn_host_resolving_private_is_ssrf_blocked_before_any_request(self, monkeypatch):
         """The hop constructs its own URL, so it gets the SAME preflight as a cited
         page — no CDN allowlist exemption. A poisoned/rebinding answer for
@@ -680,7 +702,7 @@ class TestDatawrapperHopFailureModes:
         """The body cap fires BEFORE the freshness check, so a huge CSV is an
         `error` (nothing readable) rather than a truncated half-dataset presented
         as the live series."""
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_MAX_RESPONSE_BYTES", 100)
+        monkeypatch.setattr(resolution_datawrapper, "RESOLUTION_SOURCE_MAX_RESPONSE_BYTES", 100)
         session = FakeSession(
             {DATASET_URL: _csv_response(_csv_body(200), last_modified=_fresh_last_modified())},
         )
@@ -888,7 +910,7 @@ class TestDatasetMarkupStripping:
         """The measured claim, pinned: at the live run's actual 2,853-char budget, 9 rows survived
         with tags against 30 with them stripped. Here the same comparison runs against the
         untouched truncator, so a regression that stopped stripping shows up as fewer rows."""
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS", 3_000)
+        monkeypatch.setattr(resolution_datawrapper, "RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS", 3_000)
         tagged = _poll_table_csv(60, tagged=True)
         session = FakeSession({DATASET_URL: _csv_response(tagged, last_modified=_fresh_last_modified())})
 

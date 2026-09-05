@@ -154,7 +154,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
@@ -170,14 +170,10 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_READER_MODEL,
     GAP_FILL_V2_READER_THINKING_LEVEL,
     GOOGLE_API_KEY_ENV,
-    RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE,
     RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS,
     RESOLUTION_SOURCE_CONTENT_SHARE_MIN,
     RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S,
-    RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS,
-    RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
     RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S,
-    RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS,
     RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S,
     RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS,
     RESOLUTION_SOURCE_ENABLED_ENV,
@@ -205,7 +201,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS,
     env_flag_enabled,
 )
-from metaculus_bot.research import derived_api, impersonated_fetch, resolution_presentation
+from metaculus_bot.research import derived_api, impersonated_fetch, resolution_datawrapper, resolution_presentation
 from metaculus_bot.research.document_text import (
     DocumentDigest,
     PdfText,
@@ -226,7 +222,6 @@ from metaculus_bot.research.http_fetch import (
     extract_datawrapper_charts,
     host_semaphores,
     meta_refresh_target,
-    parse_http_last_modified,
     pdf_parse_semaphore,
     read_body_capped,
     rewrite_aria_tables,
@@ -260,7 +255,6 @@ from metaculus_bot.research.rendered_fetch import (
     rendered_to_nothing,
 )
 from metaculus_bot.research.resolution_body_text import (
-    _truncate_csv_middle,
     _truncate_with_marker,
     strip_html_tags,
 )
@@ -3016,157 +3010,6 @@ async def _fetch_direct(
     )
 
 
-def _datawrapper_hop_status(status: int) -> FetchStatus:
-    """Map the CDN's HTTP status onto a FetchStatus (200 -> ``success``)."""
-    return "success" if status == 200 else _NON_OK_FETCH_STATUS.get(status, "error")
-
-
-def _datawrapper_last_modified(resp: Any) -> datetime | None:
-    """The dataset's parsed ``Last-Modified``, or None when absent or unparseable."""
-    raw = resp.headers.get("Last-Modified")
-    return parse_http_last_modified(raw) if raw else None
-
-
-def _datawrapper_freshness_failure(last_modified: datetime | None) -> str | None:
-    """Why ``last_modified`` fails the freshness guard, or None when it passes.
-
-    Two-sided, deliberately. The lead this stamp authorizes asserts a
-    publication date, and a FUTURE one means a broken clock or a misparse on
-    one side — so it is unusable as a freshness claim, not maximally fresh.
-    The old one-sided check let any future date through as the freshest
-    possible dataset.
-    """
-    if last_modified is None:
-        return "no parseable Last-Modified"
-    now = datetime.now(UTC)
-    if last_modified - now > RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE:
-        return f"published {last_modified.isoformat()}, which is in the FUTURE"
-    if now - last_modified > timedelta(days=RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS):
-        return (
-            f"published {last_modified.isoformat()}, age {(now - last_modified).days}d "
-            f"> {RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS}d bound"
-        )
-    return None
-
-
-def _datawrapper_success_text(
-    chart: DatawrapperChartRef, parent_url: str, url: str, *, dataset_text: str, published: datetime
-) -> str:
-    """The liveness lead plus the budgeted CSV rows."""
-    # Every claim in this lead is now checked: the timestamp by the
-    # freshness guard above, and "dataset" itself by the row-shape
-    # check — an authoritative `published <ts>` stamp over an empty or
-    # soft-404 body was the same defect class as a manufactured price.
-    title_part = f" ({chart.title!r})" if chart.title else ""
-    lead = (
-        f'Live "Get the data" dataset for Datawrapper chart {chart.chart_id}{title_part} '
-        f"embedded in {parent_url}. Dataset published {published.isoformat()}."
-    )
-    # The DATASET cap, not the page cap: datasets budget against their own
-    # section allowance so a chart's rows can never evict cited page text.
-    # Tags are stripped BEFORE truncation so the budget buys rows, not markup.
-    csv_budget = RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS - len(lead) - 2
-    return f"{lead}\n\n{_truncate_csv_middle(dataset_text, csv_budget, url)}"
-
-
-async def _datawrapper_dataset_outcome(resp: Any, chart: DatawrapperChartRef, parent_url: str, url: str) -> FetchResult:
-    """Turn the CDN response into a FetchResult, serving the dataset live or not at all."""
-    status = resp.status
-    content_type = (resp.headers.get("Content-Type") or "").lower()
-    hop_status = _datawrapper_hop_status(status)
-    if hop_status != "success":
-        return FetchResult(
-            url=url,
-            status=hop_status,
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-            chart_id=chart.chart_id,
-            chart_title=chart.title,
-            parent_url=parent_url,
-            failure_class=http_failure_class(status),
-            server=server_header_token(resp.headers.get("Server")),
-        )
-
-    body = await read_body_capped(
-        resp,
-        max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
-        label=f"resolution_source datawrapper {chart.chart_id}",
-    )
-    if body is None:
-        return FetchResult(
-            url=url,
-            status="error",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-            chart_id=chart.chart_id,
-            chart_title=chart.title,
-            parent_url=parent_url,
-        )
-
-    # Content BEFORE freshness, deliberately: an empty or non-CSV CDN
-    # body is a failed hop whatever its Last-Modified says, and
-    # `stale_data` is reported to diagnostics as the benign `none`
-    # (the freshness guard working as designed), which would hide it.
-    # Row-shape is decided on the PRE-strip text: looks_like_csv_rows
-    # rejects markup by its leading `<`, and stripping first would remove
-    # exactly the allow-listed fragment tags (`<p>`, `<div>`) a CDN
-    # soft-404 opens with, letting an error page carry the authoritative
-    # "Dataset published" lead if its prose holds a comma.
-    dataset_text, undecodable_ratio = decode_text_body(body, content_type)
-    vacuous = vacuous_body_status(dataset_text, undecodable_ratio, require_csv_rows=True)
-    dataset_text = strip_html_tags(dataset_text).strip()
-    if vacuous is not None:
-        logger.warning(
-            f"resolution_source datawrapper hop {chart.chart_id}: dataset body is not a usable "
-            f"dataset ({vacuous}: {len(body)} bytes, undecodable={undecodable_ratio:.2f}) — "
-            f"withheld rather than stamped live"
-        )
-        return FetchResult(
-            url=url,
-            status=vacuous,
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-            chart_id=chart.chart_id,
-            chart_title=chart.title,
-            parent_url=parent_url,
-        )
-
-    last_modified = _datawrapper_last_modified(resp)
-    freshness_failure = _datawrapper_freshness_failure(last_modified)
-    if freshness_failure is not None:
-        logger.warning(
-            f"resolution_source datawrapper hop {chart.chart_id}: dataset failed the "
-            f"freshness guard ({freshness_failure}) — withheld, not served as live"
-        )
-        return FetchResult(
-            url=url,
-            status="stale_data",
-            text="",
-            http_status=status,
-            content_type=content_type or None,
-            chart_id=chart.chart_id,
-            chart_title=chart.title,
-            parent_url=parent_url,
-            data_last_modified=last_modified.isoformat() if last_modified else None,
-        )
-
-    assert last_modified is not None  # a passing freshness guard implies a parsed timestamp
-    return FetchResult(
-        url=url,
-        status="success",
-        text=_datawrapper_success_text(chart, parent_url, url, dataset_text=dataset_text, published=last_modified),
-        http_status=status,
-        content_type=content_type or None,
-        chart_id=chart.chart_id,
-        chart_title=chart.title,
-        parent_url=parent_url,
-        data_last_modified=last_modified.isoformat(),
-    )
-
-
 async def _fetch_datawrapper_dataset(
     session: Any,
     chart: DatawrapperChartRef,
@@ -3211,7 +3054,7 @@ async def _fetch_datawrapper_dataset(
     async with _sem_for_host(host_sems, url):
         try:
             async with session.get(url, allow_redirects=False) as resp:
-                return await _datawrapper_dataset_outcome(resp, chart, parent_url, url)
+                return await resolution_datawrapper._datawrapper_dataset_outcome(resp, chart, parent_url, url)
         except (TimeoutError, aiohttp.ClientError) as e:
             logger.info(f"resolution_source datawrapper hop {chart.chart_id} error: {type(e).__name__}: {e}")
             return FetchResult(
@@ -3226,44 +3069,6 @@ async def _fetch_datawrapper_dataset(
                 failure_class=_network_failure_class(e),
                 exc=type(e).__name__,
             )
-
-
-def _select_datawrapper_charts(page_results: list[FetchResult]) -> list[tuple[int, DatawrapperChartRef]]:
-    """Pick the charts to hop to, as ``(parent_index, chart)`` pairs.
-
-    Page order first, then document order within a page (tracker pages put the
-    hero/resolving chart first), deduped by chart id across pages, capped
-    globally at ``RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS``.
-    """
-    picks: list[tuple[int, DatawrapperChartRef]] = []
-    seen: set[str] = set()
-    for idx, r in enumerate(page_results):
-        for chart in r.datawrapper_charts:
-            if chart.chart_id in seen:
-                continue
-            seen.add(chart.chart_id)
-            picks.append((idx, chart))
-            if len(picks) >= RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS:
-                return picks
-    return picks
-
-
-def _interleave_dataset_results(
-    page_results: list[FetchResult],
-    picks: list[tuple[int, DatawrapperChartRef]],
-    dataset_results: list[FetchResult],
-) -> list[FetchResult]:
-    """Place each dataset result directly after its parent page's result, so
-    the rendered section (and the total-budget trimming order) keeps a chart's
-    data adjacent to the page that embeds it."""
-    by_parent: dict[int, list[FetchResult]] = {}
-    for (idx, _chart), ds in zip(picks, dataset_results, strict=False):
-        by_parent.setdefault(idx, []).append(ds)
-    merged: list[FetchResult] = []
-    for idx, r in enumerate(page_results):
-        merged.append(r)
-        merged.extend(by_parent.get(idx, []))
-    return merged
 
 
 async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_path: bool = False) -> list[FetchResult]:
@@ -3334,7 +3139,7 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_pat
             tasks.extend(page_tasks)
             page_results = list(await asyncio.gather(*page_tasks, return_exceptions=False))
 
-            picks = _select_datawrapper_charts(page_results)
+            picks = resolution_datawrapper._select_datawrapper_charts(page_results)
             if not picks:
                 return page_results
             # The hop is a SECOND network phase inside the provider's single 45s wall,
@@ -3382,7 +3187,7 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_pat
                     len(page_results),
                 )
                 return page_results
-            return _interleave_dataset_results(page_results, picks, dataset_results)
+            return resolution_datawrapper._interleave_dataset_results(page_results, picks, dataset_results)
         finally:
             # Whether we exit normally or via cancellation, cancel any still-
             # running task and let them settle before the session closes.
