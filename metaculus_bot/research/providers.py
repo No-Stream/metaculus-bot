@@ -60,6 +60,13 @@ ResearchCallable = Callable[[MetaculusQuestion], Awaitable[str]]
 logger = logging.getLogger(__name__)
 
 
+class _OmittedPerplexityApiKey:
+    pass
+
+
+_OMITTED_API_KEY = _OmittedPerplexityApiKey()
+
+
 # ---------------------------------------------------------------------------
 # Concrete provider helpers
 # ---------------------------------------------------------------------------
@@ -367,23 +374,32 @@ def _format_asknews_dual_sections(
     return formatted_articles
 
 
+async def _invoke_exa_research(
+    default_llm: GeneralLlm,
+    prompt: str,
+    *,
+    include_works_cited_list: bool | None = None,
+    use_brackets_around_citations: bool | None = None,
+) -> str:
+    citation_kwargs: dict[str, bool] = {}
+    if include_works_cited_list is not None:
+        citation_kwargs["include_works_cited_list"] = include_works_cited_list
+    if use_brackets_around_citations is not None:
+        citation_kwargs["use_brackets_around_citations"] = use_brackets_around_citations
+    searcher = SmartSearcher(
+        # temperature ignored when model is a preconfigured GeneralLlm; None
+        # keeps litellm from applying a sampling param on the fallback str path.
+        model=default_llm,
+        temperature=None,
+        num_searches_to_run=2,
+        num_sites_per_search=10,
+        **citation_kwargs,
+    )
+    return await searcher.invoke(prompt)
+
+
 def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
     async def _fetch(question: MetaculusQuestion) -> str:
-        searcher = SmartSearcher(
-            # temperature ignored when model is a preconfigured GeneralLlm; None
-            # keeps litellm from applying a sampling param on the fallback str path.
-            model=default_llm,
-            temperature=None,
-            num_searches_to_run=2,
-            num_sites_per_search=10,
-            # 0.2.92 gained SmartSearcher citation controls (include_works_cited_list,
-            # use_brackets_around_citations), both defaulting to False. Pin them
-            # False explicitly so the research-text shape stays as it is today — no
-            # appended works-cited footer, no inline [n] brackets — even if a future
-            # upstream default flips them on.
-            include_works_cited_list=False,
-            use_brackets_around_citations=False,
-        )
         prompt = (
             "You are an assistant to a superforecaster. The superforecaster will give"
             " you a question they intend to forecast on. To be a great assistant, you generate"
@@ -391,37 +407,45 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
             " would resolve Yes or No based on current information. You do not produce forecasts yourself."
             f"\n\nThe question is: {question.question_text}"
         )
-        return await searcher.invoke(prompt)
+        # Pin the current citation shape against a future framework-default flip.
+        return await _invoke_exa_research(
+            default_llm,
+            prompt,
+            include_works_cited_list=False,
+            use_brackets_around_citations=False,
+        )
 
     return _fetch
 
 
+async def _invoke_perplexity_research(
+    prompt: str,
+    *,
+    use_open_router: bool,
+    api_key: str | _OmittedPerplexityApiKey | None = _OMITTED_API_KEY,
+) -> str:
+    model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
+    metadata = llm_call_metadata("perplexity_research", plain_llm_key_alias(model_name))
+    model_kwargs: dict[str, Any] = {
+        "model": model_name,
+        # Pin provider-default sampling and leave the elapsed-gated wrapper below
+        # as the sole retry owner.
+        "temperature": None,
+        "allowed_tries": 1,
+        "metadata": metadata,
+    }
+    if api_key is not _OMITTED_API_KEY:
+        model_kwargs["api_key"] = api_key
+    model = GeneralLlm(**model_kwargs)
+    return await invoke_with_transient_retry(
+        lambda: model.invoke(prompt),
+        wall_timeout=PERPLEXITY_WALL_TIMEOUT,
+        label="perplexity_research",
+    )
+
+
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
     async def _fetch(question: MetaculusQuestion) -> str:
-        model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
-        # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
-        # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
-        # kept to pin provider-default sampling against a future default flip. No top_p.
-        # allowed_tries=1 hands the retry budget to the gated wrapper below; left
-        # unpinned it inherited forecasting-tools' default of 2 with an un-gated
-        # random.uniform(5, 10) tenacity sleep.
-        #
-        # No explicit api_key, unlike the near-identical builder in
-        # ``ResearchOrchestrator._call_perplexity`` which passes
-        # ``get_openrouter_api_key(model_name)``. Equivalent TODAY and only by
-        # coincidence: perplexity is not in ``DONATED_KEY_PROVIDERS``, so that helper
-        # returns ``OPENROUTER_API_KEY``, which litellm also reads straight from the
-        # environment. It stops being equivalent the moment perplexity becomes
-        # donated-key-eligible, at which point this call site silently keeps billing
-        # the personal key while the orchestrator's switches. The real fix is to
-        # collapse the two builders (forge flagged the duplication); until then, don't
-        # "clean up" this asymmetry by deleting the orchestrator's api_key argument.
-        model = GeneralLlm(
-            model=model_name,
-            temperature=None,
-            allowed_tries=1,
-            metadata=llm_call_metadata("perplexity_research", plain_llm_key_alias(model_name)),
-        )
         # Exclude prediction markets research when benchmarking to avoid data leakage.
         # The same narrowed policy `web_research_prompt` carries, interpolated rather than
         # restated: this provider is the PRIMARY whenever AskNews credentials are absent, so a
@@ -438,11 +462,8 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
             "Do not produce forecasts yourself. Provide data for the superforecaster.\n\n"
             f"Question:\n{question.question_text}"
         )
-        return await invoke_with_transient_retry(
-            lambda: model.invoke(prompt),
-            wall_timeout=PERPLEXITY_WALL_TIMEOUT,
-            label="perplexity_research",
-        )
+        # Omitting api_key preserves LiteLLM's provider-specific environment lookup.
+        return await _invoke_perplexity_research(prompt, use_open_router=use_open_router)
 
     return _fetch
 
