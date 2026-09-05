@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 import certifi
 import curl_cffi.requests.impersonate
 import pytest
-from curl_cffi import CurlOpt
+from curl_cffi import CurlError, CurlOpt
 from curl_cffi.const import CurlECode
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from curl_cffi.requests import Headers, Response
@@ -1072,7 +1072,7 @@ class TestFailureMapping:
             (curl_exceptions.DNSError("resolve", CurlECode.COULDNT_RESOLVE_HOST), "dns"),
             (curl_exceptions.IncompleteRead("partial", CurlECode.PARTIAL_FILE), "decode"),
             (curl_exceptions.ConnectionError("refused", CurlECode.COULDNT_CONNECT), "connection"),
-            (curl_exceptions.CurlError("bad setopt", CurlECode.UNKNOWN_OPTION), "connection"),
+            (CurlError("bad setopt", CurlECode.UNKNOWN_OPTION), "connection"),
         ],
     )
     async def test_a_code_carrying_failure_maps_to_a_failure_class(
