@@ -1998,9 +1998,10 @@ async def _render_or_record_the_skip(
         return None
     except RenderOffHost:
         # Chromium's main frame landed on a host other than the pinned one, a server-side redirect
-        # the route guard never sees, and the transport refused the DOM unread. Also a fact about
-        # the page, and nothing from the render exists to publish. The transport already logged
-        # both hosts.
+        # the route guard never sees, so the transport refused the DOM unread on its pre-read check,
+        # or discarded it unpublished when the navigation committed during the read itself. Also a
+        # fact about the page, and nothing from that render is published either way. The transport
+        # already logged both hosts.
         attempt.skipped_reason = "render_off_host"
         return None
     if page is None:
@@ -2066,9 +2067,10 @@ async def _rendered_rung(
     fact about the page and its own skip, ``render_dom_too_large`` (the transport raises
     :class:`RenderDomOverCeiling` for it), so neither inflates ``renderer_unavailable``. A main
     frame that landed on a host other than the one the browser's DNS pin covers is refused by the
-    transport before its DOM is read (:class:`RenderOffHost`), and is its own skip too,
-    ``render_off_host``: a server-side redirect the route guard never sees, so a fact about the
-    page rather than the install, and nothing from the render exists to publish.
+    transport unread on its pre-read check, or discarded unpublished when the navigation commits
+    during the read itself (:class:`RenderOffHost`), and is its own skip too, ``render_off_host``:
+    a server-side redirect the route guard never sees, so a fact about the page rather than the
+    install, and nothing from that render is published either way.
     When the DOM STILL carries nothing, the JSON the page fetched for itself is the last free
     route (:func:`_derived_api_from_harvest`) — a JavaScript dashboard's numbers arrive over XHR
     and are in its HTML at no wait condition. Only once that fails too is the URL memoized

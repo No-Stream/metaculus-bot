@@ -372,12 +372,13 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     transport CUT OFF (its DOM-read cap fired because the page kept navigating) raises
     ``TimeoutError`` instead, a rendered DOM over ``RENDERED_DOM_MAX_CHARS`` raises
     ``RenderDomOverCeiling``, and a main frame that landed on a host other than the pinned one
-    raises ``RenderOffHost`` with the DOM never read, so the Tier-1 rung can record each under its
-    own reason; this ladder's callers only know ``None``, so all three are folded back into that
-    signal here, and nothing from an off-host render reaches the driver. The transport memoises
-    the cut-off itself and re-raises it on the next fetch of the same URL, so a second fetch of
-    the same hostile page in this run does not pay for it again; the oversized DOM and the
-    off-host landing are memoised by nobody, since the page did render. The ceilings this
+    raises ``RenderOffHost`` with its DOM refused unread on the transport's pre-read check, or
+    discarded unpublished when the navigation commits during the read itself, so the Tier-1 rung
+    can record each under its own reason; this ladder's callers only know ``None``, so all three
+    are folded back into that signal here, and nothing from an off-host render reaches the driver.
+    The transport memoises the cut-off itself and re-raises it on the next fetch of the same URL,
+    so a second fetch of the same hostile page in this run does not pay for it again; the oversized
+    DOM and the off-host landing are memoised by nobody, since the page did render. The ceilings this
     wrapper already runs under are unchanged: the ``fetch`` tool's ``timeout_s`` and
     ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
 

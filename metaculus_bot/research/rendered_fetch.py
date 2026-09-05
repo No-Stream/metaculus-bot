@@ -1123,9 +1123,10 @@ async def _render_in_context(
     # a Route only in the else of `if (redirectedFrom || ...)`; Playwright's own `page.route` docs say "the
     # handler will only be called for the first url if the response is a redirect". So a 3xx answer that
     # sends the main frame elsewhere is dialed with no check of ours; what closes it is the landing-host
-    # check in `_navigate_and_read_dom`, which refuses the DOM unread when `page.url` is not on the pinned
-    # host. A request Playwright cannot attribute to a frame is auto-continued the same way, and stays the
-    # one channel with no check of ours. A WebSocket handshake is invisible to `context.route` by
+    # check in `_navigate_and_read_dom`, which runs before AND after the DOM read, so a `page.url` off the
+    # pinned host has its DOM refused unread, or discarded unpublished when the navigation committed during
+    # the read itself. A request Playwright cannot attribute to a frame is auto-continued the same way, and
+    # stays the one channel with no check of ours. A WebSocket handshake is invisible to `context.route` by
     # construction, because HTTP interception is the CDP `Fetch.enable` domain while WebSockets surface only
     # on the report-only `Network.webSocket*` events; it is closed for page scripts by the `route_web_socket`
     # handler registered below, `_block_web_socket`, which never connects the socket to a server. Its
