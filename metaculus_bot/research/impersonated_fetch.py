@@ -468,7 +468,10 @@ async def _fetch_pinned_hop(
     the same pinned hop is dialed ONCE more under it, still holding the gate and still against
     the same deadline: one extra request in a rare shape, and the rung is no narrower than the
     direct path it substitutes for, which reads a declared PDF under the document cap. A second
-    abort, or an oversized body of any other type, is the decline.
+    abort, or an oversized body of any other type, is the decline. The larger cap was earned by
+    the FIRST response's declared type, so the re-dial hands :func:`_dial` the page cap too and
+    that dial holds a body that no longer declares a document to it: a host cannot declare a PDF
+    once and then serve a page-cap-busting HTML body under the document cap.
     """
     pinned = await _within_budget(
         rendered_fetch.resolve_pinned_host(hop_url), deadline_monotonic_s, waiting_on="the vetting lookup"
@@ -504,6 +507,7 @@ async def _fetch_pinned_hop(
                 deadline_monotonic_s=deadline_monotonic_s,
                 per_hop_timeout_s=per_hop_timeout_s,
                 max_bytes=document_max_bytes,
+                page_max_bytes=max_bytes,
             )
     finally:
         gate.release()
@@ -540,6 +544,7 @@ async def _dial(
     deadline_monotonic_s: float,
     per_hop_timeout_s: float,
     max_bytes: int,
+    page_max_bytes: int | None = None,
 ) -> _Hop:
     """One pinned GET under one cap, with the gate already held: the session, the request, the
     body read through the write callback, and the pin assertion on what came back.
@@ -548,6 +553,13 @@ async def _dial(
     ``CURLOPT_RESOLVE`` is the boundary that prevents a connection to anything else; this check
     is what makes an inert pin loud. Nothing from a refused response is returned, so a refusal
     after the read still closes the channel, and the bytes read before it are bounded by the cap.
+
+    ``page_max_bytes`` is set on the document re-dial only, where ``max_bytes`` is the larger
+    document cap that the FIRST response's declared type earned. The write callback cannot see
+    this response's headers, so the transfer runs under the document cap and the page cap is
+    enforced after the read: a body that no longer declares a document and exceeds the page cap
+    is the same :class:`ImpersonateBodyTooLarge` the first dial produces for it, with the page
+    cap on it. Resident memory stays bounded by the document cap either way.
     """
     hop_timeout_s = _hop_timeout_s(deadline_monotonic_s, per_hop_timeout_s)
     reader = _CappedBodyReader(max_bytes)
@@ -580,11 +592,16 @@ async def _dial(
             # path calls a response its parser refused ``malformed_response``; so does this one.
             raise ImpersonateTransportError(failure_class="malformed_response", exc=type(exc).__name__) from exc
     _check_pin(response.primary_ip, vetted_ip, hop_url)
+    content_type = _content_type_of(response)
+    if page_max_bytes is not None and reader.total > page_max_bytes and not declared_pdf(content_type):
+        raise ImpersonateBodyTooLarge(
+            hop_url, bytes_read=reader.total, max_bytes=page_max_bytes, content_type=content_type
+        )
     headers = response.headers
     return _Hop(
         status=response.status_code,
         url=hop_url,
-        content_type=_content_type_of(response),
+        content_type=content_type,
         server=headers.get("server"),
         body=reader.body(),
         primary_ip=response.primary_ip,

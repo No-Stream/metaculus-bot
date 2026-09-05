@@ -849,6 +849,37 @@ class TestTwoCapReDial:
 
         assert len(curl.sessions) == 1
 
+    async def test_a_re_dial_that_no_longer_declares_a_document_is_held_to_the_page_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The larger cap is EARNED by the first dial's declared type and applied to the second
+        dial, so a host could declare ``application/pdf`` once and then serve a page-cap-busting
+        HTML body under the document cap. The re-dial honours the document cap only while the
+        response still declares a document; anything else over the page cap is the same decline
+        the first dial would have produced, with the page cap on it."""
+        curl = install_fake_curl(monkeypatch, _pdf(b"P" * 3000), _page(body=b"h" * 3000))
+
+        with pytest.raises(ImpersonateBodyTooLarge) as excinfo:
+            await _fetch(max_bytes=1000, document_max_bytes=5000)
+
+        assert excinfo.value.max_bytes == 1000
+        assert excinfo.value.bytes_read == 3000
+        assert excinfo.value.content_type == "text/html; charset=utf-8"
+        assert len(curl.sessions) == 2
+
+    async def test_a_re_dial_that_no_longer_declares_a_document_but_fits_the_page_cap_is_returned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A body under the page cap was never the abuse: whatever it declares, the first dial would
+        have returned it, so the second does too."""
+        curl = install_fake_curl(monkeypatch, _pdf(b"P" * 3000), _page(body=b"h" * 800))
+
+        response = await _fetch(max_bytes=1000, document_max_bytes=5000)
+
+        assert response.status == 200
+        assert len(response.body) == 800
+        assert len(curl.sessions) == 2
+
 
 class TestBodyCapAgainstLibcurl:
     """The retention bound is a libcurl fact, so pin it on loopback against the real wheel."""
