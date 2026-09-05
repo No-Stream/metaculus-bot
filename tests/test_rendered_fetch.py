@@ -22,6 +22,7 @@ import inspect
 import logging
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -1116,6 +1117,8 @@ class TestTheLandingHost:
             "file:///etc/hostname",
             "blob:https://dashboard.example.com/3f1c9a2e",
             "chrome-error://chromewebdata/",
+            # The ``about:`` allowance is keyed on the absence of a hostname, not on the scheme.
+            "about://169.254.169.254/latest/meta-data/",
         ],
     )
     async def test_a_landing_on_a_scheme_that_is_not_the_pinned_host_is_refused(self, monkeypatch, landed):
@@ -1136,6 +1139,10 @@ class TestTheLandingHost:
             ("about:blank", False),
             ("about:srcdoc", False),
             ("ABOUT:BLANK", False),
+            # An ``about:`` URL that parses WITH a hostname is refused: allowed on its scheme alone
+            # it would reach ``document_url`` as the classifier base.
+            ("about://evil.example/", True),
+            ("about://169.254.169.254/x", True),
             ("https://dashboard.example.com/senate", False),
             ("http://Dashboard.Example.COM:8443/x", False),
             ("https://other.example.com/", True),
@@ -1147,7 +1154,11 @@ class TestTheLandingHost:
         ],
     )
     def test_the_no_document_landings_are_the_only_allowlist(self, final_url, expected):
+        """Every landing the guard allows is either the pinned host or has no hostname at all, which
+        is the invariant ``document_url`` relies on when it falls back to the requested URL."""
         assert rendered_fetch._landed_off_host(final_url, "dashboard.example.com") is expected
+        if not expected:
+            assert urlparse(final_url).hostname in (None, "dashboard.example.com")
 
     async def test_a_navigation_that_commits_during_the_dom_read_is_discarded_unpublished(self, monkeypatch, caplog):
         """The window between the pre-read check and the read. ``page.url`` is a client-side cache

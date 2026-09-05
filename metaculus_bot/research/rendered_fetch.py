@@ -505,13 +505,17 @@ def _landed_off_host(final_url: str, pinned_host: str) -> bool:
     """Whether the main frame's landing URL is anywhere but ``pinned_host``.
 
     A guard that fails SHUT. The only landings it lets through without a matching hostname are
-    the no-document ones: an empty ``page.url`` and the ``about:`` scheme (``about:blank`` when a
-    navigation never committed, ``about:srcdoc``), which are nobody's host and fall through to the
-    empty DOM read they always produced. Everything else is compared by ``urlparse`` hostname,
-    lower-cased with the brackets stripped, the same form the pin was built from, and a URL with no
-    hostname at all is off-host. That covers an http(s) URL with an empty authority, every
-    non-http(s) scheme Chromium can leave the frame on (``data:``, ``file:``, ``blob:``), and
-    Chromium's own error document: live QA on 2026-09-04 observed
+    the no-document ones: an empty ``page.url``, and an ``about:`` URL with NO hostname
+    (``about:blank`` when a navigation never committed, ``about:srcdoc``), which are nobody's host
+    and fall through to the empty DOM read they always produced. The scheme alone is not the
+    allowance: ``about://evil.example/`` parses with a hostname, and let through on its scheme it
+    would reach ``RenderedPage.document_url`` as the base the callers classify against. So the
+    invariant every allowed landing satisfies is "no hostname, or the pinned one", which is exactly
+    what ``document_url`` relies on when it falls back to the requested URL. Everything else is
+    compared by ``urlparse`` hostname, lower-cased with the brackets stripped, the same form the pin
+    was built from, and a URL with no hostname at all is off-host. That covers an http(s) URL with
+    an empty authority, every non-http(s) scheme Chromium can leave the frame on (``data:``,
+    ``file:``, ``blob:``), and Chromium's own error document: live QA on 2026-09-04 observed
     ``page.url == "chrome-error://chromewebdata/"`` after a goto that failed with
     ``net::ERR_UNSAFE_PORT`` and after ``net::ERR_CONNECTION_REFUSED`` on a redirect to a loopback
     target, and the tri-state predecessor of this helper, which allowed every non-http(s) scheme,
@@ -519,7 +523,7 @@ def _landed_off_host(final_url: str, pinned_host: str) -> bool:
     boolean whose allow case is the named sentinel it is refused with no arm of its own.
     """
     parsed = urlparse(final_url)
-    if not final_url or parsed.scheme.lower() == "about":
+    if not final_url or (parsed.scheme.lower() == "about" and parsed.hostname is None):
         return False
     return parsed.hostname != pinned_host
 
