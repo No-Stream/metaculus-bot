@@ -341,6 +341,10 @@ DEP003 = ["urllib3", "httpx"]
 #     runner's aiohttp client with 403 and an impersonated client with 200. The ROOT conftest also
 #     imports `curl_cffi.requests` at module scope to patch libcurl's request chokepoint for the
 #     native-egress guard, and scripts/probes/fetch_diagnostic.py uses it for its column B.
+#     One limit of `make audit` to know about: osv-scanner reads Python package versions out of
+#     uv.lock and cannot see the libcurl (8.15.0 in the 0.15.0 wheel) and BoringSSL binaries
+#     VENDORED inside the curl_cffi wheel, and curl upstream is well past that release, so a
+#     libcurl CVE would not be reported by that gate. A curl_cffi bump is how one gets picked up.
 DEP004 = ["matplotlib"]
 
 # Import-direction contracts. Every contract below was derived from the real graph (grimp).

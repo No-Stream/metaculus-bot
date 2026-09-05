@@ -367,12 +367,12 @@ def _async_return(value: Any):
 async def _pin_the_requested_host(url: str) -> tuple[str, str] | None:
     """The default DNS pin: the host the transport asked for, at ``DEFAULT_PIN_IP``.
 
-    Eligibility comes from the transport's own ``_pinnable_url_host``, so a URL the real resolver
+    Eligibility comes from the transport's own ``pinnable_url_host``, so a URL the real resolver
     would refuse to pin (a unicode or trailing-dot host, userinfo, a non-http(s) scheme) declines
     here too rather than being pinned anyway.
     """
     await asyncio.sleep(0)
-    host = rendered_fetch._pinnable_url_host(url)
+    host = rendered_fetch.pinnable_url_host(url)
     return None if host is None else (host, DEFAULT_PIN_IP)
 
 
@@ -408,5 +408,5 @@ def install_fake_playwright(
         SimpleNamespace(async_playwright=lambda: manager, Error=PlaywrightError),
     )
     resolve = _pin_the_requested_host if isinstance(pinned, _PinTheRequestedHost) else _async_return(pinned)
-    monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", resolve)
+    monkeypatch.setattr(rendered_fetch, "resolve_pinned_host", resolve)
     return launcher

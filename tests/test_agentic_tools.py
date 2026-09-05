@@ -1757,7 +1757,7 @@ async def test_resolve_pinned_host_public_ip_returns_host_and_ip(monkeypatch: py
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("93.184.216.34")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await rendered_fetch._resolve_pinned_host("https://example.com/page") == ("example.com", "93.184.216.34")
+    assert await rendered_fetch.resolve_pinned_host("https://example.com/page") == ("example.com", "93.184.216.34")
 
 
 @pytest.mark.asyncio
@@ -1765,7 +1765,7 @@ async def test_resolve_pinned_host_private_ip_fails_closed(monkeypatch: pytest.M
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("10.0.0.5")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await rendered_fetch._resolve_pinned_host("https://internal.example.com/page") is None
+    assert await rendered_fetch.resolve_pinned_host("https://internal.example.com/page") is None
 
 
 @pytest.mark.asyncio
@@ -1774,7 +1774,7 @@ async def test_resolve_pinned_host_link_local_fails_closed(monkeypatch: pytest.M
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("169.254.169.254")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await rendered_fetch._resolve_pinned_host("https://rebind.example.com/page") is None
+    assert await rendered_fetch.resolve_pinned_host("https://rebind.example.com/page") is None
 
 
 @pytest.mark.asyncio
@@ -1785,7 +1785,7 @@ async def test_resolve_pinned_host_rejects_when_any_address_disallowed(monkeypat
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=mixed))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await rendered_fetch._resolve_pinned_host("https://mixed.example.com/page") is None
+    assert await rendered_fetch.resolve_pinned_host("https://mixed.example.com/page") is None
 
 
 @pytest.mark.asyncio
@@ -1793,7 +1793,7 @@ async def test_resolve_pinned_host_ipv6_public_is_pinned(monkeypatch: pytest.Mon
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo6("2606:2800:220:1:248:1893:25c8:1946")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await rendered_fetch._resolve_pinned_host("https://v6.example.com/page") == (
+    assert await rendered_fetch.resolve_pinned_host("https://v6.example.com/page") == (
         "v6.example.com",
         "2606:2800:220:1:248:1893:25c8:1946",
     )
@@ -1804,21 +1804,21 @@ async def test_resolve_pinned_host_ip_literal_public_pins_to_itself(monkeypatch:
     # An IP-literal host needs no DNS; getaddrinfo must not even be consulted.
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=AssertionError("getaddrinfo must not run")))
 
-    assert await rendered_fetch._resolve_pinned_host("https://93.184.216.34/page") == ("93.184.216.34", "93.184.216.34")
+    assert await rendered_fetch.resolve_pinned_host("https://93.184.216.34/page") == ("93.184.216.34", "93.184.216.34")
 
 
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_ip_literal_private_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=AssertionError("getaddrinfo must not run")))
 
-    assert await rendered_fetch._resolve_pinned_host("http://127.0.0.1/latest/meta-data/") is None
+    assert await rendered_fetch.resolve_pinned_host("http://127.0.0.1/latest/meta-data/") is None
 
 
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_userinfo_and_scheme_fail_closed() -> None:
     # Userinfo defeats hostname trust; non-http(s) schemes are never fetched.
-    assert await rendered_fetch._resolve_pinned_host("https://trusted@169.254.169.254/") is None
-    assert await rendered_fetch._resolve_pinned_host("ftp://example.com/x") is None
+    assert await rendered_fetch.resolve_pinned_host("https://trusted@169.254.169.254/") is None
+    assert await rendered_fetch.resolve_pinned_host("ftp://example.com/x") is None
 
 
 @pytest.mark.asyncio
@@ -1826,7 +1826,7 @@ async def test_resolve_pinned_host_dns_failure_fails_closed(monkeypatch: pytest.
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=socket.gaierror("no such host")))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
-    assert await rendered_fetch._resolve_pinned_host("https://nxdomain.example.com/page") is None
+    assert await rendered_fetch.resolve_pinned_host("https://nxdomain.example.com/page") is None
 
 
 @pytest.mark.asyncio

@@ -3,11 +3,16 @@ name: Fetch egress diagnostic (free, no API keys)
 # Measures WHY the Tier-1 resolution-source fetcher gets HTTP 403 from
 # Akamai-fronted federal hosts (bls.gov, cdc.gov, fsis.usda.gov) only when the bot
 # runs here, while the identical client gets 200 from the operator's laptop and EC2
-# box. Per URL it runs the bot's own aiohttp client, the same GET under curl_cffi
-# Chrome impersonation, and the Wayback copy, then prints one table plus a verdict.
-# A row where the plain rung is 403 and the impersonated rung is 200 says the
-# runner's TLS fingerprint is being scored (fixable client-side); a row where both
-# are 403 says the runner's egress IP is blocked (not fixable client-side).
+# box, and whether the shipped escalation ladder recovers them. Per URL it runs the
+# bot's own aiohttp client (A), the same GET under curl_cffi Chrome impersonation (B),
+# the Wayback copy (C), and the real production provider `fetch_resolution_sources`
+# with every free rung of its ladder (D), then prints one table, the ladder block and
+# a verdict. A row where A is 403 and B is 200 says the runner's TLS fingerprint is
+# being scored (fixable client-side); a row where both are 403 says the runner's
+# egress IP is blocked (not fixable client-side). A D row reading
+# `status=success route=impersonate` on an Akamai host is the live proof that the
+# impersonation rung works from production egress, since the operator's own machines
+# are not fingerprint-scored and cannot exercise it.
 on:
   workflow_dispatch:
 
@@ -20,11 +25,12 @@ concurrency:
 jobs:
   fetch_diagnostic:
     runs-on: ubuntu-latest
-    # Sized off the local run (~1 min for 30 sequential requests at 25s timeouts and
-    # 1s per-host spacing). The worst case is every request timing out, which is
-    # 30 x 25s = 12.5 min, so the per-step cap below is the real bound and this is
-    # the backstop.
-    timeout-minutes: 20
+    # Sized off the local run (~1 min for the 30 sequential A/B/C requests at 25s
+    # timeouts and 1s per-host spacing, plus the ladder column). The worst case is
+    # every request timing out: 30 x 25s = 12.5 min for A/B/C, plus column D's 10 URLs
+    # x the provider's 45s wall = 7.5 min, 20 min in all, so the per-step cap below is
+    # the real bound and this is the backstop.
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -38,24 +44,26 @@ jobs:
         timeout-minutes: 10
         run: uv sync --frozen --no-dev
       - name: Probe egress and fetch rungs
-        timeout-minutes: 15
+        timeout-minutes: 25
         # NO SECRET IS PASSED TO THIS JOB, deliberately: per the repo's cost gate
-        # (CLAUDE.md), every credit spend goes through the operator, so a diagnostic
+        # (AGENTS.md), every credit spend goes through the operator, so a diagnostic
         # that anyone may dispatch must be structurally incapable of spending. With
         # no METACULUS_TOKEN, no OpenRouter key and no provider key in the
         # environment, this job cannot call an LLM, cannot reach a paid research
         # provider and cannot publish to Metaculus even if the code changed under
-        # it. The only env var here controls stdout buffering.
+        # it. Column D runs the production escalation ladder, whose one PAID rung
+        # (the Gemini url_context read) is gated on RESOLUTION_SOURCE_URL_CONTEXT_ENABLED
+        # and on GOOGLE_API_KEY; neither is set here, and the rung declines on the
+        # flag before it ever looks for the key. Keep both absent. The only env var
+        # here controls stdout buffering.
         #
-        # curl_cffi is declared only in pyproject's dev group (the root conftest's
-        # egress guard imports it), and this job syncs `--no-dev`, so `--with
-        # curl_cffi` is still what supplies it here. It stays out of the prod
-        # dependency set: the probe is a debugging tool, and yfinance pulling it in
-        # transitively today is not something the diagnostic should rely on.
+        # curl_cffi is a runtime dependency since 2026-09-04 (the impersonation rung
+        # in metaculus_bot/research/impersonated_fetch.py drives it), so the plain
+        # `--no-dev` sync supplies it to column B, column C and the ladder alike.
         #
         # The script prints the runner's egress IP first (api.ipify.org), since the
         # IP is what the both-403 verdict is about. Nothing is uploaded: the table in
         # this step's log IS the artifact.
         env:
           PYTHONUNBUFFERED: '1'
-        run: uv run --frozen --no-dev --with curl_cffi python scripts/probes/fetch_diagnostic.py
+        run: uv run --frozen --no-dev python scripts/probes/fetch_diagnostic.py

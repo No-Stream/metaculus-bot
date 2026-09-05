@@ -949,15 +949,15 @@ class TestDnsPinEligibility:
         ["https://münchen.example/x", "https://straße.example/x", "https://example.com./x"],
     )
     def test_a_host_chromium_would_canonicalise_is_not_pinnable(self, url):
-        assert rendered_fetch._pinnable_url_host(url) is None
+        assert rendered_fetch.pinnable_url_host(url) is None
 
     def test_an_already_punycoded_host_is_pinnable(self):
-        assert rendered_fetch._pinnable_url_host("https://xn--mnchen-3ya.example/x") == "xn--mnchen-3ya.example"
+        assert rendered_fetch.pinnable_url_host("https://xn--mnchen-3ya.example/x") == "xn--mnchen-3ya.example"
 
     async def test_a_unicode_host_never_launches(self, monkeypatch, caplog):
-        real_resolve = rendered_fetch._resolve_pinned_host
+        real_resolve = rendered_fetch.resolve_pinned_host
         chromium = install_fake_playwright(monkeypatch, FakePage([]))
-        monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", real_resolve)
+        monkeypatch.setattr(rendered_fetch, "resolve_pinned_host", real_resolve)
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"):
             rendered = await rendered_fetch.render_page(
