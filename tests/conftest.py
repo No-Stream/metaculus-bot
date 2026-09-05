@@ -159,12 +159,15 @@ def _block_native_egress(
       subprocess with its own network stack, so the socket patch is invisible to it. Verified
       2026-09-03: three resolution-source marker tests launched a real browser the moment the Tier-1
       rung landed, and connected to a real host from a unit test.
-    - **libcurl**, entered from Python through ``curl_cffi``, the client ``yfinance`` drives for
+    - **libcurl**, entered from Python through ``curl_cffi``, driven by two production callers now:
+      the TLS-impersonation transport in ``metaculus_bot/research/impersonated_fetch.py`` (the
+      Tier-1 resolution-source rung and gap-fill v2's ``fetch`` tool both dial it, so this is the
+      most important reason the guard must stay armed), and the client ``yfinance`` drives for
       every ticker fetch in ``metaculus_bot/research/financial_data.py`` and ``ts_fetch.py``. The C
-      library opens its own sockets. ``curl_cffi`` is a declared dev dependency (pyproject
-      ``[dependency-groups] dev``) precisely so the module-scope import at the top of this file
-      can stay hard: it used to arrive only as yfinance's transitive dependency, and a yfinance
-      client swap would have taken the whole suite down at collection.
+      library opens its own sockets. ``curl_cffi`` is a runtime dependency (pyproject
+      ``[project] dependencies``) since 2026-09-04, when the impersonation rung landed; the
+      module-scope import at the top of this file is now hard for that reason rather than because
+      it used to arrive only as yfinance's transitive dependency.
 
     Chokepoints, chosen so every caller trips them whichever public API it holds.
     ``playwright._impl._browser_type.BrowserType`` is the one class both ``playwright.async_api`` and

@@ -9,10 +9,12 @@ name: Fetch egress diagnostic (free, no API keys)
 # with every free rung of its ladder (D), then prints one table, the ladder block and
 # a verdict. A row where A is 403 and B is 200 says the runner's TLS fingerprint is
 # being scored (fixable client-side); a row where both are 403 says the runner's
-# egress IP is blocked (not fixable client-side). A D row reading
-# `status=success route=impersonate` on an Akamai host is the live proof that the
+# egress IP is blocked (not fixable client-side). A D row whose impersonate ATTEMPT
+# came back anything but blocked on an Akamai host is the live proof that the
 # impersonation rung works from production egress, since the operator's own machines
-# are not fingerprint-scored and cannot exercise it.
+# are not fingerprint-scored and cannot exercise it. Read the attempt, not `route=`:
+# an impersonated PDF rescue fires `pdf_local` after `impersonate`, so `route` reads
+# `pdf_local` while the impersonate attempt itself succeeded.
 on:
   workflow_dispatch:
 

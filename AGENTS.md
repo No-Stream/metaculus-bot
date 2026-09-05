@@ -99,8 +99,11 @@ Free and safe — run freely:
   `make supply_probe`, `make benchmark_display`. These hit only the Metaculus API and GitHub
   artifacts.
 - `make check_credits` — reads both OpenRouter key balances.
-- `uv run python scripts/probes/fetch_diagnostic.py` — public GETs only, no LLM and no key
-  (`curl_cffi` is in the dev group, so a `uv sync --dev` checkout already has it).
+- `uv run python scripts/probes/fetch_diagnostic.py` — probes A/B/C are public GETs, and column D
+  runs the production ladder but forces its one paid rung (the Gemini `url_context` read) off in
+  the process environment before any probe runs, so it stays free even on a laptop whose `.env`
+  has the flag and a `GOOGLE_API_KEY`. No key is spent (`curl_cffi` is a runtime dependency, so
+  any `uv sync` checkout already has it).
 
 ## Repo overrides
 

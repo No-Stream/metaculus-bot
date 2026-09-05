@@ -22,19 +22,25 @@ So this script runs four probes per URL and prints one table plus a ladder block
      THE FINGERPRINT VERDICT; a row where both are 403 is the IP verdict.
   C  the Wayback Machine copy, which is the fallback route if B does not help.
   D  the real Tier-1 provider entry point, ``fetch_resolution_sources``, run on the
-     URL alone with no keys in the environment: the direct fetch plus every FREE rung
-     of the escalation ladder (the impersonation rung among them), reported as the
-     status, the route and the rung outcomes production would record. A row reading
-     ``status=success route=impersonate`` with ``rung=impersonate outcome=success``
-     on an Akamai host, from the runner, is the live proof that the rung works from
-     production egress; B says the fingerprint is the problem, D says the shipped
-     code fixes it.
+     URL alone: the direct fetch plus every FREE rung of the escalation ladder (the
+     impersonation rung among them), reported as the status, the route and the rung
+     outcomes production would record. A row whose impersonate ATTEMPT came back
+     anything but ``blocked`` on an Akamai host, from the runner, is the live proof
+     that the rung works from production egress; B says the fingerprint is the
+     problem, D says the shipped code fixes it. Note the route read is NOT
+     ``route=impersonate``: an impersonated document rescue fires ``pdf_local`` after
+     ``impersonate``, so ``route`` (the last rung that fired) reads ``pdf_local`` while
+     the impersonate attempt itself succeeded. Column D reads the impersonate ATTEMPT,
+     not the route, for exactly that reason.
 
-Everything here is free: no LLM call, no API key, no paid provider, and no write of
-any kind. It is safe to run on a runner with no secrets in the environment. Column D
-reads production code only, and the one PAID rung in that ladder (the Gemini
-``url_context`` read) declines on its flag before it looks for its key, and both are
-unset here.
+Everything here is free: no LLM call, no API key spent, no paid provider, and no write
+of any kind. Column D runs the production escalation ladder, whose one PAID rung (the
+Gemini ``url_context`` read) is gated on ``RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`` and a
+``GOOGLE_API_KEY``. Both would be present on a laptop mirroring prod, so :func:`main`
+forces the flag OFF in the process environment before any probe runs (see
+:func:`_disable_the_paid_rung`): the rung then declines on its flag before it looks for
+its key, whatever ``.env`` supplied. That makes the free property STRUCTURAL rather than
+a matter of which environment the script happened to run in.
 
 Politeness: probes run strictly sequentially, with at least ``_HOST_SPACING_S``
 between two requests to the same host, and every request carries a timeout. Column D
@@ -47,6 +53,7 @@ archive lookup, which repeats column C's request).
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import UTC, datetime
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -54,7 +61,7 @@ from urllib.parse import urlparse
 import aiohttp
 from curl_cffi import requests as curl_requests
 
-from metaculus_bot.constants import RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
+from metaculus_bot.constants import RESOLUTION_SOURCE_MAX_RESPONSE_BYTES, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research.http_fetch import read_body_capped
 from metaculus_bot.research.resolution_fetch_result import FetchResult, RungAttempt
 from metaculus_bot.research.resolution_source import _get_session, fetch_resolution_sources, is_public_http_url
@@ -186,7 +193,11 @@ def probe_impersonated(url: str) -> ProbeOutcome:
     except (curl_requests.RequestsError, OSError) as exc:
         return ProbeOutcome(None, 0, _short_error(exc))
     server = (resp.headers.get("Server") or "").strip()[:_SERVER_HEADER_MAX_CHARS]
-    return ProbeOutcome(resp.status_code, len(resp.content), server)
+    # Server header AND round-trip time on the note: an Akamai 403 comes back near-instantly
+    # while a Cloudflare or DataDome challenge takes seconds, so the pair tells one refusal from
+    # another at a glance (R1). ``elapsed`` is curl_cffi's own timing for the whole request.
+    note = f"{server} {resp.elapsed.total_seconds():.1f}s".strip()
+    return ProbeOutcome(resp.status_code, len(resp.content), note)
 
 
 def probe_wayback(url: str) -> ProbeOutcome:
@@ -245,9 +256,22 @@ class LadderOutcome(NamedTuple):
         return f"{head} {' '.join(_render_rung_attempt(attempt) for attempt in self.rung_attempts)}"
 
     @property
-    def rescued_by_impersonation(self) -> bool:
-        """The rung fired on this URL and the page it produced is what was published."""
-        return self.status == "success" and self.route == "impersonate"
+    def impersonation_answered(self) -> bool:
+        """The impersonated retry fired on this URL and came back anything but still-blocked.
+
+        Keyed on the rung's own ATTEMPT rather than on ``route``, and on "not blocked" rather than
+        on "success", for two reasons the route reading cannot honour. ``route`` is the LAST rung
+        that fired, and an impersonated document rescue fires ``pdf_local`` after ``impersonate``,
+        so a working PDF rescue reads ``route=pdf_local`` (F3). And this probe carries no query, so
+        ``select_passages`` returns nothing and a rescued document digests to ``no_resolving_content``
+        however well the fetch went, which a ``success`` predicate would read as a defect. What the
+        rung proves from production egress is that it DIALED and was not refused, which is
+        ``outcome != "blocked"`` on a fired (un-skipped) impersonate attempt.
+        """
+        return any(
+            attempt.rung == "impersonate" and not attempt.skipped_reason and attempt.outcome != "blocked"
+            for attempt in self.rung_attempts
+        )
 
 
 def _render_rung_attempt(attempt: RungAttempt) -> str:
@@ -264,15 +288,22 @@ async def probe_ladder(url: str) -> LadderOutcome:
     same page from the same egress: the direct fetch and, when that fails, the meta-refresh hop,
     the impersonated retry, the local PDF read, the browser render (which declines on a runner
     with no Chromium installed, as the ``renderer_unavailable`` skip), the derived feed and the
-    archive. The paid ``url_context`` rung declines on its unset flag. ``query`` is empty because
-    there is no question here; it only ranks which passages of a document a forecaster sees.
-    ``fast_path=False`` so no rung declines for the thin-window mode a real question might be in.
+    archive. The paid ``url_context`` rung declines on the flag :func:`main` forced off. ``query``
+    is empty because there is no question here; it only ranks which passages of a document a
+    forecaster sees. ``fast_path=False`` so no rung declines for the thin-window mode a real
+    question might be in.
 
     No exception is caught: a failed fetch comes back as a ``FetchResult`` with its own status,
     and anything that RAISES out of the provider is a bug this diagnostic should crash on.
+
+    ``result = results[0]`` rather than a one-element unpack: ``fetch_resolution_sources`` returns
+    one result per FETCHED URL, and a page embedding a Datawrapper chart appends one extra result
+    per chart AFTER its parent, so a single-URL call can come back with more than one. The page
+    result is always first by construction (F5), and this is a contract of the provider, not a
+    failure, so it is read rather than caught.
     """
     results: list[FetchResult] = await fetch_resolution_sources([url], query="", fast_path=False)
-    (result,) = results
+    result = results[0]
     return LadderOutcome(
         status=result.status,
         route=result.route,
@@ -341,7 +372,7 @@ def print_table(rows: list[ProbeRow]) -> None:
 
 def print_ladder(rows: list[ProbeRow]) -> None:
     """Column D on its own lines: the rung pairs are too wide for the table."""
-    print("D  production ladder (fetch_resolution_sources, no keys)")
+    print("D  production ladder (fetch_resolution_sources, paid url_context rung forced off)")
     for index, row in enumerate(rows, start=1):
         print(f"  {index:>2}  {row.probe_url.source_class:<18}  {row.ladder.render()}")
     print()
@@ -373,8 +404,8 @@ def print_verdict(rows: list[ProbeRow]) -> None:
     both_refused = [r for r in rows if r.bot.status == 403 and r.impersonated.status == 403]
     both_ok = [r for r in rows if r.bot.status == 200 and r.impersonated.status == 200]
     archived = [r for r in rows if r.wayback.status == 200]
-    rescued = [r for r in rows if r.ladder.rescued_by_impersonation]
-    helped_not_rescued = [r for r in helped if not r.ladder.rescued_by_impersonation]
+    answered = [r for r in rows if r.ladder.impersonation_answered]
+    still_blocked = [r for r in helped if r.ladder.status == "blocked"]
 
     print("Verdict")
     print(
@@ -388,15 +419,30 @@ def print_verdict(rows: list[ProbeRow]) -> None:
         "treating any of them as a live source."
     )
     print(
-        f"  The production ladder published {_count(rescued)} through the impersonation rung "
-        f"({_hosts(rescued)}). {_count(helped_not_rescued)} that column B recovered did NOT come back "
-        f"route=impersonate from the ladder ({_hosts(helped_not_rescued)}); a nonzero count there is a defect in "
-        "the shipped rung rather than in the host, so read that row's rung pairs and the run log for an "
-        "ImpersonatePinNotHeld error or a failure_class=tls before merging."
+        f"  The production ladder's impersonate attempt answered on {_count(answered)} ({_hosts(answered)}); read "
+        "the attempt, not route=, since an impersonated PDF rescue fires pdf_local after impersonate. "
+        f"{_count(still_blocked)} that column B recovered came back still blocked from the ladder "
+        f"({_hosts(still_blocked)}); read those rows' rung pairs and the run log for an ImpersonatePinNotHeld "
+        "error or a failure_class=tls before merging."
     )
 
 
+def _disable_the_paid_rung() -> None:
+    """Force column D's one paid rung off in the process environment, whatever ``.env`` said.
+
+    ``fetch_resolution_sources`` ends in the Gemini ``url_context`` read, gated only on
+    ``RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`` and a ``GOOGLE_API_KEY``, both of which a laptop
+    mirroring prod supplies (``constants.load_environment()`` reads ``.env`` at import, and the
+    flag is on in every bot workflow). Writing ``"false"`` here lands AFTER dotenv, so it wins,
+    and an explicit ``"false"`` is off regardless of the flag's default. Without this the script's
+    "free" property is a matter of which environment it ran in; with it the property is
+    structural, which is what the cost gate requires of a script anyone may run.
+    """
+    os.environ[RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV] = "false"
+
+
 async def main() -> None:
+    _disable_the_paid_rung()
     print(f"Fetch egress diagnostic — {datetime.now(UTC).isoformat(timespec='seconds')}")
     async with _get_session() as session:
         print(f"  egress IP: {await read_egress_ip(session)}")
