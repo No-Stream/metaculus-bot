@@ -16,7 +16,7 @@ ifeq ($(UNAME_S),Darwin)
 else
     # Linux: stdbuf for system-level line buffering + script for PTY
     define RUN_UNBUFFERED
-        PYTHONUNBUFFERED=1 stdbuf -oL -eL script -q -c "uv run python -u $(1)" /dev/null
+        PYTHONUNBUFFERED=1 stdbuf -oL -eL script -q -e -c "uv run python -u $(1)" /dev/null
     endef
 endif
 
