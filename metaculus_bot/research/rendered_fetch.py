@@ -109,17 +109,16 @@ RENDER_LAUNCH_CAP: int = 2
 _RENDERED_FETCH_GLOBAL_SEMAPHORE = asyncio.Semaphore(RENDER_LAUNCH_CAP)
 
 # The two per-run render memos, one bounded map. ``no_text``: Chromium ran and the caller's
-# extraction found nothing, so a second launch on the same URL in the same run is skipped —
-# 100-300 MB and a whole slot out of the cap above, to learn what this run already knows.
-# ``timed_out``: the render ran and read no DOM, because the read was cut off or refused (the page
-# kept navigating) or the navigation failed onto Chromium's own document, and the transport
-# re-raises :class:`RenderTimeout` rather than launching again. Both deliberately record ONLY those
-# outcomes — a `blocked` or
-# `error` GET is never memoized, because 429 is retryable and a throttle interstitial has to
-# stay re-requestable (the q45191 receipt). Keyed by (scope, url): the two callers mean
-# different things by "rendered to nothing" (gap-fill v2 writes it on bare trafilatura
-# emptiness; Tier-1 only after the ARIA rewrite, the inline-chart read and the XHR-harvest
-# fallback have ALL failed), so one path's negative must never answer the other's question.
+# extraction found nothing, so a second launch on the same URL in the same run is skipped: 100-300 MB
+# and a whole slot out of the cap above, to learn what this run already knows. ``timed_out``: the
+# render ran and read no DOM, because the read was cut off or refused (the page kept navigating) or
+# the navigation failed onto Chromium's own document, and the transport re-raises
+# :class:`RenderTimeout` rather than launching again. Both deliberately record ONLY those outcomes:
+# a `blocked` or `error` GET is never memoized, because 429 is retryable and a throttle
+# interstitial has to stay re-requestable (the q45191 receipt). Keyed by (scope, url): the two
+# callers mean different things by "rendered to nothing" (gap-fill v2 writes it on bare trafilatura
+# emptiness; Tier-1 only after the ARIA rewrite, the inline-chart read and the XHR-harvest fallback
+# have ALL failed), so one path's negative must never answer the other's question.
 MemoScope = Literal["resolution_source", "gap_fill_v2"]
 _MemoKind = Literal["no_text", "timed_out"]
 _RENDER_MEMO_MAX_ENTRIES = 50
