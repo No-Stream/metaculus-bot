@@ -28,7 +28,11 @@ came back as an empty page), and round two, against `001b6f9`, passed all 8 case
 on `001b6f9` is green (`make lint`, `make typecheck` 0 errors, `make lint_imports` 6 contracts, `make deps`,
 `make test_fast`: 7,655 passed, 14 skipped, 33 deselected, `~/logs/gate18.log`), and `make cov` on the main
 checkout ran clean at 7,649 passed with 92 percent total branch coverage.
-Verification pass result: see the sentence the lead appends.
+A post-fix verification pass (forge verify mode plus three adversarial reviewers) judged all 18 targeted
+findings resolved and could not break the guard; its nine stale-wording sites were swept in `e6c0f91` and its
+five small improvements (the `about:` allow-arm keyed on no host, a navigating page's `page.content()` error
+classified as `render_timeout`, the failed-navigation memo, the marker's `same_publisher` field, explicit
+keyword names on the fake browser context) landed as a final fix wave. The full free gate on the merged tree, with these documentation edits in the working tree, is green: `make lint`, `make typecheck` at 0 errors, `make lint_imports` with 6 contracts kept, `make deps`, and `make test_fast` at 7,673 passed, 14 skipped, 33 deselected, exit 0 (`~/logs/gate19.log`). The code tip is df05c8c; the commit above it carries only this documentation and one docstring.
 The commit after `001b6f9` brings the tracked PR description
 (`scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`, about 113,000 characters, well over
 GitHub's 65,536-character body cap), the condensed body and this status to the final state of the branch; the

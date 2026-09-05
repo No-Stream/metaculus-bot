@@ -1215,9 +1215,10 @@ lines keys on the escalation line.
 stands and nothing from the render is published. Gap-fill v2 folds it into the None outcome it
 already returns for its sibling declines. A skipped attempt emits no `RESOLUTION_SOURCE_ESCALATION`
 line, so the per-event record is the transport's WARNING, registered in `aa37f11` as the marker
-`RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host> landed_host=<host>`
-(spec `rendered_fetch_off_host`), which names hostnames only because a landing URL can carry a
-session token.
+`RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host> landed_host=<host>
+same_publisher=<true|false>` (spec `rendered_fetch_off_host`), which names hostnames only because a
+landing URL can carry a session token; `same_publisher` is true for a benign hop inside the pinned
+host's registrable domain and false otherwise, including every landing with no hostname.
 
 **The probe that priced strict host equality, free and local.** Playwright 1.61 was driven directly
 with the transport's navigation shape and no pin, over the 106-URL Phase 3 QA sweep united with the
@@ -1319,7 +1320,18 @@ fix wave's; the five above the gate before that were the Codex triage's, three f
 marker and two for model-id locations. Line coverage was read separately, because one reviewer's
 `pytest --cov` died in its own checkout: `make cov` on the main checkout ran clean at 7,649 passed
 and 92 percent total branch coverage.
-Verification pass result: see the sentence the lead appends.
+A post-fix verification pass (a forge verify-mode agent plus three adversarial reviewers, one each on the
+landing-host guard, the render path and the hop policy) judged all 18 targeted findings resolved, each
+with a test that goes red under the original defect, and found no way through the guard against any
+scheme, hostname form or mid-read navigation it could reach. It surfaced nine comment and doc sites that
+still carried the pre-fix absolute "refused unread" (swept in e6c0f91) and five small, strictly-safer
+improvements that landed as a final fix wave: the `about:` allow-arm keys on the landing having no host
+rather than on the scheme; a plain Playwright error from `page.content()`, which is what a page
+navigating mid-read raises, is classified as `render_timeout` instead of `renderer_unavailable` and no
+longer burns the once-per-run install warning; a failed-navigation landing writes the timed-out memo so
+a run does not relaunch Chromium for the same dead URL; the marker gained `same_publisher=true|false`
+so a benign hop inside the publisher's registrable domain is distinguishable from a hostile landing;
+and the fake browser context accepts only real keyword names. The full free gate on the merged tree, with these documentation edits in the working tree, is green: `make lint`, `make typecheck` at 0 errors, `make lint_imports` with 6 contracts kept, `make deps`, and `make test_fast` at 7,673 passed, 14 skipped, 33 deselected, exit 0 (`~/logs/gate19.log`). The code tip is df05c8c; the commit above it carries only this documentation and one docstring.
 PR CI on the pushed 1f2b504 (run 33917127083: lint, test, secret scan, audit) completed green at
 20:43 UTC on 2026-09-04; the commits after it carry the Codex triage's documentation, comments and
 tests,

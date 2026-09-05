@@ -1437,13 +1437,13 @@ the telemetry markers:
   apart. The `ungrounded` line appears only when that read said something, since the same
   branch also fires on an empty reply.
 - `RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host>
-  landed_host=<host>`, a WARNING, one per headless-Chromium render whose main frame ended up on a
+  landed_host=<host> same_publisher=<true|false>`, a WARNING, one per headless-Chromium render whose main frame ended up on a
   host other than the one the transport pinned at launch, emitted by the shared transport
   `research/rendered_fetch.py` and so fired for either caller, which is what `scope` names. The
   DOM was refused unread on the transport's pre-read check, or discarded unpublished when the
   navigation committed during the read itself, so nothing from that render is published either way
   and the direct fetch's result stands. Hostnames only, never the landing URL, which can carry a
-  session token.
+  session token. `same_publisher` is `true` when the landing host shares the pinned host's registrable domain (a benign client-side hop such as `example.com` to `www.example.com`, refused by strict hostname equality and priced by this value) and `false` otherwise, including every landing with no hostname, so a `false` record is the security signal and a `true` record prices the strictness.
   This is the ONLY per-event record of an off-host landing, because a refused render is a skip and
   a skip emits no `RESOLUTION_SOURCE_ESCALATION` line; the per-question rate is
   `render_off_host_skips` in the resolution-source provider's `details["counts"]`. Registered on

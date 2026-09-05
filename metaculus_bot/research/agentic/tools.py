@@ -377,9 +377,10 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     can record each under its own reason; this ladder's callers only know ``None``, so all three
     are folded back into that signal here, and nothing from an off-host render reaches the driver.
     The transport memoises the cut-off itself and re-raises it on the next fetch of the same URL,
-    so a second fetch of the same hostile page in this run does not pay for it again; the oversized
-    DOM and the off-host landing are memoised by nobody, since the page did render. The ceilings this
-    wrapper already runs under are unchanged: the ``fetch`` tool's ``timeout_s`` and
+    so a second fetch of the same hostile page in this run does not pay for it again, and a failed
+    navigation that landed on Chromium's own error document is memoised the same way; the oversized
+    DOM and a genuine off-host landing are memoised by nobody, since the page did render. The
+    ceilings this wrapper already runs under are unchanged: the ``fetch`` tool's ``timeout_s`` and
     ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
 
     The URL handed to the browser is the plain rung's ``url``, which is the last hop of its own
