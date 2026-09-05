@@ -3110,6 +3110,29 @@ class TestGapFillV2RendersThePlainRungsFinalUrl:
         assert held.has_text
 
     @pytest.mark.asyncio
+    async def test_links_resolve_against_the_documents_landing_url(self, monkeypatch: pytest.MonkeyPatch):
+        """A same-host client-side redirect (``/senate`` to ``/senate/2026/``) moves the document's
+        base; a relative ``href`` resolved against the requested URL would send the driver's next
+        fetch to a 404. The memo key, ``url``, stays the requested URL."""
+        page = FakePage(
+            html='<html><body><a href="methodology.html">Method</a><p>Rendered body</p></body></html>',
+            land_on="https://example.com/senate/2026/",
+        )
+        install_fake_playwright(monkeypatch, page)
+        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+        monkeypatch.setattr(
+            "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+        result = await agentic_tools._try_rendered_fetch("https://example.com/senate")
+
+        assert result is not None
+        assert result.links == ["https://example.com/senate/2026/methodology.html"]
+        assert result.url == "https://example.com/senate"
+
+    @pytest.mark.asyncio
     async def test_through_fetch_a_scripted_302_decides_the_render_target(self, monkeypatch: pytest.MonkeyPatch):
         """End to end through the plain rung's own redirect loop, so the URL the browser is handed
         is proven to be the hop the plain fetch actually landed on rather than a value a stub

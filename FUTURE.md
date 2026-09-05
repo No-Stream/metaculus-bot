@@ -1451,9 +1451,13 @@ Follow-ups:
    an empty DOM read; it is now refused, so `render_off_host_skips` is an upper bound on hostile
    landings that also counts failed navigations, told apart by the marker's `landed_host`
    (`chromewebdata`). A navigation that never committed leaves `about:blank`, which is nobody's host
-   and falls through to the empty-DOM read it always produced. `RenderedPage` gained `final_url` for
-   the caller's own classification, and `RenderedPage.url` still carries the REQUESTED URL, because
-   that is the base for link resolution and for both render memos. Second,
+   and falls through to the empty-DOM read it always produced. `RenderedPage` gained `final_url`,
+   and in the fix wave it was wired rather than carried: `RenderedPage.document_url` (the landing
+   when one committed, else the requested URL) is the Tier-1 classifier's base and gap-fill v2's
+   link base, so a same-host client-side redirect from `/senate` to `/senate/2026/` resolves
+   `href="methodology.html"` against the real document and the published section URL names it;
+   `RenderedPage.url` still carries the REQUESTED URL, because that is the key for both render
+   memos. Second,
    `context.route_web_socket("**/*", _block_web_socket)` is registered before the page is opened,
    and the handler logs one INFO line (raised from DEBUG in the fix wave, because `cli.py` configures
    the root logger at INFO and the line is the only record of a content-affecting block) and never

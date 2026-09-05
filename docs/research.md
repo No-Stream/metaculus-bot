@@ -1022,9 +1022,14 @@ the direct fetch LANDED on once its own redirect hops were followed and re-guard
 cited URL, so the DNS pin the transport sets covers the host that actually serves the content and a
 page whose canonical form is one ordinary hop away (`example.com` to `www.example.com`) is not
 refused for taking it; when the two differ, the landing is re-vetted with the same self-reference
-and public-URL checks every derived hop owes. Both render memos and the HTML classifier key on the
-URL rendered, while the rung's attempt stays keyed on the cited URL, which is what the escalation
-line names. The transport's own post-gate need is
+and public-URL checks every derived hop owes. Both render memos key on the URL rendered, the HTML
+classifier keys on the URL the browser's main frame LANDED on (`RenderedPage.final_url`, the
+rendered URL or a same-host hop past it), and the rung's attempt stays keyed on the cited URL,
+which is what the escalation line names. One accounting consequence, since 2026-09-04: on a
+`route=rendered` rescue the `FetchResult.url`, which is the `url=` of the `RESOLUTION_SOURCE_FETCH`
+line and the published `### <url>` heading, is that landing URL, while the
+`RESOLUTION_SOURCE_ESCALATION` line's `url=` is the cited URL, so a per-URL join between the two
+lines must key on the escalation line; before that boundary the two agreed. The transport's own post-gate need is
 higher: `RENDER_MIN_GOTO_MS` (5 s of navigation) plus `RENDER_POST_GOTO_TAIL_MS` (the 2 s settle
 and the 5 s DOM-read bound, reserved so a goto that runs its budget out can still be salvaged)
 plus `RENDER_EXIT_RESERVE_MS` (3 s, described below), 15 s in all, so a render admitted with 12 to

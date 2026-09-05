@@ -457,6 +457,25 @@ class TestRenderedRungRendersTheFinalUrl:
         (attempt,) = [a for a in result.rung_attempts if a.rung == "rendered"]
         assert attempt.url == _URL
 
+    async def test_the_classifier_sees_the_documents_landing_url(self, monkeypatch):
+        """``final_url`` is the URL the main frame actually landed on, same host as the rendered URL
+        by construction and a different path after a same-host client-side redirect or meta refresh
+        (6 of 22 render targets in the 2026-09-04 probe). It is the classifier's base, so relative
+        links and the published section URL name the real document, as the direct path's last hop
+        and the ``meta_refresh`` route already do; the attempt stays keyed on the cited URL."""
+        landed = f"{self._FINAL}/2026/?tab=polls"
+        rescued = _rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>")
+        page = RenderedPage(url=self._FINAL, content_type="text/html", html=rescued.html, final_url=landed)
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+
+        result = await _fetch_one(self._redirected_session(), _URL, {})
+
+        assert result.status == "success"
+        assert result.route == "rendered"
+        assert result.url == landed
+        (attempt,) = [a for a in result.rung_attempts if a.rung == "rendered"]
+        assert attempt.url == _URL
+
     async def test_the_render_memos_are_keyed_on_the_rendered_url(self, monkeypatch):
         calls: list[dict[str, object]] = []
         empty = RenderedPage(url=self._FINAL, content_type="text/html", html=_JS_SHELL.decode(), final_url=self._FINAL)

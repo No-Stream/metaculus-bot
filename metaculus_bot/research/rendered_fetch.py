@@ -254,7 +254,8 @@ class RenderedPage:
     is checked before and after the read, and a stranger's DOM is refused unread or discarded
     unpublished (:class:`RenderOffHost`), with Chromium's own error document counted as a
     stranger. It is ``about:blank`` when the navigation never committed, which is the salvage of a
-    genuine navigation error.
+    genuine navigation error. ``document_url`` is what the callers classify and resolve links
+    against: ``final_url`` when a navigation committed, else ``url``.
     """
 
     url: str
@@ -263,6 +264,19 @@ class RenderedPage:
     json_responses: tuple[HarvestedJson, ...] = ()
     http_status: int | None = None
     final_url: str = ""
+
+    @property
+    def document_url(self) -> str:
+        """The URL of the document ``html`` is, for classification and link resolution.
+
+        The landing when one committed, because a same-host client-side redirect or meta refresh
+        moves the document's base (6 of 22 render targets in the 2026-09-04 probe ended on a
+        different path or query), and a relative link or a published section URL resolved against
+        the requested URL would name the wrong document. A no-document landing (``about:blank``,
+        or an empty ``final_url`` from a caller-built page) names nothing, so the requested URL
+        stands. Never a memo key: the memos are keyed on ``url``.
+        """
+        return self.final_url if urlparse(self.final_url).hostname else self.url
 
 
 def reset_render_state() -> None:

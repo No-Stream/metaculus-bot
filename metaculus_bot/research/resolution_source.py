@@ -2084,9 +2084,13 @@ async def _rendered_rung(
     re-vetted here through :func:`_hop_refusal`, the one home of the two checks every derived
     URL owes, because this is where the URL the browser dials is decided; the refusal is a
     decline rather than a terminal result, so this site logs and returns None. The render memos are keyed on
-    the URL rendered; the rung's attempt stays keyed on the cited ``url``, which is what the
-    escalation line names, and the harvested feed is remembered for the cited URL's host, which
-    is the host the next cited URL asks :func:`_derived_api_rung` about.
+    the URL rendered; the classifier's base, and so the ``FetchResult.url`` a rescue carries onto
+    the ``RESOLUTION_SOURCE_FETCH`` line and into the published ``### <url>`` heading, is the URL
+    the browser's main frame LANDED on (``RenderedPage.document_url``: the direct fetch's final
+    hop, or a same-host hop past it); the rung's attempt stays keyed on the cited ``url``, which
+    is what the escalation line names, so a per-URL join between the two lines keys on the
+    escalation line; and the harvested feed is remembered for the cited URL's host, which is the
+    host the next cited URL asks :func:`_derived_api_rung` about.
     """
     if not _rendered_rung_applies(direct):
         return None
@@ -2122,7 +2126,11 @@ async def _rendered_rung(
         return None
     classified = await _classify_html_body(
         page.html.encode("utf-8", errors="replace"),
-        render_url,
+        # The document the DOM came from: `final_url` when the navigation committed (same host as
+        # `render_url` by construction, the path may differ after a same-host client-side redirect
+        # or meta refresh), so relative links and the published section URL name the real
+        # document, as the direct path's last hop and the `meta_refresh` route already do.
+        page.document_url,
         page.content_type or "text/html",
         # The direct fetch's status, not the browser's: this page answered 200 and carried no
         # text, which is the fact the record should keep. Chromium reports no status at all
@@ -3277,7 +3285,10 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     GET was followed by a rescuing render the first line reads the direct status and the
     second reads ``success``, and neither is billed for the other's latency. The ``url``
     on an escalation line is the URL the rung was invoked ON, which for a meta-refresh hop
-    is the stub rather than the target the fetch line names.
+    is the stub rather than the target the fetch line names, and for a ``route=rendered``
+    rescue is the cited URL while the fetch line names the URL the browser landed on (since
+    2026-09-04; before that boundary the two agreed, so a per-URL join against the cited URL
+    is exact only for earlier records and otherwise keys on the escalation line).
     """
     for r in results:
         reason = f" reason={r.status_reason}" if r.status_reason else ""

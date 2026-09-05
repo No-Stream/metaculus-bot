@@ -398,7 +398,9 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
         return _document_needed_result(url, page.content_type)
     body = page.html.encode("utf-8", errors="replace")
     extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, url)
-    links = _extract_links_from_html(page.html, url)
+    # Links resolve against the document the DOM came from, which after a same-host client-side
+    # redirect is not the URL asked for; the memo key and the result's `url` stay the requested URL.
+    links = _extract_links_from_html(page.html, page.document_url)
     text = (extracted or "").strip()
     if not text:
         note_rendered_no_text(url, memo_scope=_RENDER_MEMO_SCOPE)

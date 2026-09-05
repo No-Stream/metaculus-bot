@@ -1053,6 +1053,21 @@ class TestTheLandingHost:
         assert rendered.final_url == landed
         assert page.content_reads == 1
 
+    @pytest.mark.parametrize(
+        ("final_url", "expected"),
+        [
+            ("https://dashboard.example.com/senate/2026/", "https://dashboard.example.com/senate/2026/"),
+            # A navigation that never committed names no document, so the requested URL stands.
+            ("about:blank", _PAGE_URL),
+            ("", _PAGE_URL),
+        ],
+    )
+    def test_the_document_url_is_the_landing_when_one_committed(self, final_url, expected):
+        """The base both callers classify and resolve links against: the document the DOM came
+        from, never a no-document landing."""
+        page = RenderedPage(url=_PAGE_URL, content_type="text/html", html=_DOM, final_url=final_url)
+        assert page.document_url == expected
+
     async def test_a_landing_that_differs_only_in_case_is_the_same_host(self, monkeypatch):
         page = FakePage([], land_on="https://Dashboard.Example.COM/senate")
 
