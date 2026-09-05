@@ -517,6 +517,16 @@ class TestSessionOptions:
         assert curl.sessions[0].kwargs["allow_redirects"] is False
         assert curl.sessions[0].kwargs["verify"] == certifi.where()
 
+    async def test_cookies_are_discarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The session is single-use and nothing reads its jar, and curl_cffi parses each
+        ``Set-Cookie`` line with strict UTF-8 (``requests/cookies.py``), so a hostile header would
+        otherwise raise a ``UnicodeDecodeError`` out of a completed response."""
+        curl = install_fake_curl(monkeypatch, _page())
+
+        await _fetch()
+
+        assert curl.sessions[0].kwargs["discard_cookies"] is True
+
     async def test_no_headers_are_passed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The impersonation profile supplies Chrome's complete header set (Accept, Accept-Language,
         Priority, the Sec-Fetch and sec-ch-ua families). Overriding it with the direct path's
@@ -1108,6 +1118,12 @@ class TestFailureMapping:
             (curl_exceptions.IncompleteRead("partial", CurlECode.PARTIAL_FILE), "decode"),
             (curl_exceptions.ConnectionError("refused", CurlECode.COULDNT_CONNECT), "connection"),
             (CurlError("bad setopt", CurlECode.UNKNOWN_OPTION), "connection"),
+            # A Content-Encoding libcurl cannot decode (code 61) arrives as ``HTTPError``; a status
+            # line it cannot parse (code 8) arrives as ``ConnectionError`` in curl_cffi's own map, so
+            # the transport reads the code. Both are the direct path's ``malformed_response``: a
+            # response refused before the body was ours.
+            (curl_exceptions.HTTPError("bad content encoding", CurlECode.BAD_CONTENT_ENCODING), "malformed_response"),
+            (curl_exceptions.ConnectionError("weird server reply", CurlECode.WEIRD_SERVER_REPLY), "malformed_response"),
         ],
     )
     async def test_a_code_carrying_failure_maps_to_a_failure_class(
@@ -1126,6 +1142,41 @@ class TestFailureMapping:
         assert excinfo.value.exc == type(exc).__name__
         assert excinfo.value.__cause__ is exc
         assert curl.sessions[0].closed
+
+    def test_every_failure_class_the_direct_path_speaks_is_reachable(self) -> None:
+        """The vocabulary the transport claims to mirror (``resolution_source._network_failure_class``)
+        has six tokens; before the ``HTTPError`` clause ``malformed_response`` was one it could
+        never emit."""
+        reachable = {
+            impersonated_fetch._curl_failure_class(exc)
+            for exc in (
+                curl_exceptions.Timeout("t", CurlECode.OPERATION_TIMEDOUT),
+                curl_exceptions.SSLError("s", CurlECode.SSL_CONNECT_ERROR),
+                curl_exceptions.DNSError("d", CurlECode.COULDNT_RESOLVE_HOST),
+                curl_exceptions.IncompleteRead("i", CurlECode.PARTIAL_FILE),
+                curl_exceptions.HTTPError("h", CurlECode.BAD_CONTENT_ENCODING),
+                curl_exceptions.ConnectionError("c", CurlECode.COULDNT_CONNECT),
+            )
+        }
+
+        assert reachable == {"timeout", "tls", "dns", "decode", "malformed_response", "connection"}
+
+    async def test_a_unicode_decode_error_out_of_curl_cffi_is_a_transport_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """curl_cffi decodes server-controlled bytes with strict UTF-8 when it parses a completed
+        response (the reason phrase in ``requests/session.py``, and the cookie jar unless cookies
+        are discarded), so a ``UnicodeDecodeError``, a ``ValueError`` that is neither a
+        ``RequestException`` nor a ``CurlError``, escaped ``_dial`` and broke the contract that
+        every failure out of the transport is an ``ImpersonateDeclined``."""
+        install_fake_curl(monkeypatch, UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"))
+
+        with pytest.raises(ImpersonateTransportError) as excinfo:
+            await _fetch()
+
+        assert excinfo.value.failure_class == "malformed_response"
+        assert excinfo.value.exc == "UnicodeDecodeError"
+        assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
 
     @pytest.mark.allow_network
     async def test_a_plaintext_listener_behind_https_maps_to_tls(self, monkeypatch: pytest.MonkeyPatch) -> None:

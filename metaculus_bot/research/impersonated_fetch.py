@@ -73,9 +73,10 @@ from urllib.parse import urljoin, urlparse
 
 import certifi
 from curl_cffi import CurlError, CurlOpt
+from curl_cffi.const import CurlECode
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from curl_cffi.requests import AsyncSession
-from curl_cffi.requests.exceptions import DNSError, IncompleteRead, RequestException, SSLError, Timeout
+from curl_cffi.requests.exceptions import DNSError, HTTPError, IncompleteRead, RequestException, SSLError, Timeout
 
 from metaculus_bot.constants import (
     IMPERSONATE_BROWSER_TARGET,
@@ -572,6 +573,12 @@ async def _dial(
             # provider down with it. A ``CurlError`` out of ``AsyncSession.close()`` on the way
             # out of the ``async with`` is outside this try either way.
             raise ImpersonateTransportError(failure_class=_curl_failure_class(exc), exc=type(exc).__name__) from exc
+        except UnicodeDecodeError as exc:
+            # curl-cffi decodes the reason phrase of a completed response with strict UTF-8 when
+            # it parses the headers (``requests/session.py``), so a hostile status line raises a
+            # ``ValueError`` that is neither a ``RequestException`` nor a ``CurlError``. The direct
+            # path calls a response its parser refused ``malformed_response``; so does this one.
+            raise ImpersonateTransportError(failure_class="malformed_response", exc=type(exc).__name__) from exc
     _check_pin(response.primary_ip, vetted_ip, hop_url)
     headers = response.headers
     return _Hop(
@@ -658,6 +665,10 @@ def _pinned_session(resolve_entry: str, hop_timeout_s: float) -> AsyncSession:
         verify=certifi.where(),  # pyright: ignore[reportArgumentType]  # CA bundle path; the hint is narrower than the runtime
         timeout=hop_timeout_s,
         curl_options=curl_options,
+        # The session is single-use and nothing reads its jar. curl-cffi parses every
+        # ``Set-Cookie`` line with strict UTF-8 (``requests/cookies.py``), so without this a
+        # hostile cookie header raises a ``UnicodeDecodeError`` out of a completed response.
+        discard_cookies=True,
     )
 
 
@@ -778,14 +789,19 @@ def _curl_failure_class(exc: CurlError) -> str:
     """Bucket a curl-cffi failure into the direct path's ``failure_class`` vocabulary.
 
     Mirrors ``resolution_source._network_failure_class`` so the two fetchers speak the same
-    small set. In the non-stream mode the transport uses, curl-cffi maps the libcurl code to its
-    typed subclass through ``code2error`` before raising, so the ladder below sees ``Timeout``
+    six-token set. In the non-stream mode the transport uses, curl-cffi maps the libcurl code to
+    its typed subclass through ``code2error`` before raising, so the ladder below sees ``Timeout``
     for code 28, ``SSLError`` for the TLS codes, ``DNSError`` for 6 and ``IncompleteRead`` for
     18 (verified on loopback: a plaintext listener behind an ``https`` URL arrives as
     ``SSLError`` 35). The specific classes come first because ``DNSError`` and ``SSLError`` both
-    subclass curl-cffi's ``ConnectionError``, and ``CertificateVerifyError`` subclasses
-    ``SSLError``. Everything else, the bare ``CurlError`` a rejected option raises included, is
-    ``connection``; no new token is invented, because the vocabulary is a marker contract.
+    subclass curl-cffi's ``ConnectionError``, ``CertificateVerifyError`` subclasses ``SSLError``
+    and ``IncompleteRead`` subclasses ``HTTPError``. ``malformed_response`` is the direct path's
+    token for a response the parser refused before the body was ours: here ``HTTPError``, which
+    ``code2error`` attaches to a ``Content-Encoding`` libcurl cannot decode (61) and to the HTTP/2
+    and HTTP/3 framing codes, plus ``WEIRD_SERVER_REPLY`` (8, a status line libcurl cannot
+    parse), which curl-cffi types as a ``ConnectionError`` and so has to be read off the code.
+    Everything else, the bare ``CurlError`` a rejected option raises included, is ``connection``;
+    no new token is invented, because the vocabulary is a marker contract.
     """
     if isinstance(exc, Timeout):
         return "timeout"
@@ -795,4 +811,6 @@ def _curl_failure_class(exc: CurlError) -> str:
         return "dns"
     if isinstance(exc, IncompleteRead):
         return "decode"
+    if isinstance(exc, HTTPError) or exc.code == CurlECode.WEIRD_SERVER_REPLY:
+        return "malformed_response"
     return "connection"
