@@ -40,6 +40,11 @@ Every question goes through `ResearchOrchestrator.run_research`
 The single string returned from `run_research` is what every forecaster in the
 ensemble reads verbatim.
 
+`research/section_format.py` also owns `detect_providers` and `detect_gap_fill`,
+which decode section headers for both the log and comment backfill scripts. The
+scripts share detection rules while retaining their separate archive record builders
+and provenance.
+
 ## Primary provider: a priority ladder
 
 There is always exactly one primary provider, chosen by
