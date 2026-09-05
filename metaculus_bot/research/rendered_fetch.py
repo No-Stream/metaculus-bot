@@ -52,14 +52,15 @@ logger = logging.getLogger(__name__)
 RENDER_TIMEOUT_MS: int = 35_000
 RENDER_SETTLE_MS: int = 2_000
 # Bound on ``page.content()``. On a settled DOM it is a sub-second round trip to the browser; it
-# runs long only when the page keeps navigating after the settle, which Playwright retries
-# internally before giving up ("the page is navigating and changing the content"). Measured
-# 2026-09-03 on ogimet.com: the goto timed out at 33 s as designed, the settle ran, and the
-# unbounded read then blocked for a further 40 s, so the render ran 76 s against a Tier-1
-# provider wall of 45 s and every page that question had already fetched was discarded. A DOM
-# that has not answered in this long is one that will not settle. Fixed rather than derived
-# from the remaining goto budget, because the read that matters most is the salvage AFTER a
-# goto timeout, when that remainder is zero by construction.
+# runs long only when the page keeps navigating after the settle. Measured 2026-09-03 on
+# ogimet.com: the goto timed out at 33 s as designed, the settle ran, and the unbounded read then
+# blocked for a further 40 s, so the render ran 76 s against a Tier-1 provider wall of 45 s and
+# every page that question had already fetched was discarded. A DOM that has not answered in this
+# long is one that will not settle. The pinned 1.61 driver does NOT retry the read: it evaluates
+# ``outerHTML`` once and, when the page navigates mid-evaluate, raises its plain ``Error`` ("the
+# page is navigating and changing the content"), which :func:`_navigate_and_read_dom` reads as the
+# same cut-off. Fixed rather than derived from the remaining goto budget, because the read that
+# matters most is the salvage AFTER a goto timeout, when that remainder is zero by construction.
 RENDER_DOM_READ_TIMEOUT_MS: int = 5_000
 # What a render spends AFTER its goto returns or times out, at worst: the settle, then the DOM
 # read at its bound. A caller-derived deadline has to leave this much room past the goto, or the
@@ -108,15 +109,16 @@ RENDER_LAUNCH_CAP: int = 2
 _RENDERED_FETCH_GLOBAL_SEMAPHORE = asyncio.Semaphore(RENDER_LAUNCH_CAP)
 
 # The two per-run render memos, one bounded map. ``no_text``: Chromium ran and the caller's
-# extraction found nothing, so a second launch on the same URL in the same run is skipped —
-# 100-300 MB and a whole slot out of the cap above, to learn what this run already knows.
-# ``timed_out``: the render was cut off (the page kept navigating), and the transport re-raises
-# that rather than launching again. Both deliberately record ONLY those outcomes — a `blocked` or
-# `error` GET is never memoized, because 429 is retryable and a throttle interstitial has to
-# stay re-requestable (the q45191 receipt). Keyed by (scope, url): the two callers mean
-# different things by "rendered to nothing" (gap-fill v2 writes it on bare trafilatura
-# emptiness; Tier-1 only after the ARIA rewrite, the inline-chart read and the XHR-harvest
-# fallback have ALL failed), so one path's negative must never answer the other's question.
+# extraction found nothing, so a second launch on the same URL in the same run is skipped: 100-300 MB
+# and a whole slot out of the cap above, to learn what this run already knows. ``timed_out``: the
+# render ran and read no DOM, because the read was cut off or refused (the page kept navigating) or
+# the navigation failed onto Chromium's own document, and the transport re-raises
+# :class:`RenderTimeout` rather than launching again. Both deliberately record ONLY those outcomes:
+# a `blocked` or `error` GET is never memoized, because 429 is retryable and a throttle
+# interstitial has to stay re-requestable (the q45191 receipt). Keyed by (scope, url): the two
+# callers mean different things by "rendered to nothing" (gap-fill v2 writes it on bare trafilatura
+# emptiness; Tier-1 only after the ARIA rewrite, the inline-chart read and the XHR-harvest fallback
+# have ALL failed), so one path's negative must never answer the other's question.
 MemoScope = Literal["resolution_source", "gap_fill_v2"]
 _MemoKind = Literal["no_text", "timed_out"]
 _RENDER_MEMO_MAX_ENTRIES = 50
@@ -146,7 +148,16 @@ _JSON_CONTENT_TYPE_TOKENS = ("application/json", "text/json", "+json")
 
 
 class RenderTimeout(TimeoutError):
-    """A render that ran and was CUT OFF, or a URL whose render already was in this run.
+    """A render that ran and was CUT OFF, or a URL a render in this run already ran to no DOM.
+
+    "Cut off" has two shapes, and both are the page keeping on navigating after the settle: the
+    DOM read outlives ``RENDER_DOM_READ_TIMEOUT_MS``, or the browser refuses it first, because the
+    pinned 1.61 driver evaluates ``outerHTML`` once and raises its plain ``Error`` ("Unable to
+    retrieve content because the page is navigating and changing the content.") when the document
+    changes under the evaluate. The second is caught at that one call and re-raised as this class,
+    since at the transport's Playwright boundary it read as "the renderer is unavailable", burned
+    the once-per-run warn latch (so a real install failure later in the run logged nothing) and
+    wrote no memo (so the next question relaunched Chromium for the same page).
 
     A subclass of the builtin so both callers' ``except TimeoutError`` catch it unchanged, and a
     class of its own so the transport can tell its deliberate cut-off from a raw OS-level
@@ -154,13 +165,17 @@ class RenderTimeout(TimeoutError):
     render: the first is re-raised for the caller to record as ``render_timeout``, the second is
     not a fact about the page and lands in the logged boundary like any other unexpected error.
 
-    The timed-out memo is written at the RAISE SITE of this exception, inside the transport, and
-    nowhere else: a caller that bounds the whole call with its own ``wait_for`` cannot tell a
-    render that ran out the clock from one that never left the queue behind the two gates, and
-    memoising the second would switch the URL off for every later question in the run over a
-    wait that was never about the page. At the raise site rather than in a handler because the
-    exception unwinds through the bounded teardown before any handler sees it, and a caller's
-    cancellation landing during that teardown replaces it, so a handler would never run.
+    The timed-out memo is written inside the transport at the RAISE SITE, of this exception and
+    of the failed-navigation half of :class:`RenderOffHost` (Chromium's own document, from which a
+    retry reads nothing either), and nowhere else: a caller that bounds the whole call with its
+    own ``wait_for`` cannot tell a render that ran out the clock from one that never left the
+    queue behind the two gates, and memoising the second would switch the URL off for every later
+    question in the run over a wait that was never about the page. At the raise site rather than
+    in a handler because the exception unwinds through the bounded teardown before any handler
+    sees it, and a caller's cancellation landing during that teardown replaces it, so a handler
+    would never run. A memo hit re-raises this class before any gate is taken, so a URL memoised by
+    either raise site is recorded by the Tier-1 caller as ``render_timeout`` from the second
+    question on.
     """
 
 
@@ -211,12 +226,18 @@ class RenderOffHost(Exception):
     count is therefore an UPPER bound on hostile landings: it also counts failed navigations, and
     the marker's ``landed_host`` tells the two apart (``chromewebdata`` is the error document).
 
-    Its own class for the same reason as :class:`RenderDomOverCeiling`: the page rendered, so it
-    is a fact about the page rather than about the browser install, and the callers count it
-    under its own token. Not a ``TimeoutError``: no clock ran out. Not memoised: the page was not
-    "rendered to nothing", and the host it redirected the browser to is not something a retry
-    within the run changes. ``final_url`` is carried for the caller's own classification; the
-    transport's log names only its hostname, because a landing URL can carry a token.
+    Its own class for the same reason as :class:`RenderDomOverCeiling`: it is a fact about the
+    page rather than about the browser install, and the callers count it under its own token. Not
+    a ``TimeoutError``: no clock ran out. Memoised by halves (:func:`_refuse_landing`). A genuine
+    http(s) landing on another host is not: the page was not "rendered to nothing", the host it
+    sent the browser to is not something a retry within the run changes, and the next question
+    citing it should be refused on its own record. Chromium's own document (any non-http(s)
+    landing, the error document above included) is: the page rendered nothing and a retry changes
+    nothing, which is the population the empty-DOM read used to memoise through the callers'
+    no-text memo, so the transport writes its timed-out memo at the raise site and a later render
+    of the URL in the run declines without a launch. ``final_url`` is carried for the caller's own
+    classification; the transport's log names only its hostname, because a landing URL can carry
+    a token.
     """
 
     def __init__(self, *, requested_url: str, final_url: str, pinned_host: str) -> None:
@@ -308,7 +329,10 @@ def note_rendered_no_text(url: str, *, memo_scope: MemoScope) -> None:
 
 
 def _note_render_timeout(url: str, *, memo_scope: MemoScope) -> None:
-    """Record that a render of ``url`` RAN and was cut off, so this run does not pay for it again.
+    """Record that a render of ``url`` RAN and read no DOM, so this run does not pay for it again.
+
+    Cut off or refused because the page kept navigating, or a navigation that failed onto
+    Chromium's own document (:func:`_refuse_landing`).
 
     Transport-private: only :func:`render_page` knows a browser actually ran (see
     :class:`RenderTimeout`), so no caller writes this one.
@@ -505,13 +529,17 @@ def _landed_off_host(final_url: str, pinned_host: str) -> bool:
     """Whether the main frame's landing URL is anywhere but ``pinned_host``.
 
     A guard that fails SHUT. The only landings it lets through without a matching hostname are
-    the no-document ones: an empty ``page.url`` and the ``about:`` scheme (``about:blank`` when a
-    navigation never committed, ``about:srcdoc``), which are nobody's host and fall through to the
-    empty DOM read they always produced. Everything else is compared by ``urlparse`` hostname,
-    lower-cased with the brackets stripped, the same form the pin was built from, and a URL with no
-    hostname at all is off-host. That covers an http(s) URL with an empty authority, every
-    non-http(s) scheme Chromium can leave the frame on (``data:``, ``file:``, ``blob:``), and
-    Chromium's own error document: live QA on 2026-09-04 observed
+    the no-document ones: an empty ``page.url``, and an ``about:`` URL with NO hostname
+    (``about:blank`` when a navigation never committed, ``about:srcdoc``), which are nobody's host
+    and fall through to the empty DOM read they always produced. The scheme alone is not the
+    allowance: ``about://evil.example/`` parses with a hostname, and let through on its scheme it
+    would reach ``RenderedPage.document_url`` as the base the callers classify against. So the
+    invariant every allowed landing satisfies is "no hostname, or the pinned one", which is exactly
+    what ``document_url`` relies on when it falls back to the requested URL. Everything else is
+    compared by ``urlparse`` hostname, lower-cased with the brackets stripped, the same form the pin
+    was built from, and a URL with no hostname at all is off-host. That covers an http(s) URL with
+    an empty authority, every non-http(s) scheme Chromium can leave the frame on (``data:``,
+    ``file:``, ``blob:``), and Chromium's own error document: live QA on 2026-09-04 observed
     ``page.url == "chrome-error://chromewebdata/"`` after a goto that failed with
     ``net::ERR_UNSAFE_PORT`` and after ``net::ERR_CONNECTION_REFUSED`` on a redirect to a loopback
     target, and the tri-state predecessor of this helper, which allowed every non-http(s) scheme,
@@ -519,9 +547,30 @@ def _landed_off_host(final_url: str, pinned_host: str) -> bool:
     boolean whose allow case is the named sentinel it is refused with no arm of its own.
     """
     parsed = urlparse(final_url)
-    if not final_url or parsed.scheme.lower() == "about":
+    if not final_url or (parsed.scheme.lower() == "about" and parsed.hostname is None):
         return False
     return parsed.hostname != pinned_host
+
+
+def _refuse_landing(requested_url: str, final_url: str, pinned_host: str, *, memo_scope: MemoScope) -> RenderOffHost:
+    """Build the off-host refusal, memoising first when the landing is Chromium's own document.
+
+    Two populations share :class:`RenderOffHost`, and only one is worth remembering. A landing
+    whose scheme is not http(s) is a document the browser made rather than a redirect to a
+    stranger's host: ``chrome-error://chromewebdata/`` after a failed navigation, or a ``data:``,
+    ``blob:`` or ``file:`` document the page navigated itself to. The page rendered nothing a caller
+    could read and a retry within the run changes nothing, which is exactly the population the
+    empty-DOM read used to memoise through the callers' no-text memo, so without a memo a run
+    relaunched Chromium (100-300 MB and one of the two slots) for the same dead URL on every later
+    question that cited it. The timed-out memo is the one the transport owns, and it is written
+    here, at the raise site, for the reason :class:`RenderTimeout` gives. An http(s) landing on
+    another host is memoised by nobody: it is a fact about where the page sent the browser, not
+    about the page having nothing, and the next question citing it runs the render and is refused
+    on its own record.
+    """
+    if urlparse(final_url).scheme.lower() not in ("http", "https"):
+        _note_render_timeout(requested_url, memo_scope=memo_scope)
+    return RenderOffHost(requested_url=requested_url, final_url=final_url, pinned_host=pinned_host)
 
 
 def _goto_budget_ms(goto_timeout_ms: int, deadline_monotonic_s: float | None) -> int | None:
@@ -635,7 +684,9 @@ async def _navigate_and_read_dom(
     salvage path ``response`` is None and there is no other source, and that path is where a
     timed-out navigation may already have landed on a redirect target. A landing on any other
     host, an IP literal included, raises :class:`RenderOffHost` before ``page.content()`` is
-    called, which is the cheap early exit. Then the same check runs again on ``page.url`` as it
+    called, which is the cheap early exit (memoised by halves, see :func:`_refuse_landing`: a
+    failed navigation left on Chromium's own document is, a redirect to a stranger's host is not).
+    Then the same check runs again on ``page.url`` as it
     stands after the read, because a navigation can commit in the one driver round trip between
     the first check and the read (see the comment at that line), and a mismatch there raises the
     same exception with the DOM that was read discarded unpublished. The page's ``final_url`` is
@@ -656,7 +707,10 @@ async def _navigate_and_read_dom(
     The DOM read is bounded by ``RENDER_DOM_READ_TIMEOUT_MS`` and raises :class:`RenderTimeout`
     when it fires — deliberately NOT swallowed into the salvage, because a page that keeps
     navigating has no DOM to salvage and the caller needs to tell this from a browser that is
-    missing or broken (see :func:`render_page`). The timed-out memo for ``memo_scope`` is written
+    missing or broken (see :func:`render_page`). The browser's own refusal of the read, Playwright's
+    plain ``Error`` for a page that navigated during the evaluate, is the same fact about the page
+    and is caught at this one call and raised as the same class; every other Playwright error on
+    the render path keeps its own boundary. The timed-out memo for ``memo_scope`` is written
     here, immediately before the raise, so it lands even when the caller's own cut arrives while
     the exception is still unwinding through teardown. The harvest's in-flight body reads are
     drained INSIDE what is left of that same bound, never after it, and no later than the
@@ -683,7 +737,7 @@ async def _navigate_and_read_dom(
     await page.wait_for_timeout(RENDER_SETTLE_MS)
     final_url: str = page.url
     if _landed_off_host(final_url, pinned_host):
-        raise RenderOffHost(requested_url=url, final_url=final_url, pinned_host=pinned_host)
+        raise _refuse_landing(url, final_url, pinned_host, memo_scope=memo_scope)
     # ``goto`` returns None for an about:blank or same-document navigation, and the salvage
     # above leaves no response either; both read as "no main-frame response".
     content_type = (response.headers.get("content-type") or "").lower() if response is not None else ""
@@ -696,6 +750,18 @@ async def _navigate_and_read_dom(
         raise RenderTimeout(
             f"the DOM read of {urlparse(url).netloc} outlived {RENDER_DOM_READ_TIMEOUT_MS}ms: the page kept navigating"
         ) from exc
+    except playwright_error as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # Playwright's own Error class, passed in from the optional import; this one call only
+        # The driver's other answer to the same page (see :class:`RenderTimeout`): in 1.61,
+        # ``Frame.content()`` evaluates ``outerHTML`` once and raises its plain ``Error`` when the
+        # page navigates mid-evaluate. Left to the boundary in ``render_page`` it was classified
+        # as the renderer being unavailable, which latched the once-per-run warning and memoised
+        # nothing. Every Playwright error out of this one call is read as the page rather than the
+        # install; the browser dying during this exact call would ride along, a shape the
+        # 2026-09-04 probe never produced, and the alternative is matching on the message text.
+        _note_render_timeout(url, memo_scope=memo_scope)
+        raise RenderTimeout(
+            f"the browser refused the DOM read of {urlparse(url).netloc}: the page kept navigating ({exc})"
+        ) from exc
     # The same check again, on the document the read actually came from. `page.url` is a cached
     # attribute the driver updates on its `navigated` event and `page.content()` is a round trip
     # evaluated in whatever document is current when the driver handles it, so a navigation that
@@ -705,7 +771,7 @@ async def _navigate_and_read_dom(
     # call: reading `page.url` costs a local attribute access, so the render is no longer for it.
     final_url = page.url
     if _landed_off_host(final_url, pinned_host):
-        raise RenderOffHost(requested_url=url, final_url=final_url, pinned_host=pinned_host)
+        raise _refuse_landing(url, final_url, pinned_host, memo_scope=memo_scope)
     if len(html) > RENDERED_DOM_MAX_CHARS:
         logger.warning(
             "rendered fetch declined the DOM of %s: %d chars is over the %d-char ceiling",
@@ -731,32 +797,46 @@ async def _navigate_and_read_dom(
     )
 
 
+def _same_publisher(host: str | None, other: str) -> bool:
+    """True when ``host`` and ``other`` belong to one publisher, by registrable domain.
+
+    The public suffix plus one label, from the public-suffix list vendored by
+    ``research/public_suffix.py`` (``registrable_domain``). A page on ``www.x.gov`` whose data
+    endpoint is ``api.x.gov`` or ``data.x.gov`` is the ordinary dashboard shape, and a page on
+    ``forest-fire.emergency.copernicus.eu`` fed by ``api2.effis.emergency.copernicus.eu`` is the
+    sibling-subdomain shape live QA found (2026-09-03); a bare ``endswith`` relation matched
+    neither. The PSL is also what makes ``a.co.uk`` and ``b.co.uk`` strangers and a stranger's site
+    on a shared suffix (``x.github.io`` against ``github.io``) no match. IP literals have no
+    registrable domain and the PSL algorithm would collapse two of them to their last two octets,
+    so they are compared exactly and never otherwise, and a missing hostname is nobody's publisher.
+
+    Two readers, one judgment: the XHR harvest deciding whose JSON a page fetched
+    (:func:`_harvestable_json_host`), and the ``RENDERED_FETCH_OFF_HOST`` marker's
+    ``same_publisher`` field, which tells a benign hop inside the publisher's own domain from a
+    landing on a stranger's.
+    """
+    if not host or not other:
+        return False
+    if host == other:
+        return True
+    if _ip_literal(host) is not None or _ip_literal(other) is not None:
+        return False
+    publisher = registrable_domain(other)
+    return publisher is not None and registrable_domain(host) == publisher
+
+
 def _harvestable_json_host(response_host: str, page_host: str) -> bool:
     """True when ``response_host`` may serve harvestable JSON for a page on ``page_host``.
 
-    Same publisher, by registrable domain: the public suffix plus one label, from the
-    public-suffix list vendored by ``research/public_suffix.py`` (``registrable_domain``). A page
-    on ``www.x.gov`` whose data endpoint is ``api.x.gov`` or ``data.x.gov`` is the ordinary
-    dashboard shape, and a page on ``forest-fire.emergency.copernicus.eu`` fed by
-    ``api2.effis.emergency.copernicus.eu`` is the sibling-subdomain shape live QA found
-    (2026-09-03); a bare ``endswith`` relation matched neither. The PSL is also what makes
-    ``a.co.uk`` and ``b.co.uk`` strangers and a stranger's site on a shared suffix
-    (``x.github.io`` against ``github.io``) no match, which is exactly where a wrong answer reads
-    someone else's JSON as the cited page's content. IP literals have no registrable domain and
-    the PSL algorithm would collapse two of them to their last two octets, so they are compared
-    exactly and never otherwise. The explicitly allow-listed CDNs are the one exception to
-    same-publisher.
+    Same publisher (:func:`_same_publisher`), which is exactly where a wrong answer reads someone
+    else's JSON as the cited page's content, or one of the explicitly allow-listed CDNs, the one
+    exception to same-publisher.
     """
     if not response_host or not page_host:
         return False
-    if response_host == page_host:
-        return True
     if response_host in HARVEST_ALLOWED_CDN_HOSTS:
         return True
-    if _ip_literal(response_host) is not None or _ip_literal(page_host) is not None:
-        return False
-    publisher = registrable_domain(page_host)
-    return publisher is not None and registrable_domain(response_host) == publisher
+    return _same_publisher(response_host, page_host)
 
 
 def is_json_content_type(content_type: str) -> bool:
@@ -907,8 +987,9 @@ async def render_page(
     :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
 
     A render that ran and was CUT OFF is different, and raises :class:`RenderTimeout` (a
-    builtin ``TimeoutError``) instead: the DOM read outlived ``RENDER_DOM_READ_TIMEOUT_MS``
-    because the page kept navigating. It is not folded into ``None`` because the two mean
+    builtin ``TimeoutError``) instead: the DOM read outlived ``RENDER_DOM_READ_TIMEOUT_MS``, or the
+    browser refused it with its own "navigating" error, because the page kept navigating. It is
+    not folded into ``None`` because the two mean
     different things to a caller — a timeout says nothing about whether Chromium works, so it
     must neither trip the once-per-process unavailable warning nor be recorded as the browser
     being absent — and it is its own class so the Tier-1 rung, which also bounds this whole call
@@ -917,7 +998,10 @@ async def render_page(
     ``TimeoutError``, which says nothing about the page). The transport memoises the timed-out
     URL for the run at the raise site — and only there, for that same reason — and a memoised
     timeout is RE-RAISED here rather than declined, so a second question citing the same hostile
-    page records the same reason again instead of reading as a missing browser.
+    page records the same reason again instead of reading as a missing browser. The same memo is
+    written for a navigation that failed onto Chromium's own document, the failed-navigation half
+    of :class:`RenderOffHost`, so a dead URL is not relaunched for either; from the second question
+    on it is recorded as ``render_timeout``.
 
     What a deadline bounds, and what it does not. ``deadline_monotonic_s`` is the instant by
     which the transport must have its DOM (and any harvested bodies) in hand: the goto is sized
@@ -959,8 +1043,10 @@ async def render_page(
         logger.debug("rendered fetch skipped (already rendered to nothing): %s", urlparse(url).netloc)
         return None
     if render_timed_out(url, memo_scope=memo_scope):
-        logger.info("rendered fetch skipped (a render already timed out this run): %s", urlparse(url).netloc)
-        raise RenderTimeout(f"a render of {urlparse(url).netloc} already timed out this run")
+        logger.info("rendered fetch skipped (a render already ran to no DOM this run): %s", urlparse(url).netloc)
+        raise RenderTimeout(
+            f"a render of {urlparse(url).netloc} already ran to no DOM this run: cut off, or a failed navigation"
+        )
     try:
         from playwright.async_api import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
             Error as PlaywrightError,
@@ -992,9 +1078,10 @@ async def render_page(
                 deadline_monotonic_s=deadline_monotonic_s,
                 harvest_json=harvest_json,
             )
-    # The three declines the caller records under their own tokens: nothing is memoised for any
-    # of them (nothing ran for the first; the second rendered content, just too much of it; the
-    # third rendered a page on a host the pin does not cover, and published none of it).
+    # The three declines the caller records under their own tokens. Nothing is memoised for the
+    # first two (nothing ran for the first; the second rendered content, just too much of it). The
+    # third memoises by halves at its raise site (`_refuse_landing`): a page that sent the browser
+    # to another host is not, a failed navigation left on Chromium's own document is.
     except (RenderBudgetExpired, RenderDomOverCeiling):
         raise
     except RenderOffHost as exc:
@@ -1004,24 +1091,28 @@ async def render_page(
         # free-text WARNING is gone once the GitHub Actions logs expire at 90 days. ``scope`` names
         # which caller's render it was, since the two have different URL populations.
         # Hostnames only: the landing URL can carry a session token or a credential. A landing URL
-        # with no hostname at all renders as ``None``, which harvests as no data.
+        # with no hostname at all renders as ``None``, which harvests as no data. ``same_publisher``
+        # is the registrable-domain judgment the harvest makes about a page's own JSON, applied to
+        # the landing: strict hostname equality also refuses a benign hop inside the publisher's own
+        # domain (``example.com`` to ``www.example.com``), and without the field every such record
+        # read as a security event. ``true`` prices the strictness; ``false`` is the signal.
+        landed_host = urlparse(exc.final_url).hostname
         logger.warning(
-            "RENDERED_FETCH_OFF_HOST: scope=%s pinned_host=%s landed_host=%s",
+            "RENDERED_FETCH_OFF_HOST: scope=%s pinned_host=%s landed_host=%s same_publisher=%s",
             memo_scope,
             exc.pinned_host,
-            urlparse(exc.final_url).hostname,
+            landed_host,
+            "true" if _same_publisher(landed_host, exc.pinned_host) else "false",
         )
         raise
     # Ordered before Playwright's Error deliberately, though the order is not load-bearing:
     # Playwright's TimeoutError derives from its own Error, not the builtin, so this clause never
     # sees one, and a raw OS-level TimeoutError is not a RenderTimeout and falls through to the
     # logged boundary below. The memo was already written at the raise site; only the log is here.
-    except RenderTimeout:
-        logger.warning(
-            "rendered fetch timed out reading the DOM of %s after %dms: the page kept navigating",
-            urlparse(url).netloc,
-            RENDER_DOM_READ_TIMEOUT_MS,
-        )
+    except RenderTimeout as exc:
+        # The exception's own message says which shape it was: the bound firing, or the browser
+        # refusing the read because the page was navigating.
+        logger.warning("rendered fetch timed out reading the DOM of %s: %s", urlparse(url).netloc, exc)
         raise
     except PlaywrightError as exc:
         _warn_playwright_unavailable_once(exc)

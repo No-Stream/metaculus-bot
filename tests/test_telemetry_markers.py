@@ -1530,16 +1530,24 @@ class TestResolutionSourceUrlContextNotAddressed:
 # run carries a record and a first one is itself the finding.
 RENDERED_FETCH_OFF_HOST_LINE = (
     PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
-    "landed_host=internal.example.net"
+    "landed_host=internal.example.net same_publisher=false"
 )
 RENDERED_FETCH_OFF_HOST_GAP_FILL_LINE = (
     PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=gap_fill_v2 pinned_host=dashboard.example.com "
-    "landed_host=169.254.169.254"
+    "landed_host=169.254.169.254 same_publisher=false"
 )
-# An http(s) landing with no hostname at all: ``urlparse(...).hostname`` is None and the %s renders
-# it as the word the parser reads as no data.
+# A landing with no hostname at all (an http(s) URL with an empty authority, or a non-http(s)
+# scheme the fail-shut guard refuses): ``urlparse(...).hostname`` is None and the %s renders it as
+# the word the parser reads as no data. No hostname is never the same publisher.
 RENDERED_FETCH_OFF_HOST_NO_HOSTNAME_LINE = (
-    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com landed_host=None"
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+    "landed_host=None same_publisher=false"
+)
+# A benign client-side hop inside the publisher's own registrable domain, refused by strict
+# hostname equality: the record that prices the strictness rather than the security signal.
+RENDERED_FETCH_OFF_HOST_SAME_PUBLISHER_LINE = (
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+    "landed_host=www.dashboard.example.com same_publisher=true"
 )
 
 
@@ -1559,15 +1567,27 @@ class TestRenderedFetchOffHost:
         assert rec["pinned_host"] == "dashboard.example.com"
         # A HOSTNAME, never the landing URL, which can carry a session token or a credential.
         assert rec["landed_host"] == "internal.example.net"
+        # Another registrable domain: the security signal.
+        assert rec["same_publisher"] is False
 
     def test_the_gap_fill_callers_render_is_told_apart_by_scope(self):
         rec = _parse_one(RENDERED_FETCH_OFF_HOST_GAP_FILL_LINE)
         assert rec["scope"] == "gap_fill_v2"
         # The IMDS shape: an IP literal is a stranger like any other host.
         assert rec["landed_host"] == "169.254.169.254"
+        assert rec["same_publisher"] is False
 
     def test_a_landing_with_no_hostname_harvests_as_no_data(self):
-        assert _parse_one(RENDERED_FETCH_OFF_HOST_NO_HOSTNAME_LINE)["landed_host"] is None
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_NO_HOSTNAME_LINE)
+        assert rec["landed_host"] is None
+        assert rec["same_publisher"] is False
+
+    def test_a_benign_hop_inside_the_publisher_prices_the_strictness(self):
+        # Strict hostname equality also refuses `example.com` to `www.example.com`; this field is
+        # what keeps that population from diluting the security signal.
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_SAME_PUBLISHER_LINE)
+        assert rec["landed_host"] == "www.dashboard.example.com"
+        assert rec["same_publisher"] is True
 
     def test_no_question_ref(self):
         # The transport runs per URL with no question in scope, so a join goes through the run id.

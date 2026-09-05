@@ -22,10 +22,11 @@ import inspect
 import logging
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import pytest
+from playwright.async_api import Browser, WebSocketRoute
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import WebSocketRoute
 
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -35,6 +36,7 @@ from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.resolution_source import FetchContext
 from scripts.telemetry.markers import MARKER_SPECS
 from tests.playwright_fakes import (
+    FakeBrowser,
     FakePage,
     FakeResponse,
     FakeWebSocketRoute,
@@ -336,6 +338,28 @@ class TestHarvestableHost:
     )
     def test_the_host_rule(self, response_host, page_host, expected):
         assert rendered_fetch._harvestable_json_host(response_host, page_host) is expected
+
+
+class TestSamePublisher:
+    """The one registrable-domain judgment behind the harvest's host rule and the off-host marker's
+    ``same_publisher`` field: the public suffix plus one label, IP literals compared exactly, and no
+    hostname never the same publisher."""
+
+    @pytest.mark.parametrize(
+        ("host", "other", "expected"),
+        [
+            ("www.dashboard.example.com", "dashboard.example.com", True),
+            ("api.x.gov", "www.x.gov", True),
+            ("internal.example.net", "dashboard.example.com", False),
+            ("a.co.uk", "b.co.uk", False),
+            ("169.254.169.254", "dashboard.example.com", False),
+            ("chromewebdata", "dashboard.example.com", False),
+            (None, "dashboard.example.com", False),
+            ("", "dashboard.example.com", False),
+        ],
+    )
+    def test_the_rule(self, host, other, expected):
+        assert rendered_fetch._same_publisher(host, other) is expected
 
 
 class TestDerivedFeedSelection:
@@ -890,6 +914,29 @@ class TestTheSharedPlaywrightFake:
             with pytest.raises(TypeError):
                 signature.bind(None, 1008, "blocked")
 
+    async def test_the_context_double_takes_only_the_real_option_names(self, monkeypatch):
+        """A ``new_context(**kwargs)`` double accepted any keyword, so a misspelled context option
+        in the transport (``service_worker="block"``, which would silently stop blocking service
+        workers) kept every assertion green. The double now names its options, each checked here
+        against the real ``Browser.new_context`` signature, and records anything else apart, which
+        a render must leave empty."""
+        real = inspect.signature(Browser.new_context).parameters
+        named = [
+            name
+            for name, parameter in inspect.signature(FakeBrowser.new_context).parameters.items()
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        ]
+        assert named
+        for name in named:
+            assert real[name].kind is inspect.Parameter.KEYWORD_ONLY
+        page = FakePage([])
+
+        rendered = await _render(monkeypatch, page)
+
+        assert rendered is not None
+        assert page.unknown_context_kwargs == {}
+        assert page.context_kwargs["service_workers"] == "block"
+
 
 class TestDnsPinEligibility:
     """Chromium matches ``--host-resolver-rules`` against the canonical (punycode) hostname, so a
@@ -1021,7 +1068,7 @@ class TestTheLandingHost:
         (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
         assert (
             message == "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
-            "landed_host=internal.example.net"
+            "landed_host=internal.example.net same_publisher=false"
         )
         assert "/admin" not in message
         spec = next(s for s in MARKER_SPECS if s.name == "rendered_fetch_off_host")
@@ -1030,6 +1077,32 @@ class TestTheLandingHost:
         assert match.group("scope") == _TIER1_SCOPE
         assert match.group("pinned_host") == "dashboard.example.com"
         assert match.group("landed_host") == "internal.example.net"
+        assert match.group("same_publisher") == "false"
+
+    async def test_a_hop_inside_the_publisher_is_still_refused_and_the_marker_says_so(self, monkeypatch, caplog):
+        """Strict hostname equality is the rule, so ``example.com`` to ``www.example.com`` is refused
+        like a stranger; without this field every such record read as a security-relevant event and
+        diluted the signal. ``same_publisher`` is the registrable-domain judgment the harvest already
+        makes (``registrable_domain`` over the vendored public-suffix list), so a ``true`` record
+        prices the strictness and a ``false`` one is the signal."""
+        page = FakePage([], land_on="https://www.dashboard.example.com/senate?session=abc")
+
+        with (
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"),
+            pytest.raises(rendered_fetch.RenderOffHost),
+        ):
+            await _render(monkeypatch, page)
+
+        assert page.content_reads == 0
+        (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
+        assert (
+            message == "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+            "landed_host=www.dashboard.example.com same_publisher=true"
+        )
+        assert "session" not in message
+        # A benign hop is still not memoised: it is an http(s) landing, and the memo is the
+        # transport's judgment about the page, not about the strictness of its own rule.
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
 
     async def test_an_ip_literal_landing_is_off_host(self, monkeypatch):
         """The IMDS shape: the hostname compare refuses a literal like any other stranger."""
@@ -1107,7 +1180,7 @@ class TestTheLandingHost:
         assert page.content_reads == 0
         assert raised.value.final_url == "chrome-error://chromewebdata/"
         (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
-        assert "landed_host=chromewebdata" in message
+        assert "landed_host=chromewebdata same_publisher=false" in message
 
     @pytest.mark.parametrize(
         "landed",
@@ -1116,6 +1189,8 @@ class TestTheLandingHost:
             "file:///etc/hostname",
             "blob:https://dashboard.example.com/3f1c9a2e",
             "chrome-error://chromewebdata/",
+            # The ``about:`` allowance is keyed on the absence of a hostname, not on the scheme.
+            "about://169.254.169.254/latest/meta-data/",
         ],
     )
     async def test_a_landing_on_a_scheme_that_is_not_the_pinned_host_is_refused(self, monkeypatch, landed):
@@ -1129,6 +1204,49 @@ class TestTheLandingHost:
 
         assert page.content_reads == 0
 
+    async def test_chromiums_own_error_document_is_memoised_so_the_run_does_not_relaunch_for_it(self, monkeypatch):
+        """The fail-shut guard folded a FAILED navigation into the off-host refusal, and for that
+        population the page rendered nothing and a retry changes nothing, exactly the case the old
+        empty-DOM path memoised. Left unmemoised, a run relaunched Chromium (100-300 MB and one of
+        the two slots) for the same dead URL on every later question that cited it. So a landing
+        on a scheme that is not http(s), Chromium's own document rather than a redirect to a
+        stranger's host, writes the timed-out memo at the raise site, and the second render under
+        the same scope declines without a launch."""
+        page = FakePage(
+            [], goto_raises=PlaywrightError("net::ERR_CONNECTION_REFUSED"), land_on="chrome-error://chromewebdata/"
+        )
+        chromium = install_fake_playwright(monkeypatch, page)
+
+        with pytest.raises(rendered_fetch.RenderOffHost):
+            await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+        assert len(chromium.launch_args) == 1
+
+        with pytest.raises(rendered_fetch.RenderTimeout):
+            await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert len(chromium.launch_args) == 1
+        assert page.content_reads == 0
+        # The other caller's scope is its own, as for every memo.
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_V2_SCOPE) is False
+
+    async def test_a_genuine_off_host_landing_is_not_memoised_and_renders_again(self, monkeypatch):
+        """The other half: an http(s) landing on a stranger's host is a fact about where the page
+        sent the browser, not about the page rendering nothing, and it is memoised by nobody, so a
+        later question citing the same URL runs the render again and is refused again."""
+        page = FakePage([], land_on="https://evil.example/")
+        chromium = install_fake_playwright(monkeypatch, page)
+
+        for _ in range(2):
+            with pytest.raises(rendered_fetch.RenderOffHost):
+                await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert len(chromium.launch_args) == 2
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+
     @pytest.mark.parametrize(
         ("final_url", "expected"),
         [
@@ -1136,6 +1254,10 @@ class TestTheLandingHost:
             ("about:blank", False),
             ("about:srcdoc", False),
             ("ABOUT:BLANK", False),
+            # An ``about:`` URL that parses WITH a hostname is refused: allowed on its scheme alone
+            # it would reach ``document_url`` as the classifier base.
+            ("about://evil.example/", True),
+            ("about://169.254.169.254/x", True),
             ("https://dashboard.example.com/senate", False),
             ("http://Dashboard.Example.COM:8443/x", False),
             ("https://other.example.com/", True),
@@ -1147,7 +1269,11 @@ class TestTheLandingHost:
         ],
     )
     def test_the_no_document_landings_are_the_only_allowlist(self, final_url, expected):
+        """Every landing the guard allows is either the pinned host or has no hostname at all, which
+        is the invariant ``document_url`` relies on when it falls back to the requested URL."""
         assert rendered_fetch._landed_off_host(final_url, "dashboard.example.com") is expected
+        if not expected:
+            assert urlparse(final_url).hostname in (None, "dashboard.example.com")
 
     async def test_a_navigation_that_commits_during_the_dom_read_is_discarded_unpublished(self, monkeypatch, caplog):
         """The window between the pre-read check and the read. ``page.url`` is a client-side cache
@@ -1179,7 +1305,7 @@ class TestTheLandingHost:
         assert raised.value.pinned_host == "dashboard.example.com"
         assert page.teardown == ["unroute_all", "context.close", "browser.close"]
         (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
-        assert "landed_host=169.254.169.254" in message
+        assert "landed_host=169.254.169.254 same_publisher=false" in message
         assert not [message for message in caplog.messages if "ami-0abc" in message]
 
     async def test_the_final_url_is_the_post_read_landing(self, monkeypatch):
@@ -1462,6 +1588,55 @@ class TestTheDomReadIsBounded:
         rendered = await _render(monkeypatch, FakePage([]), harvest_json=False)
         assert rendered is not None
         assert "rendered" in rendered.html
+
+    _NAVIGATING = "Unable to retrieve content because the page is navigating and changing the content."
+
+    async def test_the_browsers_own_navigating_error_is_the_same_cut_off(self, monkeypatch, caplog):
+        """The driver's other answer to the ogimet page. In the pinned Playwright 1.61,
+        ``Frame.content()`` evaluates ``outerHTML`` once and, when the page navigates mid-evaluate,
+        raises its plain ``Error`` (not a ``TimeoutError``) with this message. Caught only at the
+        transport's Playwright boundary, that error was "the renderer is unavailable": it burned the
+        once-per-run warn latch, so a real install failure later in the run logged nothing, and it
+        wrote no memo, so the next question relaunched Chromium for the same page. It is the same
+        fact about the page as the bound firing, and now reaches the caller the same way."""
+        page = FakePage([], content_raises=PlaywrightError(self._NAVIGATING))
+        install_fake_playwright(monkeypatch, page)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="metaculus_bot.research.rendered_fetch"),
+            pytest.raises(rendered_fetch.RenderTimeout) as raised,
+        ):
+            await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert page.content_reads == 1
+        assert isinstance(raised.value.__cause__, PlaywrightError)
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
+        assert rendered_fetch._PLAYWRIGHT_WARNED is False
+        assert not [message for message in caplog.messages if "rung unavailable" in message]
+        assert not [record for record in caplog.records if record.exc_info is not None]
+        (cut_off,) = [record for record in caplog.records if "timed out reading the DOM" in record.getMessage()]
+        assert cut_off.levelno == logging.WARNING
+        assert "navigating" in cut_off.getMessage()
+        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
+
+    async def test_the_tier_1_rung_records_the_navigating_error_as_render_timeout(self, monkeypatch):
+        """Through the real transport and the real caller: the skip token the operator reads is
+        ``render_timeout``, and ``renderer_unavailable`` (the install-failed count) stays at zero."""
+        page = FakePage([], content_raises=PlaywrightError(self._NAVIGATING))
+        install_fake_playwright(monkeypatch, page)
+        direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
+        ctx = FetchContext()
+
+        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+
+        assert result is None
+        assert [attempt.skipped_reason for attempt in ctx.rungs] == ["render_timeout"]
+        direct.rung_attempts = list(ctx.rungs)
+        counts = resolution_source._rung_counts([direct])
+        assert counts["render_timeout_skips"] == 1
+        assert counts["renderer_unavailable_skips"] == 0
+        assert counts["rendered_attempts"] == 0
+        assert rendered_fetch._PLAYWRIGHT_WARNED is False
 
 
 class TestTheFailureBoundary:

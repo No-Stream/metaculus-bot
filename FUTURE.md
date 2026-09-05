@@ -1457,7 +1457,15 @@ Follow-ups:
    link base, so a same-host client-side redirect from `/senate` to `/senate/2026/` resolves
    `href="methodology.html"` against the real document and the published section URL names it;
    `RenderedPage.url` still carries the REQUESTED URL, because that is the key for both render
-   memos. Second,
+   memos. One thing the post-read `page.url` does NOT establish is provenance. It establishes
+   safety, because a DOM that is handed back is one whose frame was on the pinned host both before
+   and after the read, but the content evaluation's reply and the `navigated` event of a navigation
+   that commits a moment later both arrive over the same ordered pipe before the awaiting task
+   resumes, so on a same-host navigation that commits mid-read `final_url` can name the new document
+   while the DOM is the old one. The refinement that would settle it is reading the DOM and
+   `location.href` in ONE `page.evaluate` round trip, so both come from the same document by
+   construction; it is deferred because it changes the core read on merge day, and the mismatch it
+   would close is same-host and confined to `final_url`. Second,
    `context.route_web_socket("**/*", _block_web_socket)` is registered before the page is opened,
    and the handler logs one INFO line (raised from DEBUG in the fix wave, because `cli.py` configures
    the root logger at INFO and the line is the only record of a content-affecting block) and never
@@ -1474,8 +1482,15 @@ Follow-ups:
    its sibling declines. A skipped attempt emits no `RESOLUTION_SOURCE_ESCALATION` line, so the
    per-event record is the transport's own WARNING, registered as the marker
    `RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host>
-   landed_host=<host>` (spec `rendered_fetch_off_host`), which names hostnames only because a
-   landing URL can carry a session token. **What the probe measured, free and local, on
+   landed_host=<host> same_publisher=<true|false>` (spec `rendered_fetch_off_host`), which names
+   hostnames only because a landing URL can carry a session token. `same_publisher`, added in the
+   second fix wave the same day, is `registrable_domain(landed_host) ==
+   registrable_domain(pinned_host)` over the vendored public-suffix list, the judgment the XHR
+   harvest already makes about a page's own JSON: `true` is a benign client-side hop inside the
+   publisher's own registrable domain (`example.com` to `www.example.com`) that strict hostname
+   equality refused, so its rate prices the strictness of the rule, and `false`, which every landing
+   with no hostname also is, is the security signal. No record had been archived when the field was
+   added, so extending the line broke no contract. **What the probe measured, free and local, on
    2026-09-04.** Playwright 1.61 was driven directly with the transport's navigation shape and no
    pin, over the 106-URL Phase 3 QA sweep united with the 47-URL replay, one page at a time. 103 of
    the 106 navigations committed, and 0 of the 103 landed on a different host. Of the 22 render

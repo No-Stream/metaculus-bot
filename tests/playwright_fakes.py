@@ -113,11 +113,15 @@ class FakePage:
     """A page that replays a fixed list of response events during ``goto``.
 
     ``content_hangs`` is the ogimet shape (P3-1): a DOM read that never answers because the page
-    keeps navigating. ``goto_raises`` is the salvage shape: the navigation times out with the DOM
-    already rendered. ``goto_runs_its_budget_out`` puts the clock on that shape: the navigation
-    sleeps for its whole ``timeout`` before it raises or returns, as a real goto timeout does,
-    so a test can measure what the transport spends AFTER the budget is gone. ``status`` is the
-    main-frame response's HTTP status.
+    keeps navigating. ``content_raises`` is the driver's other answer to that page: in Playwright
+    1.61 ``Frame.content()`` evaluates ``outerHTML`` once and, when the page navigates
+    mid-evaluate, raises its plain ``Error("Unable to retrieve content because the page is
+    navigating and changing the content.")`` rather than a ``TimeoutError``. ``goto_raises`` is the
+    salvage shape: the navigation times out with the DOM already rendered.
+    ``goto_runs_its_budget_out`` puts the clock on that shape: the navigation sleeps for its whole
+    ``timeout`` before it raises or returns, as a real goto timeout does, so a test can measure
+    what the transport spends AFTER the budget is gone. ``status`` is the main-frame response's
+    HTTP status.
 
     ``land_on`` is where the main frame ends up, when that is not the URL ``goto`` was given: the
     server-side redirect hop Playwright follows without consulting any route handler. ``url``
@@ -128,8 +132,11 @@ class FakePage:
 
     Everything the transport does to the page and its context is recorded on the page, because
     the page is the one object a test holds: ``goto_calls``, ``settles`` (each
-    ``wait_for_timeout``), ``content_reads`` (each ``page.content()``), ``context_kwargs`` (what
-    ``new_context`` was given), ``route_patterns`` and ``route_handler`` (what ``context.route``
+    ``wait_for_timeout``), ``content_reads`` (each ``page.content()``), ``context_kwargs`` (the
+    real ``new_context`` options the transport passed) and ``unknown_context_kwargs`` (any keyword
+    that is not one, which the real ``Browser.new_context`` would refuse with ``TypeError`` and
+    which a render must therefore leave empty), ``route_patterns`` and ``route_handler`` (what
+    ``context.route``
     registered), ``web_socket_patterns`` and ``web_socket_handler`` (what ``route_web_socket``
     registered), ``setup_events`` (the order the context was guarded and the page opened in),
     ``unroute_behavior``, and ``teardown`` (the close sequence the context and browser ran, so a
@@ -142,6 +149,7 @@ class FakePage:
         *,
         html: str = DEFAULT_DOM,
         content_hangs: bool = False,
+        content_raises: BaseException | None = None,
         goto_raises: BaseException | None = None,
         goto_runs_its_budget_out: bool = False,
         status: int = 200,
@@ -150,6 +158,7 @@ class FakePage:
         self._responses = responses or []
         self._html = html
         self._content_hangs = content_hangs
+        self._content_raises = content_raises
         self._goto_raises = goto_raises
         self._goto_runs_its_budget_out = goto_runs_its_budget_out
         self._status = status
@@ -161,6 +170,7 @@ class FakePage:
         self.settles: list[float] = []
         self.content_reads = 0
         self.context_kwargs: dict[str, Any] = {}
+        self.unknown_context_kwargs: dict[str, Any] = {}
         self.route_patterns: list[str] = []
         self.route_handler: Any = None
         self.web_socket_patterns: list[str] = []
@@ -201,6 +211,8 @@ class FakePage:
         # The real read is a round trip; yielding here lets the detached handler tasks run
         # between goto and the snapshot, which is where the un-joined harvest lost bodies.
         await asyncio.sleep(0)
+        if self._content_raises is not None:
+            raise self._content_raises
         return self._html
 
 
@@ -278,12 +290,30 @@ class FakeContext:
 
 
 class FakeBrowser:
+    """``new_context`` names the options the transport passes, spelled as Playwright 1.61's
+    ``Browser.new_context`` spells them, and parks anything else in ``unknown_context_kwargs``
+    rather than accepting it silently: a ``**kwargs`` double kept every assertion green under a
+    misspelled option (``service_worker="block"``) that the real browser would refuse and that
+    would have quietly stopped blocking service workers."""
+
     def __init__(self, page: FakePage, faults: Faults) -> None:
         self._page = page
         self._faults = faults
 
-    async def new_context(self, **kwargs: Any) -> FakeContext:
-        self._page.context_kwargs = kwargs
+    async def new_context(
+        self,
+        *,
+        user_agent: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        service_workers: str | None = None,
+        **unknown: Any,
+    ) -> FakeContext:
+        self._page.context_kwargs = {
+            "user_agent": user_agent,
+            "extra_http_headers": extra_http_headers,
+            "service_workers": service_workers,
+        }
+        self._page.unknown_context_kwargs = unknown
         if self._faults.new_context_error is not None:
             raise self._faults.new_context_error
         return FakeContext(self._page, self._faults)

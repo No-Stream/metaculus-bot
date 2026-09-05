@@ -950,11 +950,15 @@ MARKER_SPECS: list[MarkerSpec] = [
         # navigation committed during the read itself (research/rendered_fetch.py render_page; the
         # landing is checked before and after ``page.content()``). Read fail-shut, so Chromium's own
         # error document after a failed navigation (``landed_host=chromewebdata``) is refused too,
-        # which makes the record an upper bound on hostile landings. A server-side redirect hop is dialed by the
-        # browser with no route handler of ours involved, so the landing is reached through
-        # Chromium's own resolver, outside every check the transport makes; a record therefore says
-        # a cited page tried to send us somewhere the pin does not cover, which is a
-        # security-relevant event rather than a data-quality one.
+        # which makes the record an upper bound on hostile landings. A server-side redirect hop is
+        # dialed by the browser with no route handler of ours involved, so the landing is reached
+        # through Chromium's own resolver, outside every check the transport makes; a
+        # ``same_publisher=false`` record therefore says a cited page tried to send us somewhere the
+        # pin does not cover, which is a security-relevant event rather than a data-quality one. A
+        # ``same_publisher=true`` record is the other population strict hostname equality refuses: a
+        # benign client-side hop inside the publisher's own registrable domain (``example.com`` to
+        # ``www.example.com``), and its rate prices the strictness of the rule rather than
+        # measuring hostile landings.
         #
         # This is the ONLY per-event record of it. The resolution-source caller counts the refusal
         # under ``render_off_host_skips`` in its ``details["counts"]``, which is a per-question
@@ -967,12 +971,21 @@ MARKER_SPECS: list[MarkerSpec] = [
         # the render path is shared by both callers, whose URL populations differ, and the count
         # only one of them keeps cannot tell them apart. ``landed_host`` is a HOSTNAME and never
         # the landing URL, which can carry a session token or a credential, and it is ``None``
-        # (harvested as no data) for an http(s) landing with no hostname at all, the shape that
-        # matches no pin and so fails closed into this refusal. No ``question=``: the transport
-        # runs per URL with no question in scope, so a join goes through the run id.
+        # (harvested as no data) for any landing with no hostname at all: an http(s) URL with an
+        # empty authority, or a non-http(s) scheme the fail-shut guard refuses (``data:``,
+        # ``file:``, ``blob:``), every one of which matches no pin and so fails closed into this
+        # refusal. Chromium's own error document is the one non-http(s) shape that DOES carry a
+        # hostname, ``chromewebdata``. ``same_publisher`` is
+        # ``registrable_domain(landed_host) == registrable_domain(pinned_host)`` over the vendored
+        # public-suffix list (research/public_suffix.py), the same judgment the XHR harvest makes
+        # about a page's own JSON, with IP literals compared exactly and ``false`` whenever the
+        # landing has no hostname. It was added on 2026-09-04, the day the marker was registered and
+        # before any run emitted it, so no archived record lacks the field and extending the line
+        # is contract-safe. No ``question=``: the transport runs per URL with no question in scope,
+        # so a join goes through the run id.
         re.compile(
             r"RENDERED_FETCH_OFF_HOST:\s*scope=(?P<scope>\S+)\s+pinned_host=(?P<pinned_host>\S+)"
-            r"\s+landed_host=(?P<landed_host>\S+)"
+            r"\s+landed_host=(?P<landed_host>\S+)\s+same_publisher=(?P<same_publisher>true|false)"
         ),
     ),
     MarkerSpec(
