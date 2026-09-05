@@ -3142,7 +3142,9 @@ class TestGapFillV2RendersThePlainRungsFinalUrl:
             agentic_tools, "_fetch_plain", AsyncMock(return_value=self._thin_plain_read_that_landed_elsewhere())
         )
 
-        held = await agentic_tools._run_local_document_ladder(self._REQUESTED)
+        held = await agentic_tools._run_local_document_ladder(
+            self._REQUESTED, deadline_monotonic_s=monotonic() + agentic_tools._LOCAL_DOCUMENT_BUDGET_S
+        )
 
         assert targets == [self._FINAL]
         assert held.has_text
@@ -3690,6 +3692,70 @@ class TestGapFillV2ImpersonatedRetry:
         assert outcome.method == "document"
         assert len(calls) == 1
         assert impersonation_refused(self._URL) is True
+
+    @pytest.mark.asyncio
+    async def test_the_document_ladder_declines_the_retry_when_its_budget_is_nearly_spent(self, monkeypatch) -> None:
+        """Under `read_document` the retry runs inside `_acquire_local_document`'s
+        `_LOCAL_DOCUMENT_BUDGET_S`. With less than the rung's floor left (the same
+        `RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S` Tier 1 claims) it declines without a transport
+        call, instead of dialing a 20 s wall the ladder's own `wait_for` would cancel mid-transfer."""
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        rendered = AsyncMock(return_value=None)
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+
+        held = await agentic_tools._run_local_document_ladder(self._URL, deadline_monotonic_s=monotonic() + 2.0)
+
+        assert calls == []
+        assert held.has_text is False
+        rendered.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_document_ladder_dials_under_its_own_deadline(self, monkeypatch) -> None:
+        """With budget above the floor the retry dials, and the transport's deadline is the ladder's
+        own rather than a fresh `RESOLUTION_SOURCE_HTTP_TIMEOUT` wall that outlives it."""
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+        deadline = monotonic() + 10.0
+
+        held = await agentic_tools._run_local_document_ladder(self._URL, deadline_monotonic_s=deadline)
+
+        (call,) = calls
+        assert call["deadline_monotonic_s"] <= deadline
+        assert call["deadline_monotonic_s"] < monotonic() + RESOLUTION_SOURCE_HTTP_TIMEOUT - 5.0
+        assert held.has_text
+
+    @pytest.mark.asyncio
+    async def test_acquire_local_document_hands_the_ladder_its_budget_as_the_deadline(self, monkeypatch) -> None:
+        seen: list[float] = []
+
+        async def _ladder(url: str, *, deadline_monotonic_s: float) -> local_document.HeldDocument:
+            del url
+            seen.append(deadline_monotonic_s)
+            await asyncio.sleep(0)
+            return local_document.HeldDocument()
+
+        monkeypatch.setattr(agentic_tools, "_run_local_document_ladder", _ladder)
+        before = monotonic()
+
+        await agentic_tools._acquire_local_document(self._URL)
+
+        (deadline,) = seen
+        assert deadline == pytest.approx(before + agentic_tools._LOCAL_DOCUMENT_BUDGET_S, abs=0.5)
+
+    @pytest.mark.asyncio
+    async def test_fetch_keeps_the_full_wall(self, monkeypatch) -> None:
+        """Under the `fetch` tool (a 90 s ToolSpec) no ladder deadline applies, so the retry keeps
+        the one-plain-hop wall it always had."""
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+        before = monotonic()
+
+        await agentic_tools.fetch(self._URL)
+
+        (call,) = calls
+        assert call["deadline_monotonic_s"] == pytest.approx(before + RESOLUTION_SOURCE_HTTP_TIMEOUT, abs=0.5)
 
     @pytest.mark.asyncio
     async def test_the_retry_dials_the_plain_rungs_final_url(self, monkeypatch) -> None:
