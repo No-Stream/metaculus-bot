@@ -19,8 +19,9 @@ from typing import ClassVar
 import aiohttp
 import pytest
 
-from metaculus_bot.research import resolution_chart_data, resolution_source
+from metaculus_bot.research import impersonated_fetch, resolution_chart_data, resolution_source
 from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore, semaphore_for_host
+from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_chart_data import CHART_DATA_LEAD, render_inline_chart_data
 from metaculus_bot.research.resolution_source import (
@@ -44,12 +45,14 @@ from tests.resolution_source_fakes import (
     _embed_shell_page,
     _escape_config,
     _fake_render,
+    _impersonated,
     _iom_shaped_page,
     _meta_refresh_stub,
     _mid_band_chart_page,
     _mock_question,
     _prose_page,
     cdc_aria_stat_block_page,
+    fake_impersonated_fetch,
 )
 from tests.test_document_text import build_text_pdf
 
@@ -1416,6 +1419,69 @@ class TestTheHopRefusalPolicy:
         assert renders == []
         assert [message for message in caplog.messages if "not rendering" in message]
 
+    async def test_the_landing_re_vet_is_one_helper_with_the_cited_url_owing_nothing(self, monkeypatch, caplog):
+        """`_landing_refused` is the one copy of "re-vet the landing before a second transport dials
+        it". The equality short-circuit is a rule rather than an optimisation: the cited URL was
+        vetted hop by hop by `_fetch_direct`, so it never reaches `_hop_refusal` here, while a
+        landing that differs is a derived URL and does. The WARNING names the caller's verb."""
+        calls: list[str] = []
+
+        async def _refuse(candidate_url: str) -> str | None:
+            calls.append(candidate_url)
+            await asyncio.sleep(0)
+            return "ssrf_blocked" if "10.0.0.8" in candidate_url else None
+
+        monkeypatch.setattr(resolution_source, "_hop_refusal", _refuse)
+        allowed_landing = "https://www.tracker.example.com/senate"
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+            same = await resolution_source._landing_refused(_URL, _URL, action="rendering")
+            allowed = await resolution_source._landing_refused(allowed_landing, _URL, action="rendering")
+            refused = await resolution_source._landing_refused("http://10.0.0.8/status", _URL, action="re-dialing")
+
+        assert (same, allowed, refused) == (False, False, True)
+        assert calls == [allowed_landing, "http://10.0.0.8/status"]
+        assert [
+            message
+            for message in caplog.messages
+            if "not re-dialing 10.0.0.8, where the cited tracker.example.com landed" in message
+        ]
+        assert not any("not rendering" in message for message in caplog.messages)
+
+    async def test_both_second_transport_rungs_decide_the_landing_through_it(self, monkeypatch):
+        """The browser rung and the impersonated retry both dial `direct.url`, and both route the
+        decision through the helper rather than a copy of it: a refusal it returns is a decline
+        with no attempt opened and nothing dialed, on either transport."""
+        seen: list[tuple[str, str, str]] = []
+
+        async def _refused(landing_url: str, cited_url: str, *, action: str) -> bool:
+            seen.append((landing_url, cited_url, action))
+            await asyncio.sleep(0)
+            return True
+
+        monkeypatch.setattr(resolution_source, "_landing_refused", _refused)
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
+        renders: list[dict[str, object]] = []
+        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, renders))
+        dials: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            resolution_source,
+            "fetch_impersonated",
+            fake_impersonated_fetch(_impersonated(200, body=_prose_page("Whatever the host served.")), dials),
+        )
+        landed = "https://www.tracker.example.com/senate"
+        walled = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
+        refused = FetchResult(url=landed, status="blocked", text="", http_status=403, content_type="text/html")
+        ctx = FetchContext()
+
+        assert await resolution_source._rendered_rung(_URL, walled, {}, ctx) is None
+        assert await resolution_source._impersonate_rung(_URL, refused, host_sems={}, ctx=ctx) is None
+
+        assert seen == [(landed, _URL, "rendering"), (landed, _URL, "re-dialing")]
+        assert renders == []
+        assert dials == []
+        assert ctx.rungs == []
+
 
 class TestLocalPdfReading:
     """A cited PDF used to be the one resolution source dropped unread. Now it is read with
@@ -1785,5 +1851,5 @@ class TestPerHopRequestTimeout:
             FetchContext(started=time.monotonic() - 2 * resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT),
         )
 
-        assert session.get_kwargs[0]["timeout"].total == resolution_source._MIN_HOP_TIMEOUT_S
+        assert session.get_kwargs[0]["timeout"].total == resolution_source.RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
         assert result.status == "success", "the floor is a real attempt, not a formality"

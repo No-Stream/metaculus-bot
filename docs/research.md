@@ -869,8 +869,9 @@ embedded Datawrapper dataset, below). When the direct fetch cannot read a page a
 escalation ladder runs (`_escalate_unresolved`), each rung self-bounded against the same
 provider wall and each returning a result that went through the same classification path,
 so a rescued page is indistinguishable downstream from a directly-fetched one; the `route`
-on every result says which rung produced it. The four rungs added on 2026-09-03, and the
-one paid rung among them, are described under "The escalation ladder" below.
+on every result says which rung produced it. The four rungs added on 2026-09-03, the
+TLS-impersonating retry added on 2026-09-04, and the one paid rung among them, are described
+under "The escalation ladder" below.
 
 It deterministically extracts URLs from resolution criteria + fine print (markdown
 links and bare URLs, order-preserving dedup, Metaculus markdown-escapes undone),
@@ -989,9 +990,55 @@ means a broken clock, not maximal freshness. The hop is bounded by
 `RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S`. A served dataset leads with a
 `Dataset published <ts>` liveness stamp.
 
-**The escalation ladder.** Four more rungs shipped on 2026-09-03, tried cheapest first behind
-the free hops above. Each declines by returning nothing, in which case the direct route's own
-status stands.
+**The escalation ladder.** Four more rungs shipped on 2026-09-03 and a fifth on 2026-09-04,
+tried cheapest first behind the free hops above. Each declines by returning nothing, in which
+case the direct route's own status stands. The ladder order is the `FetchRoute` Literal's:
+the impersonated retry first, then the derived feed and the browser, then the archive, then
+the paid reader.
+
+`route=impersonate` (`research/impersonated_fetch.py`, the transport; `_impersonate_rung` in
+`research/resolution_source.py`) re-dials a page that answered our aiohttp client 403, once,
+through libcurl presenting a real Chrome TLS ClientHello and HTTP/2 settings fingerprint
+(`curl_cffi`, profile pinned by `IMPERSONATE_BROWSER_TARGET`), and the body re-enters the same
+classification path a direct 200 gets: HTML through `_classify_html_body`, JSON and text through
+the raw-body rule, a PDF through the local document read (which is why an impersonated PDF
+reads `route=pdf_local`, the accounting a meta-refresh hop onto a PDF already produces). It is
+the one rung that leaves aiohttp without leaving our address. Measured 2026-09-04 from a GitHub
+Actions runner with `scripts/probes/fetch_diagnostic.py`: four of the four Akamai-fronted
+federal URLs that refused the bot's own client (bls.gov twice, one a PDF, cdc.gov,
+fsis.usda.gov) answered the impersonated GET 200, so that refusal is a fingerprint verdict and
+recoverable client-side; the four hosts that refused both (Cloudflare, CloudFront and DataDome
+fronts) are the egress-IP population and stay the Wayback and paid rungs' business. The trigger
+is `blocked` with HTTP 403 and nothing else: 429 is a throttle a fingerprint change could make
+worse, 406 is content negotiation the impersonation profile's own `Accept` headers would only
+guess at, 401 is authentication, and the Metaculus self-reference hop's `blocked` carries the
+redirect's 301 or 302, which is what keeps a URL this module refused from being handed to a
+second transport. It sits between the direct fetch and the archive so a live page beats a stale
+capture, and before the paid reader so a rescue saves the read on that URL entirely; the
+position among the earlier rungs is a reading choice, because the browser rungs never fire on
+`blocked`. Free (no key, no model, no spend), floored at
+`RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S` like the other one-GET rungs, never fast-path
+gated, memoized per HOST for the run once a host answers the impersonated client with a block
+status (`IMPERSONATE_BLOCK_STATUSES`: the three `blocked` rows of the status table, 403, 406 and
+429, plus 401 and 503, which the fetch line still records as `error` because the status table is
+a telemetry contract and the memo is a policy; the memo is process-global and shared with
+gap-fill v2, which dials the same transport from both of its free ladders, the `fetch` tool's
+and `read_document`'s local acquisition; the transport writes the host memo for the host that
+ANSWERED, since the impersonated client follows redirects itself and the block can come from a
+later hop, and a separate per-URL memo for the exact URL dialed so that chain is not walked
+again, while the dialed host itself stays dialable because a host that merely redirected never
+refused us), and behind a kill
+switch that is ON by default in code, `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, unlike the paid
+rung's default-off. The trigger set, the block-shaped set the memo keys on and the kill switch
+all live on the transport (`IMPERSONATE_TRIGGER_STATUSES`, `IMPERSONATE_BLOCK_STATUSES`,
+`impersonation_enabled`, `note_refusal_if_block_shaped`), read by both fetchers at call time so
+neither can drift from the other. A rescue's fetch line reads `status=ok http=200
+route=impersonate` because the bytes came with a 200; the refusal
+lives on the escalation line's `from_status=blocked`, as a Wayback rescue already reports the
+snapshot's own status. An impersonated 200 that still classifies as unreadable stamps its verdict
+on the escalation line (`rung=impersonate outcome=js_wall`) and leaves `blocked` standing, so
+the paid rung stays reachable for that URL. libcurl never touches aiohttp's connect-time
+resolver, so the transport carries the SSRF invariants itself; see the SSRF paragraph below.
 
 `route=derived_api` (`research/derived_api.py`) serves the JSON feed a page loads its own
 figures from. A JavaScript dashboard's numbers arrive over XHR after the DOM is ready and sit
@@ -1178,10 +1225,14 @@ conclude from having them. The mapping is keyed by route and iterated, so it is 
 vocabulary check and the render order, cheapest and most transparent first and model-mediated
 last. `direct` is deliberately ABSENT from it rather than mapped to an empty string, which is
 what keeps an all-direct question's section byte-identical to what it rendered before the ladder
-existed (the overwhelming majority of questions, pinned by a test). One sentence belongs to a
-rung that has not shipped: `impersonate` is in the route vocabulary and carries a caveat, but
-nothing produces that route, and a completeness test asserts every non-direct token has a
-sentence so a future rung cannot render rescued content with no disclosure at all.
+existed (the overwhelming majority of questions, pinned by a test). Every non-direct token now
+has a live producer: the `impersonate` sentence was reserved on 2026-09-03 for a rung that did
+not yet exist and has rendered since 2026-09-04, and the completeness test that guarded the
+reserved token still asserts every non-direct route carries a sentence, so a future rung cannot
+render rescued content with no disclosure at all. An impersonated PDF renders the `pdf_local`
+sentence rather than the `impersonate` one, because `route` is the last rung that fired and the
+local read is what produced the text; the impersonation fact does not change how a forecaster
+should weight the content, unlike a capture's age or a model's mediation.
 
 Every rung is self-bounding on the Datawrapper hop's pattern — wall minus elapsed
 minus `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`, skipped below its own floor — because
@@ -1192,9 +1243,11 @@ records itself on the result (`route=` on the fetch marker, plus one
 `RESOLUTION_SOURCE_ESCALATION` line); a rung that was SKIPPED is counted under
 `details["counts"]` instead of logged, alongside the fired counts. A zero
 renders nothing while still surviving into the archive, which is what makes "the rung existed
-and never fired" distinguishable from "this record predates the rung". Six of the keys count
-rungs that FIRED: `meta_refresh_hops`, `pdf_documents_read`, `rendered_attempts`,
-`derived_api_reads`, `wayback_attempts` and `url_context_reads`. Three count the extractor
+and never fired" distinguishable from "this record predates the rung". Seven of the keys count
+rungs that FIRED: `meta_refresh_hops`, `impersonate_attempts`, `pdf_documents_read`,
+`rendered_attempts`, `derived_api_reads`, `wayback_attempts` and `url_context_reads`. There is
+deliberately no `impersonate_rescues`: rescues are read off `route=` on the fetch marker, which
+already partitions the population by rung. Three count the extractor
 policy's decisions rather than rungs. `chrome_metric_withholds` is a cited URL somewhere on whose
 ladder the line-shape metric withheld an HTML extraction, because that extraction cleared the
 chrome floor on navigation alone: the withhold flag is carried onto a later rung's rescue, so a
@@ -1210,8 +1263,9 @@ rest count rungs that
 were SKIPPED, one key per skip reason rather than everything folded into `rung_budget_skips`,
 because each names a different binding constraint. `rung_budget_skips` is the question that ran
 out of wall, summed over every rung; the same skips are broken out per rung as
-`meta_refresh_budget_skips`, `pdf_local_budget_skips`, `derived_api_budget_skips`,
-`rendered_budget_skips`, `wayback_budget_skips` and `url_context_budget_skips`, because the
+`meta_refresh_budget_skips`, `impersonate_budget_skips`, `pdf_local_budget_skips`,
+`derived_api_budget_skips`, `rendered_budget_skips`, `wayback_budget_skips` and
+`url_context_budget_skips`, because the
 aggregate cannot say WHICH rung the wall is binding on and "how often is the paid rung starved
 by the pages before it" is the question the flag's rollout asks.
 `pdf_contention_skips` is a document left unread while two others were parsing, so the two-slot
@@ -1249,7 +1303,20 @@ pre-check earning its request: the host would have refused the read server-side,
 spend avoided rather than a page lost and it must not read as a failure. `url_context_no_api_key_skips`
 is the paid rung enabled with no `GOOGLE_API_KEY` set: a misconfiguration rather than a tuning
 signal, and counted precisely because without it "flag on, key missing" is byte-identical in the
-archive to "flag off".
+archive to "flag off". Three keys belong to the impersonated retry. `impersonate_disabled_skips`
+is the kill switch (`RESOLUTION_SOURCE_IMPERSONATE_ENABLED`) set to off, a configuration rather
+than a tuning signal and counted for the same reason as the missing-key skip above.
+`impersonate_unpinnable_skips` is a retry declined because a hop's host would not resolve to a
+vetted public address to pin the connection to, on the first hop (nothing dialed; the direct fetch
+resolved the same host moments earlier, so what binds is DNS disagreeing with itself, and a
+nonzero count is a flake or a rebinding host rather than a refusal) or on a later redirect hop
+(the earlier hops were dialed, and the target is one the direct fetch never resolved, so the
+DNS-disagreement reading does not apply). `impersonate_host_refused_skips` is the per-run host
+memo declining a cited URL on a host that already answered the impersonated client with a block
+status this run, the memo doing its job rather than a failure, which is the same distinction
+`rendered_no_text_skips` draws for the browser; the memo is process-global and shared with
+gap-fill v2, so the earlier refusal may have been a v2 `fetch` or `read_document` of a URL no
+question cited.
 
 It is **SSRF-hardened** because these URLs are user-authored and fetches run from
 CI: a preflight `is_public_http_url` check rejects private / loopback /
@@ -1270,7 +1337,21 @@ DOM that fails it is discarded unpublished. It also registers a
 WebSocket, which HTTP interception cannot see at all, is blocked. What is left is a
 cross-host SUBRESOURCE, whose host Chromium resolves with no pin of ours, and the
 route-guard comment in `research/rendered_fetch.py` is the authority on
-what that transport does and does not cover. Per-URL truncation appends a
+what that transport does and does not cover. The `route=impersonate` rung is the third
+shape: libcurl never touches aiohttp's connect-time `FilteringResolver`, so the transport in
+`research/impersonated_fetch.py` carries the invariants itself. Every hop is pre-resolved
+through the repo's one vetting predicate (`rendered_fetch.resolve_pinned_host`, which
+rejects the whole hostname if ANY resolved address is disallowed), pinned to that address
+with `CURLOPT_RESOLVE` on a session built for that one hop, and checked after the fact
+against the address libcurl reports it connected to, refusing the body unread on a
+mismatch. No automatic redirects: every hop is re-guarded through `_hop_refusal`,
+re-resolved and re-pinned under the shared `MAX_REDIRECTS` cap, the proxy environment is
+disabled so a pin cannot be bypassed by an `HTTP_PROXY` libcurl would otherwise honour,
+and the body is capped at the same decompressed byte counts as the direct fetch: the page cap
+(`RESOLUTION_SOURCE_MAX_RESPONSE_BYTES`) for every body, with one re-dial under the document
+cap (`DOCUMENT_TEXT_PDF_MAX_BYTES`) when a declared PDF aborts on the first, so a cited PDF
+between the two is read on this rung as `_resolution_pdf_outcome` would have read it. Every
+refusal raises, and nothing from a refused response is returned. Per-URL truncation appends a
 `[truncated at N chars — full source at URL]` marker, the aggregate section-budget
 trim routes through the same marker-emitting truncator (a bare slice could cut
 mid-sentence and eat that marker, so an already-truncated page rendered as

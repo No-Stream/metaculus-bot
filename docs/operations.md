@@ -432,6 +432,7 @@ CI.
 | `PREDICTION_MARKETS_ENABLED` | off | `true` | Polymarket / Kalshi / Manifold / PredictIt snapshot (suppressed under `is_benchmarking=True`) |
 | `RESOLUTION_SOURCE_ENABLED` | off | `true` | Tier-1 fetcher of URLs cited in the resolution criteria (plain HTTP + trafilatura, plus the free escalation rungs; no LLM call and no spend of its own) |
 | `RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` | off | `true` | The one PAID rung of that fetcher's escalation ladder: when every free rung has failed to read a cited page, Gemini's `url_context` reader is asked to read it, billed to the operator's personal `GOOGLE_API_KEY`. ON in every bot workflow since 2026-09-04, so the resolution-source provider is a paid surface; changing it anywhere is a cost-gate decision for the operator, not an agent |
+| `RESOLUTION_SOURCE_IMPERSONATE_ENABLED` | on | unset (so on) | The free TLS-impersonating retry of a direct-fetch 403 (`research/impersonated_fetch.py`, the `route=impersonate` rung and gap-fill v2's `fetch` / `read_document` ladders alike). The only research flag whose code default is ON, read through `impersonated_fetch.impersonation_enabled()`: it costs no key, no model call and no spend, fires on a host's 403 only, is memoized per host for the run once a host refuses the impersonated client, and sits behind the same wall-budget floor as the other one-GET rungs, so the flag is a kill switch rather than an opt-in. No bot workflow sets it. Set it to `false` to fall straight through to the archive and the paid reader on a 403 |
 | `TS_ANCHOR_ENABLED` | off | `true` | Time-series empirical P10/P50/P90 band from a question's own resolution series |
 | `TS_ANCHOR_CHART_ENABLED` | off | `false` | Chart-image side-channel for the anchor (vision message to base models); held off pending a text-vs-image A/B |
 | `RESEARCH_PROVIDER` | `auto` | unset | Forces one primary provider (`asknews`/`exa`/`perplexity`/`openrouter`) instead of the priority order |
@@ -441,10 +442,13 @@ The primary provider is chosen by priority: AskNews (when
 Perplexity, then Perplexity-via-OpenRouter. The flags above run on top of the
 primary, each independently gated.
 
-The resolution-source escalation ladder is otherwise tuned by constants rather than flags, all
-in `constants.py` and all read at call time. Each rung has a minimum-wall-budget floor below
+Those two are the only flags on the resolution-source escalation ladder (the paid rung's opt-in
+and the impersonated retry's kill switch); the rest of it is tuned by constants, all in
+`constants.py` and all read at call time. Each rung has a minimum-wall-budget floor below
 which it is skipped: `RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S`,
-`RESOLUTION_SOURCE_PDF_MIN_BUDGET_S`, `RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S`,
+`RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S` (the meta-refresh hop's floor, since the retry is
+one GET against a host that just answered us), `RESOLUTION_SOURCE_PDF_MIN_BUDGET_S`,
+`RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S`,
 `RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` (12 s, far above the others, because the rung launches a
 browser and the launch slot is contended process-wide; it is the pre-gate floor, and the
 transport's post-gate need of `RENDER_MIN_GOTO_MS` plus `RENDER_POST_GOTO_TAIL_MS` plus
@@ -743,7 +747,10 @@ The paid run is the operator's last step.
 
 - Gates and formatting: `make test`, `make test_fast`, `make test_e2e`,
   `make lint`, `make format`, `make typecheck`, `make typecheck_ty`, `make cov`,
-  `make audit`, `make precommit*`.
+  `make audit`, `make precommit*`. One blind spot in `make audit`: osv-scanner reads
+  `uv.lock`, and the `curl_cffi` wheel behind the impersonated retry vendors its own
+  libcurl and BoringSSL binaries that no lockfile entry names, so a libcurl CVE is not
+  reported by that gate and is picked up only by bumping `curl_cffi`.
 - Read-only Metaculus and GitHub-artifact pulls: `make sync_all` and its parts
   (`sync_research`, `sync_telemetry`, `sync_raw_research`, the `download_*` and
   `backfill_*` targets), the `performance_analysis` package and its width
@@ -1337,9 +1344,11 @@ the telemetry markers:
   `unsupported_type` carries `budget_skipped` / `parse_contention` when it was a document
   we held and declined to parse. Its absence means no reason applies, on a fresh line as much as on an
   archived one. `route` names which rung of the escalation ladder produced the recorded
-  outcome: `direct` for the plain fetch, and `meta_refresh`, `pdf_local`, `derived_api`,
-  `rendered`, `wayback` or `url_context` for an escalated one (`impersonate` is reserved in
-  the vocabulary for a rung that is not built). Without it
+  outcome: `direct` for the plain fetch, and `meta_refresh`, `impersonate`, `pdf_local`,
+  `derived_api`, `rendered`, `wayback` or `url_context` for an escalated one (`impersonate`
+  is the TLS-impersonating retry of a 403, live since 2026-09-04 behind the default-on
+  `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`; an impersonated PDF reads `pdf_local`, since the
+  local read is what produced the text). Without it
   a rescued page reads exactly like one the direct route managed on its own, so "what
   did the ladder actually buy" would not be a query. Three more optional keyed fields carry
   failure diagnostics on a non-success fetch, so the archive can separate an egress-reputation

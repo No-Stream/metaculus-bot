@@ -99,8 +99,11 @@ Free and safe — run freely:
   `make supply_probe`, `make benchmark_display`. These hit only the Metaculus API and GitHub
   artifacts.
 - `make check_credits` — reads both OpenRouter key balances.
-- `uv run python scripts/probes/fetch_diagnostic.py` — public GETs only, no LLM and no key
-  (`curl_cffi` is in the dev group, so a `uv sync --dev` checkout already has it).
+- `uv run python scripts/probes/fetch_diagnostic.py` — probes A/B/C are public GETs, and column D
+  runs the production ladder but forces its one paid rung (the Gemini `url_context` read) off in
+  the process environment before any probe runs, so it stays free even on a laptop whose `.env`
+  has the flag and a `GOOGLE_API_KEY`. No key is spent (`curl_cffi` is a runtime dependency, so
+  any `uv sync` checkout already has it).
 
 ## Repo overrides
 
@@ -143,7 +146,8 @@ Top level:
   `residual_analysis_playbook.md` (the per-round residual procedure),
   `probabilistic_tools_activation.md` (activation pending) and
   `fetch_escalation_ladder_design.md` (superseded by `fetch_ladder_plan_2026-09-03.md`, whose
-  ladder is built except the TLS-impersonation rung). `metaculus_api_doc_LARGE_FILE.yml` there is the full Metaculus
+  ladder is built; the TLS-impersonation rung it deferred is built per
+  `impersonate_rung_plan_2026-09-04.md`). `metaculus_api_doc_LARGE_FILE.yml` there is the full Metaculus
   API spec — read it with offset/limit.
 - `REFERENCE_COPY_OF_forecasting_tools*/` — read-only copy of the framework source; edits do not
   affect the installed package. `REFERENCE_COPY_OF_panchul*/` — a Q2 2025 competition winner,
@@ -157,7 +161,7 @@ Inside `metaculus_bot/`:
 | Per-question orchestration | `forecaster.py` (`_research_and_make_predictions`), `cli.py` |
 | Close-derived time budget | `time_budget.py` |
 | Research fan-out and providers | `research/` (`orchestrator.py`, `providers.py`, one module per provider) |
-| Outbound fetch transports (never hand-rolled) | `research/http_fetch.py`, `rendered_fetch.py` (headless Chromium), `url_context_reader.py` (the paid Gemini read), `robots_policy.py` |
+| Outbound fetch transports (never hand-rolled) | `research/http_fetch.py`, `impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry), `rendered_fetch.py` (headless Chromium), `url_context_reader.py` (the paid Gemini read), `robots_policy.py` |
 | Resolution-source fetcher and its escalation rungs | `research/resolution_source.py`, `resolution_fetch_result.py`, `derived_api.py`, `wayback.py` |
 | Gap-fill v1 / v2 | `research/targeted.py`, `research/agentic/` |
 | Model roster (source of truth) | `llm_configs.py` |
@@ -256,23 +260,34 @@ Each of these has cost real work at least once. The pointer is where the reasoni
   a count (`details["counts"]`) is how "ran and found none" stays distinguishable from "never
   ran". Detail: `docs/research.md`.
 
+**Proportion**
+
+- **The medicine must be better than the disease.** Fix what has cost or plausibly will cost
+  forecasts: missed deadlines, wrong values, silent drops, spend. Refuse a fix, a review finding or
+  a hardening request whose remedy adds a flag, a branch, a mechanism or a parallel path for a case
+  this deployment does not produce, even when the finding is technically correct. Simplicity is for
+  the agents who work here next, so a review verdict of "real but not worth it" is a normal
+  outcome, not a deferral. Operator ruling, 2026-09-04.
+
 **Guards and safety**
 
 - **A guard fails SHUT.** The unit-mismatch guard is the worked example: wrapping it in
   try/except made a guard crash byte-identical to a passing check, so it published the
   order-of-magnitude error the guard exists to block. Let it raise.
-- **Any new outbound HTTP path goes through `research/http_fetch.py`.** It owns the SSRF
-  invariants: the `is_public_http_url` preflight, the connect-time `FilteringResolver` (the
-  resolver, not the preflight, is the real DNS-rebinding boundary), a bounded manual redirect
-  loop that re-guards every hop, the meta-refresh hop that no HTTP status announces, and the
-  per-host politeness semaphores. Two transports sit beside it and are SHARED with gap-fill v2
-  rather than copied: `research/rendered_fetch.py` owns the headless-Chromium render, including
-  the DNS pin, the per-request route guard, the landing-host check after navigation, the
-  WebSocket block and the process-global launch cap, and
-  `research/url_context_reader.py` owns the one paid Gemini `url_context` read, with
-  `research/robots_policy.py` the per-host `Google-Extended` pre-check in front of it. Do not
-  hand-roll a fetch, a render or a reader.
-- **Timing, deadline and fallback code gets strictly-safer changes only.** A tidy-up in a
+- **Reuse the existing fetch transports; bound every fetch; skip the security theater.** New
+  outbound fetches go through `research/http_fetch.py` (aiohttp), `research/rendered_fetch.py`
+  (headless Chromium), `research/impersonated_fetch.py` (curl-cffi with a Chrome fingerprint) or
+  `research/url_context_reader.py` (the paid Gemini read) rather than a hand-rolled client, because
+  those already carry what matters: a total timeout inside the 45 s wall, a byte cap, a redirect
+  hop limit, the Metaculus self-reference refusal and per-host politeness. The DNS pins,
+  connection-time IP assertions, landing-host checks and WebSocket block that also live there were
+  built for a threat this deployment cannot realise (the bot runs on GitHub-hosted runners with no
+  internal network and no readable metadata endpoint), so they stay as they are but are NOT to be
+  extended, re-implemented for a new transport, or cited as a reason to add branches. Operator
+  ruling, 2026-09-04.
+- **Timing, deadline and fallback code gets strictly-safer changes only, and its robustness is
+  a priority.** Missed deadlines cost real forecasts this quarter (a few questions, tens of points),
+  so a fetch or rung that can overrun the 45 s wall is a bug to fix, while a tidy-up in a
   soft-deadline, retry or key-fallback path can silently thin the ensemble or strand it on a dead
   key. If a change is not obviously safer, leave it and note it in `FUTURE.md`.
 - **Benchmarking leakage guards are hard returns.** `prediction_market` and `resolution_source`
@@ -338,7 +353,9 @@ Each of these has cost real work at least once. The pointer is where the reasoni
 - **Lint and format**: `make lint` (Ruff check), `make format` (Ruff format + autofix).
 - **Typecheck**: `make typecheck` (basedpyright), `make typecheck_ty` (secondary).
 - **Coverage**: `make cov` (branch coverage is on). **Audit**: `make audit` (osv-scanner over
-  `uv.lock`; `brew install osv-scanner` locally, CI runs it via `google/osv-scanner-action`).
+  `uv.lock`; `brew install osv-scanner` locally, CI runs it via `google/osv-scanner-action`). It
+  cannot see the libcurl and BoringSSL binaries vendored inside the `curl_cffi` wheel, so a
+  libcurl CVE surfaces only through a `curl_cffi` bump.
 - **Dependency hygiene**: `make deps` (deptry). **Import contracts**: `make lint_imports`
   (import-linter; the contracts live in `pyproject.toml` `[tool.importlinter]`). Both are free
   and both run in CI's lint job and in `make all`.

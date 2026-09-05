@@ -26,15 +26,25 @@ from typing import get_args
 
 import pytest
 
-from metaculus_bot.research import resolution_source
-from metaculus_bot.research.resolution_fetch_result import FetchStatus
+from metaculus_bot.research import impersonated_fetch, resolution_source
+from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
+from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus
 from metaculus_bot.research.resolution_source import (
     _URL_CONTEXT_TRIGGER_STATUSES,
     _WAYBACK_TRIGGER_STATUSES,
     FetchContext,
     _fetch_one,
+    _impersonate_rung_applies,
 )
-from tests.resolution_source_fakes import FakeResponse, FakeSession, _prose_page, arm_paid_rung, paid_reader
+from tests.resolution_source_fakes import (
+    FakeResponse,
+    FakeSession,
+    _impersonated,
+    _prose_page,
+    arm_paid_rung,
+    fake_impersonated_fetch,
+    paid_reader,
+)
 
 _NOW = datetime(2026, 9, 4, tzinfo=UTC)
 
@@ -146,6 +156,39 @@ class TestThePaidReaderNeverSeesAUrlWeRefused:
         assert session.requested == []
 
 
+@pytest.mark.usefixtures("_resolve_the_intranet_host_privately")
+class TestTheImpersonatedRetryNeverDialsAUrlWeRefused:
+    """The impersonated retry, armed exactly as production runs it, on a URL the preflight refused.
+
+    Its egress IS ours, but its transport is libcurl rather than aiohttp, so the connect-time
+    ``FilteringResolver`` never sees it: handing it a URL this module refused would re-dial that
+    URL through a client with none of the direct path's guards. The trigger is the one gate that
+    cannot be relaxed, and it is a 403 on a ``blocked`` result, which ``ssrf_blocked`` never is.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _arm_the_retry(self, monkeypatch):
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
+
+    @pytest.mark.parametrize("url", _REFUSED_URLS)
+    async def test_a_refused_url_is_never_retried_under_impersonation(self, url, monkeypatch):
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            resolution_source,
+            "fetch_impersonated",
+            fake_impersonated_fetch(_impersonated(200, body=_prose_page("Whatever the host served.")), calls),
+        )
+        session = FakeSession({})
+
+        result = await _fetch_one(session, url, {}, FetchContext(now=_NOW))
+
+        assert result.status == "ssrf_blocked"
+        assert result.route == "direct"
+        assert result.rung_attempts == []
+        assert calls == []
+        assert session.requested == []
+
+
 class TestBothTriggerSetsExcludeOurOwnRefusal:
     """The frozenset populations themselves, so a widening is a test failure rather than a probe.
 
@@ -163,6 +206,15 @@ class TestBothTriggerSetsExcludeOurOwnRefusal:
 
     def test_the_paid_reader_trigger_set_excludes_it(self):
         assert "ssrf_blocked" not in _URL_CONTEXT_TRIGGER_STATUSES
+
+    @pytest.mark.parametrize("http_status", [None, 301, 403])
+    def test_the_impersonate_trigger_excludes_it(self, http_status):
+        """Through the predicate rather than a set: the trigger keys on the STATUS being `blocked`
+        as well as on the 403, so a refusal carrying a 403 (which nothing produces today) would
+        still not fire it."""
+        refused = FetchResult(url=_IMDS_URL, status="ssrf_blocked", text="", http_status=http_status, content_type=None)
+
+        assert _impersonate_rung_applies(refused) is False
 
     @pytest.mark.usefixtures("_resolve_the_intranet_host_privately")
     @pytest.mark.parametrize("url", _REFUSED_URLS)

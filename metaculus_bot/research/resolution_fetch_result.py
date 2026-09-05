@@ -161,7 +161,9 @@ FetchStatusReason = Literal[
 # `FetchStatusReason`: a held document declined for want of a parse slot both records the skip
 # here and stamps the withheld result's `status_reason` there.
 #
-# `wall_budget` — the rung's own floor was below the remaining provider wall (`claim_rung_budget`).
+# `wall_budget` — the rung's own floor was below the remaining provider wall (`claim_rung_budget`),
+#   or, for the impersonated retry, the wall ran out while the transport waited on a pre-dial
+#   await (`impersonated_fetch.ImpersonateBudgetExhausted`); nothing was dialed either way.
 # `wayback_cap` — the question spent its per-question snapshot attempts on earlier cited URLs.
 # `url_context_cap` — the question spent its per-question PAID-read attempts on earlier cited URLs
 #   (the paid rung's analogue of `wayback_cap`, bounding spend when the flag is on).
@@ -207,6 +209,26 @@ FetchStatusReason = Literal[
 #   nothing about the page was published and the next question should be refused on its own
 #   record; the error-document landing is memoised by the transport (its timed-out memo), so a
 #   later question in the run records `render_timeout` for it without a launch.
+# `impersonate_disabled`: the impersonated retry declined on its kill switch
+#   (`RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, on by default in code). A configuration rather than a
+#   tuning signal, and counted because without it a run with the switch off is byte-identical in
+#   the archive to one where no cited page ever earned the retry.
+# `impersonate_unpinnable`: the impersonated retry declined because a hop's host would not resolve
+#   to a vetted public address to pin the connection to (`impersonated_fetch.ImpersonateUnpinnable`).
+#   The pin can fail on the FIRST hop, where nothing was dialed and nothing about the page changed,
+#   or on a later redirect hop, where the earlier hops were dialed and wall was spent; the skip says
+#   the pin failed on some hop. On the first hop the direct fetch resolved the same host through the
+#   filtering resolver moments earlier, so a nonzero count there means DNS disagreed with the direct
+#   fetch's own resolution (a flake, or a rebinding host that flipped) rather than a host refusing
+#   us; a later-hop failure is a redirect target the direct fetch never resolved, so that reading
+#   does not apply to it.
+# `impersonate_host_refused`: the impersonated retry skipped because an earlier impersonated fetch
+#   this run already answered with a block status from the same host, or dialed this exact URL into
+#   one, by this fetcher or by gap-fill v2 (the memo is process-global and shared, keyed by the
+#   answering host plus the dialed URL, so the earlier fetch may have been a v2 `fetch` or
+#   `read_document` of a URL no question cited). The memo doing its job rather than a
+#   failure, the same distinction `rendered_no_text` draws for the browser; folded into the fired
+#   count it would read as a host refusing us twice.
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",
@@ -221,6 +243,9 @@ RungSkipReason = Literal[
     "render_non_200",
     "render_dom_too_large",
     "render_off_host",
+    "impersonate_disabled",
+    "impersonate_unpinnable",
+    "impersonate_host_refused",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the
@@ -303,6 +328,14 @@ _NON_OK_FETCH_STATUS: dict[int, FetchStatus] = {
     404: "not_found",
     410: "not_found",
 }
+
+# The declared Content-Types every fetch path reads as a PDF: the ONE vocabulary the Tier-1 page
+# fetch (the larger body cap and the local document read), the impersonated transport (its
+# document re-dial) and gap-fill v2's plain rung (its `pdf_local` routing) all test against, kept
+# here because all three already import this module and a third copy had drifted (v2 read
+# `application/pdf` alone). Matched as substrings of the lower-cased header, so a charset suffix
+# does not defeat it.
+PDF_CONTENT_TYPES: tuple[str, ...] = ("application/pdf", "application/x-pdf")
 
 # The `Server` header is free text and delimiter-hostile; bound it so one hostile value cannot
 # blow the marker line's width, and lower-case it so `akamaighost` and `AkamaiGHost` bucket

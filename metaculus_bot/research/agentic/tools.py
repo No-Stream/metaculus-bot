@@ -14,14 +14,19 @@ headless-Chromium TRANSPORT moved out one level, to ``research.rendered_fetch``,
 Tier-1 resolution-source fetcher gained the same rung — the DNS pin, the route guard and the
 process-global launch cap are all load-bearing and a second copy of any of them would drift.
 ``_try_rendered_fetch`` stays here because what a rendered page MEANS is this ladder's
-business: extracted text plus outbound links for a driver model.
+business: extracted text plus outbound links for a driver model. The TLS-impersonating retry
+(``research.impersonated_fetch``, added 2026-09-04) follows the same split: the transport and
+its policy (the trigger set, the kill switch, the per-run host memo) are shared with Tier 1, and
+``_try_impersonated_fetch`` here maps its response onto this ladder, from both free ladders that
+run a plain GET (``fetch`` and ``read_document``'s local-document acquisition).
 
 The seams the suite monkeypatches
 — ``_read_response_body``, ``_fetch_plain``, ``_try_rendered_fetch``,
+``_try_impersonated_fetch``, ``fetch_impersonated``,
 ``_acquire_local_document``, ``_run_document_read_sync``, ``read_document``,
 ``_READ_DOCUMENT_TIMEOUT_S`` — are attributes of THIS module and are resolved here at call
 time, so their callers stay here even where the callee moved out. The render transport's own
-seams (``_resolve_pinned_host``, the launch semaphore) are attributes of ``rendered_fetch``
+seams (``resolve_pinned_host``, the launch semaphore) are attributes of ``rendered_fetch``
 and are patched there.
 """
 
@@ -45,14 +50,15 @@ from metaculus_bot.constants import (
     DOCUMENT_TEXT_PDF_MAX_BYTES,
     EXA_API_KEY_ENV,
     GOOGLE_API_KEY_ENV,
+    RESOLUTION_SOURCE_HTTP_TIMEOUT,
+    RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import impersonated_fetch, resolution_source
 from metaculus_bot.research.agentic import local_document
 from metaculus_bot.research.agentic.fetch_outcomes import (
     _FETCH_MIN_CONTENT_CHARS,
     _HTML_CONTENT_TYPE_TOKENS,
-    _RETRYABLE_FETCH_BLOCK_STATUSES,  # noqa: F401  # re-export: the suite parametrizes the blocked-status set off this module
     _TEXTUAL_CONTENT_TYPE_TOKENS,
     DOCUMENT_NEEDED_METHOD,
     PlainFetchResult,
@@ -93,6 +99,10 @@ from metaculus_bot.research.http_fetch import (
     REDIRECT_STATUSES,
     decode_text_body,
     read_body_capped,
+)
+from metaculus_bot.research.impersonated_fetch import (
+    ImpersonateDeclined,
+    fetch_impersonated,
 )
 from metaculus_bot.research.rendered_fetch import (
     MemoScope,
@@ -278,8 +288,9 @@ async def _plain_response_outcome(resp: aiohttp.ClientResponse, current_url: str
         return non_ok
     if _content_type_is_image(content_type):
         # An image is the one document shape with no text a local rung could read, so its bytes
-        # buy nothing and it keeps the pre-read escalation to the paid reader. A PDF no longer
-        # takes this exit: its bytes are exactly what the local rung needs.
+        # buy nothing: this exit skips the READ, and `_plain_body_outcome` reaches the same verdict
+        # for a body another transport already holds. A PDF does not take this exit: its bytes are
+        # exactly what the local rung needs.
         return _document_needed_result(current_url, content_type)
     declared_pdf = _content_type_is_pdf(content_type)
     body = await _read_response_body(
@@ -289,10 +300,25 @@ async def _plain_response_outcome(resp: aiohttp.ClientResponse, current_url: str
     )
     if body is None:
         return _body_too_large_result(current_url, content_type, declared_pdf=declared_pdf)
-    if declared_pdf or is_pdf_body(body):
+    return await _plain_body_outcome(body, content_type, current_url)
+
+
+async def _plain_body_outcome(body: bytes, content_type: str, current_url: str) -> PlainFetchResult:
+    """Classify a body this ladder already holds, whichever transport read it.
+
+    The bytes-level tail of :func:`_plain_response_outcome`, split from the read so the
+    impersonated retry (:func:`_try_impersonated_fetch`) gets this ladder's FULL classification,
+    the local PDF rung and the document escalation included, rather than a second partial copy.
+    The declared-image rule lives here as well as in the wrapper's pre-read exit, because the
+    wrapper's copy is a read-avoidance shortcut and this is the classification: a declared
+    ``image/webp`` or ``image/svg+xml`` has no magic bytes the sniff below knows, and without the
+    header clause the impersonated path reported it as an unsupported type where the aiohttp path
+    escalated it to ``read_document``.
+    """
+    if _content_type_is_pdf(content_type) or is_pdf_body(body):
         # Local extraction first, whether the header said PDF or only the magic bytes did.
         return await local_document.pdf_fetch_result(body, url=current_url, content_type=content_type)
-    if _body_is_document(body):
+    if _content_type_is_image(content_type) or _body_is_document(body):
         return _document_needed_result(current_url, content_type)
 
     # Charset-honoring decode (BOM > declared charset > UTF-8), not a
@@ -417,6 +443,116 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     )
 
 
+async def _try_impersonated_fetch(url: str, *, deadline_monotonic_s: float | None = None) -> PlainFetchResult | None:
+    """Re-dial a page the plain rung was answered 403, presenting a real browser's fingerprint.
+
+    The transport is ``research.impersonated_fetch``, shared with the Tier-1 resolution-source
+    rung, which is where the measurement behind it lives (2026-09-04, from a GitHub Actions
+    runner: four Akamai-fronted federal hosts answered the bot's aiohttp client 403 and the same
+    GET under Chrome impersonation 200). What stays here is the MAPPING onto ``PlainFetchResult``,
+    this ladder's own contract. A 200 goes through :func:`_plain_body_outcome`, the same
+    classification a plain body gets, with ``method="impersonate"`` stamped on the plain-shaped
+    results so the loop's tier map (``provenance._METHOD_TO_TIER``) grants ``fetched``; a document
+    keeps the method its own rung stamps (``pdf_local``, ``document_needed``), which the ``fetch``
+    handler keys on.
+
+    Every decline folds back into ``None``, because this ladder's callers only know ``None``: the
+    kill switch (``impersonated_fetch.impersonation_enabled``, the transport's reading of
+    ``RESOLUTION_SOURCE_IMPERSONATE_ENABLED``, on by default in code), the per-run host memo
+    shared with Tier 1 (a host that refused the impersonated client once this run will not answer
+    the next URL on it differently), every :class:`ImpersonateDeclined` (a host that will not pin,
+    a refused hop, an oversized body, a transport failure), and a non-200 answer, which the
+    transport's ``note_refusal_if_block_shaped`` memoizes when it is block-shaped, for the host
+    that answered and for the exact URL dialed. The direct ``blocked`` result then stands, byte
+    for byte what it was before the rung existed.
+
+    ``url`` is the plain rung's ``url``, the last hop of its own guarded redirect loop, the same
+    choice :func:`_try_rendered_fetch` documents; the trigger (a host's 403) is the caller's test,
+    in :func:`_fetch_plain_with_impersonated_retry`. The wall is one plain hop's worth
+    (``RESOLUTION_SOURCE_HTTP_TIMEOUT``, the timeout the plain rung's session already runs under)
+    for the whole retry, redirect hops included, so the retry costs the ``fetch`` tool's ceiling at
+    most what one more plain hop would have. Under ``read_document``'s acquisition ladder that wall
+    outlives the caller: the ladder is capped at ``_LOCAL_DOCUMENT_BUDGET_S`` by a ``wait_for``
+    that would cancel the dial mid-transfer, so the ladder passes its own ``deadline_monotonic_s``,
+    the dial is sized to the earlier of the two, and with less than
+    ``RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S`` left (the floor Tier 1's rung claims) the retry
+    declines without dialing rather than spend the paid reader's turn on a request it cannot
+    finish. Strictly safer: a deadline only ever shortens or skips a dial. The host gate is this
+    ladder's own map. The two body caps are the plain rung's own:
+    ``RESOLUTION_SOURCE_MAX_RESPONSE_BYTES`` for a page and ``DOCUMENT_TEXT_PDF_MAX_BYTES`` for a
+    declared PDF, the pair :func:`_plain_response_outcome` reads under, so a PDF between the two is
+    read here as the plain rung would have read it.
+    """
+    if not impersonated_fetch.impersonation_enabled():
+        return None
+    if impersonated_fetch.impersonation_refused(url):
+        return None
+    netloc = urlparse(url).netloc
+    wall_deadline_s = monotonic() + RESOLUTION_SOURCE_HTTP_TIMEOUT
+    if deadline_monotonic_s is not None:
+        remaining_s = deadline_monotonic_s - monotonic()
+        if remaining_s < RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S:
+            logger.info(
+                "agentic fetch: skipping the impersonated retry of %s, %.1fs of the ladder's budget left",
+                netloc,
+                remaining_s,
+            )
+            return None
+        wall_deadline_s = min(wall_deadline_s, deadline_monotonic_s)
+    try:
+        response = await fetch_impersonated(
+            url,
+            host_sems=_FETCH_HOST_SEMAPHORES,
+            deadline_monotonic_s=wall_deadline_s,
+            per_hop_timeout_s=RESOLUTION_SOURCE_HTTP_TIMEOUT,
+            max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+            document_max_bytes=DOCUMENT_TEXT_PDF_MAX_BYTES,
+        )
+    except ImpersonateDeclined as exc:
+        logger.info(
+            "agentic fetch: the impersonated retry of %s produced nothing (%s: %s)", netloc, type(exc).__name__, exc
+        )
+        return None
+    if response.status != 200:
+        impersonated_fetch.note_refusal_if_block_shaped(
+            dialed_url=url, answered_url=response.url, status=response.status
+        )
+        logger.info(
+            "agentic fetch: the impersonated retry of %s was answered %d by %s",
+            netloc,
+            response.status,
+            urlparse(response.url).netloc,
+        )
+        return None
+    result = await _plain_body_outcome(response.body, response.content_type, response.url)
+    if result.method == "plain":
+        result.method = "impersonate"
+    return result
+
+
+async def _fetch_plain_with_impersonated_retry(
+    url: str, *, deadline_monotonic_s: float | None = None
+) -> PlainFetchResult:
+    """The plain rung, plus the one free retry a host's 403 earns.
+
+    The one trigger both fetchers share, read off the transport at call time so the population
+    cannot drift between them (``impersonated_fetch.IMPERSONATE_TRIGGER_STATUSES``): a host's 403,
+    never the ``blocked`` this ladder produces itself for a non-public URL or a Metaculus
+    self-reference, both of which carry no ``http_status``. Shared by ``fetch`` and by
+    ``read_document``'s local-document ladder, because the latter sits immediately in front of
+    the paid reader and a cold ``read_document`` on a 403 host would otherwise pay for bytes the
+    free retry fetches. A rescue replaces the plain result; every decline leaves it as it was.
+    ``deadline_monotonic_s`` is the caller's own budget, handed to the retry so it never dials a
+    wall its caller would cancel; ``fetch`` has none and passes nothing.
+    """
+    plain = await _fetch_plain(url)
+    if plain.status == "blocked" and plain.http_status in impersonated_fetch.IMPERSONATE_TRIGGER_STATUSES:
+        impersonated = await _try_impersonated_fetch(plain.url, deadline_monotonic_s=deadline_monotonic_s)
+        if impersonated is not None:
+            return impersonated
+    return plain
+
+
 async def search_news(query: str) -> ToolOutcome:
     client_id = os.getenv(ASKNEWS_CLIENT_ID_ENV)
     secret = os.getenv(ASKNEWS_SECRET_ENV)
@@ -496,16 +632,21 @@ def _held_from_result(url: str, result: PlainFetchResult) -> local_document.Held
     return held
 
 
-async def _run_local_document_ladder(url: str) -> local_document.HeldDocument:
-    """The free rungs ``fetch`` runs, plain then rendered, for a document read.
+async def _run_local_document_ladder(url: str, *, deadline_monotonic_s: float) -> local_document.HeldDocument:
+    """The free rungs ``fetch`` runs, for a document read: plain, the impersonated retry, then rendered.
 
     Escalation follows ``fetch``'s own rule rather than a looser one: a page whose plain text is
     thin enough to look like a JavaScript shell goes to the browser even though we hold
     something, because digesting 100 chars of navigation chrome would answer the ask out of
     furniture. A parse ends the ladder either way — a scan is as far as the free route reaches,
-    and that is worth knowing rather than re-fetching.
+    and that is worth knowing rather than re-fetching. The impersonated retry runs here for the
+    same reason it runs in ``fetch``, and with more at stake: this ladder is the one in front of
+    the paid ``url_context`` read, so a 403 it left standing was a paid read of a page the retry
+    fetches for free (a bls.gov PDF is one of the four measured rescues). ``deadline_monotonic_s``
+    is the instant :func:`_acquire_local_document`'s ``wait_for`` fires, handed to the retry so it
+    sizes its dial to what is left instead of to a fresh wall the cancellation would cut short.
     """
-    plain = await _fetch_plain(url)
+    plain = await _fetch_plain_with_impersonated_retry(url, deadline_monotonic_s=deadline_monotonic_s)
     held = _held_from_result(url, plain)
     if held.oversize or held.pdf is not None or plain.method == DOCUMENT_NEEDED_METHOD:
         # A parse, a refusal, or a document no local rung can read: an image, or a PDF with no
@@ -527,9 +668,11 @@ async def _acquire_local_document(url: str) -> local_document.HeldDocument:
     """What the free ladder holds for ``url``: something already read this run, or a fresh try.
 
     Bounded by ``_LOCAL_DOCUMENT_BUDGET_S`` so a slow host cannot spend the paid reader's
-    budget as well as its own; on expiry we hold nothing and the reader gets its turn. The
-    cancelled work includes at most one in-flight extraction thread, which finishes and drops
-    its result, because a thread cannot be cancelled.
+    budget as well as its own; on expiry we hold nothing and the reader gets its turn. The same
+    instant is handed to the ladder as its deadline, so the impersonated retry sizes its dial to
+    what is left rather than to a wall this cancellation would cut short. The cancelled work
+    includes at most one in-flight extraction thread, which finishes and drops its result,
+    because a thread cannot be cancelled.
 
     That thread does NOT finish inside its own ``max_seconds``. The clock for that budget starts
     only once ``extract_pdf_text`` has read the declared page count and the whole bookmark
@@ -545,8 +688,12 @@ async def _acquire_local_document(url: str) -> local_document.HeldDocument:
     if cached_text is not None:
         _FETCH_TEXT_CACHE.move_to_end(url)
         return local_document.HeldDocument(text=cached_text)
+    deadline_monotonic_s = monotonic() + _LOCAL_DOCUMENT_BUDGET_S
     try:
-        return await asyncio.wait_for(_run_local_document_ladder(url), timeout=_LOCAL_DOCUMENT_BUDGET_S)
+        return await asyncio.wait_for(
+            _run_local_document_ladder(url, deadline_monotonic_s=deadline_monotonic_s),
+            timeout=_LOCAL_DOCUMENT_BUDGET_S,
+        )
     except TimeoutError:
         logger.info(
             "agentic read_document local acquisition exceeded %.0fs, falling back to the reader: %s",
@@ -600,7 +747,7 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
     if cached is not None:
         return cached
 
-    plain = await _fetch_plain(url)
+    plain = await _fetch_plain_with_impersonated_retry(url)
     if plain.status == "blocked":
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="blocked")
     if plain.method == local_document.PDF_LOCAL_METHOD:
@@ -687,11 +834,11 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     """Answer ``ask`` about ``url``: from the page's own text where we can get it, else Gemini.
 
     Acquisition-first. The free ladder runs before anything is spent (this run's cache, then
-    the plain and rendered rungs ``fetch`` uses), and any text it holds is answered with a
-    deterministic BM25 passage digest — ``method="digest_local"``. The paid ``url_context``
-    read happens only when the ladder holds nothing: a host that refuses us, a page with no
-    text at all, or a PDF with no text layer. Measured 2026-09-03, that is two of 47 archived
-    fetch failures, against 191 reader calls over the 2026 summer season.
+    the plain, impersonated-retry and rendered rungs ``fetch`` uses), and any text it holds is
+    answered with a deterministic BM25 passage digest — ``method="digest_local"``. The paid
+    ``url_context`` read happens only when the ladder holds nothing: a host that refuses us, a
+    page with no text at all, or a PDF with no text layer. Measured 2026-09-03, that is two of 47
+    archived fetch failures, against 191 reader calls over the 2026 summer season.
 
     The retrieval-count guard on the paid rung stays exactly as it was, because it is what
     keeps that rung honest: ``method="document"`` maps to the ``fetched`` tier

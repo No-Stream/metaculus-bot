@@ -22,7 +22,15 @@ writes itself, because only the transport knows whether a browser actually ran b
 clock cut it off (see :class:`RenderTimeout`).
 
 The SSRF guard is resolved through ``resolution_source`` at call time, from inside the two
-functions that need it, and both halves of that are deliberate — see :func:`_resolve_pinned_host`.
+functions that need it, and both halves of that are deliberate — see :func:`resolve_pinned_host`.
+
+The DNS-pin helpers here, :func:`pinnable_url_host` and :func:`resolve_pinned_host`, have a
+THIRD consumer: the TLS-impersonation transport (:mod:`metaculus_bot.research.impersonated_fetch`,
+2026-09-04), which pins libcurl to the vetted address with ``CURLOPT_RESOLVE`` exactly as this
+module pins Chromium with ``--host-resolver-rules``. Both helpers are the one home of that
+vetting for both pin syntaxes, which is why their return and rejection contracts are stated in
+their docstrings for libcurl as well as Chromium; the browser render itself is still this
+module's alone.
 """
 
 from __future__ import annotations
@@ -369,25 +377,29 @@ def _host_resolver_rule(host: str, ip: str) -> str:
     IPv6 literals must be bracketed in the MAP target per Chromium's rule parser
     (``MAP host [dead::beef]``); IPv4 literals are bare. A malformed ``ip`` is
     passed through unbracketed — callers only ever feed this a value already
-    vetted by :func:`_resolve_pinned_host`, so that branch is defensive only.
+    vetted by :func:`resolve_pinned_host`, so that branch is defensive only.
     """
     parsed_ip = _ip_literal(ip)
     target = f"[{ip}]" if parsed_ip is not None and parsed_ip.version == 6 else ip
     return f"--host-resolver-rules=MAP {host} {target}"
 
 
-def _pinnable_url_host(url: str) -> str | None:
+def pinnable_url_host(url: str) -> str | None:
     """Hostname of a URL eligible for DNS pinning, or None when the URL itself disqualifies it.
 
-    The pin is only as good as the MAP pattern's match. Chromium canonicalises a hostname
-    (punycode for a unicode name, the trailing dot dropped) before it consults
-    ``--host-resolver-rules``, and ``urlparse`` does neither, so a pattern built from a unicode
-    or trailing-dot host is accepted and matches NOTHING: the main frame then resolves through
-    Chromium's own resolver and the rebinding window the pin closes re-opens. Failing closed is
-    the only safe answer — reproducing Chromium's canonicalisation is not, because the stdlib
-    ``idna`` codec is IDNA2003 and diverges from Chromium's UTS#46 form on real names
-    (``straße`` maps to ``strasse`` there and to ``xn--strae-oqa`` in Chromium), so it would emit
-    a pattern that looks right and is inert.
+    Serves both pin syntaxes: Chromium's ``--host-resolver-rules=MAP`` and libcurl's
+    ``CURLOPT_RESOLVE``. A pin is only as good as its host match, and both matchers compare a
+    canonicalised host that ``urlparse`` does not produce. Chromium canonicalises (punycode for a
+    unicode name, the trailing dot dropped) before it consults ``--host-resolver-rules``, and a
+    ``CURLOPT_RESOLVE`` entry matches libcurl's own host string exactly; a pattern or entry built
+    from a unicode or trailing-dot host is accepted and matches NOTHING, so the client resolves
+    through its own resolver and the rebinding window the pin closes re-opens. Failing closed on a
+    non-ASCII or trailing-dot host is the only safe answer for either matcher, and reproducing
+    Chromium's canonicalisation is not: the stdlib ``idna`` codec is IDNA2003 and diverges from
+    Chromium's UTS#46 form on real names (``straße`` maps to ``strasse`` there and to
+    ``xn--strae-oqa`` in Chromium), so it would emit a pattern that looks right and is inert. So
+    this rejects unicode, trailing-dot, userinfo and non-HTTP(S) hosts for both callers rather
+    than relaxing the rule on one client's reasoning; relaxing it would reopen the pin on the other.
     """
     try:
         parsed = urlparse(url)
@@ -404,24 +416,29 @@ def _pinnable_url_host(url: str) -> str | None:
     return host
 
 
-async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
-    """Vet ``url``'s host and resolve it to ONE public IP for Chromium DNS pinning.
+async def resolve_pinned_host(url: str) -> tuple[str, str] | None:
+    """Vet ``url``'s host and resolve it to ONE public IP for DNS pinning, browser or libcurl.
 
-    Returns ``(host, vetted_ip)`` — the ``--host-resolver-rules=MAP`` operands — or
-    ``None`` when the URL is non-public, unresolvable, or ANY resolved address is
-    disallowed. Mirrors :func:`resolution_source.is_public_http_url`'s classification
-    (scheme, userinfo, and the shared :func:`resolution_source.resolve_vetted_public_ip`
-    predicate) so Chromium can only dial an address the airtight aiohttp
-    ``FilteringResolver`` path would also accept.
+    Returns ``(host, vetted_ip)`` or ``None`` when the URL is non-public, unresolvable, or ANY
+    resolved address is disallowed. ``vetted_ip`` is a BARE address string, never bracketed: each
+    caller brackets an IPv6 literal itself for its own syntax (Chromium's ``--host-resolver-rules
+    =MAP host [ip]`` in :func:`_host_resolver_rule`, libcurl's ``host:port:[ip]`` in the
+    impersonation transport's ``_resolve_entry``), so returning the bracketed form here would make
+    one caller's pin match nothing. That bare-address return is part of the contract. Mirrors
+    :func:`resolution_source.is_public_http_url`'s classification (scheme, userinfo, and the shared
+    :func:`resolution_source.resolve_vetted_public_ip` predicate) so neither client can dial an
+    address the airtight aiohttp ``FilteringResolver`` path would also refuse.
 
-    This is what closes the DNS-rebinding TOCTOU on the rendered rung: the per-request
-    route guard runs its own ``getaddrinfo`` independently of Chromium's socket connect, so
-    a rebinding host (TTL 0) can pass the preflight and connect to a private IP. Pinning the
-    main-frame host to a single pre-vetted IP removes that second resolution entirely —
-    Chromium's connect can only reach the vetted address.
+    This is what closes the DNS-rebinding TOCTOU on both pinned transports: the per-request route
+    guard runs its own ``getaddrinfo`` independently of the client's socket connect, so a rebinding
+    host (TTL 0) can pass the preflight and connect to a private IP. Pinning the host to a single
+    pre-vetted IP removes that second resolution entirely — the connect can only reach the vetted
+    address, whether that pin is Chromium's ``--host-resolver-rules`` or libcurl's
+    ``CURLOPT_RESOLVE``.
 
-    Fails CLOSED: on any rejection the caller skips Chromium for that host and its fetch
-    ladder degrades to whatever the plain rung already had.
+    Fails CLOSED: on any rejection the browser caller skips Chromium for that host (its fetch
+    ladder degrades to whatever the plain rung already had), and the impersonation caller declines
+    the retry with :class:`impersonated_fetch.ImpersonateUnpinnable`.
 
     The ``resolution_source`` import is function-scoped for two reasons at once, and both
     have to hold for it to stay. It is a REAL circular import — that module imports this one
@@ -436,7 +453,7 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
         resolution_source,
     )
 
-    host = _pinnable_url_host(url)
+    host = pinnable_url_host(url)
     if not host:
         return None
 
@@ -467,9 +484,9 @@ async def _vet_route(route: Any, request: Any, playwright_error: type[BaseExcept
     propagates.
 
     The guard is resolved through ``resolution_source`` at call time for the reasons
-    :func:`_resolve_pinned_host` states.
+    :func:`resolve_pinned_host` states.
     """
-    from metaculus_bot.research import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real cycle + the guard's single patch surface, see _resolve_pinned_host
+    from metaculus_bot.research import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real cycle + the guard's single patch surface, see resolve_pinned_host
         resolution_source,
     )
 
@@ -984,7 +1001,7 @@ async def render_page(
     big to read safely), and a main frame that landed on a host other than the pinned one raises
     :class:`RenderOffHost` (the page sent the browser somewhere the pin does not cover, and its
     DOM was refused unread or discarded unpublished). A caller that wants to tell the ``None`` causes apart reads
-    :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
+    :func:`rendered_to_nothing` and :func:`resolve_pinned_host` itself.
 
     A render that ran and was CUT OFF is different, and raises :class:`RenderTimeout` (a
     builtin ``TimeoutError``) instead: the DOM read outlived ``RENDER_DOM_READ_TIMEOUT_MS``, or the
@@ -1059,7 +1076,7 @@ async def render_page(
     # Pin Chromium's DNS to a single pre-vetted public IP BEFORE launch. If the host can't be
     # resolved to a public address, fail closed: skip Chromium and let the caller's ladder fall
     # back (same graceful-failure signal as a playwright-unavailable / render-error return).
-    pinned = await _resolve_pinned_host(url)
+    pinned = await resolve_pinned_host(url)
     if pinned is None:
         logger.warning("rendered fetch skipped (host not pinnable to a public IP): %s", urlparse(url).netloc)
         return None

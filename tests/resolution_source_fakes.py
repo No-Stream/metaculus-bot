@@ -1,4 +1,5 @@
-"""Fake aiohttp session and HTML page builders for the resolution-source tests.
+"""Fake aiohttp session and HTML page builders for the resolution-source tests, plus the
+impersonated-transport double that ``tests/test_agentic_tools.py`` shares with them.
 
 Copied and extended from ``tests/market_retrieval_fakes.py``. Extensions versus the
 prediction-market template:
@@ -28,6 +29,7 @@ from urllib.parse import urlparse
 
 from metaculus_bot.constants import GOOGLE_API_KEY_ENV, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.impersonated_fetch import ImpersonatedResponse
 from metaculus_bot.research.rendered_fetch import RenderedPage
 
 
@@ -359,6 +361,18 @@ _RENDERED_PROSE = (
 )
 
 
+def _menu_tree_page() -> bytes:
+    """A page the line-shape metric withholds: the abs.gov.au shape the extractor policy was
+    calibrated on, about 2,000 chars of 48-char listing lines, well over the chrome floor and
+    nothing but a release archive, so real trafilatura extracts it and the metric withholds it."""
+    return (
+        "<!doctype html><html><head><title>Labour Force, Australia</title></head><body><nav>Home</nav><main>"
+        "<h1>Labour Force, Australia</h1><ul>"
+        + "".join(f"<li>Labour Force, Australia, release {i:02d} 2026 Archive release</li>" for i in range(36))
+        + "</ul></main></body></html>"
+    ).encode()
+
+
 def _rendered(html: str, *, content_type: str = "text/html") -> RenderedPage:
     return RenderedPage(url=_URL, content_type=content_type, html=html)
 
@@ -471,3 +485,69 @@ def refused_page_with_robots(*, robots: bytes = ROBOTS_ALLOW_ALL, extra: _Handle
             **(extra or {}),
         }
     )
+
+
+# --- Impersonated-retry scaffolding (shared by the Tier-1 rung, SSRF, dispatch and fetch modules
+# and by gap-fill v2's `tests/test_agentic_tools.py`) ---
+# The transport is `research/impersonated_fetch.py`; every test patches its own ladder's import
+# seam (`resolution_source.fetch_impersonated` for Tier 1, `agentic_tools.fetch_impersonated` for
+# gap-fill v2) with the double below rather than the transport's own session, so the suite's
+# `_block_native_egress` guard stays armed underneath it.
+
+
+def _impersonated(
+    status: int,
+    *,
+    body: bytes = b"",
+    content_type: str = "text/html; charset=utf-8",
+    url: str = _URL,
+    server: str | None = None,
+) -> ImpersonatedResponse:
+    """One completed impersonated response, shaped as the transport returns it."""
+    return ImpersonatedResponse(
+        status=status,
+        url=url,
+        content_type=content_type.lower(),
+        server=server,
+        body=body,
+        elapsed_s=0.31,
+        primary_ip="93.184.216.34",
+    )
+
+
+def fake_impersonated_fetch(answer: ImpersonatedResponse | BaseException, calls: list[dict[str, Any]]):
+    """A stand-in for ``fetch_impersonated`` that records every keyword the caller handed it.
+
+    ``answer`` is returned, or raised when it is an exception, so one double covers a rescue,
+    a still-refused host and every member of the ``ImpersonateDeclined`` family. The one double
+    for BOTH callers (the Tier-1 rung patches it on ``resolution_source``, gap-fill v2 on
+    ``agentic.tools``), so the transport's keyword contract is spelled once: a keyword the
+    transport gains or loses changes this signature, and both suites go red together.
+    """
+
+    async def _fetch(
+        url: str,
+        *,
+        host_sems: dict[str, asyncio.Semaphore],
+        deadline_monotonic_s: float,
+        per_hop_timeout_s: float,
+        max_bytes: int,
+        document_max_bytes: int,
+    ) -> ImpersonatedResponse:
+        calls.append(
+            {
+                "url": url,
+                "host_sems": host_sems,
+                "deadline_monotonic_s": deadline_monotonic_s,
+                "per_hop_timeout_s": per_hop_timeout_s,
+                "max_bytes": max_bytes,
+                "document_max_bytes": document_max_bytes,
+            }
+        )
+        # A real yield point, so the double schedules like the transport it replaces.
+        await asyncio.sleep(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    return _fetch

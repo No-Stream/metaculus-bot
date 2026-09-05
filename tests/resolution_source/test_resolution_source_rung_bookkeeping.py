@@ -39,6 +39,7 @@ from tests.resolution_source_fakes import (
     FakeSession,
     _escape_config,
     _fake_render,
+    _menu_tree_page,
     _mock_question,
     _prose_page,
     _snapshot_url,
@@ -237,16 +238,21 @@ class TestRungSkipReasonCounts:
         assert all(value == 0 for value in counts.values())
         assert {"rung_budget_skips", "chrome_metric_withholds", "chrome_metric_withholds_rescued"} <= set(counts)
 
+    def test_the_impersonate_rung_is_phrased_and_budget_gated(self):
+        """Explicit, because the failure it guards is silent until production: `claim_rung_budget`
+        indexes the phrase map, so an impersonate rung shipped without its entry raises `KeyError`
+        from inside the rung, which the provider's `gather(return_exceptions=False)` turns into
+        losing every cited page of the question."""
+        assert _RUNG_WALL_SKIP_PHRASE["impersonate"] == "the impersonated retry"
+        assert "impersonate" in _BUDGET_GATED_RUNGS
+        # Inserted in ladder order, right after the meta-refresh hop and before the local PDF read.
+        assert _BUDGET_GATED_RUNGS.index("impersonate") == _BUDGET_GATED_RUNGS.index("meta_refresh") + 1
+        assert {"impersonate_attempts", "impersonate_budget_skips"} <= set(_rung_counts([]))
 
-# The abs.gov.au shape the extractor policy was calibrated on: about 2,000 chars of 48-char
-# listing lines, well over the chrome floor and nothing but a menu, so real trafilatura extracts
-# it and the line-shape metric withholds it.
-_MENU_TREE = (
-    "<!doctype html><html><head><title>Labour Force, Australia</title></head><body><nav>Home</nav><main>"
-    "<h1>Labour Force, Australia</h1><ul>"
-    + "".join(f"<li>Labour Force, Australia, release {i:02d} 2026 Archive release</li>" for i in range(36))
-    + "</ul></main></body></html>"
-).encode()
+
+# The abs.gov.au shape the extractor policy was calibrated on (`_menu_tree_page`), shared with
+# the impersonated retry's own withhold test.
+_MENU_TREE = _menu_tree_page()
 
 
 class TestChromeMetricWithholdCounts:

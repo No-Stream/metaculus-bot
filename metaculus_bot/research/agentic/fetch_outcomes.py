@@ -33,11 +33,11 @@ import aiohttp
 from metaculus_bot.constants import GAP_FILL_V2_MIN_CONTENT_CHARS
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO
+from metaculus_bot.research.resolution_fetch_result import PDF_CONTENT_TYPES
 
 _FETCH_LINK_CAP = 25
 _FETCH_MIN_CONTENT_CHARS = GAP_FILL_V2_MIN_CONTENT_CHARS
 
-_PDF_CONTENT_TYPE_TOKENS = ("application/pdf",)
 _IMAGE_CONTENT_TYPE_PREFIXES = ("image/",)
 _RETRYABLE_FETCH_BLOCK_STATUSES = {403, 406, 429}
 _TEXTUAL_CONTENT_TYPE_TOKENS = ("text/plain", "text/csv", "application/json")
@@ -100,6 +100,11 @@ class PlainFetchResult:
     url: str
     content_type: str | None = None
     escalate_rendered: bool = False
+    # The HTTP status behind a non-200 terminal result (`_non_ok_status_result`); None on a 200 and
+    # on every refusal this ladder makes itself. It is what lets the impersonated retry key on a
+    # host's 403 alone: `blocked` is also what a non-public URL and a Metaculus self-reference come
+    # back as, and handing either of those to a second transport is the bypass the guard prevents.
+    http_status: int | None = None
 
 
 class _LinkCollector(HTMLParser):
@@ -149,7 +154,7 @@ def _content_type_is_pdf(content_type: str | None) -> bool:
     """True for a declared PDF, which the ladder reads locally rather than escalating."""
     if not content_type:
         return False
-    return any(token in content_type.lower() for token in _PDF_CONTENT_TYPE_TOKENS)
+    return any(token in content_type.lower() for token in PDF_CONTENT_TYPES)
 
 
 def _content_type_is_image(content_type: str | None) -> bool:
@@ -233,6 +238,7 @@ def _non_ok_status_result(status: int, current_url: str, content_type: str) -> P
             links=[],
             url=current_url,
             content_type=content_type or None,
+            http_status=status,
         )
     if status != 200:
         return PlainFetchResult(
@@ -242,6 +248,7 @@ def _non_ok_status_result(status: int, current_url: str, content_type: str) -> P
             links=[],
             url=current_url,
             content_type=content_type or None,
+            http_status=status,
         )
     return None
 

@@ -2873,18 +2873,80 @@ Meta-Analysis`, `## Meta-Analysis`, `# Meta-Analysis and Synthesis`) plus the tr
 Unlocked the May 2026 stacker treatment-effect estimate (`analysis_stacking_historical_treatment.md`) —
 first measurable signal (n=8 stacker-ran, −0.090 Brier vs counterfactual, P(helped)=89.8%).
 
-### GitHub-runner egress reputation is the dominant cause of resolution-source 403s (added 2026-09-03; LOW priority by operator decision)
+### GitHub-runner egress reputation is the dominant cause of resolution-source 403s (added 2026-09-03; SPLIT 2026-09-04: the fingerprint half is BUILT, the egress-IP half stays parked at LOW)
 
 The archived `blocked` fetches on bls.gov, cdc.gov and fsis.usda.gov (Akamai edges) do NOT
 reproduce from the operator's laptop or EC2 box with the bot's own aiohttp session and headers;
 only the GitHub Actions runner gets 403 (`scratch/fetch_ladder_2026-09-03/replay_report.md`,
 plan `scratch_docs_and_planning/fetch_ladder_plan_2026-09-03.md`). The free GHA diagnostic in
-that plan's step 0 decides whether TLS impersonation helps from the runner. If it does not, the
-only structural fix is an egress that is not a GitHub runner (an HTTP proxy on the operator's EC2
-box, or a self-hosted runner). Operator 2026-09-03: "probably too complicated" — park here; the
-Wayback and url_context rungs cover the class in the meantime. The same runner-side cause is
-consistent with GitHub cron gaps (q45092 forfeited 2026-09-01: the 00:05Z fire saw 0 questions
-and the next fire was 04:55Z, past a 2.8-hour window).
+that plan's step 0 ran on 2026-09-04 from the runner (egress IP 4.246.135.160) and split the
+population in two. All four Akamai-fronted federal URLs (bls.gov `/wsp/` and `wkstp.pdf`,
+cdc.gov cyclosporiasis, fsis.usda.gov) answered the same GET 200 under Chrome impersonation, so
+those 403s were a TLS and HTTP/2 fingerprint verdict, and the impersonated retry rung shipped
+for them the same day (`research/impersonated_fetch.py`, `_impersonate_rung`, plan
+`scratch_docs_and_planning/impersonate_rung_plan_2026-09-04.md`; gap-fill v2's `fetch` tool
+dials the same transport). The four hosts that refused both (congress.gov on Cloudflare,
+tracxn.com on CloudFront, sagaftra.org on DataDome, trueup.io on Cloudflare) are the egress-IP
+half, and for them the only structural fix is still an egress that is not a GitHub runner (an
+HTTP proxy on the operator's EC2 box, or a self-hosted runner). Operator 2026-09-03: "probably
+too complicated" for that half; it stays parked here, and the Wayback and url_context rungs
+cover it in the meantime. The same runner-side cause is consistent with GitHub cron gaps
+(q45092 forfeited 2026-09-01: the 00:05Z fire saw 0 questions and the next fire was 04:55Z,
+past a 2.8-hour window).
+
+### A 200 challenge or throttle interstitial as a Tier-1 impersonation trigger (added 2026-09-04; LOW)
+
+The impersonated retry fires on a direct-fetch 403 only. A host that answers 200 with a
+bot-challenge or rate-limit interstitial in place of the page is not a representable trigger
+today: Tier 1 has no throttle-phrase check at all (`matched_throttle_phrase` and
+`FETCH_THROTTLE_PHRASES` live only in gap-fill v2's `agentic/fetch_outcomes.py`), so such a page
+goes through `_classify_html_body` and lands on `js_wall` or `no_resolving_content` with reason
+`thin_page`; an interstitial routinely clears the chrome floor. Making it a trigger means porting
+the phrase check into Tier 1's classifier, with its own false-positive risk (a real page that
+discusses rate limits) and its own measurement. In the same bucket: an `error` with
+`failure_class="tls"` is a plausible widening (a handshake reset is arguably a fingerprint
+verdict too) that nothing has measured.
+
+### An impersonated 200 that carries no readable text is a candidate browser-rung trigger (added 2026-09-04; LOW)
+
+When the impersonated retry gets a 200 that classifies as `js_wall` or `thin_page`, the rung
+stamps that verdict on its escalation line and leaves the direct `blocked` standing, because
+`_escalate_unresolved` keys the browser block on `direct` and not on a rung's result, and
+replacing `blocked` with `js_wall` on the page's own record would change the fetch line without
+giving any later rung a way to act on it. That page is exactly the shape the browser rung was
+built for, except that Chromium dials from our own address and would be answered 403 like the
+aiohttp client was. Wiring it up means letting the dispatcher escalate on a RUNG's result, a
+restructure with its own review, and would need a browser that presents the impersonated
+fingerprint too.
+
+### A meta-refresh hop from an impersonated page (added 2026-09-04; LOW)
+
+The impersonated router (`_impersonated_body_outcome`) deliberately runs no meta-refresh hop:
+`_resolution_html_outcome` follows one after a no-content classification on the direct path, but
+following it from inside the rung would mean deciding which transport dials the target (the
+direct fetch was refused by this host, so the hop would have to go out impersonated too) and
+re-entering the whole hop loop from inside a rung, so the router calls `_classify_html_body`
+directly. The consequence is one shape that still declines: a cdc.gov surveillance stub that
+answers 403 to aiohttp, 200 to the impersonated client, and carries only
+`<meta http-equiv="refresh">` classifies as `js_wall` on the impersonated body and leaves the
+direct `blocked` standing. The shape is a hypothesis built from two receipts (the cdc.gov
+refresh stubs the meta-refresh hop was added for, and cdc.gov's 403 to aiohttp), not a measured
+case; wiring it means the transport following the refresh target as one more re-guarded,
+re-pinned hop under the shared `MAX_REDIRECTS` cap, dialed impersonated because this host refused
+the direct client. The browser rung has no such decision to make: Chromium follows a meta refresh
+itself and the route guard re-checks the hop, which is why `RenderedPage.document_url` exists.
+
+### Cross-question host-gate contention from the impersonation rung (added 2026-09-04; LOW)
+
+The impersonation rung acquires the shared per-host politeness semaphore once more per 403, on top of
+the direct fetch and any later rung, so several questions citing the same refusing host in one run
+queue behind each other inside their claimed budgets. The wait is bounded by the budget re-check after
+the gate is acquired (a spent budget declines without dialing), so the 45 s provider wall is safe, and
+the free suite cannot measure how often the queue costs a rescue. Only a real multi-question run can,
+and every bot run is a paid surface, so the measurement waits for the season's first archived runs:
+compare `impersonate_budget_skips` against `impersonate_attempts` across questions sharing a host. A
+non-trivial skip share would argue for a per-host memo of "answered 200 under impersonation" that
+lets later questions skip the queue, which is a design change and not a tuning knob.
 
 ### Chromium teardown noise after a render: cause found, fix not shipped (added 2026-09-03; LOW)
 

@@ -798,6 +798,36 @@ RENDERED_DOM_MAX_CHARS: int = RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
 # as the HTTP timeout — not the browser floor above. It has its own name because the two rungs
 # are tuned independently: this one gets cheaper as a run goes on, the browser never does.
 RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S: float = 3.0
+# --- The impersonated retry (research/impersonated_fetch.py, shared with gap-fill v2) ---
+# Measured 2026-09-04 from a GitHub Actions runner (scripts/probes/fetch_diagnostic.py): four
+# Akamai-fronted federal hosts answered the bot's own aiohttp client 403 and the same GET through
+# curl_cffi with Chrome impersonation 200, so the refusal is a TLS and HTTP/2 fingerprint verdict
+# and is recoverable client-side. Free: no key, no model call, no spend.
+#
+# Floor for the retry. One GET against a host that just answered us, so it is the meta-refresh
+# hop's 3.0 s and the derived-feed GET's 3.0 s, on the same "0-2 s typical" probe basis as the HTTP
+# timeout. Deliberately NOT the browser rung's 12.0 s: no process is launched, no gate is contended
+# process-wide, and no model round trip happens.
+RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S: float = 3.0
+# Kill switch, ON by default in code (unlike the paid rung's default-off) because the rung is free
+# and bounded by its 403-only trigger, the per-run host memo and the floor above; an explicit
+# "false" in a workflow yaml turns it off without a code change. Read with `default=True`.
+RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV: str = "RESOLUTION_SOURCE_IMPERSONATE_ENABLED"
+# Floor under the per-hop timeout the two SSRF-guarded fetchers derive from the remaining wall
+# budget (resolution_source._fetch_one_hop and the impersonated transport alike). A hop reached with
+# the budget already spent still gets a token attempt rather than a guaranteed-expired one: nothing
+# downstream distinguishes "timed out at 0.0 s" from "timed out at 0.5 s", and a fast host
+# answering in 200 ms is a page we would otherwise refuse for free. Small enough that the overshoot
+# stays well inside RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S.
+RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S: float = 0.5
+# The concrete curl_cffi impersonation profile, pinned rather than the floating "chrome" alias.
+# The alias resolves to a specific Chrome release inside the library (chrome146 at curl_cffi
+# 0.15.0), so a routine curl_cffi bump would silently change the TLS and HTTP/2 fingerprint and the
+# User-Agent the federal hosts see, which can flip the rung's success rate with no code change and
+# makes the 2026-09-04 measurement non-reproducible. Pinning makes a fingerprint change a
+# reviewable diff. No RESOLUTION_SOURCE_ prefix because gap-fill v2 dials the same transport,
+# following RENDERED_DOM_MAX_CHARS' precedent.
+IMPERSONATE_BROWSER_TARGET: str = "chrome146"
 # --- Wayback Machine snapshots ---
 # The archive is the one free route whose egress is not ours, which is the whole reason it earns
 # a rung (measured 2026-09-03: identical client, identical headers, 403 from a GitHub Actions
