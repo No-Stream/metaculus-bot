@@ -3060,6 +3060,87 @@ class TestRenderedRungTimeoutAtTheV2Wrapper:
         assert page.teardown == ["unroute_all", "context.close", "browser.close"]
 
 
+class TestGapFillV2RendersThePlainRungsFinalUrl:
+    """Both call sites hand the browser the plain rung's POST-REDIRECT URL, ``plain.url``, never
+    the URL the driver asked for. That is load-bearing since the transport pins Chromium's DNS to
+    the host it is asked for and refuses a main frame that lands anywhere else: rendering the
+    pre-redirect URL would pin the wrong host and then refuse the DOM when Chromium followed the
+    same hop (every http-to-https, apex-to-www and shortener redirect), and gap-fill v2 would
+    degrade on the resulting ``None`` with one warning line. Rewriting either site to ``url`` left
+    the whole suite green before these tests, so they exist to go red under that mutation."""
+
+    _REQUESTED = "https://example.com/start"
+    _FINAL = "https://www.example.com/final"
+
+    @staticmethod
+    def _record_render_targets(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """A browser rung that declines, recording what it was asked to render."""
+        targets: list[str] = []
+
+        async def _declining_recorder(target: str) -> None:
+            targets.append(target)
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", _declining_recorder)
+        return targets
+
+    def _thin_plain_read_that_landed_elsewhere(self) -> fetch_outcomes.PlainFetchResult:
+        return fetch_outcomes.PlainFetchResult(
+            status="ok", method="plain", text="Menu. Home.", links=[], url=self._FINAL, escalate_rendered=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_escalation_outcome_renders_the_plain_rungs_final_url(self, monkeypatch: pytest.MonkeyPatch):
+        targets = self._record_render_targets(monkeypatch)
+
+        outcome = await agentic_tools._rendered_escalation_outcome(
+            self._REQUESTED, self._thin_plain_read_that_landed_elsewhere(), start_char=0, question_topic=""
+        )
+
+        assert targets == [self._FINAL]
+        # The browser declined, so the thin-but-real plain read stands under its own method.
+        assert outcome.method == "plain"
+
+    @pytest.mark.asyncio
+    async def test_the_document_ladder_renders_the_plain_rungs_final_url(self, monkeypatch: pytest.MonkeyPatch):
+        targets = self._record_render_targets(monkeypatch)
+        monkeypatch.setattr(
+            agentic_tools, "_fetch_plain", AsyncMock(return_value=self._thin_plain_read_that_landed_elsewhere())
+        )
+
+        held = await agentic_tools._run_local_document_ladder(self._REQUESTED)
+
+        assert targets == [self._FINAL]
+        assert held.has_text
+
+    @pytest.mark.asyncio
+    async def test_through_fetch_a_scripted_302_decides_the_render_target(self, monkeypatch: pytest.MonkeyPatch):
+        """End to end through the plain rung's own redirect loop, so the URL the browser is handed
+        is proven to be the hop the plain fetch actually landed on rather than a value a stub
+        supplied. The final page is thin, which is what sends the ladder to the browser."""
+        targets = self._record_render_targets(monkeypatch)
+        session = _FakeSession(
+            _FakeResponse(status=302, headers={"Location": self._FINAL}),
+            _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
+        )
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            agentic_tools,
+            "_read_response_body",
+            AsyncMock(return_value=b"<html><body><p>Menu. Home.</p></body></html>"),
+        )
+        monkeypatch.setattr(
+            "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Menu. Home.")
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+        await agentic_tools.fetch(self._REQUESTED)
+
+        assert session.calls == [(self._REQUESTED, False), (self._FINAL, False)]
+        assert targets == [self._FINAL]
+
+
 # ---------------------------------------------------------------------------
 # The Google-Extended robots pre-check on the paid reader (2026-09-03). Proven live: the
 # verification probe's url_context call returned URL_RETRIEVAL_STATUS_ERROR on
