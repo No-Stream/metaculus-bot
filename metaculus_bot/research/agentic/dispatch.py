@@ -221,7 +221,10 @@ def _append_tool_messages(
     """Emit exactly one tool message per tool_call_id, in the assistant's original order.
 
     Anything else and the next LLM turn 400s. Rejected calls get a synthetic
-    plan-gate / budget-exhausted error response.
+    plan-gate / budget-exhausted error response. This is also the only stage that
+    can see an outcome, so it owns the one duplicate-detection exemption the
+    admission stage cannot make: a throttled fetch's key is evicted from
+    ``state.seen_tool_calls`` here (see the inline comment below).
     """
     results_by_id = {result.tool_call_id: result for result in results}
     for tool_call in tool_calls:
@@ -231,6 +234,18 @@ def _append_tool_messages(
             content = _budget_rejected_content(tool_call.name, config)
         else:
             result = results_by_id[tool_call.id]
+            # Forget a throttled call so its retry isn't called a duplicate. The
+            # throttle outcome is deliberately not cached and its message tells the
+            # driver to fetch the same URL again later in the run
+            # (tools._throttled_fetch_outcome), so _DUPLICATE_CALL_WARNING's "its
+            # result will not have changed. Vary the query/URL or move on." is false
+            # exactly here and steers the driver off the URL. Advisory bookkeeping
+            # only: max_tool_calls still caps a throttle spin, a re-throttled retry
+            # re-registers at admission and is evicted again here, and a retry that
+            # succeeds leaves its key in place so a THIRD identical call is still
+            # warned.
+            if result.method == "throttled":
+                state.seen_tool_calls.discard(_normalized_call_key(tool_call))
             content = result.content + (_DUPLICATE_CALL_WARNING if tool_call.id in admitted.duplicate_call_ids else "")
         state.messages.append(
             {

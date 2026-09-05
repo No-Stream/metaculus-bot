@@ -13,7 +13,11 @@ properties:
   (``stale_data``) instead of being served as live,
 - CSV truncation keeps the MOST RECENT rows (the tail), not the head.
 
-Network plumbing (FakeSession / FakeResponse) is shared with the Tier-1 suite.
+Lives in the ``tests/resolution_source/`` package so the directory conftest's autouse DNS
+stub covers it: every hostname here is a reserved ``example.com`` name with no real DNS, and
+without the stub the SSRF preflight classifies every fetch ``ssrf_blocked``. Network plumbing
+(``FakeSession`` / ``FakeResponse``), the question builder and the Infogram embed literal are
+shared with the Tier-1 suite via ``tests/resolution_source_fakes.py``.
 """
 
 from __future__ import annotations
@@ -22,7 +26,6 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
-from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
@@ -38,24 +41,16 @@ from metaculus_bot.research.resolution_source import (
     format_resolution_sections,
     resolution_source_provider,
 )
-from tests.test_resolution_source_provider import FakeResponse, FakeSession
+from tests.resolution_source_fakes import (
+    _INFOGRAM_EMBED_DIV,
+    FakeResponse,
+    FakeSession,
+    _mock_question,
+)
 
 PAGE_URL = "https://tracker.example.com/polls"
 CHART_ID = "T3st1"
 DATASET_URL = f"https://static.dwcdn.net/data/{CHART_ID}.csv"
-
-
-@pytest.fixture(autouse=True)
-def _stub_public_dns(monkeypatch):
-    """Same rationale as the Tier-1 suite: test hostnames have no real DNS, so
-    the SSRF preflight would classify everything ``ssrf_blocked`` without a
-    public-IP stub (autouse fixtures don't cross module boundaries)."""
-
-    def _sync_ainfo(host, port, *args, **kwargs):
-        del host, port, args, kwargs
-        return [(0, 0, 0, "", ("8.8.8.8", 0))]
-
-    monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _sync_ainfo)
 
 
 def _http_date(dt: datetime) -> str:
@@ -91,6 +86,50 @@ def _tracker_page_html(*chart_ids: str) -> bytes:
         f"{embeds}"
         "<p>Methodology: polls are adjusted for house effects and recency; the "
         "downloadable data under the chart takes precedence over the prose.</p>"
+        "</article></body></html>"
+    ).encode()
+
+
+def _embed_shell_page_with_datawrapper(chart_id: str) -> bytes:
+    """Chrome around BOTH an Infogram embed (no route) and a Datawrapper one (the hop).
+
+    The Tier-1 verdict on the page and the Tier-2 verdict on the dataset are
+    independent: the page carries numbers we cannot read, AND the chart's live CSV
+    is served. Withholding the page must not withhold the dataset.
+    """
+    return (
+        "<!doctype html><html><head><title>Tracker</title></head><body>"
+        "<article><h1>Poll tracker</h1>"
+        f"{_INFOGRAM_EMBED_DIV}"
+        f'<div id="datawrapper-iframe" data-attrs="{{&quot;url&quot;:&quot;'
+        f"https://datawrapper.dwcdn.net/{chart_id}/11/&quot;,"
+        f'&quot;title&quot;:&quot;Tracker chart {chart_id}&quot;}}"></div>'
+        "<p>Charts update whenever new qualifying polls are released.</p>"
+        "</article></body></html>"
+    ).encode()
+
+
+def _prose_page_with_both_embeds(chart_id: str) -> bytes:
+    """Real prose plus BOTH an Infogram embed (no route) and a Datawrapper one (the hop).
+
+    The page is a `success` carrying the unreadable-embed disclosure, and its chart's
+    dataset renders as its own section — so this is the one shape where the page-level
+    disclosure and the Tier-2 liveness lead both apply to the same fetch.
+    """
+    return (
+        "<!doctype html><html><head><title>Poll tracker</title></head><body>"
+        "<article><h1>The latest on the tracker</h1>"
+        "<p>Updated recently. As of today, just 33 percent of Americans support "
+        "the conflict, while about 59 percent oppose it. The chart below is "
+        "updated whenever new qualifying polls are released, and the modeled "
+        "average weights each pollster by sample size and track record.</p>"
+        f"{_INFOGRAM_EMBED_DIV}"
+        f'<div id="datawrapper-iframe" data-attrs="{{&quot;url&quot;:&quot;'
+        f"https://datawrapper.dwcdn.net/{chart_id}/11/&quot;,"
+        f'&quot;title&quot;:&quot;Tracker chart {chart_id}&quot;}}"></div>'
+        "<p>Methodology: polls are adjusted for house effects and recency; the "
+        "downloadable data under the chart takes precedence over the prose, and "
+        "the crosstabs behind the interactive are not reproduced in this text.</p>"
         "</article></body></html>"
     ).encode()
 
@@ -253,11 +292,11 @@ class TestDatawrapperHop:
         assert dataset.data_last_modified is not None
         # The formatter surfaces the withholding on the datasets' OWN line — a
         # chart CSV is not a cited resolution source, so it must not ride the
-        # "cited resolution source(s) could not be fetched" wording — and the
+        # "cited resolution source(s) yielded no usable content" wording — and the
         # (fresh) page content still renders.
         out = format_resolution_sections(results, datetime.now(UTC))
         assert "[1 embedded chart dataset(s) not served (stale_data)" in out
-        assert "could not be fetched" not in out
+        assert "yielded no usable content" not in out
         assert "day-0019" not in out
         assert "updated whenever new qualifying polls" in out
 
@@ -532,7 +571,7 @@ class TestDatawrapperHop:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
 
         # The hop's own bound fired, so Tier-1 survives the hanging CDN fetch.
@@ -558,7 +597,7 @@ class TestDatawrapperHop:
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
         with caplog.at_level(logging.WARNING):
-            q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+            q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
             out = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert f"### {PAGE_URL}" in out
@@ -655,6 +694,36 @@ class TestDatawrapperHopFailureModes:
         result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
         assert result.status == "error"
         assert result.http_status is None
+
+    async def test_a_refused_dataset_carries_its_failure_class_and_the_cdn_s_server_token(self):
+        """The Tier-2 hop reads the same two marker-field helpers as the cited-page fetch, so a
+        CDN 403 is attributable to the edge that served it. The spaced header is deliberate: it is
+        the shape that would split the marker's ``server`` field into two tokens if the collapse
+        were ever skipped on this call site."""
+        session = FakeSession(
+            {
+                DATASET_URL: FakeResponse(
+                    403, body=b"", content_type="text/html", headers={"Server": "Apache/2.4.62 (Debian)"}
+                )
+            }
+        )
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+        assert result.status == "blocked"
+        assert result.failure_class == "http_403"
+        assert result.server == "apache/2.4.62_(debian)"
+        assert result.exc is None
+
+    async def test_a_transport_failure_carries_its_class_and_the_exception_name(self):
+        """No response means no status and no ``Server`` header; what the archive gets instead is
+        the transport bucket and the exact class, which is how a CDN body cut short is told from a
+        timeout without re-scraping the run log."""
+        session = FakeSession({DATASET_URL: aiohttp.ClientPayloadError("truncated")})
+        result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
+        assert result.status == "error"
+        assert result.http_status is None
+        assert result.failure_class == "decode"
+        assert result.exc == "ClientPayloadError"
+        assert result.server is None
 
     async def test_a_soft_404_fragment_is_rejected_before_tag_stripping(self):
         """A CDN soft-404 served as 200 can arrive as an HTML FRAGMENT opening with
@@ -841,14 +910,76 @@ class TestDatasetMarkupStripping:
         assert result.text.endswith(_csv_body(20).strip())
 
 
-def _mock_question(criteria: str) -> MagicMock:
-    q = MagicMock()
-    q.resolution_criteria = criteria
-    q.fine_print = ""
-    q.id_of_question = 998
-    q.question_text = "tracker question"
-    q.page_url = "https://metaculus.com/q/998"
-    return q
+class TestEmbedShellPageStillHops:
+    """The two tiers are independent verdicts. A page whose own text is embed chrome is
+    withheld (`no_resolving_content`), and that must not touch the Datawrapper hop the
+    page also exposes — the dataset is the resolving series those pages exist to serve."""
+
+    async def test_a_withheld_shell_page_still_serves_its_dataset(self, monkeypatch):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(
+                    200, body=_embed_shell_page_with_datawrapper(CHART_ID), content_type="text/html"
+                ),
+                DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL])
+
+        assert [r.status for r in results] == ["no_resolving_content", "success"]
+        assert results[0].unreadable_embeds == ["infogram"]
+        out = format_resolution_sections(results, datetime.now(UTC))
+        assert "day-0019,38.5,57.9" in out  # the dataset renders
+        assert f"### {PAGE_URL}" not in out  # the shell page does not
+        assert "no_resolving_content" in out  # and the loss is named
+
+    async def test_a_datawrapper_only_shell_is_still_js_wall(self, monkeypatch):
+        """Datawrapper is exempt from the routeless-embed scan because the hop reaches it,
+        so a JS-walled tracker keeps reporting `js_wall` — the status that names a page we
+        could not read at all rather than one hiding data behind a provider with no route."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        shell = (
+            '<!doctype html><html><body><div id="root"></div>'
+            '<div data-attrs="{&quot;url&quot;:&quot;'
+            f'https://datawrapper.dwcdn.net/{CHART_ID}/11/&quot;}}"></div></body></html>'
+        ).encode()
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=shell, content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL])
+
+        assert [r.status for r in results] == ["js_wall", "success"]
+        assert results[0].unreadable_embeds == []
+
+    async def test_the_hop_emits_its_own_fetch_marker(self, monkeypatch, caplog):
+        """Item 19d: dataset hops ride the same per-URL marker, told apart by their url —
+        `static.dwcdn.net/data/<chart_id>.csv` is reachable no other way, so a query can
+        partition hop artifacts from cited pages on it."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(5), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} status=ok http=200 embeds=none",
+        ]
 
 
 class TestProviderEndToEnd:
@@ -862,7 +993,7 @@ class TestProviderEndToEnd:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL} — the CSV under the chart.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL} — the CSV under the chart.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert f"### {PAGE_URL}" in out
@@ -891,7 +1022,7 @@ class TestProviderEndToEnd:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert "day-0019" not in out  # the stale CSV never reaches a forecaster
@@ -912,11 +1043,59 @@ class TestProviderEndToEnd:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         await resolution_source_provider(is_benchmarking=False)(q)
 
         sources = pop_provider_detail(q.id_of_question, "resolution_source")["sources"]
         assert sources[f"datawrapper:{CHART_ID}"] == "error"
+
+    async def test_a_refused_hop_names_its_failure_class_and_cdn_server_on_the_marker(self, monkeypatch, caplog):
+        """The failure diagnostics ride the hop's own ``RESOLUTION_SOURCE_FETCH`` line exactly as
+        they ride a cited page's, and the ``Server`` value is one token: the spec's
+        ``(?P<server>\\S+)`` would otherwise match ``apache/2.4.62`` alone and the archive would
+        file a CDN 403 against a truncated header with no parse error to notice."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: FakeResponse(
+                    403, body=b"", content_type="text/html", headers={"Server": "Apache/2.4.62 (Debian)"}
+                ),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} "
+            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian)",
+        ]
+
+    async def test_a_hop_that_never_got_a_response_reports_its_transport_class(self, monkeypatch, caplog):
+        """``http=n/a`` alone said only that no response came back; ``failure_class`` and ``exc``
+        are what tell a refused connection from a timeout or a TLS rejection on the CDN."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
+                DATASET_URL: aiohttp.ClientError("boom"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} "
+            "status=error http=n/a embeds=none failure_class=connection exc=ClientError",
+        ]
 
     async def test_datasets_cannot_evict_cited_page_text(self, monkeypatch):
         """The partitioned section budget: datasets draw on their OWN allowance, so
@@ -955,7 +1134,42 @@ class TestProviderEndToEnd:
         )
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        q = _mock_question(f"Resolves per the tracker at {PAGE_URL}.")
+        q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=True)(q)
         assert out == ""
         assert session.requested == []  # leakage guard fires before any fetch
+
+
+class TestUnreadableEmbedBesideADataset:
+    """One page can BOTH hide numbers in a routeless embed and expose a Datawrapper chart the
+    hop reaches. That renders two sections, each led by its own lead: the page's
+    unreadable-embed disclosure and the dataset's liveness stamp. Both LEAD for the same
+    reason — every truncator on this text preserves the head, so a trailing note is what a
+    later trim deletes first (F6, which found the disclosure being trimmed away)."""
+
+    async def test_each_section_is_led_by_its_own_lead(self, monkeypatch):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                PAGE_URL: FakeResponse(200, body=_prose_page_with_both_embeds(CHART_ID), content_type="text/html"),
+                DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources([PAGE_URL])
+
+        assert [r.status for r in results] == ["success", "success"]
+        assert results[0].unreadable_embeds == ["infogram"]
+        assert results[0].text.startswith("[This page displays data through infogram")
+        assert results[1].text.startswith('Live "Get the data" dataset for Datawrapper chart')
+
+        out = format_resolution_sections(results, datetime(2026, 9, 1, tzinfo=UTC))
+
+        # Each lead sits immediately under its own heading; neither displaces the other,
+        # because the page text and the dataset are separate sections on separate budgets.
+        assert f"### {PAGE_URL}\n(fetched 2026-09-01)\n\n[This page displays data through infogram" in out
+        assert f'### {DATASET_URL}\n(fetched 2026-09-01)\n\nLive "Get the data" dataset' in out
+        assert out.index(PAGE_URL) < out.index(DATASET_URL)
+        assert "NOT in the page text below" in out
+        assert "day-0019,38.5,57.9" in out  # the dataset's rows still arrive

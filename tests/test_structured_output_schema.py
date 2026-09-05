@@ -6,18 +6,21 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
+    _NUMERIC_OUTCOME_TYPES,
     BaseRateAnchor,
     BinaryStructured,
     CriteriaClause,
     DiscreteCountStructured,
     EvidenceItem,
     MultipleChoiceStructured,
+    NumericOutcomeType,
     NumericStructured,
     ScenarioBranch,
     StatedBaseRate,
@@ -28,6 +31,7 @@ from metaculus_bot.structured_output_schema import (
     extract_json_block_candidates,
     iter_balanced_braces,
     parse_structured_block,
+    parse_structured_payload,
 )
 from metaculus_bot.tool_runner import _aggregate_binary_lines, _parse_all_blocks
 
@@ -466,14 +470,63 @@ class TestNumericStructuredHappyPath:
         )
         assert n.outcome_type is None
 
-    def test_outcome_type_invalid_raises(self) -> None:
-        """C3: invalid outcome_type string rejected by Literal constraint."""
-        with pytest.raises(ValidationError):
-            NumericStructured(
+    @pytest.mark.parametrize("declared", ["unknown", "integer", "discrete", "count", 3, ["continuous"]])
+    def test_an_unrecognised_outcome_type_reads_as_absent(
+        self, declared: object, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A misspelling must cost ONE parser call, not the whole numeric block.
+
+        Under the bare Literal, "integer" or "count" failed validation, and since the
+        numeric block has no strip-and-retry the PERCENTILES went down with it: the
+        forecast dropped to the LLM salvage rung and the OutcomeTypeResult parser call
+        fired anyway for the type. Reading a stray as None leaves
+        ``_resolve_discrete_vote`` on exactly the parser fallback it already has.
+        """
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            n = NumericStructured(
                 question_type="numeric",
                 declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-                outcome_type="unknown",  # type: ignore[arg-type]
+                outcome_type=declared,  # type: ignore[arg-type]
             )
+        assert n.outcome_type is None
+        assert n.declared_percentiles == {0.1: 1.0, 0.5: 5.0, 0.9: 9.0}
+        # The raw value rides the WARNING: a spelling the roster starts using is a prompt
+        # signal, not noise.
+        assert any(repr(declared) in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.parametrize(
+        ("log_failures", "expected_level"),
+        [(True, logging.WARNING), (False, logging.DEBUG)],
+    )
+    def test_the_stray_spelling_line_respects_the_log_failures_contract(
+        self, caplog: pytest.LogCaptureFixture, log_failures: bool, expected_level: int
+    ) -> None:
+        """``parse_structured_payload(..., log_failures=False)`` promises no scary WARNING about
+        a candidate it is about to discard, and this validator logs from inside the model where
+        it cannot see the flag. The flag rides down as validation context. Without it a
+        misspelling warned on every silently-probed candidate, on superseded draft blocks, and
+        twice per numeric forecast on the publish path, about a block that publishes fine."""
+        payload = (
+            '{"question_type": "numeric", "outcome_type": "integer",'
+            ' "declared_percentiles": {"0.1": 10.0, "0.5": 50.0, "0.9": 90.0}}'
+        )
+        with caplog.at_level(logging.DEBUG, logger="metaculus_bot.structured_output_schema"):
+            parsed = parse_structured_payload(payload, "numeric", log_failures=log_failures)
+
+        assert isinstance(parsed, NumericStructured)
+        assert parsed.outcome_type is None
+        stray_lines = [r for r in caplog.records if "Unrecognised outcome_type" in r.getMessage()]
+        assert len(stray_lines) == 1
+        assert stray_lines[0].levelno == expected_level
+        # The raw value rides the line at either level: that is what makes it a prompt signal.
+        assert "'integer'" in stray_lines[0].getMessage()
+
+    def test_the_accepted_outcome_types_are_derived_from_the_literal(self) -> None:
+        """One vocabulary, one definition. A restated copy fails asymmetrically: a third outcome
+        type would pass the annotation and then be silently nulled by the lenient validator."""
+        assert set(get_args(NumericOutcomeType)) == set(_NUMERIC_OUTCOME_TYPES)
+        annotation = NumericStructured.model_fields["outcome_type"].annotation
+        assert NumericOutcomeType in get_args(annotation)
 
     def test_accepts_extra_percentiles(self) -> None:
         n = NumericStructured(
@@ -755,20 +808,30 @@ class TestNumericDeclaredPercentiles:
                 declared_percentiles={0.1: 1.0, 0.5: 5.0},
             )
 
-    def test_non_monotone_raises(self) -> None:
-        with pytest.raises(ValidationError, match="strictly increasing"):
+    def test_a_decrease_with_rising_percentile_still_raises(self) -> None:
+        # Incoherent by construction, and unsalvageable: sort_percentiles_by_value sorts by
+        # LABEL, so a value-disordered set is force-monotonized rather than reordered, which
+        # on one stray value pins most of the curve at a bound.
+        with pytest.raises(ValidationError, match="non-decreasing"):
             NumericStructured(
                 question_type="numeric",
                 declared_percentiles={0.1: 10.0, 0.5: 5.0, 0.9: 15.0},
             )
 
-    def test_equal_values_raise(self) -> None:
-        # equal (not strictly increasing) should raise
-        with pytest.raises(ValidationError, match="strictly increasing"):
-            NumericStructured(
-                question_type="numeric",
-                declared_percentiles={0.1: 5.0, 0.5: 5.0, 0.9: 10.0},
-            )
+    def test_tied_values_parse(self) -> None:
+        """Ties are a legitimate concentrated declaration, and the schema now says so.
+
+        ``value_extraction._validate_numeric`` allows them by name and
+        ``sanitize_percentiles``'s cluster spreader exists to separate them, so while this
+        schema demanded a STRICT increase a count-like block (p10 = p50 on a quantity that
+        usually reads the same low number) failed rung 1, could not be repaired — it is
+        valid JSON — and reached the pipeline only through the LLM salvage rung.
+        """
+        block = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 5.0, 0.5: 5.0, 0.9: 10.0},
+        )
+        assert block.declared_percentiles == {0.1: 5.0, 0.5: 5.0, 0.9: 10.0}
 
     def test_percentile_key_out_of_range_raises(self) -> None:
         with pytest.raises(ValidationError, match="Percentile keys"):
@@ -819,13 +882,76 @@ class TestMultipleChoiceOptionProbs:
                 option_probs={"A": 1.5, "B": -0.5},
             )
 
-    def test_concentration_zero_raises(self) -> None:
-        with pytest.raises(ValidationError, match="concentration must be > 0"):
-            MultipleChoiceStructured(
-                question_type="multiple_choice",
-                option_probs={"A": 0.5, "B": 0.5},
-                concentration=0.0,
-            )
+    def test_concentration_zero_reads_as_absent(self) -> None:
+        """q45189: gemini wrote ``"concentration": 0.0`` beside a valid ballot and the old
+        ``> 0`` check took the whole block down with it. A non-positive concentration is
+        not a reading, but the field is dormant and unprompted, so it now reads as absent
+        rather than costing the forecast."""
+        block = MultipleChoiceStructured(
+            question_type="multiple_choice",
+            option_probs={"A": 0.5, "B": 0.5},
+            concentration=0.0,
+        )
+        assert block.concentration is None
+        assert block.option_probs == {"A": 0.5, "B": 0.5}
+
+    @pytest.mark.parametrize("declared", [0.0, -3.0, float("inf"), float("nan"), "twenty", True, {"alpha": 20.0}])
+    def test_unusable_concentration_never_costs_the_ballot(self, declared: object) -> None:
+        block = MultipleChoiceStructured(
+            question_type="multiple_choice",
+            option_probs={"A": 0.5, "B": 0.5},
+            concentration=declared,  # type: ignore[arg-type]  # the point is a value the schema must tolerate
+        )
+        assert block.concentration is None
+
+    def test_a_usable_concentration_still_round_trips(self) -> None:
+        block = MultipleChoiceStructured(
+            question_type="multiple_choice",
+            option_probs={"A": 0.5, "B": 0.5},
+            concentration=20.0,
+        )
+        assert block.concentration == pytest.approx(20.0)
+
+    @pytest.mark.parametrize("declared", [-0.1, 1.5, float("nan"), "a third", True])
+    def test_out_of_range_other_mass_reads_as_absent(self, declared: object) -> None:
+        """Same rule as concentration: the field is a retired Dirichlet input, so an
+        out-of-range declaration is worth nothing and must cost nothing. MC has no
+        telemetry strip-and-retry, so a raise here means the LLM salvage rung."""
+        block = MultipleChoiceStructured(
+            question_type="multiple_choice",
+            option_probs={"A": 0.5, "B": 0.5},
+            other_mass=declared,  # type: ignore[arg-type]  # the point is a value the schema must tolerate
+        )
+        assert block.other_mass is None
+
+    @pytest.mark.parametrize("field", ["concentration", "other_mass"])
+    def test_an_integer_literal_too_large_for_a_float_reads_as_absent(self, field: str) -> None:
+        """The lenient contract is "unusable reads as absent", and it has to hold for EVERY
+        unusable input, including one that breaks the conversion itself.
+
+        ``json.loads`` decodes an integer literal of any length into an arbitrary-precision int,
+        and ``float()`` past about 308 digits raises OverflowError. Pydantic converts only
+        ValueError and AssertionError into a ValidationError, so before the guard this escaped
+        ``model_validate`` and ``parse_structured_payload`` (which catches ValidationError only)
+        and crashed the caller, which is strictly worse than the strict code it replaced: that
+        produced a clean rejection the ladder could fall through on.
+        """
+        payload = {
+            "question_type": "multiple_choice",
+            "option_probs": {"A": 0.5, "B": 0.5},
+            field: int("9" * 400),
+        }
+        block = MultipleChoiceStructured.model_validate(payload)
+        assert getattr(block, field) is None
+        assert block.option_probs == {"A": 0.5, "B": 0.5}
+
+    def test_a_usable_other_mass_still_round_trips(self) -> None:
+        block = MultipleChoiceStructured(
+            question_type="multiple_choice",
+            option_probs={"A": 0.5, "B": 0.5},
+            other_mass=0.0,
+        )
+        assert block.other_mass == pytest.approx(0.0)
 
 
 # ===========================================================================
@@ -1110,6 +1236,29 @@ class TestParseStructuredBlock:
         result = parse_structured_block(rationale, "multiple_choice")
         assert isinstance(result, MultipleChoiceStructured)
         assert result.option_probs == {"A": 0.6, "B": 0.4}
+
+    def test_q45189_zero_concentration_ballot_parses(self) -> None:
+        """The exact archived shape that used to fall to the LLM salvage rung.
+
+        q45189 (2026-08-31): gemini-3.1-pro wrote ``other_mass`` and ``concentration`` both
+        at 0.0 beside three option probabilities summing to 1.00. The old
+        ``concentration > 0`` validator rejected the block, ``json_repair`` cannot alter
+        valid JSON, and MC has no telemetry strip-and-retry, so the ballot was re-read by
+        the parser LLM. Both retired fields read leniently now, so the ballot parses here
+        and the unusable declarations read as absent rather than as zero.
+        """
+        payload = {
+            "question_type": "multiple_choice",
+            "option_probs": {"A": 0.5, "B": 0.3, "C": 0.2},
+            "other_mass": 0.0,
+            "concentration": 0.0,
+        }
+        rationale = f"Analysis...\n```json\n{json.dumps(payload)}\n```"
+        result = parse_structured_block(rationale, "multiple_choice")
+        assert isinstance(result, MultipleChoiceStructured)
+        assert result.option_probs == {"A": 0.5, "B": 0.3, "C": 0.2}
+        assert result.concentration is None
+        assert result.other_mass == pytest.approx(0.0)
 
     def test_discrete_count_class_still_constructable(self) -> None:
         # Discrete-count dispatch is phase-3, but the class remains available

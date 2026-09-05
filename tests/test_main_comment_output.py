@@ -79,7 +79,7 @@ from tests.conftest import gather_predictions_stub
 # ---------------------------------------------------------------------------
 
 
-def _make_bot(strategy: AggregationStrategy, n_forecasters: int = 2) -> TemplateForecaster:
+def _make_bot(strategy: AggregationStrategy, n_forecasters: int = 2, research_reports: int = 1) -> TemplateForecaster:
     """Create a TemplateForecaster with the minimal LLM config for the strategy.
 
     STACKING and CONDITIONAL_STACKING require a stacker LLM; CONDITIONAL_STACKING
@@ -98,7 +98,7 @@ def _make_bot(strategy: AggregationStrategy, n_forecasters: int = 2) -> Template
         "summarizer": test_llm,
     }
     return TemplateForecaster(
-        research_reports_per_question=1,
+        research_reports_per_question=research_reports,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=False,
         aggregation_strategy=strategy,
@@ -667,14 +667,13 @@ class TestForecastersUsedDisclosure:
         bot._stacker_outcome[12345] = "skipped"
         return bot
 
-    async def _publish_via_pipeline(self, bot, question, prediction_values: list[float]):
-        """Run the real _research_and_make_predictions, then build the comment from
-        what it returned — the producer path end to end.
+    async def _run_fanout(self, bot, question, prediction_values: list[float]) -> ResearchWithPredictions:
+        """Run the real _research_and_make_predictions once and return its collection.
 
         Everything outside ensemble-size bookkeeping is stubbed: research, the
         forecaster fan-out (whose return value IS the surviving per-model
         prediction list), crux extraction, targeted search, and the stacker
-        aggregate. Returns (collection, comment_text).
+        aggregate.
         """
         predictions = [
             ReasonedPrediction(prediction_value=value, reasoning=f"Model: openrouter/provider/m{i}\nbody")
@@ -697,13 +696,22 @@ class TestForecastersUsedDisclosure:
             patch("metaculus_bot.stacking_route.run_targeted_search", new=AsyncMock(return_value="targeted research")),
             patch.object(bot, "_aggregate_predictions", new=AsyncMock(return_value=0.6)),
         ):
-            collection = await bot._research_and_make_predictions(question)
-        # The real _aggregate_predictions sets this; it is mocked out above, and
+            return await bot._research_and_make_predictions(question)
+
+    def _build_comment(self, bot, question, collections: list[ResearchWithPredictions]) -> str:
+        """Build the published comment from collections the fan-out already returned."""
+        # The real _aggregate_predictions sets this; _run_fanout mocks it out, and
         # build_unified_explanation asserts on its presence under stacking.
         bot._stacker_outcome.setdefault(question.id_of_question, "primary")
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
-            comment = bot._create_unified_explanation(question, [collection], 0.6, 0.01, 1.0)
-        return collection, comment
+            return bot._create_unified_explanation(question, collections, 0.6, 0.01, 1.0)
+
+    async def _publish_via_pipeline(self, bot, question, prediction_values: list[float]):
+        """The producer path end to end: fan out, then build the comment from what the
+        fan-out returned. Returns (collection, comment_text).
+        """
+        collection = await self._run_fanout(bot, question, prediction_values)
+        return collection, self._build_comment(bot, question, [collection])
 
     @pytest.mark.asyncio
     async def test_stacked_publish_discloses_every_contributing_forecaster(self):
@@ -752,6 +760,34 @@ class TestForecastersUsedDisclosure:
         match = FORECASTERS_USED_MARKER_RE.search(comment)
         assert match is not None
         assert match.groups() == ("1", "3")
+
+    @pytest.mark.asyncio
+    async def test_multi_report_publish_counts_forecasters_from_every_report(self):
+        """With research_reports_per_question > 1 the framework fans out once per
+        report and hands every collection to one comment, so the count has to
+        accumulate across reports: it is defined as the number of per-model summary
+        bullets the comment carries. Assigning instead of accumulating would report
+        the LAST report's survivors (3) on a comment showing 5 bullets, which reads
+        as a drop that did not happen.
+
+        Note the denominator stays the ROSTER size, so a multi-report run publishes
+        used > configured (5/3 here). No entrypoint configures more than one report
+        (cli.py, benchmark/bot_factory.py and ablation/forecasters.py all pin 1), so
+        production never emits that shape.
+        """
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING, n_forecasters=3, research_reports=2)
+        q = _make_binary_question()
+        # Both spreads sit at/below the 0.15 threshold, so each report base-combines
+        # and keeps its own per-model predictions (2 bullets, then 3).
+        first = await self._run_fanout(bot, q, [0.45, 0.55])
+        second = await self._run_fanout(bot, q, [0.44, 0.50, 0.56])
+
+        comment = self._build_comment(bot, q, [first, second])
+
+        assert [len(first.predictions), len(second.predictions)] == [2, 3]
+        match = FORECASTERS_USED_MARKER_RE.search(comment)
+        assert match is not None
+        assert match.groups() == ("5", "3")
 
     def _collection(self, n_predictions: int) -> ResearchWithPredictions:
         return ResearchWithPredictions(
@@ -1625,7 +1661,9 @@ class TestOfflineAssemblySmoke:
     """
 
     def _bot_and_question(self):
-        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        # Roster size matches the six-model collection below, so the ensemble-size
+        # marker this path publishes is the one a real six-model run would carry.
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING, n_forecasters=6)
         q = BinaryQuestion(
             question_text="Will it happen?", background_info="bg", resolution_criteria="rc", fine_print=""
         )
@@ -1678,6 +1716,7 @@ class TestOfflineAssemblySmoke:
         # Residual-analysis markers present.
         assert "<!-- STACKER_OUTCOME=primary -->" in explanation
         assert "<!-- STACKED=true -->" in explanation
+        assert "<!-- FORECASTERS_USED=6/6 -->" in explanation
 
     def test_oversized_6model_comment_holds_invariant_and_constructs(self) -> None:
         bot, q = self._bot_and_question()
@@ -1698,6 +1737,12 @@ class TestOfflineAssemblySmoke:
         assert "[Hashtag]" not in explanation
         assert "<!-- STACKER_OUTCOME=primary -->" in explanation
         assert "<!-- STACKED=true -->" in explanation
+        # Trim survival on a REALISTIC oversized comment — sections the trimmer
+        # recognizes, so the research-first strategy fires rather than the
+        # last-resort header-and-tail one that the synthetic filler test in
+        # test_comment_formatting.py exercises. A degraded publish is most likely on
+        # a long comment, so this is where losing the disclosure would hurt most.
+        assert "<!-- FORECASTERS_USED=6/6 -->" in explanation
         # The exact 2026-06-05 crash: report construction must not raise.
         report = BinaryReport(question=q, explanation=explanation, prediction=0.65)
         assert report.explanation.lstrip().startswith("#")

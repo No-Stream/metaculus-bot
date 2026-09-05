@@ -7,6 +7,11 @@ body's trafilatura main text, a raw text/CSV/JSON body). The ``status`` values t
 are load-bearing downstream — only ``"ok"`` grants the loop's ``fetched`` verification tier,
 so a page we could not read is ``"empty"`` or ``"blocked"``, never ``"ok"``.
 
+``matched_throttle_phrase`` lives here for the same reason even though its caller is the
+fetch handler rather than this module's dispatcher: recognising a host's rate-limit
+interstitial is the same "is this body actually the page" judgment, and it has to run on
+the rendered rung's text too, which never passes through here.
+
 Split out of ``tools.py`` to leave that module the ladder spine (hop loop, rendered rung,
 the four tool handlers, registration). The dispatcher choosing between these builders,
 ``tools._plain_response_outcome``, deliberately stays there: it calls
@@ -37,6 +42,53 @@ _IMAGE_CONTENT_TYPE_PREFIXES = ("image/",)
 _RETRYABLE_FETCH_BLOCK_STATUSES = {403, 406, 429}
 _TEXTUAL_CONTENT_TYPE_TOKENS = ("text/plain", "text/csv", "application/json")
 _HTML_CONTENT_TYPE_TOKENS = ("text/html", "application/xhtml+xml")
+
+# A host that is throttling us answers HTTP 200 with a short interstitial in place of the
+# page it was asked for, so every status check on the ladder passes and the driver reads the
+# refusal as the page's content. Receipt: q45191 (2026-08-10), where three parallel fetches
+# of ogimet.com daily summaries tripped that host's spacing rule and two came back as a
+# 304-char body reading "gsynext: Limit for old data queries exceeded. Permitted a query per
+# 20 seconds per IP" under status="ok" — which was then cached and replayed on the driver's
+# own retry, so the exact-date reference class it published came to 4 years instead of 6 and
+# the forecast under-committed to the winner it had already named.
+#
+# Detection needs BOTH halves, and the size half is why it is safe: the phrases alone would
+# demote a real page that merely discusses rate limits, while a size floor alone would demote
+# every legitimately short source (a one-line official statement), which the builders below
+# deliberately keep as "ok". Bare "slow down" is left out on purpose — it is ordinary English
+# ("growth will slow down") where the rest are throttle idiom, and missing a throttle only
+# preserves today's behavior whereas a false positive discards a page we really did read.
+# Calibration: the receipt's body is 304 chars (303 stripped, which is what the cap sees).
+FETCH_THROTTLE_PAGE_MAX_CHARS = 1200
+FETCH_THROTTLE_PHRASES: tuple[str, ...] = (
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "limit exceeded",
+    "too many requests",
+    "query per",
+    "queries per",
+    "requests per",
+    "per second per ip",
+    "retry after",
+    "try again later",
+    "please slow down",
+)
+
+
+def matched_throttle_phrase(text: str) -> str | None:
+    """The throttle phrase in ``text`` when it reads as a host's rate-limit interstitial.
+
+    Returns the matched phrase (evidence, so the caller can log WHICH rule fired and the
+    list can be retuned on real prod fires) or ``None`` when the body is a page. A body
+    longer than :data:`FETCH_THROTTLE_PAGE_MAX_CHARS` is always a page: an interstitial is
+    a sentence, and a long page containing throttle vocabulary is a page about throttling.
+    """
+    stripped = text.strip()
+    if not stripped or len(stripped) > FETCH_THROTTLE_PAGE_MAX_CHARS:
+        return None
+    lowered = stripped.lower()
+    return next((phrase for phrase in FETCH_THROTTLE_PHRASES if phrase in lowered), None)
 
 
 @dataclass(slots=True)
@@ -90,12 +142,21 @@ def _extract_links_from_html(html: str, base_url: str) -> list[str]:
 
 
 def _content_type_is_document(content_type: str | None) -> bool:
+    return _content_type_is_pdf(content_type) or _content_type_is_image(content_type)
+
+
+def _content_type_is_pdf(content_type: str | None) -> bool:
+    """True for a declared PDF, which the ladder reads locally rather than escalating."""
     if not content_type:
         return False
-    lowered = content_type.lower()
-    if any(token in lowered for token in _PDF_CONTENT_TYPE_TOKENS):
-        return True
-    return any(lowered.startswith(prefix) for prefix in _IMAGE_CONTENT_TYPE_PREFIXES)
+    return any(token in content_type.lower() for token in _PDF_CONTENT_TYPE_TOKENS)
+
+
+def _content_type_is_image(content_type: str | None) -> bool:
+    """True for a declared image: the one document shape with no text a local rung could read."""
+    if not content_type:
+        return False
+    return content_type.lower().startswith(_IMAGE_CONTENT_TYPE_PREFIXES)
 
 
 def _body_is_document(body: bytes) -> bool:
@@ -105,7 +166,29 @@ def _body_is_document(body: bytes) -> bool:
     return stripped.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a"))
 
 
+# Named rather than spelled at each site: three rungs produce this method and two consumers
+# branch on it, and one of them (the local-document ladder) is WRONG if it ever treats the
+# placeholder message below as the document's text.
+DOCUMENT_NEEDED_METHOD = "document_needed"
 _DOCUMENT_NEEDED_MSG = "This URL is a PDF or image — use read_document(url, ask) to read it."
+
+
+def _document_needed_result(current_url: str, content_type: str) -> PlainFetchResult:
+    """The escalate-to-a-document-read outcome, for the three rungs that can reach it.
+
+    ``status="ok"`` with a method the tier map does not carry: nothing has been read yet, so
+    this can never be stamped ``fetched``, but it is not a failure either — the fetch handler
+    reads the method and escalates.
+    """
+    return PlainFetchResult(
+        status="ok",
+        method=DOCUMENT_NEEDED_METHOD,
+        text=_DOCUMENT_NEEDED_MSG,
+        links=[],
+        url=current_url,
+        content_type=content_type or None,
+    )
+
 
 _METACULUS_FETCH_BLOCK_MSG = (
     "Metaculus pages are already reflected in the question brief; do not fetch metaculus.com URLs."
@@ -132,6 +215,33 @@ def _fetch_plain_url_block(url: str) -> PlainFetchResult | None:
             text=_METACULUS_FETCH_BLOCK_MSG,
             links=[],
             url=url,
+        )
+    return None
+
+
+def _non_ok_status_result(status: int, current_url: str, content_type: str) -> PlainFetchResult | None:
+    """The terminal result for a non-200, non-redirect response, or None for a 200.
+
+    Split from the dispatcher so the body-shape rungs below it read as one sequence rather
+    than as the tail of a status ladder.
+    """
+    if status in _RETRYABLE_FETCH_BLOCK_STATUSES:
+        return PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text=f"Fetch blocked with HTTP {status}.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
+        )
+    if status != 200:
+        return PlainFetchResult(
+            status="error",
+            method="plain",
+            text=f"Fetch failed with HTTP {status}.",
+            links=[],
+            url=current_url,
+            content_type=content_type or None,
         )
     return None
 

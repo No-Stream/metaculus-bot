@@ -11,6 +11,7 @@ from forecasting_tools import (
     clean_indents,
 )
 
+from metaculus_bot.constants import MC_PROB_MIN
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
 from metaculus_bot.numeric.utils import nominal_bounds
 from metaculus_bot.time_utils import _as_utc
@@ -196,11 +197,14 @@ def _option_probs_example(options: list[str]) -> str:
 CitationStyle = Literal["markdown", "auto_annotated"]
 
 
-# Condensed source-tier vocabulary for the RESEARCH-side prompts (web research +
-# AskNews summarizer). The forecaster prompts carry the full provenance ladder
-# (``_SOURCE_PROVENANCE_LADDER`` below), but without research-side tags a C-tier
-# aggregator claim arrives in the briefing looking identical to a B-tier wire
-# fact and the forecasters' ladder has nothing left to weight. Deliberately
+# Source-tier vocabulary for the RESEARCH-side prompts (web research + AskNews
+# summarizer). The FULL A-D definitions live here and only here; the forecaster prompts'
+# provenance ladder (``_SOURCE_PROVENANCE_LADDER`` below) names the tag shape, carries a
+# one-clause GLOSS per tier, and relies on the briefing arriving tagged. Re-cutting a tier
+# boundary means editing both, or the forecaster reads the old boundary while the research
+# side tags by the new one.
+# Without research-side tags a C-tier aggregator claim arrives in the briefing
+# looking identical to a B-tier wire fact and the ladder has nothing to weight. Deliberately
 # short — research output is itself an input to further summarization — and
 # zero-indent so the text survives ``clean_indents`` verbatim in every consumer
 # (contrast the ladder's >=15-space pre-indent note).
@@ -233,6 +237,62 @@ def _mc_options_line(options: Sequence[str] | None) -> str:
     return "Options (in resolution order): " + " | ".join(names)
 
 
+# The FOCUS AREAS market-odds bullet, narrowed away from the four venues the
+# structured prediction-market snapshot already covers live. In 42 ranked-era
+# bundles the old blanket bullet ("Prediction market odds and forecasts (if
+# available)") produced exactly one content-redundant retrieval plus three stale
+# covered-venue prices that contradicted correct live snapshot rows — the only
+# measured harm mode — while every realized instance of decisive market evidence
+# came from OUTSIDE those four venues (Good Judgment Open on q44869, CME FedWatch
+# on q45401, the Metaculus crowd on q20683). Hence narrowed rather than removed.
+# Wording confirmed verbatim by the operator 2026-09-01; receipts in
+# scratch/residual_2026-08-31/market_odds_coverage.md.
+#
+# Split in two so the policy has exactly ONE definition across prompts that format it
+# differently: `web_research_prompt` wants a FOCUS AREAS bullet, and the two Perplexity
+# prompts are unbulleted prose whose whole body is one `clean_indents` block, where an
+# interpolated line starting at column 0 would defeat the dedent for the entire prompt.
+# The bullet is the policy plus its dash, so the operator-confirmed text is byte-identical
+# on the surface it was confirmed against. Restating it per prompt is what let the two
+# Perplexity sites keep the retired blanket "consider all relevant prediction markets" ask
+# after this one was narrowed, until a review caught them.
+OUTSIDE_VENUE_MARKET_ODDS_POLICY = (
+    "Market-implied or crowd odds from sources OTHER than Polymarket, Kalshi, Manifold, or PredictIt "
+    "(e.g. Metaculus, Good Judgment Open, CME FedWatch, bookmakers) — always name the market and the date "
+    "you observed the price. Do NOT report Polymarket/Kalshi/Manifold/PredictIt prices from search results: "
+    "a dedicated live snapshot of those venues is provided separately, and search-indexed copies of their "
+    "prices are usually days stale."
+)
+_OUTSIDE_VENUE_MARKET_ODDS_BULLET = f"- {OUTSIDE_VENUE_MARKET_ODDS_POLICY}"
+
+
+# Citation instruction for the Gemini grounding provider. The SDK returns grounding
+# metadata that `research/gemini_search.py` splices in as plain `[N]` markers; the
+# model ALSO writes its own hierarchical `[1.2.3]` indices, which index a chunk list
+# we do not hold — 173 of 323 archived gemini sections carried them, 163 of those
+# alongside our real markers, so a forecaster reading the section cannot tell which
+# brackets are checkable. The formatter strips them after splicing; this stops the
+# model producing them in the first place. Gemini-only: the markdown branch is the
+# native-search provider, whose citations are the model's own by design.
+#
+# The closing carve-out is spelled out because ``_SOURCE_TIER_TAG_INSTRUCTION`` renders
+# 26 lines further down the SAME prompt and orders the model to write bracketed
+# ``[A: official]`` tier tags, so an unqualified ban on "self-invented bracketed"
+# annotation reads as a contradiction. Over-compliance is the direction nothing guards:
+# a model that stops tagging costs the forecaster prompts the source-tier signal they
+# weight on and leaves ``research/gemini_attribution.py`` no tags to check, whereas
+# UNDER-compliance is already handled downstream by ``_strip_model_citation_indices``,
+# which removes the dotted indices and keeps the tier tags in a mixed group. Phrased as
+# "still applies" rather than as a requirement, because the tier block's own closing
+# line licenses leaving a claim untagged when its tier is unclear.
+_AUTO_ANNOTATED_CITATION_CLAUSE = (
+    "Include inline citations for all factual claims (the tool will auto-annotate) — do NOT write your own "
+    "citation markers or index numbers: no hierarchical tokens like [1.2.3], no self-invented bracketed "
+    "source numbering. The tool attaches the real markers. This bans invented CITATION indices only: the "
+    "SOURCE TIER TAGS instruction below still applies, and its [A: ...] tags are not citation markers"
+)
+
+
 def web_research_prompt(
     question_text: str,
     *,
@@ -250,7 +310,7 @@ def web_research_prompt(
     citation_clause = (
         "Include inline citations [source name](url) for all factual claims"
         if citation_style == "markdown"
-        else "Include inline citations for all factual claims (the tool will auto-annotate)"
+        else _AUTO_ANNOTATED_CITATION_CLAUSE
     )
     footer = (
         "Provide a factual research summary with citations:"
@@ -262,9 +322,7 @@ def web_research_prompt(
         if allow_resolution_source_reading
         else ""
     )
-    prediction_markets_instruction = (
-        "" if is_benchmarking else "\n- Prediction market odds and forecasts (if available)"
-    )
+    prediction_markets_instruction = "" if is_benchmarking else f"\n{_OUTSIDE_VENUE_MARKET_ODDS_BULLET}"
     benchmarking_warning = _benchmarking_warning("search") if is_benchmarking else ""
     options_block = f"\n{_mc_options_line(options)}" if options else ""
 
@@ -276,6 +334,8 @@ GUIDELINES:
 - Search thoroughly — issue multiple queries if needed to fill gaps
 - Be factual and unbiased — report what you find, not what you think
 - {citation_clause}
+- Carry the publication date of every dated or forward-looking claim ("announced <date>", "published <date>", "as of <date>")
+- For a schedule, plan, target, or other forward-looking claim, state when and where it was announced — never present an undated recollection as a current fact; if you cannot date it, say so
 - If you cannot find reliable information on something, say so explicitly
 - DO NOT hallucinate sources — only cite what you actually found
 - DO NOT make predictions or forecasts yourself
@@ -431,18 +491,28 @@ SUMMARIZER_SOFT_FAIL_BANNER = (
 # competitor bots showed they rank factual claims by proximity to the primary
 # record and adjust by source motivation. Interpolated in place of the old
 # "Separate facts from opinions" bullet (which leads this block, so the swap is
-# clean and just appends the ladder). Every line is pre-indented to >= 15 spaces
-# so clean_indents preserves the (A)-(D) nesting in all three prompts despite
-# their differing baselines (binary baseline 12, MC/numeric baseline 8).
+# clean and just appends the ladder). The A-D tier DEFINITIONS are stated once,
+# in the research-side ``_SOURCE_TIER_TAG_INSTRUCTION`` above, and the briefing
+# arrives carrying the tags (every artifact record since the tagging landed in
+# prod); the ladder names the tag shape, keeps the two usage clauses the tag instruction
+# does not carry, and glosses each tier in one clause. It used to restate all four
+# definitions in full, which re-taught the model a vocabulary the text in front of it was
+# already written in. The gloss is not the definition: those live once in
+# ``_SOURCE_TIER_TAG_INSTRUCTION``, and a tier re-cut has to move both.
+# Every line is pre-indented to >= 15 spaces so clean_indents preserves the
+# nesting in all three prompts despite their differing baselines (binary
+# baseline 12, MC/numeric baseline 8).
 _SOURCE_PROVENANCE_LADDER = """
                • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
-               • Rank factual claims by proximity to the primary record:
-                 (A) official / primary — government statistics, regulatory filings (e.g. SEC/EDGAR), court records,
-                     central-bank releases, and the question's own named resolution source;
-                 (B) wire services and papers of record carrying named-sourced facts (Reuters, AP, Bloomberg, FT);
-                 (C) aggregators, advocacy or partisan outlets, and translated or single-outlet reports —
-                     use the underlying cited facts, not their framing or causal narrative;
-                 (D) anonymous, social, rumor, or untraceable AI-generated summaries — suggestive only.
+               • Weight factual claims by proximity to the primary record. The briefing's claims arrive tagged by
+                 source tier where it was clear: [A: ...] official or primary record (including the question's own
+                 resolution source), [B: ...] wire services and papers of record, [C: ...] aggregators, advocacy or
+                 single-outlet reports (use their cited facts, not their framing), [D: ...] anonymous, social or
+                 untraceable (suggestive only).
+               • `[unverified attribution]` marks a claim whose named outlet the research pipeline could not match
+                 against its own retrieval record, so the tag and its tier were removed. The claim itself may still
+                 be correct: treat it as untiered, unattributed evidence rather than as a named outlet's authority,
+                 and not as a low tier either.
                • Weigh motivation, not just authority: discount claims that serve the speaker's interest (hype,
                  marketing, sponsor optimism). Treat a statement AGAINST the speaker's interest — a company tempering
                  its own timeline, an on-record denial of a favorable rumor — as strong evidence.
@@ -452,65 +522,169 @@ _SOURCE_PROVENANCE_LADDER = """
                  corroborating sources is likely a transcription or translation error — flag it, don't anchor on it."""
 
 
-# The liquidity/participation weighting sentence, appended to the shared strong-evidence
-# clause so every forecaster prompt tells the model to weight a crowd signal by how
-# informative it is (the prediction-market provider emits a per-market `signal` label
-# plus volume/OI — approximate USD on the real-money venues, play-money mana on Manifold,
-# which is why the rendered legend qualifies the unit per venue rather than venue-wide).
-#
-# The `no-liquidity-data` sentence is load-bearing and must stay in sync with
-# `prediction_market._liquidity_label`. That label means "this venue publishes no volume
-# figures", which is only ever true of PredictIt now that the Kalshi field names are
-# fixed — so it is an absence of measurement, not a measurement of thinness, and a
-# forecaster that collapses it into "thin" would discount a market for the wrong reason.
-_MARKET_LIQUIDITY_WEIGHTING_SENTENCE = (
-    "Weight each market/crowd signal by its stated liquidity/participation label: treat deep / "
-    "high-liquidity markets as a strong anchor, and discount thin markets (low volume, few participants) "
-    "as noisy. A `no-liquidity-data` label means the venue publishes no volume figures at all, so treat "
-    "that market's depth as unknown — judge it on its resolution-criteria match, and do not read it as thin."
+# How to read a searched-and-found-nothing result, shared verbatim across the three
+# forecaster prompts. On qid 44799 the gap-fill resolver reported "I found no
+# authoritative public record" and four of six forecasters converted that into
+# "the authorization is absent"; the two that discounted it scored best in the
+# ensemble. A third bullet ("absence is weaker still where the actor has already
+# demonstrated the behavior") was dropped: it carried no receipt of its own and pushed
+# the wrong way on qid 43837 (eleven prior tournaments announced, none found, answer NO).
+# Same pre-indent contract as _SOURCE_PROVENANCE_LADDER above: every line is at >= 15
+# spaces so clean_indents preserves the nesting in all three prompts despite their
+# differing baselines (binary 12, MC/numeric 8).
+_NULL_RESULT_READING = """
+               • Read a null search result as a null search result. "No record found", "no authoritative
+                 source located", or "could not confirm" licenses only "we could not find evidence of X" —
+                 it does NOT establish that X does not exist or did not happen. Never convert an absence of
+                 retrieved evidence into a positive finding of absence.
+               • Weight the absence by how well the topic is covered. Silence from a comprehensive,
+                 well-indexed source that this domain reliably reports through (a regulator's filing
+                 database, an official statistics release, an official registry) is real evidence, but only
+                 weak-to-moderate. Silence from general web search on a poorly-covered, local, or
+                 fast-moving topic is nearly no evidence at all."""
+
+
+# Which reference class is admissible for a "how many X in period P" question,
+# shared verbatim by the binary, MC and numeric prompts (count questions arrive as
+# all three types). On qid 44561 all six members built a "no failure announced yet,
+# so Poisson(1.0)" schedule model instead of the pooled FDIC bank-failure rate, and
+# published far too low. Same >= 15-space pre-indent contract as _NULL_RESULT_READING.
+_COUNT_IN_PERIOD_REFERENCE_CLASS = """
+               • For questions asking how many events of a kind occur in a period, the admissible outside
+                 view is the pooled realized rate of that event over the longest comparable history. A
+                 schedule of currently known candidates ("none announced yet", "one is due") is evidence
+                 about the pipeline and updates that rate; it does not replace it."""
+
+
+# The soft-clock rule: a target date the responsible actor is not BOUND to is evidence that
+# a target exists, not that it will hold. The 2026-09-02 failure-mode audit
+# (scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md, lens A) found the shape on 52 of
+# 815 STRICT records (6.4%; 8.3% of binaries; coder kappa 0.74): on "will X happen before D"
+# questions whose only route to X was an ANNOUNCED target date, members decomposed
+# P(target lands in window) x P(X | target) and set the first term near 1 because the target
+# had been announced. On the 37 flagged binaries the bot published a mean 0.44 for events that
+# happened 3 times (8%); 13 records above 0.5 resolved NO and none went the other way; flagged
+# records score 18.7 spot-peer points worse (95% CI 5.9 to 33.4) and are wrong-sided 40% of
+# the time against 18%. Soft targets WITHOUT the decomposition move score fine (+13.6) and
+# deadline questions in general are calibrated (0.25 published, 0.25 realized), so the rule
+# names the MOVE, not the question shape, and it is roster-wide (every vendor biased up 0.27
+# to 0.47 on the shape, within 0.06 of zero off it). Receipts: qids 43837 (a Fall tournament
+# start read off the Summer close), 44424 (an announced summit that slipped twice), 44557 (a
+# "planned August" launch off a partner page and a Wikipedia infobox); the contrast is 45217,
+# where a statutory clock existed, members computed the date and scored +45. The "measured
+# record of meeting" carve-out is load-bearing: on qid 42305 a weekly bulletin with a measured
+# 1-to-3-week publication lag WAS a binding clock in practice and a near-1 timing term was
+# right. Binary + MC only (the numeric prompt anchors on a range, not a probability); no
+# structured-block field, since the number belongs in the rationale and the block is written
+# after the forecast is fixed. Supersedes `_REMAINING_EXPOSURE_RULE` and
+# `_ANCHOR_CONSISTENCY_RULE`, the two 2026-09-02 rules the fix plan's Item B removed. Same
+# >= 15-space pre-indent contract as _COUNT_IN_PERIOD_REFERENCE_CLASS.
+_SOFT_CLOCK_RULE = """
+               • A target date the responsible actor has not bound itself to — no statute, no contract, no
+                 published schedule it has a measured record of meeting — is evidence that a target EXISTS,
+                 not that it will hold. Price the probability that the target lands inside the question
+                 window as its own number, derived from that actor's record of slips and scrubs for this
+                 kind of event; an announcement, plan, tracker page or partner page does not raise it. Where
+                 a binding clock exists, compute the date from it and say which clock. (Announced-but-unbound
+                 dates are the bot's most consistent miss: forecasts averaged 44% on events that happened 8% of
+                 the time.)"""
+
+
+# History repeats past an acknowledged regime change (the same audit's lens C): a member
+# writes down a historical cadence, names in the SAME rationale a reason it has been
+# discharged (its driver was met, the deadline passed, the rule changed), and keeps the old
+# cadence as its central estimate anyway. 12.1% of coded rationales; about 7 spot-peer points
+# per flagged record (95% CI 2.7 to 12.2); the pattern failed in 83% of fires and in 13 of 13
+# on the live triple. Coder agreement was 0.59 and the label is partly hindsight-contaminated,
+# so read those numbers as upper bounds. That caveat is why the model-facing parenthetical
+# names the count as a small audit of this bot's own past forecasts rather than stating a flat
+# rate: against the 17-18% held rate the three older era bands show, 0 of 13 is an ordinary
+# draw (p = 0.09), and a bare figure reads to a forecaster as near-certainty. Conditional on
+# the member's OWN written acknowledgment, so it cannot fire on a question where nothing has
+# changed, and shipped only once `_ANCHOR_CONSISTENCY_RULE`'s "do not move off your number when
+# history counsels caution" was gone, since the two pulled opposite ways. Shipped on the fix
+# plan's recommendation (section 6) with the operator's final say pending; to revert, delete
+# this constant, its two interpolation sites in `binary_prompt` and `multiple_choice_prompt`,
+# and only the history-discharged cases in `TestSoftClockAndHistoryDischargedRules`, which also
+# covers the approved `_SOFT_CLOCK_RULE`. Binary + MC only. Same pre-indent contract as the
+# rule above.
+_HISTORY_DISCHARGED_RULE = """
+               • If your own analysis names a reason the historical cadence has been discharged (its driver was
+                 met, the deadline passed, the rule changed), that cadence is a bound on your estimate, not its
+                 center; state the post-change estimate and what it rests on (in a small audit of this bot's own
+                 past forecasts, a cadence kept as the center held in none of 13 recent cases)."""
+
+
+# Apply the rate to the exposure that is LEFT. On qid 43837 six members applied a monthly
+# announcement rate across the FULL question window when 16 days had already elapsed
+# event-free (then OR-ed it with a scheduled path the rate already covered, which the
+# binary union line now forbids: "union only over paths that cannot be the same event").
+# One sentence, interpolated INLINE (no pre-indent) into the binary conditional-hazard
+# bullet, which is the same rule specialised to recurring events, and standing alone as
+# one bullet in the MC outside-view step, which has no hazard bullet. Binary + MC only:
+# the numeric prompt anchors on a range, not a rate. It replaced a two-bullet constant
+# that restated the hazard bullet twenty lines below it and the union clause five lines
+# above it, so the rule read three times and the model was told nothing new twice.
+_REMAINING_EXPOSURE_SENTENCE = (
+    "Rates apply to the exposure that REMAINS: estimate the rate over the longest window the evidence supports, "
+    "then apply it from now until the deadline, treating the elapsed event-free part of the window as observed "
+    "(a rate spread over the whole window prices time that has already passed)."
 )
 
-# The second axis market retrieval gained when it moved to ranked selection: the table arrives
-# in EVIDENTIAL order with a per-row `relation` grade and a one-phrase `why`, so a forecaster
-# has something better to weight on than word overlap. Kept next to the liquidity
-# sentence, inside the same shared constant region, so all three prompts stay in sync — which is
-# what the comment block above exists to protect. The four tier names are verbatim from
-# `market_retrieval.ranking.TIERS`; renaming one there without renaming it here silently teaches
-# forecasters a vocabulary the table no longer uses.
-#
-# The closing `↳` sentence is POLICY, not notation — the glyph itself is explained in the rendered
-# table's own legend (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`), beside the table where it
-# appears. What belongs here is the anchoring rule it changes: a multi-outcome market (a Kalshi
-# strike family, a Polymarket event, a PredictIt ballot) has no single price, so the row a forecaster
-# is told to anchor on renders an empty `prob` cell, and without this clause the strongest available
-# evidence can read as priceless. One sentence; this constant ships in all three prompts.
-_MARKET_RELATION_WEIGHTING_SENTENCE = (
-    "The markets are listed in order of evidential value, most valuable first, and each row carries a "
-    "`relation` label saying how it relates to this question: `same_quantity_same_date` measures the same "
-    "thing on the same date and is the strongest anchor available; `same_quantity_other_cut` measures the "
-    "same thing at a different date, threshold, or source, so extrapolate from it rather than discounting it "
-    "vaguely; `driver_or_consequence` and `weak` are context to reason from, not anchors. When the relation "
-    "and liquidity labels disagree — a tightly-related market whose signal is thin — the liquidity warning "
-    "governs the price: a thin market's price is noisy even when its relation is tight, so extrapolate from "
-    "a thin market by widening your distribution around its implied value rather than transplanting its "
-    "price exactly. A row marked "
-    "RESOLVED has already settled, so its price is a realized outcome rather than a forecast — read it as "
-    "evidence about what happened, not as a probability. A market with several outcomes has no single price, so "
-    "its own `prob` cell is blank and each outcome is listed beneath it on a `↳` row with its own price — anchor "
-    "on the outcome matching this question, and do not read the blank parent cell as a missing market. "
-    "A market with several `↳` outcomes is a DISTRIBUTION over that market's own question, not a set of "
-    "independent facts: read the whole ladder (including the `↳ [remaining N]` row, which accounts for every "
-    "outcome not given a row of its own — priced individually where space allows, otherwise inside a counted "
-    "group with its summed price, never silently dropped) and translate it into this question's outcome space. "
-    "Never treat one "
-    "outcome's price as an equality constraint that fixes a tail — a single bracket of a ten-bracket ladder "
-    "constrains almost nothing on its own, and reading it that way has cut the resolving bucket below the "
-    "forecaster's own prior."
+# The binary outside-view step's conditional-hazard bullet, which OPENS with the sentence
+# above because the hazard check is that same rule specialised to recurring events. A named
+# constant rather than an inline interpolation: ruff-format split the mid-bullet replacement
+# field across three lines at an indent the surrounding prompt does not use, in the region of
+# this file that gets edited most. The rendered text is unchanged.
+_BINARY_CONDITIONAL_HAZARD_BULLET = (
+    f"{_REMAINING_EXPOSURE_SENTENCE} Conditional-hazard check: for a recurring event with a history of "
+    "inter-arrival gaps, fit a simple model to the gaps (exponential with mean = average gap, or the observed "
+    "gaps as an empirical distribution), compute P(event by deadline | no event in the T days already elapsed), "
+    'and show the number. Otherwise write "non-recurring, conditional-hazard skipped".'
 )
+
+
+# The three READING rules for the rendered market table that its own legend does not carry.
+# The legend (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`, printed beside the table)
+# owns NOTATION: the liquidity labels and `no-liquidity-data`, the evidential row order, the
+# four `relation` tiers, RESOLVED, `↳` sub-rows, `[remaining N]`, `(Nd ago)`, `demoted from
+# same-date:`. Re-teaching any of that here gave the model two partially-overlapping glossaries
+# (the legend had grown labels the prompt never mentioned), so the prompt keeps only POLICY —
+# what to DO with a row the legend has already explained. Receipts: rule 2 and rule 3 are both
+# q45189, where all three forecasters imported a thin single-strike price at full weight, then
+# read one bracket of a ten-bracket Kalshi ladder as an equality constraint on a tail and cut
+# the resolving bucket below their own prior (published 0.130, spot -26.77). Rule 1 is the
+# ranked-retrieval design intent: an other-cut market is the same quantity, so it is something
+# to extrapolate from, not to haircut. `same_quantity_other_cut` is verbatim from
+# `market_retrieval.ranking.TIERS`; renaming it there without renaming it here silently teaches
+# forecasters a vocabulary the table no longer uses. Ships in all three forecaster prompts,
+# gated with the rest of the clause on the snapshot section being present.
+_MARKET_READING_RULES = (
+    "Three reading rules for the snapshot (its legend defines the columns and markers). A "
+    "`same_quantity_other_cut` market measures the same thing at another date, threshold or source: "
+    "extrapolate from it rather than discount it vaguely. When a market's relation is tight but its liquidity "
+    "thin, the liquidity warning governs — a thin price is noisy however tight its relation — so widen around "
+    "its implied value rather than transplant its price. A market with several `↳` outcomes is a DISTRIBUTION "
+    "over that market's own question: read the whole ladder and translate it into this question's outcome "
+    "space. Never treat one outcome's price as an equality constraint that fixes a tail; reading one bracket "
+    "that way has cut the resolving bucket below the forecaster's own prior."
+)
+
+
+# Header the prediction-market research provider emits (`research/section_format.py`
+# PROVIDER_SECTION_HEADERS imports it from here, the same way it imports
+# TS_ANCHOR_SECTION_HEADER). The three forecaster prompts gate the whole market clause on this
+# substring, so the policy appears only when a snapshot was actually rendered. Prod-neutral:
+# the provider emits the header whenever it rendered anything, including the deliberate-empty
+# "no sufficiently relevant market" sentence, and omits it only when it returned "" —
+# benchmarking, flag off, or a soft-fail — which are exactly the prompts where ~1.5k chars of
+# market policy had nothing to bear on.
+MARKET_SNAPSHOT_SECTION_HEADER = "## Prediction Market Snapshot"
 
 
 def _strong_evidence_market_clause(
     *,
+    research: str,
     subject: str,
     signal_noun: str,
     anchor_tail: str,
@@ -519,11 +693,20 @@ def _strong_evidence_market_clause(
 ) -> str:
     """Shared "prediction markets are strong evidence" clause for the three forecaster prompts.
 
-    The framing is identical across binary / MC / numeric; only a few type-specific words differ
-    (the signal noun, the anchor verb phrase, the extrapolation target, and the projection tail).
-    Centralizing it keeps the strong-evidence framing AND the liquidity-weighting sentence in sync
-    across all three prompts. Spliced into each prompt's ``clean_indents`` f-string; the embedded
-    newlines are cosmetic (``clean_indents`` and the whitespace-collapsing tests both ignore them).
+    Returns ``""`` unless ``research`` carries ``MARKET_SNAPSHOT_SECTION_HEADER`` — the clause
+    is about reading a table, so it renders only when the table does (the same substring gate
+    the numeric prompt's TS-anchor clause uses). Note the one path where the two come apart: on
+    the provider's DELIBERATE-empty answer the header is present with a single sentence and no
+    table, so the reading rules render while the legend that defines their notation (`↳`
+    sub-rows, `[remaining N]`, the liquidity and relation labels) does not. Left as is on
+    purpose: a second gating condition would silently drop the whole market policy from every
+    prompt that DOES have a table the moment its false negative fired, which is a far worse
+    failure than three rules naming notation an empty section never uses. The framing is identical across binary / MC / numeric; only a few
+    type-specific words differ (the signal noun, the anchor verb phrase, the extrapolation
+    target, and the projection tail). Centralizing it keeps the strong-evidence framing AND the
+    reading rules in sync across all three prompts. Spliced into each prompt's ``clean_indents``
+    f-string; the embedded newlines are cosmetic (``clean_indents`` and the whitespace-collapsing
+    tests both ignore them).
 
     Why the strong push is earned (don't re-litigate this in future prompt audits): past misses
     traced to forecasters ignoring prediction markets, and the evidence is that a liquid, closely
@@ -532,6 +715,8 @@ def _strong_evidence_market_clause(
     match/mismatch discounting (resolution criteria, resolution date, liquidity), not in waving the
     market off. The all-caps shouting was dropped 2026-07-18 as decoration; the strong push stays.
     """
+    if MARKET_SNAPSHOT_SECTION_HEADER not in research:
+        return ""
     return (
         "Prediction markets are strong evidence — weight them heavily, not as a footnote. When the research "
         f"includes a market on this {subject}, default to treating {signal_noun} as a serious signal: if the "
@@ -541,8 +726,7 @@ def _strong_evidence_market_clause(
         "burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. "
         "When the criteria are practically identical and the only material difference is the resolution date, do "
         f"NOT apply a vague haircut — EXPLICITLY EXTRAPOLATE {extrapolate_target} to our resolution date with a "
-        f"simple model and state the assumption. {projection} "
-        f"{_MARKET_LIQUIDITY_WEIGHTING_SENTENCE} {_MARKET_RELATION_WEIGHTING_SENTENCE}"
+        f"simple model and state the assumption. {projection} {_MARKET_READING_RULES}"
     )
 
 
@@ -660,6 +844,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             every claim in the research; just be clear when you're drawing on your own knowledge versus the research.
             {
             _strong_evidence_market_clause(
+                research=research,
                 subject="question",
                 signal_noun="its price",
                 anchor_tail="should anchor your forecast",
@@ -704,7 +889,6 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             0a) Resolution check
                • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
-               • Before marking the resolution condition "already met", verify the triggering evidence post-dates the question's open timestamp (shown above). Historical events pre-dating the open date generally do NOT resolve a forward-looking question YES — e.g., a 1945 detonation does not resolve "Will a nuclear detonation occur in a Japanese city by 2030?" that opened in 2024. If the resolution criteria explicitly count pre-open events, say so explicitly.
 
             0b) Resolution decomposition (multi-part questions only)
                • If the resolution criteria contain multiple independently-testable conditions (e.g. "X is available AND the provider is Y" or "an event occurs AND it is formally confirmed by the named source AND it falls within the question window"), write the criteria as a Boolean product: "Yes iff A × B × C × ... = 1", naming each factor.
@@ -724,8 +908,11 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             2) Reference class and quantitative base rate
                • List plausible reference classes for this question and evaluate suitability.
                • State the outside-view base rate(s) and how you combine them into a baseline probability.
-               • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i)). A rough quantitative estimate from data is more reliable than an intuitive guess.
-               • Conditional-hazard check (for recurring-event questions only — product launches, elections, legislation, earnings, etc. with a history of inter-arrival gaps): an unconditional "event per typical interval" rate is usually wrong when time has already elapsed without the event. Compute the *conditional* probability: fit a simple model to historical gaps (exponential with mean = average gap, or the set of observed gaps treated as an empirical distribution), then compute P(event by deadline | no event in the T days already elapsed) — not just P(event in a window of size W). Show the number. If the question is not of this recurring type, write "non-recurring, conditional-hazard skipped".
+               • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i) — union only over paths that cannot be the same event, since an overlapping term double-counts it). A rough quantitative estimate from data is more reliable than an intuitive guess.
+               • {_BINARY_CONDITIONAL_HAZARD_BULLET}
+{_COUNT_IN_PERIOD_REFERENCE_CLASS}
+{_SOFT_CLOCK_RULE}
+{_HISTORY_DISCHARGED_RULE}
 
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
@@ -739,6 +926,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                  - Strong: multiple independent sources; clear causal mechanisms; strong precedent
                  - Moderate: one good source; indirect links; weak precedent
                  - Weak: anecdotes; speculative logic; volatile indicators
+{_NULL_RESULT_READING}
 
             5) Competing cases and red-teaming
                • Strongest Bear Case (No): most compelling, evidence-based argument for No.
@@ -746,24 +934,19 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Red-team both: attack assumptions, data gaps, and causal claims.
 
             5b) Conjunctive criteria pricing (multi-part questions only — skip if you wrote "single-condition, decomposition skipped" in 0b)
-               • NOW price the clauses you listed in 0b, informed by the evidence review and red-team above. Write a small table: one row per resolution clause (e.g. formal instrument? in-window? threshold met? listed by named source?) with its own probability, then the product of the rows.
-               • Reconcile your final forecast against the product in one line. If you disagree with the product, you have exactly three valid moves: revise the clause probabilities themselves and recompute; name a specific dependence between clauses (e.g. "clauses A and B are positively correlated, so the independent product underestimates") and quantify its effect; or realize the decomposition itself was wrong — revise the clause decomposition from 0b, then re-derive the clause probabilities and the product. Any override that is none of these is not valid — all hedging and adjustment must operate through the clauses, their dependence, or a corrected decomposition, not around them. If none applies, stay at the product.
+               • NOW price the clauses you listed in 0b, informed by the evidence review and red-team above. Write a small table: one row per resolution clause (e.g. formal instrument? in-window? threshold met? listed by named source?) with its own probability, then the product of the rows. On a multi-clause question this product is the number the "Anchor on your math" check in step 6 anchors to, because it is more specific than the step-2 base rate.
+               • Reconcile your final forecast against the product in one line. If you disagree with it, you have exactly three valid moves: revise the clause probabilities themselves and recompute; name a specific dependence between clauses (e.g. "A and B are positively correlated, so the independent product underestimates") and quantify its effect; or revise the clause decomposition from 0b and re-derive the product. Nothing else is a valid override — all hedging and adjustment must operate through the clauses, their dependence, or a corrected decomposition, not around them, so the criteria stay consumed as constraints rather than argued around. If none applies, stay at the product.
 
             6) Final rationale and calibration — integrate outside→inside view
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
                • Question-specific base rate: the relevant base rate is the historical frequency for questions LIKE THIS ONE (e.g., "how often do German federal elections return X"), not a generic "most things don't happen" prior.
-               • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
-               • Small-delta check: would a ±10% change still be coherent with the rationale? Why?
+               • Odds and delta check: translate your probability to odds (90% = 9:1, 99% = 99:1) — does it feel right, and would a ±10-point shift still be coherent with the rationale?
                • Trajectory check: consider whether the "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion" (e.g., a deadline arriving, a trend continuing, a process completing). Justify predictions that diverge from the most likely trajectory.
-               • Anchor on your math: if you computed a probability from data (base rate, frequency, z-score, rate extrapolation, probability union), your final answer should stay close to that number. You can adjust, but name the SPECIFIC new evidence justifying the adjustment. "I'll hedge to 30% because this is a novel situation" is NOT a valid adjustment — either your base rate was wrong (redo the calculation with different inputs) or the base rate stands with minor refinement.
+               • Anchor on your math: if you computed a probability from data (base rate, frequency, z-score, rate extrapolation, probability union, clause product), your final answer should stay close to that number; a move of more than about 15 points needs a named, specific piece of new evidence. "I'll hedge to 30% because this is a novel situation" is NOT a valid adjustment — either your base rate was wrong (redo the calculation with different inputs) or the base rate stands with minor refinement.
 
-            ── Brief checklist (keep concise) ───────────────────────────────
-            • Paraphrase the resolution criteria (<30 words).
-            • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
-            • State the outside-view base rate you anchored to.
-            • Consistency line: "X out of 100 times, [criteria] happens." Sensible?
-            • Top 3-5 evidence items + quick factual validity check.
-            • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
+            7) Final checks
+               • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
+               • Consistency line: "X out of 100 times, [criteria] happens." Sensible?
 
             ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
             This block is the ONLY authoritative source of your forecast — a
@@ -774,15 +957,11 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             ```json
             {{
               "question_type": "binary",
-              "posterior_prob": 0.28,
-              "base_rate_anchor": {{"low": 0.15, "high": 0.35}},
-              "criteria_clauses": [{{"name": "formal instrument signed", "prob": 0.6}}, {{"name": "in-window", "prob": 0.8}}]
+              "posterior_prob": 0.28
             }}
             ```
 
             `posterior_prob`: ALWAYS populate as a decimal in [0,1] (e.g., 0.28 for 28%).
-            `base_rate_anchor`: populate with the outside-view base-rate range you stated in PHASE 1 (as decimals, 0-1). Omit only if you truly stated no outside-view range.
-            `criteria_clauses`: populate from your conjunctive criteria pricing table in 5b (one entry per clause, probs as decimals). Omit for single-condition questions.
 
             The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
             """
@@ -797,13 +976,13 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
     return clean_indents(
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
-        Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid
-        over-confidence and make sure your probabilities sum to **100%**.
+        Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid over-confidence.
         Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
         training that the research reports don't cover, you may rely on it. You are not required to ground every claim
         in the research; just be clear when you're drawing on your own knowledge versus the research.
         {
             _strong_evidence_market_clause(
+                research=research,
                 subject="question",
                 signal_noun="its prices",
                 anchor_tail="should anchor your distribution",
@@ -855,6 +1034,10 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         (2) Reference class (outside view) analysis
             • Candidate reference classes and suitability.
             • Outside-view distribution over options; discuss the historical rate of upsets/unexpected outcomes in this domain and how that affects the distribution.
+            • {_REMAINING_EXPOSURE_SENTENCE}
+{_COUNT_IN_PERIOD_REFERENCE_CLASS}
+{_SOFT_CLOCK_RULE}
+{_HISTORY_DISCHARGED_RULE}
 
         (3) Timeframe reasoning
             • Time to resolution; describe how halving/doubling the timeline might reshape the distribution.
@@ -868,6 +1051,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
               - Strong: multiple independent sources; clear causality; strong precedent
               - Moderate: one good source; indirect links; weak precedent
               - Weak: anecdotes; speculative logic; volatile indicators
+{_NULL_RESULT_READING}
 
         (5) Strongest pro case for the currently most-likely option
             • Use weighted evidence and explicit causal chains.
@@ -880,38 +1064,28 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         (8) Final rationale and calibration — integrate outside→inside view
             • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
-            • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
-            • Small-delta check: would ±10% on the leading options remain coherent with your reasoning?
+            • Odds and delta check: translate the leading option's probability to odds (90% = 9:1) — does it feel right, and would ±10 points on the leading options still be coherent with your reasoning?
             • Blind-spot consideration: if the resolution is unexpected, what would likely be the reason, and how should that affect confidence spreads?
-            • Anchor on your math: if you computed probabilities from data (base rate, frequency, etc.), your final answers should stay close to those numbers. Adjust only with specific new evidence, not vibe.
+            • Anchor on your math: if you computed probabilities from data (base rate, frequency, etc.), your final answers should stay close to those numbers; a move of more than about 15 points on an option needs a named, specific piece of new evidence, not vibe.
             • Calibration audit: if one option is genuinely dominant, commit to it — don't flatten a well-supported favorite out of general conservatism; under-committing to strong favorites costs points. Hedge by keeping honest probability on plausible residual outcomes ("Other", "no decision", "none of the above", record-extreme buckets) — that is where surprises actually land — not by spreading mass across the board.
-            Remember:
-            • Use integers 1%-99% (no 0 % or 100 %).
-            • They must sum to 100 %.
 
-        ── Brief checklist (keep concise) ───────────────────────────────────
-        • Paraphrase options & resolution criteria (<30 words).
-        • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
-        • State the outside-view distribution used as anchor.
-        • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
-        • Top 3-5 evidence items + quick factual validity check.
-        • Blind-spot statement.
+        (9) Final checks
+            • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
+            • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
 
-        [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
-        Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
+        [**CRITICAL**: You MUST assign a probability to EVERY single option listed above.
+        Even if an option seems very unlikely, assign it at least {MC_PROB_MIN}. Never skip any option.]
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream
         deterministic parser reads it and nothing else. Responses without it are
         discarded.
-        Schema (`option_probs` is REQUIRED; others optional):
+        Schema:
 
         ```json
         {{
           "question_type": "multiple_choice",
-          "option_probs": {{{option_probs_example}}},
-          "other_mass": 0.0,
-          "concentration": 20.0
+          "option_probs": {{{option_probs_example}}}
         }}
         ```
 
@@ -929,30 +1103,22 @@ def numeric_prompt(
 ) -> str:
     unit_str = question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
     nom_upper, nom_lower = nominal_bounds(question)
-    # Only surface the anchor guidance when an anchor section is actually in the
-    # research (mirrors how the market clause's advice only bites when a market
-    # snapshot is present, but here we gate the text itself on a cheap substring
-    # check since the anchor provider is off by default).
+    # Only surface the anchor guidance when an anchor section is actually in the research:
+    # the same cheap substring gate ``_strong_evidence_market_clause`` applies to the market
+    # clause, so neither clause spends prompt on a table the forecaster does not have.
     ts_anchor_clause = f"\n        {_ts_anchor_evidence_clause()}" if TS_ANCHOR_SECTION_HEADER in research else ""
     return clean_indents(
         f"""
         You are a **senior forecaster** writing a public report for expert peers.
         You will be scored with Metaculus' log-score, so accuracy **and** calibration
-        (especially the width of your prediction interval) are critical.
+        (especially the width of your prediction interval) are critical; how to set that width
+        is step (8) of the template below.
         Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
         training that the research reports don't cover, you may rely on it. You are not required to ground every claim
-        in the research; just be clear when you're drawing on your own knowledge versus the research.
-        Calibration guidance: For volatile quantities (financial markets, novel events, short-horizon
-        relative returns), produce wide, diffuse distributions — these are fundamentally hard to predict.
-        For stable, well-measured indicators with recent data (economic indices, demographic measures,
-        climate data), anchor tightly to recent observations with historically-appropriate variance.
-        Do not over-hedge on quantities you can actually predict well.
-        Match your interval width to what your reasoning actually supports, and do not pad or sharpen
-        out of a generic disposition.
-        Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
-        but penalties for overly wide intervals on predictable quantities also accumulate.{ts_anchor_clause}
+        in the research; just be clear when you're drawing on your own knowledge versus the research.{ts_anchor_clause}
         {
             _strong_evidence_market_clause(
+                research=research,
                 subject="quantity",
                 signal_noun="its implied range",
                 anchor_tail="your percentiles should center on it",
@@ -1012,19 +1178,18 @@ def numeric_prompt(
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
-        (1) Source analysis and data anchor
+        (1) Source analysis
             - Summarize key sources; note recency, credibility, and scope.
 {_SOURCE_PROVENANCE_LADDER}
-            - Critical: what is the most recent authoritative measurement or data point for this quantity? Your prediction should be centered near this value unless you have strong, specific evidence for departure.
 
         (2) Outside view and quantitative modeling
             - Candidate reference classes and suitability.
             - State the outside view range and how you anchor to it.
             - If the data supports it, perform an explicit quantitative estimate: extrapolate recent trends, compute historical mean and variance, or fit a simple model. A rough calculation from data is more reliable than an intuitive range estimate.
+{_COUNT_IN_PERIOD_REFERENCE_CLASS}
 
         (3) Timeframe and dynamics
             - Time to resolution; describe how halving or doubling the timeline might shift percentiles.
-            - Status-quo outcome: what value is implied if current conditions simply persist.
             - Trend continuation: extrapolate historical data to the closing date.
 
         (4) Expert and market priors
@@ -1038,6 +1203,7 @@ def numeric_prompt(
             - Strong: multiple independent sources, clear causal links, strong precedent
             - Moderate: one good source, indirect links, weak precedent
             - Weak: anecdotes, speculative logic, volatile indicators
+{_NULL_RESULT_READING}
 
         (6) Tail scenarios
             - Coherent pathway for unusually low results.
@@ -1045,49 +1211,22 @@ def numeric_prompt(
 
         (7) Red team and final rationale — integrate outside→inside view
             - Challenge assumptions and data quality.
-            - Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
-            - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning
-            - Trajectory check: consider whether "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion." Justify deviations from the most likely trajectory.
+            - State your outside-view central estimate and range, then say what the current evidence moved and why.
+            - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning?
             - Anchor on your math: if you derived a central estimate or range from data (extrapolation, historical trend, explicit formula), your percentiles should stay close to it. Adjust only with specific evidence, not vibe.
             - Question-specific base rate: anchor on the historical frequency, trend, or variance for THIS specific indicator (e.g., "how much has this index moved in prior analogous windows"), not a generic "things are usually stable" or "things are usually volatile" prior.
 
-        (8) Calibration and distribution shaping
-            - Think in ranges, not single points.
+        (8) Forecastability and width
+            - Decide how forecastable this quantity is from current information on this horizon. An administered or slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely predictable from its latest value and historical variance: anchor tightly on recent observations. A traded price, a volatile count or a novel metric on a short horizon is close to a random walk: center on the current value, take the width from its realized variability over comparable windows, and do not expect movement you cannot source to a named cause.
+            - Match your interval width to what your reasoning actually supports, and do not pad or sharpen out of a generic disposition. Log score punishes a narrow interval that misses far more than a wide one that covers, but a wide interval on a predictable quantity also bleeds points.
             - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution.
-            - Ensure strictly increasing percentiles.
-            - Avoid scientific notation.
-            - For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
 
-        (9) Outcome type classification
-            Determine whether the resolution value for this question will always be a whole integer
-            (e.g. counts, rankings, number of events, number of countries) or can be any real number
-            (e.g. temperatures, percentages, dollar amounts, ratios).
-            Record this decision in the `outcome_type` field of the STRUCTURED FORECAST block below
-            ("discrete_integer" for whole-integer resolutions, "continuous" otherwise).
+        (9) Outcome type: decide whether the resolution value is inherently a whole integer and record it in `outcome_type` in the block below (definition in the schema notes).
 
-        (9b) Forecastability classification
-            How inherently predictable is this quantity on the given time horizon?
-            - HIGH: stable indicator with recent data, low historical variance
-              (e.g., monthly unemployment rate, home price index, CO2 concentration)
-            - MEDIUM: event-based or moderately variable
-              (e.g., election results, quarterly earnings, box office)
-            - LOW: volatile or near-random on this horizon
-              (e.g., 2-week stock/futures returns, financial spreads, novel metrics)
-            Output exactly one of:
-            FORECASTABILITY: HIGH
-            FORECASTABILITY: MEDIUM
-            FORECASTABILITY: LOW
-            Use this classification as a self-check: your interval width should match how predictable the quantity actually is on this horizon.
-
-        (10) Brief checklist
+        (10) Final checks
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
-            - Paraphrase the resolution criteria and units in less than 30 words.
             - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
-            - State the outside view baseline used.
-            - Consistency line about which percentile corresponds to the status quo or trend.
-            - Top 3 to 5 evidence items plus a quick factual validity check.
-            - Blind spot scenario and expected effect on tails.
-            - Forecastability check: does your interval width match the forecastability classification?
+            - Consistency line: which percentile corresponds to the status quo or trend, and is that sensible?
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream
@@ -1108,9 +1247,6 @@ def numeric_prompt(
         ```
 
         Notes:
-        - The `declared_percentiles` block is the ONLY source of your forecast — it
-          MUST contain all {EXPECTED_PERCENTILE_COUNT} standard percentiles
-          ({_STANDARD_PERCENTILES_DECIMAL_CSV}); a partial set cannot be salvaged.
         - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
           equal); floating-point numbers in the base unit; no scientific notation.
         - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
@@ -1163,7 +1299,7 @@ def stacking_binary_prompt(
         {_forecasting_window_str(question)}
 
         ── Multiple Expert Analyses ──
-        Each base-model analysis above carries its final forecast inside a fenced
+        Each base-model analysis below carries its final forecast inside a fenced
         ```json STRUCTURED FORECAST block at its tail (field `posterior_prob`, a
         decimal in [0,1]). Read those blocks to get each model's declared number,
         and read the surrounding reasoning to weight the analysis.
@@ -1255,7 +1391,7 @@ def stacking_multiple_choice_prompt(
         {_forecasting_window_str(question)}
 
         ── Multiple Expert Analyses ──
-        Each base-model analysis above carries its final forecast inside a fenced
+        Each base-model analysis below carries its final forecast inside a fenced
         ```json STRUCTURED FORECAST block at its tail (field `option_probs`, keyed
         by the exact option names, values as decimals summing to 1.0). Read those
         blocks to get each model's declared distribution, and read the surrounding
@@ -1294,8 +1430,8 @@ def stacking_multiple_choice_prompt(
            • Does my distribution appropriately reflect uncertainty?
            • Are my tail probabilities justified given the evidence?
 
-        **CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
-        Even if an option seems very unlikely, assign it at least 1%. Never skip any option.
+        **CRITICAL**: You MUST assign a probability to EVERY single option listed above.
+        Even if an option seems very unlikely, assign it at least {MC_PROB_MIN}. Never skip any option.
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream
@@ -1370,7 +1506,7 @@ def stacking_numeric_prompt(
         {upper_bound_message}
 
         ── Multiple Expert Analyses ──
-        Each base-model analysis above carries its final forecast inside a fenced
+        Each base-model analysis below carries its final forecast inside a fenced
         ```json STRUCTURED FORECAST block at its tail (field `declared_percentiles`,
         an object keyed by the {EXPECTED_PERCENTILE_COUNT} standard percentiles as decimals from {
             _LOWEST_PERCENTILE_LABEL
@@ -1420,7 +1556,7 @@ def stacking_numeric_prompt(
         deterministic parser reads it and nothing else. Responses without it are
         discarded.
         Schema (`declared_percentiles` is REQUIRED and MUST contain all {EXPECTED_PERCENTILE_COUNT} standard
-        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}; `outcome_type` is REQUIRED):
+        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}):
 
         ```json
         {{
@@ -1428,20 +1564,13 @@ def stacking_numeric_prompt(
           "declared_percentiles": {{
             "0.01": 0.5, "0.025": 1.2, "0.05": 10.1, "0.1": 12.3, "0.2": 23.4, "0.4": 34.5, "0.5": 45.6,
             "0.6": 56.7, "0.8": 67.8, "0.9": 78.9, "0.95": 89.0, "0.975": 123.4, "0.99": 140.2
-          }},
-          "outcome_type": "continuous"
+          }}
         }}
         ```
 
         Notes:
-        - The `declared_percentiles` block is the ONLY source of your forecast — it
-          MUST contain all {EXPECTED_PERCENTILE_COUNT} standard percentiles
-          ({_STANDARD_PERCENTILES_DECIMAL_CSV}); a partial set cannot be salvaged.
         - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
           equal); floating-point numbers in the base unit; no scientific notation.
-        - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
-          whole number (counts, rankings, number of events, number of countries),
-          "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
 
         The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """
@@ -1502,10 +1631,12 @@ def gap_fill_analyzer_prompt(
 ) -> str:
     """Prompt for a cheap model to identify factual gaps in the first-pass research.
 
-    Returns a JSON list of gap objects (or empty list). Quality over quantity:
-    most questions have 0-2 meaningful gaps; at most ``max_gaps``. ``options`` is the MC
-    ballot (see ``_mc_options_line``) — a gap like "no coverage of candidate X" is only
-    findable when the analyzer knows the candidates.
+    Returns a JSON list of gap objects (or empty list), at most ``max_gaps``, ordered most
+    forecast-moving first (the cap truncates, so order is the ranking). The analyzer fills
+    its slots whatever it is told — 55-77% of archived records sit at the cap — so the prompt
+    spends its words on WHICH gaps earn a slot rather than on how many to return. ``options``
+    is the MC ballot (see ``_mc_options_line``) — a gap like "no coverage of candidate X" is
+    only findable when the analyzer knows the candidates.
     """
     benchmarking_warning = _benchmarking_warning("gap_flagging") if is_benchmarking else ""
     resolution_block = (resolution_criteria or "(none provided)").strip()
@@ -1517,9 +1648,9 @@ def gap_fill_analyzer_prompt(
         on a question. Your job: identify up to {max_gaps} specific factual gaps where
         additional targeted search would meaningfully improve the forecast.{benchmarking_warning}
 
-        Be thorough but SELECTIVE. Only flag a gap if resolving it would change how a
-        superforecaster reasons about the question. Most questions have 0-2 real gaps;
-        a few have 3-5. DO NOT invent gaps for completeness.
+        Only flag a gap if resolving it would change how a superforecaster reasons about the
+        question. DO NOT invent gaps for completeness: each gap is a paid search, and a slot
+        spent on a gap that would not move the forecast is a slot not spent on one that would.
 
         Gap types to look for:
 
@@ -1536,6 +1667,10 @@ def gap_fill_analyzer_prompt(
            not fetch a tiebreaker.
         6. Missing base rate / reference class — the question asks about a class of
            event but first pass gives anecdotes rather than historical frequency data.
+           Where the question resolves through an institutional rule (an electoral
+           threshold, a quota, an allocation formula, a cut-off score), this includes how
+           that rule actually applied at its most recent real application, as a realized
+           count or outcome — a different fact from the question's own resolution threshold.
         7. Missing expert opinion — first pass asserts a claim that should have a
            named expert or institution behind it but does not cite one.
         8. Stale first-pass info — first pass appears drawn from training data rather
@@ -1543,11 +1678,28 @@ def gap_fill_analyzer_prompt(
         9. Missing counter-evidence — first pass is one-sided; a "consider the
            opposite" search would strengthen the forecast.
 
-        ORDER THE GAPS BY DECISION-RELEVANCE, most forecast-moving first. Before you
-        finalize the list, compare the candidate gaps against each other and rank
-        them: the gap whose resolution would most change a superforecaster's answer
-        goes first, the least impactful last. The list ORDER is the ranking — do NOT
-        add rank fields or scores; keep the schema exactly as below.
+        ANSWERABLE NOW. Every gap must be answerable from sources that exist today. When
+        the question resolves off a live data source — a tracker, index, polling or rate
+        average, counter, league table, or dashboard — at least ONE gap must ask what that
+        source reads NOW, in the present tense, because the current reading is the single
+        fact that most often decides these questions. A first pass that already states the
+        source's current reading WITH its as-of date counts as answered: spend the slot on
+        something the briefing lacks, and re-ask only if the stated reading is undated or
+        older than the source's own update cadence. Never phrase a gap as that source's
+        value on the resolution date ("what will <tracker> show on <date>"). If a candidate
+        gap can only be answered by a future observation, rewrite it as the present-tense
+        observable or drop it.
+
+        NULL RESULTS ARE SEARCH OUTCOMES. Where the first pass says it searched and
+        found nothing ("no record found", "no authoritative source located"), treat that
+        as an open question, not as an established negative fact. If the missing record
+        is load-bearing, the gap is to look for it in the specific authoritative place
+        that would hold it — name that source in the search query — and to establish what
+        its silence there would and would not show.
+
+        Order the gaps most forecast-moving first; the list ORDER is the ranking, so the
+        trailing slot holds the gap that would change the answer least. Do NOT add rank
+        fields or scores; keep the schema exactly as below.
 
         Output STRICT JSON, nothing else, matching this schema exactly:
 

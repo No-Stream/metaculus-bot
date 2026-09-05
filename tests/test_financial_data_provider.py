@@ -1,6 +1,7 @@
 """Tests for the financial data research provider (yfinance + FRED)."""
 
 import math
+import re
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -10,60 +11,50 @@ import pytest
 from forecasting_tools import GeneralLlm
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
-from metaculus_bot.constants import FINANCIAL_YFINANCE_LOOKBACK_DAYS, MAX_FINANCIAL_IDENTIFIERS
+from metaculus_bot.constants import (
+    FINANCIAL_VARIANCE_RATIO_FLOOR,
+    FINANCIAL_VARIANCE_RATIO_LAG,
+    FINANCIAL_YFINANCE_LOOKBACK_DAYS,
+    MAX_FINANCIAL_IDENTIFIERS,
+)
 from metaculus_bot.research.financial_data import (
     _PERIOD_SLIP_GRACE_DAYS,
     _PERIOD_TARGET_DAYS,
     CLASSIFIER_PROMPT,
     FRED_LABELS,
+    FRED_SKIPPED_NO_KEY_TOKEN,
     KNOWN_FRED_SERIES,
     KNOWN_TICKERS,
     TICKER_LABELS,
     _cap_identifiers,
     _classify_financial_question,
-    _fetch_fred_data,
-    _fetch_fred_data_ceiling,
     _fetch_yfinance_data,
-    _render_fred_series,
     extract_financial_identifiers_from_criteria,
     financial_data_provider,
 )
+from metaculus_bot.research.fred_rendering import _fetch_fred_data_ceiling
+from metaculus_bot.research.noise_flag import NoiseScreen, noise_flag_line, screen_for_quote_noise
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
 from metaculus_bot.research.ts_estimators import (
     CALENDAR_DAYS_PER_YEAR,
     TRADING_DAYS_PER_YEAR,
+    annualized_realized_vol_pct,
+    multi_period_annualized_vol_pct,
     observed_periods_per_year,
     stale_latest_age_days,
+    variance_ratio,
 )
 from metaculus_bot.research.ts_fetch import FetchError
-
-
-def _make_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> MagicMock:
-    """Build a minimal MetaculusQuestion-shaped mock for the ResearchCallable
-    contract. resolution_criteria/fine_print default to "" (a bare MagicMock
-    would auto-create truthy child mocks, breaking the `or ""` guard and regex)."""
-    q = MagicMock()
-    q.question_text = text
-    q.resolution_criteria = resolution_criteria
-    q.fine_print = fine_print
-    return q
-
-
-# Fixed open_time used across the benchmarking date-ceiling tests. as_of derivation
-# under is_benchmarking pins to this, so the yfinance start/end and FRED ceiling are
-# both deterministic: end == open_time.date() + 1 day, start == open_time.date() minus
-# the FINANCIAL_YFINANCE_LOOKBACK_DAYS calendar window.
-_BENCH_OPEN_TIME = datetime(2026, 3, 15, 14, 30, tzinfo=UTC)
-
-
-def _make_bench_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> MagicMock:
-    """A _make_q with a concrete open_time so the benchmarking ceiling can be derived
-    (a bare MagicMock open_time isn't a datetime → the provider soft-skips as leakage-safe)."""
-    q = _make_q(text, resolution_criteria, fine_print)
-    q.open_time = _BENCH_OPEN_TIME
-    return q
-
+from scripts.telemetry.markers import MARKER_SPECS
+from tests.financial_fakes import (
+    _BENCH_OPEN_TIME,
+    _clean_close,
+    _make_bench_q,
+    _make_q,
+    _noisy_close,
+    _yfinance_by_symbol,
+)
 
 # ---------------------------------------------------------------------------
 # Classifier tests
@@ -290,7 +281,11 @@ class TestAnnualizationBasis:
 
         result = self._fetch_with_history(close)
         expected_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(365) * 100
-        assert self._line_value(result, "- 30-calendar-day annualized volatility") == f"{expected_vol:.1f}%"
+        # startswith, not equality: the implanted 3x spike-and-revert above is a one-bar
+        # reversal, so this fixture legitimately trips the variance-ratio noise screen and
+        # the line picks up a trailing noise-suspect label. The claim under test is the
+        # VALUE and its annualization basis, which are unchanged.
+        assert self._line_value(result, "- 30-calendar-day annualized volatility").startswith(f"{expected_vol:.1f}%")
         # A 252-basis vol would be ~17% lower; make sure that's not what rendered.
         wrong_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(252) * 100
         assert f"{wrong_vol:.1f}%" != f"{expected_vol:.1f}%"
@@ -640,141 +635,185 @@ class TestDateBasedPeriodReturns:
         assert one_m == f"- 1m: {expected:+.2f}%"
 
 
-class TestFetchFredData:
-    """Tests for _fetch_fred_data."""
-
-    def test_valid_series_returns_markdown_with_key_fields(self) -> None:
-        dates = pd.date_range(end="2026-03-01", periods=60, freq="MS")
-        values = np.linspace(3.5, 4.2, 60)
-        mock_series = pd.Series(values, index=dates, name="UNRATE")
-
-        mock_fred_instance = MagicMock()
-        mock_fred_instance.get_series.return_value = mock_series
-        mock_fred_instance.get_series_info.return_value = pd.DataFrame(
-            {"title": ["Unemployment Rate"]}, index=["UNRATE"]
-        )
-
-        with patch("metaculus_bot.research.financial_data.Fred") as mock_fred_class:
-            mock_fred_class.return_value = mock_fred_instance
-
-            result = _fetch_fred_data("UNRATE", "fake_api_key")
-
-        assert result != ""
-        assert "UNRATE" in result
-        # Should contain the latest value
-        assert "4.2" in result or "4.20" in result
-
-    def test_fred_exception_returns_empty_string(self) -> None:
-        with patch("metaculus_bot.research.financial_data.Fred") as mock_fred_class:
-            mock_fred_class.return_value.get_series.side_effect = Exception("API error")
-
-            result = _fetch_fred_data("INVALID", "fake_api_key")
-
-        assert result == ""
-
-
-class TestRenderFredSeriesYoY:
-    """The year-over-year line must use a DATE-based ~365-day lookup, not a fixed
-    13-observation offset (F8). On a daily series 13 observations is ~2.5 weeks, so
-    the old offset mislabeled a two-and-a-half-week move as year-over-year."""
+class TestVolatilityHorizonsAndNoiseFlag:
+    """Two volatility horizons, and the variance-ratio noise flag that reorders them."""
 
     @staticmethod
-    def _yoy_change_from(markdown: str) -> float:
-        """Pull the signed YoY change value out of the rendered markdown line."""
-        for line in markdown.splitlines():
-            if line.startswith("- Year-over-year change:"):
-                # "- Year-over-year change: +12.3 (+4.56%)" -> "+12.3"
-                return float(line.split(":", 1)[1].strip().split(" ")[0])
-        raise AssertionError(f"no year-over-year line in:\n{markdown}")
+    def _fetch(close: pd.Series, ticker: str = "TEST") -> str:
+        with patch("metaculus_bot.research.financial_data.yfinance", _yfinance_by_symbol({ticker: close})):
+            return _fetch_yfinance_data(ticker)
 
-    def test_daily_series_uses_365d_ago_value_not_obs_minus_13(self) -> None:
-        # 800 business days ending 2026-03-02. The value is a linear ramp from 0.0
-        # to 799.0 (one unit per observation), so the value at any date equals its
-        # integer offset from the start — making the two lookups trivially distinct.
-        dates = pd.bdate_range(end="2026-03-02", periods=800)
-        data = pd.Series(np.arange(800.0), index=dates, name="DGS10")
+    def test_a_clean_series_prints_short_then_long_with_no_flag(self) -> None:
+        clean = _clean_close(seed=3)
+        result = self._fetch(clean)
 
-        latest_value = float(data.iloc[-1])  # 799.0
-        # obs[-13] (the OLD, wrong behavior) is ~2.5 weeks back, not a year.
-        wrong_offset_value = float(data.iloc[-13])  # 787.0
-        # The date-based lookup: last observation at or before ~365 days ago.
-        year_ago = data.index[-1] - pd.Timedelta(days=365)
-        correct_value = float(data.loc[:year_ago].iloc[-1])
+        short_expected = annualized_realized_vol_pct(clean, window=30, periods_per_year=252)
+        long_expected = annualized_realized_vol_pct(clean, window=252, periods_per_year=252)
+        assert short_expected is not None
+        assert long_expected is not None
+        assert f"- 30-trading-day annualized volatility: {short_expected:.1f}%" in result
+        assert f"- 252-trading-day annualized volatility: {long_expected:.1f}%" in result
+        assert result.index("- 30-trading-day") < result.index("- 252-trading-day")
+        assert "Vendor-noise flag" not in result
 
-        markdown = _render_fred_series("DGS10", data, "10Y Treasury rate")
-        rendered_yoy = self._yoy_change_from(markdown)
+    def test_the_long_horizon_line_names_the_rows_it_actually_holds(self) -> None:
+        """264 returns is under a year, so the label must say 264, not 252."""
+        clean = _clean_close(seed=3, n=200)
+        result = self._fetch(clean)
+        assert "- 199-trading-day annualized volatility:" in result
 
-        assert rendered_yoy == pytest.approx(latest_value - correct_value, abs=1e-6)
-        # And is materially different from the old fixed-offset result.
-        assert rendered_yoy != pytest.approx(latest_value - wrong_offset_value, abs=1e-6)
+    def test_too_little_history_prints_only_the_short_window(self) -> None:
+        short = _clean_close(seed=3, n=31)
+        result = self._fetch(short)
+        assert "- 30-trading-day annualized volatility:" in result
+        assert result.count("annualized volatility") == 1
+        assert "Vendor-noise flag" not in result
 
-    def test_monthly_series_still_correct(self) -> None:
-        # 60 monthly observations; the value ~12 months back is one year ago.
-        dates = pd.date_range(end="2026-03-01", periods=60, freq="MS")
-        data = pd.Series(np.arange(60.0), index=dates, name="UNRATE")
+    def test_a_noise_dominated_series_flags_and_leads_with_the_robust_figure(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        noisy = _noisy_close(seed=3)
+        with caplog.at_level("INFO", logger="metaculus_bot.research.financial_data"):
+            result = self._fetch(noisy)
 
-        latest_value = float(data.iloc[-1])
-        year_ago = data.index[-1] - pd.Timedelta(days=365)
-        expected_prior = float(data.loc[:year_ago].iloc[-1])
+        ratio = variance_ratio(noisy, lag=5, min_returns=120)
+        robust = multi_period_annualized_vol_pct(noisy, lag=5, periods_per_year=252, min_returns=120)
+        assert ratio is not None
+        assert robust is not None
+        assert f"variance ratio VR(5) = {ratio:.2f}" in result
+        assert "Noise-robust annualized volatility, from overlapping 5-trading-day returns" in result
+        assert f"{robust:.1f}% — size intervals from THIS figure" in result
+        # Ordering: robust first, then the long window, then the noise-suspect short window.
+        assert result.index("Noise-robust") < result.index("- 252-trading-day") < result.index("- 30-trading-day")
+        assert "(from one-day returns, noise included; noise-suspect)" in result
+        assert "FINANCIAL_NOISE_FLAG" in caplog.text
 
-        markdown = _render_fred_series("UNRATE", data, "unemployment rate")
-        rendered_yoy = self._yoy_change_from(markdown)
+    def test_the_emitted_line_parses_under_the_marker_spec(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The harvest contract, checked against the REAL logged line rather than a literal.
 
-        assert rendered_yoy == pytest.approx(latest_value - expected_prior, abs=1e-6)
+        `"FINANCIAL_NOISE_FLAG" in caplog.text` was the only assertion on this emitter, so a
+        field reorder — or deleting the logger.info outright — left the suite green while the
+        archive silently harvested nothing. The parser-side tests cannot close that: they parse
+        hand-typed strings whose comments claim "in the shape X emits" with nothing enforcing
+        it. Same pattern as tests/test_ts_routing.py's ts_anchor_route test.
+        """
+        noisy = _noisy_close(seed=3)
+        with caplog.at_level("INFO", logger="metaculus_bot.research.financial_data"):
+            self._fetch(noisy, ticker="USDSZL=X")
 
-    def test_short_series_omits_yoy_line(self) -> None:
-        # Only ~3 months of monthly data: nothing is ~365 days back, so the YoY
-        # line is omitted rather than reaching for a nonexistent observation.
-        dates = pd.date_range(end="2026-03-01", periods=3, freq="MS")
-        data = pd.Series(np.arange(3.0), index=dates, name="UNRATE")
+        ratio = variance_ratio(noisy, lag=FINANCIAL_VARIANCE_RATIO_LAG, min_returns=120)
+        robust = multi_period_annualized_vol_pct(
+            noisy, lag=FINANCIAL_VARIANCE_RATIO_LAG, periods_per_year=252, min_returns=120
+        )
+        short = annualized_realized_vol_pct(noisy, window=30, periods_per_year=252)
+        long_vol = annualized_realized_vol_pct(noisy, window=252, periods_per_year=252)
+        assert ratio is not None
+        assert robust is not None
+        assert short is not None
+        assert long_vol is not None
 
-        markdown = _render_fred_series("UNRATE", data, "unemployment rate")
+        (line,) = [r.getMessage() for r in caplog.records if "FINANCIAL_NOISE_FLAG" in r.getMessage()]
+        spec = next(s for s in MARKER_SPECS if s.name == "financial_noise_flag")
+        match = spec.regex.search(line)
+        assert match is not None
+        assert match.groupdict() == {
+            "surface": "financial_data",
+            "symbol": "USDSZL=X",
+            "vr_lag": str(FINANCIAL_VARIANCE_RATIO_LAG),
+            "vr": f"{ratio:.3f}",
+            "floor": str(FINANCIAL_VARIANCE_RATIO_FLOOR),
+            "short_vol": f"{short:.1f}",
+            "long_vol": str(round(long_vol, 1)),
+            "robust_vol": str(round(robust, 1)),
+        }
 
-        assert "Year-over-year change" not in markdown
+    def test_the_robust_figure_is_the_short_one_scaled_by_the_root_ratio(self) -> None:
+        """The remedy is the flag's own arithmetic, not an unrelated number: the multi-day
+        volatility equals the one-day figure times sqrt(VR) in log-return terms."""
+        noisy = _noisy_close(seed=11)
+        ratio = variance_ratio(noisy, lag=5, min_returns=120)
+        robust = multi_period_annualized_vol_pct(noisy, lag=5, periods_per_year=252, min_returns=120)
+        assert ratio is not None
+        assert robust is not None
+        log_returns = np.diff(np.log(noisy.to_numpy(dtype="float64")))
+        one_day = float(log_returns.std(ddof=1) * np.sqrt(252) * 100.0)
+        assert robust == pytest.approx(one_day * math.sqrt(ratio), rel=1e-9)
 
 
-class TestRenderFredSeriesZeroBasePercent:
-    """A base of exactly 0 has no percent change; it must not render as 0.00%.
+class TestSharedNoiseScreen:
+    """One owner for the screen and the telemetry line, so the two surfaces cannot drift.
 
-    FRED spread series cross zero routinely (T10Y2Y inverted through 2023-24), and the
-    old ``else 0`` put a fabricated "unchanged" percentage next to a genuine absolute
-    move in a forecaster prompt.
+    The screen and the FINANCIAL_NOISE_FLAG format string were duplicated across
+    `financial_data._volatility_lines` and `ts_render._realized_vol_lines`, which is how the
+    two copies of the vol estimator drifted before (the q44882 sqrt(252)-on-a-24/7-series
+    defect was fixed in one copy weeks before the other). Only the forecaster-facing prose is
+    local to each renderer now.
     """
 
-    def test_zero_previous_observation_omits_the_percent_clause(self) -> None:
-        dates = pd.date_range(end="2026-03-01", periods=3, freq="MS")
-        data = pd.Series([0.5, 0.0, 0.31], index=dates, name="T10Y2Y")
+    @staticmethod
+    def _spec_regex() -> re.Pattern[str]:
+        return next(s for s in MARKER_SPECS if s.name == "financial_noise_flag").regex
 
-        markdown = _render_fred_series("T10Y2Y", data, "10Y-2Y spread")
-        change_line = next(line for line in markdown.splitlines() if line.startswith("- Change from previous:"))
+    def test_the_screen_fires_only_below_the_floor(self) -> None:
+        assert screen_for_quote_noise(_clean_close(seed=3), periods_per_year=252) is None
+        fired = screen_for_quote_noise(_noisy_close(seed=3), periods_per_year=252)
+        assert fired is not None
+        assert fired.ratio < FINANCIAL_VARIANCE_RATIO_FLOOR
+        # Same refusal policy for both estimators, so a fired screen always carries a remedy.
+        assert fired.robust_vol_pct is not None
 
-        assert change_line == "- Change from previous: +0.31"
-        assert "0.00%" not in markdown
+    def test_a_sample_the_estimator_refuses_is_not_a_flag(self) -> None:
+        """An administratively fixed quote has no measurable return variance, so the ratio
+        would be float noise over float noise — and "no measurement" must not read as a flag."""
+        flat = pd.Series([7.4604] * 300, index=pd.date_range(end="2026-03-02", periods=300, freq="B"))
+        assert screen_for_quote_noise(flat, periods_per_year=252) is None
 
-    def test_zero_year_ago_observation_omits_only_the_yoy_percent(self) -> None:
-        # 25 monthly observations so the ~365-day lookup lands on a real row, which is
-        # set to exactly 0. The month-over-month clause is unaffected.
-        dates = pd.date_range(end="2026-03-01", periods=25, freq="MS")
-        values = [1.0] * 25
-        values[12] = 0.0  # the observation ~365 days before the last one
-        data = pd.Series(values, index=dates, name="T10Y3M")
-        data.iloc[-1] = 0.4
-        data.iloc[-2] = 0.2
+    def test_both_surfaces_emit_the_same_field_set_under_the_spec_regex(self) -> None:
+        """The anti-drift property R12 exists for: one shape, every field required, so a
+        reorder harvests as a clean zero rather than recording None for an emitted value."""
+        screen = NoiseScreen(ratio=0.412, robust_vol_pct=9.44)
+        yfinance_line = noise_flag_line(
+            screen, surface="financial_data", symbol="USDSZL=X", short_vol=17.85, long_vol=15.24
+        )
+        anchor_line = noise_flag_line(screen, surface="ts_anchor", symbol="CSUSHPISA", short_vol=14.6, long_vol=None)
 
-        markdown = _render_fred_series("T10Y3M", data, "10Y-3M spread")
-        yoy_line = next(line for line in markdown.splitlines() if line.startswith("- Year-over-year change:"))
-        mom_line = next(line for line in markdown.splitlines() if line.startswith("- Change from previous:"))
+        regex = self._spec_regex()
+        yfinance_match = regex.search(yfinance_line)
+        anchor_match = regex.search(anchor_line)
+        assert yfinance_match is not None
+        assert anchor_match is not None
+        assert yfinance_match.groupdict() == {
+            "surface": "financial_data",
+            "symbol": "USDSZL=X",
+            "vr_lag": str(FINANCIAL_VARIANCE_RATIO_LAG),
+            "vr": "0.412",
+            "floor": str(FINANCIAL_VARIANCE_RATIO_FLOOR),
+            "short_vol": "17.9",
+            "long_vol": "15.2",
+            "robust_vol": "9.4",
+        }
+        # The anchor computes no long window; `surface` is what tells that apart from a
+        # yfinance series too short to hold one, so the field itself stays present.
+        assert anchor_match.groupdict() | {"surface": "financial_data"} == yfinance_match.groupdict() | {
+            "symbol": "CSUSHPISA",
+            "short_vol": "14.6",
+            "long_vol": "None",
+        }
 
-        assert yoy_line == "- Year-over-year change: +0.4"
-        assert "(+100.00%)" in mom_line
-
-    def test_a_nonzero_base_still_renders_its_percent(self) -> None:
-        dates = pd.date_range(end="2026-03-01", periods=2, freq="MS")
-        data = pd.Series([2.0, 3.0], index=dates, name="UNRATE")
-
-        markdown = _render_fred_series("UNRATE", data, "unemployment rate")
-
-        assert "- Change from previous: +1 (+50.00%)" in markdown
+    def test_a_refused_remedy_renders_the_none_sentinel(self) -> None:
+        line = noise_flag_line(
+            NoiseScreen(ratio=0.369, robust_vol_pct=None),
+            surface="financial_data",
+            symbol="USDSZL=X",
+            short_vol=17.85,
+            long_vol=None,
+        )
+        match = self._spec_regex().search(line)
+        assert match is not None
+        # "None", not 0.0: the archive coerces the sentinel to null rather than a fabricated
+        # zero volatility.
+        assert match.group("robust_vol") == "None"
+        assert match.group("long_vol") == "None"
 
 
 # ---------------------------------------------------------------------------
@@ -816,7 +855,7 @@ class TestFinancialDataProviderIntegration:
         with (
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
-            patch("metaculus_bot.research.financial_data.Fred") as mock_fred_class,
+            patch("metaculus_bot.research.fred_rendering.Fred") as mock_fred_class,
         ):
             mock_yf.Ticker.return_value = mock_ticker
             mock_fred_class.return_value = mock_fred_instance
@@ -999,8 +1038,12 @@ class TestExtractFinancialIdentifiers:
 # ---------------------------------------------------------------------------
 
 
-def _stub_fred_fetch(series_id: str, api_key: str) -> str:
-    """Recognizable FRED markdown so tests assert on routing, not the live API."""
+def _stub_fred_fetch(series_id: str, api_key: str, **_kwargs: object) -> str:
+    """Recognizable FRED markdown so tests assert on routing, not the live API.
+
+    ``**_kwargs`` absorbs the real fetcher's keyword-only flags (``is_resolving_source``),
+    which these routing tests do not exercise."""
+    del api_key
     return f"### {series_id} (Test Series)\n- Latest value: 4.48 (2026-06-27)"
 
 
@@ -1241,6 +1284,188 @@ class TestDeterministicRouting:
 
 
 # ---------------------------------------------------------------------------
+# Exchange-rate routing: hallucinated FRED ids, the Yahoo cross, and the disclosure
+# ---------------------------------------------------------------------------
+
+
+class TestExchangeRateRouting:
+    """q45363 published with no financial block at all on a currency question.
+
+    The classifier proposed the FRED series ``DEXBOUS``, which does not exist -- FRED carries no
+    Bolivia daily FX series -- and named no Yahoo cross beside it, so the forecasters got no level
+    and no realized volatility on an exchange-rate question. The verification pass measured what
+    that cost: a member sized off the resolving series' own 30-print volatility would have scored
+    +55.35 spot peer alone, better than every member that actually ran.
+
+    Three things have to hold. A nonexistent id is distinguishable from a live-but-empty series;
+    the Yahoo cross the prompt now asks for renders on its own when FRED has nothing; and a pair
+    NEITHER vendor serves leaves the section ABSENT while its loss shows up in the diagnostics
+    detail. The absence is deliberate and is the AskNews ``No articles were found`` rule: prose
+    standing in for a provider's absent output would flip the orchestrator's status from ``empty``
+    to ``ok`` and count in ``providers_succeeded``, so the count is where the signal lives.
+    """
+
+    FRED_400 = ValueError("The series does not exist.")
+
+    @staticmethod
+    def _fx_question(qid: int) -> MagicMock:
+        question = _make_q("What will be the Boliviano-USD exchange rate on August 31, 2026?")
+        question.id_of_question = qid
+        return question
+
+    @staticmethod
+    async def _run(question: MagicMock, classifier_response: str, yahoo: dict[str, str]) -> str:
+        """Run the provider with a canned classification, a stubbed Yahoo, and a dead FRED."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = classifier_response
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch(
+                "metaculus_bot.research.financial_data._fetch_yfinance_data",
+                side_effect=lambda ticker, **_: yahoo.get(ticker, ""),
+            ),
+            patch("metaculus_bot.research.fred_rendering.Fred") as mock_fred_class,
+        ):
+            mock_fred_class.return_value.get_series.side_effect = TestExchangeRateRouting.FRED_400
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setenv("FRED_API_KEY", "fake_key")
+            try:
+                return await financial_data_provider()(question)
+            finally:
+                monkeypatch.undo()
+
+    @pytest.mark.asyncio
+    async def test_a_hallucinated_fred_id_gets_its_own_token_and_the_yahoo_cross_still_renders(self) -> None:
+        """The realized q45363 shape, with the fix in place: FRED is dead, Yahoo carries the pair."""
+        question = self._fx_question(45363)
+
+        result = await self._run(
+            question,
+            "FINANCIAL: YES\nTICKERS: USDBOB=X\nFRED_SERIES: DEXBOUS",
+            {"USDBOB=X": "### USDBOB=X\n- Latest price: 11.62 (as of 2026-08-14)"},
+        )
+
+        assert "### USDBOB=X" in result
+        assert "Latest price: 11.62" in result
+        detail = pop_provider_detail(question.id_of_question, "financial_data")
+        # `unknown_series`, not `empty`: the id does not exist, which is a defect to chase rather
+        # than a live source with no observations in the window.
+        assert detail["sources"]["DEXBOUS"] == "unknown_series"
+        assert _is_lost_source(detail["sources"]["DEXBOUS"])
+        assert detail["sources"]["USDBOB=X"] == "ok"
+        # The count is a per-identifier vendor outcome, not a property of the section: the FRED id
+        # carried nothing even though the Yahoo cross rendered, so the partial gap is still visible.
+        assert detail["counts"]["fx_identifiers_empty"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_pair_neither_vendor_serves_leaves_the_section_absent(self) -> None:
+        """Both vendors tried, neither carried anything: no section, and the loss in the detail.
+
+        Nothing renders -- not even the routing marker, which only ever rides a body. What a
+        residual round reads instead is the two loss tokens plus the count of exchange-rate
+        identifiers among them.
+        """
+        question = self._fx_question(45364)
+
+        result = await self._run(question, "FINANCIAL: YES\nTICKERS: USDBOB=X\nFRED_SERIES: DEXBOUS", yahoo={})
+
+        assert result == ""
+        detail = pop_provider_detail(question.id_of_question, "financial_data")
+        assert detail["sources"] == {"USDBOB=X": "empty", "DEXBOUS": "unknown_series"}
+        assert detail["counts"]["fx_identifiers_empty"] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_fred_only_currency_question_is_absent_but_counted(self) -> None:
+        """The literal q45363 classification: one bogus FX series, no ticker at all."""
+        question = self._fx_question(45365)
+
+        result = await self._run(question, "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: DEXBOUS", yahoo={})
+
+        assert result == ""
+        detail = pop_provider_detail(question.id_of_question, "financial_data")
+        assert detail["sources"] == {"DEXBOUS": "unknown_series"}
+        assert detail["counts"]["fx_identifiers_empty"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_non_currency_question_with_nothing_to_render_counts_nothing(self) -> None:
+        """A stock and a macro series carrying nothing are not exchange rates, so the count stays 0.
+
+        The 0 is itself a reading: it says the check ran on this question and found no lost FX
+        identifier, which is what separates it from a record where the check never ran.
+        """
+        question = _make_q("Will Apple stock exceed $200 by end of 2026?")
+        question.id_of_question = 45366
+
+        result = await self._run(question, "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: NOTASERIES", yahoo={})
+
+        assert result == ""
+        detail = pop_provider_detail(question.id_of_question, "financial_data")
+        assert detail["counts"]["fx_identifiers_empty"] == 0
+        assert detail["sources"] == {"AAPL": "empty", "NOTASERIES": "unknown_series"}
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_fred_series_is_recorded_as_a_lost_source(self) -> None:
+        """Without ``FRED_API_KEY`` the series never becomes a job, and used to leave NO token —
+        so N requested series vanished from the source map and the line read as fully healthy."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: UNRATE"
+        question = _make_q("Will Apple stock rise and unemployment fall?")
+        question.id_of_question = 45367
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch(
+                "metaculus_bot.research.financial_data._fetch_yfinance_data",
+                side_effect=lambda ticker, **_: f"### {ticker}\n- Latest price: 190",
+            ),
+        ):
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.delenv("FRED_API_KEY", raising=False)
+            try:
+                result = await financial_data_provider()(question)
+            finally:
+                monkeypatch.undo()
+
+        assert "### AAPL" in result
+        sources = pop_provider_detail(question.id_of_question, "financial_data")["sources"]
+        assert sources["UNRATE"] == FRED_SKIPPED_NO_KEY_TOKEN
+        assert _is_lost_source(sources["UNRATE"])
+
+    @pytest.mark.asyncio
+    async def test_a_keyless_fred_only_fetch_set_still_records_the_skip(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No ``FRED_API_KEY`` and nothing but FRED series: zero jobs, and the skip is the record.
+
+        This is the arm the retired ``if not jobs: return ""`` short-circuited — it returned before
+        the per-identifier ``record_provider_detail`` call, so ``pop_provider_detail`` gave ``{}``
+        and the requested series vanished from the archive entirely. Every other no-key test
+        classifies a ticker, so a job always existed and none of them reached this path. Deliberately
+        not routed through ``_run``, which pins ``FRED_API_KEY`` to a fake value.
+        """
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: UNRATE"
+        question = _make_q("Will unemployment fall below 4% in 2026?")
+        question.id_of_question = 45368
+        monkeypatch.delenv("FRED_API_KEY", raising=False)
+
+        with patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm):
+            result = await financial_data_provider()(question)
+
+        assert result == ""
+        assert pop_provider_detail(question.id_of_question, "financial_data") == {
+            "sources": {"UNRATE": FRED_SKIPPED_NO_KEY_TOKEN},
+            "counts": {"fx_identifiers_empty": 0},
+        }
+
+    def test_the_prompt_routes_exchange_rates_to_a_yahoo_cross(self) -> None:
+        """The cause of q45363 was a reference table with no FX coverage at all, so the classifier
+        had nothing to route to and invented an id. The routing rule is the fix at that cause."""
+        assert "USD<ISO>=X" in CLASSIFIER_PROMPT
+        assert "<ISO>USD=X" in CLASSIFIER_PROMPT
+        assert "NEVER invent a FRED series ID" in CLASSIFIER_PROMPT
+
+
+# ---------------------------------------------------------------------------
 # Allowlist / prompt single-source-of-truth consistency
 # ---------------------------------------------------------------------------
 
@@ -1402,7 +1627,7 @@ class TestBenchmarkingDateCeiling:
             captured["ceiling"] = ceiling
             return mock_series
 
-        with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=fake_fetch_series):
+        with patch("metaculus_bot.research.fred_rendering.fetch_series", side_effect=fake_fetch_series):
             result = _fetch_fred_data_ceiling("CPIAUCSL", _BENCH_OPEN_TIME)
 
         assert captured["ceiling"] == date(2026, 3, 15)  # open_time.date()
@@ -1425,7 +1650,7 @@ class TestBenchmarkingDateCeiling:
             captured["spec"] = spec
             return mock_series
 
-        with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=fake_fetch_series):
+        with patch("metaculus_bot.research.fred_rendering.fetch_series", side_effect=fake_fetch_series):
             result = _fetch_fred_data_ceiling("DGS10", _BENCH_OPEN_TIME)
 
         assert captured["spec"].revises is False
@@ -1433,7 +1658,7 @@ class TestBenchmarkingDateCeiling:
 
     def test_fred_ceiling_fetch_soft_fails_on_fetch_error(self) -> None:
         """A ts_fetch FetchError soft-fails to "" (never propagates)."""
-        with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=FetchError("bad id")):
+        with patch("metaculus_bot.research.fred_rendering.fetch_series", side_effect=FetchError("bad id")):
             result = _fetch_fred_data_ceiling("BOGUS", _BENCH_OPEN_TIME)
 
         assert result == ""
@@ -1462,7 +1687,7 @@ class TestBenchmarkingDateCeiling:
         with (
             patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
             patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
-            patch("metaculus_bot.research.financial_data.fetch_series", side_effect=fake_fetch_series) as mock_fetch,
+            patch("metaculus_bot.research.fred_rendering.fetch_series", side_effect=fake_fetch_series) as mock_fetch,
         ):
             mock_yf.Ticker.return_value = mock_ticker
 
@@ -1570,6 +1795,42 @@ class TestBenchmarkingDateCeiling:
         sources = pop_provider_detail(4242, "financial_data")["sources"]
         assert _is_lost_source(sources["classifier"]), f"a dead classifier must read as a LOST source; got {sources}"
         assert "RuntimeError" in sources["classifier"]
+
+    @pytest.mark.asyncio
+    async def test_dead_classifier_token_survives_beside_a_fetched_identifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The classifier loss has to reach the FINAL record too, not only the pre-return one.
+
+        ``record_provider_detail`` assigns the whole dict, so the per-identifier record written
+        after the fetches used to overwrite the classifier token wholesale. A dead classifier on a
+        question whose resolving FRED series was still recovered from its own resolution URL then
+        archived ``{"sources": {"CPIAUCSL": "ok"}}`` — a diagnostics line byte-identical to a fully
+        healthy run, leaving the outage's only trace an unstructured run-log WARN that dies with
+        the 90-day GHA artifact.
+        """
+        mock_llm = AsyncMock()
+        mock_llm.invoke.side_effect = RuntimeError("classifier model retired")
+        question = _make_q(
+            "A question the classifier never got to read.",
+            resolution_criteria="Resolves to https://fred.stlouisfed.org/series/CPIAUCSL on the close date.",
+        )
+        question.id_of_question = 4243
+        monkeypatch.setenv("FRED_API_KEY", "fake_key")
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
+        ):
+            result = await financial_data_provider()(question)
+
+        assert "### CPIAUCSL" in result, "the URL-extracted resolving series still fetches"
+        detail = pop_provider_detail(4243, "financial_data")
+        assert detail["sources"]["CPIAUCSL"] == "ok"
+        assert _is_lost_source(detail["sources"]["classifier"])
+        assert "RuntimeError" in detail["sources"]["classifier"]
+        # The token is not an identifier, so it must not read as a lost exchange rate.
+        assert detail["counts"]["fx_identifiers_empty"] == 0
 
     @pytest.mark.asyncio
     async def test_provider_default_is_live(self) -> None:

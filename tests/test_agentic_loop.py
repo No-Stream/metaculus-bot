@@ -174,6 +174,56 @@ async def test_duplicate_tool_calls_counted_and_warned(caplog: pytest.LogCapture
 
 
 @pytest.mark.asyncio
+async def test_throttled_fetch_retry_is_not_flagged_a_duplicate() -> None:
+    """A throttled fetch's identical retry must not carry the duplicate note.
+
+    The throttle message asks the driver to call fetch on the same URL again
+    later in the run, and the outcome is deliberately not cached, so the retry
+    really does re-request the page. Telling it "its result will not have
+    changed" would steer it off the URL this handling exists to recover.
+    """
+
+    async def fetch(**_: Any) -> ToolOutcome:
+        return ToolOutcome(
+            content_markdown="Rate limited: https://ogimet.com returned HTTP 200, but its body is a short "
+            'interstitial carrying the throttle phrase "wait 20 seconds".',
+            method="throttled",
+            status="throttled",
+        )
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_plan_call()]),
+            _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://ogimet.com/q"})]),
+            _response(tool_calls=[_tool_call("f2", "fetch", {"url": "https://ogimet.com/q"})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("fetch", fetch)],
+        # The W2 conclude gate is beside the point here and a throttled fetch
+        # reaches no primary source, so keep it out of the way rather than
+        # scripting an extra turn.
+        _config(max_conclude_gate_rejections=0),
+        llm_call=fake_llm,
+    )
+
+    # tool_messages[0] is the set_research_plan result; the two fetches follow.
+    tool_messages = _tool_messages(result)
+    first, second = tool_messages[1], tool_messages[2]
+    assert "already made earlier in this run" not in first["content"]
+    assert "already made earlier in this run" not in second["content"]
+    assert "Rate limited" in second["content"]
+    assert result.telemetry.dup_tool_calls == 0
+    # The retry is still a real call against the budget — eviction is advisory
+    # bookkeeping only, so max_tool_calls keeps capping a throttle spin.
+    assert result.telemetry.per_tool_counts["fetch"] == 2
+
+
+@pytest.mark.asyncio
 async def test_rendered_fetch_outcomes_counted_in_telemetry() -> None:
     async def fetch(**_: Any) -> ToolOutcome:
         return ToolOutcome(content_markdown="rendered body", method="rendered")
@@ -996,7 +1046,10 @@ class TestHarvestVerificationTiers:
     def test_fetched_class_methods_tier_argument_urls_fetched(self) -> None:
         from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
 
-        for method in ("document", "rendered", "plain", "cache"):
+        # pdf_local and digest_local belong in this class because both mean we decoded the bytes
+        # the host served (pypdf text, then a deterministic passage selection), which is a
+        # stronger claim than "document" — a model's reading of a URL we never saw ourselves.
+        for method in ("document", "rendered", "plain", "cache", "pdf_local", "digest_local"):
             tiers = _harvest_verification_tiers(
                 "fetch",
                 {"url": "https://x.example/a"},

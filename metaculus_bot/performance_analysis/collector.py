@@ -8,8 +8,10 @@ import json
 import logging
 import os
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -25,6 +27,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_stacked_marker,
     parse_stacker_skip_reason_marker,
 )
+from metaculus_bot.performance_analysis.rescore_diff import RESCORE_ATOL, diff_platform_rescores
 from metaculus_bot.performance_analysis.research_tags import DEFAULT_RESEARCH_ARCHIVE_LATEST, attach_research_tags
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score, mc_log_score, numeric_log_score
@@ -237,13 +240,19 @@ def _comment_signals(comment: dict | None, post_id: int) -> _CommentSignals:
     )
 
 
-def _questions_on_post(post_data: dict) -> list[dict]:
-    """The post's question dicts — a group's members, or its single question."""
+def questions_on_post(post_data: Mapping[str, Any]) -> list[dict]:
+    """The post's question dicts — a group's members, or its single question.
+
+    Empty for a post carrying neither (tournaments hold notebook posts too). Public
+    because every consumer of the Metaculus posts list needs this same unwrapping and
+    `scripts/supply_probe.py` had grown its own copy; one shared reading keeps a probe's
+    question counts comparable with the scoring pull's.
+    """
     group = post_data.get("group_of_questions")
     if group is not None:
-        return group.get("questions", [])
-    q = post_data.get("question")
-    return [q] if q is not None else []
+        return list(group.get("questions") or [])
+    question = post_data.get("question")
+    return [question] if isinstance(question, dict) else []
 
 
 def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict]:
@@ -256,7 +265,7 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
         logger.info(f"  Skipping PRACTICE post {post_id}: {title_preview}")
         return []
 
-    questions = _questions_on_post(post_data)
+    questions = questions_on_post(post_data)
     if not questions:
         logger.warning(f"  Post {post_id} has no question data")
         return []
@@ -438,10 +447,14 @@ def _process_single_question(
         # actual_resolve_time stamp on the question.
         "bot_comment_created_at": comment_created_at,
         # Metaculus-computed scores from my_forecasts.score_data. Contains
-        # peer_score (ascending: negative = worse than crowd), spot_peer_score,
-        # baseline_score, spot_baseline_score, coverage, weighted_coverage,
+        # spot_peer_score, peer_score (both ascending: negative = worse than crowd),
+        # spot_baseline_score, baseline_score, coverage, weighted_coverage,
         # relative_legacy_score. None for records fetched before score data
         # was captured; always populated on fresh pulls of resolved questions.
+        # READ SPOT_PEER, NOT PEER: the tournament leaderboard ranks on spot peer, and
+        # peer is the same quantity scaled by coverage. Accessors that encode that
+        # preference live in performance_analysis/platform_scores.py — use them rather
+        # than indexing this dict, so the convention can't drift per consumer.
         "metaculus_scores": metaculus_scores,
         "metadata": {
             # The Metaculus CROWD size, which lives on the POST, not on the question
@@ -460,6 +473,13 @@ def _process_single_question(
             "open_time": q.get("open_time"),
             "actual_resolve_time": q.get("actual_resolve_time"),
             "scheduled_resolve_time": q.get("scheduled_resolve_time"),
+            # Stored so a re-resolution has SOMETHING timestamp-shaped on the record, but
+            # never as the detector: Metaculus edited q44798 from 80 to 82 with this field
+            # left at 2026-08-31T21:38:45Z, a stamp that PRECEDES the pull which still read
+            # 80. Diff the resolution VALUE instead (performance_analysis/rescore_diff.py);
+            # this field is only useful once you already know an edit happened, for bounding
+            # when the original resolution was set.
+            "resolution_set_time": q.get("resolution_set_time"),
             "category": category,
         },
         "brier_score": None,
@@ -567,6 +587,8 @@ def build_performance_dataset(
     token: str | None = None,
     author_id: int = DEFAULT_BOT_USER_ID,
     research_archive_dir: str | Path = DEFAULT_RESEARCH_ARCHIVE_LATEST,
+    *,
+    prior_records: Sequence[dict] | None = None,
 ) -> list[dict]:
     """Fetch questions + comments, match them, parse per-model predictions, compute scores.
 
@@ -581,6 +603,13 @@ def build_performance_dataset(
     ``gfv2_loop_ran`` is additionally None on any record whose writer could not have
     carried the v2 payload, so the untreated arm of a v2 cut holds only measured
     Falses (see :mod:`metaculus_bot.performance_analysis.research_tags`).
+
+    Pass ``prior_records`` (a previous round's dataset) to diff this pull against it and tag
+    every question Metaculus re-resolved or re-scored in place — the q44798 failure mode,
+    where a resolution changed from 80 to 82 with no timestamp moving and a prior round's
+    tables went stale silently. See
+    :mod:`metaculus_bot.performance_analysis.rescore_diff`; with no prior supplied the tag
+    fields are None, meaning "not compared" rather than "unchanged".
     """
     if token is None:
         token = os.environ["METACULUS_TOKEN"]
@@ -600,6 +629,9 @@ def build_performance_dataset(
         records.extend(post_records)
 
     attach_research_tags(records, research_archive_dir)
+    if prior_records is not None:
+        diff = diff_platform_rescores(prior_records, records)
+        logger.info(f"Diffed against prior dataset: {diff.rescored} record(s) re-resolved or re-scored")
 
     logger.info(f"Collected {len(records)} question records")
     return records
@@ -638,11 +670,6 @@ def _rescorable(record: object) -> bool:
     return q_type not in ("numeric", "discrete") or all(k in record for k in ("open_lower_bound", "open_upper_bound"))
 
 
-# Recomputation float wiggle vs a genuinely different stored value. The scorer
-# reproduces the platform to ~1e-14; the known-stale gaps start at 0.6.
-_RESCORE_ATOL = 1e-6
-
-
 def rescore_records(records: list[dict]) -> int:
     """Recompute every record's score fields from its own stored inputs, in place.
 
@@ -669,7 +696,7 @@ def rescore_records(records: list[dict]) -> int:
         for field in _SCORE_FIELDS:
             new = fresh[field]
             old = record.get(field)
-            if new is not None and (old is None or abs(new - old) > _RESCORE_ATOL):
+            if new is not None and (old is None or abs(new - old) > RESCORE_ATOL):
                 record[field] = new
                 record_changed = True
         changed += record_changed

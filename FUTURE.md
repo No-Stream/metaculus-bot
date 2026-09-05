@@ -51,28 +51,79 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 > entry, and answered/shipped items moved to "Resolved / shipped" near the bottom rather than being
 > deleted. Note that the round's two largest *measured* levers sit in Near-term, not here: the
 > deterministic numeric tail-consistency check (+11.93 baseline pts on the q44453 cohort) and the
-> gap-fill v2 office-holder precedent rule (~+31 spot-peer pts on q44210).
+> gap-fill v2 office-holder precedent rule (~+31 spot-peer pts on q44210). The fall-2026 season
+> entry added 2026-09-03 below is an operator ACTION rather than an improvement lever, so it is
+> outside that count.
+
+### Fall 2026 season: the cup is configured, the bot tournament has no successor yet (added 2026-09-03, **operator action**)
+
+Metaculus granted $1,500 of API credits on 2026-09-03 for the bot to compete in both the fall
+Metaculus Cup and the fall bot tournament. The cup side is done in the repo: `METACULUS_CUP_ID` holds
+`metaculus-cup-fall-2026` (project 33108, forecasting through 2027-01-01, API-verified), the cup
+workflow is at full env parity with the tournament workflow and runs hourly at :13/:33/:53,
+`FALL_CUP_CONFIGURED` is True so the dated reminder is discharged, and research records are labelled
+by run mode so cup runs no longer archive under the bot tournament's slug. **Two things are still
+open, both the operator's.**
+
+1. **Enable `run_bot_on_metaculus_cup.yaml` on GitHub.** It is `disabled_manually` there, which no
+   merge can change, so the crons fire nothing until it is switched on. There is no repo-side
+   warning for this state; the way to notice is a supply-probe row showing cup questions with no bot
+   forecasts.
+2. **No successor to `summer-futureeval-2026` was published as of 2026-09-03** (id space above the
+   summer tournament empty, four plausible slugs 404, forecasting-tools still pointing
+   `CURRENT_AI_COMPETITION_ID` at summer), so `TOURNAMENT_ID` deliberately stays on the summer season
+   rather than being guessed. **From 2026-09-20** (`TOURNAMENT_END_DATE` plus
+   `TOURNAMENT_HARD_STOP_WEEKS`) `check_tournament_dates` raises, which reddens `--mode tournament`
+   runs and the CI freshness test in `tests/test_tournament_dates.py`. That is the intended reminder,
+   it does not touch the cup (cup mode never calls the check), and the fix when a fall bot tournament
+   appears is to point the constants at it. `make supply_probe` is the free watch: it takes its
+   default slugs from these constants and a dead slug renders as one error row without stopping the
+   other rows. Details and receipts: `docs/operations.md` "Fall 2026 season".
 
 ### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH — operator-confirmed 2026-08-25**)
 
-**Scope, per the operator: the checkpoint is the FULL triple-era read, not numerics alone.** Four
+**Scope, per the operator: the checkpoint is the FULL triple-era read, not numerics alone.** Five
 reads come due at the same checkpoint and share one cohort, so they run together (the fourth added
 by the 2026-08-25 priority audit, when the ghost-scoring entry was demoted to Low and its re-read
-folded in here):
+folded in here; the fifth on 2026-09-02, for the two prompt rules the next-season bundle adds).
+Read number 2 has since been answered ahead of the checkpoint and is kept below with its receipts,
+so four remain live:
 
 1. **The numeric ensemble delta** — the accepted +3.24 lean toward the retired 6-member roster,
    which is what this entry was originally opened for (detail and decision rule below).
-2. **The all-types peer gap.** The era's first scores came in mildly below the older eras: STRICT
-   triple mean peer **+4.28 (n=12)** against post_flip's +11.6 (n=104), and the first
-   within-tournament cut (summer-futureeval spans both eras, so the question generator is held
-   fixed) puts the gap at **−4.69 peer points after type-mix adjustment** (raw −7.3;
-   Mann-Whitney p=0.084 unmatched, 0.030 lag-matched — and the comparison arm is not
-   cluster-collapsed, so every p is generous). Effective independent n is **10 clusters, 8
-   conservative**, and the resolved 14 are by construction the era's short-horizon tail (median
-   submit-to-resolve 18.0 days vs 27.7 post-flip). So this is a flag to re-read on the full
-   cohort, not a finding: at the checkpoint the same cut should run on ~35 resolved records
-   instead of 12, and the question is whether the gap persists, shrinks, or was a
-   short-horizon-tail artifact. (`scratch/residual_2026-08-24/SYNTHESIS.md` §1.)
+2. **The all-types peer gap: RETIRED on 2026-08-31, re-confirmed retired on 2026-09-01. Stop
+   citing the gap.** What the flag said when it was raised on 2026-08-24: the triple era's first
+   scores came in mildly below the older eras, STRICT triple mean peer +4.28 (n=12) against
+   post_flip's +11.6 (n=104), and the within-tournament cut (summer-futureeval spans both eras, so
+   the question generator is held fixed) put the gap at −4.69 peer points after type-mix
+   adjustment (raw −7.3; Mann-Whitney p=0.084 unmatched, 0.030 lag-matched), on 10 effective
+   clusters and a resolved set that was by construction the era's short-horizon tail. It was
+   raised as a flag to re-read on a bigger cohort rather than as a finding, and two rounds have
+   now re-read it.
+
+   The 2026-08-31 round retired it at n=20. The STRICT triple cohort read spot peer +13.8 with
+   coverage-scaled peer +12.07, right at the post_flip level, and the within-tournament era cut
+   measured +1.26 peer after type-mix adjustment, cluster bootstrap 95% interval [−6.78,
+   +9.55], Mann-Whitney p between 0.44 and 0.95 under every collapse convention. The 2026-09-01
+   round confirmed that at n=30 (28 effective clusters, 25 conservative): STRICT triple spot peer
+   +17.46 against post_flip's summer-clean +14.33, a type-mix-adjusted gap of +3.66 spot with a
+   cluster bootstrap interval of [−6.67, +13.90], and +5.79 on the coverage-scaled field the
+   earlier round used, which sits inside that round's own reopen interval. The correct statement
+   is "no measurable era difference".
+
+   Two honesty notes travel with the retirement. Retired is not inverted: both rounds warn
+   explicitly that reading these numbers as "the triple is better" would be the same small-sample
+   error with the sign flipped, and the 2026-09-01 gap drifted positive mostly because the
+   comparison arm fell, since the 19 new post_flip records are that era's long-horizon "before
+   September" tail and scored +3.01 against +16.11 for the post_flip records already in hand. And
+   the −70.1 single-record reading that prompted the second look was the dry-key incident
+   scoring itself (q44874, coverage-scaled peer −70.1, published on one surviving forecaster),
+   not the live bot; it sits in `DEGRADED_RUN_QIDS` and is excluded from every figure above.
+   (Flag as raised: `scratch/residual_2026-08-24/SYNTHESIS.md` §1. Retirement:
+   `scratch/residual_2026-08-31/SYNTHESIS.md` §1 and
+   `scratch/residual_2026-08-31/dim_category-tournament.md`. Confirmation:
+   `scratch/residual_2026-09-01/SYNTHESIS.md` §1 and
+   `scratch/residual_2026-09-01/dim_category-tournament.md`.)
 3. **The anchored/unanchored and v2-treated/untreated splits**, which are newly cheap to run:
    `performance_analysis/research_tags.py` (shipped 2026-08-24, `dece67f`) now stamps
    `anchor_present` / `anchor_confidence` / `gfv2_present` / `gfv2_loop_ran` /
@@ -85,6 +136,24 @@ folded in here):
    n=12 and joins the same resolutions this cohort waits on, so it rides along rather than being
    scheduled separately; the composition guardrail (most scored ghosts are byte-identical to the
    driver's PRE-research dry run) is in the demoted entry under Low-priority.
+5. **The effect of the two Phase 1 prompt rules the next-season bundle adds**, `_SOFT_CLOCK_RULE`
+   and `_HISTORY_DISCHARGED_RULE` in `metaculus_bot/prompts.py` (Items A and C of
+   `scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md`; live from the
+   bundle merge). **Item C is not an approved rule.** The plan reserves it for the operator in
+   three places and recommends shipping; it shipped on that recommendation with the operator's
+   final say still pending, so a reader landing here should not take it as settled. If the
+   operator declines it, this watch item narrows to `_SOFT_CLOCK_RULE` alone and the
+   history-repeats comparison below has nothing to measure. AGENTS.md carries the revert recipe. Nothing about either can be measured offline, so the first read is the residual
+   round after the fall cup's first resolutions: re-code the live-triple rationales with the
+   audit's lens definitions (the lens list at the top of
+   `scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md`; tables in `STATS.md`) and compare
+   the announced-unscheduled shape's incidence and spot peer against the whole-archive baseline of
+   6.4% of records and minus 18.7 spot (95% CI 5.9 to 33.4 worse), and the history-repeats
+   rationale rate against 12.1%. Two cautions carry over from the audit. The shape fired on 0 of
+   the 30 resolved live-triple records, so there is no pre-bundle live-era rate to compare against
+   and the whole-archive figures are the baseline. And the history-repeats label had coder
+   agreement 0.59 and was partly hindsight-contaminated, so 12.1% is an upper bound and a
+   post-bundle rate should be read as one too, not as a point estimate.
 
 Status: shipped-and-watch. The drop to the latest-per-vendor triple (`gpt-5.6-sol` /
 `claude-opus-4.8` / `gemini-3.1-pro-preview`) shipped accepting a fragile numeric lean toward the
@@ -129,23 +198,57 @@ questions.
    the resolution lag. Run all four header items in ONE pass, since they read the same records
    and re-pulling is free: the triple-era numeric peer / log score and PIT against the post_flip
    cell (the "did the accepted lean show up as a visible loss" sanity check), the all-types
-   within-tournament peer gap on the full resolved cohort, the anchored/unanchored +
+   within-tournament peer gap on the full resolved cohort (a re-confirmation only now, since
+   header item 2 was retired at n=20 and again at n=30), the anchored/unanchored +
    v2-treated/untreated splits off the `research_tags.py` fields, and the ghost re-score. Each is
    descriptive at n≈35 with
    ~10 independent clusters — below the between-era floor above — so no fitted correction ships
    off them (AGENTS.md: fitted calibration layers need a decisive out-of-sample era test).
    (`scratch/residual_2026-08-24/dim_numeric-width.md` §2.)
+
+   **Update 2026-09-01: the resolution-lag projection above missed again, for the fourth round in
+   a row.** Of the 26 numeric-family questions sitting at post status `closed` on 2026-08-31,
+   exactly 3 resolved into the 2026-09-01 wave (45215 discrete, 45362 and 45363 numeric) and 23
+   remain unresolved, among them both pending degraded records (44875, 44876), all three pending
+   TS-anchored questions (44803, 44943, 45172), the post-fix replay 45241 and the TS-routing
+   target 45401. STRICT triple numeric-family n therefore went 10 to 13, not the 15 to 25 the
+   projection expected, so expect the 2026-09-12 checkpoint to read well short of n≈35, and treat
+   any date on this cohort as Metaculus's to set rather than ours to forecast.
+   (`scratch/residual_2026-09-01/FOLLOWUP_LEDGER.md`, the three framing facts at the top.)
 3. **Decision rule:** reintroduce the dropped numeric members ONLY if the frozen-era numeric
    delta *still* leans full with **P(loss>1pt/Q) ≥ 0.7 AND** the point estimate survives the
    top-2-question jackknife. Otherwise keep the uniform triple permanently — a per-qtype roster
    split is the config spaghetti the operator would rather avoid, and it only earns its cost
    under that condition.
 
-**Cost context for the re-add decision.** The drop cut per-question reasoning spend from
-~$3.05 to ~$1.65 (three fewer xhigh forecasters), and removing grok also ends routine
-personal-key forecaster spend. Weigh that saving against the numeric lean when deciding whether
-to reintroduce members — a re-add must clear both the score bar above *and* justify the cost it
-brings back.
+**Cost context for the re-add decision.** The MEASURED per-question OpenRouter spend in the
+triple era is **$0.38–0.41/question** — an OpenRouter-only lower bound; excludes Google AI Studio
+prepaid (Gemini grounded search, gap-fill v2 document reads), the AskNews subscription, and Exa;
+measured over 29 triple-era runs / 33 questions ($0.4082/question; $0.3836 in the ranked-markets
+window). Receipt: `scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md` §3, "Cost, and a
+standing figure that should stop being quoted". The earlier estimate that the 6→3 drop cut
+per-question reasoning spend from ~$3.05 to ~$1.65 (three fewer xhigh forecasters) was never
+measured and is an order of magnitude too high; it is superseded and must not appear in a re-add
+decision. Removing grok did also end routine personal-key forecaster spend. A 4th reasoning
+forecaster is plausibly +$0.10–0.15/question, but the measured total cannot yet be split into
+forecaster versus research versus ranker, so that increment is an assertion until the per-role
+ledger accumulates a season of runs: `CREDIT_ROLE_SPEND` (`metaculus_bot/credit_telemetry.py`,
+"Per-role dollar attribution", shipped in the 2026-09 bundle) books every OpenRouter completion
+under its role (`forecaster:<vendor>`, `native_search`, `gap_fill_resolver`, `parser`, ...), and
+`scripts/reconcile_credit_spend.py --roles` tabulates it against settled per-run spend. Price a
+re-add off those rows, not off this paragraph. A re-add must clear both the score bar above *and*
+justify the cost it brings back.
+
+**Coverage caveat on those role rows (added 2026-09-01, forge F1/R18; registered 2026-09-04).** The
+same bundle bounded litellm's end-of-run callback drain at `LITELLM_CALLBACK_DRAIN_TIMEOUT_S` (10 s)
+so telemetry can never hold a finished run hostage, and a drain that times out logs a
+`LITELLM_CALLBACK_DRAIN_TIMEOUT` WARN saying in as many words that the `CREDIT_ROLE_SPEND` ledger
+under-counts that run's last completions. That WARN is now a harvested MarkerSpec,
+`litellm_callback_drain_timeout`: at most one row per run, carrying the `timeout_s` bound the run
+used. A row means that run's role ledger is a lower bound and its
+`reconcile_credit_spend.py --roles` coverage ratio should read low for a benign reason; a run with
+no row covers every completion, so a low ratio there is a genuine gap in OpenRouter's per-call cost
+data. The line has never fired, so a first record is itself the finding.
 
 **Discrete-calibration note (2026-08-24).** The post-fix (`9f1175c`) discrete cohort has ZERO
 max-step-bug exposure by composition: all four resolved triple-era discretes are fine-grid
@@ -201,6 +304,15 @@ Rigorous era-bucketed Bayesian calibration audit (2026-07-16; scripts
 budget. Prefer SOTA forecasters over fitted calibration.** Do NOT ship isotonic / Platt /
 directional-shrink layers (see the killed-calibration entries; the Beta-Bernoulli "calibrator"
 from arXiv 2605.27668 degrades OOD in its own tables — cite it as anti-adoption evidence).
+
+**If Platt is ever enabled, one published binary path would bypass it.** `_base_combine`
+(`aggregation_pipeline.py`) returns from its `len(predictions) == 1` branch above the
+`_apply_platt_calibration` tail, so a lone raw binary survivor is the one published binary value that
+never reaches Platt. `_simple_aggregate` is its mirror: it calibrates a single prediction but applies
+no single-survivor publish floor. Inert while `PLATT_CALIBRATION_ENABLED` is unset in every workflow,
+which is the standing state and the reason this is recorded rather than fixed. Whoever turns the flag
+on decides whether the k=1 floor and Platt compose, and in which order; the branch comment carries
+the same note.
 
 **DO promote the audit to a standing monitoring module (free, zero scar risk).** Complementary to
 `performance_analysis/analysis.py` (point-estimate buckets, a single `bias_pp` scalar, PIT
@@ -677,6 +789,22 @@ how that gets measured instead of re-run offline.
 density, which on a 24/7 series drew a 62-step band under a 90-day label. Detail in the resolved
 entry "financial_data / ts-anchor: calendar time converted on a hardcoded trading-day density".
 
+**`ts_render._fmt` swept 2026-09-01, same branch (added 2026-09-01, SHIPPED).** The bundle replaced
+`:.4g` at the five FRED render sites (a Case-Shiller print of 331.893 was rendering as "331.9" on a
+question whose displayed range was four index points wide) but left the anchor section's own
+formatter rendering anything between 100 and 10,000 at ONE decimal, and dropping decimals entirely
+above that — so one bundle stated two different values for one observation in two adjacent sections
+(both providers append unconditionally, and q44944's archived record carries both). `_fmt` is now
+fixed-point up to three decimals above 100 with trailing zeros stripped, `:.4g` below.
+
+The taste call this entry flagged went the OTHER way than the entry proposed. The entry argued for a
+separate level formatter at the "latest value" and history-table sites only, leaving P10/P50/P90
+BAND estimates at one decimal as honest about an estimate's precision. The global three-decimal cap
+shipped instead, because the band quantiles are exactly what a forecaster sizes an interval from and
+one decimal costs up to 0.05 index points there, roughly 1-2 buckets on these questions. Three
+rather than `research/number_format.py`'s `format_decimal_value` six keeps six-decimal fabricated precision off
+an estimate.
+
 ### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-21 (added 2026-07-16)
 
 **FLAG STATUS: `GAP_FILL_V2_ENABLED: 'true'` in all four yamls** — flipped ON in the branch 2026-07-17
@@ -773,16 +901,34 @@ in writing — so the binding constraint had moved to RENDERING. Status of the f
    P(>70% of the vote) = 0.58 verbatim. Replayed over the 42 archived ranked-era snapshots:
    individually-named outcomes 792 → 1,572 of 1,839, families naming under 0.95 of their own summed
    open price 60 → 6, fabricated prices rendered 59 → 0.
-2. ~~**One relation-vs-liquidity precedence sentence in the prompt**~~ — **SHIPPED** in `4e342da`
-   (`_MARKET_RELATION_WEIGHTING_SENTENCE`, `prompts.py`): when the relation and liquidity labels
+2. ~~**One relation-vs-liquidity precedence sentence in the prompt**~~ — **SHIPPED** in `4e342da`,
+   and now rule 2 of `_MARKET_READING_RULES` (`prompts.py`): when the relation and liquidity labels
    disagree the liquidity warning governs the price, so an other-cut extrapolation from a thin
    strike widens rather than shifts. q45189's anchor strike had $1,377 of volume, all three
-   forecasters called it thin, and all three resolved the conflict in favour of relation.
-3. **Staleness guard on tier grading — STILL OPEN.** A market whose `close_time` precedes the
-   question's `open_time` cannot be `same_quantity_same_date`, and an `other_cut` grade on one must
-   name the period gap in its `why`. Would have caught 3 of the 5 over-graded top-tier rank-0 rows
-   (all Manifold; the worst a 2023-resolved market graded "near-identical"). The ranker prompt does
-   render each candidate's close date, but nothing deterministic enforces the implication.
+   forecasters called it thin, and all three resolved the conflict in favour of relation. The
+   constant it shipped as, `_MARKET_RELATION_WEIGHTING_SENTENCE`, was cut on 2026-09-02 to its
+   three policy clauses because the other 1,908 chars re-taught the notation the rendered table's
+   own legend already defines (audit `scratch/prompt_bloat_audit_2026-09-02.md`, item R1).
+3. **Staleness guard on tier grading — SHIPPED NARROW 2026-09-01, one operator decision left.**
+   `ranking.cap_stale_top_tier` now demotes a row graded `same_quantity_same_date` exactly one rung
+   when its close precedes the question's `open_time` by more than `MARKET_STALENESS_TIER_CAP_DAYS`
+   (60), recording the ranker's own grade in `MarketMatch.tier_cap_note`; the render also appends
+   `(Nd ago)` to any already-passed close cell, the ranker prompt gained a `closes` recency
+   tiebreaker, and the legend now says `close` is the trading close and not the settlement date.
+   **The open decision is whether to widen the cap.** The q45163 dossier's own recommendation was
+   stronger than what shipped — a stale market "cannot be `same_quantity_same_date` OR
+   `same_quantity_other_cut`" — and widening it matters because 45163's offending row was graded
+   tier 2, so the shipped pass would not have touched it (the `(Nd ago)` disclosure and the prompt
+   bullet are what cover that case today). The reason it was not widened unilaterally: tier 3
+   (`driver_or_consequence`) is described to the forecaster as context rather than an anchor, so the
+   demotion would change how the prompt weights the row, and a resolved market on an adjacent cut is
+   legitimately informative (it says what actually happened). It is a two-line change in
+   `_tier_cap_note` if wanted. **Watch item either way:** the cap fires on nothing in the 102
+   archived snapshots (only 9 rows are graded tier 1 at all, none stale), so the first
+   `MARKET_TIER_CAPPED` line in a prod run log — harvested as `market_tier_capped` — IS the finding:
+   it means the ranker called a long-closed market same-quantity-same-date. Read the archive for it
+   after a few weeks of fall-cup runs; a continued zero is also an answer (the ranker does not make
+   that mistake at tier 1) and would argue for the wider rule rather than against it.
 4. ~~**Render an explicit zero-rows line**~~ — **SHIPPED** in `4e342da`: a deliberate zero-row
    ranking over a non-empty candidate pool now renders one sentence naming it as a considered empty
    result. Before that, q45200's ranker validly returned zero rows over a healthy 381-candidate pool
@@ -791,9 +937,11 @@ in writing — so the binding constraint had moved to RENDERING. Status of the f
    still renders nothing, which is what keeps the two readings distinguishable.
 
 Also still worth one upstream check: the Kalshi `close` column is not a settle date (median +114
-days vs the question's own resolve time; 14/78 rows at +300d or more). Re-read the informativeness
-question at ~41 ranked-era resolutions (late September / early October), not ~09-01 (which buys only
-~7).
+days vs the question's own resolve time; 14/78 rows at +300d or more). The forecaster-facing half of
+that is now disclosed — the legend sentence added 2026-09-01 says outright that `close` is the
+venue's trading close and not its settlement date — so what is left here is the upstream question of
+whether to render a settle date at all. Re-read the informativeness question at ~41 ranked-era
+resolutions (late September / early October), not ~09-01 (which buys only ~7).
 
 5. **Retune `KALSHI_NO_PRICE_SPREAD` from prod telemetry (added 2026-08-25, owner: the next
    residual round).** The 0.40 book-width threshold that blanks a Kalshi midpoint as
@@ -805,12 +953,31 @@ question at ~41 ranked-era resolutions (late September / early October), not ~09
    near-zero on liquid families and nonzero exactly on empty books means the threshold is
    right; a material rate on books that later traded near their midpoint means it is blanking
    real prices and should come down.
+6. **LOW — the shared Manifold test payload is unfaithful (added 2026-09-01).** It carries no
+   `outcomeType` key, so every pipeline test using it logs a venue-parser warning ("Manifold None
+   market carries a market-level probability but no readable value"); live Manifold always ships that
+   field. Adding `outcomeType: BINARY` would give that row a price where several tests currently
+   expect none, so the fixture and those expectations have to move together — which is why it was
+   left alone during a parallel fan-out that had other agents in the same file.
+7. **LOW — the narrowed market-odds research bullet claims a snapshot that can be missing (added
+   2026-09-01, forge R24).** `_OUTSIDE_VENUE_MARKET_ODDS_BULLET` (`prompts.py`, shipped by the
+   bundle's item 5) tells the search providers not to report Polymarket/Kalshi/Manifold/PredictIt
+   prices because "a dedicated live snapshot of those venues is provided separately", which is true
+   whenever the prediction-market provider works and false on any question where it fails — now the
+   only way that snapshot goes missing, since the flag is on in every prod workflow. Left alone
+   because gating the sentence on the flag cures only the never-happens disabled case, and the
+   item's own receipt (`scratch/residual_2026-08-31/market_odds_coverage.md`) measured
+   search-indexed covered-venue prices as net harmful in the ranked era (one content-redundant
+   retrieval against three stale prices that contradicted correct live snapshot rows), so
+   re-inviting them on a provider failure is not obviously an improvement over saying nothing.
 
-### Sentinel-value sweep leftovers: three deliberate deferrals (added 2026-08-26)
+### Sentinel-value sweep leftovers: deliberate deferrals (added 2026-08-26)
 
 The 2026-08-25/26 sentinel-value work (`scratch/residual_2026-08-24/sentinel_value_audit.md`)
 closed all 7 HIGH findings, the MEDs and every LOW. Three items were deferred ON PURPOSE, each
-because the honest fix is a new decision rather than a correction:
+because the honest fix is a new decision rather than a correction. Later rounds appended their own
+deferrals below the numbered three, so the heading carries no count: the section holds six items and
+the prose below names each one's position.
 
 1. **A confident DISCRETE point mass is now WITHHELD, and building the spike is the faithful
    third option.** `sanitize_percentiles` no longer cluster-spreads a whole-set epsilon collapse,
@@ -844,6 +1011,34 @@ wave): the agentic `_fetch_plain` textual allowlist (`text/plain`, `text/csv`,
 as `Content-Type: application/csv`, with a clean "Unsupported content type" error, so such URLs
 ride the fetch ladder's later rungs. One allowlist entry if agentic FRED reads ever matter.
 
+A fifth, from the 2026-09 bundle's forge pass (added 2026-09-01, forge R8): `getattr(question,
+"<attr>", None)` on attributes that always exist on `MetaculusQuestion` is licensed by the
+`question: Any` typing rather than by any field that can actually be absent, and the forge pass
+counted about 30 such sites across `metaculus_bot/research/` (a raw grep for `getattr(question, `
+there returns 51, the difference being genuinely type-specific attributes like `open_upper_bound`
+and `options`). The two guarding the new staleness tier cap were fixed inside the bundle; the rest
+is one mechanical sweep and deserves its own PR, because the MagicMock question fixtures several
+research tests build will need explicit attributes once those defaults stop covering for them.
+
+A sixth, accepted deliberately rather than fixed (added 2026-09-02, forge R1 from the 2026-08-31
+round; operator decision recorded in that round's SYNTHESIS decision table): **the ft-fallback
+numeric builder's CLOSED-bound path skips `safe_cdf_bounds` entirely.** In
+`create_fallback_numeric_distribution` (`metaculus_bot/numeric/pchip_processing.py`) the
+`BoundSafeNumericDistribution.get_cdf` override returns upstream's CDF unchanged when neither bound
+is open, so no min-step, max-step or endpoint enforcement runs on that output and no
+`CDF_MAXSTEP_CLIP` marker can fire; the forge reviewer measured a 0.2034 bin against the platform's
+0.2 cap on that path, and the stacker path publishes such output directly, so in principle an
+over-cap CDF is POSTed and Metaculus rejects the whole submission. It also falsifies the "single
+choke point" claim in `docs/numeric_pipeline.md`. Accepted because the failure is compound-rare: it
+needs closed bounds AND a PCHIP failure AND stacking enabled, and stacking is prod-disabled today,
+with zero measured fires in the archive. Restructuring the fallback path speculatively risks more
+than it buys, and timing/fallback paths in this pipeline have cost real questions before. If
+stacking is ever re-enabled, this becomes a real pre-flight item: route the closed-bound branch
+through `safe_cdf_bounds` too, with the grid-scaled step constraints the open-bound branch already
+computes.
+(`scratch/residual_2026-08-31/forge_report_resids-sept1.md` R1;
+`scratch/residual_2026-08-31/SYNTHESIS.md` decision table, decision (b).)
+
 ### Deterministic tail-consistency check on the numeric structured block (added 2026-08-24)
 
 From the q44453 dossier (July payrolls, peer −11.24; the whole field missed the −23k print, so the
@@ -859,6 +1054,115 @@ de-skewing every member to a symmetric normal at its own declared p50 and 10–9
 **+11.93 baseline points, taking spot peer from −12.15 to −0.22** — roughly break-even with the
 crowd, from arithmetic the models had already done.
 (`scratch/residual_2026-08-24/dossiers/44453_dossier.md` + `44453_verification.md` C1.)
+
+### Anchor-date discipline, prompt-side: make a status-quo anchor state its date (added 2026-09-02, tracked at last; recommended by the 2026-08-24 round)
+
+**What.** One forecaster-prompt rule: when a member derives a status-quo or time-series anchor (a
+last print, a current polling level, a latest index value), it must state the DATE of the reading it
+anchored on and prefer the newest dated read available in the bundle. Nothing computes off it and it
+is not a clamp; it is an elicitation rule aimed at a specific failure.
+
+**Why.** The stale-anchor pattern is the common mechanism behind a whole run of misses. The
+2026-08-24 round named 44858, 44841, 44855, 44553 and 45115, with 45114 and 45174 as the saves that
+show what correct handling looks like, and the 2026-08-31 round added 44554 (sol published 17
+points below its own anchor on a polling-lead question, presumably off stale summer polls; that one
+is a plausible instance rather than a traced one). A member that never says when its anchor was
+measured cannot notice that the bundle carries a fresher number, and the reader of the rationale
+cannot tell a current read from a remembered one.
+
+**Status and the honest discount.** Unshipped, and until 2026-09-02 also untracked, which is why
+this entry exists. The RENDER side is now half-covered: `bc9d9ad` dates every rendered latest value
+and flags staleness, and the 2026-09 bundle added vintage / as-of bullets to
+`web_research_prompt` asking research output to carry the publication date of dated claims. That
+weakens the prompt-side case without retiring it, because those changes make the dates AVAILABLE to
+a forecaster without making a forecaster state which one it used. Not a fitted layer, so no
+out-of-sample era gate is needed to ship it; but do not quote 44553's +58 as an expected value, and
+size it against the fact that the bundle already carries several prompt rules whose combined effect
+is unmeasured until the fall cup resolves.
+(`scratch/residual_2026-08-24/SYNTHESIS.md` §6 item 6;
+`scratch/residual_2026-08-31/SYNTHESIS.md` free-recommendation item 10 and
+`dim_consensus-dissent.md` on 44554.)
+
+### ~~Anchor-overshoot self-consistency screen (the anchor half of the same check)~~: MEASURED and REJECTED 2026-08-31, priced again 2026-09-02. Do not build it.
+
+This is the sibling half of the tail-consistency check above, and unlike that half it has been
+measured and does not survive. The proposal was: flag or correct a binary forecast whose published
+probability sits outside the member's own declared `base_rate_anchor` range, on the theory that
+leaving your own stated anchor is an internal contradiction. Three findings kill it, and a fourth
+fact retires the input: the 2026-09 bundle removes `base_rate_anchor` from the prompt.
+
+**The premise is not a contradiction.** The prompt defines `base_rate_anchor` as the outside-view
+range stated in Phase 1 and `posterior_prob` as the post-update posterior, so publishing outside
+the range is licensed by construction: it means the inside view moved the model past its own base
+rate. The screen measures the size of that update, not an inconsistency.
+
+**The incidence is 3x what the screen was priced against, and the direction is INVERTED at the n
+it can be read at.** Over the triple era's clean published blocks the rate is 32 of 119 = **26.9%**
+(Wilson 95% 19.7 to 35.5), against the 8% a single earlier round had carried, and it is a stable
+property rather than an era effect (post_flip 21 of 87 = 24.1%, Fisher p=0.75 between eras). On the
+21 blocks that had resolved, blocks that LEFT their own anchor scored **+72.11 (n=3, none
+negative)** while blocks that stayed inside scored **+25.60 (n=18, 4 negative)**, and all three of
+the worst blocks (worse than −100) sat inside their anchors. All 3 resolved fires were hit-side, 0
+miss-side. The per-slot rates are a style difference, not an error signature: gpt-5.6-sol leaves
+its own anchor on 46.2% of blocks against opus-4.8's 7.5% (Fisher p=0.0001), and it is not a width
+artifact, since sol states the WIDEST intervals (mean 0.174 against opus's 0.139) and still leaves
+them most often, with the width-free distance-from-own-anchor-centre measure putting sol at about
+3x opus.
+
+**Priced field-free on the whole archive, "publish your anchor instead" is worth about zero with a
+parse-dependent sign.** The 2026-09-02 failure-mode audit re-medianed every binary ensemble with
+each member's stated anchor substituted for its published value: **minus 221 spot peer over 143
+records** under the strict parse (anchors written as a bare number) and **plus 789 over 376
+records** under the extended parse (leading number or range midpoint), with the **median record
+delta 0.00 under both**. Most overrides do move away from the resolution, but the moves toward it
+are individually larger (30 to 78 points each above the 15-point gap cut) and roughly cancel, so
+the net is a variance trade with no expected gain. The largest single contributors point opposite
+ways: q42304 would have gained +144 from keeping its anchor, q39747 (the US bailout of Argentina)
+would have lost 170, because there the members' 0.10 anchor was wrong and their 0.55 publish was
+right.
+
+**What to do instead.** Nothing automated, and the elicitation this check reads is itself going
+away. The 2026-09 bundle asks a member to state its outside-view number and to name the specific
+evidence when the final probability lands more than about 15 points off it, as one clause on the
+existing "anchor on your math" bullet rather than as a standalone rule; the audit endorses exactly
+that and warns against strengthening it into a clamp or a shrink. The same bundle removes
+`base_rate_anchor` from the block (Item D of
+`scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md`), so from that merge on
+there is no machine-readable anchor to compare a publish against at all, and reviving the screen
+would mean re-adding the field first. The one cheap thing worth continuing is the control:
+hand-run the single anchor-versus-published comparison on any new binary MISS dossier and record
+which side it fires on, because the resolved-fire cell is n=3 and every one of them is hit-side.
+Never propose it as a screen or a guard. Note also that any June-era hand-run of this check is
+unmeasurable: `base_rate_anchor` did not exist in the archive before `30bca2f` landed on main
+2026-07-11.
+(`scratch/residual_2026-08-31/dim_ghosts-guards.md` §3c and
+`scratch/residual_2026-08-31/SYNTHESIS.md` decision table;
+`scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md` §4.)
+
+### Gap-fill v2 throttle handling: the request-spacing half the q45191 fix left (added 2026-09-02)
+
+The fix that shipped makes a host's rate-limit interstitial a `status=throttled` failure that is
+never cached, so the driver's retry of a throttled URL is a real request
+(`research/agentic/fetch_outcomes.py` + `tools.py`; receipt:
+`scratch/residual_2026-09-01/dossiers/45191_verification.md`). The duplicate-call note that
+contradicted that retry has since been fixed as well, and needed no per-URL outcome memory:
+`dispatch._append_tool_messages` discards a throttled call's `(tool, normalized-args)` key from
+`state.seen_tool_calls` at emission, so the identical retry is neither counted in `dup_tool_calls`
+nor told "its result will not have changed", while `max_tool_calls` still caps a throttle spin.
+One adjacent thing is still left alone on purpose, because it touches timing rather than detection:
+
+**No request SPACING.** Same-host fetches already serialize on the per-host `Semaphore(1)` v2
+shares with Tier-1 (`tools._host_gate`), but Ogimet asked for 20 s BETWEEN queries and nothing
+waits. So a parallel same-host batch still trips a spacing rule; it is now disclosed and retryable
+instead of silently wrong. Adding a per-host minimum interval means new sleep/deadline logic on the
+path the wall deadline already governs, which is the highest-risk surface in this package. If it is
+ever wanted, the cheap version is a per-host "next allowed at" timestamp consulted inside the
+existing gate, and it needs its own review pass.
+
+Also unhandled, and cheaper to leave: `read_document` (rung 3, Gemini `url_context`) applies no
+throttle check, so an interstitial the reader summarises would still come back as a document read.
+Nothing in the archive shows that shape; the marker `agentic_fetch_throttled` is what would make a
+case for it.
 
 ### Gap-fill v2: office-holder precedent verification rule (added 2026-08-24)
 
@@ -924,7 +1228,10 @@ Follow-ups:
    (provenance); URLs 2+ / whales (≥~10k chars) go through the cheap summarizer (`gpt-5.6-luna`, temp
    0, a rounding error at $0.10/$0.60 per 1M). ~5 whale sources per 40 questions no cap captures.
 2. **MEDIUM — Tier-2 LLM fetch** for the js_wall/blocked slice (~15%; Masters.com, childmortality.org,
-   UNICEF, Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked/js_wall) is the seam.
+   UNICEF, Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked / js_wall / and since
+   2026-09-01 `no_resolving_content`, the embed-shaped 200 whose numbers sit inside an Infogram,
+   Flourish or Tableau widget) is the seam. Those three are pages we could not READ; `empty_body`
+   and `unsupported_type` are bodies that carried nothing and are NOT escalation seams.
    **Precondition:** ~~the Gemini `url_context` probe above~~ — SATISFIED 2026-08 (probe negative,
    0/271 sections carry the marker). *Note 2026-07-16:* the gap-fill v2 fetch
    ladder gives the driver this capability inside the loop, so the js_wall slice may get covered
@@ -938,10 +1245,295 @@ Follow-ups:
    5-14-month-old snapshots as HTTP 200; and anything older than
    `RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS`, or undatable, is withheld as a new `stale_data`
    status rather than served as live. The generic js_wall/blocked slice is still open.
-3. **LOW (deferred) — now over the ceiling:** module split of `resolution_source.py` (extract
-   `ssrf_guard.py`). The "~670 LoC" in the original note is stale — it is **1,175** as of 2026-08-25
-   after the Datawrapper hop, and the shared embed-detection primitives already moved to
-   `http_fetch.py`, so the seam is visible.
+3. **LOW (deferred) — well over the ceiling; split is its own PR.** module split of
+   `resolution_source.py`. The file is **3,170 lines** as of 2026-09-03 (the "~670 LoC" and the
+   later "1,175 as of 2026-08-25" in earlier revisions of this note are both stale — the
+   Datawrapper hop and then the 2026-09-03 escalation ladder are what grew it). Three candidate
+   seams, in order of how self-contained they are: the shared SSRF/fetch primitives into
+   `ssrf_guard.py` (the original note's target; the shared embed-detection primitives already
+   moved to `http_fetch.py`, so this seam is visible); the escalation ladder
+   (`_rendered_rung_applies` through `_escalate_unresolved`, ~L1806-2457, **~650 lines** — the
+   rendered / derived_api / wayback / url_context rungs and their gates, a self-contained concern
+   with its own vocabulary); and the Datawrapper hop (`_datawrapper_hop_status` through
+   `_interleave_dataset_results`, ~L2549-2798, **~250 lines**).
+   **The blocker is the monkeypatch surface, not the layer diagram.** The test suites patch **22
+   distinct names** on `resolution_source` (heaviest: `_get_session`, `render_page`,
+   `run_url_context_read`, `_WAYBACK_TRIGGER_STATUSES`, `_extract_main_text`, and ten
+   `RESOLUTION_SOURCE_*` caps) plus two attribute-of-import targets
+   (`resolution_source.asyncio.wait_for`, `resolution_source.socket.getaddrinfo`), so any split
+   must re-point every one of them, and a patch left on the old module stays green while proving
+   nothing (the trap AGENTS.md documents). The ladder also reads `_fetch_direct` and
+   `_classify_html_body`, so extracting it means injected callbacks through the rung functions or
+   a circular import, and still leaves ~2,500 lines behind. Record over reflex: the split does
+   not leave the code better inside this bundle, so it is deferred to its own PR.
+4. **LOW — the all-failed section notice now overclaims for one status.** When every URL fails, the
+   rendered notice still says the resolving page "was unreachable", which is imprecise for a
+   `no_resolving_content`: we reached it, got a 200, and could not read the embed. The same notice
+   names the real status token beside it and the instruction to the forecaster is unchanged, so this
+   is wording, not a defect. The fix is per-status phrasing in that one render string; it was left
+   alone in the 2026-09-01 bundle rather than reworking shared render wording under an unrelated item.
+5. **The 45 s wall-clock timeout throws away work that already succeeded (added 2026-09-01, forge
+   R3; SKIPPED by operator decision — do not implement without them).** The provider's `_fetch`
+   wraps `fetch_resolution_sources` in a single
+   `asyncio.wait_for(..., RESOLUTION_SOURCE_WALL_TIMEOUT)` and returns `""` on timeout, and that
+   return happens BEFORE `_log_fetch_outcome_markers`, `record_raw_research`,
+   `record_provider_detail` and `format_resolution_sections`. So an overrun loses every per-URL
+   `RESOLUTION_SOURCE_FETCH` marker, the diagnostics source map, the raw-archive payload AND the
+   page text the URLs that did finish had already produced — the run cannot tell afterwards which
+   sources it nearly had. The minimal fix bounds the page gather internally the way the Datawrapper
+   hop already self-bounds: cancel the stragglers, materialise the unfinished URLs as `error` or a
+   new status token, return partial results. Note that this also starts rendering partial snapshots
+   where today nothing renders, i.e. a forecaster-visible change on a timing path, and timing and
+   fallback paths in this pipeline have cost real questions before (q45085). Blast radius is
+   unmeasured, so size it first:
+   `rg --no-ignore 'wall-clock timeout' backtests/telemetry_archive/`.
+   **The 2026-09-03 fetch-ladder bundle added an amplifier this item did not have when it was
+   written (forge R4, F61/F39/F35; still SKIPPED, still the operator's call).** The per-host
+   politeness map moved from a fresh dict per provider call to the loop-wide
+   `http_fetch.host_semaphores()`, so same-host requests now serialize ACROSS the
+   `DEFAULT_MAX_CONCURRENT_RESEARCH = 6` questions researching at once rather than only within one
+   question. Each hold covers the GET, the body read and the trafilatura extraction (the F45 split
+   has since landed, so the PDF parse now runs in `_finish_document` after this gate has been
+   released and no longer holds it), the acquire wait is unbounded, and each request may
+   take `RESOLUTION_SOURCE_HTTP_TIMEOUT = 20.0` — so six questions citing one slow host (the
+   worked cases q44873/q44874 both cite cdc.gov) can queue past the 45 s wall, at which point the
+   question that lost the queue discards every page it had ALREADY fetched, not just the contended
+   one. The archived timings say the tail is real rather than hypothetical: all-fail p50 0.3 s, but
+   3 of 23 ran the full 20 s. Nothing measured this interaction when the map was widened; the
+   politeness argument for widening it is unaffected. Three remedies, all the operator's to pick:
+   the partial harvest this item already describes; or a budget-bounded acquire — wrap the whole
+   hop in `asyncio.timeout(ctx.rung_budget_s())` while KEEPING `async with sem`, so a queued
+   question gives up its turn instead of the wall taking the section (the reviewers flagged this as
+   new timeout policy on a surface reserved on 2026-09-01, and a hand-rolled acquire/release on a
+   process-wide permit risks a leak or a double release, which is why it is not "strictly safer");
+   or pure instrumentation, a WARN when the acquire wait exceeds a few seconds, which measures the
+   contention without changing any timing. A `Semaphore(2)` per host is NOT an option — it trades
+   the politeness the widening bought for a bound it does not actually give.
+   **Merging Tier-1's host map with gap-fill v2's own map waits on this.** v2 keeps its own
+   module-global map (`research/agentic/tools.py`) and shares only the helper, so today a Tier-1
+   fetch and a v2 fetch can hit one host at once — but v2's rendered rung holds its host gate
+   across a Chromium launch of up to 35 s, and merging the maps would put that hold in front of a
+   Tier-1 fetch whose 45 s wall discards finished pages. So the merge needs either the bounded
+   acquire or the wall-degradation fix above landed first, and it needs the resulting queueing
+   measured rather than assumed.
+   **Two more amplifiers, added 2026-09-03 with the rendered rung's post-gate budget recompute
+   (still SKIPPED, still the operator's call).** Tier-1's own browser rung now holds the
+   loop-wide per-host gate too, and for longer than the 20 s HTTP hold this item reasons about:
+   the render re-acquires the same `Semaphore(1)` from `_rendered_rung` and keeps it across the
+   launch-cap queue, the launch, the navigation (up to 33 s), the settle and the teardown,
+   because Chromium dials the host itself. And the process-global `Semaphore(2)` Chromium launch
+   cap in `research/rendered_fetch.py` is now queued in FRONT of Tier-1's 45 s wall as well as
+   v2's driver loop, so two other renders anywhere in the process (either path, any question)
+   hold a Tier-1 render in the queue with the wall running. What landed is the strictly-safer
+   half: the navigation budget is recomputed AFTER both gates are held (`_goto_budget_ms`), so a
+   render admitted late navigates on what is actually left or declines under `RENDER_MIN_GOTO_MS`
+   before a browser is launched, and the outer cut no longer memoises a URL whose render never
+   left the queue. Neither acquire is bounded, no launch allowance is reserved, and the 12 s floor
+   is unchanged; the bounded acquire remains the reserved call above, and `render_page` is shared
+   with v2, so bounding it there would be new timeout policy for both paths at once.
+   **The render's exit-cost accounting, closed 2026-09-04, and what it leaves open.**
+   `_rendered_rung` used to hand the transport a deadline at the same instant as its own outer
+   `wait_for`, while the three teardown steps each carried a fresh 2 s bound. `asyncio.wait_for`
+   cancels the render and then awaits its unwinding finallys, so a wedged browser could run up to
+   6 s past the cut and trip the 45 s provider wall, discarding every page the question had
+   already fetched, and a cancellation landing during that teardown replaced the propagating
+   `RenderTimeout`, so the timed-out memo never landed. What shipped: the three teardown steps
+   share ONE lazily started `RENDER_TEARDOWN_TIMEOUT_MS` budget (`_TeardownBudget`), so the whole
+   exit costs at most 2 s before the driver stop; `RENDER_EXIT_RESERVE_MS` (that bound plus one
+   second for the launch and the driver stop, 3 s in all) is subtracted from the deadline the rung
+   hands the transport while the rung keeps `timeout=budget_s` on its `wait_for`; the harvest
+   drain is clamped to that deadline itself; and the memo is written at the `RenderTimeout` raise
+   site with `memo_scope` threaded down. Strictly safer throughout: the goto can only get shorter
+   or decline earlier at `RENDER_MIN_GOTO_MS`. Three things stay open, and each is a deliberate
+   choice rather than an oversight. (a) The `async_playwright()` driver stop is the one unbounded
+   step in the exit. It is what actually kills the Chromium process, and abandoning it on a wedged
+   browser would leak 100 to 300 MB past `RENDER_LAUNCH_CAP`, an OOM nothing can catch; the
+   reserve's spare second is sized for a healthy stop, and a wedged one is unmeasured live. (b)
+   `RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S` stays at 12 s while the post-gate need is now
+   `RENDER_MIN_GOTO_MS` + `RENDER_POST_GOTO_TAIL_MS` + `RENDER_EXIT_RESERVE_MS` = 5 + 7 + 3 = 15 s,
+   so a render admitted with 12 to 15 s of wall declines at the gates with an honest `wall_budget`
+   skip rather than launching. Raising the floor to 15 s would make the pre-gate check truthful at
+   the cost of that band's reach, and the plan's own rule forbids raising it without the operator.
+   (c) The 2026-09-04 review's other two structural notes on the transport, sequenced after the
+   fixes above because all of them edit the same region: `rendered_fetch.py` is about 980 lines
+   carrying the render budget, the SSRF pin, the teardown and a 200-line XHR-harvest subsystem, and
+   the harvest (`_JsonHarvest`, `_harvestable_json_host`, `_harvestable_json_response`,
+   `_declared_length_over_cap`, the `HARVEST_*` constants and `is_json_content_type`) is a clean
+   extraction into a `rendered_harvest.py` leaf; and `_navigate_and_read_dom` does eight things
+   (goto, salvage, settle, status and content-type read, bounded DOM read with the memo write, the
+   ceiling check, the drain clamp, the page assembly) while the harvest task set is cancelled from
+   two places for one invariant (`drain` cancels what outlived the clamp; `_render_in_context`'s
+   `finally` cancels what a raise left pending), so the harvest deserves a single owner of its
+   lifecycle when it moves. Neither is a bug; both are the shape the next transport change pays for.
+   **The harvest's one memory residual (2026-09-04).** The listener now screens a response event
+   before it spawns a task and the reads run one at a time behind a `Semaphore(1)`, so peak harvest
+   memory is one body. That one body can still be an undeclared oversized one: HTTP/2 and chunked
+   responses routinely send no `Content-Length`, and Playwright's `body()` has no streaming route,
+   so it is buffered whole before the post-read size test drops it. Refusing undeclared bodies
+   outright would drop the payload the rung exists to find (dashboard feeds commonly omit the
+   header), so the residual is accepted and documented at `_declared_length_over_cap`.
+6. **MEDIUM: trafilatura silently drops MediaWiki collapsible boxes, and the surviving text can
+   read as the inverse of the truth (verified 2026-08-24 on q44870; tracked here 2026-09-02).** On
+   an English Wikipedia endorsements page the box renders as
+   `<div class="endorsements-box mw-collapsible"><div class="endorsements-box-title">Declined to
+   endorse</div>...`. Under our production `favor_precision=True` settings trafilatura drops the
+   whole thing; under default/recall settings the list body survives but the box TITLE never does
+   (tested across txt, txt+formatting, markdown and xml output, and reproduced on the live page, so
+   it is systematic rather than a revision artifact). The consequences are worse than truncation and
+   worse than a plain miss. First, a cited grading page reports `status: ok` while the section the
+   resolution criteria point at is absent, so nothing downstream knows the evidence was lost.
+   Second, what the extraction DOES deliver from that section is unattributed: endorser bullets
+   arrive with the per-candidate box titles stripped, so a "Declined to endorse" entry can appear
+   immediately after another candidate's endorser list and read as an endorsement, which is the
+   exact inverse of the truth. Third, the obvious budget-side fixes do not work: a
+   subject-anchored truncation window and honouring the URL fragment both operate on the extracted
+   text, where the box's content does not exist, and no per-URL cap delivers it. The fix has to sit
+   at the extraction layer: for `en.wikipedia.org` specifically, pull section wikitext or
+   `action=parse` HTML through a purpose-built reader instead of generic main-content extraction;
+   or, generically, keep a structured pass over `<div>`-titled list blocks before handing off to
+   trafilatura. Same extraction-fidelity family as the Datawrapper hop in item 2, and NOT covered by
+   items 1 to 3 above (conditional summarization would summarize the same defective extraction).
+   (`scratch/residual_2026-08-24/dossiers/44870_verification.md` §2.1.)
+7. **LOW — a DIRECTLY cited Wayback capture renders with no age line (added 2026-09-03).** A
+   question whose criteria cite `https://web.archive.org/web/<14 digits>/<page>` outright is
+   fetched by `_fetch_direct` as an ordinary page, so it never passes through the Wayback rung
+   and never gets the `wayback_lead` capture-date / age disclosure that rung makes mandatory. The
+   self-reference half is closed: `is_metaculus_self_ref` now judges the innermost URL of a
+   capture at any nesting depth, so a cited capture of a Metaculus page is dropped at selection.
+   The disclosure half is deliberately NOT retrofitted onto the direct path: the section heading
+   already prints the cited URL with its 14-digit timestamp, the lead's wording ("the live page
+   could not be fetched") would be false for a capture the question chose to cite, and that
+   path's all-direct output is byte-identically pinned. If a residual round ever finds a
+   forecaster misreading a cited capture as live, the fix is a separate lead for the cited-capture
+   shape, rendered from `parse_snapshot_url` on the cited URL.
+8. **The browser transport's three unguarded request channels: BUILT 2026-09-04, one residual
+   left.** Three terms first, because the record leans on them. The DNS PIN is the
+   `--host-resolver-rules=MAP <host> <ip>` argument `research/rendered_fetch.py` passes at launch,
+   which forces Chromium's own resolution of the one hostname the render was asked for to a single
+   pre-vetted public IP. The ROUTE HANDLER is the callback `context.route("**/*", _guard_route)`
+   registers, which re-runs `is_public_http_url` on a request Chromium is about to make. The LANDING
+   HOST is the hostname of `page.url` once the navigation has settled, which is where the main frame
+   actually ended up. **What was open.** Read out of the pinned Playwright 1.61 driver source on
+   2026-09-04, three request channels never reached the route handler. A server-side redirect hop
+   was auto-continued by the driver, which constructs a Route only in the else branch of
+   `if (redirectedFrom || ...)`, so a 3xx answer that sent the main frame somewhere else was dialed
+   with no check of ours at all. A request Playwright cannot attribute to a frame was auto-continued
+   the same way. And a WebSocket handshake is invisible to `context.route` by construction, because
+   HTTP interception is the CDP `Fetch.enable` domain while WebSockets surface only on the
+   report-only `Network.webSocket*` events, and an IP-literal target such as `ws://127.0.0.1` never
+   consults the resolver the pin rewrites. The exploitable shape was the first of those. The
+   rendered rung fires only on `js_wall` or the `thin_page` shape of `no_resolving_content`, both of
+   which mean a page answered our aiohttp GET with 200 and nothing readable, so an attacker who
+   wanted the browser to run served exactly that to aiohttp, and a 302 to a private address to
+   Chromium, which the User-Agent alone separates. Chromium followed the hop unchecked,
+   `page.content()` read the internal response, and the transport handed it back attached to the
+   ORIGINAL cited URL, where Tier-1 re-classified it as page text that could be captioned as primary
+   grading evidence and published in the Metaculus comment. Service workers were a fourth such
+   channel and were already closed by `service_workers="block"` on the context. One shape that
+   looked like a hole and was not: a CORS preflight OPTIONS is auto-fulfilled by the driver with a
+   synthetic 204 and never reaches the network. **What shipped, in `6646a0b` and `8ced8a5`.** Three
+   closures. First, the transport refuses an off-host landing. After the settle, on the normal path
+   and on the salvage path where the goto raised and there is no response object to read, it
+   compares the landing host with the pinned host under the same normalisation the pin was built
+   from, and any other host, an IP literal included, raises `RenderOffHost` before `page.content()`
+   is called. The same comparison runs again on `page.url` immediately after the read (added
+   2026-09-04 in the fix wave after the forge review, which reproduced the gap): `page.url` is a
+   client-side cache updated by the driver's `navigated` event and `page.content()` is a driver round
+   trip evaluated in whatever document is current when the driver handles it, so a navigation that
+   committed in that one round trip handed back the other host's DOM with the first check already
+   passed; the second read costs no await, and a DOM that fails it is discarded unpublished. So the
+   guarantee is "refused unread, or discarded unpublished", not "never read". The predicate fails
+   shut: only an empty `page.url` and the `about:` scheme pass without a matching hostname, and every
+   other scheme is a stranger, which covers Chromium's own error document. Live QA against real
+   Chromium the same day found `page.url == "chrome-error://chromewebdata/"` after a goto that failed
+   with `net::ERR_UNSAFE_PORT` and after `net::ERR_CONNECTION_REFUSED` on a redirect to a loopback
+   target, a landing the earlier tri-state helper (None for every non-http(s) scheme) let through to
+   an empty DOM read; it is now refused, so `render_off_host_skips` is an upper bound on hostile
+   landings that also counts failed navigations, told apart by the marker's `landed_host`
+   (`chromewebdata`). A navigation that never committed leaves `about:blank`, which is nobody's host
+   and falls through to the empty-DOM read it always produced. `RenderedPage` gained `final_url`,
+   and in the fix wave it was wired rather than carried: `RenderedPage.document_url` (the landing
+   when one committed, else the requested URL) is the Tier-1 classifier's base and gap-fill v2's
+   link base, so a same-host client-side redirect from `/senate` to `/senate/2026/` resolves
+   `href="methodology.html"` against the real document and the published section URL names it;
+   `RenderedPage.url` still carries the REQUESTED URL, because that is the key for both render
+   memos. One thing the post-read `page.url` does NOT establish is provenance. It establishes
+   safety, because a DOM that is handed back is one whose frame was on the pinned host both before
+   and after the read, but the content evaluation's reply and the `navigated` event of a navigation
+   that commits a moment later both arrive over the same ordered pipe before the awaiting task
+   resumes, so on a same-host navigation that commits mid-read `final_url` can name the new document
+   while the DOM is the old one. The refinement that would settle it is reading the DOM and
+   `location.href` in ONE `page.evaluate` round trip, so both come from the same document by
+   construction; it is deferred because it changes the core read on merge day, and the mismatch it
+   would close is same-host and confined to `final_url`. Second,
+   `context.route_web_socket("**/*", _block_web_socket)` is registered before the page is opened,
+   and the handler logs one INFO line (raised from DEBUG in the fix wave, because `cli.py` configures
+   the root logger at INFO and the line is the only record of a content-affecting block) and never
+   calls `connect_to_server`, so no page socket is dialed; the mechanism and its limits, including
+   the two enumerable `__pwWebSocket*` globals the injection leaves in every frame, are recorded on
+   `_block_web_socket`'s docstring. Third, the rendered rung hands the browser `direct.url`, the URL the direct fetch landed
+   on once its own redirect hops were followed and re-guarded, rather than the cited URL, so the pin
+   covers the host that actually serves the content and a page whose canonical form is one ordinary
+   hop away (`example.com` to `www.example.com`) is not refused for taking it. Where the two URLs
+   differ the landing is re-vetted with the same self-reference and public-URL checks every derived
+   hop owes. On the caller side, Tier-1 records the decline as its own skip token `render_off_host`
+   with its own count key `render_off_host_skips`, the direct result stands, and nothing from the
+   render is published; gap-fill v2 folds the decline into the None outcome it already returns for
+   its sibling declines. A skipped attempt emits no `RESOLUTION_SOURCE_ESCALATION` line, so the
+   per-event record is the transport's own WARNING, registered as the marker
+   `RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host>
+   landed_host=<host> same_publisher=<true|false>` (spec `rendered_fetch_off_host`), which names
+   hostnames only because a landing URL can carry a session token. `same_publisher`, added in the
+   second fix wave the same day, is `registrable_domain(landed_host) ==
+   registrable_domain(pinned_host)` over the vendored public-suffix list, the judgment the XHR
+   harvest already makes about a page's own JSON: `true` is a benign client-side hop inside the
+   publisher's own registrable domain (`example.com` to `www.example.com`) that strict hostname
+   equality refused, so its rate prices the strictness of the rule, and `false`, which every landing
+   with no hostname also is, is the security signal. No record had been archived when the field was
+   added, so extending the line broke no contract. **What the probe measured, free and local, on
+   2026-09-04.** Playwright 1.61 was driven directly with the transport's navigation shape and no
+   pin, over the 106-URL Phase 3 QA sweep united with the 47-URL replay, one page at a time. 103 of
+   the 106 navigations committed, and 0 of the 103 landed on a different host. Of the 22 render
+   targets in that corpus, 22 committed, 0 landed off host, and 0 opened a WebSocket. 3 base-rate
+   pages opened one: two Yahoo Finance history pages to `streamer.finance.yahoo.com` and
+   manifold.markets to `api.manifold.markets`, all three public hosts inside their own registrable
+   domain. 6 pages ended on a different path or query on the same host, so a host-only comparison is
+   what the corpus supports and a path-level one would have refused all 6. The only main-frame hops
+   were same-host: trueup.io answering a 307 to itself and then a 403, ballotpedia.org and
+   fts.unocha.org reloading their own bot-challenge documents, and a cdc.gov meta refresh. 3 URLs
+   did not commit, a PDF download and two HTTP/2 protocol errors. 6 hosts answered headless Chromium
+   with a 403, which is a fingerprinting result rather than a host change. So strict pinned-host
+   refusal costs no recall on this corpus, and no WebSocket recall was at stake on the pages the
+   rung actually renders. **The one residual, and the measurement that would settle it.** A
+   cross-host SUBRESOURCE is still resolved by Chromium with no pin, so the route handler's own
+   `getaddrinfo` and Chromium's connect resolve independently and a rebinding host with TTL 0 can
+   win that race; a request Playwright cannot attribute to a frame is the same window under another
+   name. Chromium 149, the build Playwright 1.61 pins, is believed to narrow this: Local Network
+   Access gates a public page's subresource requests to loopback, RFC1918 and link-local addresses
+   behind a permission this headless context never grants. That is INFERRED from Chromium's feature
+   lists and vendor docs and has never been observed in this headless build, because
+   `tests/conftest.py` refuses every real browser launch, and it is a browser default we neither pin
+   nor assert. One observation settles it: launch this build outside the suite against a page whose
+   subresource targets a local address, and record whether the request is gated. The main-frame
+   channel is closed by the landing-host check. The server-side redirect hop is still invisible to
+   the route handler, and for the main frame that no longer matters, because the landing is what
+   gets checked. **What not to rebuild.** A re-render hop to the landing host would be built for a
+   case this corpus does not contain, so it is not worth writing until a real `render_off_host`
+   count says otherwise. Fulfilling every browser request from Python through
+   `research/http_fetch.py` with `route.fulfill` was rejected: cookies, auth, ranges, streaming and
+   CORS semantics all move into our code, page fidelity drops, and it undermines the reason a
+   browser is launched at all. A local filtering forward proxy (`--proxy-server` pointed at a
+   loopback proxy that resolves and vets every CONNECT and GET target) stays the only remedy that is
+   a real connect-time boundary, covering the subresource residual, a dedicated Web Worker and the
+   frameless request in one move and making `--host-resolver-rules` unnecessary; it is its own
+   project with its own failure modes and its own QA pass, and it earns that cost only if the
+   subresource residual ever proves live. Two facts about the WebSocket block outlive the diff.
+   Playwright implements the block by injecting an init script that replaces `globalThis.WebSocket`
+   per frame, so it is an in-page mitigation rather than a boundary and a dedicated Web Worker very
+   likely keeps the native constructor. And `unroute_all` clears the HTTP routes only
+   (`_unroute_internal(self._routes, ...)`), with no `unroute_web_socket` anywhere in the API, so
+   the WebSocket handler stays registered through the context close and the browser close by design,
+   which is what the transport's teardown comment says.
 
 ### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
 
@@ -1189,24 +1781,54 @@ its gate must include a fall-like era-stability check (harvesting the spring mis
 damages the largest, best-calibrated era). Receipts: `scratch/residual_2026-07-08/ACID_TEST_VERDICT.md` §3,
 `scratch/residual_2026-07-08/experiments/GUARDS_SYNTHESIS.md`.
 
-### Telemetry-first guard revival program (added 2026-07-08, passive)
+### ~~Telemetry-first guard revival program~~: CLOSED 2026-09-02 (the field it accrues on is being removed) (added 2026-07-08, passive)
+
+**Why it is closed.** This program was a passive bet that the `base_rate_anchor` /
+`criteria_clauses` elicitation would keep accruing archive rows until the guard-revival conditions
+could be tested exactly rather than by parsing prose. The 2026-09 bundle retires that elicitation:
+Item D of `scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md` removes both
+fields from the binary prompt's schema instruction and example block (the Pydantic fields stay
+tolerant so archived comments still strict-parse), on the grounds that they restate prose the
+rationale already carries, their only consumer is `tool_runner` behind
+`PROBABILISTIC_TOOLS_ENABLED=false`, and their harvested marker holds zero rows. Once the prompt
+stops asking, no new question can carry the field, so neither free check below can accrue and the
+`base_rate_anchor` leg of the anchor-floor guard's revival condition (in "Killed by July 2026-07-08
+residual + competitor analysis") is frozen where it stands: about 40 triple-era binary questions
+carry the field against a threshold of 50, and only 21 of their 119 blocks had resolved as of
+2026-08-31.
+Reviving any of this now means re-adding the elicitation first, which is a prompt change and a
+config-era boundary, so it is a decision rather than a wait. The `remaining_window_days` field and
+its `WINDOW_DECLARED` marker, which shipped earlier on 2026-09-02, are retired by the same item on
+the same day, on the grounds that its own instruction made it telemetry-only; they never appear
+in this file, so there is nothing else here to update. The evidence below is kept because it is
+what stops the idea being re-proposed from memory.
+(`scratch/residual_2026-08-31/dim_ghosts-guards.md` §3b-3c for the archived counts;
+`scratch/residual_2026-09-01/FOLLOWUP_LEDGER.md` row 29.)
+
 
 Shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` + `criteria_clauses` on `BinaryStructured`;
 authored 2026-07-08, live on main 2026-07-11T16:37Z in merge `642b027` — that merge date is the era
 boundary for any replay that splits on the telemetry's presence)
 plus `PREDICTION_MARKETS_ENABLED: 'true'` make future guard replays exact rather than parser-based. No
-code on the roadmap; passive. Note: the computed `ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP`
-markers emit only from `tool_runner` (gated behind `PROBABILISTIC_TOOLS_ENABLED`, off in prod) so they're
-DORMANT; the raw `base_rate_anchor` / `criteria_clauses` JSON lands unconditionally and the
-overshoot/divergence math is trivially replayable offline from it.
+code on the roadmap; passive. Note, superseded 2026-09-02 by Item D: the computed
+`ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP` markers and the
+`_anchor_and_clause_telemetry_lines` helper that emitted them are DELETED (`tool_runner.py`'s module
+docstring records which of its dispatch is unreachable as a result), and the binary prompt no longer asks for
+`base_rate_anchor` / `criteria_clauses`, so no new raw JSON lands at all. The Pydantic fields stay
+optional so archived blocks still strict-parse; the overshoot/divergence math is replayable offline
+only over the blocks already in the archive.
 
-Two free checks next residual session: (1) **structured-JSON presence rate per forecaster** — grep the
-archive for the raw JSON keys, confirm every slot emits them; (2) **does the spring overshoot pattern
-reproduce on the current roster?** — if the confident-overshoot cluster (42024 / 42304 / 41800 analogues)
-doesn't appear post-`30bca2f`, the prompt fixes sufficed and all three guard-revival conditions become
-moot. `clause_product_divergence_pp` (published vs the model's own priced clause product) is the first
-trigger keying on divergence-from-own-math — the conditionality the three tested guards failed to achieve.
-Watch, don't act.
+Two free checks were the plan while the elicitation was live, and NEITHER can accrue any further, so
+they are recorded here as closed rather than as work: (1) the structured-JSON presence rate per
+forecaster, grepping the archive for the raw JSON keys to confirm every slot emitted them; (2) whether
+the spring confident-overshoot cluster (42024 / 42304 / 41800 analogues) reproduced on the roster after
+`30bca2f`, which would have settled all three guard-revival conditions at once. The elicitation ran from
+the 2026-07-11 merge (`642b027`) to the 2026-09 bundle's merge, so the archive closes at about 40
+triple-era binaries, and both checks are replayable offline over exactly those blocks and no more.
+`clause_product_divergence_pp` was the intended first trigger keying on divergence-from-own-math, the
+conditionality the three tested guards failed to achieve; that helper and both computed markers were
+deleted with the fields, so reviving any of this means re-adding the elicitation first, which is a prompt
+change and a config-era boundary.
 
 MC [0-5%) low bucket — **measured NULL 2026-08-24; do not re-open as a gap.** Exact cluster-correct
 test over the whole archive: 61 questions supply 117 in-band options carrying **2.83 expected
@@ -1217,11 +1839,86 @@ post-bullet MC, all also post-clamp). The once-proposed prompt line ("price clea
 options near the 1% floor") has no evidential support and would now collide with the 0.01 clamp
 floor, which binds on 4 of 18 post-clamp ballots. **Do not conflate it with the MC top-band
 under-commitment, which is the one MC signal still worth watching**: combined ≥0.60 top bands
-over-resolve in all 4 eras, pooled exact p=0.097 at 32 questions, crossing p<0.05 at n≈41 — nine
-top-band questions away at ~1.2/month, so a next-season item for throughput reasons, not
-effect-size ones. The 1% floor stays (operator 2026-07-09: sub-1% headroom ~+0.01 nats/question vs
-parser/clamp regression risk — not worth it).
-(`scratch/residual_2026-08-24/dim_binary-mc-calibration.md` §3–4.)
+over-resolve in all 4 eras (the direction replicates 4 of 4), and as of 2026-09-01 the STRICT
+cohort reads **35 questions, expected 26.11, observed 30, exact p = 0.1624**, with the sample size
+needed for exact p<0.05 now **57**, i.e. **short by 22 questions, not the 9 the 2026-08-24 reading
+implied**. The item moved AWAY from the gate rather than merely failing to move: the three new
+top-band ballots hit 2 of 3 against the cohort's own 0.857 realised rate, which lowers the effect
+size and raises the required n. **There is no accrual path inside summer-futureeval-2026** — the
+latest scored MC submission anywhere is 2026-08-15 and the tournament closes 2026-09-06 — **but
+there is one now outside it.** Updated 2026-09-03: the fall Metaculus Cup is configured
+(`METACULUS_CUP_ID` = `metaculus-cup-fall-2026`, project 33108, forecasting through 2027-01-01) and
+its workflow runs hourly, so cup MC ballots start accruing once the operator enables that workflow
+on GitHub and the cup publishes its first questions (it held 0 as of 2026-09-03). Two caveats before
+counting on it: cup questions are drawn for humans rather than for a bot benchmark, so the MC mix
+may differ from the tournament's, and no successor to `summer-futureeval-2026` existed on 2026-09-03,
+so the tournament side stays closed until one opens. Treat 22 more questions as reachable over the
+fall rather than as arriving on a schedule. The 1% floor stays (operator 2026-07-09: sub-1% headroom
+~+0.01 nats/question vs parser/clamp regression risk — not worth it).
+(`scratch/residual_2026-08-24/dim_binary-mc-calibration.md` §3–4;
+`scratch/residual_2026-09-01/dim_binary-mc-calibration.md` §5.3 and ledger row 11.)
+
+### Clip-threshold sweep: the binary and MC floors are priced, neither moves (added 2026-09-02, standing residual dim, operator decides)
+
+**The question.** The bot clamps every published probability (binary members into
+`[BINARY_PROB_MIN, BINARY_PROB_MAX]` = [0.02, 0.98] before the median, MC option vectors into
+`[MC_PROB_MIN, MC_PROB_MAX]` = [0.01, 0.99] then renormalised) and nobody had priced those floors. The
+operator asked for a repeatable pass: over every resolved binary and MC question, what floor would have
+maximised spot peer, and does the answer hold across lookback windows? It is now a tracked module,
+`metaculus_bot/performance_analysis/clip_threshold.py`, and a standing Phase 3 dimension of the residual
+playbook; the 2026-09-02 write-up is `scratch/residual_2026-09-01/clip_threshold/dim_clip-threshold.md`
+(with `sweep_strict.md`, `sweep_all.md`, `RECONCILIATION.md` and three refutation passes beside it).
+
+**Dated result (2026-09-02, STRICT cohort = 447 binary / 97 MC, excluding `known_bug`,
+`degraded_run`, `partial_degraded`).**
+
+- The live clamp has bound NO binary publish since it went live: the 70 strict binaries published after
+  the 2026-05-18 widening flip span 0.034 to 0.925, zero at or below 0.02, zero at or above 0.98. The
+  MC floor has bound one option (q45088). So for the live config the clip question is moot in both
+  directions until the ensemble prices below 0.034 again.
+- Raising the binary floor loses in every window and every era: c = 0.05 costs 217.48 spot-peer points
+  pooled (81 records moved, 0 resolving on the clipped side), of which 214.76 is the retired pre-flip
+  regime, 1.05 the post-flip era and 1.67 the triple era; the live-regime figure is 2.72 over 70
+  records (0.039 per question), and that, not the pooled 0.4865 per question, is the decision number.
+  Spot peer is proper, so a calibrated forecaster loses 91.19 of the 217.48 to the clip by construction;
+  the floor pays only if the sub-c band is under-priced, and its break-even hit rate (3.08% at
+  c = 0.05) sits above the Jeffreys upper bound on 0 of 81 (3.0%). 94 publishes at or below 5% produced
+  0 YES against 2.60 expected under the bot's own prices.
+- An MC floor is a tax on every question: c = 0.05 moves 68 of 97 records, 67 of them losing with the
+  resolving option never lifted (renormalisation drag off the top option), 3.53 points per question
+  (95% CI 2.40 to 4.71) and era-stable (3.40 / 3.94 / 3.21 across the three eras).
+- Loosening is censored, not measured: a record published at its in-force floor destroyed the raw
+  member value. Below 0.01 the maximally generous bound is +8.56 over 447 binaries under the
+  published-value rule and +10.91 under the member-level rule (28 records had a clamped member in a
+  median position), all pre-flip; +0.50 over 97 MC questions, and unshippable under forecasting-tools
+  0.2.92 anyway. The one MEASURED comparison runs the other way: today's 0.02 floor priced on the 23
+  pre-flip publishes below it costs 20.31 points, 23 of 23 resolving NO, era-confounded and not a live
+  lever.
+- Every out-of-sample fit returns the do-nothing candidate, so the era test is vacuous rather than
+  passed; the out-of-bag value of "pick the best floor, then apply it" is 0 to minus 0.25 per question
+  in every strict window. Ceiling-only tightening reads +39.70 at c = 0.05 pooled, all of it q42024
+  (pre-flip, 0.97, resolved NO, one of the spring miss cluster the killed YES-side shrink was fitted
+  on), every interval straddling zero, no triple-era record reaching 0.90: **do not pursue**, it is the
+  hard-clip form of the layer killed on 2026-07-08.
+- The only pro-tightening row in either cohort is unfiltered and is one record: q44874, a dry-donated-
+  key publish at 0.03 on a single surviving forecaster that resolved YES, worth +120.40 at c = 0.10 on
+  its own (triple era +107.91 in-window, minus 0.55 per question out of bag). The single-survivor publish
+  floor `[THIN_PUBLISH_BINARY_FLOOR, THIN_PUBLISH_BINARY_CEIL]` = [0.05, 0.95] on this branch fires on
+  exactly that shape: +51.08 over the 4 genuine k=1 publishes in the archive (all in
+  `DEGRADED_RUN_QIDS`), zero on the other three, forward price about minus 2 per future k=1 publish at
+  0.03 that resolves NO.
+
+**Decision status: operator decides; the data supports leaving both floors where they are.** Nothing
+supports tightening either floor (proper-score loss everywhere, no under-priced band), nothing can
+measure loosening on the live roster, and the one shape that ever read pro-tightening already has its
+instrument. Two judgment calls are the operator's: whether the widening flip's binary half (0.01 to
+0.02) is worth revisiting given the +20.31 measured on pre-flip records (it cannot matter until a
+post-flip publish comes within 0.014 of the floor), and whether the MC headroom figure this entry
+supersedes is the one the repo keeps. **Reconciliation with the 2026-07-09 MC decision above:** same
+verdict, independently reached, but the sweep's measured bound (+0.50 total, about +0.005 per question)
+supersedes that entry's "about +0.01 nats/question" estimate (0.01 nats is 1 spot-peer point, so about
++97 over this cohort), two orders of magnitude apart in the same direction. Re-run each round with the
+two commands in the dim doc; the first line to read is the header's live-regime line.
 
 ### File splits + shared fetch-primitive promotion (added 2026-07-18, low, standalone PRs)
 
@@ -1247,6 +1944,54 @@ them OUT of feature work, land as their own PRs.
 - **Give the anchor-chart `_session_charts` global a public accessor** — still open; it is a
   module-level dict at `research/timeseries_anchor.py:94` (moved by the split) mutated and read by
   qid. Expose a small get/set/clear surface instead of touching the global directly.
+- **Hoist a public `metaculus_get` and repoint the three private copies (added 2026-09-01).** There
+  are now three separate authenticated Metaculus GET helpers with the same `Authorization: Token`
+  header shape and offset/limit paging: `performance_analysis/collector.py`'s private `_api_get`
+  (three 429 retries, then a bare `RuntimeError`), `scripts/backfill_research_from_comments.py`'s own
+  copy, and `scripts/supply_probe.py`'s `_get_json` (a larger rate-limit budget, and it raises
+  `requests` exceptions rather than `RuntimeError` because its caller soft-fails per slug). The probe
+  deliberately did NOT import collector's private helper — the contract does not fit and promoting it
+  would have edited a shared file mid-fan-out — so the consolidation is this follow-up: one public
+  helper in a shared module, parameterized on retry budget and raising `requests` exceptions, with
+  all three call sites repointed.
+- **Split `tests/test_telemetry_markers.py` by marker family, and re-measure this list first (added
+  2026-09-01, forge R7).** That file is **2,283** lines and each marker family's tests are already
+  independent, so splitting it is mechanical the next time anything touches it. The sizes in the
+  first bullet are all pre-`276ecf2` (2026-08-27, "split the six monolith modules"), which closed
+  more than it recorded: `ablation/cli.py` is **972** not 2,206, `agentic/loop.py` **683** not 1,684,
+  `agentic/tools.py` **624** not 1,047, `parsing.py` **432** not 1,135. Meanwhile `prompts.py` grew
+  to **1,691** and `resolution_source.py` to **1,294**, and three files over the ceiling are listed
+  nowhere: `research/financial_data.py` **1,365**, this test file, and `tests/test_agentic_tools.py`
+  **2,021**.
+
+  **Re-measured 2026-09-02, and one of them is closed.** `tests/test_resolution_source_provider.py`
+  (2,054 lines, the largest test file with no entry anywhere) is SPLIT: its three declared layers are
+  now `tests/resolution_source/test_resolution_source_helpers.py` (528),
+  `test_resolution_source_fetch.py` (1,070) and `test_resolution_source_provider_gating.py` (424),
+  with the fake aiohttp session and the HTML page builders in `tests/resolution_source_fakes.py`
+  (266) and the autouse DNS stub plus the page fixtures in the package's own `conftest.py`, following
+  the `tests/ablation/` precedent. Same 147 tests, none rewritten. The Tier-2 Datawrapper suite MOVED
+  into that package too (`tests/resolution_source/test_resolution_source_datawrapper.py`), dropping its
+  own copy of the autouse DNS stub, its own question builder and a twice-inlined Infogram embed literal
+  in favour of the conftest's and the fakes module's; same collected count. **`tests/test_prompts.py` is
+  also SPLIT** (2026-09-02 forge R11, at 2,192 lines): its three surfaces are now
+  `tests/prompts/test_base_prompt_rules.py`, `test_structured_block.py` and
+  `test_research_clauses.py`, with the question stubs and prompt renderers in
+  `tests/prompt_builders.py`. Same 166 tests, none rewritten, and the package needs no `conftest.py`
+  because nothing in it wants a fixture. Everything
+  else on this list grew again: `tests/test_telemetry_markers.py` **2,428**,
+  `tests/test_agentic_tools.py` **2,235**, `prompts.py` **1,805**, `resolution_source.py` **1,382**,
+  `research/financial_data.py` **1,033** (down, after `currency_pegs.py` and `fred_rendering.py`
+  came out of it). Read the prompts.py and resolution_source.py figures as a snapshot taken while
+  the 2026-09 bundle was still being edited. The re-measure keeps going stale because nothing
+  updates it except a round that trips over it, so measure before acting rather than quoting these.
+- **Dedupe the peg anchor when two tickers share one (added 2026-09-01, forge R15).** The bundle's
+  peg-anchor block is decided per ticker inside `_fetch_yfinance_data`
+  (`research/financial_data.py`), so a question naming two pegged crosses that share an anchor
+  (SZL and LSL both anchor on `ZAR=X`) or naming the anchor itself beside a pegged cross renders
+  that anchor block twice, at the cost of one extra yfinance call (free, and the render is the
+  actual cost). Skipped as a corner case; the fix is a dedupe in the job builder, natural to do
+  when the peg table moves out to its own `currency_pegs.py` per the split above.
 
 ## Medium-term (requires more exploration)
 
@@ -1392,9 +2137,18 @@ now the wrong one.
 
 Ask LLMs to parameterize a mixture (2-3 components: mean, std, weight) instead of percentiles, for
 smoother CDFs (Mantic reports good results). **Note:** a mixture path
-(`NumericStructured.mixture_components` + router branch) was built and REMOVED 2026-07-08 after zero
-prod fires — percentiles+PCHIP beat it in every benchmark (`mixtures.py` library preserved but dormant).
-Re-proposing the LLM-parameterized-mixture form has to clear that bar.
+(`NumericStructured.mixture_components` + router branch) was built and REMOVED 2026-07-08 (landed on
+main in `642b027`, 2026-07-11) because percentiles+PCHIP beat it in every benchmark; the `mixtures.py`
+library is preserved but dormant. **The removal was justified at the time as "zero prod fires", which
+turned out to be wrong.** The 2026-08-24 counterfactual round proved one confirmed prod fire (q43826,
+2026-06-06, gemini-3.1-pro, whose published CDF reproduces bit-exactly only through the mixture
+branch) and one rejected attempt (q43913, 2026-06-11, gpt-5.4). The removal decision itself stands on
+the benchmarks; do not cite "zero prod fires" as its evidence. Re-proposing the
+LLM-parameterized-mixture form has to clear the benchmark bar.
+(`scratch/residual_2026-08-24/dim_discrete-maxstep-counterfactual.md`, "Two side findings worth
+carrying forward" item 1; the same correction is in AGENTS.md's
+"Probabilistic tools" mixture-of-normals bullet. Corrected here 2026-09-02 after surviving three
+residual rounds.)
 
 ### Aggregation strategy improvements
 
@@ -1492,7 +2246,8 @@ Notes on the story:
 **Ongoing monitor: `metaculus_bot/performance_analysis/width_monitor.py`** (read-only, free — not cost-gated).
 Run: `uv run python -m metaculus_bot.performance_analysis.width_monitor --cached scratch/coherence_2026-07-15/perf_all_tagged.json`
 (or `--tournament <slug>` for a live read-only pull; `--output-json <path>` to persist;
-`--exclude-qids known_bug` drops the 43746/43747 open-bound bug pair that every other residual dimension already
+`--exclude-qids known_bug` drops the known-pipeline-bug cohort — 43746/43747 (open-bound arithmetic bug) plus
+43913 (pre-`9f1175c` discrete max-step cap) — that every other residual dimension already
 excludes, and renders the dropped count so the exclusion is never silent). Per config era it reports
 central-80% / central-50% coverage with Jeffreys CIs, cov@10/50/90, PIT std (uniform ideal 0.289 — below ⇒ too
 wide, above ⇒ too narrow), median relative band width `(P90−P10)/|P50|` as the raw sharpness metric, and
@@ -1564,6 +2319,39 @@ hedge-audit narrowing push and Step-9b's LOW→wide IQR prescription from the nu
    pooled across treated and untreated. Split them and the anchor-effect read is unblocked — read
    `anchor_present=False` through `anchor_confidence`, since a trimmed comment-backfill record can
    read absent when it isn't.
+
+### Starved outer tails: the detector shipped, the publish-time WARN did not (added 2026-09-01, medium)
+
+`scan_outer_tails` (`performance_analysis/outer_tail.py`, rendered by the width monitor's CLI)
+landed 2026-09-01. It finds a defect distinct from the max-step smear: on an open bound the
+declared outer tail can route past the displayed range entirely, leaving every in-range bin above
+the members' declared p99 pinned at the platform's per-bin minimum step, so any resolution in that
+band earns the same ~−219 floor score whatever the grid size. That makes it a cliff at a fixed
+location rather than a band of the wrong width, which is why widening does not address it and why
+the standing `k_tail` hold above is not in tension with the detector. Two items are open.
+
+1. **No publish-time `STARVED_OUTER_TAIL` WARN, deliberately, and a second trigger to calibrate if
+   one is wanted.** On DISCRETE questions — exactly where both motivating records live, q45218 and
+   q44182 — `numeric.pipeline._build_discrete_distribution` overwrites `declared_percentiles` with a
+   resample grid pinned to the raw bounds, so a detector reading that field at publish time would put
+   the anchor AT the bound and quietly never fire on the cohort it exists for. (Same trap
+   `log_open_bound_piling_diagnostics` dodges by taking the sanitized declarations as an argument.)
+   Firing correctly on the published aggregate needs each member's sanitized declarations threaded
+   from `forecaster_runners` to the aggregation site, which is new plumbing on the publish path. **The
+   alternative that needs no plumbing is to locate the band WITHOUT the declaration — the terminal run
+   of bins sitting at the minimum step.** That is a second trigger definition with its own
+   calibration, so it was written down rather than improvised; the reasoning is in the code comment
+   above `STARVED_OUTER_TAIL_FLOOR_MULTIPLE`. No telemetry marker is registered while the WARN does
+   not exist.
+2. **The prevalence is a watch item, and it stays gated on the `k_tail` hold.** The shape is
+   SYSTEMATIC, not a per-question accident: 68 of the 417 measurable open-bound sides in the archived
+   cohort fire, across 49 distinct questions, 19 of them starved on BOTH sides, and the distribution
+   is bimodal with 44 sides sitting essentially exactly at the pipeline's own applied floor (~1.1x the
+   platform minimum). So read a fire as "this question carries a cliff", not "something broke here".
+   Whether that prevalence justifies revisiting the CDF construction itself is an operator decision
+   and explicitly out of scope of the detector; nothing about it licenses a width change, since the
+   whole point is that the band is at the structural floor rather than the wrong width. Receipts:
+   `scratch/next_season_bundle_2026-09/item19/`.
 
 ### Ideas reverse-engineered from high-scoring competitor bots (added 2026-06-26)
 
@@ -1638,24 +2426,37 @@ priority audit.
 
 **Operator decision 2026-08-25 — moved off top-priority to LOW so it stops resurfacing.** Two
 reasons, both about today's configuration rather than the idea's merit: stacking is prod-disabled,
-so spread gates nothing we currently ship, and the measured trigger is dead for binaries on the
-3-member roster (0/4 would have fired; the gate fires on ~1/3 of questions overall and only in the
-numeric family). Revive if the roster grows back or stacking is re-enabled — and re-derive the
-binary threshold rather than inheriting it.
+so spread gates nothing we currently ship, and the measured trigger looked dead for binaries on the
+3-member roster (0 of 4 would have fired). **The second reason is now known to be wrong**: at
+n=11 the gate fires on 4 of 11 triple binaries, so the parking decision stands on the
+stacking-disabled reason alone; see the trigger measurement below before quoting the LOW label as
+evidence about the idea. Revive if the roster grows back or stacking is re-enabled, and re-derive
+the binary threshold rather than inheriting it.
 
-**Trigger measurement (load-bearing, read first — re-priced 2026-08-24 on the live roster).** The
-modal worst-miss remains consensus-with-zero-dissenters under a shared briefing (2026-07-18,
-reconfirmed 2026-08-24), so **spread carries no directional information when the ensemble shares an
-attractor**. On the frozen triple the gate also fires far less than the post-flip data implied: a
-3-member range is ~4x narrower (mean binary published range 0.055 vs 0.244 on ~6 models), and the
-first prod measurement (`skipped_config_off` telemetry, 13 spread-computable triple questions) has
-it firing on **~1/3 of questions instead of the 78–80% post_flip implied — and entirely
-numeric-family** (2/2 numeric, 3/4 discrete, 0/4 binary, 0/3 MC; triple binary spreads run
-0.04–0.08 against the 0.15 threshold). In practice this is a **numeric-only lever on the current
-roster**, addressing the disagreement subset only; do not expect it to fix the current worst
-misses. The consensus-miss counters are separate items (gap-fill v2 verify / DISCREPANCY channel;
-cross-question coherence / resolution-metric verification checks from the residual rounds).
-(`scratch/residual_2026-08-24/dim_consensus-dissent.md` §5b, `dim_aggregation-stacker.md` §4.)
+**Trigger measurement (load-bearing, read first; first priced 2026-08-24 on the live roster,
+re-measured 2026-08-31 and again 2026-09-01 as the triple cohort grew).** The modal worst-miss
+remains consensus-with-zero-dissenters under a shared briefing (2026-07-18, reconfirmed
+2026-08-24), so **spread carries no directional information when the ensemble shares an
+attractor**. On the frozen triple the gate does fire less often than the post-flip data implied,
+but the type story the first measurement told was an n=4 artifact. The 2026-09-01 recount over the
+STRICT triple cohort (`skipped_config_off` telemetry, 30 questions, the marker agreeing with a
+recomputed spread on 31 of 31 comparable records) has the gate firing on **15 of 30 questions:
+binary 4 of 11, MC 0 of 6, numeric 6 of 7, discrete 5 of 6**. So this is a **numeric-DOMINANT
+lever on the current roster, not a numeric-only one.** The correction matters because "dead for
+binaries" is the kind of statement that would stop the item ever being revisited, and the two
+newest binary firings are the widest three-member binary spreads on record (0.38 and 0.33 against
+the 0.15 threshold). MC is the only cell still empty. The three supporting figures the earlier
+measurement carried are superseded by the same recount: triple binary spreads run **0.0100 to
+0.3800** rather than 0.04 to 0.08, the three-member narrowing is **1.63x on the mean and 1.90x on
+the median** rather than about 4x, and the binary at-threshold rate is **36.4% against 63.0% for
+post_flip** rather than zero. The lever still addresses the disagreement subset only, so do not
+expect it to fix the current worst misses; the consensus-miss counters are separate items
+(gap-fill v2 verify / DISCREPANCY channel; cross-question coherence / resolution-metric
+verification checks from the residual rounds).
+(First pricing: `scratch/residual_2026-08-24/dim_consensus-dissent.md` §5b and
+`dim_aggregation-stacker.md` §4. Correction and recount:
+`scratch/residual_2026-08-31/dim_aggregation-stacker.md` §1 and
+`scratch/residual_2026-09-01/dim_aggregation-stacker.md`, ledger row 20.)
 
 **What.** On questions where forecaster spread exceeds the existing CONDITIONAL_STACKING
 thresholds (~30% of questions per the one recorded estimate): run the EXISTING crux extractor →
@@ -1989,8 +2790,15 @@ here so future sessions don't re-recommend them without new data.
 - **Anchor-floor guard on cheap tails** — median-band variant sign-flips (fall +1.68 / spring −2.19 total
   Brier at 10pp) because 76% of parsed anchor bands are degenerate points; union-band variant is
   sign-consistent but 100% top-5-concentrated (1–2 Qs/era) and catches 1/5 of known misses; same-side tail
-  clamping hurts both well-powered eras. Revival: ≥50 current-roster binaries with `base_rate_anchor`
-  telemetry (`30bca2f`, live on main 2026-07-11T16:37Z in `642b027`) AND an era-stable, top-5<50% replay.
+  clamping hurts both well-powered eras. Revival was: ≥50 current-roster binaries with
+  `base_rate_anchor` telemetry (`30bca2f`, live on main 2026-07-11T16:37Z in `642b027`) AND an
+  era-stable, top-5<50% replay. **That condition can no longer accrue as of 2026-09-02**: the
+  2026-09 bundle removes the `base_rate_anchor` elicitation from the binary prompt (Item D of
+  `scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md`), so the count is frozen
+  at about 40 triple-era binaries. Reviving this guard now starts with re-adding the field, which is
+  a prompt change and a config-era boundary; see the closed "Telemetry-first guard revival program"
+  entry. Note separately that the anchor-overshoot variant of the idea was measured and rejected on
+  its own evidence in 2026-08-31 (its entry is beside the numeric tail-consistency check).
   `.../GUARD1_FINDINGS.md`.
 - **No-market-no-extremize cap** — feasibility kill: market-presence signal exists in ~one era (fall 89%
   NO_SIGNAL, `## Prediction Market Snapshot` in exactly 1 archived binary), so era-stability un-testable;
@@ -2064,3 +2872,194 @@ live-API audit of surfacing crowd-signal informativeness in research packets.
 Meta-Analysis`, `## Meta-Analysis`, `# Meta-Analysis and Synthesis`) plus the tri-state + legacy markers.
 Unlocked the May 2026 stacker treatment-effect estimate (`analysis_stacking_historical_treatment.md`) —
 first measurable signal (n=8 stacker-ran, −0.090 Brier vs counterfactual, P(helped)=89.8%).
+
+### GitHub-runner egress reputation is the dominant cause of resolution-source 403s (added 2026-09-03; LOW priority by operator decision)
+
+The archived `blocked` fetches on bls.gov, cdc.gov and fsis.usda.gov (Akamai edges) do NOT
+reproduce from the operator's laptop or EC2 box with the bot's own aiohttp session and headers;
+only the GitHub Actions runner gets 403 (`scratch/fetch_ladder_2026-09-03/replay_report.md`,
+plan `scratch_docs_and_planning/fetch_ladder_plan_2026-09-03.md`). The free GHA diagnostic in
+that plan's step 0 decides whether TLS impersonation helps from the runner. If it does not, the
+only structural fix is an egress that is not a GitHub runner (an HTTP proxy on the operator's EC2
+box, or a self-hosted runner). Operator 2026-09-03: "probably too complicated" — park here; the
+Wayback and url_context rungs cover the class in the meantime. The same runner-side cause is
+consistent with GitHub cron gaps (q45092 forfeited 2026-09-01: the 00:05Z fire saw 0 questions
+and the next fire was 04:55Z, past a 2.8-hour window).
+
+### Chromium teardown noise after a render: cause found, fix not shipped (added 2026-09-03; LOW)
+
+The phase-3 QA sweep (`/tmp/fetchprobe/qa_report_phase3.md`, P3-10) still saw two
+`TargetClosedError` tracebacks and one `Task was destroyed but it is pending!` right after the
+companiesmarketcap render, despite the `unroute_all(behavior="ignoreErrors")` guard in
+`research/rendered_fetch.py:_render_in_browser`. Read against Playwright 1.61.0's own source, the
+guard covers less than its comment claims. `RouteHandler.stop("ignoreErrors")` only flags the
+handlers so exceptions INSIDE a route callback are swallowed; it does nothing for the task
+`BrowserContext._on_route` spawns in its `finally` (`asyncio.create_task(...
+_update_interception_patterns())`) once `_routes` is empty, which is exactly the state
+`unroute_all` puts the context in. Every route event still in flight at that moment therefore
+fires one un-awaited protocol send that races our `context.close()` / `browser.close()`, and
+loses as either an unretrieved `TargetClosedError` or a task destroyed pending when the driver
+connection drops its callbacks. `BrowserContext.close()` itself does not stop handlers.
+
+Candidate fix: close the PAGE before unrouting (`page.close()` then `unroute_all` then
+`context.close()` then `browser.close()`), which is Playwright's documented order and makes
+`_on_route` return early ("we stall all requests right away") for anything arriving after,
+shrinking the window without closing it. Not shipped because it is a teardown-order change in
+timing code with no fake-driven test that can prove it (the suite refuses real launches) and one
+more un-timed IPC in the rung's tail; it needs a live render against a busy page to verify.
+Since 2026-09-03 the rung is bounded at the remaining wall budget either way, so the noise costs
+log readability, not pages.
+
+### The rendered DOM ceiling is the real bound on post-render extraction cost (added 2026-09-04; LOW)
+
+`RENDERED_DOM_MAX_CHARS` is 5 MiB, sized to the response cap for memory. The rendered rung hands
+the browser its whole remaining wall budget and classifies the DOM afterwards, and every
+trafilatura pass over that DOM is unbudgeted CPU inside the 2 s margin the rung leaves the
+provider's outer `wait_for`, which discards every page the question already fetched when it
+fires. Measured 2026-09-04 on the operator's laptop, synthetic div-soup dashboard DOM: the
+default pass 1.1 / 2.6 / 8.3 s and the precision pass 1.5 / 3.2 / 9.7 s at 1 / 2 / 5 MiB
+(nested menu lists run 5-10x cheaper; the second forge pass measured 42 s for both passes at
+5.2 MiB on a heavier synthetic tree). The same-day fix bounds only the SECOND pass
+(`RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S`: skipped under the floor, with the default
+text withheld as if the pass had failed), which can only ever withhold. The first pass is still
+unbounded, and at 5 MiB it alone overruns the margin on this laptop, let alone on a GitHub
+runner sharing its thread pool with up to five sibling URLs. The lever is the ceiling: 1-2 MiB
+would hold the default pass to a few seconds. Not moved in this bundle because nothing measures
+how many rescuable DOMs sit between 1 and 5 MiB (the phase-3 QA sweep's 12 rendered successes
+were all far smaller). Read the fall season's `route=rendered` successes first; if none of them
+needed the band, lower the ceiling, and if some did, the alternative is a reserve inside the
+render budget sized to the DOM the browser actually returned.
+
+### The HTML extraction runs inside the per-host gate and the open response (added 2026-09-04; LOW)
+
+`_fetch_one_hop` holds the loop-wide per-host `Semaphore(1)` and the aiohttp response context
+across the HTML branch's `to_thread` extraction, on the grounds that trafilatura on a capped page
+is short next to the request it follows. Since extractor policy D (2026-09-03) that branch can
+run TWO trafilatura passes, and since the same day the gate is process-wide, so a second pass on
+a large body holds every other question's request to that host and keeps the connection open
+meanwhile. The 2026-09-04 wall-budget floor on the second pass bounds the worst case; it does not
+move the work. The structural fix is the one the PDF branch already has: hand the body back as a
+pending classification (`_PendingDocument`'s shape) and extract after both contexts have exited.
+Not done in this bundle because it re-orders the meta-refresh hop (which needs the decoded text
+inside the loop) around the release, in the one choke point every hop passes through, for a
+hazard nothing has yet measured. Measure first: the `RESOLUTION_SOURCE_FETCH` line has no
+per-fetch extraction time, so add one before deciding.
+
+### Rendered companiesmarketcap table drops the company names and corrupts the rank cell (QA P3-6, added 2026-09-04; LOW)
+
+From the phase-3 QA sweep (`/tmp/fetchprobe/qa_report_phase3.md`, P3-6): the rendered
+`https://companiesmarketcap.com/` page (`route=rendered`, 5,589 chars) extracts every row as
+`| <rank> | <market cap> | <price> | <today %> | <country> |` with the Name column empty, and
+ranks 16, 21, 25, 29 read `116`, `221`, `925`, `329` because a movement badge is concatenated
+onto the rank. The market caps are present and in order, so the question it served ("How many
+trillion-dollar companies...") stays answerable; a question about which company holds which rank
+would not be. Extraction quality, not routing: the rung fetched and classified the right page,
+and what is wrong is how trafilatura flattened two of its cells. The DOM has not been examined
+(the QA sweep recorded the rendered text, not the markup), so the cause is unconfirmed; the
+shape suggests a name cell whose only text is inside a nested element trafilatura drops and a
+rank cell carrying a second inline element. Deferred as LOW because the fix is a cell-flattening
+pass before extraction that wants a corpus of rendered tables to calibrate against rather than
+one page, and the ARIA rewrite does not apply (this is a real `<table>`). Revisit if a
+resolution criterion keys on a ranking.
+
+### The PDF parse overruns `max_seconds`, and a cancelled parse hands its gate permit back while the worker runs (added 2026-09-04; LOW)
+
+`extract_pdf_text` (`research/document_text.py`) takes a `max_seconds` budget, and three steps run
+before the clock for that budget exists. Call those three steps the prologue. First, `_page_count`
+is `len(reader.pages)` (:250), which measured 2.365 s on the operator's laptop for a PDF declaring
+100,000 pages in a 12.78 MB body, and `DOCUMENT_TEXT_MAX_PAGES = 400` does not bound it. Second,
+`_read_outline` (:254) walks the whole bookmark tree, and it runs before `_read_pages` (:255),
+which is where `deadline = monotonic() + max_seconds` is finally computed (:471). Third, on the
+resolution-source route the same worker runs `digest_pdf` after the pages
+(`research/resolution_source.py:1568-1592`, 96 ms to 235 ms per 400-page document by that
+function's own measurement). The page loop then reads its deadline only after `_page_text` returns
+(:476), so the page in flight always completes. The module docstring (:451-469) and the
+`DOCUMENT_TEXT_MAX_SECONDS` note in `constants.py` (:730-740) described the between-pages
+checkpoint and the single-page overrun and said nothing about the prologue; both were corrected on
+2026-09-04, which is the only change this finding landed.
+
+The prologue's cost is seconds rather than indefinite, because pypdf 6.16.2 caps its own outline
+traversal at `OUTLINE_MAX_ENTRIES = 100_000` and `OUTLINE_MAX_DEPTH = 100`
+(`pypdf/_doc_common.py:91-92`), caps form-XObject recursion at
+`MAX_XFORM_INVOCATIONS_PER_EXTRACTION = 5_000` (`pypdf/_page.py:101`), and
+`research/document_text.py:74-98` lowers every pypdf decoded-stream cap to 8 MB. The tree's shape
+decides its cost, so measure a NESTED tree: `_get_outline` copies its `visited` set for every
+sibling that has children (`pypdf/_doc_common.py:936-938`), which makes the walk superlinear.
+Measured in memory with pypdf 6.16.2 on the operator's laptop on 2026-09-04, nested: 20,000
+entries 1.105 s, 40,000 entries 3.279 s, 80,000 entries 11.623 s, and 100,000 entries in a
+20.57 MB file 13.7 s. The same sizes flat: 0.757 s, 1.960 s, 4.047 s. A bound derived from the flat
+figures comes out about 3x too optimistic. One body under `DOCUMENT_TEXT_PDF_MAX_BYTES` = 40 MB can
+carry both a page-bloated tree and a 100,000-entry nested outline, so the prologue's measured
+ceiling is about 16 s, and an abandoned worker's whole life is the prologue plus `max_seconds` plus
+one page plus the digest, about 36 s to 40 s worst case on that laptop.
+
+The second half of the finding is what happens to the parse gate. Both PDF routes take the shared
+two-slot `http_fetch.pdf_parse_semaphore()` (:234-272), and one of its two slots is a gate permit.
+`asyncio.to_thread` cannot cancel a worker that has already started, since
+`concurrent.futures.Future.cancel` refuses a RUNNING future, so a cancellation discards the result
+and nothing else. The resolution-source route releases the permit in a `finally`
+(`research/resolution_source.py:1707-1725`) and the gap-fill v2 route uses a bare `async with`
+(`research/agentic/local_document.py:175-184`), so on both routes the permit comes back at once
+while the worker keeps burning the GIL. Reproduced empirically on 2026-09-04 in this repo's venv:
+cancelling a coroutine that held an `asyncio.Semaphore(2)` around `asyncio.to_thread` returned the
+permit immediately and the worker ran its full body afterwards. So the gate stops bounding parse
+concurrency exactly when the run is loaded, which is the job it exists for. Six concurrent parses
+of a 220-page document took 10.20 s against 1.66 s solo, and each parse's `max_seconds` is
+wall-clock, so a live parse alongside an abandoned one truncates because of concurrency rather than
+because of its own document's size. The visible symptom is a digest built from fewer pages, so the
+cost is research recall and latency. Nothing raises, no forecast is corrupted, and no money is
+spent.
+
+Gap-fill v2 is the exposed route. Its parse gets the full `DOCUMENT_TEXT_MAX_SECONDS` = 20.0 behind
+an unbounded acquire, under the 25 s `_LOCAL_DOCUMENT_BUDGET_S` wall
+(`research/agentic/tools.py:114,534`), so cancellation partway through a parse is the ordinary case
+there. The resolution-source route is defended by construction: the parse is pre-skipped below
+`RESOLUTION_SOURCE_PDF_MIN_BUDGET_S` = 3.0, the acquire is bounded and degrades to a labelled
+`parse_contention` skip, and `max_seconds` is `min(DOCUMENT_TEXT_MAX_SECONDS, budget_s)` inside the
+45 s wall, so a cancellation there needs a genuine overrun, which only the prologue and the last
+page can produce.
+
+One adjacent weakness, recorded because the name is misleading. `OUTLINE_MAX_ENTRIES_WALKED` =
+2,000 (`research/document_text.py:513,530`) counts entries APPENDED, so a nested list or an
+untitled `Destination` is popped without incrementing it and the walk can traverse pypdf's whole
+tree. pypdf's own 100,000-entry cap is what ends it. Counting every popped item instead would
+tighten the bound in one line, and it was left alone on 2026-09-04 because
+`tests/test_document_text.py::TestOutline::test_a_pathologically_deep_outline_does_not_raise` sizes
+its fixture from `sys.getrecursionlimit()` plus 200, which would couple that test to the cap, and
+because a legitimately deep tree would then yield fewer titled entries than today.
+
+Four remedies, all deferred, in the order a follow-up should consider them. (1) Lower pypdf's
+`OUTLINE_MAX_ENTRIES` at import, the way this module already lowers four decoded-stream caps.
+Verified on 2026-09-04 that with the cap at 2,000 a 40,000-entry nested tree raised
+`LimitReachedError` in 0.076 s instead of costing 2.994 s, and `LimitReachedError` is a
+`PyPdfError`, already listed in `_PDF_ERRORS`, so `_read_outline` degrades it to `()` with no other
+change and no clock plumbing. A cap of 20,000 would hold the walk near 1 s and keep every
+realistic government report. It is a real bound, and it still loses the outline lines of a document
+above the cap, so it needs sign-off. (2) Compute one deadline at the top of `extract_pdf_text`,
+read the pages first, and read the outline only if the deadline has not passed. About 25 lines plus
+two tests using the existing `_FakeClock`, and it stops the un-clocked step from front-running the
+clocked one. Deferred for two reasons: it drops the outline whenever the page read consumed the
+budget, and `truncation_note` has no clause for that, so the loss is undisclosed, which is the
+ambiguity the module's own docstring refuses; and it only moves the cost, since the outline still
+runs its full walk un-clocked whenever the pages finish early. (3) Hold the gate permit until the
+abandoned worker finishes. Shielding stretches the 45 s provider wall to as much as 65 s, and
+releasing from a done-callback leaks the permit whenever the callback never fires, which wedges a
+gate every question's PDF read passes through. Item 5 of the resolution-source list earlier in this
+file (FUTURE.md:1272) already rejected a hand-rolled acquire and release on a process-wide permit
+for that reason. (4) Run the parse in a
+subprocess for a hard kill. The only true bound, and a large build with its own failure modes:
+pickling up to 40 MB of body per parse, spawn cost on macOS and in the suite, a child that does not
+inherit the import-time pypdf caps under spawn, and extra resident memory on a runner.
+
+Measure before picking one. On the resolution-source route the figure already exists: `attempt.wall_s`
+is stamped around exactly the `to_thread` parse and digest (`research/resolution_source.py:1713-1723`,
+deliberately excluding the queue wait) and rides the registered `RESOLUTION_SOURCE_ESCALATION`
+marker, whose `rung` domain includes `pdf_local`, so the fall season's archive answers how often a
+parse overruns `min(20, budget)` with no code change. Only gap-fill v2 lacks it:
+`AGENTIC_FETCH_LOCAL_DOC` carries url, method, chars, pages and passages and no elapsed figure
+(`scripts/telemetry/markers.py:416-418`, emitted at `research/agentic/local_document.py:254`), so
+appending an `elapsed_s=` field there is the additive marker change that closes the measurement
+gap. Two costs to price at the same time: bounding v2's currently-bare acquire hands the document
+to the PAID Gemini `url_context` reader on expiry, as that module's own comment at :164-167 says,
+so any v2 gate tightening is a cost-gate item; and nothing today records that a worker was
+abandoned at all, so the frequency of the whole failure is unmeasured.

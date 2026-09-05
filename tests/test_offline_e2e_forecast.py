@@ -654,7 +654,7 @@ def _install_provider_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(prediction_market, "_get_session", _FakeHttpSession)
     monkeypatch.setattr(resolution_source, "_get_session", _FakeHttpSession)
     # resolution_source runs a getaddrinfo SSRF preflight on every URL; example.gov
-    # has no real DNS, so return a public IP (mirrors test_resolution_source_provider).
+    # has no real DNS, so return a public IP (mirrors tests/resolution_source/conftest.py).
     monkeypatch.setattr(
         resolution_source.socket,
         "getaddrinfo",

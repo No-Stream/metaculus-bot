@@ -13,7 +13,7 @@ which providers a historical bundle carried.
 
 import re
 
-from metaculus_bot.prompts import TS_ANCHOR_SECTION_HEADER
+from metaculus_bot.prompts import MARKET_SNAPSHOT_SECTION_HEADER, TS_ANCHOR_SECTION_HEADER
 from metaculus_bot.research.provider_diagnostics import ProviderResult
 
 _LEADING_HEADING_RE = re.compile(r"^(#{1,2})(?=\s|$)", re.MULTILINE)
@@ -28,7 +28,7 @@ PROVIDER_SECTION_HEADERS: dict[str, str] = {
     "gemini_search": "## Web Research (Google Search via Gemini)",
     "financial_data": "## Financial & Economic Data",
     "timeseries_anchor": TS_ANCHOR_SECTION_HEADER,
-    "prediction_market": "## Prediction Market Snapshot",
+    "prediction_market": MARKET_SNAPSHOT_SECTION_HEADER,
     "resolution_source": "## Resolution Source Snapshot",
     "exa": "## Web Research (Exa)",
     "perplexity": "## Web Research (Perplexity)",

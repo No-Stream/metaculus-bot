@@ -192,8 +192,11 @@ def _mc_option_probs_from_block(body_text: str) -> dict[str, float] | None:
 #
 # Historical blocks (pre-2026-07-08 prompt era) carry retired tier-2 scaffold
 # fields (``mixture_components``, ``tails``, ``distribution_family_hint``, the
-# old ``scenarios`` shape) or values the current strict schemas reject
-# (``concentration: 0.0``). ``parse_structured_block`` uses extra="forbid"
+# old ``scenarios`` shape). The retired KEYS are what still needs this rung; the
+# other historical offender, an edge-value ``concentration: 0.0``, does not — since
+# 2026-09-02 the strict MC schema reads an unusable ``concentration`` / ``other_mass``
+# as absent rather than rejecting the block, so those comments now resolve on the
+# strict rung. ``parse_structured_block`` uses extra="forbid"
 # schemas, so it returns None for the ENTIRE block even though the declared
 # forecast values inside are fine. Models that emitted block-only rationales
 # with no prose value lines (gemini-3.1-pro in the 2026-05/06 era) then vanish

@@ -39,7 +39,7 @@ from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.llm_retry import TRANSIENT_RETRY_MAX_ELAPSED_S
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
-from metaculus_bot.value_extraction import ExtractionOutcome
+from metaculus_bot.value_extraction import ExtractionOutcome, McForecast
 
 
 @pytest.fixture
@@ -88,12 +88,18 @@ def _binary_outcome(value: float) -> ExtractionOutcome[float]:
     return ExtractionOutcome(value=value, rung="block", block_present=True)
 
 
-def _mc_outcome(pol: PredictedOptionList) -> ExtractionOutcome[PredictedOptionList]:
-    return ExtractionOutcome(value=pol, rung="block", block_present=True)
+def _mc_outcome(pol: PredictedOptionList) -> ExtractionOutcome[McForecast]:
+    return ExtractionOutcome(
+        value=McForecast(pol, [o.probability for o in pol.predicted_options]), rung="block", block_present=True
+    )
 
 
 def _make_option_list(options: list[tuple[str, float]]) -> PredictedOptionList:
     return PredictedOptionList(predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in options])
+
+
+def _member_forecast_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("MEMBER_FORECAST:")]
 
 
 _STANDARD_PERCENTILES: list[Percentile] = [
@@ -129,8 +135,12 @@ class TestRunBinaryForecast:
         assert result.reasoning == reasoning_text
 
     @pytest.mark.asyncio
-    async def test_clamps_below_minimum(self, binary_question, forecaster_llm, parser_llm) -> None:
-        """Values below BINARY_PROB_MIN are clamped up."""
+    async def test_clamps_below_minimum(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Values below BINARY_PROB_MIN are clamped up, and the MEMBER_FORECAST line
+        keeps the pre-clamp value beside the published one."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
         with (
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="Very unlikely")),
@@ -142,10 +152,17 @@ class TestRunBinaryForecast:
             result = await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
 
         assert result.prediction_value == BINARY_PROB_MIN
+        assert _member_forecast_lines(caplog) == [
+            f"MEMBER_FORECAST: question=1001 model=test-forecaster role=member qtype=binary "
+            f"raw=0.001 published={BINARY_PROB_MIN}"
+        ]
 
     @pytest.mark.asyncio
-    async def test_clamps_above_maximum(self, binary_question, forecaster_llm, parser_llm) -> None:
-        """Values above BINARY_PROB_MAX are clamped down."""
+    async def test_clamps_above_maximum(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Values above BINARY_PROB_MAX are clamped down, with the raw value on the marker."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
         with (
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="Nearly certain")),
@@ -157,6 +174,10 @@ class TestRunBinaryForecast:
             result = await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
 
         assert result.prediction_value == BINARY_PROB_MAX
+        assert _member_forecast_lines(caplog) == [
+            f"MEMBER_FORECAST: question=1001 model=test-forecaster role=member qtype=binary "
+            f"raw=0.999 published={BINARY_PROB_MAX}"
+        ]
 
     @pytest.mark.asyncio
     async def test_extraction_rung_logged_via_real_ladder(
@@ -304,7 +325,9 @@ class TestForecasterChartVision:
                 ),
             ),
             patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(_STANDARD_PERCENTILES, None)),
-            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+            patch(
+                "metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()
+            ) as mock_build,
             patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
             patch("metaculus_bot.forecaster_runners.log_final_prediction"),
             patch("metaculus_bot.forecaster_runners.log_open_bound_piling_diagnostics"),
@@ -314,6 +337,8 @@ class TestForecasterChartVision:
         called_arg = _last_invoke_arg(invoke)
         assert isinstance(called_arg, VisionMessageData)
         assert called_arg.b64_image == "ZmFrZQ=="
+        # A lost model_name kwarg attributes CDF_MAXSTEP_CLIP to model=unknown silently.
+        assert mock_build.call_args.kwargs["model_name"] == forecaster_llm.model
 
 
 class TestRunMcForecast:
@@ -393,7 +418,9 @@ class TestRunNumericForecast:
                 "metaculus_bot.forecaster_runners.sanitize_percentiles",
                 return_value=(_STANDARD_PERCENTILES, None),
             ),
-            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=mock_prediction),
+            patch(
+                "metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=mock_prediction
+            ) as mock_build,
             patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
             patch("metaculus_bot.forecaster_runners.log_final_prediction"),
         ):
@@ -403,6 +430,8 @@ class TestRunNumericForecast:
 
         assert prediction.prediction_value == mock_prediction
         assert discrete_vote is True
+        # A lost model_name kwarg attributes CDF_MAXSTEP_CLIP to model=unknown silently.
+        assert mock_build.call_args.kwargs["model_name"] == forecaster_llm.model
 
     @pytest.mark.asyncio
     async def test_sanitize_percentiles_receives_the_forecaster_model_name(
@@ -507,6 +536,51 @@ class TestRunNumericForecast:
 
         assert discrete_vote is True
         assert mock_parse_structured.await_count == 0  # confirms parse_structured was never called
+
+    @pytest.mark.asyncio
+    async def test_a_misspelled_outcome_type_falls_back_to_the_parser_call(
+        self, numeric_question, forecaster_llm, parser_llm
+    ) -> None:
+        """A stray spelling costs ONE parser call and keeps the percentiles on rung 1.
+
+        The schema reads an unrecognised outcome_type as absent (2026-09-02), so the block
+        still validates and ``_resolve_discrete_vote`` takes exactly the OutcomeTypeResult
+        fallback it already has for a block that declares nothing. Under the bare Literal
+        this same rationale failed the whole numeric block, which sent the FORECAST to the
+        LLM salvage rung and fired the parser call anyway.
+        """
+        reasoning_text = (
+            "Some rationale text.\n"
+            "```json\n"
+            '{"question_type": "numeric", "outcome_type": "integer",'
+            ' "declared_percentiles": {"0.1": 10.0, "0.5": 50.0, "0.9": 90.0}}\n'
+            "```\n"
+        )
+        mock_parse_structured = AsyncMock(return_value=OutcomeTypeResult(is_discrete_integer=True))
+
+        with (
+            patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
+            patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_parse_structured),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_numeric",
+                new=AsyncMock(
+                    return_value=ExtractionOutcome(value=_STANDARD_PERCENTILES, rung="block", block_present=True)
+                ),
+            ),
+            patch(
+                "metaculus_bot.forecaster_runners.sanitize_percentiles",
+                return_value=(_STANDARD_PERCENTILES, None),
+            ),
+            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+            patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
+            patch("metaculus_bot.forecaster_runners.log_final_prediction"),
+        ):
+            _, discrete_vote = await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm)
+
+        assert discrete_vote is True
+        assert mock_parse_structured.await_count == 1
 
     @pytest.mark.asyncio
     async def test_discrete_vote_none_when_parse_fails(self, numeric_question, forecaster_llm, parser_llm) -> None:

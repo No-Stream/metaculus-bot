@@ -95,16 +95,19 @@ class TestBinaryPromptSchemaInstruction:
         assert "STRUCTURED FORECAST" in prompt
         assert prompt.rstrip().endswith("Write nothing after it."), "prompt must end with the block-is-last instruction"
 
-    def test_telemetry_fields_documented_in_binary_schema(self):
-        """Anchor + clause telemetry fields (2026-07-08) are shown in the schema
-        example AND carry fill instructions, so forecasters populate them."""
+    def test_retired_telemetry_fields_are_not_asked_for(self):
+        """The anchor + clause telemetry slots (prompted 2026-07-08, retired 2026-09-02)
+        must stay out of the binary block. Both only re-keyed prose the template already
+        forces — the Phase 1 base rate and the step-5b clause table — and their only
+        reader was telemetry behind ``PROBABILISTIC_TOOLS_ENABLED``, off in every prod
+        workflow. The schema keeps the fields tolerant for archived comments, so nothing
+        but this test stops the prompt half coming back."""
         prompt = binary_prompt(_make_binary_q(), research="R")
         structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
-        assert '"base_rate_anchor"' in structured_section
-        assert '"criteria_clauses"' in structured_section
-        # Fill instructions reference where the values come from.
-        assert "outside-view base-rate range" in structured_section
-        assert "conjunctive criteria pricing table" in structured_section.lower()
+        assert '"base_rate_anchor"' not in structured_section
+        assert '"criteria_clauses"' not in structured_section
+        assert "outside-view base-rate range" not in structured_section
+        assert "conjunctive criteria pricing table" not in structured_section.lower()
 
 
 class TestMultipleChoicePromptSchemaInstruction:
@@ -113,9 +116,18 @@ class TestMultipleChoicePromptSchemaInstruction:
         assert "STRUCTURED FORECAST" in prompt
         assert '"multiple_choice"' in prompt
         assert "option_probs" in prompt
-        # Optional tier-1 fields still shown in the example
-        for field in ("other_mass", "concentration"):
-            assert field in prompt, f"missing optional field {field!r} in MC schema"
+
+    def test_retired_dirichlet_inputs_are_not_asked_for(self):
+        """``other_mass`` and ``concentration`` were inputs to a Dirichlet tool that has
+        been dormant behind ``PROBABILISTIC_TOOLS_ENABLED`` since it shipped, and neither
+        improves a ballot: the option set is exhaustive so ``option_probs`` sums to 1
+        regardless, and 7 of 19 archived ``concentration`` fills just echoed the example's
+        20.0. Retired 2026-09-02 — asking for ``concentration`` also cost q45189 a rung-1
+        parse. The schema keeps both tolerant for archived comments."""
+        prompt = multiple_choice_prompt(_make_mc_q(), research="R")
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        assert "other_mass" not in structured_section
+        assert "concentration" not in structured_section
 
     def test_tier2_fields_not_demanded_in_mc_schema(self):
         """Tier-2 scaffold fields are no longer demanded in the MC JSON schema block (C2)."""

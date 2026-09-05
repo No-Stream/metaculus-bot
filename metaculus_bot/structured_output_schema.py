@@ -23,11 +23,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
-from collections.abc import Iterator
-from typing import Annotated, Literal
+from collections.abc import Iterator, Mapping
+from typing import Annotated, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,13 +157,13 @@ class ScenarioBranch(BaseModel):
 
 
 class BaseRateAnchor(BaseModel):
-    """The forecaster's stated outside-view base-rate range (telemetry only).
+    """The forecaster's stated outside-view base-rate range (archived blocks only).
 
-    Consumed by the anchor-overshoot telemetry in ``tool_runner``: the signed
-    pp distance of the declared posterior outside [low, high]. Never used to
-    clamp or mutate a forecast — the 2026-07 residual experiments showed
-    anchor-guard clamping sign-flips across eras, while overshoot >15pp
-    monotonically degrades Brier, so we measure and log only.
+    Prompted 2026-07-08 to 2026-09-02 and read by an anchor-overshoot telemetry line
+    that was deleted with it; it never clamped or mutated a forecast (the 2026-07
+    residual experiments buried the anchor-guard clamp for sign-flipping across eras).
+    Retained so the 49 published comments carrying the field still strict-parse in
+    ``performance_analysis``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -170,10 +179,12 @@ class BaseRateAnchor(BaseModel):
 
 
 class CriteriaClause(BaseModel):
-    """One priced resolution clause from the conjunctive-criteria table (telemetry only).
+    """One priced resolution clause from the conjunctive-criteria table (archived blocks only).
 
-    The product of clause probabilities is compared against the declared
-    posterior by ``tool_runner``; divergence is logged, never enforced.
+    Same history as ``BaseRateAnchor``: prompted 2026-07-08 to 2026-09-02, read only by a
+    clause-product divergence line that is gone, retained for the 12 published comments
+    that carry it. The clause-pricing REASONING stays in the binary prompt's step 5b —
+    what went is the JSON echo of the table.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -185,6 +196,55 @@ class CriteriaClause(BaseModel):
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _readable_optional_float(value: object, *, low: float | None, high: float | None) -> float | None:
+    """A finite float inside [low, high], or None when the declaration is unusable.
+
+    The lenient half of the 2026-09-02 retirement of ``other_mass`` / ``concentration``.
+    Both were inputs to a Dirichlet tool behind ``PROBABILISTIC_TOOLS_ENABLED`` (off in
+    prod) and neither is prompted any more, so a value that fails its range is worth
+    nothing and must cost nothing: it reads as absent instead of raising. The strict
+    version cost a real forecast — on q45189 gemini wrote ``"concentration": 0.0`` beside
+    a valid three-option ballot, the ``> 0`` check rejected the whole block, ``json_repair``
+    cannot alter valid JSON, and MC has no telemetry strip-and-retry, so the ballot was
+    re-read by the LLM salvage rung (``rung=llm`` in the extraction archive).
+
+    None is the honest reading rather than a clamp: a value outside its own range means the
+    model was not declaring the quantity we asked for, and inventing an in-range substitute
+    for a dormant field would put a number nobody stated into the archive.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        # ``json.loads`` decodes an integer literal of any length into an arbitrary-precision
+        # int, and ``float()`` on one past ~308 digits raises. Pydantic converts only
+        # ValueError and AssertionError into a ValidationError, so this would propagate out of
+        # ``model_validate`` and past ``parse_structured_payload``, whose except clause catches
+        # ValidationError only -- strictly worse than the strict code it replaced, which turned
+        # the same input into a clean rejection the ladder could fall through.
+        return None
+    if not math.isfinite(number):
+        return None
+    if low is not None and number < low:
+        return None
+    if high is not None and number > high:
+        return None
+    return number
+
+
+# The DISCRETE-vs-CONTINUOUS vote's vocabulary, declared once. ``_tolerate_unknown_outcome_type``
+# reads its accepted set off this Literal via ``get_args`` rather than restating the two strings:
+# a restated copy fails asymmetrically, since a third outcome type would pass the annotation and
+# then be silently nulled by the validator. A TUPLE, not a set: membership on a tuple compares by
+# equality, so an unhashable declaration (a list, a dict) reads as unrecognised instead of raising
+# TypeError out of the validator.
+NumericOutcomeType = Literal["discrete_integer", "continuous"]
+_NUMERIC_OUTCOME_TYPES: tuple[str, ...] = get_args(NumericOutcomeType)
 
 
 def _validate_scenario_sum(scenarios: list[ScenarioBranch]) -> list[ScenarioBranch]:
@@ -215,8 +275,12 @@ class BinaryStructured(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
     posterior_prob: float = Field(ge=0.0, le=1.0)
-    # Telemetry-only optional fields (2026-07-08): stated outside-view range and
-    # priced resolution clauses. Old blocks without them must keep parsing.
+    # ARCHIVED BLOCKS ONLY: the stated outside-view range and priced resolution
+    # clauses (2026-07-08). No longer prompted since 2026-09-02 — the block is written
+    # after the forecast is fixed, so both slots only re-keyed prose we already have, and
+    # their only reader was telemetry behind a flag every prod workflow pins off. The
+    # fields stay optional and tolerant because 49 + 12 published comments carry them and
+    # performance_analysis strict-parses those blocks.
     base_rate_anchor: BaseRateAnchor | None = None
     criteria_clauses: list[CriteriaClause] = Field(default_factory=list)
 
@@ -234,8 +298,43 @@ class NumericStructured(BaseModel):
     question_type: Literal["numeric"]
     prior: StatedPrior | None = None
     declared_percentiles: dict[float, float] | None = None
-    outcome_type: Literal["discrete_integer", "continuous"] | None = None
+    outcome_type: NumericOutcomeType | None = None
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
+
+    @field_validator("outcome_type", mode="before")
+    @classmethod
+    def _tolerate_unknown_outcome_type(cls, v: object, info: ValidationInfo) -> str | None:
+        """An unrecognised spelling reads as absent instead of failing the whole block.
+
+        ``outcome_type`` gates discrete snapping, and the block value exists to save a
+        parser-LLM call (``forecaster_runners._resolve_discrete_vote``). Under a bare
+        ``Literal`` a near-miss spelling — "integer", "discrete", "count" — took the
+        PERCENTILES down with it: the numeric block has no strip-and-retry, so the whole
+        forecast dropped to LLM salvage AND the parser call fired anyway for the type.
+        Reading the strays as None costs exactly the one parser call the field was meant
+        to save, which is the right price for a misspelling.
+
+        Logged at WARNING with the raw value, because a spelling the roster starts using is a
+        prompt signal rather than noise, but only where the caller wants failure logging.
+        ``parse_structured_payload`` hands its ``log_failures`` down as validation context, so a
+        candidate probe that will be discarded silently (``value_extraction``'s ladder probes
+        every candidate that way) drops to DEBUG. Without that gate a misspelling warned on
+        superseded draft blocks and twice per numeric forecast on the publish path, about a block
+        that validates and publishes fine, which is exactly what ``log_failures`` exists to
+        prevent. Direct construction passes no context and keeps the WARNING.
+        """
+        if v is None:
+            return None
+        if v in _NUMERIC_OUTCOME_TYPES:
+            return str(v)
+        context = info.context or {}
+        log = logger.warning if context.get("log_failures", True) else logger.debug
+        log(
+            "Unrecognised outcome_type %r in numeric structured block; reading it as absent "
+            "(the discrete vote falls back to the parser call)",
+            v,
+        )
+        return None
 
     @field_validator("declared_percentiles")
     @classmethod
@@ -251,13 +350,40 @@ class NumericStructured(BaseModel):
         for pct in v:
             if not (0.0 <= pct <= 1.0):
                 raise ValueError(f"Percentile keys must be in [0, 1], got {pct}")
+        # NON-decreasing, not strictly increasing: a repeated value is a legitimate
+        # concentrated (often count-like) declaration — p1 = p2.5 = 0 on a question that
+        # usually reads zero — and both downstream layers are built for exactly that
+        # (``value_extraction._validate_numeric`` allows ties by name, and
+        # ``sanitize_percentiles``'s cluster spreader exists to separate them). While this
+        # schema demanded a strict increase, such a block failed rung 1, could not be
+        # repaired (it is valid JSON), and reached the pipeline only via LLM salvage. A
+        # strict DECREASE with rising percentile still raises: it is incoherent, and
+        # ``sort_percentiles_by_value`` sorts by LABEL, so a value-disordered set is
+        # force-monotonized rather than reordered.
+        #
+        # This is a SAFETY NET for non-compliant output, not a licensed shape. The numeric
+        # prompt's schema notes still tell the model values must be strictly increasing, and
+        # that wording is deliberate (softening it shifts the forecast distribution, so it is
+        # the operator's call), which means the relaxation only ever engages for a forecaster
+        # that disobeys its instructions. Measured on the archive: 2 of 346 declarations carry
+        # any exact tie, both 3-anchor records from the KNOWN_BUG_QIDS cohort.
+        #
+        # It also admits a WHOLE-set collapse, which lands somewhere different from the
+        # partial tie argued for above: a 13-way tie reaches rung 1, ``sanitize_percentiles``
+        # deliberately refuses to cluster-spread it (``NUMERIC_DEGENERATE_DECLARATION`` with
+        # spread_applied=false), and ``detect_unit_mismatch`` then WITHHOLDS the member as an
+        # alertable drop, instead of the salvage rung re-reading a percentile table out of the
+        # prose. The withhold is the designed outcome for a member that declared no width, and
+        # 0 of 346 archived declarations are all-equal, so this is unobserved in prod. Do NOT
+        # add a "require at least two distinct values" branch: that is defensive branching for
+        # a zero-instance case inside the extraction fallback ladder.
         sorted_keys = sorted(v.keys())
         prev_value: float | None = None
         for key in sorted_keys:
             value = v[key]
-            if prev_value is not None and value <= prev_value:
+            if prev_value is not None and value < prev_value:
                 raise ValueError(
-                    f"declared_percentiles values must be strictly increasing with percentile; "
+                    f"declared_percentiles values must be non-decreasing with percentile; "
                     f"got {value} at pct {key} after {prev_value}"
                 )
             prev_value = value
@@ -285,15 +411,24 @@ class MultipleChoiceStructured(BaseModel):
     question_type: Literal["multiple_choice"]
     prior: StatedPrior | None = None
     option_probs: dict[str, float]
-    other_mass: float | None = Field(default=None, ge=0.0, le=1.0)
+    # ARCHIVED BLOCKS ONLY, and read leniently — see _readable_optional_float. Both were
+    # Dirichlet tool inputs; no longer prompted since 2026-09-02, and an unusable value
+    # now reads as absent rather than costing the ballot that carries the forecast.
+    other_mass: float | None = None
     concentration: float | None = None
 
-    @field_validator("concentration")
+    @field_validator("other_mass", mode="before")
     @classmethod
-    def _check_concentration(cls, v: float | None) -> float | None:
-        if v is not None and v <= 0:
-            raise ValueError(f"MultipleChoiceStructured.concentration must be > 0 if set, got {v}")
-        return v
+    def _tolerate_other_mass(cls, v: object) -> float | None:
+        return _readable_optional_float(v, low=0.0, high=1.0)
+
+    @field_validator("concentration", mode="before")
+    @classmethod
+    def _tolerate_concentration(cls, v: object) -> float | None:
+        # A concentration is a positive Dirichlet hyperparameter, so 0.0 and negatives are
+        # not readings; the widely-copied example value was 20.0, hence no upper bound.
+        read = _readable_optional_float(v, low=None, high=None)
+        return read if read is not None and read > 0.0 else None
 
     @field_validator("option_probs")
     @classmethod
@@ -526,7 +661,11 @@ def parse_structured_payload(
     rejected-then-recovered candidate doesn't emit a scary WARNING as if
     extraction failed; the telemetry-strip RECOVERY log is not gated, since it
     reports on a block that IS returned. Default ``True`` keeps every direct
-    caller's logging unchanged.
+    caller's logging unchanged. It is also handed to ``model_validate`` as validation
+    CONTEXT, because a lenient validator that reads an unusable declaration as absent
+    logs from inside the model, where it cannot otherwise see the flag: without that, a
+    suppressed probe still emitted an operator-facing WARNING about a block it was about
+    to discard.
 
     ``"discrete_count"`` is intentionally unsupported at runtime — see the
     module docstring.
@@ -536,10 +675,11 @@ def parse_structured_payload(
         return None
 
     model_cls = _QUESTION_TYPE_TO_MODEL[question_type]
+    context: Mapping[str, object] = {"log_failures": log_failures}
     try:
-        return model_cls.model_validate(payload)  # type: ignore[return-value]
+        return model_cls.model_validate(payload, context=context)  # type: ignore[return-value]
     except ValidationError as exc:
-        retry = _retry_without_binary_telemetry(model_cls, payload, question_type, exc)
+        retry = _retry_without_binary_telemetry(model_cls, payload, question_type, exc, context=context)
         if retry is not None:
             return retry
         if log_failures:
@@ -613,11 +753,15 @@ def _retry_without_binary_telemetry(
     payload: dict,
     question_type: str,
     exc: ValidationError,
+    *,
+    context: Mapping[str, object] | None = None,
 ) -> StructuredBlock | None:
     """Re-validate a failed BINARY block with only the telemetry fields dropped.
 
-    Strip-and-retry for malformed BINARY telemetry (2026-07-08). The ``base_rate_anchor``
-    and ``criteria_clauses`` fields are TELEMETRY ONLY — nothing in the pipeline reads them
+    Strip-and-retry for malformed BINARY telemetry (2026-07-08). Since 2026-09-02 the
+    prompt no longer asks for either field, so on a fresh forecast this never fires; it
+    survives for archived blocks and for a model that emits one from habit. The
+    ``base_rate_anchor`` and ``criteria_clauses`` fields are TELEMETRY ONLY — nothing reads them
     to clamp or mutate a forecast. But without this, a malformed anchor / clauses payload
     (canonical failure modes: ``criteria_clauses: null`` even though the prompt says "omit";
     a reversed ``{low > high}`` anchor) would make us drop the ENTIRE block — including a
@@ -637,7 +781,7 @@ def _retry_without_binary_telemetry(
     stripped_keys = sorted(telemetry_fields & payload.keys())
     stripped_payload = {k: v for k, v in payload.items() if k not in telemetry_fields}
     try:
-        retry = model_cls.model_validate(stripped_payload)
+        retry = model_cls.model_validate(stripped_payload, context=context)
     except ValidationError:
         return None
     logger.warning(
@@ -691,7 +835,7 @@ def parse_structured_block(
         # silently skipped (a valid block may still follow), while the final
         # failure's WARNING preserves the honest end-state signal. A single-block
         # rationale (the common case) is index==last, so its logging is unchanged.
-        parsed = parse_structured_payload(candidate, question_type, log_failures=(index == last_index))
+        parsed = parse_structured_payload(candidate, question_type, log_failures=index == last_index)
         if parsed is not None:
             if index > 0:
                 logger.info(

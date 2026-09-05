@@ -31,6 +31,15 @@ data.
 
 Scope note: ``DiscreteCountStructured`` (schema) is intentionally not
 dispatched here — discrete-count tools are phase-3 work.
+
+Some of this dispatch is unreachable on a FRESH forecast, because the prompts stopped
+eliciting the block fields it reads. The binary anchor / clause telemetry lines are gone
+outright. ``_run_mc_tools``'s declared-Other line and its Dirichlet-with-Other branch both
+key on ``other_mass`` / ``concentration``, which the MC prompt no longer asks for, so they
+fire only on an archived block or on a model emitting the field from habit; turning
+``PROBABILISTIC_TOOLS_ENABLED`` on today would produce binary lines and no MC ones. The
+schema fields stay optional so archived blocks still parse. Why those fields were retired,
+and what reviving any of it would cost, is in FUTURE.md and AGENTS.md rather than here.
 """
 
 from __future__ import annotations
@@ -49,10 +58,6 @@ from forecasting_tools import (
 )
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.comment.markers import (
-    format_anchor_overshoot_marker,
-    format_clause_divergence_marker,
-)
 from metaculus_bot.constants import env_flag_enabled
 from metaculus_bot.probabilistic_tools import (
     DEFAULT_INFORMATIVE_PRIOR_STRENGTH,
@@ -109,14 +114,6 @@ _P10_P90_Z_GAP: float = 2.5631
 # that legitimate-but-tighter forecasters don't get flagged. Defense-in-depth
 # atop the family-consistency check.
 _SPREAD_ANOMALY_RATIO_THRESHOLD: float = 0.10
-
-# Anchor-overshoot telemetry threshold (percentage points). The 2026-07-08
-# residual experiments showed overshoot beyond ~15pp past the stated
-# outside-view anchor degrades Brier monotonically in both well-powered eras.
-# TELEMETRY ONLY: overshoots past this log a WARNING for residual analysis;
-# they never clamp or mutate the forecast (the clamp variant sign-flipped
-# across eras and is buried).
-ANCHOR_OVERSHOOT_FLAG_THRESHOLD_PP: float = 15.0
 
 
 def _feature_enabled(question_type: Literal["binary", "numeric", "multiple_choice"] | None = None) -> bool:
@@ -191,85 +188,6 @@ def _format_family_consistency(result: ConsistencyResult) -> str:
     return f"- **Percentile-family consistency{flag_mark}**: claimed {claimed!r}, best-fit {best!r}{reason}"
 
 
-def anchor_overshoot_pp(posterior_prob: float, anchor_low: float, anchor_high: float) -> float:
-    """Signed pp distance of the published probability outside [low, high].
-
-    0.0 when the posterior sits inside the stated anchor range; positive when
-    it overshoots above ``anchor_high``; negative when it undershoots below
-    ``anchor_low``. Telemetry only — callers must never clamp with this.
-    """
-    if posterior_prob > anchor_high:
-        return (posterior_prob - anchor_high) * 100.0
-    if posterior_prob < anchor_low:
-        return (posterior_prob - anchor_low) * 100.0
-    return 0.0
-
-
-def clause_product_divergence_pp(posterior_prob: float, clause_probs: list[float]) -> tuple[float, float]:
-    """Return (clause_product, signed pp divergence of posterior from the product).
-
-    Positive divergence = the published probability exceeds the independent
-    clause product (the forecaster priced in positive dependence or narrative
-    uplift); negative = below it. Telemetry only.
-    """
-    product = math.prod(clause_probs)
-    return product, (posterior_prob - product) * 100.0
-
-
-def _anchor_and_clause_telemetry_lines(block: BinaryStructured) -> list[str]:
-    """Neutral telemetry lines + HTML markers for anchor / clause declarations.
-
-    Emitted into the per-forecaster "Computed quantities" section built by
-    ``run_tools_for_forecaster``, which is gated behind
-    ``PROBABILISTIC_TOOLS_ENABLED`` (every prod workflow pins the flag
-    to ``'false'`` today, so these lines and their ``ANCHOR_OVERSHOOT_PP`` /
-    ``CLAUSE_PRODUCT_DIVERGENCE_PP`` HTML markers are dormant in prod
-    comments). The raw ``base_rate_anchor`` / ``criteria_clauses`` JSON the
-    forecaster writes into its own STRUCTURED FORECAST block DOES land in
-    every published R1 rationale regardless of the flag; the same overshoot
-    / divergence math is trivially replayable offline from that JSON.
-
-    NO forecast mutation anywhere — the 2026-07-08 experiments buried the
-    clamp variant; only the ``ANCHOR_OVERSHOOT_FLAG_THRESHOLD_PP``
-    *measurement* survived.
-    """
-    lines: list[str] = []
-
-    if block.base_rate_anchor is not None:
-        overshoot = anchor_overshoot_pp(
-            block.posterior_prob,
-            block.base_rate_anchor.low,
-            block.base_rate_anchor.high,
-        )
-        lines.append(
-            f"- **Anchor telemetry**: declared {block.posterior_prob * 100:.0f}% vs stated anchor "
-            f"{block.base_rate_anchor.low * 100:.0f}-{block.base_rate_anchor.high * 100:.0f}%, "
-            f"overshoot {overshoot:+.1f}pp {format_anchor_overshoot_marker(overshoot)}"
-        )
-        if abs(overshoot) > ANCHOR_OVERSHOOT_FLAG_THRESHOLD_PP:
-            logger.warning(
-                "ANCHOR_OVERSHOOT: posterior %.3f is %.1fpp outside stated anchor [%.3f, %.3f]",
-                block.posterior_prob,
-                overshoot,
-                block.base_rate_anchor.low,
-                block.base_rate_anchor.high,
-            )
-
-    if block.criteria_clauses:
-        product, divergence = clause_product_divergence_pp(
-            block.posterior_prob,
-            [c.prob for c in block.criteria_clauses],
-        )
-        clause_strs = ", ".join(f"{c.name} {c.prob:.2f}" for c in block.criteria_clauses)
-        lines.append(
-            f"- **Clause-product telemetry**: {len(block.criteria_clauses)} clauses ({clause_strs}) → "
-            f"product {product:.3f}; published {block.posterior_prob:.3f}, "
-            f"divergence {divergence:+.1f}pp {format_clause_divergence_marker(divergence)}"
-        )
-
-    return lines
-
-
 def _lr_chained_posterior(prior_prob: float, lrs: list[float]) -> float | None:
     """Chain evidence-LRs onto prior odds. Returns None if prior is at a
     boundary (LR update undefined)."""
@@ -327,9 +245,6 @@ def _run_binary_tools(block: BinaryStructured) -> list[str]:
         )
 
     lines.extend(_lr_chained_posterior_lines(block))
-
-    # Anchor / clause telemetry (2026-07-08): neutral measurement lines only.
-    lines.extend(_anchor_and_clause_telemetry_lines(block))
 
     return lines
 
@@ -886,14 +801,11 @@ def cdf_at_threshold_for_forecaster(
 
 
 __all__ = [
-    "ANCHOR_OVERSHOOT_FLAG_THRESHOLD_PP",
     "FEATURE_FLAG_ENV",
     "aggregate_binary_values",
     "aggregate_mc_values",
     "aggregate_numeric_values",
-    "anchor_overshoot_pp",
     "build_cross_model_aggregation",
     "cdf_at_threshold_for_forecaster",
-    "clause_product_divergence_pp",
     "run_tools_for_forecaster",
 ]

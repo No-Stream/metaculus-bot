@@ -18,6 +18,7 @@ from metaculus_bot import performance_analysis
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis import collector
 from metaculus_bot.performance_analysis.analysis import (
+    PitReading,
     _interpolate_pit,
     _single_curve_pit,
     binary_summary,
@@ -28,6 +29,7 @@ from metaculus_bot.performance_analysis.analysis import (
     mc_summary,
     no_bias_check,
     numeric_pit_analysis,
+    out_of_range_pit_reading,
     per_model_binary_scores,
     per_model_cohort,
     stacking_effectiveness,
@@ -89,6 +91,42 @@ def _binary_record(
         "per_model_forecasts": per_model or {},
         "metadata": {"category": category},
         **stacker_fields,
+    }
+
+
+def _binary_post(
+    post_id: int,
+    question_id: int,
+    resolution: str = "yes",
+    score_data: dict[str, float] | None = None,
+) -> dict:
+    """One resolved binary post in the shape ``fetch_resolved_questions`` returns.
+
+    ``score_data`` defaults to a peer-scored forecast; pass ``{}`` for a post whose
+    forecast carries no platform scores. ``nr_forecasters`` is deliberately set on the
+    QUESTION here as a decoy, since the collector must read the crowd size off the post.
+    """
+    return {
+        "id": post_id,
+        "title": f"Q{post_id}",
+        "question": {
+            "id": question_id,
+            "type": "binary",
+            "resolution": resolution,
+            "my_forecasts": {
+                "latest": {
+                    "forecast_values": [0.3, 0.7],
+                    "score_data": {"peer_score": 1.0} if score_data is None else score_data,
+                },
+            },
+            "scaling": {},
+            "options": None,
+            "open_lower_bound": False,
+            "open_upper_bound": False,
+            "nr_forecasters": 5,
+            "title": f"Q{post_id}",
+        },
+        "projects": {},
     }
 
 
@@ -445,32 +483,8 @@ class TestCollectorCommentCreatedAt:
     ``created_at`` timestamp so cohort cuts can filter by submit-date (vs the
     coarser actual_resolve_time on the question)."""
 
-    def _post_data(self, post_id: int, question_id: int, resolution: str = "yes") -> dict:
-        return {
-            "id": post_id,
-            "title": f"Q{post_id}",
-            "question": {
-                "id": question_id,
-                "type": "binary",
-                "resolution": resolution,
-                "my_forecasts": {
-                    "latest": {
-                        "forecast_values": [0.3, 0.7],
-                        "score_data": {"peer_score": 1.0},
-                    },
-                },
-                "scaling": {},
-                "options": None,
-                "open_lower_bound": False,
-                "open_upper_bound": False,
-                "nr_forecasters": 5,
-                "title": f"Q{post_id}",
-            },
-            "projects": {},
-        }
-
     def test_record_includes_bot_comment_created_at(self):
-        post = self._post_data(1, 11)
+        post = _binary_post(1, 11)
         comment = {
             "id": 999,
             "text": "*Forecaster 1*: 70%\n",
@@ -482,7 +496,7 @@ class TestCollectorCommentCreatedAt:
         assert records[0]["bot_comment_created_at"] == "2026-04-30T12:34:56Z"
 
     def test_record_has_none_when_comment_missing(self):
-        post = self._post_data(2, 22)
+        post = _binary_post(2, 22)
         records = _process_post(post, {})
         assert len(records) == 1
         assert records[0]["bot_comment_created_at"] is None
@@ -491,7 +505,7 @@ class TestCollectorCommentCreatedAt:
         """``nr_forecasters`` is a POST field; reading it off the question dict with a 0
         default made it read 0 in all 2196 archived records — "never read", rendered as a
         measured empty crowd. This fixture deliberately keeps the decoy on the question."""
-        post = self._post_data(5, 55)
+        post = _binary_post(5, 55)
         post["nr_forecasters"] = 170
         records = _process_post(post, {})
 
@@ -501,14 +515,14 @@ class TestCollectorCommentCreatedAt:
         # None means "the post didn't say", which a crowd-size cut can drop. A 0 would
         # average a fabricated empty crowd into the cut, and would also silently kill
         # audit.py's `n/a` fallback (a real 0 is not a missing key).
-        post = self._post_data(6, 66)
+        post = _binary_post(6, 66)
         post.pop("nr_forecasters", None)
         records = _process_post(post, {})
 
         assert records[0]["metadata"]["nr_forecasters"] is None
 
     def test_record_has_none_when_comment_lacks_created_at(self):
-        post = self._post_data(3, 33)
+        post = _binary_post(3, 33)
         comment = {"id": 1000, "text": "*Forecaster 1*: 70%\n", "on_post": 3}
         records = _process_post(post, {3: comment})
         assert len(records) == 1
@@ -517,7 +531,7 @@ class TestCollectorCommentCreatedAt:
     def test_stacker_skip_reason_marker_round_trips_onto_record(self):
         # The additive STACKER_SKIP_REASON marker must reach the record dict —
         # its documented durable path is the comment, not the run log.
-        post = self._post_data(4, 44)
+        post = _binary_post(4, 44)
         comment = {
             "id": 1001,
             "text": "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=skipped -->\n<!-- STACKER_SKIP_REASON=single_forecaster -->\n",
@@ -529,7 +543,7 @@ class TestCollectorCommentCreatedAt:
         assert records[0]["stacker_outcome"] == "skipped"
 
     def test_stacker_skip_reason_none_without_marker(self):
-        post = self._post_data(5, 55)
+        post = _binary_post(5, 55)
         comment = {"id": 1002, "text": "*Forecaster 1*: 70%\n", "on_post": 5}
         records = _process_post(post, {5: comment})
         assert records[0]["stacker_skip_reason"] is None
@@ -537,7 +551,7 @@ class TestCollectorCommentCreatedAt:
     def test_practice_posts_produce_no_records(self):
         # Practice questions are not tournament scoring surface; they must never enter
         # the dataset (they would otherwise land in every calibration cut).
-        post = self._post_data(6, 66)
+        post = _binary_post(6, 66)
         post["title"] = "[PRACTICE] Will this be scored?"
         comment = {"id": 1003, "text": "*Forecaster 1*: 70%\n", "on_post": 6}
         assert _process_post(post, {6: comment}) == []
@@ -557,32 +571,8 @@ class TestCollectorStackerOutcome:
     consume ``stacker_outcome``.
     """
 
-    def _post_data(self, post_id: int, question_id: int) -> dict:
-        return {
-            "id": post_id,
-            "title": f"Q{post_id}",
-            "question": {
-                "id": question_id,
-                "type": "binary",
-                "resolution": "yes",
-                "my_forecasts": {
-                    "latest": {
-                        "forecast_values": [0.3, 0.7],
-                        "score_data": {"peer_score": 1.0},
-                    },
-                },
-                "scaling": {},
-                "options": None,
-                "open_lower_bound": False,
-                "open_upper_bound": False,
-                "nr_forecasters": 5,
-                "title": f"Q{post_id}",
-            },
-            "projects": {},
-        }
-
     def _run(self, post_id: int, question_id: int, comment_text: str | None) -> dict:
-        post = self._post_data(post_id, question_id)
+        post = _binary_post(post_id, question_id)
         if comment_text is None:
             records = _process_post(post, {})
         else:
@@ -1031,6 +1021,44 @@ class TestMaxStepClampScreen:
         assert screen["max_step_cap"] == pytest.approx(0.2)
         assert screen["suspected"] is True
 
+    def _fine_grid_members(self) -> dict[str, list[list[float]]]:
+        """Three 11-anchor curves each putting ~0.65-0.77 on the [100, 101] bin."""
+        value_rows = [
+            [99.90, 100.00, 100.15, 100.30, 100.45, 100.55, 100.70, 100.85, 101.00, 101.30, 101.60],
+            [99.95, 100.05, 100.18, 100.32, 100.46, 100.56, 100.72, 100.90, 101.05, 101.35, 101.65],
+            [99.85, 99.98, 100.12, 100.28, 100.43, 100.53, 100.68, 100.83, 100.98, 101.28, 101.55],
+        ]
+        return {
+            f"model-{name}": [[label, value] for label, value in zip(self._LABELS, values, strict=True)]
+            for name, values in zip("abc", value_rows, strict=True)
+        }
+
+    def _fine_grid_record(self, realized_bin_mass: float) -> dict:
+        steps = np.full(200, (1.0 - realized_bin_mass) / 199)
+        steps[100] = realized_bin_mass
+        cdf = np.concatenate([[0.0], np.cumsum(steps)]).tolist()
+        grid = np.linspace(0.0, 200.0, 201).tolist()
+        return self._record(
+            submitted=self._POST_FIX_TS, members=self._fine_grid_members(), cdf=cdf, grid=grid, resolution=100.5
+        )
+
+    def test_post_snap_near_cap_bin_is_suspected(self):
+        """The q45065 shape: the snap alpha shaves the realized bin ~1.1% under the 0.2
+        cap (0.1977991526), so the exact-equality screen read it as clear while all
+        three members declared 0.65-0.77 there. The near-cap ratio must catch it."""
+        screen = max_step_clamp_screen(self._fine_grid_record(0.1977991526))
+        assert screen["suspected"] is True
+        assert screen["resolution_bin_at_cap"] is False
+        assert screen["resolution_bin_cap_bound"] is True
+        assert screen["resolution_bin_cap_fraction"] == pytest.approx(0.989, abs=1e-3)
+
+    def test_bin_well_below_the_cap_is_not_cap_bound(self):
+        # 0.15 against a 0.2 cap is 75% — below _CLAMP_CAP_NEAR_FRAC, so not cap-bound
+        # even though every member wanted materially more mass there.
+        screen = max_step_clamp_screen(self._fine_grid_record(0.15))
+        assert screen["resolution_bin_cap_bound"] is False
+        assert screen["suspected"] is False
+
     def test_missing_timestamp_treated_as_pre_fix(self):
         screen = max_step_clamp_screen(self._record(submitted=None))
         assert screen["submitted_before_grid_scaled_cap"] is True
@@ -1210,6 +1238,114 @@ class TestNumericPitAnalysisValueGrid:
         assert result["pit_values"][0] == pytest.approx(0.5, abs=0.02)
 
 
+class TestSetValuedOutOfRangePit:
+    """An out-of-range resolution's PIT is a SET, and point statistics exclude it.
+
+    The platform reports "beyond the displayed range" as a string, so the resolution VALUE
+    is unknown and ``F(resolution)`` is only pinned to ``[cdf[-1], 1]`` (above) or
+    ``[0, cdf[0]]`` (below). Forcing it to 1.0 / 0.0 counted q44842 as a high-side band
+    miss: an open-bound record that deliberately published 13% of its mass above the
+    displayed ceiling, resolved ``above_upper_bound``, and won spot peer +24.4.
+    """
+
+    @staticmethod
+    def _record(resolution, *, cdf_start: float = 0.0, cdf_end: float = 1.0) -> dict:
+        cdf = list(np.linspace(cdf_start, cdf_end, 201))
+        return {
+            "post_id": 1,
+            "type": "numeric",
+            "our_forecast_values": cdf,
+            "resolution_parsed": resolution,
+            "scaling": {"range_min": 0.0, "range_max": 100.0, "zero_point": None},
+            "open_lower_bound": True,
+            "open_upper_bound": True,
+            "numeric_log_score": 0.0,
+            "metadata": {"category": None},
+        }
+
+    def test_the_interval_is_read_off_our_own_published_tail_mass(self):
+        above = out_of_range_pit_reading("above_upper_bound", list(np.linspace(0.0, 0.87, 201)))
+        assert above is not None
+        assert (above.low, above.high) == pytest.approx((0.87, 1.0))
+        assert above.oob_side == "high"
+        assert above.is_interval
+        assert above.point is None
+
+        below = out_of_range_pit_reading("below_lower_bound", list(np.linspace(0.13, 1.0, 201)))
+        assert below is not None
+        assert (below.low, below.high) == pytest.approx((0.0, 0.13))
+        assert below.oob_side == "low"
+
+        # Not an out-of-range marker at all.
+        assert out_of_range_pit_reading("annulled", [0.0, 1.0]) is None
+        assert out_of_range_pit_reading(50.0, [0.0, 1.0]) is None
+
+    def test_a_closed_bound_interval_collapses_to_the_old_point_convention(self):
+        # With no mass beyond the bound, [cdf[-1], 1] == [1, 1]: the set-valued reading
+        # degenerates to exactly the 1.0 the old convention forced, so nothing changes on
+        # records that put nothing out of range.
+        reading = out_of_range_pit_reading("above_upper_bound", list(np.linspace(0.0, 1.0, 201)))
+        assert reading is not None
+        assert not reading.is_interval
+        assert reading.point == pytest.approx(1.0)
+
+    def test_a_point_reading_answers_the_band_predicates_like_a_scalar(self):
+        point = PitReading.from_point(0.42)
+        assert point.point == pytest.approx(0.42)
+        assert point.intersects(0.10, 0.90)
+        assert point.at_or_below(0.50)
+        assert not point.at_or_below(0.40)
+        assert not point.entirely_below(0.10)
+        assert not point.entirely_above(0.90)
+
+    def test_q44842_shape_is_covered_and_excluded_from_the_histogram(self):
+        result = numeric_pit_analysis([self._record("above_upper_bound", cdf_end=0.87)])
+        assert result["count"] == 1
+        assert result["n_point"] == 0
+        assert result["n_oob_interval"] == 1
+        assert result["pit_values"] == []
+        assert result["pit_intervals"] == [(pytest.approx(0.87), 1.0)]
+        # [0.87, 1] intersects [0.05, 0.95] and [0.25, 0.75] it does not.
+        assert result["coverage_90"] == pytest.approx(1.0)
+        assert result["coverage_50"] == pytest.approx(0.0)
+        assert sum(result["histogram"]) == 0
+
+    def test_a_starved_tail_is_still_outside_the_coverage_band(self):
+        # cdf[-1] = 0.999 is the open-bound structural floor: [0.999, 1] lies wholly above
+        # 0.95, so this record is the band miss the q44842 shape is not.
+        result = numeric_pit_analysis([self._record("above_upper_bound", cdf_end=0.999)])
+        assert result["coverage_90"] == pytest.approx(0.0)
+
+    def test_the_below_bound_mirror(self):
+        covered = numeric_pit_analysis([self._record("below_lower_bound", cdf_start=0.13)])
+        assert covered["coverage_90"] == pytest.approx(1.0)
+        assert covered["n_oob_interval"] == 1
+        starved = numeric_pit_analysis([self._record("below_lower_bound", cdf_start=0.001)])
+        assert starved["coverage_90"] == pytest.approx(0.0)
+
+    def test_point_records_and_intervals_share_the_coverage_denominator(self):
+        data = [
+            self._record(50.0),  # PIT 0.50 — covered
+            self._record(1.0),  # PIT 0.01 — outside [0.05, 0.95]
+            self._record("above_upper_bound", cdf_end=0.87),  # interval — covered
+        ]
+        result = numeric_pit_analysis(data)
+        assert result["count"] == 3
+        assert result["n_point"] == 2
+        assert result["n_oob_interval"] == 1
+        assert result["coverage_90"] == pytest.approx(2 / 3)
+        # The histogram (a point statistic) counts only the two point readings.
+        assert sum(result["histogram"]) == 2
+
+    def test_the_report_discloses_the_excluded_count(self):
+        report = performance_analysis.generate_report(
+            [self._record(50.0), self._record("above_upper_bound", cdf_end=0.87)]
+        )
+        assert "## Numeric Questions" in report
+        assert "Out-of-range resolutions (set-valued PIT" in report
+        assert "excluded from the histogram): 1" in report
+
+
 class TestRescoreRecords:
     """Stale stored scores in cached datasets must self-heal on load.
 
@@ -1335,25 +1471,6 @@ class TestBuildPerformanceDatasetResearchTags:
     built dataset.
     """
 
-    def _post(self, post_id: int, question_id: int) -> dict:
-        return {
-            "id": post_id,
-            "title": f"Q{post_id}",
-            "question": {
-                "id": question_id,
-                "type": "binary",
-                "resolution": "yes",
-                "my_forecasts": {"latest": {"forecast_values": [0.3, 0.7], "score_data": {}}},
-                "scaling": {},
-                "options": None,
-                "open_lower_bound": False,
-                "open_upper_bound": False,
-                "nr_forecasters": 5,
-                "title": f"Q{post_id}",
-            },
-            "projects": {},
-        }
-
     def test_records_carry_tags_from_the_archive_dir(self, tmp_path: Path, monkeypatch):
         (tmp_path / "11.json").write_text(
             json.dumps(
@@ -1364,7 +1481,9 @@ class TestBuildPerformanceDatasetResearchTags:
                 }
             )
         )
-        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [self._post(1, 11)])
+        monkeypatch.setattr(
+            collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(1, 11, score_data={})]
+        )
         monkeypatch.setattr(
             collector,
             "fetch_bot_comments",
@@ -1382,7 +1501,9 @@ class TestBuildPerformanceDatasetResearchTags:
     def test_question_without_an_archive_record_gets_none_not_false(self, tmp_path: Path, monkeypatch):
         # Absence of evidence is not an untreated record: a missing archive file (or a
         # whole missing archive) must never look like a measured False in the cuts.
-        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [self._post(2, 22)])
+        monkeypatch.setattr(
+            collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(2, 22, score_data={})]
+        )
         monkeypatch.setattr(collector, "fetch_bot_comments", lambda author_id, token: [])
 
         records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
@@ -1390,6 +1511,44 @@ class TestBuildPerformanceDatasetResearchTags:
         assert records[0]["anchor_present"] is None
         assert records[0]["gfv2_present"] is None
         assert records[0]["anchor_confidence"] is None
+
+
+class TestBuildPerformanceDatasetPriorDiff:
+    """``prior_records=`` must actually reach the re-resolution diff.
+
+    Same rule as the sibling class above: the call inside ``build_performance_dataset`` is a
+    single line, so unit-testing ``diff_platform_rescores`` alone leaves the pass-through
+    deletable with a green suite. It is the live-pull half of the q44798 detector, where
+    Metaculus edits a resolution in place and no timestamp moves.
+    """
+
+    def _fetchers(self, monkeypatch, post: dict) -> None:
+        monkeypatch.setattr(collector, "fetch_resolved_questions", lambda tournament, token: [post])
+        monkeypatch.setattr(collector, "fetch_bot_comments", lambda author_id, token: [])
+
+    def test_a_moved_resolution_is_tagged_on_the_built_records(self, tmp_path: Path, monkeypatch):
+        self._fetchers(monkeypatch, _binary_post(3, 33, score_data={}))
+        prior = [{"post_id": 3, "question_id": 33, "resolution_raw": "no", "resolution_parsed": False}]
+
+        records = build_performance_dataset(
+            tournament="t", token="fake", research_archive_dir=tmp_path, prior_records=prior
+        )
+
+        assert records[0]["platform_rescored"] is True
+        assert "resolution_raw" in records[0]["platform_rescored_fields"]
+        assert records[0]["prior_resolution"] == "no"
+
+    def test_no_prior_leaves_the_tags_none_not_false(self, tmp_path: Path, monkeypatch):
+        # "Not compared" and "compared, nothing moved" are different facts; a default build
+        # must produce the first, or every downstream cut reads silence as stability. The
+        # keys are absent rather than explicitly None on this path, which is the same "not
+        # compared" answer to every reader (the diff and the renderer both use ``.get``).
+        self._fetchers(monkeypatch, _binary_post(4, 44, score_data={}))
+
+        records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
+
+        assert records[0].get("platform_rescored") is None
+        assert records[0].get("platform_rescored_fields") is None
 
 
 class TestPackageExports:

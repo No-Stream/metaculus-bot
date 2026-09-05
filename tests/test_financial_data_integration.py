@@ -7,8 +7,8 @@ drift or initial implementation.
 
 Each test exercises a stable, high-signal symbol (AAPL for yfinance, UNRATE
 for FRED) and asserts that the produced markdown contains the load-bearing
-fields. The provider's underlying fetchers (`_fetch_yfinance_data`,
-`_fetch_fred_data`) currently swallow `Exception` and return `""` on failure
+fields. The provider's underlying fetchers (`financial_data._fetch_yfinance_data`,
+`fred_rendering._fetch_fred_data`) currently swallow `Exception` and return `""` on failure
 -- so an empty string is the soft-fail signal, and any non-empty result
 must contain the documented sections. We use stronger asserts than "doesn't
 crash" precisely because the provider is permissive.
@@ -113,7 +113,7 @@ def _fred_api_key() -> str | None:
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_returns_parseable_markdown():
     """FRED returns markdown with all standard sections for UNRATE (unemployment)."""
-    from metaculus_bot.research.financial_data import _fetch_fred_data
+    from metaculus_bot.research.fred_rendering import _fetch_fred_data
 
     api_key = _fred_api_key()
     assert api_key is not None  # skipif gate guarantees this; narrows for type checker
@@ -134,7 +134,7 @@ def test_fred_real_fetch_returns_parseable_markdown():
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_includes_series_title():
     """FRED's get_series_info path populates a human-readable title in the header."""
-    from metaculus_bot.research.financial_data import _fetch_fred_data
+    from metaculus_bot.research.fred_rendering import _fetch_fred_data
 
     api_key = _fred_api_key()
     assert api_key is not None
@@ -155,9 +155,44 @@ def test_fred_real_fetch_includes_series_title():
 
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
+def test_fred_real_fetch_renders_the_first_release_table_for_a_resolving_series():
+    """The one live check the first-release table needs, and the reason it exists.
+
+    Everything about that table is covered offline except a single inference: that
+    ``output_type=4`` with the real-time window opened to FRED's full range really does
+    return each observation's INITIAL release, including for prints that have since been
+    revised. ALFRED's download-data help says so in prose; only a live call proves it.
+    CSUSHPISA is the right probe because it revises every month and it is the series the
+    q44944 finding came from.
+
+    If FRED's parameter semantics differ from that reading, the guard in
+    ``_first_release_lines`` drops the table (the latest print would be missing from the
+    response) and this test fails on the missing header rather than the bot rendering
+    something stale.
+    """
+    from metaculus_bot.research.fred_rendering import _fetch_fred_data
+
+    api_key = _fred_api_key()
+    assert api_key is not None
+    md = _fetch_fred_data("CSUSHPISA", api_key, is_resolving_source=True)
+
+    if not md:
+        pytest.skip("FRED returned empty for CSUSHPISA (transient or upstream issue)")
+
+    assert "- First release vs current vintage" in md, (
+        "no first-release table: either output_type=4 did not return revised prints' initial "
+        "releases, or the latest print was absent from the response"
+    )
+    assert "first release" in md
+    assert "current vintage" in md
+    assert "⚠ Do not double-count" in md, "the double-count guard is mandatory in this block"
+
+
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
+@pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_unknown_series_returns_empty():
     """Unknown FRED series return empty string. Soft-fail behavior."""
-    from metaculus_bot.research.financial_data import _fetch_fred_data
+    from metaculus_bot.research.fred_rendering import _fetch_fred_data
 
     api_key = _fred_api_key()
     assert api_key is not None

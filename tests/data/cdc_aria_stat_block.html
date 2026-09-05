@@ -1,0 +1,58 @@
+<!doctype html>
+<!--
+  Structural skeleton of the cyclosporiasis surveillance stat block CDC serves at
+  /cyclosporiasis/outbreaks/, captured from the Wayback snapshot of 2026-08-29 and
+  redacted to what the extractor keys on: the ARIA roles, the div nesting, and the
+  mix of `<p>`-wrapped and bare cell values.
+
+  Two details are load-bearing and must not be "tidied":
+    * every element in the block is a `div` — the roles are the only thing saying it is a
+      table, which is why "the next </div>" cannot be used to pair tags;
+    * the hospitalization count sits in a BARE `role="cell"` div while the case count is
+      wrapped in `<p>`. Before the rewrite, trafilatura kept the wrapped values (unlabelled)
+      and dropped the bare ones, so the resolving hospitalization figure vanished entirely.
+-->
+<html><head><title>Cyclosporiasis Outbreak Investigations</title></head><body>
+<article>
+<h2>Cases acquired in the U.S.</h2>
+<p>Since May 1, 2026, CDC has received reports of 17,180 laboratory-confirmed cases of
+cyclosporiasis acquired in the United States. For comparison, 1,180 cases were reported in the
+United States between May 1 and August 31, 2025.</p>
+<p>These data include the cases reported in the ongoing multistate outbreak linked to iceberg
+lettuce. The data also include cases not linked to that outbreak. Multiple jurisdictions have
+reported an increase of cases compared with the same period in 2025.</p>
+<p>May 1 - August 24, 2026:</p>
+<div class="table dfe-table table-no-header" role="table" aria-label="table">
+		<div class="table-body" role="rowgroup">
+					<div class="table-row row" role="row">
+									<div role="rowheader" class="table-col col-md-6" data-col="1">
+						Laboratory-confirmed cases					</div>
+										<div role="cell" class="table-col col-md-6" data-col="2">
+						<p>
+
+17,180</p>					</div>
+								</div>
+						<div class="table-row row" role="row">
+									<div role="rowheader" class="table-col col-md-6" data-col="1">
+						Hospitalizations					</div>
+										<div role="cell" class="table-col col-md-6" data-col="2">
+						922					</div>
+								</div>
+						<div class="table-row row" role="row">
+									<div role="rowheader" class="table-col col-md-6" data-col="1">
+						Deaths					</div>
+										<div role="cell" class="table-col col-md-6" data-col="2">
+						<p>2
+
+</p>					</div>
+								</div>
+						<div class="table-row row" role="row">
+									<div role="rowheader" class="table-col col-md-6" data-col="1">
+						Median age of cases					</div>
+										<div role="cell" class="table-col col-md-6" data-col="2">
+						46 years (range 1 to 99 years)					</div>
+								</div>
+		</div>
+</div>
+</article>
+</body></html>

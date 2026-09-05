@@ -42,21 +42,29 @@ _QUOTE_GLYPHS_RE = re.compile(r"[\"'‘’“”`]")  # noqa: RUF001  # the curl
 _WHITESPACE_RE = re.compile(r"\s+")
 
 # Retrieval-quality tiers (W4). ToolOutcome.method records HOW a URL's content
-# reached the driver; we collapse the seven method values into two tiers so a
+# reached the driver; we collapse those method values into two tiers so a
 # finding stamped from the URL->best-method map carries honest authority. A
 # "fetched" URL is one whose actual page/document we pulled (document/rendered/
-# plain/cache); a "snippet" URL was only seen in a search/news result. A
-# discrepancy resting on a snippet must NOT supersede the briefing (the 131.3
-# failure mode: a crowd-median "correction" from a search snippet after the
-# direct fetch 403'd, which every forecaster then adopted). Methods absent here
-# (internal bookkeeping, error/blocked outcomes) contribute no tier — the URL
+# plain/cache/pdf_local/digest_local); a "snippet" URL was only seen in a
+# search/news result. A discrepancy resting on a snippet must NOT supersede the
+# briefing (the 131.3 failure mode: a crowd-median "correction" from a search
+# snippet after the direct fetch 403'd, which every forecaster then adopted).
+# Methods absent here (internal bookkeeping, error/blocked/throttled/oversize
+# outcomes, the intermediate document_needed state) contribute no tier — the URL
 # still counts for the provenance gate, but the finding stays untiered and a
 # discrepancy on it is demoted, conservatively. See artifact.render_findings.
+#
+# The two local-document methods sit in the "fetched" class deliberately: we
+# decoded the bytes the host served us (pypdf text, then a deterministic BM25
+# passage selection), which is a STRONGER claim than "document" — a model's
+# reading of a URL it fetched itself and we never saw.
 _METHOD_TO_TIER: dict[str, str] = {
     "document": "fetched",
     "rendered": "fetched",
     "plain": "fetched",
     "cache": "fetched",
+    "pdf_local": "fetched",
+    "digest_local": "fetched",
     "search": "snippet",
     "news": "snippet",
 }

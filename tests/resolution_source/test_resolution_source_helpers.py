@@ -1,0 +1,1009 @@
+"""Pure helpers of the Tier-1 resolution-source fetcher: URL extraction to formatter.
+
+One of three modules split out of the old single ``test_resolution_source_provider.py``,
+which had crossed 2,000 lines. The split follows that file's own three layers: helpers
+here, the network layer in ``test_resolution_source_fetch.py``, and the provider factory
+plus the SSRF guard in ``test_resolution_source_provider_gating.py``.
+
+Real trafilatura runs on a fixed article-shaped HTML fixture, so the success path exercises
+extraction end to end.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from datetime import UTC, datetime
+
+import pytest
+
+from metaculus_bot.constants import RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS
+from metaculus_bot.research import resolution_source
+from metaculus_bot.research.http_fetch import (
+    MAX_UNDECODABLE_CHAR_RATIO,
+    decode_text_body,
+    meta_refresh_target,
+    rewrite_aria_tables,
+)
+from metaculus_bot.research.resolution_fetch_result import (
+    _SERVER_HEADER_MAX_CHARS,
+    ROUTE_CAVEATS,
+    RungAttempt,
+    http_failure_class,
+    server_header_token,
+)
+from metaculus_bot.research.resolution_source import (
+    FetchResult,
+    extract_source_urls,
+    format_resolution_sections,
+    is_fred_url,
+    is_metaculus_self_ref,
+    is_yahoo_ticker_url,
+    looks_like_csv_rows,
+    looks_like_js_wall,
+    select_fetchable_urls,
+    strip_html_tags,
+    strip_markdown_escapes,
+    vacuous_body_status,
+)
+from metaculus_bot.research.wayback import WaybackSnapshot, wayback_lead
+from tests.resolution_source_fakes import cdc_aria_stat_block_page, cp1252_aria_stat_block_page
+
+
+class TestStripMarkdownEscapes:
+    def test_underscore_and_dot(self):
+        assert strip_markdown_escapes(r"https://example\.com/foo\_bar") == "https://example.com/foo_bar"
+
+    def test_no_escapes_is_identity(self):
+        assert strip_markdown_escapes("https://a.com/x") == "https://a.com/x"
+
+    def test_escaped_ampersand_hash_paren(self):
+        # The regex covers _ & . - # ( ). Verify the covered set:
+        assert strip_markdown_escapes(r"a\#b\(c\)d\-e") == "a#b(c)d-e"
+
+
+class TestExtractSourceUrls:
+    def test_markdown_link_extraction(self):
+        text = "See [BLS report](https://www.bls.gov/cpi/) for details."
+        assert extract_source_urls(text) == ["https://www.bls.gov/cpi/"]
+
+    def test_bare_url_extraction(self):
+        text = "Source: https://fred.stlouisfed.org/series/DGS10 as reported."
+        assert extract_source_urls(text) == ["https://fred.stlouisfed.org/series/DGS10"]
+
+    def test_trailing_punctuation_stripped(self):
+        text = "See https://example.com/foo, and also https://example.com/bar."
+        urls = extract_source_urls(text)
+        assert urls == ["https://example.com/foo", "https://example.com/bar"]
+
+    def test_backslash_escapes_unescaped(self):
+        text = r"See [report](https://example\.com/foo\_bar)"
+        assert extract_source_urls(text) == ["https://example.com/foo_bar"]
+
+    def test_dedup_preserves_order(self):
+        text = "First https://a.example.com/x then [link](https://b.example.com/y) again https://a.example.com/x."
+        urls = extract_source_urls(text)
+        assert urls == ["https://a.example.com/x", "https://b.example.com/y"]
+
+    def test_http_and_https_only(self):
+        text = "ftp://old.example.com/x and gopher://x.com and https://ok.com/z"
+        assert extract_source_urls(text) == ["https://ok.com/z"]
+
+    def test_dedup_collapses_bare_host_and_trailing_slash(self):
+        # Real questions cite both root-page forms (Q41581 on a smoke test:
+        # childmortality.org vs childmortality.org/) — one fetch slot, not two.
+        text = "See https://x.org and also https://x.org/ for data."
+        assert extract_source_urls(text) == ["https://x.org"]
+
+    def test_dedup_ignores_fragment(self):
+        # Fragments are never sent over HTTP — URLs differing only by fragment
+        # are the same fetch and must not burn two fetch slots. First-seen wins.
+        text = "See https://x.org/page#section-a and https://x.org/page#section-b for data."
+        assert extract_source_urls(text) == ["https://x.org/page#section-a"]
+
+    def test_no_cap_in_extraction(self, monkeypatch):
+        # The cap moved to `select_fetchable_urls` (F2 fix). `extract_source_urls`
+        # now returns the FULL deduped list so the skip-filter can drop
+        # self-refs/FRED/Yahoo before the cap fires — a run of leading self-refs
+        # was starving real sources out of the fetch budget.
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_MAX_URLS", 3)
+        text = " ".join(f"https://example{i}.com/x" for i in range(10))
+        urls = resolution_source.extract_source_urls(text)
+        assert len(urls) == 10
+        assert urls[0] == "https://example0.com/x"
+        assert urls[-1] == "https://example9.com/x"
+
+
+class TestUrlParensBelongToTheUrl:
+    """Parens inside a cited URL — the 2026-09-03 measured 404 pair.
+
+    Both regexes used to end a URL at the first `)`, so a Wikipedia-style path lost its
+    closing paren and, when Metaculus had escaped the parens, kept a trailing backslash
+    instead. The archived instances: `…/wiki/Nuri_\\(rocket\\)` fetched as
+    `…/wiki/Nuri_(rocket\\` and was archived `not_found`, where the repaired URL returns
+    200 with 16,753 chars; a Ballotpedia primary page lost the closing paren that was its
+    last character. So `)` is a delimiter only when it closes nothing inside the URL.
+    """
+
+    # Verbatim from the archived resolution criteria (the escapes are Metaculus's own).
+    ARCHIVED_ESCAPED_WIKIPEDIA = r"https://en.wikipedia.org/wiki/Nuri_\(rocket\)"
+    # The second archived instance's tail on a placeholder path: parens unescaped, and the
+    # closing paren is the URL's last character — the position the old class always dropped.
+    BALLOTPEDIA_SHAPE = "https://ballotpedia.org/An_election_(August_18_Republican_primary)"
+
+    def test_the_archived_escaped_wikipedia_url_survives_whole(self):
+        text = f"This question resolves per {self.ARCHIVED_ESCAPED_WIKIPEDIA} as of the close date."
+        assert extract_source_urls(text) == ["https://en.wikipedia.org/wiki/Nuri_(rocket)"]
+
+    def test_a_trailing_backslash_never_survives(self):
+        """The 404 was caused by the backslash, not the missing paren: `_TRAILING_PUNCT`
+        does not contain `\\`, so a URL cut mid-escape kept it and no later stage removed it."""
+        texts = [
+            f"See {self.ARCHIVED_ESCAPED_WIKIPEDIA}.",
+            r"See https://example.com/foo\ then more prose.",
+            r"Escaped period at the end: https://example\.com/foo\.",
+            r"Wrapped in escaped prose parens \(https://example.com/x\) as cited.",
+        ]
+        for text in texts:
+            for url in extract_source_urls(text):
+                assert "\\" not in url, text
+
+    def test_balanced_unescaped_parens_are_part_of_the_url(self):
+        text = f"Resolution source: {self.BALLOTPEDIA_SHAPE}"
+        assert extract_source_urls(text) == [self.BALLOTPEDIA_SHAPE]
+
+    def test_a_url_inside_prose_parens_drops_the_prose_paren(self):
+        # The `)` closes the prose `(`, not anything inside the URL, so it is a delimiter.
+        assert extract_source_urls("(see https://example.com/x)") == ["https://example.com/x"]
+        assert extract_source_urls(r"(see https://example.com/x\)") == ["https://example.com/x"]
+
+    def test_prose_parens_around_a_url_that_has_its_own_parens(self):
+        # Both rules at once: the inner pair stays, the outer prose paren goes.
+        text = f"({self.BALLOTPEDIA_SHAPE})"
+        assert extract_source_urls(text) == [self.BALLOTPEDIA_SHAPE]
+
+    def test_markdown_link_keeps_inner_parens_and_loses_its_own(self):
+        assert extract_source_urls("[Nuri](https://en.wikipedia.org/wiki/Nuri_(rocket))") == [
+            "https://en.wikipedia.org/wiki/Nuri_(rocket)"
+        ]
+        assert extract_source_urls(r"[Nuri](https://en.wikipedia.org/wiki/Nuri_\(rocket\))") == [
+            "https://en.wikipedia.org/wiki/Nuri_(rocket)"
+        ]
+
+    def test_an_unbalanced_markdown_link_yields_one_untruncated_url(self):
+        """A malformed link (`(` opened, never closed inside) must not ALSO produce the
+        truncated markdown capture — that would burn a second fetch slot on a broken URL.
+        The markdown regex requires balance for exactly this reason."""
+        assert extract_source_urls("[a](https://example.com/p_(q)") == ["https://example.com/p_(q)"]
+
+    def test_two_adjacent_markdown_links_with_no_space_between_them(self):
+        # The delimiter is structural, not greedy-to-the-last-paren: a greedy URL body
+        # would swallow `),[b](` and yield one garbage URL.
+        assert extract_source_urls("[a](https://a.example.com/1),[b](https://b.example.com/2)") == [
+            "https://a.example.com/1",
+            "https://b.example.com/2",
+        ]
+
+    def test_an_unbalanced_open_paren_does_not_truncate_a_bare_url(self):
+        # No closing paren exists anywhere, so the `(` cannot be a delimiter.
+        assert extract_source_urls("Details: https://example.com/a(b — as cited") == ["https://example.com/a(b"]
+
+    def test_a_long_paren_run_matches_in_linear_time(self):
+        """The URL body is an alternation under a star, which is the shape that goes
+        exponential when two branches can match the same text. They can't here (a `(`
+        starts a balanced group or is a literal, and the group's body excludes parens),
+        and this pins that."""
+        text = "https://example.com/" + "(a" * 400 + " and prose"
+        start = time.monotonic()
+        extract_source_urls(text)
+        assert time.monotonic() - start < 1.0
+
+
+class TestSkipPredicates:
+    def test_is_metaculus_self_ref(self):
+        assert is_metaculus_self_ref("https://metaculus.com/q/12345") is True
+        assert is_metaculus_self_ref("https://www.metaculus.com/questions/12345") is True
+        assert is_metaculus_self_ref("https://example.com/metaculus-fan") is False
+
+    def test_is_metaculus_self_ref_port_and_userinfo_do_not_bypass(self):
+        # .hostname strips port + userinfo; .netloc would have kept them and let
+        # these slip past the exact-host / suffix checks.
+        assert is_metaculus_self_ref("https://www.metaculus.com:443/questions/12345") is True
+        assert is_metaculus_self_ref("https://metaculus.com:8080/q/1") is True
+        assert is_metaculus_self_ref("https://user@metaculus.com/q/1") is True
+        assert is_metaculus_self_ref("https://sub.metaculus.com/page") is True
+        # A host that merely contains the string is not a self-ref.
+        assert is_metaculus_self_ref("https://notmetaculus.com/x") is False
+
+    def test_is_metaculus_self_ref_sees_through_a_wayback_capture(self):
+        """A capture of a Metaculus page is the question quoting itself with an archive in front
+        of it; the hostname check alone reads `web.archive.org` and lets it through — at any
+        depth of nesting."""
+        assert (
+            is_metaculus_self_ref("https://web.archive.org/web/20240101000000/https://www.metaculus.com/q/1/") is True
+        )
+        assert (
+            is_metaculus_self_ref(
+                "https://web.archive.org/web/20260901000000id_/"
+                "https://web.archive.org/web/20240101000000/https://metaculus.com/questions/45001/"
+            )
+            is True
+        )
+        # A capture of an ordinary page is still an ordinary (fetchable) source.
+        assert is_metaculus_self_ref("https://web.archive.org/web/20240101000000/https://www.bls.gov/cpi/") is False
+
+    def test_is_fred_url(self):
+        assert is_fred_url("https://fred.stlouisfed.org/series/DGS10") is True
+        assert is_fred_url("https://stlouisfed.org/other") is False
+        # Port must not bypass (.hostname fix).
+        assert is_fred_url("https://fred.stlouisfed.org:443/series/DGS10") is True
+
+    def test_is_yahoo_ticker_url(self):
+        assert is_yahoo_ticker_url("https://finance.yahoo.com/quote/AAPL") is True
+        assert is_yahoo_ticker_url("https://finance.yahoo.com/quote/BTC-USD/history") is True
+        # Generic Yahoo articles are still fetchable — only /quote/ URLs are yfinance-served.
+        assert is_yahoo_ticker_url("https://finance.yahoo.com/news/some-article") is False
+        # Port must not bypass (.hostname fix).
+        assert is_yahoo_ticker_url("https://finance.yahoo.com:443/quote/AAPL") is True
+
+
+class TestSelectFetchableUrls:
+    def test_none_fields_are_safe(self):
+        assert select_fetchable_urls(None, None) == []
+        assert select_fetchable_urls("", "") == []
+
+    def test_drops_self_ref_fred_yahoo_ticker(self):
+        criteria = (
+            "See https://metaculus.com/q/1 and https://fred.stlouisfed.org/series/DGS10 "
+            "and https://finance.yahoo.com/quote/AAPL — but also https://www.bls.gov/cpi/."
+        )
+        urls = select_fetchable_urls(criteria, "")
+        assert urls == ["https://www.bls.gov/cpi/"]
+
+    def test_combines_criteria_and_fine_print(self):
+        urls = select_fetchable_urls(
+            "See https://a.example.com/x",
+            "Details at https://b.example.com/y",
+        )
+        assert set(urls) == {"https://a.example.com/x", "https://b.example.com/y"}
+
+    def test_a_cited_capture_of_a_metaculus_page_is_dropped_like_the_page_itself(self):
+        """Directly cited, the capture never reaches the Wayback rung's own unwrap check: it is
+        fetched as an ordinary page. The selection filter is where it has to be caught."""
+        criteria = (
+            "Resolves per https://web.archive.org/web/20240101000000/https://www.metaculus.com/questions/45001/ "
+            "and https://web.archive.org/web/20260801000000/https://www.bls.gov/cpi/."
+        )
+        urls = select_fetchable_urls(criteria, "")
+        assert urls == ["https://web.archive.org/web/20260801000000/https://www.bls.gov/cpi/"]
+
+    def test_cap_applied_after_skip_filter(self, monkeypatch):
+        # F2 regression: cap must apply AFTER dropping self-refs/FRED/Yahoo, or
+        # a run of leading self-refs starves the real source out of the fetch
+        # budget. With MAX_URLS=1 and 5 leading self-refs, the one real source
+        # must survive.
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_MAX_URLS", 1)
+        criteria = (
+            "See https://metaculus.com/q/1 and https://metaculus.com/q/2 "
+            "and https://metaculus.com/q/3 and https://metaculus.com/q/4 "
+            "and https://metaculus.com/q/5 — resolution source: https://www.bls.gov/cpi/."
+        )
+        urls = select_fetchable_urls(criteria, "")
+        assert urls == ["https://www.bls.gov/cpi/"]
+
+    def test_cap_bounds_result_length(self, monkeypatch):
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_MAX_URLS", 3)
+        criteria = " ".join(f"https://example{i}.com/x" for i in range(10))
+        urls = select_fetchable_urls(criteria, "")
+        assert len(urls) == 3
+        assert urls == [
+            "https://example0.com/x",
+            "https://example1.com/x",
+            "https://example2.com/x",
+        ]
+
+
+class TestLooksLikeJsWall:
+    def test_short_text_flagged(self, monkeypatch):
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 100)
+        assert resolution_source.looks_like_js_wall("only a few chars") is True
+
+    def test_long_text_not_flagged(self, monkeypatch):
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 20)
+        assert resolution_source.looks_like_js_wall("x" * 30) is False
+
+    def test_whitespace_only_flagged(self):
+        assert looks_like_js_wall("       \n\n   ") is True
+
+
+class TestStripHtmlTags:
+    """Markup stripping for the RAW-body branches. Two properties matter: real tags go, and
+    inequality signs in a data cell are NOT tags. The naive `</?[A-Za-z][^>]*>` form fails the
+    second — it eats `x <a and y > b` down to `x  b`."""
+
+    _VUUVZ_ROW = (
+        '"8/16 - 8/17, 2026@@24335",'
+        "<a href='https://emersoncollegepolling.com/august-2026-national-poll/'"
+        "style='color:#000000; text-decoration: underline;'target='_blank' rel='nofollow noopener'>"
+        "Emerson College</a>,"
+        '"1,000 LV@@1000",1.108478,36.4,49.2,-12.8'
+    )
+
+    def test_a_live_poll_table_row_keeps_the_pollster_and_loses_the_markup(self):
+        """The measured shape from the live VUUVz dataset (2026-08-26 receipts): a styled anchor
+        per pollster row, 69% of that CSV's 33k chars being tag markup. The pollster name IS the
+        content, so it stays and the tags go — 248 chars down to 84."""
+        out = strip_html_tags(self._VUUVZ_ROW)
+
+        assert "Emerson College" in out
+        assert "<a " not in out
+        assert "</a>" not in out
+        assert "style=" not in out
+        assert len(out) < len(self._VUUVZ_ROW) / 2.5
+
+    @pytest.mark.parametrize(
+        "cell",
+        ["a < 5, b > 3", "x <a and y > b", "1 < 2 and 3 > 2", "temp < -40 or > 40"],
+    )
+    def test_inequalities_in_a_data_cell_are_untouched(self, cell: str):
+        """`<a and y >` is why the tag NAME is an allow-list and an attribute region must contain
+        an `=`: without both halves this eats real numeric data out of a dataset."""
+        assert strip_html_tags(cell) == cell
+
+    def test_a_body_with_no_angle_brackets_is_byte_identical(self):
+        """The numeric tracker CSVs (1mU3g / kSCt4) contain zero `<` characters, so the strip must
+        be a provable no-op there rather than merely a small one."""
+        csv = "modeldate,approve,disapprove\n8/25/2026,36.41889,55.62032\n"
+        assert strip_html_tags(csv) == csv
+
+    def test_a_bare_link_cell_keeps_its_href_as_the_content(self):
+        """An anchor with empty inner text carries its content in the href, so dropping the tag
+        outright would delete the cell."""
+        assert strip_html_tags("source,<a href='https://x.test/report'></a>") == "source,https://x.test/report"
+
+    def test_an_unlisted_tag_name_is_left_alone(self):
+        """The allow-list is closed: `<body>`/`<script>` never appear in a CSV cell, and matching
+        every `<word>` is what makes the inequality cases above fail."""
+        assert strip_html_tags("<body class='x'>hi</body>") == "<body class='x'>hi</body>"
+
+    def test_a_pathological_no_close_tag_body_strips_in_linear_time(self):
+        """The tag-body alternation must reach its first `=` exactly one way. With `[^<>]*` on
+        both sides of the `=`, a body holding one `<b ` lookalike followed by an angle-bracket-free
+        run of URL cells (query-string `=` signs, no closing `>`) backtracks quadratically: 3.4s at
+        200 KiB measured, ~35 minutes at the 5 MiB response cap — synchronously on the event loop,
+        wedging the sibling fetches past every wall timeout. The linear form is sub-millisecond
+        here, so the 1s bound has three orders of magnitude of slack on either side."""
+        body = "x <b " + ("url=https://example.test/p?q=1&r=2, " * 6000)
+        start = time.perf_counter()
+        out = strip_html_tags(body)
+        elapsed = time.perf_counter() - start
+        assert out == body, "`<b ` with no closing `>` names no tag — the body must be untouched"
+        assert elapsed < 1.0, f"quadratic backtracking regression: {elapsed:.2f}s on a ~220 KiB body"
+
+
+class TestLooksLikeCsvRows:
+    """The precondition for the Tier-2 lead's `Dataset published <ts>` liveness claim."""
+
+    def test_a_header_plus_a_row_is_a_dataset(self):
+        assert looks_like_csv_rows("date,value\n2026-08-01,0.42\n") is True
+
+    def test_a_header_alone_is_not(self):
+        assert looks_like_csv_rows("date,value\n") is False
+
+    def test_a_delimiterless_header_is_not(self):
+        assert looks_like_csv_rows("Not Found\nThe requested chart is unavailable\n") is False
+
+    def test_an_html_error_page_is_not_even_when_it_carries_commas(self):
+        """A soft-404 page passes a bare delimiter test easily, which is why markup is rejected
+        outright on the first non-blank line."""
+        body = "<!DOCTYPE html>\n<html><head><title>404, not found</title></head>\n<body>gone</body>\n"
+        assert looks_like_csv_rows(body) is False
+
+    def test_tab_and_semicolon_delimiters_count(self):
+        assert looks_like_csv_rows("date\tvalue\n2026-08-01\t0.42\n") is True
+        assert looks_like_csv_rows("date;value\n2026-08-01;0.42\n") is True
+
+
+class TestVacuousBodyStatus:
+    """The one place "does this 200 body carry information?" is decided."""
+
+    def test_content_returns_none(self):
+        assert vacuous_body_status("date,value\n2026-08-01,0.42\n", 0.0, require_csv_rows=True) is None
+
+    @pytest.mark.parametrize("body", ["", "   ", "\n\n\t"])
+    def test_an_empty_or_whitespace_body_is_empty_body(self, body: str):
+        assert vacuous_body_status(body, 0.0, require_csv_rows=False) == "empty_body"
+
+    def test_an_undecodable_body_is_unsupported_type(self):
+        assert vacuous_body_status("d\x00a\x00t\x00e\x00", 0.5, require_csv_rows=False) == "unsupported_type"
+
+    def test_the_row_shape_requirement_is_dataset_only(self):
+        """A cited JSON or plain-text page has no row shape to satisfy; only a dataset claiming to
+        be a live series does."""
+        assert vacuous_body_status('{"cve": "x"}', 0.0, require_csv_rows=False) is None
+        assert vacuous_body_status('{"cve": "x"}', 0.0, require_csv_rows=True) == "unsupported_type"
+
+
+class TestServerHeaderToken:
+    """The marker's ``server`` field is ONE ``\\S+`` token, and this helper is what makes it one.
+
+    The archive parser (``resolution_source_fetch`` in ``scripts/telemetry/markers.py``) reads the
+    field as ``(?:\\s+server=(?P<server>\\S+))?`` with no trailing anchor, so a value that kept its
+    internal whitespace would not FAIL to parse: ``Server: Apache/2.4.62 (Debian)`` would match on
+    ``apache/2.4.62`` and the archive would record that as the whole header, ``(Debian)`` silently
+    dropped. Wrong data rather than a parse error, which is why the collapse, the case fold and the
+    width cap are pinned here rather than left to the two production call sites that are the
+    helper's only other readers.
+    """
+
+    def test_internal_whitespace_collapses_to_underscores(self):
+        assert server_header_token("Apache/2.4.62 (Debian)") == "apache/2.4.62_(debian)"
+        # Tabs, newlines and runs of spaces are one separator each, not one underscore per character.
+        assert server_header_token("nginx/1.25\t(Ubuntu)\n  edge-\r\n  pop") == "nginx/1.25_(ubuntu)_edge-_pop"
+
+    def test_the_case_fold_buckets_one_vendor_s_spellings_together(self):
+        """``AkamaiGHost`` and ``akamaighost`` are the same CDN; a query grouping by server must see
+        one key."""
+        assert server_header_token("AkamaiGHost") == "akamaighost"
+
+    @pytest.mark.parametrize("header", [None, "", "   \t"])
+    def test_an_absent_or_blank_header_is_none_not_an_empty_token(self, header: str | None):
+        """A bare ``server=`` with nothing after it is a line the parser's ``\\S+`` would refuse.
+        The emitter appends the field only when the token is truthy, so blank must come back None
+        rather than ``""``."""
+        assert server_header_token(header) is None
+
+    def test_the_width_cap_bounds_the_collapsed_token_not_the_raw_header(self):
+        """Truncation runs AFTER the collapse, so the cap is exactly the emitted token's width.
+
+        Capping the raw header first and collapsing second would shrink a shorter string: for this
+        input that order yields the 36-char ``apache/2.4.62_(debian)_openssl/3.0.1``, the right
+        order the 40-char ``apache/2.4.62_(debian)_openssl/3.0.13_mo`` (both hand-computed at the
+        cap of 40 the constant carried when this was written).
+        """
+        raw = "Apache/2.4.62 (Debian)     OpenSSL/3.0.13 mod_wsgi/4.9.4 Python/3.11"
+        collapsed = "apache/2.4.62_(debian)_openssl/3.0.13_mod_wsgi/4.9.4_python/3.11"
+        assert len(collapsed) > _SERVER_HEADER_MAX_CHARS, "the fixture must exceed the cap to exercise it"
+
+        token = server_header_token(raw)
+
+        assert token == collapsed[:_SERVER_HEADER_MAX_CHARS]
+        assert token is not None
+        assert len(token) == _SERVER_HEADER_MAX_CHARS
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "Apache/2.4.62 (Debian)",
+            "AkamaiGHost",
+            "cloudflare",
+            "  Microsoft-IIS/10.0   ",
+            "nginx/1.25\t(Ubuntu)\n  edge-\r\n  pop",
+            "Apache/2.4.62 (Debian)     OpenSSL/3.0.13 mod_wsgi/4.9.4 Python/3.11",
+        ],
+    )
+    def test_every_emitted_token_is_a_single_non_whitespace_run(self, header: str):
+        """The marker-line invariant made explicit rather than implied by the cases above: every
+        kind of whitespace ``str.split`` recognises must be gone from the token, or the archive's
+        ``\\S+`` reads a prefix of the value and records it as the whole."""
+        token = server_header_token(header)
+        assert token is not None
+        assert re.fullmatch(r"\S+", token), token
+
+
+class TestHttpFailureClass:
+    """The ``failure_class`` vocabulary off an HTTP status.
+
+    ``http_403`` stands on its own because it is the egress-reputation refusal the escalation
+    ladder exists for; the rest bucket by side. Below 400 the answer is None so a success and a
+    vetted redirect emit no field at all, which is what keeps every archived line byte-identical.
+    """
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [
+            (403, "http_403"),
+            (400, "http_4xx"),
+            (404, "http_4xx"),
+            (429, "http_4xx"),
+            (499, "http_4xx"),
+            (500, "http_5xx"),
+            (503, "http_5xx"),
+            (200, None),
+            (302, None),
+            (None, None),
+        ],
+    )
+    def test_the_status_maps_to_its_class_token(self, status: int | None, expected: str | None):
+        assert http_failure_class(status) == expected
+
+
+class TestFetchResultInvariant:
+    def test_a_success_with_blank_text_cannot_be_constructed(self):
+        """The invariant the field comment always stated and nothing enforced. An empty 200 body
+        shipped as `success` rendered an empty section under the "primary grading evidence"
+        caveat, suppressed the all-failed notice for its siblings, and reported `ok` to provider
+        diagnostics — so a future edit that reintroduces it should crash, not publish a hole."""
+        with pytest.raises(ValueError, match="blank text"):
+            FetchResult(url="https://x.test/a", status="success", text="   ", http_status=200, content_type="text/csv")
+
+    def test_a_failure_with_blank_text_is_the_normal_case(self):
+        assert FetchResult(url="https://x.test/a", status="empty_body", text="", http_status=200, content_type=None)
+
+
+class TestFormatResolutionSections:
+    def test_empty_results_returns_empty_string(self):
+        assert format_resolution_sections([], datetime(2026, 7, 9, tzinfo=UTC)) == ""
+
+    def test_all_failed_renders_unreachable_notice(self):
+        # URLs were attempted but every fetch failed — surface it instead of
+        # staying silent (the qid 44211 miss: the resolving CBP page 403'd and
+        # nobody in the pipeline learned it was unreachable).
+        results = [
+            FetchResult(
+                url="https://a.com/x",
+                status="blocked",
+                text="",
+                http_status=403,
+                content_type=None,
+            ),
+            FetchResult(
+                url="https://b.com/y",
+                status="js_wall",
+                text="",
+                http_status=200,
+                content_type="text/html",
+            ),
+        ]
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        assert out  # no longer empty
+        assert "2 resolution source(s) yielded no usable content" in out
+        assert "a.com: blocked" in out
+        assert "b.com: js_wall" in out
+        assert "nothing from the cited resolving page(s) is in this bundle; weight other evidence accordingly" in out
+        # Body only — the orchestrator prepends the "## Resolution Source Snapshot" header.
+        assert "## Resolution Source Snapshot" not in out
+
+    def test_an_empty_body_result_no_longer_suppresses_the_all_failed_notice(self):
+        """The render half of the empty-200 defect. While an empty body counted as `success`, ONE
+        such result put the section on the success path: it rendered an empty `### <url>` block
+        under the primary-grading-evidence caveat, and the all-failed "yielded no usable content" notice
+        — the whole point of which is to tell the forecaster to weight other evidence — was
+        withheld for the sibling URLs that genuinely failed."""
+        results = [
+            FetchResult(
+                url="https://empty.example.com/x",
+                status="empty_body",
+                text="",
+                http_status=200,
+                content_type="application/json",
+            ),
+            FetchResult(url="https://bad.com/y", status="blocked", text="", http_status=403, content_type=None),
+        ]
+
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+
+        assert "2 resolution source(s) yielded no usable content" in out
+        assert "empty.example.com: empty_body" in out
+        assert "nothing from the cited resolving page(s) is in this bundle" in out
+        assert "primary grading evidence" not in out
+        assert "### https://empty.example.com/x" not in out
+
+    def test_partial_success_appends_failure_note(self):
+        # Some sources fetched, some failed: keep the success content and append
+        # a terse note naming the unreachable ones.
+        results = [
+            FetchResult(
+                url="https://ok.com/data",
+                status="success",
+                text="the reading is 3.2%",
+                http_status=200,
+                content_type="text/html",
+            ),
+            FetchResult(
+                url="https://bad.com/y",
+                status="blocked",
+                text="",
+                http_status=403,
+                content_type=None,
+            ),
+        ]
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        # Success content still rendered.
+        assert "### https://ok.com/data" in out
+        assert "the reading is 3.2%" in out
+        assert "primary grading evidence" in out
+        # Terse note about the failed source appended.
+        assert "bad.com: blocked" in out
+        assert "other cited resolution source(s) yielded no usable content" in out
+        # The success path must not carry the all-failed sentence.
+        assert "nothing from the cited resolving page(s) is in this bundle" not in out
+
+    def test_success_rendering_includes_url_and_date(self):
+        results = [
+            FetchResult(
+                url="https://www.bls.gov/cpi/",
+                status="success",
+                text="CPI rose 3.2% over the past 12 months.",
+                http_status=200,
+                content_type="text/html",
+            ),
+        ]
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        assert "primary grading evidence" in out
+        assert "### https://www.bls.gov/cpi/" in out
+        assert "fetched 2026-07-09" in out
+        assert "CPI rose 3.2% over the past 12 months." in out
+
+    def test_total_budget_trims_later_sections(self, monkeypatch):
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        results = [
+            FetchResult(
+                url=f"https://example.com/{i}",
+                status="success",
+                text="A" * 300,
+                http_status=200,
+                content_type="text/html",
+            )
+            for i in range(4)
+        ]
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        # First section fits; later ones must be trimmed or dropped.
+        assert "https://example.com/0" in out
+        # We should NOT see all four full 300-char blocks packed together.
+        assert out.count("A" * 300) <= 2
+
+    def test_a_budget_trim_leaves_a_visible_truncation_marker(self, monkeypatch):
+        """The aggregate trim goes through the marker-emitting truncator, not a bare slice.
+
+        A bare slice cut mid-sentence and could eat the per-URL ``[truncated at N chars ...]``
+        marker the fetch already appended at the end — so an already-truncated page rendered
+        as complete. Reachable on prod constants (5 x 6000 per-URL against an 18000 total).
+        """
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        results = [
+            FetchResult(
+                url="https://example.com/long",
+                status="success",
+                text="B" * 5000 + "\n[truncated at 5000 chars — full source at https://example.com/long]",
+                http_status=200,
+                content_type="text/html",
+            )
+        ]
+
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+
+        # The section is cut, and the cut says so rather than ending mid-body.
+        assert "[truncated at 400 chars — full source at https://example.com/long]" in out
+        assert "B" * 5000 not in out
+
+    def test_dropped_sections_note_appended(self, monkeypatch):
+        # Tighten TOTAL cap so at least one section is dropped entirely: cap=300,
+        # 4 sources of 300 chars each — first section fills the budget, 3 dropped.
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 300)
+        results = [
+            FetchResult(
+                url=f"https://example.com/{i}",
+                status="success",
+                text="A" * 300,
+                http_status=200,
+                content_type="text/html",
+            )
+            for i in range(4)
+        ]
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        # The dropped-section note must appear, naming the dropped count.
+        assert "additional source(s) omitted — section budget" in out
+        assert "3 additional" in out
+
+    def test_no_drop_note_when_all_sections_fit(self):
+        # All sections fit -> no trailing "omitted" note.
+        results = [
+            FetchResult(
+                url="https://x.example.com/a",
+                status="success",
+                text="short body",
+                http_status=200,
+                content_type="text/html",
+            ),
+            FetchResult(
+                url="https://x.example.com/b",
+                status="success",
+                text="another short body",
+                http_status=200,
+                content_type="text/html",
+            ),
+        ]
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        assert "omitted" not in out
+
+    def test_a_remainder_under_the_section_floor_omits_the_section_rather_than_a_lead_stub(self):
+        """Below the truncation marker's own length the truncator degrades to a bare slice, so a
+        rescued section landing on a remainder shorter than its provenance lead rendered that
+        lead cut mid-word (`[Archived copy from the Wayback M`) with no marker, while the route
+        caveat above, computed over the kept results, promised every archived section states its
+        capture date and age. Reachable on prod constants: three full direct pages ahead of a
+        rescued fourth leave a remainder under the floor. Sizes derive from the constants so the
+        scenario stays the reachable one."""
+        total = resolution_source.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+        per_url = resolution_source.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        leftover = resolution_source.RESOLUTION_SOURCE_MIN_SECTION_CHARS // 3
+        fillers = [
+            FetchResult(
+                url=f"https://p{i}.example.com/x", status="success", text="F" * size, http_status=200, content_type=None
+            )
+            for i, size in enumerate((per_url, per_url, total - 2 * per_url - leftover))
+        ]
+        url = "https://www.bls.gov/wsp/"
+        snapshot = WaybackSnapshot(captured_at=datetime(2026, 8, 29, tzinfo=UTC), inner_url=url)
+        archived = FetchResult(
+            url=url,
+            status="success",
+            text=resolution_source._lead_then_capped_body(wayback_lead(snapshot, 6.0, "blocked"), "x" * 8000, url),
+            http_status=200,
+            content_type="text/html",
+            route="wayback",
+        )
+
+        out = format_resolution_sections([*fillers, archived], datetime(2026, 9, 4, tzinfo=UTC))
+
+        assert f"### {url}" not in out
+        assert "[Archived copy" not in out
+        assert "[1 additional source(s) omitted — section budget]" in out
+        assert ROUTE_CAVEATS["wayback"] not in out
+
+
+class TestRungVerdictsAreGlossedForForecasters:
+    """The per-domain token in both failure notices exists to tell "the tracker was down" from
+    "the tracker has no reading". Since the ladder, a cited page's status can be a RUNG's verdict
+    about an artifact the forecaster never sees: the Wayback rung's ``stale_data`` for a capture
+    it withheld, the paid reader's ``ungrounded`` for a read that retrieved nothing. Rendered
+    bare, ``www.bls.gov: stale_data`` asserts a false thing about the LIVE page. The notice
+    renders the direct outcome the rung's attempt recorded, glossed with what the rung found;
+    the status tokens themselves are telemetry and do not move."""
+
+    _AT = datetime(2026, 9, 4, tzinfo=UTC)
+    _BLS = "https://www.bls.gov/wsp/"
+    _WALLED = "https://x.example.com/dashboard"
+    _STALE_GLOSS = (
+        "www.bls.gov: blocked (live page could not be fetched; the newest archived copy is older than "
+        f"{RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS:.0f} days or undatable)"
+    )
+    _UNGROUNDED_GLOSS = "x.example.com: js_wall (a model-mediated read retrieved nothing)"
+
+    def _withheld_capture(self) -> FetchResult:
+        return FetchResult(
+            url=self._BLS,
+            status="stale_data",
+            text="",
+            http_status=403,
+            content_type=None,
+            route="wayback",
+            rung_attempts=[
+                RungAttempt(
+                    rung="wayback",
+                    from_status="blocked",
+                    url=self._BLS,
+                    started_at=0.0,
+                    wall_s=0.1,
+                    outcome="stale_data",
+                )
+            ],
+        )
+
+    def _ungrounded_read(self) -> FetchResult:
+        return FetchResult(
+            url=self._WALLED,
+            status="ungrounded",
+            text="",
+            http_status=200,
+            content_type="text/html",
+            route="url_context",
+            rung_attempts=[
+                RungAttempt(
+                    rung="url_context",
+                    from_status="js_wall",
+                    url=self._WALLED,
+                    started_at=0.0,
+                    wall_s=4.2,
+                    outcome="ungrounded",
+                )
+            ],
+        )
+
+    def _blocked_sibling(self) -> FetchResult:
+        return FetchResult(url="https://bad.com/y", status="blocked", text="", http_status=403, content_type=None)
+
+    def _success_sibling(self) -> FetchResult:
+        return FetchResult(
+            url="https://ok.com/data", status="success", text="the reading is 3.2%", http_status=200, content_type=None
+        )
+
+    def test_a_withheld_capture_renders_the_direct_outcome_in_the_all_failed_notice(self):
+        out = format_resolution_sections([self._withheld_capture(), self._blocked_sibling()], self._AT)
+
+        assert self._STALE_GLOSS in out
+        assert ": stale_data" not in out
+        # A plain direct failure beside it is byte-identical to what it rendered before the ladder.
+        assert "bad.com: blocked" in out
+        assert "2 resolution source(s) yielded no usable content" in out
+
+    def test_a_withheld_capture_renders_the_direct_outcome_in_the_mixed_note(self):
+        out = format_resolution_sections([self._success_sibling(), self._withheld_capture()], self._AT)
+
+        assert self._STALE_GLOSS in out
+        assert ": stale_data" not in out
+        assert "1 other cited resolution source(s) yielded no usable content" in out
+        assert "### https://ok.com/data" in out
+
+    def test_an_ungrounded_read_renders_the_direct_outcome(self):
+        out = format_resolution_sections([self._ungrounded_read(), self._blocked_sibling()], self._AT)
+
+        assert self._UNGROUNDED_GLOSS in out
+        assert ": ungrounded" not in out
+        assert "bad.com: blocked" in out
+
+
+class TestAriaTableRewrite:
+    """The stat block that is a table in every way except its tag names.
+
+    cdc.gov's outbreak pages build their case/hospitalization/death block out of
+    `<div role="table">` and friends. That is valid accessible markup and no table at all to
+    trafilatura, which renders the block as a whitespace blob of labels and values on
+    separate lines — so a cyclosporiasis question graded on the hospitalization count is
+    handed digits whose pairing with their labels rests on tab runs. (Under the
+    `favor_precision=True` call this module shipped until 2026-09-03 it was worse: the 922
+    was dropped outright.)
+    """
+
+    def test_the_hospitalization_count_arrives_with_its_label(self):
+        body = cdc_aria_stat_block_page()
+
+        before = resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+        after = resolution_source._extract_page_text(
+            body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0
+        ).text
+
+        assert before is not None
+        assert after is not None
+        assert "| Hospitalizations | 922 |" not in before, "the pre-rewrite behaviour this rung exists for"
+        assert "| Hospitalizations | 922 |" in after
+        # Every row survives, labelled — including the two whose values were bare text.
+        assert "| Laboratory-confirmed cases | 17,180 |" in after
+        assert "| Median age of cases | 46 years (range 1 to 99 years) |" in after
+        # The prose around the block is untouched.
+        assert "linked to iceberg lettuce" in after
+
+    def test_a_page_with_no_aria_table_is_left_alone(self, article_html):
+        """None means "hand trafilatura the original bytes", which is what keeps every page
+        that already worked byte-identical — including its encoding detection."""
+        assert rewrite_aria_tables(article_html.decode()) is None
+
+        assert resolution_source._extract_page_text(
+            article_html.decode(), article_html, "https://news.example.com/report", 0.0
+        ).text == resolution_source._extract_main_text(article_html, "https://news.example.com/report")
+
+    def test_an_unclosed_role_element_is_still_rewritten(self):
+        """A truncated capture (and plenty of live HTML) never closes its outer divs. Leaving
+        the `role="table"` div alone would strand the rewritten rows outside a table, and
+        lxml's recovering parser then drops the whole block."""
+        html = '<div role="table"><div role="row"><div role="rowheader">Deaths</div><div role="cell">2</div>'
+
+        out = rewrite_aria_tables(html)
+
+        assert out is not None
+        assert out.startswith("<table><tr><th>Deaths</th><td>2")
+
+    def test_an_unclosed_paragraph_inside_a_cell_does_not_swallow_the_row(self):
+        """The CDC shape: `<div role="cell"><p>17,180</div>`. The close tag pairs with the
+        nearest open of ITS name, so the stray `<p>` is dropped with the cell rather than
+        eating the rest of the block."""
+        html = '<div role="row"><div role="cell"><p>17,180</div><div role="cell">922</div></div>'
+
+        out = rewrite_aria_tables(html)
+
+        assert out == "<tr><td><p>17,180</td><td>922</td></tr>"
+
+    def test_a_stray_close_tag_is_ignored(self):
+        assert rewrite_aria_tables('</div><div role="cell">2</div>') == "</div><td>2</td>"
+
+    def test_a_data_role_attribute_is_not_an_aria_role(self) -> None:
+        # ``\brole`` matched inside ``data-role="table"`` (a word boundary sits after the hyphen), so a
+        # framework's data attribute rewrote a non-table element; the role attribute must stand alone.
+        html = '<div class="widget" data-role="table"><span data-role="cell">7</span></div>'
+        assert rewrite_aria_tables(html) is None
+        assert rewrite_aria_tables('<div role="table"><div role="cell">7</div></div>') is not None
+
+    def test_roles_are_matched_case_insensitively_and_unquoted(self):
+        assert rewrite_aria_tables("<span ROLE=Cell>2</span>") == "<td>2</td>"
+
+    def test_a_void_element_carrying_a_role_never_joins_the_nesting_stack(self):
+        """A `<br role="cell">` never closes, so pushing it would make every later close tag
+        pair with the wrong element."""
+        assert rewrite_aria_tables('<div role="row"><br role="cell"><div role="cell">2</div></div>') == (
+            '<tr><br role="cell"><td>2</td></tr>'
+        )
+
+    def test_a_cp1252_page_keeps_its_accents_instead_of_being_rewritten(self):
+        """The rewrite forecloses trafilatura's own encoding detection, so it is trusted only
+        on a body that decoded cleanly. This page declares windows-1252 ONLY in a
+        `<meta charset>`, which `decode_text_body` cannot see, so our decode mojibakes it —
+        and the ratio lands FAR below the shared refuse-the-body bound, which is why keying
+        the gate on that bound let it through and shipped mojibake as grading evidence."""
+        body = cp1252_aria_stat_block_page()
+        html_text, ratio = decode_text_body(body, "text/html")
+
+        assert 0.0 < ratio < MAX_UNDECODABLE_CHAR_RATIO, "pins that the old gate admitted this page"
+        assert "�" in html_text, "our own decode is what mangled it"
+
+        out = resolution_source._extract_page_text(html_text, body, "https://sante.example.com/qc", ratio).text
+
+        assert out is not None
+        assert "Résumé" in out
+        assert "Québec" in out
+        assert "�" not in out, "the bytes path found the meta declaration our decode missed"
+
+    @pytest.mark.parametrize("ratio", [0.01, MAX_UNDECODABLE_CHAR_RATIO + 0.01])
+    def test_any_undecodable_character_falls_back_to_the_bytes_path(self, ratio: float):
+        """Below AND above the shared bound: the guard is `== 0.0`, so both sides of the old
+        threshold now hand trafilatura the original bytes."""
+        body = cdc_aria_stat_block_page()
+
+        assert resolution_source._extract_page_text(
+            body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", ratio
+        ).text == resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+
+    def test_a_cleanly_decoded_page_still_gets_the_rewrite(self):
+        """Non-vacuity for the two cases above: at 0.0 the labelled row is present, so they
+        are asserting a real fallback rather than an extraction that never differs."""
+        body = cdc_aria_stat_block_page()
+
+        out = resolution_source._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0).text
+
+        assert out is not None
+        assert "| Hospitalizations | 922 |" in out
+
+
+class TestMetaRefreshTarget:
+    """The redirect no HTTP status announces.
+
+    cdc.gov's surveillance URLs answer 200 with a 234-340 byte stub whose only content is a
+    meta-refresh tag pointing at the real page. The manual redirect loop cannot see it (no
+    3xx, no `Location`), so the fetch classified the stub as a JS wall and the resolving
+    numbers were never fetched.
+    """
+
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            '<meta http-equiv="refresh" content="0; url=/real/page">',
+            "<meta http-equiv='refresh' content='0;URL=/real/page'>",
+            "<meta http-equiv=refresh content=0;url=/real/page>",
+            '<meta content="5; url=/real/page" http-equiv="refresh">',
+            '<meta http-equiv="REFRESH" content="0; URL=&#x27;/real/page&#x27;">',
+        ],
+    )
+    def test_the_target_is_read_from_every_spelling_in_the_wild(self, tag: str):
+        assert meta_refresh_target(f"<html><head>{tag}</head><body></body></html>") == "/real/page"
+
+    def test_entities_in_the_target_are_unescaped(self):
+        html = '<meta http-equiv="refresh" content="0; url=/p?a=1&amp;b=2">'
+
+        assert meta_refresh_target(html) == "/p?a=1&b=2"
+
+    def test_a_refresh_that_only_reloads_the_page_is_not_a_hop(self):
+        """`content="30"` with no url is a self-reload, which is a live-updating page rather
+        than a redirect — following it would just re-fetch what we already have."""
+        assert meta_refresh_target('<meta http-equiv="refresh" content="30">') is None
+
+    def test_an_unrelated_meta_tag_is_not_a_hop(self):
+        assert meta_refresh_target('<meta name="description" content="0; url=/x">') is None
+
+    def test_no_meta_tag_at_all(self):
+        assert meta_refresh_target("<html><body>hello</body></html>") is None
+        assert meta_refresh_target("") is None
+
+    def test_the_first_refresh_tag_wins(self):
+        html = '<meta http-equiv="refresh" content="0; url=/first"><meta http-equiv="refresh" content="0; url=/second">'
+
+        assert meta_refresh_target(html) == "/first"

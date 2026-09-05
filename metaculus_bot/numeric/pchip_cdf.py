@@ -8,6 +8,7 @@ Provides smooth, monotonic CDF construction with strict constraints enforcement.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
@@ -20,55 +21,111 @@ logger = logging.getLogger(__name__)
 # constraint rather than landing exactly on it (mirrors ``discrete_snap``).
 _ALPHA_SAFETY_MARGIN: float = 1.1
 
+# How far above ``max_step`` a step must sit to count as a violation, and how little
+# displaced mass is left before packing stops chasing it.
+_STEP_TOLERANCE: float = 1e-12
+_MASS_TOLERANCE: float = 1e-15
+# When packing gives up, how much unplaced mass makes it a real failure rather than
+# accumulated float drift. Deliberately far looser than _MASS_TOLERANCE (a ~200-ring walk
+# can drift a few times 1e-15) and far below the min-step, so nothing meaningful is lost.
+_UNPLACED_MASS_TOLERANCE: float = 1e-9
 
-def _redistribute_excess_probability(cdf: np.ndarray, max_step: float) -> np.ndarray:
+
+@dataclass(frozen=True)
+class _MaxStepRepair:
+    """A max-step repair's output plus what the cap displaced (the marker's fields)."""
+
+    cdf: np.ndarray
+    clipped_mass: float
+    over_cap_bins: int
+    bins_displaced: int
+    max_offset_bins: int
+
+
+def _pack_excess_nearest_first(steps: np.ndarray, max_step: float) -> None:
+    """Clip each over-cap bin to ``max_step`` and pour its excess into the NEAREST bins, in place.
+
+    Nearest-first rather than proportional-to-slack: on a fine grid every other bin has
+    almost the full cap free, so slack-proportional allocation spreads a clipped spike
+    near-uniformly over the whole grid. q45065 published 47% of its mass above 35 deaths
+    where all three forecasters had declared ~2% there. The cap itself is the platform's
+    (``0.2 * 200 / N``), so the spike is genuinely unpublishable; where the excess lands
+    is ours, and adjacent bins are the legal shape closest to what was declared.
     """
-    Redistribute probability mass so that no single step exceeds max_step while
-    preserving the original total mass and monotonicity.
+    n_bins = steps.size
+    for source in np.flatnonzero(steps > max_step + _STEP_TOLERANCE):
+        excess = float(steps[source]) - max_step
+        steps[source] = max_step
+        for offset in range(1, n_bins):
+            if excess <= _MASS_TOLERANCE:
+                break
+            ring = [j for j in (source - offset, source + offset) if 0 <= j < n_bins]
+            room = np.maximum(max_step - steps[ring], 0.0)
+            total_room = float(room.sum())
+            if total_room <= 0.0:
+                continue
+            if total_room <= excess:
+                # ``+= room`` rather than ``= max_step``: a ring member can itself be an
+                # over-cap bin awaiting its own turn as ``source``, and assigning the cap
+                # would silently delete its excess.
+                steps[ring] += room
+                excess -= total_room
+            else:
+                # Split the remainder across the ring in proportion to headroom, so a
+                # symmetric declaration does not acquire a one-sided tail at the last ring.
+                steps[ring] += excess * room / total_room
+                excess = 0.0
+        if excess > _UNPLACED_MASS_TOLERANCE:
+            raise RuntimeError(
+                f"Failed to redistribute CDF probability mass within max step constraint "
+                f"(unplaced excess={excess:.12f}, bins={n_bins}, max_step={max_step})"
+            )
+
+
+def _displacement_stats(before: np.ndarray, after: np.ndarray, over_cap: np.ndarray) -> tuple[int, int]:
+    """``(bins that received displaced mass, farthest such bin's distance from a clipped bin)``."""
+    received = np.flatnonzero(after > before + _STEP_TOLERANCE)
+    sources = np.flatnonzero(over_cap)
+    if received.size == 0 or sources.size == 0:
+        return 0, 0
+    offsets = np.abs(received[:, None] - sources[None, :]).min(axis=1)
+    return int(received.size), int(offsets.max())
+
+
+def _redistribute_excess_probability(cdf: np.ndarray, max_step: float) -> _MaxStepRepair:
+    """Clip every over-cap step and pack the displaced mass into the nearest bins with headroom.
+
+    Total mass and monotonicity survive by construction: packing only ADDS to bins that
+    had headroom, so the min-step cannot be tightened either. Callers must hand in a
+    MONOTONE CDF (every production caller pre-monotonizes); the ``np.maximum(raw_steps,
+    0.0)`` floor below is a defensive last resort, not a supported path — it inflates
+    total mass, and the endpoint is restored only for monotone input.
     """
-    if cdf.size <= 1:
-        return cdf
+    raw_steps = np.diff(cdf)
+    was_monotone = not bool(np.any(raw_steps < 0.0))
+    steps = np.maximum(raw_steps, 0.0)
+    over_cap = steps > max_step + _STEP_TOLERANCE
+    clipped_mass = float(np.sum(steps[over_cap] - max_step))
 
-    steps = np.diff(cdf)
-    if not np.any(steps > max_step + 1e-12):
-        return cdf
-
-    original_total = float(steps.sum())
-    steps = np.clip(steps, 0.0, max_step)
-    deficit = original_total - float(steps.sum())
-
-    iteration = 0
-    max_iterations = max(5, steps.size * 5)
-
-    while deficit > 1e-12 and iteration < max_iterations:
-        slack = max_step - steps
-        positive_slack = slack > 1e-12
-        if not np.any(positive_slack):
-            # No room left to redistribute
-            break
-
-        allocation = np.zeros_like(steps)
-        slack_sum = float(slack[positive_slack].sum())
-        if slack_sum <= 1e-18:
-            break
-
-        allocation[positive_slack] = deficit * slack[positive_slack] / slack_sum
-        allocation = np.minimum(allocation, slack)
-
-        steps += allocation
-        deficit = original_total - float(steps.sum())
-        iteration += 1
-
-    if deficit > 1e-8:
-        raise RuntimeError(
-            f"Failed to redistribute CDF probability mass within max step constraint "
-            f"(remaining deficit={deficit:.12f}, iterations={iteration}, max_step={max_step})"
-        )
+    before = steps.copy()
+    _pack_excess_nearest_first(steps, max_step)
+    bins_displaced, max_offset_bins = _displacement_stats(before, steps, over_cap)
 
     new_cdf = np.empty_like(cdf)
     new_cdf[0] = cdf[0]
     new_cdf[1:] = cdf[0] + np.cumsum(steps)
-    return new_cdf
+    if was_monotone:
+        # The repair only MOVES mass between bins, so a monotone input's endpoint is
+        # unchanged by contract; assigning it back keeps a closed upper bound exactly 1.0
+        # instead of one ulp under, which Metaculus compares for equality.
+        new_cdf[-1] = cdf[-1]
+    return _MaxStepRepair(
+        cdf=new_cdf,
+        clipped_mass=clipped_mass,
+        over_cap_bins=int(np.count_nonzero(over_cap)),
+        bins_displaced=bins_displaced,
+        max_offset_bins=max_offset_bins,
+    )
 
 
 def safe_cdf_bounds(
@@ -78,6 +135,8 @@ def safe_cdf_bounds(
     *,
     min_step: float = NUM_MIN_PROB_STEP,
     max_step: float = NUM_MAX_STEP,
+    question_id: int | str | None = None,
+    model_name: str = "",
 ) -> np.ndarray:
     """
     Ensure CDF respects Metaculus boundary constraints:
@@ -90,6 +149,10 @@ def safe_cdf_bounds(
     (a discrete question with ``cdf_size != 201``) must pass the grid-scaled values so the
     per-bin constraints match the server's ``round(0.01 / N, 9)`` min-step and
     ``0.2 * 200 / N`` max-step formulas, where ``N = cdf_size - 1``.
+
+    ``question_id`` / ``model_name`` only label the ``CDF_MAXSTEP_CLIP`` marker emitted
+    when the max-step cap displaces mass; they are absent on the ablation/pooling callers,
+    where the repair is not a production forecast.
     """
     # Work on a copy to avoid mutating callers unexpectedly
     cdf = cdf.copy()
@@ -100,15 +163,24 @@ def safe_cdf_bounds(
     if open_upper:
         cdf[-1] = min(cdf[-1], 0.999)
 
-    # Enforce the maximum step rule iteratively
+    # Enforce the maximum step rule
     pre_max_step = float(np.max(np.diff(cdf))) if cdf.size > 1 else 0.0
-    if pre_max_step > max_step + 1e-12:
-        cdf = _redistribute_excess_probability(cdf, max_step)
-        post_max_step = float(np.max(np.diff(cdf))) if cdf.size > 1 else 0.0
-        logger.debug(
-            "CDF max-step redistribution applied | pre_max_step=%.8f | post_max_step=%.8f | max_step=%.8f",
+    if pre_max_step > max_step + _STEP_TOLERANCE:
+        repair = _redistribute_excess_probability(cdf, max_step)
+        cdf = repair.cdf
+        # WARN, not DEBUG: this repair reshaped 47% of q45065's published mass and left no
+        # trace in the run logs, so the 2026-07-15 "repair-tier WARNs never fire" audit
+        # never saw it. NOT alertable — the cap is the platform's, not a bot defect.
+        logger.warning(
+            "CDF_MAXSTEP_CLIP: question=%s model=%s clipped_mass=%.6f over_cap_bins=%d "
+            "bins_displaced=%d max_offset_bins=%d pre_max_step=%.6f max_step=%.6f",
+            question_id,
+            model_name or "unknown",
+            repair.clipped_mass,
+            repair.over_cap_bins,
+            repair.bins_displaced,
+            repair.max_offset_bins,
             pre_max_step,
-            post_max_step,
             max_step,
         )
 
@@ -526,6 +598,7 @@ def generate_pchip_cdf(
     num_points: int = 201,
     question_id: int | str | None = None,
     question_url: str | None = None,
+    model_name: str = "",
 ) -> tuple[list[float], bool]:
     """
     Generate a robust continuous CDF using PCHIP interpolation with strict constraint enforcement.
@@ -541,6 +614,10 @@ def generate_pchip_cdf(
     server's ``round(0.01 / N, 9)`` min-step and ``0.2 * 200 / N`` max-step, where
     ``N = num_points - 1``. Passing the 201-grid ``max_step`` (0.2) on a coarse discrete grid
     wrongly clips each bin to 20% and shoves the excess onto higher bins.
+
+    ``model_name`` only labels the ``CDF_MAXSTEP_CLIP`` marker (which forecaster's
+    declaration the cap had to clip); callers that build an ensemble CDF pass a label for
+    the aggregation stage instead.
 
     Raises:
         ValueError: If input validation fails
@@ -573,7 +650,15 @@ def generate_pchip_cdf(
     cdf_y = _blend_with_uniform(cdf_y, min_step, num_points)
     cdf_y = enforce_min_steps(cdf_y, min_step, upper_cap=1.0, lower_cap=0.0)
     _redistribute_saturated_tail(cdf_y, min_step)
-    cdf_y = safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound, min_step=min_step, max_step=max_step)
+    cdf_y = safe_cdf_bounds(
+        cdf_y,
+        open_lower_bound,
+        open_upper_bound,
+        min_step=min_step,
+        max_step=max_step,
+        question_id=question_id,
+        model_name=model_name,
+    )
 
     aggressive_enforcement_used = bool(np.any(np.diff(cdf_y) < min_step))
     if aggressive_enforcement_used:

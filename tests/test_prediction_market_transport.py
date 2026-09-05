@@ -12,8 +12,10 @@ Fakes, payload fixtures and the `handlers()` baseline live in `tests/market_retr
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,6 +25,7 @@ from metaculus_bot.research.http_fetch import ERROR_SNIPPET_BYTES
 from metaculus_bot.research.market_retrieval import venues
 from metaculus_bot.research.market_retrieval.http import MAX_RESPONSE_BYTES
 from metaculus_bot.research.prediction_market import _reset_session_caches
+from metaculus_bot.research.provider_health import recorded_observations, reset_provider_health
 from tests import market_retrieval_fakes as _fakes
 from tests.market_retrieval_fakes import KALSHI_EVENTS_URL as _KALSHI_EVENTS_URL
 from tests.market_retrieval_fakes import MANIFOLD_SEARCH_URL as _MANIFOLD_SEARCH_URL
@@ -217,3 +220,144 @@ class TestCatalogueCaching:
         assert pmp._SNAPSHOT_CACHE == {}
         assert pmp.kalshi_catalogue_fetch_failures() == 0
         assert pmp.prediction_market_source_losses() == 0
+
+
+class _SuspendingResponse(FakeResponse):
+    """A `FakeResponse` that yields to the event loop before it serves its body.
+
+    The single-flight tests need two callers inside one pull at once, and nothing in the fake
+    transport suspends on its own: `FakeResponse.json` and the streamed `iter_chunked` never await
+    a real future, so a gathered caller can run a whole unpaginated fetch without ever handing
+    control back. Kalshi's own inter-page `asyncio.sleep` gives that up for free once a pull spans
+    two pages, which is why only the one-GET PredictIt pull needs this.
+    """
+
+    async def __aenter__(self) -> _SuspendingResponse:
+        await asyncio.sleep(0)
+        return self
+
+
+# Page one of a two-page catalogue: a real row plus an open cursor, so the pull paginates — and
+# sleeps between pages, which is what lets a second caller reach the guard mid-pull.
+_KALSHI_PAGE_ONE = {
+    "events": [{"event_ticker": "KXPAGEONE", "title": "Page one event", "markets": []}],
+    "cursor": "next",
+}
+
+
+class TestCatalogueSingleFlight:
+    """The in-flight guard on the two catalogue caches.
+
+    The 6h TTL check cannot see a pull that has STARTED and not finished, so with one pull per
+    question a run's concurrent questions opened one whole-catalogue pagination each against the
+    same venue — 60-75 pages apiece for Kalshi — and the venue rate-limited most of them. Every
+    test here is about what N concurrent callers make the venue see, and about the outcome they
+    share when the one pull they all ride goes wrong.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_questions_share_one_kalshi_pagination(self, kalshi_events_payload):
+        """Four questions, one pagination: two page fetches total, and all four get BOTH pages.
+
+        The per-question catalogue-size observation is asserted alongside, because sharing the
+        pull must not cost the waiters their own provider-health signal — that recording is what
+        Signal C reads, and it is keyed by qid.
+        """
+        session = FakeSession(
+            {_KALSHI_EVENTS_URL: [FakeResponse(200, _KALSHI_PAGE_ONE), FakeResponse(200, kalshi_events_payload)]}
+        )
+        reset_provider_health()
+
+        results = await asyncio.gather(*(pmp._kalshi_catalogue(session, qid=qid) for qid in (11, 22, 33, 44)))
+
+        assert session._call_counts[_KALSHI_EVENTS_URL] == 2, "one shared pagination, not one per question"
+        assert [[event["event_ticker"] for event in events] for events, _token in results] == [
+            ["KXPAGEONE", "KXSPACEX-26", "KXOTHER-1"]
+        ] * 4
+        assert [token for _events, token in results] == ["ok(3)"] * 4
+        _venue_observations, catalogues = recorded_observations()
+        assert sorted(obs.qid for obs in catalogues) == [11, 22, 33, 44]
+        assert all(obs.fetch_ok for obs in catalogues)
+
+    @pytest.mark.asyncio
+    async def test_a_rate_limited_leader_hands_every_waiter_the_same_partial(self):
+        """A 429 mid-pagination is SHARED rather than retried by each waiter.
+
+        Re-asking a rate limiter from three more questions is a second violation, not a retry
+        (`_kalshi_fetch_events_page` refuses to retry a 429 for exactly that reason), so the
+        waiters get what the leader got: the partial catalogue plus its error token. One lost pull
+        also bumps the catalogue-failure counter ONCE, which is the honest count of pulls lost —
+        the pre-guard behaviour reported the same outage once per rate-limited question.
+        """
+        session = FakeSession(
+            {_KALSHI_EVENTS_URL: [FakeResponse(200, _KALSHI_PAGE_ONE), FakeResponse(429, text="slow down")]}
+        )
+
+        results = await asyncio.gather(*(pmp._kalshi_catalogue(session, qid=None) for _ in range(4)))
+
+        assert session._call_counts[_KALSHI_EVENTS_URL] == 2, "the waiters must not re-ask the rate limiter"
+        assert [token for _events, token in results] == ["error(http_429)"] * 4
+        assert [[event["event_ticker"] for event in events] for events, _token in results] == [["KXPAGEONE"]] * 4
+        assert "events" not in pmp._KALSHI_CACHE, "a truncated catalogue must not be pinned for the TTL"
+        assert pmp.kalshi_catalogue_fetch_failures() == 1, "one lost pull is one failure, not one per waiter"
+
+    @pytest.mark.asyncio
+    async def test_a_leader_whose_pull_raises_does_not_strand_its_waiters(self):
+        """A leader that produces NO result — its pull raised, or its own caller's deadline
+        cancelled it — is the one case the waiters cannot share.
+
+        They go back through the guard instead: the first to wake leads a fresh pull and the rest
+        wait on that one, so an abandoned pull costs one more pull rather than one per waiter, and
+        nobody is left awaiting a future that will never resolve.
+        """
+        attempts: list[int] = []
+
+        async def flaky_prefetch(_session: Any, **_kwargs: Any) -> venues.CataloguePull:
+            attempts.append(1)
+            await asyncio.sleep(0)  # let the other callers queue behind this pull first
+            if len(attempts) == 1:
+                raise RuntimeError("connector died mid-pull")
+            return venues.CataloguePull(
+                events=[{"event_ticker": "KXLATE", "title": "Late event", "markets": []}],
+                token="",
+                tally=pmp._FetchTally(ok=1),
+                complete=True,
+            )
+
+        with patch.object(venues, "kalshi_prefetch_events", flaky_prefetch):
+            outcomes = await asyncio.gather(
+                *(pmp._kalshi_catalogue(MagicMock(), qid=None) for _ in range(3)), return_exceptions=True
+            )
+
+        assert isinstance(outcomes[0], RuntimeError), "the leader's own caller still sees the failure"
+        # A waiter that inherited the failure lands its exception in the token slot, so it fails
+        # this same assertion rather than needing a second one.
+        waiter_tokens = [outcome if isinstance(outcome, BaseException) else outcome[1] for outcome in outcomes[1:]]
+        assert waiter_tokens == ["ok(1)"] * 2
+        assert len(attempts) == 2, "one extra pull for the whole set of waiters"
+        assert pmp._KALSHI_CATALOGUE_IN_FLIGHT == {}, "a settled pull leaves nothing behind to await"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_questions_share_one_predictit_fetch(self, predictit_payload):
+        """The PredictIt dump is one unpaginated GET, and four questions make exactly one of it."""
+        session = FakeSession({_PREDICTIT_URL: _SuspendingResponse(200, predictit_payload)})
+
+        results = await asyncio.gather(*(pmp._predictit_universe(session, qid=None) for _ in range(4)))
+
+        assert session._call_counts[_PREDICTIT_URL] == 1, "one shared dump, not one per question"
+        assert [tally.ok for _markets, tally in results] == [1] * 4
+        assert all(markets == results[0][0] for markets, _tally in results)
+
+    @pytest.mark.asyncio
+    async def test_reset_clears_the_in_flight_pull_maps(self):
+        """The guards are reset with the caches they guard. A future left here from an earlier
+        test's event loop would be awaited by the next test and never resolve."""
+        loop = asyncio.get_running_loop()
+        pmp._KALSHI_CATALOGUE_IN_FLIGHT["events"] = loop.create_future()
+        pmp._PREDICTIT_UNIVERSE_IN_FLIGHT["markets"] = loop.create_future()
+
+        _reset_session_caches()
+
+        assert pmp._KALSHI_CATALOGUE_IN_FLIGHT == {}
+        assert pmp._PREDICTIT_UNIVERSE_IN_FLIGHT == {}
+        await asyncio.sleep(0)  # cooperative yield for flake8-async ASYNC910

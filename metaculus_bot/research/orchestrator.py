@@ -47,8 +47,10 @@ from metaculus_bot.constants import (
     TS_ANCHOR_ENABLED_ENV,
     env_flag_enabled,
 )
+from metaculus_bot.credit_telemetry import llm_call_metadata, plain_llm_key_alias
 from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
 from metaculus_bot.llm_retry import invoke_with_transient_retry
+from metaculus_bot.prompts import OUTSIDE_VENUE_MARKET_ODDS_POLICY
 from metaculus_bot.research import degradation_views
 from metaculus_bot.research.asknews_summarization import summarize_asknews
 from metaculus_bot.research.gap_fill_stages import run_gap_fill_passes
@@ -288,7 +290,9 @@ class ResearchOrchestrator:
         the phase's longest configured pole — so dropping the cheap hard-capped
         providers (resolution_source 45 s, prediction_market 150 s, ts_anchor 20 s,
         financial classifier 30 s) cannot shorten the phase and only discards the
-        resolution ground truth. What the fast path CAN shed is the measured tail:
+        resolution ground truth. The flag is still handed to ``resolution_source``, whose
+        two expensive escalation rungs (a Chromium launch, the paid reader) decline on it
+        while its direct fetch and cheap rungs run. What the fast path CAN shed is the measured tail:
         native_search is the phase's slowest provider on 51.5% of questions and
         reached 292 s against the primary's 110 s measured worst case
         (scratch/residual_2026-08-24/time_budget_design.md). Anything still
@@ -349,7 +353,15 @@ class ResearchOrchestrator:
                 resolution_source_provider,
             )
 
-            providers.append((resolution_source_provider(is_benchmarking=self._is_benchmarking), "resolution_source"))
+            # Stays on the fast path (cheap, hard-capped at 45 s — see the docstring above);
+            # the flag makes its two EXPENSIVE ladder rungs, the browser and the paid reader,
+            # decline instead.
+            providers.append(
+                (
+                    resolution_source_provider(is_benchmarking=self._is_benchmarking, fast_path=fast_path),
+                    "resolution_source",
+                )
+            )
 
         if not providers:
             providers.append((_empty_provider, "none"))
@@ -581,12 +593,18 @@ class ResearchOrchestrator:
     async def _call_perplexity(self, question: MetaculusQuestion | str, use_open_router: bool = True) -> str:
         question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
 
+        # Same narrowed market-odds policy as `web_research_prompt` and the direct-Perplexity
+        # provider, interpolated from the one definition in `prompts` rather than restated —
+        # this prompt carried the retired blanket "briefly research prediction markets" ask after
+        # that policy was narrowed to the venues the live snapshot cannot cover.
+        # The no-speculation tail is this prompt's own and stays: it is an anti-fabrication rule
+        # about an empty result, not a second opinion on which venues to read.
         prediction_markets_instruction = (
             ""
             if self._is_benchmarking
             else (
-                "In addition to news, briefly research prediction markets that are relevant to the question. "
-                "(If there are no relevant prediction markets, simply skip reporting on this and "
+                f"In addition to news, cover: {OUTSIDE_VENUE_MARKET_ODDS_POLICY} "
+                "(If there are no relevant markets of that kind, simply skip reporting on this and "
                 "DO NOT speculate what they would say.)"
             )
         )
@@ -610,6 +628,9 @@ class ResearchOrchestrator:
             # (GeneralLlm ctor default is already None). No top_p.
             temperature=None,
             api_key=get_openrouter_api_key(model_name) if model_name.startswith("openrouter/") else None,
+            # CREDIT_ROLE_SPEND tag. Perplexity is not donated-key-eligible, so the
+            # openrouter/ route bills the personal key; the direct route bills Perplexity.
+            metadata=llm_call_metadata("perplexity_research", plain_llm_key_alias(model_name)),
             # allowed_tries=1 hands the retry budget to the gated wrapper below; left
             # unpinned it inherited forecasting-tools' default of 2 with an un-gated
             # random.uniform(5, 10) tenacity sleep.

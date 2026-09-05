@@ -16,11 +16,12 @@ import pandas as pd
 import yfinance
 from forecasting_tools import GeneralLlm
 from forecasting_tools.data_models.questions import MetaculusQuestion
-from fredapi import Fred
 
 from metaculus_bot.constants import (
     FINANCIAL_CLASSIFIER_MODEL,
     FINANCIAL_CLASSIFIER_TIMEOUT,
+    FINANCIAL_VARIANCE_RATIO_FLOOR,
+    FINANCIAL_VARIANCE_RATIO_LAG,
     FINANCIAL_YFINANCE_LOOKBACK_DAYS,
     FINANCIAL_YFINANCE_RECENT_DAYS,
     FRED_API_KEY_ENV,
@@ -28,7 +29,11 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
-from metaculus_bot.research.provider_diagnostics import record_provider_detail
+from metaculus_bot.research.currency_pegs import peg_disclosure_lines, peg_for_ticker
+from metaculus_bot.research.fred_rendering import UnknownFredSeries, _fetch_fred_data, _fetch_fred_data_ceiling
+from metaculus_bot.research.fx_identifiers import is_fx_identifier
+from metaculus_bot.research.noise_flag import noise_flag_line, screen_for_quote_noise
+from metaculus_bot.research.provider_diagnostics import is_lost_source, record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.ts_estimators import (
     CALENDAR_DAYS_PER_YEAR,
@@ -38,7 +43,6 @@ from metaculus_bot.research.ts_estimators import (
     observed_periods_per_year,
     stale_latest_age_days,
 )
-from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -243,6 +247,20 @@ def extract_financial_identifiers_from_criteria(text: str) -> dict[str, list[str
     return {"tickers": tickers, "fred_series": fred_series}
 
 
+# Exchange-rate routing rule, interpolated into CLASSIFIER_PROMPT below.
+#
+# The reference tables carry NO exchange-rate FRED series at all and only three currency crosses, so
+# on a question about any other currency the classifier had nothing to route to and invented an id:
+# q45363 got `DEXBOUS`, which does not exist on FRED, with no Yahoo cross beside it, and therefore no
+# financial block at all on a currency question (see fx_identifiers for the full receipt). Naming
+# Yahoo's two FX spellings and forbidding an unsourced FRED FX id is the fix at the cause, because the
+# currency's ISO code is not recoverable downstream: FRED's country codes are not ISO currency codes,
+# and the `BO` in `DEXBOUS` is a country rather than a currency, so the classifier is the only step in
+# the pipeline that can name the pair.
+_FX_ROUTING_RULE = """EXCHANGE-RATE QUESTIONS: route these to a Yahoo FX ticker, never to a FRED series unless the resolution criteria name one by URL. Yahoo serves every cross in two spellings that mean opposite directions: USD<ISO>=X (equivalently <ISO>=X) quotes units of the foreign currency per US dollar, and <ISO>USD=X quotes US dollars per unit of it. Emit the spelling that matches how the question quotes the rate - a question asking how many bolivianos one US dollar buys is USDBOB=X, a question asking the dollar value of one boliviano is BOBUSD=X. This holds for every currency, including ones absent from the reference table above.
+
+NEVER invent a FRED series ID. Emit only IDs listed in the reference table above, or ones a URL in the resolution criteria names explicitly."""
+
 # Built from _TICKER_GROUPS / _FRED_GROUPS so the prompt's reference table and the
 # KNOWN_* allowlist share one source of truth (the f-string-injected blocks carry no
 # `{...}` of their own; the trailing {question_text}/{resolution_criteria}/{fine_print}
@@ -260,6 +278,8 @@ REFERENCE TABLE of common tickers and FRED series:
 
 FRED series:
 {_build_fred_reference_lines()}
+
+{_FX_ROUTING_RULE}
 
 Only output YES if there are specific tickers or FRED series that would provide useful data.
 If the question is about general economic trends without specific measurable indicators, output NO.
@@ -395,27 +415,89 @@ def _yfinance_latest_lines(
     return parts
 
 
-def _yfinance_stats_lines(close: pd.Series, periods_per_year: int) -> list[str]:
-    """Period returns, annualized volatility, and the 52-week range."""
+def _volatility_lines(close: pd.Series, periods_per_year: int, *, symbol: str) -> list[str]:
+    """Annualized volatility at two horizons, plus the vendor-noise flag when it fires.
+
+    Two horizons because a single 30-row window is both a noisy estimate and, on a thin
+    series, a systematically inflated one: q44797 published a 43-day forecast sized off a
+    17.8% figure computed on 30 rows of a pegged cross, where the same series over a year
+    read 15.2% and the liquid anchor read 10.6-12.9%.
+
+    The noise flag is the variance-ratio screen (``FINANCIAL_VARIANCE_RATIO_*``). When it
+    fires the ordering inverts: the noise-robust volatility (measured on multi-day returns,
+    over which the reversing component cancels) leads, the long window follows, and the
+    short window comes last carrying the noise-suspect label — so the number nearest the top
+    is the one a forecaster should size an interval from. Unflagged, the short window stays
+    first, exactly as before.
+    """
+    unit = daily_step_unit(periods_per_year)
+    # Volatility over the trailing FINANCIAL_YFINANCE_RECENT_DAYS observations — the
+    # shared estimator (ts_estimators), so this line and the anchor stack's vol note
+    # cannot drift apart again; None when the return sample is shorter than the window
+    # (a vol wearing the window's label without its sample size). Name the step unit:
+    # FINANCIAL_YFINANCE_RECENT_DAYS is a ROW count, which is six calendar weeks on an
+    # exchange-traded series and 30 calendar days on a 24/7 one, so a bare "30-day" label
+    # was itself a row count posing as a calendar window.
+    short_vol = annualized_realized_vol_pct(
+        close, window=FINANCIAL_YFINANCE_RECENT_DAYS, periods_per_year=periods_per_year
+    )
+    if short_vol is None:
+        return []
+    short_line = f"- {FINANCIAL_YFINANCE_RECENT_DAYS}-{unit} annualized volatility: {short_vol:.1f}%"
+
+    # The long horizon: one year of returns, or everything the fetch actually holds when
+    # that is less. Capped at a year so the label stays a period a forecaster can reason
+    # about, and skipped when it would not clear the short window (two windows of the same
+    # length are one number printed twice).
+    long_window = min(len(close) - 1, periods_per_year)
+    long_vol = (
+        annualized_realized_vol_pct(close, window=long_window, periods_per_year=periods_per_year)
+        if long_window > FINANCIAL_YFINANCE_RECENT_DAYS
+        else None
+    )
+    long_line = None if long_vol is None else f"- {long_window}-{unit} annualized volatility: {long_vol:.1f}%"
+
+    screen = screen_for_quote_noise(close, periods_per_year=periods_per_year)
+    if screen is None:
+        return [short_line] if long_line is None else [short_line, long_line]
+
+    robust_vol = screen.robust_vol_pct
+    flagged = [
+        f"- ⚠ Vendor-noise flag: variance ratio VR({FINANCIAL_VARIANCE_RATIO_LAG}) = {screen.ratio:.2f} over "
+        f"{len(close) - 1} {unit} returns. A random walk reads ~1.0; below "
+        f"{FINANCIAL_VARIANCE_RATIO_FLOOR:.2f} most of each day's move is reversed the next, which is quote "
+        "noise on an illiquid or fixed cross rather than genuine price movement, and it inflates every "
+        "volatility computed from one-day returns."
+    ]
+    if robust_vol is not None:
+        flagged.append(
+            f"- Noise-robust annualized volatility, from overlapping {FINANCIAL_VARIANCE_RATIO_LAG}-"
+            f"{unit} returns (the horizon over which that reversing component cancels): "
+            f"{robust_vol:.1f}% — size intervals from THIS figure, not the one-day-return ones below."
+        )
+    if long_line is not None:
+        flagged.append(f"{long_line} (from one-day returns, noise included)")
+    flagged.append(f"{short_line} (from one-day returns, noise included; noise-suspect)")
+    logger.info(
+        noise_flag_line(screen, surface="financial_data", symbol=symbol, short_vol=short_vol, long_vol=long_vol)
+    )
+    return flagged
+
+
+def _yfinance_stats_lines(close: pd.Series, periods_per_year: int, *, symbol: str) -> list[str]:
+    """Period returns, annualized volatility, and the 52-week range.
+
+    ``symbol`` is threaded purely for the noise flag's telemetry line, which is otherwise
+    anonymous: nothing on ``close`` names the ticker (its ``.name`` is "Close") and the fetch
+    fans out one thread per identifier, so line order does not identify it either.
+    """
     parts: list[str] = []
     # Period returns
     returns_section = _compute_period_returns(close, periods_per_year)
     if returns_section:
         parts.append(returns_section)
 
-    # Volatility over the trailing FINANCIAL_YFINANCE_RECENT_DAYS observations — the
-    # shared estimator (ts_estimators), so this line and the anchor stack's vol note
-    # cannot drift apart again; None when the return sample is shorter than the window
-    # (a vol wearing the window's label without its sample size).
-    annualized_vol = annualized_realized_vol_pct(
-        close, window=FINANCIAL_YFINANCE_RECENT_DAYS, periods_per_year=periods_per_year
-    )
-    if annualized_vol is not None:
-        # Name the step unit: FINANCIAL_YFINANCE_RECENT_DAYS is a ROW count, which is six
-        # calendar weeks on an exchange-traded series and 30 calendar days on a 24/7 one, so
-        # a bare "30-day" label was itself a row count posing as a calendar window.
-        unit = daily_step_unit(periods_per_year)
-        parts.append(f"- {FINANCIAL_YFINANCE_RECENT_DAYS}-{unit} annualized volatility: {annualized_vol:.1f}%")
+    parts.extend(_volatility_lines(close, periods_per_year, symbol=symbol))
 
     # 52-week range, windowed by DATE like the period returns: a row-count slice
     # under a fixed "52-week" label spans ~13 months on a gapped 24/7 series and
@@ -449,9 +531,41 @@ def _yfinance_fundamentals_lines(close: pd.Series, info: dict, *, is_benchmarkin
 
 
 def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_benchmarking: bool = False) -> str:
+    """One ticker's markdown block, plus the peg anchor's block when the pair is pegged.
+
+    Sync function -- caller wraps in asyncio.to_thread(). Returns "" when the ticker's own
+    fetch fails, exactly as before; a peg anchor that fails to fetch degrades to a visible
+    one-line notice rather than taking the pegged pair's block down with it.
+
+    The anchor is rendered BESIDE the pegged pair, never substituted for it: the question
+    resolves on the pegged cross, so its own quote has to stay on the page. Only the
+    interpretation changes, and the peg disclosure inside the block says so.
+    """
+    block = _render_yfinance_block(ticker, as_of=as_of, is_benchmarking=is_benchmarking)
+    if not block:
+        return ""
+    peg = peg_for_ticker(ticker)
+    if peg is None or peg.anchor_ticker is None:
+        return block
+    # Recursion is bounded at one level by construction: no anchor ticker is itself a key of
+    # currency_pegs.HARD_PEG_ANCHORS (asserted in tests), so the anchor's own render finds no peg.
+    anchor_block = _render_yfinance_block(peg.anchor_ticker, as_of=as_of, is_benchmarking=is_benchmarking)
+    if not anchor_block:
+        logger.warning(f"peg anchor fetch returned nothing for {peg.anchor_ticker=} (pegged {ticker=})")
+        return (
+            f"{block}\n- ⚠ The peg anchor `{peg.anchor_ticker}` could not be fetched, so no clean read of "
+            "this pair's dynamics is available in this block."
+        )
+    return (
+        f"{block}\n\n_Peg anchor for {ticker} — the liquid cross the peg is fixed to. Its volatility and "
+        f"percent moves are the honest read of USD/{peg.currency}'s; its price LEVELS are a different "
+        f"quantity unless the peg is at par._\n{anchor_block}"
+    )
+
+
+def _render_yfinance_block(ticker: str, *, as_of: datetime | None = None, is_benchmarking: bool = False) -> str:
     """Fetch price data and key metrics for a single ticker via yfinance.
 
-    Sync function -- caller wraps in asyncio.to_thread().
     Returns formatted markdown or "" on any failure.
 
     Both paths fetch by explicit calendar start date, ``as_of`` -
@@ -503,7 +617,11 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
             periods_per_year=periods_per_year,
             is_benchmarking=is_benchmarking,
         )
-        parts.extend(_yfinance_stats_lines(close, periods_per_year))
+        # Before the stats, because it changes how every one of them reads.
+        peg = peg_for_ticker(ticker)
+        if peg is not None:
+            parts.extend(peg_disclosure_lines(peg))
+        parts.extend(_yfinance_stats_lines(close, periods_per_year, symbol=ticker))
         parts.extend(_yfinance_fundamentals_lines(close, info, is_benchmarking=is_benchmarking))
         return "\n".join(parts)
 
@@ -600,127 +718,6 @@ def _format_fundamentals(info: dict) -> str:
     return ""
 
 
-def _pct_clause(change: float, base: float) -> str:
-    """`` (+1.23%)`` for a percent change off ``base``, or "" when there is no percent.
-
-    A base of exactly 0 has NO percent change — it is undefined, not 0.00%. FRED spread
-    and rate-difference series (T10Y2Y, T10Y3M) cross zero routinely, and the old
-    ``else 0`` rendered ``+0.31 (+0.00%)`` there: a fabricated "unchanged" reading sitting
-    beside a genuine absolute move, in a forecaster prompt. Omitting the clause leaves the
-    absolute change, which is the part that was actually measured.
-    """
-    base_value = float(base)
-    if base_value == 0:
-        return ""
-    return f" ({(change / abs(base_value)) * 100:+.2f}%)"
-
-
-def _render_fred_series(series_id: str, data: pd.Series, title: str) -> str:
-    """Render the derived-stat markdown block for a FRED series.
-
-    Shared by the live (fredapi) and benchmarking (keyless ts_fetch) paths so the two
-    render identically — latest/previous value, MoM + YoY change, last 6 observations.
-    ``data`` must already be dropna'd and sorted ascending by date.
-    """
-    parts = [f"### {series_id} ({title})"]
-
-    latest_value = data.iloc[-1]
-    latest_date = data.index[-1]
-    parts.append(f"- Latest value: {latest_value:.4g} ({latest_date.strftime('%Y-%m-%d')})")
-
-    if len(data) >= 2:
-        previous_value = data.iloc[-2]
-        parts.append(f"- Previous value: {previous_value:.4g}")
-
-    # Change from the previous OBSERVATION — a row step, whatever the series'
-    # cadence (monthly CPI, quarterly GDP, weekly claims) — which is exactly what
-    # the rendered "Change from previous" label claims and no more.
-    if len(data) >= 2:
-        mom_change = latest_value - data.iloc[-2]
-        parts.append(f"- Change from previous: {mom_change:+.4g}{_pct_clause(mom_change, data.iloc[-2])}")
-
-    # Year-over-year change via a DATE-based lookup, not a fixed observation
-    # offset: `data.iloc[-13]` is one year back only on a monthly series; on a
-    # daily FRED series (DGS10, DGS2, T10Y2Y, ...) 13 observations is ~2.5 weeks,
-    # which would be mislabeled "year-over-year" in a live forecaster prompt. Take
-    # the most recent observation at or before ~365 days ago (label slice is
-    # inclusive; data is sorted ascending). Omit the line entirely when no such
-    # observation exists (series shorter than a year).
-    year_ago = latest_date - pd.Timedelta(days=365)
-    prior = data.loc[:year_ago]
-    if not prior.empty:
-        yoy_value = prior.iloc[-1]
-        yoy_change = latest_value - yoy_value
-        parts.append(f"- Year-over-year change: {yoy_change:+.4g}{_pct_clause(yoy_change, yoy_value)}")
-
-    # Last 6 observations
-    last_6 = data.tail(6)
-    obs_lines = [f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {val:.4g}" for date, val in last_6.items()]
-    parts.append("- Recent observations:\n" + "\n".join(obs_lines))
-
-    return "\n".join(parts)
-
-
-def _fetch_fred_data(series_id: str, api_key: str) -> str:
-    """Fetch economic data for a single FRED series (live path, fredapi).
-
-    Sync function -- caller wraps in asyncio.to_thread().
-    Returns formatted markdown or "" on any failure.
-    """
-    try:
-        fred = Fred(api_key=api_key)
-        data = fred.get_series(series_id)
-
-        if data.empty:
-            logger.warning(f"FRED returned empty data for {series_id=}")
-            return ""
-
-        data = data.dropna()
-        if data.empty:
-            return ""
-
-        # Title is best-effort enrichment; fall back to the raw series_id if FRED metadata lookup fails.
-        title = series_id
-        try:
-            info_df = fred.get_series_info(series_id)
-            if isinstance(info_df, pd.DataFrame) and "title" in info_df.columns:
-                title = cast(pd.Series, info_df["title"]).iloc[0]
-            elif isinstance(info_df, pd.Series) and "title" in info_df.index:
-                title = info_df["title"]
-        except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # cosmetic title lookup, logged
-            logger.debug(f"FRED series title lookup failed for {series_id=}", exc_info=True)
-
-        return _render_fred_series(series_id, data, title)
-
-    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # provider soft-fail boundary, logged
-        logger.warning(f"FRED fetch failed for {series_id=}", exc_info=True)
-        return ""
-
-
-def _fetch_fred_data_ceiling(series_id: str, as_of: datetime) -> str:
-    """Point-in-time FRED fetch for backtests, via the keyless ts_fetch path.
-
-    Sync function -- caller wraps in asyncio.to_thread(). Reuses ``ts_fetch.fetch_series``
-    (fredgraph / ALFRED-vintage), so revised macro series (CPI, payrolls, GDP) return the
-    vintage KNOWN at ``as_of`` instead of today's revisions — a plain observation_end on
-    fredapi would still leak those. Keyless, so it works in CI without FRED_API_KEY.
-
-    Non-title header: get_series_info needs an API key, so the backtest block reuses the
-    series_id as the title — identical to the live path's metadata-failure fallback.
-    Returns formatted markdown or "" on any fetch/data error.
-    """
-    try:
-        # Default to ALFRED vintages for every revising macro series; only the curated
-        # non-revising allowlist is safe on plain fredgraph (same decision the anchor makes).
-        revises = series_id.upper() not in FRED_NON_REVISING_SERIES
-        spec = SeriesSpec(source="fred", series_id=series_id, revises=revises)
-        data = fetch_series(spec, as_of.date())
-        return _render_fred_series(series_id, data, series_id)
-    except (FetchError, ValueError):
-        logger.warning(f"FRED ceilinged fetch failed for {series_id=}", exc_info=True)
-        return ""
-
-
 def _resolve_fetch_as_of(question: MetaculusQuestion, *, is_benchmarking: bool) -> datetime | None:
     """The window ceiling for every fetch, or None when benchmarking cannot be made leakage-safe.
 
@@ -740,14 +737,29 @@ def _resolve_fetch_as_of(question: MetaculusQuestion, *, is_benchmarking: bool) 
     return open_time
 
 
+FRED_SKIPPED_NO_KEY_TOKEN = "skipped(no_fred_api_key)"  # noqa: S105  # diagnostics source token, not a credential
+
+
 def _build_financial_fetch_jobs(
     tickers: list[str],
     fred_series: list[str],
     *,
     as_of: datetime,
     is_benchmarking: bool,
-) -> list[tuple[str, asyncio.Task]]:
-    """Spawn one fetch task per identifier, each paired with the ticker/FRED id it fetches."""
+    resolving_fred_series: frozenset[str] = frozenset(),
+) -> tuple[list[tuple[str, asyncio.Task]], dict[str, str]]:
+    """Spawn one fetch task per identifier, each paired with the ticker/FRED id it fetches.
+
+    ``resolving_fred_series`` holds the UPPER-CASED ids the resolution criteria cited by URL
+    — the series a question actually grades against — which is what earns the extra
+    first-release/vintage fetch on the live path.
+
+    Returns ``(jobs, not_fetched)``, where ``not_fetched`` maps every identifier that never
+    became a job to its ``details["sources"]`` loss token. Only the missing-``FRED_API_KEY``
+    case populates it today, and it exists because a skipped series used to leave NO source
+    token at all: N requested series vanished from the diagnostics map, so the line read as
+    fully healthy while nothing had been fetched for them.
+    """
     jobs: list[tuple[str, asyncio.Task]] = [
         (
             ticker,
@@ -764,16 +776,27 @@ def _build_financial_fetch_jobs(
             (series_id, asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data_ceiling, series_id, as_of)))
             for series_id in fred_series
         )
-        return jobs
+        return (jobs, {})
     fred_api_key = os.getenv(FRED_API_KEY_ENV)
     if fred_api_key:
         jobs.extend(
-            (series_id, asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data, series_id, fred_api_key)))
+            (
+                series_id,
+                asyncio.ensure_future(
+                    asyncio.to_thread(
+                        _fetch_fred_data,
+                        series_id,
+                        fred_api_key,
+                        is_resolving_source=series_id.upper() in resolving_fred_series,
+                    )
+                ),
+            )
             for series_id in fred_series
         )
     elif fred_series:
         logger.info(f"FRED_API_KEY not set, skipping {len(fred_series)} FRED series fetches")
-    return jobs
+        return (jobs, dict.fromkeys(fred_series, FRED_SKIPPED_NO_KEY_TOKEN))
+    return (jobs, {})
 
 
 async def _gather_financial_results(jobs: list[tuple[str, asyncio.Task]]) -> tuple[list[str], dict[str, str]]:
@@ -782,11 +805,19 @@ async def _gather_financial_results(jobs: list[tuple[str, asyncio.Task]]) -> tup
     Per-identifier outcome for the diagnostics block: a requested ticker/FRED
     series that errored or returned no data is a lost source, so a partial
     financial fetch stays visible even when other identifiers succeed.
+
+    A FRED id that does not exist gets its own ``unknown_series`` token rather than the generic
+    ``error``: it means an id was hallucinated (or a resolution URL is dead), which is a defect to
+    chase, while ``error`` is an upstream failure to retry. The WARN naming the id was already
+    emitted at the fetch site, so nothing is logged again here.
     """
     results = await asyncio.gather(*(task for _, task in jobs), return_exceptions=True)
     non_empty_results: list[str] = []
     sources: dict[str, str] = {}
     for (identifier, _), result in zip(jobs, results, strict=True):
+        if isinstance(result, UnknownFredSeries):
+            sources[identifier] = "unknown_series"
+            continue
         if isinstance(result, Exception):
             logger.warning(f"Financial data fetch task failed: {result}")
             sources[identifier] = "error"
@@ -820,6 +851,7 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
     """
     classifier_llm = build_llm_with_openrouter_fallback(
         model=FINANCIAL_CLASSIFIER_MODEL,
+        role="financial_classifier",
         # temperature=None defers reasoning models to provider defaults; redundant
         # on ft 0.2.92 (GeneralLlm ctor default is already None). No top_p.
         temperature=None,
@@ -849,15 +881,21 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
             fine_print=question.fine_print or "",
         )
         qid = getattr(question, "id_of_question", None)
-        if classifier_error is not None:
+        # Built once and re-seeded into the final record at the _assemble_financial_output
+        # call below: this ``if`` is the ONLY producer of a ``classifier`` key, since
+        # ``sources`` otherwise holds identifier keys only.
+        classifier_loss = {"classifier": f"error({classifier_error})"} if classifier_error is not None else {}
+        if classifier_loss:
             # Recorded HERE, above the empty-fetch-set early return below, because that
             # return happens before the per-identifier record_provider_detail call at the
             # end — so a dead classifier on a question with no extracted identifiers
             # produced NO diagnostics detail at all and read as "no financial angle".
-            # A later successful record for this qid overwrites the entry, which is
-            # correct: if identifiers were still fetched, their per-source map is the
-            # fuller picture and the classifier loss shows up there instead.
-            record_provider_detail(qid, "financial_data", {"sources": {"classifier": f"error({classifier_error})"}})
+            # record_provider_detail assigns the whole dict, so a later record for this qid
+            # REPLACES this one rather than merging — which is why the same token is merged
+            # into the per-identifier map below rather than left to survive on its own. It
+            # used to be dropped there, so a dead classifier beside a fetched identifier
+            # archived a record byte-identical to a fully healthy provider.
+            record_provider_detail(qid, "financial_data", {"sources": dict(classifier_loss)})
 
         # Sanitize classifier IDs (F2) BEFORE they reach the fetch set, marker, or
         # unknown-flagging: they come from comma-splitting with no char validation,
@@ -889,19 +927,67 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         # a valid-but-unlisted series shouldn't be dropped, just made visible.
         unknown = _flag_unknown_classifier_ids(classifier_tickers, classifier_fred, extracted)
 
-        jobs = _build_financial_fetch_jobs(tickers, fred_series, as_of=as_of, is_benchmarking=is_benchmarking)
-        if not jobs:
-            return ""
+        jobs, not_fetched = _build_financial_fetch_jobs(
+            tickers,
+            fred_series,
+            as_of=as_of,
+            is_benchmarking=is_benchmarking,
+            resolving_fred_series=frozenset(sid.upper() for sid in extracted["fred_series"]),
+        )
 
         non_empty_results, sources = await _gather_financial_results(jobs)
-        record_provider_detail(qid, "financial_data", {"sources": sources})
-
-        if not non_empty_results:
-            return ""
-
-        return "\n\n".join(non_empty_results) + _build_routing_marker(fred_series, tickers, extracted, unknown)
+        sources.update(not_fetched)
+        return _assemble_financial_output(
+            non_empty_results,
+            {**classifier_loss, **sources},
+            qid=qid,
+            marker=_build_routing_marker(fred_series, tickers, extracted, unknown),
+        )
 
     return _fetch
+
+
+def _assemble_financial_output(
+    non_empty_results: list[str],
+    sources: dict[str, str],
+    *,
+    qid: int | None,
+    marker: str,
+) -> str:
+    """Join the fetched blocks and record the per-identifier detail; "" when nothing was fetched.
+
+    A section with nothing in it is ABSENT, and the per-identifier loss tokens in
+    ``details["sources"]`` are the whole record -- the same answer AskNews gives when both of its
+    search phases come back with no articles (``research/providers.py``). Prose must never stand in
+    for that absence, including on the exchange-rate question this helper's own predicates exist
+    for: a non-empty return flips the orchestrator's status from ``empty`` to ``ok``, counts the
+    provider in ``providers_succeeded``, and defeats every downstream empty guard at once, which is
+    why AskNews' old ``No articles were found`` sentence was removed rather than reworded.
+
+    ``sources`` is per-IDENTIFIER with one exception: the caller merges in a dead classifier's
+    ``classifier`` token, since ``record_provider_detail`` assigns the whole dict and this record
+    would otherwise overwrite the earlier classifier-only one. It is not an identifier, so the FX
+    count below skips it, while ``is_lost_source`` still renders it in the diagnostics ``lost=``
+    suffix.
+
+    ``counts["fx_identifiers_empty"]`` is what carries q45363's signal instead: how many attempted
+    EXCHANGE-RATE identifiers came back with nothing in them (shape by ``is_fx_identifier``, outcome
+    by the canonical ``is_lost_source``, so ``empty`` / ``unknown_series`` / ``error`` /
+    ``skipped(no_fred_api_key)`` all count). It is recorded on every path, so a 0 means the check ran
+    rather than that it never did, and it does not depend on whether the section rendered -- an FX
+    identifier lost beside a ticker that rendered fine is the same partial gap and reads the same
+    way.
+    """
+    empty_fx_identifiers = sum(
+        1 for identifier, token in sources.items() if is_fx_identifier(identifier) and is_lost_source(token)
+    )
+    record_provider_detail(
+        qid,
+        "financial_data",
+        {"sources": sources, "counts": {"fx_identifiers_empty": empty_fx_identifiers}},
+    )
+    body = "\n\n".join(non_empty_results)
+    return body + marker if body else ""
 
 
 def _flag_unknown_classifier_ids(

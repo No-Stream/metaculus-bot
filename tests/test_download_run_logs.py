@@ -14,6 +14,11 @@ from pathlib import Path
 
 import scripts.download_run_logs as dl
 import scripts.gha_artifacts as gha
+from metaculus_bot.member_forecast import (
+    MEMBER_FORECAST_ROLE_MEMBER,
+    MEMBER_FORECAST_ROLE_STACKER,
+    format_member_forecast_marker,
+)
 from scripts.download_run_logs import (
     RUN_LOG_ARTIFACT_PREFIXES,
     filter_run_log_artifacts,
@@ -44,6 +49,34 @@ PUBLISH_HARDENING_LINE = (
     '(HTTPError: Error while posting prediction: Status code: 405. Response: {"error":"closed"})'
 )
 STACKER_SKIP_REASON_LINE = "<!-- STACKER_SKIP_REASON=single_forecaster -->"
+# One extreme-band member call, in the shape metaculus_bot/extreme_call.py emits.
+EXTREME_CALL_LINE = (
+    "2026-09-01 12:00:00,000 - metaculus_bot.forecaster - INFO - "
+    "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=1"
+)
+# The single-survivor publish floor moving that same lone call, in the shape
+# metaculus_bot/aggregation_pipeline.py emits at the base-combine re-entry.
+THIN_PUBLISH_FLOOR_LINE = (
+    "2026-09-01 12:00:05,000 - metaculus_bot.aggregation_pipeline - WARNING - "
+    "THIN_PUBLISH_FLOOR: question=44874 raw=0.0300 clamped=0.0500 survivors=1"
+)
+# The ts_anchor surface of the vendor-noise flag: the surface with no long volatility window,
+# so its `long_vol=None` has to survive the whole durable path as a null rather than a zero.
+FINANCIAL_NOISE_FLAG_LINE = (
+    "2026-09-01 12:00:00,000 - metaculus_bot.research.ts_render - INFO - "
+    "FINANCIAL_NOISE_FLAG: surface=ts_anchor symbol=CSUSHPISA vr_lag=5 vr=0.412 floor=0.6 "
+    "short_vol=14.6 long_vol=None robust_vol=9.4"
+)
+MARKET_TIER_CAPPED_LINE = (
+    "2026-09-01 12:00:00,000 - metaculus_bot.research.prediction_market - INFO - "
+    "MARKET_TIER_CAPPED: question=45163 rows=1 capped=manifold@0"
+)
+# One response whose tier tags outran its own grounding record, in the shape
+# metaculus_bot/research/gemini_search.py _check_attributions emits.
+GEMINI_UNSUPPORTED_ATTRIBUTION_LINE = (
+    "2026-09-01 12:00:00,000 - metaculus_bot.research.gemini_search - INFO - "
+    "GEMINI_UNSUPPORTED_ATTRIBUTION: question=44953 tagged=2 unsupported=1 groups=1 labels=7"
+)
 
 
 class TestWorkflowSlugFromPath:
@@ -204,6 +237,195 @@ class TestNewMarkerSpecsReachTheArchive:
         assert archived[0]["run_id"] == "900"
         assert archived[0]["workflow"] == "tournament"
         assert archived[0]["error_type"] == "HTTPError"
+
+    def test_extreme_call_round_trips_to_jsonl(self, tmp_path: Path):
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text(EXTREME_CALL_LINE + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="901", workflow="metaculus_cup", artifact="research-901", run_date="2026-09-01T00:00:00Z"
+        )
+        assert run is not None
+
+        archive_dir = tmp_path / "archive"
+        assert merge_and_write(archive_dir, [run])["extreme_call"] == 1
+        archived = load_marker_records(archive_dir, "extreme_call")
+        assert len(archived) == 1
+        # The three fields a lone-extreme cut reads, through the whole durable path:
+        # without them in the archive the split goes back to being reconstructed from
+        # published comments once the 90-day GHA log window closes.
+        assert archived[0]["model"] == "gemini-3.1-pro-preview"
+        assert archived[0]["lone"] is True
+        assert archived[0]["survivors"] == 1
+
+    def test_thin_publish_floor_round_trips_to_jsonl(self, tmp_path: Path):
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text(EXTREME_CALL_LINE + "\n" + THIN_PUBLISH_FLOOR_LINE + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="902", workflow="metaculus_cup", artifact="research-902", run_date="2026-09-01T00:00:00Z"
+        )
+        assert run is not None
+
+        archive_dir = tmp_path / "archive"
+        totals = merge_and_write(archive_dir, [run])
+        assert totals["thin_publish_floor"] == 1
+        assert totals["extreme_call"] == 1
+        archived = load_marker_records(archive_dir, "thin_publish_floor")
+        assert len(archived) == 1
+        # raw is what the member declared, clamped is what was published; the pair is
+        # the floor's whole footprint on a forecast, and it has to outlive the 90-day
+        # GHA log window for the next residual round to price the rule on real fires.
+        assert archived[0]["qid"] == 44874
+        assert archived[0]["raw"] == 0.03
+        assert archived[0]["clamped"] == 0.05
+        assert archived[0]["survivors"] == 1
+
+    def test_financial_noise_flag_and_tier_cap_round_trip_to_jsonl(self, tmp_path: Path):
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text(FINANCIAL_NOISE_FLAG_LINE + "\n" + MARKET_TIER_CAPPED_LINE + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="902", workflow="tournament", artifact="research-902", run_date="2026-09-01T00:00:00Z"
+        )
+        assert run is not None
+
+        archive_dir = tmp_path / "archive"
+        totals = merge_and_write(archive_dir, [run])
+        assert totals["financial_noise_flag"] == 1
+        assert totals["market_tier_capped"] == 1
+
+        noise = load_marker_records(archive_dir, "financial_noise_flag")
+        assert len(noise) == 1
+        # The fields a noise-incidence cut reads, `symbol` included — without it two flagged
+        # identifiers in one run are one indistinguishable pair of records. The ts_anchor
+        # surface computes no long window, so its `long_vol` must arrive as a null rather than
+        # a fabricated 0.0.
+        assert noise[0]["surface"] == "ts_anchor"
+        assert noise[0]["symbol"] == "CSUSHPISA"
+        assert noise[0]["robust_vol"] == 9.4
+        assert noise[0]["long_vol"] is None
+
+        capped = load_marker_records(archive_dir, "market_tier_capped")
+        assert len(capped) == 1
+        assert capped[0]["qid"] == 45163
+        assert capped[0]["capped"] == "manifold@0"
+
+    def test_unsupported_attribution_round_trips_to_jsonl(self, tmp_path: Path):
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text(GEMINI_UNSUPPORTED_ATTRIBUTION_LINE + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="902", workflow="tournament", artifact="research-902", run_date="2026-09-01T00:00:00Z"
+        )
+        assert run is not None
+
+        archive_dir = tmp_path / "archive"
+        assert merge_and_write(archive_dir, [run])["gemini_unsupported_attribution"] == 1
+        archived = load_marker_records(archive_dir, "gemini_unsupported_attribution")
+        assert len(archived) == 1
+        # The three fields an "did embellishment move" cut reads: how many outlets the
+        # response named, how many its own grounding record could not back, and the label
+        # count that makes the ratio meaningful.
+        assert archived[0]["tagged"] == 2
+        assert archived[0]["unsupported"] == 1
+        assert archived[0]["labels"] == 7
+
+    def test_member_forecast_lines_from_the_real_formatter_round_trip_to_jsonl(self, tmp_path: Path):
+        """The half of the MEMBER_FORECAST end-to-end gate that closes offline.
+
+        Lines built by the REAL formatter (``format_member_forecast_marker``), one per question
+        type and both roles, written as a run log the way the workflow tees stdout, go through
+        ``harvest_run_logs_from_dir`` and ``merge_and_write`` and come back with ``raw`` /
+        ``published`` as VERBATIM JSON literals that ``json.loads`` to the values the formatter
+        was handed — the archive's contract for the one marker that carries a member's value on
+        every question. The other half, that the next real bot run's ``run_logs`` artifact
+        carries the lines at all, needs a live run and is the operator's to confirm.
+        """
+        binary_raw, binary_published = 0.005, 0.02
+        mc_raw, mc_published = [0.9, 0.005, 0.095], [0.891, 0.01, 0.099]
+        numeric_raw = [[0.025, 9.2], [0.05, 9.6], [0.5, 12.1]]
+        numeric_published = [[0.025, 9.2], [0.05, 9.6], [0.5, 12.100000001]]
+        runner_prefix = "2026-09-02 14:23:01,123 - metaculus_bot.forecaster_runners - INFO - "
+        pipeline_prefix = "2026-09-02 14:23:02,000 - metaculus_bot.aggregation_pipeline - INFO - "
+        lines = [
+            runner_prefix
+            + format_member_forecast_marker(
+                question_id=44874,
+                model="openrouter/google/gemini-3.1-pro-preview",
+                role=MEMBER_FORECAST_ROLE_MEMBER,
+                qtype="binary",
+                raw=binary_raw,
+                published=binary_published,
+            ),
+            runner_prefix
+            + format_member_forecast_marker(
+                question_id=45189,
+                model="openrouter/openai/gpt-5.6-sol",
+                role=MEMBER_FORECAST_ROLE_MEMBER,
+                qtype="multiple_choice",
+                raw=mc_raw,
+                published=mc_published,
+            ),
+            pipeline_prefix
+            + format_member_forecast_marker(
+                question_id=45065,
+                model="openrouter/anthropic/claude-opus-4.8",
+                role=MEMBER_FORECAST_ROLE_STACKER,
+                qtype="numeric",
+                raw=numeric_raw,
+                published=numeric_published,
+            ),
+        ]
+        run_logs = tmp_path / "run_logs"
+        run_logs.mkdir()
+        (run_logs / "run.log").write_text("\n".join([EXTRACTION_LINE, *lines]) + "\n")
+
+        run = harvest_run_logs_from_dir(
+            tmp_path, run_id="903", workflow="tournament", artifact="research-903", run_date="2026-09-02T00:00:00Z"
+        )
+        assert run is not None
+        assert len(run.records["extraction_rung"]) == 1, "the neighbouring marker must still parse beside the new one"
+
+        archive_dir = tmp_path / "archive"
+        assert merge_and_write(archive_dir, [run])["member_forecast"] == 3
+        archived = load_marker_records(archive_dir, "member_forecast")
+        by_qtype = {rec["qtype"]: rec for rec in archived}
+        assert set(by_qtype) == {"binary", "multiple_choice", "numeric"}
+        for rec in archived:
+            assert rec["run_id"] == "903"
+            assert rec["qid_kind"] == "question_id"
+            # Verbatim strings in the archive, never coerced: a consumer json.loads them whatever
+            # the type, instead of a binary float beside two stringified vectors.
+            assert type(rec["raw"]) is str
+            assert type(rec["published"]) is str
+
+        binary = by_qtype["binary"]
+        assert (binary["qid"], binary["role"], binary["model"]) == (
+            44874,
+            "member",
+            "openrouter/google/gemini-3.1-pro-preview",
+        )
+        assert json.loads(binary["raw"]) == binary_raw
+        assert json.loads(binary["published"]) == binary_published
+
+        mc = by_qtype["multiple_choice"]
+        assert (mc["qid"], mc["role"]) == (45189, "member")
+        assert json.loads(mc["raw"]) == mc_raw
+        assert json.loads(mc["published"]) == mc_published
+
+        numeric = by_qtype["numeric"]
+        assert (numeric["qid"], numeric["role"], numeric["model"]) == (
+            45065,
+            "stacker",
+            "openrouter/anthropic/claude-opus-4.8",
+        )
+        assert json.loads(numeric["raw"]) == numeric_raw
+        assert json.loads(numeric["published"]) == numeric_published
 
 
 class TestDownloadTimeoutResilience:

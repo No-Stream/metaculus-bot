@@ -3,10 +3,11 @@
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import numpy as np
-from scipy.stats import spearmanr
+from scipy.stats import beta, spearmanr
 
 from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
@@ -15,6 +16,13 @@ from metaculus_bot.performance_analysis.parsing import (
     _parse_probability,
     declared_anchors,
     is_anonymous_model_key,
+)
+from metaculus_bot.performance_analysis.platform_scores import (
+    baseline_score,
+    coverage,
+    peer_score,
+    spot_baseline_score,
+    spot_peer_score,
 )
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
@@ -44,6 +52,47 @@ def _mean(values: list[float]) -> float | None:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def _score_stats(values: list[float]) -> dict:
+    """``{count, mean, median}`` for one platform-score field; mean/median None when empty."""
+    return {
+        "count": len(values),
+        "mean": _mean(values),
+        "median": float(np.median(values)) if values else None,
+    }
+
+
+# The one registry for the four platform-score metrics: summary key, accessor, report
+# label, in report order. platform_score_summary, the section's emptiness gate and its
+# render loop all iterate this, so adding a metric in one place reaches all three
+# (previously a `fields` dict here and a `_PLATFORM_SCORE_ROWS` 730 lines apart could
+# drift, silently dropping a metric from the report). ``coverage`` is handled separately.
+_PLATFORM_SCORE_METRICS: tuple[tuple[str, Callable[[dict], float | None], str], ...] = (
+    ("spot_peer", spot_peer_score, "spot peer (PRIMARY, the leaderboard metric)"),
+    ("peer", peer_score, "peer (coverage-scaled, secondary)"),
+    ("spot_baseline", spot_baseline_score, "spot baseline (primary)"),
+    ("baseline", baseline_score, "baseline (coverage-scaled, secondary)"),
+)
+
+
+def platform_score_summary(data: list[dict]) -> dict:
+    """Metaculus's own scores on the published forecasts, SPOT peer first.
+
+    The tournament leaderboard ranks on ``spot_peer_score``. ``peer_score`` is the same
+    quantity scaled by coverage, which for a bot that submits once and never revises is
+    mostly a function of how early it submitted — so it is reported as a labelled
+    secondary and never used to rank. Same split for the two baseline scores. Full
+    reasoning and the accessors live in ``performance_analysis.platform_scores``.
+
+    Every field is counted over the records that actually carry it, so the per-metric
+    ``count`` differs from ``count`` (all records) whenever a pull predates score capture.
+    """
+    summary: dict = {"count": len(data)}
+    for name, reader, _label in _PLATFORM_SCORE_METRICS:
+        summary[name] = _score_stats([v for v in (reader(r) for r in data) if v is not None])
+    summary["mean_coverage"] = _mean([v for v in (coverage(r) for r in data) if v is not None])
+    return summary
 
 
 def per_model_cohort(data: list[dict], *, cut: str) -> list[tuple[dict, dict]]:
@@ -200,16 +249,111 @@ def per_model_binary_scores(data: list[dict]) -> dict[str, dict]:
     return result
 
 
+OUT_OF_RANGE_MARKER_SIDES: Mapping[str, str] = {"below_lower_bound": "low", "above_upper_bound": "high"}
+
+
+@dataclass(frozen=True, slots=True)
+class PitReading:
+    """One record's PIT reading: a point value, or an INTERVAL of possible values.
+
+    Metaculus reports a resolution past the displayed range as the string
+    ``above_upper_bound`` / ``below_lower_bound``, so the resolution VALUE is unknown and
+    ``F(resolution)`` is only pinned to a SET: ``[cdf[-1], 1]`` above the ceiling,
+    ``[0, cdf[0]]`` below the floor. On an open bound that set can be wide, because our own
+    CDF is free to put real mass out there — q44842 published 13% of its mass above the
+    displayed ceiling, resolved ``above_upper_bound``, and won spot peer +24.4, while the old
+    convention (PIT := 1.0) scored it a high-side band miss.
+
+    Two conventions ride on this type, and they differ deliberately:
+
+    * COVERAGE counts an interval as covered when it INTERSECTS the band — a band miss only
+      when the WHOLE interval lies outside it.
+    * POINT statistics (mean, std, histogram) EXCLUDE intervals and disclose how many were
+      excluded. Imputing a midpoint would manufacture a reading nobody measured.
+
+    An interval whose endpoints coincide (a closed bound, or an open one carrying no
+    out-of-range mass) IS a point reading: ``is_interval`` is False and ``point`` answers the
+    same value the old convention forced, so nothing changes on those records.
+    """
+
+    low: float
+    high: float
+    oob_side: str | None = None
+    """``"low"``/``"high"`` when the resolution fell beyond the value grid, else None."""
+
+    @classmethod
+    def from_point(cls, value: float, oob_side: str | None = None) -> "PitReading":
+        return cls(low=value, high=value, oob_side=oob_side)
+
+    @property
+    def is_interval(self) -> bool:
+        return self.high > self.low
+
+    @property
+    def point(self) -> float | None:
+        """The PIT when it is a single value; None for an interval reading."""
+        return None if self.is_interval else self.low
+
+    def intersects(self, band_low: float, band_high: float) -> bool:
+        """Coverage predicate: does any of this reading fall inside ``[band_low, band_high]``?"""
+        return self.high >= band_low and self.low <= band_high
+
+    def at_or_below(self, threshold: float) -> bool:
+        """Cumulative coverage ``PIT <= threshold`` — the band ``[0, threshold]``."""
+        return self.low <= threshold
+
+    def entirely_below(self, threshold: float) -> bool:
+        return self.high < threshold
+
+    def entirely_above(self, threshold: float) -> bool:
+        return self.low > threshold
+
+
+def out_of_range_pit_reading(resolution: object, cdf_values: Sequence[float] | np.ndarray) -> PitReading | None:
+    """The interval a STRING out-of-range resolution pins ``F(resolution)`` to.
+
+    Returns None for anything else (a numeric resolution, an annulled question), so callers
+    read it as "is this the set-valued case?" and fall through otherwise. THE single home of
+    the convention: ``numeric_pit_analysis`` here and ``width_monitor.compute_pit_reading``
+    both go through it.
+    """
+    side = OUT_OF_RANGE_MARKER_SIDES.get(resolution) if isinstance(resolution, str) else None
+    if side is None:
+        return None
+    if side == "high":
+        return PitReading(low=float(cdf_values[-1]), high=1.0, oob_side="high")
+    return PitReading(low=0.0, high=float(cdf_values[0]), oob_side="low")
+
+
+def pit_band_count(readings: Sequence[PitReading], band_low: float, band_high: float) -> int:
+    """How many readings the band covers (an interval counts when it intersects)."""
+    return sum(1 for reading in readings if reading.intersects(band_low, band_high))
+
+
+def pit_point_values(readings: Sequence[PitReading]) -> list[float]:
+    """The point PITs, dropping the set-valued readings that point statistics exclude."""
+    return [value for value in (reading.point for reading in readings) if value is not None]
+
+
 def numeric_pit_analysis(data: list[dict]) -> dict:
     """PIT (Probability Integral Transform) analysis for numeric questions.
 
-    Returns dict with pit_values, coverage stats, and histogram bin counts.
+    Coverage is computed over every reading, with an out-of-range resolution counted as
+    covered when its PIT INTERVAL intersects the band (see :class:`PitReading`). The
+    histogram and ``pit_values`` are POINT statistics and exclude interval readings;
+    ``n_oob_interval`` discloses how many were excluded, so a shrinking histogram is never
+    silent.
+
+    Keys: ``count`` (readings), ``n_point`` / ``n_oob_interval`` (its split),
+    ``pit_values`` (point readings only), ``pit_intervals`` (the set-valued ones as
+    ``(low, high)``), ``histogram``, ``coverage_90`` / ``coverage_50``,
+    ``mean_numeric_log_score``.
     """
     numeric = [r for r in data if r["type"] in ("numeric", "discrete") and r["numeric_log_score"] is not None]
     if not numeric:
         return {"count": 0}
 
-    pit_values: list[float] = []
+    readings: list[PitReading] = []
     for r in numeric:
         cdf_values = r["our_forecast_values"]
         resolution = r["resolution_parsed"]
@@ -223,50 +367,53 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
         lower_bound = float(lower_bound)
         upper_bound = float(upper_bound)
 
-        if resolution == "above_upper_bound":
-            pit = 1.0
-        elif resolution == "below_lower_bound":
-            pit = 0.0
-        elif isinstance(resolution, (int, float)):
+        out_of_range = out_of_range_pit_reading(resolution, cdf_values)
+        if out_of_range is not None:
+            readings.append(out_of_range)
+        elif isinstance(resolution, (int, float)) and not isinstance(resolution, bool):
             if upper_bound - lower_bound <= 0:
                 # No range, no interpolated PIT — the record is dropped rather than
                 # contributing the 0.5 that used to come back from _interpolate_pit, which
                 # is the single most favorable value available (inside BOTH coverage bands).
-                # Scoped to the interpolated branch: an out-of-bound resolution's 0.0/1.0 is
+                # Scoped to the interpolated branch: an out-of-range resolution's interval is
                 # a real reading that never touched the range.
                 continue
-            pit = _interpolate_pit(
-                float(resolution),
-                lower_bound,
-                upper_bound,
-                cdf_values,
-                value_grid=scaling.get("continuous_range"),
-                zero_point=grid_zero_point(scaling.get("zero_point"), lower_bound),
-                per_model_percentiles=r.get("per_model_numeric_percentiles"),
+            readings.append(
+                PitReading.from_point(
+                    _interpolate_pit(
+                        float(resolution),
+                        lower_bound,
+                        upper_bound,
+                        cdf_values,
+                        value_grid=scaling.get("continuous_range"),
+                        zero_point=grid_zero_point(scaling.get("zero_point"), lower_bound),
+                        per_model_percentiles=r.get("per_model_numeric_percentiles"),
+                    )
+                )
             )
-        else:
-            continue
 
-        pit_values.append(pit)
-
-    if not pit_values:
+    if not readings:
         return {"count": 0}
 
+    point_values = pit_point_values(readings)
     num_bins = 10
     histogram = [0] * num_bins
-    for pit in pit_values:
+    for pit in point_values:
         bin_idx = min(int(pit * num_bins), num_bins - 1)
         histogram[bin_idx] += 1
 
-    # Coverage: fraction of PIT values in [0.05, 0.95] (should be ~90% for well-calibrated)
-    coverage_90 = sum(1 for p in pit_values if 0.05 <= p <= 0.95) / len(pit_values)
-    coverage_50 = sum(1 for p in pit_values if 0.25 <= p <= 0.75) / len(pit_values)
+    # Coverage: fraction of readings the band covers (~90% / ~50% when well-calibrated).
+    coverage_90 = pit_band_count(readings, 0.05, 0.95) / len(readings)
+    coverage_50 = pit_band_count(readings, 0.25, 0.75) / len(readings)
 
     log_scores = [r["numeric_log_score"] for r in numeric]
 
     return {
-        "count": len(pit_values),
-        "pit_values": pit_values,
+        "count": len(readings),
+        "n_point": len(point_values),
+        "n_oob_interval": len(readings) - len(point_values),
+        "pit_values": point_values,
+        "pit_intervals": [(reading.low, reading.high) for reading in readings if reading.is_interval],
         "histogram": histogram,
         "coverage_90": coverage_90,
         "coverage_50": coverage_50,
@@ -339,11 +486,32 @@ def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: f
     return float(np.interp(resolution, vals, pcts))
 
 
+def jeffreys_ci(k: int, n: int, cl: float = 0.95) -> tuple[float, float, float]:
+    """Beta-Binomial posterior mean + equal-tailed CI under a Jeffreys(0.5, 0.5) prior.
+
+    The one implementation for every ``k of n`` rate this package prints (the width monitor's
+    coverage columns, the clip sweep's extreme-bin and insurance intervals), so the prior and
+    the tail convention cannot drift between two residual tables. Mirrors ``bb`` in
+    mc_numeric_calibration.py.
+    """
+    a = 0.5 + k
+    b = 0.5 + (n - k)
+    mean = a / (a + b)
+    lo = float(beta.ppf((1 - cl) / 2, a, b))
+    hi = float(beta.ppf(1 - (1 - cl) / 2, a, b))
+    return mean, lo, hi
+
+
 # ``b4e9df0`` — the merge that landed the july15 bundle on main. THE single source of
 # truth for this era boundary across the package: width_monitor's ``TS_ANCHOR_ENABLE``
 # aliases it, and every screen gated on the bundle's contents keys on it. Era
 # boundaries are merge-to-main COMMITTER timestamps, never authoring dates.
 B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
+
+# 0e85e1b: numeric k_tail 1.25 -> 1.0 AND the binary clamp [0.01, 0.99] -> [0.02, 0.98].
+WIDENING_FLIP_MERGED_AT = datetime(2026, 5, 18, 17, 21, 19, tzinfo=UTC)
+# 325b1b0 (ft 0.2.54 -> 0.2.92): the MC option clamp [0.005, 0.995] -> [0.01, 0.99].
+FT_0292_MERGED_AT = datetime(2026, 7, 24, 19, 16, 26, tzinfo=UTC)
 
 # ``9f1175c`` (grid-scaled max-step for discrete CDF resampling) rode that merge.
 # Before this instant a flat 0.2 per-bin cap applied at EVERY grid size; after it,
@@ -354,6 +522,10 @@ GRID_SCALED_MAX_STEP_MERGED_AT = B4E9DF0_MERGED_AT
 # must want at least this much MORE mass there for the record to be clamp-suspected.
 _CLAMP_CAP_ATOL = 1e-6
 _CLAMP_MEMBER_MARGIN = 0.10
+# The min-step / ramp / discrete-snap machinery shaves the top step ~1% below the cap
+# (q45065: 0.1977991526 against 0.2, 98.9%), so exact equality structurally misses every
+# post-snap instance; a bin at >= this fraction of the cap is treated as cap-bound too.
+_CLAMP_CAP_NEAR_FRAC = 0.90
 
 
 def _resolution_bin(grid: list[float], cdf: list[float], resolution: float) -> tuple[float, float, float]:
@@ -398,7 +570,8 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
 
     On a coarse discrete grid the pre-``9f1175c`` flat 0.2 cap can hold the realized
     bin far below what every member asked for (q43913: published 0.200 where members'
-    own curves wanted 0.575-0.823 — peer -38.67). That is a pipeline defect
+    own curves wanted 0.575-0.823 — spot peer -41.20, coverage-scaled peer
+    -38.67). That is a pipeline defect
     masquerading as a forecast error, and it manufactures apparent dissent: each
     member keeps its concentrated mass while the published curve does not.
 
@@ -409,11 +582,18 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
     A missing/unparseable timestamp is treated as pre-fix — the undated records in
     the archive all predate the fix.
 
-    Suspected requires ALL of: the realized bin within ``_CLAMP_CAP_ATOL`` of the
-    era-correct cap, at least two attributed member curves, and the LEAST
-    concentrated member wanting at least ``member_margin`` more mass on that bin —
-    "every member" is the point; a clamp overrides the whole ensemble, unlike a
-    median.
+    Suspected requires ALL of: the realized bin CAP-BOUND — within ``_CLAMP_CAP_ATOL``
+    of the era-correct cap, or at least ``_CLAMP_CAP_NEAR_FRAC`` of it, since the
+    min-step / ramp / snap machinery shaves a saturated bin ~1% under the cap — at
+    least two attributed member curves, and the LEAST concentrated member wanting at
+    least ``member_margin`` more mass on that bin — "every member" is the point; a
+    clamp overrides the whole ensemble, unlike a median.
+
+    The cap is the PLATFORM's per-bin rule (``0.2 * 200 / N``), so a cap-bound
+    realized bin is not automatically our defect. Pre-``d4ee57f`` records additionally
+    carry the slack-proportional smear; post-``d4ee57f`` the excess is packed into the
+    adjacent bins, and a cap-bound bin means only that the platform constraint set the
+    published mass at the truth.
     """
     out: dict = {"applicable": record.get("type") in ("numeric", "discrete"), "suspected": False}
     if not out["applicable"]:
@@ -438,6 +618,8 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
     min_member = min(member_bin_masses.values()) if member_bin_masses else None
 
     at_cap = abs(published_bin_mass - cap) <= _CLAMP_CAP_ATOL
+    cap_fraction = published_bin_mass / cap
+    cap_bound = at_cap or cap_fraction >= _CLAMP_CAP_NEAR_FRAC
     out |= {
         "n_grid_points": len(grid),
         "max_step_cap": cap,
@@ -445,10 +627,12 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
         "resolution_bin": [bin_low, bin_high],
         "published_bin_mass": published_bin_mass,
         "resolution_bin_at_cap": at_cap,
+        "resolution_bin_cap_fraction": cap_fraction,
+        "resolution_bin_cap_bound": cap_bound,
         "member_bin_masses": member_bin_masses,
         "min_member_bin_mass": min_member,
         "suspected": bool(
-            at_cap
+            cap_bound
             and min_member is not None
             and min_member > published_bin_mass + member_margin
             and len(member_bin_masses) >= 2
@@ -761,6 +945,47 @@ def _question_count_lines(data: list[dict]) -> list[str]:
     return lines
 
 
+def _platform_score_section_lines(data: list[dict]) -> list[str]:
+    """Metaculus's own scores, spot peer first. Empty when no record carries any.
+
+    Every other section of this report is a BOT-side score (Brier, log score) computed
+    here from the resolution. This one is the only section computed by the platform
+    rather than by us; it is still a pooled mean over whatever records the caller
+    passed, so it is not the leaderboard standing.
+    """
+    ps = platform_score_summary(data)
+    if not any(ps[key]["count"] for key, _reader, _label in _PLATFORM_SCORE_METRICS):
+        return []
+
+    lines = [
+        "## Metaculus Platform Scores",
+        "",
+        "The tournament leaderboard ranks on SPOT peer. `peer` is the same quantity scaled by "
+        "coverage (`peer ~= spot_peer * coverage`); this bot submits once and never revises, so "
+        "its coverage is mostly a function of how early it submitted. Rank on spot, read peer as "
+        "a diagnostic only.",
+        "",
+        "These figures are pooled over every record handed in — no config-era split, and no "
+        "exclusion of the known-bug (`KNOWN_BUG_QIDS`) or degraded-run (`DEGRADED_RUN_QIDS` / "
+        "`PARTIAL_DEGRADED_QIDS`) cohorts. Read them as this pull's mean, not as tournament "
+        "standing; pass a pre-filtered `data` or use `width_monitor --exclude-qids` for a "
+        "cohort-controlled read.",
+        "",
+        "| metric | n | mean | median |",
+        "|--------|---|------|--------|",
+    ]
+    for key, _reader, label in _PLATFORM_SCORE_METRICS:
+        stats = ps[key]
+        if not stats["count"]:
+            continue
+        lines.append(f"| {label} | {stats['count']} | {stats['mean']:+.2f} | {stats['median']:+.2f} |")
+    if ps["mean_coverage"] is not None:
+        lines.append("")
+        lines.append(f"- Mean coverage: {ps['mean_coverage']:.3f}")
+    lines.append("")
+    return lines
+
+
 def _binary_section_lines(data: list[dict]) -> list[str]:
     """Binary headline scores plus the calibration-bucket table. Empty when no binaries."""
     bs = binary_summary(data)
@@ -808,7 +1033,12 @@ def _per_model_section_lines(data: list[dict]) -> list[str]:
 
 
 def _numeric_section_lines(data: list[dict]) -> list[str]:
-    """Numeric coverage headline plus the ten-bin PIT histogram. Empty when no PITs."""
+    """Numeric coverage headline plus the ten-bin PIT histogram. Empty when no PITs.
+
+    The set-valued count is rendered unconditionally: those records DO count toward the two
+    coverage lines (on band intersection) and do NOT appear in the histogram, so a reader
+    comparing the two needs the split stated rather than inferred.
+    """
     na = numeric_pit_analysis(data)
     if na["count"] <= 0:
         return []
@@ -819,6 +1049,8 @@ def _numeric_section_lines(data: list[dict]) -> list[str]:
         f"- Mean Numeric Log Score: {na['mean_numeric_log_score']:.2f}",
         f"- 90% Coverage (PIT in [0.05, 0.95]): {na['coverage_90']:.1%}",
         f"- 50% Coverage (PIT in [0.25, 0.75]): {na['coverage_50']:.1%}",
+        f"- Out-of-range resolutions (set-valued PIT; counted in coverage, "
+        f"excluded from the histogram): {na['n_oob_interval']}",
         "",
         "### PIT Histogram",
         "| Bin | Count |",
@@ -846,7 +1078,11 @@ def _mc_section_lines(data: list[dict]) -> list[str]:
 
 
 def generate_report(data: list[dict]) -> str:
-    """Baseline markdown report (binary, numeric, MC summaries + per-model binary).
+    """Baseline markdown report (platform scores, binary, numeric, MC + per-model binary).
+
+    Platform scores lead: they're the only section that maps to tournament standing, and
+    the spot/coverage-scaled distinction is easy to get backwards when it appears only in
+    a per-question dossier.
 
     For extended analyses -- NO-bias check, financial split, stacking effectiveness,
     disagreement-error correlation -- call those functions directly; see
@@ -854,6 +1090,7 @@ def generate_report(data: list[dict]) -> str:
     """
     lines: list[str] = ["# Performance Analysis Report", ""]
     lines.extend(_question_count_lines(data))
+    lines.extend(_platform_score_section_lines(data))
     lines.extend(_binary_section_lines(data))
     lines.extend(_per_model_section_lines(data))
     lines.extend(_numeric_section_lines(data))

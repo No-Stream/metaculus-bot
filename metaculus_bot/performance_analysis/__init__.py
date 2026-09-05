@@ -5,6 +5,7 @@ and provides reusable analysis functions.
 """
 
 from metaculus_bot.performance_analysis.analysis import (
+    PitReading,
     binary_summary,
     declared_percentile_pit,
     disagreement_predicts_error,
@@ -14,8 +15,12 @@ from metaculus_bot.performance_analysis.analysis import (
     mc_summary,
     no_bias_check,
     numeric_pit_analysis,
+    out_of_range_pit_reading,
     per_model_binary_scores,
     per_model_cohort,
+    pit_band_count,
+    pit_point_values,
+    platform_score_summary,
     stacking_effectiveness,
 )
 from metaculus_bot.performance_analysis.audit import (
@@ -28,6 +33,13 @@ from metaculus_bot.performance_analysis.audit import (
     ranking_caveats,
     select_cohort,
     select_worst_misses,
+)
+from metaculus_bot.performance_analysis.cohorts import (
+    DEGRADED_RUN_QIDS,
+    EXCLUSION_COHORTS,
+    KNOWN_BUG_QIDS,
+    PARTIAL_DEGRADED_QIDS,
+    parse_exclude_qids,
 )
 from metaculus_bot.performance_analysis.collector import (
     build_performance_dataset,
@@ -55,10 +67,25 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_stacker_outcome_marker,
     parse_stacker_skip_reason_marker,
 )
+from metaculus_bot.performance_analysis.platform_scores import (
+    PEER_FIELD,
+    SPOT_PEER_FIELD,
+    RankingScore,
+    peer_score,
+    platform_score_fragments,
+    ranking_score,
+    spot_peer_score,
+)
 from metaculus_bot.performance_analysis.ranking_cohort import (
     PerModelRankingCohort,
     log_ranking_cohort,
     per_model_ranking_cohort,
+)
+from metaculus_bot.performance_analysis.rescore_diff import (
+    FieldChange,
+    RescoreDiff,
+    diff_platform_rescores,
+    render_rescore_summary,
 )
 from metaculus_bot.performance_analysis.research_tags import (
     attach_research_tags,
@@ -70,6 +97,7 @@ from metaculus_bot.performance_analysis.scoring import (
     brier_score,
     mc_log_score,
     numeric_log_score,
+    spot_peer_delta,
 )
 from metaculus_bot.performance_analysis.stacker_detection import (
     DetectorVerdict,
@@ -82,9 +110,19 @@ from metaculus_bot.performance_analysis.stacker_detection import (
 )
 
 __all__ = [
+    "DEGRADED_RUN_QIDS",
+    "EXCLUSION_COHORTS",
+    "KNOWN_BUG_QIDS",
     "MIN_SCOREABLE_ANCHORS",
+    "PARTIAL_DEGRADED_QIDS",
+    "PEER_FIELD",
+    "SPOT_PEER_FIELD",
     "DetectorVerdict",
+    "FieldChange",
     "PerModelRankingCohort",
+    "PitReading",
+    "RankingScore",
+    "RescoreDiff",
     "annotate_forecaster_bullets_with_models",
     "anonymous_model_key",
     "attach_research_tags",
@@ -97,6 +135,7 @@ __all__ = [
     "declared_percentile_pit",
     "detect_historical_stacker_signature",
     "detect_stacker_fired",
+    "diff_platform_rescores",
     "disagreement_predicts_error",
     "emit_combined_report",
     "emit_external_comment_stub",
@@ -121,6 +160,8 @@ __all__ = [
     "no_bias_check",
     "numeric_log_score",
     "numeric_pit_analysis",
+    "out_of_range_pit_reading",
+    "parse_exclude_qids",
     "parse_forecaster_model_map",
     "parse_inferred_stacker_outcome",
     "parse_per_model_forecasts",
@@ -130,16 +171,25 @@ __all__ = [
     "parse_stacked_marker",
     "parse_stacker_outcome_marker",
     "parse_stacker_skip_reason_marker",
+    "peer_score",
     "per_model_binary_scores",
     "per_model_cohort",
     "per_model_ranking_cohort",
+    "pit_band_count",
+    "pit_point_values",
+    "platform_score_fragments",
+    "platform_score_summary",
     "rank_our_models_by_accuracy",
     "ranking_caveats",
+    "ranking_score",
+    "render_rescore_summary",
     "rescore_records",
     "research_tags_for_qid",
     "research_tags_for_record",
     "save_dataset",
     "select_cohort",
     "select_worst_misses",
+    "spot_peer_delta",
+    "spot_peer_score",
     "stacking_effectiveness",
 ]

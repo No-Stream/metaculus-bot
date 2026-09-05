@@ -1,8 +1,8 @@
 """Tests for ``metaculus_bot.cli.main`` — specifically the sys.exit wiring that
 fires when ``TemplateForecaster.alertable_count > 0``, when the donated
 OpenRouter key fell back to the operator's personal (paid) key during the run,
-or when the donated key's remaining balance ended the run below the refill
-floor (``OPENROUTER_CREDIT_FLOOR_USD``).
+or when the donated key's remaining balance ended the run below the
+early-warning floor (``OPENROUTER_CREDIT_FLOOR_USD``).
 
 The fallback counter folded into ``alertable`` is ``_generic_key_fallback_count``
 — it counts EVERY donated->personal fallback (all causes: 401/402/429/guardrail/
@@ -12,13 +12,12 @@ subsets of that total, broken out in the log line for diagnostics but NOT
 separately added to ``alertable`` (that would double-count events already inside
 the generic total).
 
-Credit alerting is suppressed until ``CREDIT_ALERT_RESUME_DATE`` (2026-09-10)
-because the operator is self-funding the rest of the season, so a drained donated
-key is expected rather than broken. During the window the floor breach does not
-exit non-zero and the credit-caused fallbacks are subtracted back out of
-``alertable``; every other fallback cause (401 / 404 / 429 / guardrail) keeps its
-full weight. Tests inject the window state via ``credit_alerts_active`` rather
-than the wall clock, so they keep testing both sides after the real date passes.
+Credit alerting is gated on ``CREDIT_ALERT_RESUME_DATE`` (2026-09-03, the day
+Metaculus granted credits again). Before that date the floor breach did not exit
+non-zero and the credit-caused fallbacks were subtracted back out of
+``alertable``; every other fallback cause (401 / 404 / 429 / guardrail) always kept
+its full weight. Tests inject the window state via ``credit_alerts_active`` rather
+than the wall clock, so both sides stay covered now that the real date has passed.
 
 Publication already happened inside ``forecast_on_tournament`` by the time cli
 checks alertable state; the non-zero exit is purely so GitHub Actions marks
@@ -37,18 +36,24 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from typing import Any, ClassVar, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
+from forecasting_tools import MetaculusApi
 
+from metaculus_bot.cli import RunMode, _forecast_with_callback_drain, _run_forecasts, persisted_tournament_id
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
+    METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
     PROVIDER_DEGRADATION_SUPPRESSED_UNTIL,
+    TOURNAMENT_ID,
     credit_alerts_active,
 )
-from metaculus_bot.credit_telemetry import DonatedKeyState, reset_donated_key_state_cache
+from metaculus_bot.credit_telemetry import DonatedKeyState, RoleSpendTracker, reset_donated_key_state_cache
 from metaculus_bot.fallback_openrouter import (
     reset_credit_key_fallback_count,
     reset_donated_404_fallback_count,
@@ -125,8 +130,10 @@ def _cli_main_test_mode(
     alertable_count: int,
     *,
     donated_below_floor: bool = False,
+    fall_cup_reminder: bool = False,
     today: date | None = None,
     stub_bot: MagicMock | None = None,
+    mode: str = "test_questions",
 ) -> Iterator[MagicMock]:
     """Run ``cli.main`` with all external dependencies stubbed; yields the
     CreditTelemetry stub for call assertions.
@@ -148,6 +155,11 @@ def _cli_main_test_mode(
     ``alertable_count`` COMPUTED through the real property chain rather than
     pinned to a literal (see ``_bot_with_real_alertable_count``). ``alertable_count``
     is ignored when it is supplied.
+
+    ``mode`` is the ``--mode`` value put on the pinned argv. It defaults to
+    ``test_questions`` because that is the cheapest path through ``_question_source``;
+    the run-mode-dependent tests (the research archive's ``tournament_id`` label) pass
+    the mode they are about.
     """
     if stub_bot is None:
         stub_bot = MagicMock()
@@ -166,7 +178,7 @@ def _cli_main_test_mode(
     )
 
     argv_backup = sys.argv
-    sys.argv = ["cli", "--mode", "test_questions"]
+    sys.argv = ["cli", "--mode", mode]
     try:
         with (
             pinned_clock,
@@ -184,6 +196,11 @@ def _cli_main_test_mode(
             patch("metaculus_bot.cli.apply_publish_hardening"),
             patch("metaculus_bot.cli.apply_fetch_hardening"),
             patch("metaculus_bot.cli.check_tournament_dates"),
+            # Pin the fall-cup reminder the same way as credit_alerts_active: it reads
+            # the real clock in prod, and left unpinned it would flip this whole suite
+            # red from FALL_CUP_REMINDER_DATE. The one test allowed to read the real
+            # clock is the deliberate time bomb in test_tournament_dates.py.
+            patch("metaculus_bot.cli.check_fall_cup_reminder", return_value=fall_cup_reminder),
             # The API identity preflight makes a real unauthenticated GET to
             # metaculus.com; stub it so these exit-status/telemetry tests stay
             # hermetic (its own behavior is covered in test_api_preflight.py).
@@ -193,6 +210,14 @@ def _cli_main_test_mode(
             # anyway to keep the test surface small.
             patch.object(type(stub_bot), "log_report_summary", create=True, return_value=None),
             patch("metaculus_bot.cli.CreditTelemetry", return_value=stub_telemetry),
+            # The real install appends a RoleSpendTracker to litellm's process-global
+            # callbacks list, and nothing here would remove it — so every test driving
+            # cli_main used to leak one into the rest of the session. That breaks the
+            # invariant test_credit_telemetry's clean_role_ledger fixture states, and it
+            # made that file's test_install_is_idempotent pass on the leaked instance
+            # instead of on one it installed itself. The tests that assert the install
+            # HAPPENED patch this same name again, one layer in (TestCliRoleSpendWiring).
+            patch("metaculus_bot.cli.install_role_spend_tracker"),
         ):
             yield stub_telemetry
     finally:
@@ -344,6 +369,150 @@ class TestCliCreditFloor:
             telemetry.log_end_and_check_floor.assert_called_once()
 
 
+class TestCliRoleSpendWiring:
+    """cli.main installs the CREDIT_ROLE_SPEND tracker before the first completion and logs
+    the ledger from the same ``finally`` as the balance telemetry, so a crashed run still
+    reports where its money went. The ledger itself is unit tested in
+    test_credit_telemetry.py; these pin the wiring.
+    """
+
+    def test_tracker_installed_and_ledger_logged_on_a_clean_run(self) -> None:
+        with (
+            _cli_main_test_mode(alertable_count=0),
+            patch("metaculus_bot.cli.install_role_spend_tracker") as install,
+            patch("metaculus_bot.cli.log_role_spend") as log_roles,
+        ):
+            cli_main()
+        install.assert_called_once_with()
+        log_roles.assert_called_once_with()
+
+    def test_ledger_logged_when_forecasting_crashes(self) -> None:
+        def _crash(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("forecasting blew up")
+
+        with (
+            _cli_main_test_mode(alertable_count=0),
+            patch("metaculus_bot.cli.log_role_spend") as log_roles,
+            patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)),
+            pytest.raises(RuntimeError, match="forecasting blew up"),
+        ):
+            cli_main()
+        log_roles.assert_called_once_with()
+
+    def test_driving_cli_main_leaves_no_tracker_in_litellms_globals(self) -> None:
+        """The harness must not leak the process-global callback the real install adds.
+
+        ``install_role_spend_tracker`` is stubbed in ``_cli_main_test_mode`` for exactly
+        this reason; without the stub a run of this suite left a live RoleSpendTracker
+        registered for every later test in the session.
+        """
+        before = sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks)
+        with _cli_main_test_mode(alertable_count=0):
+            cli_main()
+        assert sum(isinstance(cb, RoleSpendTracker) for cb in litellm.callbacks) == before
+
+    async def test_forecast_wrapper_drains_callbacks_after_the_forecast(self) -> None:
+        """The drain has to run INSIDE the forecast loop (the litellm logging worker's queue is
+        bound to it), after the forecast, and still run when the forecast raises."""
+        drained = AsyncMock()
+
+        async def _forecast() -> list[Any]:
+            return ["report"]
+
+        with patch("metaculus_bot.cli.drain_litellm_callbacks", drained):
+            assert await _forecast_with_callback_drain(_forecast) == ["report"]
+        drained.assert_awaited_once_with()
+
+        async def _boom() -> list[Any]:
+            raise RuntimeError("forecasting blew up")
+
+        drained.reset_mock()
+        with patch("metaculus_bot.cli.drain_litellm_callbacks", drained), pytest.raises(RuntimeError):
+            await _forecast_with_callback_drain(_boom)
+        drained.assert_awaited_once_with()
+
+    @pytest.mark.parametrize(
+        "run_mode",
+        ["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"],
+    )
+    def test_every_run_mode_forecasts_through_the_callback_drain(self, run_mode: RunMode) -> None:
+        """Every mode goes through the one ``asyncio.run`` + drain in ``_run_forecasts``.
+
+        The drain used to be applied per mode, four times over, so a mode added without it
+        would still forecast and publish normally while silently reporting no per-role
+        spend. ``_question_source`` now hands back a factory and cannot run a loop of its
+        own, which is what this pins: the drain is awaited exactly once per mode.
+        """
+        bot = MagicMock()
+        bot.forecast_questions = AsyncMock(return_value=["report"])
+        bot.forecast_on_tournament = AsyncMock(return_value=["report"])
+        drained = AsyncMock()
+
+        with (
+            patch("metaculus_bot.cli.MetaculusApi", MagicMock()),
+            patch("metaculus_bot.cli.check_tournament_dates"),
+            patch("metaculus_bot.cli.drain_litellm_callbacks", drained),
+        ):
+            assert _run_forecasts(bot, run_mode) == ["report"]
+
+        drained.assert_awaited_once_with()
+
+    def test_an_unknown_run_mode_raises_before_any_spend(self) -> None:
+        """The invalid-mode guard has to fire while resolving the source, i.e. before the
+        loop starts and before any question is fetched."""
+        with pytest.raises(ValueError, match="Invalid run mode"):
+            _run_forecasts(MagicMock(), "not_a_mode")  # type: ignore[arg-type]
+
+    def test_a_forecast_failure_propagates_out_of_run_forecasts_unchanged(self) -> None:
+        """A forecast exception keeps its own type through the consolidated dispatch, and the
+        drain still runs — main's finally and the emit-then-raise block depend on both.
+
+        Drives the real ``asyncio.run`` and the real wrapper (only the drain is stubbed), so
+        this exercises the propagation path rather than a patched ``asyncio.run``.
+        """
+        bot = MagicMock()
+        bot.forecast_on_tournament = AsyncMock(side_effect=RuntimeError("forecasting blew up"))
+        drained = AsyncMock()
+
+        with (
+            patch("metaculus_bot.cli.check_tournament_dates"),
+            patch("metaculus_bot.cli.drain_litellm_callbacks", drained),
+            pytest.raises(RuntimeError, match="forecasting blew up"),
+        ):
+            _run_forecasts(bot, "tournament")
+
+        drained.assert_awaited_once_with()
+
+
+class TestCliFallCupReminderExit:
+    """The fall-cup reminder reddens the run the same way the credit floor does.
+
+    The check itself (date gate, FALL_CUP_CONFIGURED flip, log content) is covered in
+    test_tournament_dates.py; here the harness pins its verdict and these tests pin
+    the exit wiring: run completes and publishes first, exits non-zero after, and the
+    run is never stamped clean.
+    """
+
+    def test_reminder_fires_run_completes_then_sys_exit_1(self, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+            _cli_main_test_mode(alertable_count=0, fall_cup_reminder=True) as telemetry,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
+            # Forecasting/telemetry completed before the exit — reminder, not abort.
+            telemetry.log_start.assert_called_once()
+            telemetry.log_end_and_check_floor.assert_called_once()
+        # run_clean must be the exact complement of every non-zero exit path, so a
+        # reminder run must not stamp the archive's summary with the clean token.
+        assert "Run completed clean" not in caplog.text
+
+    def test_no_reminder_returns_normally(self) -> None:
+        with _cli_main_test_mode(alertable_count=0, fall_cup_reminder=False):
+            cli_main()
+
+
 class TestCliResearchFlush:
     """The research batch reaches disk on BOTH exit paths.
 
@@ -458,6 +627,78 @@ class TestCliResearchFlush:
         assert not (tmp_path / "research_outputs").exists()
 
 
+class TestPersistedTournamentId:
+    """The research archive's ``tournament_id`` label follows the RUN MODE.
+
+    Until 2026-09-03 cli stamped ``TOURNAMENT_ID`` on every record whatever mode was
+    running, so enabling the Metaculus Cup workflow would have filed cup questions under
+    the bot tournament's slug — inside its config-era buckets and inside the supply probe's
+    per-slug rows. That is silent data corruption, not a cosmetic label: nothing else on the
+    record says which competition a question came from, since ``run_mode`` names the
+    pipeline rather than the object.
+    """
+
+    EXPECTED_LABEL: ClassVar[dict[str, str]] = {
+        "tournament": TOURNAMENT_ID,
+        "minibench": str(MetaculusApi.CURRENT_MINIBENCH_ID),
+        "quarterly_cup": METACULUS_CUP_ID,
+        "metaculus_cup": METACULUS_CUP_ID,
+        # No label is right for the evergreen example set (it belongs to no tournament);
+        # this one is retained so the archive's existing test-run records stay comparable.
+        "test_questions": TOURNAMENT_ID,
+    }
+
+    def test_every_run_mode_has_a_decided_label(self) -> None:
+        # Derived from RunMode itself, so a mode added to the Literal without a decision
+        # here fails this test instead of quietly inheriting the tournament's slug.
+        assert set(get_args(RunMode)) == set(self.EXPECTED_LABEL)
+
+    @pytest.mark.parametrize(("run_mode", "expected"), sorted(EXPECTED_LABEL.items()))
+    def test_label_per_run_mode(self, run_mode: RunMode, expected: str) -> None:
+        assert persisted_tournament_id(run_mode) == expected
+
+    def test_the_cup_and_the_bot_tournament_do_not_share_a_label(self) -> None:
+        # The whole point: these two must be distinguishable in the archive.
+        assert persisted_tournament_id("metaculus_cup") != persisted_tournament_id("tournament")
+
+    def test_an_unknown_mode_raises_rather_than_mislabelling(self) -> None:
+        with pytest.raises(ValueError, match="Invalid run mode"):
+            persisted_tournament_id("world_cup")  # type: ignore[arg-type]  # deliberately outside RunMode
+
+    def test_a_cup_run_archives_its_records_under_the_cup_slug(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end through cli's own writer, not just the helper: mode -> label -> JSONL."""
+        monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
+        monkeypatch.chdir(tmp_path)  # writer.flush() writes research_outputs/ under CWD
+
+        forecaster_class = MagicMock()
+        forecaster_class.return_value.alertable_count = 0
+
+        def _record_then_return(*_args: object, **_kwargs: object) -> list[object]:
+            forecaster_class.call_args.kwargs["research_sink"](
+                qid=45500,
+                page_url="https://www.metaculus.com/questions/45500/",
+                question_text="A fall cup question?",
+                research_text="## News Articles (AskNews)\nResearch for 45500.",
+                providers_used=["asknews"],
+                gap_fill_used=False,
+            )
+            return []
+
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="metaculus_cup"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)),
+        ):
+            cli_main()
+
+        written = sorted((tmp_path / "research_outputs").glob("research_*.jsonl"))
+        assert len(written) == 1, f"expected exactly one flushed JSONL, got {written}"
+        records = [json.loads(line) for line in written[0].read_text().strip().splitlines()]
+        assert [(r["run_mode"], r["tournament_id"]) for r in records] == [("metaculus_cup", METACULUS_CUP_ID)]
+
+
 class TestCliCreditAlertSuppression:
     """The dated credit-alert suppression, both paths.
 
@@ -481,7 +722,19 @@ class TestCliCreditAlertSuppression:
             telemetry.log_end_and_check_floor.assert_called_once()
 
         messages = [record.getMessage() for record in caplog.records]
-        assert any("credit alerting is suppressed until 2026-09-10" in msg for msg in messages), messages
+        expected = f"credit alerting is suppressed until {CREDIT_ALERT_RESUME_DATE.isoformat()}"
+        assert any(expected in msg for msg in messages), messages
+
+    def test_floor_breach_with_no_injected_date_exits_non_zero(self) -> None:
+        """The live state since 2026-09-03: the real constant, the real clock, no
+        injection — a donated-key floor breach reddens CI again. This is the one test
+        here that would fail if the resume date were pushed back into the future.
+        """
+        assert credit_alerts_active() is True
+        with _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=None):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
 
     def test_floor_breach_on_resume_date_exits_non_zero(self) -> None:
         """The window is closed-on-the-right: the resume day itself alerts."""
@@ -657,10 +910,11 @@ class TestCliCreditAlertSuppression:
             assert summary, messages
             assert "with 0 alertable" in summary[0], summary
             assert "personal_key_fallback=7" in summary[0], summary
-            assert "credit=7 with 7 credit event(s) suppressed until 2026-09-10" in summary[0], summary
+            resume = CREDIT_ALERT_RESUME_DATE.isoformat()
+            assert f"credit=7 with 7 credit event(s) suppressed until {resume}" in summary[0], summary
             assert "donated_key=drained" in summary[0], summary
             # The floor-breach explanation is a separate concern and still lands.
-            assert any("credit alerting is suppressed until 2026-09-10" in msg for msg in messages), messages
+            assert any(f"credit alerting is suppressed until {resume}" in msg for msg in messages), messages
         finally:
             fb_module._generic_key_fallback_count = 0
             fb_module._credit_key_fallback_count = 0

@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from metaculus_bot.research.market_retrieval.generation import RETRIEVAL_WIDTH
 from metaculus_bot.research.market_retrieval.ranking import (
     FP_CHARS,
+    MARKET_STALENESS_TIER_CAP_DAYS,
     RANKER_PLACEHOLDERS,
     RANKER_PROMPT,
     RC_CHARS,
@@ -29,6 +31,7 @@ from metaculus_bot.research.market_retrieval.ranking import (
     RULES_CHARS,
     SETTLEMENT_SOURCE_CHARS,
     SETTLEMENT_SOURCES_RENDERED,
+    STRONG_TIERS,
     TIER_UNSPECIFIED,
     TIERS,
     WHY_CHARS,
@@ -38,6 +41,7 @@ from metaculus_bot.research.market_retrieval.ranking import (
     RankingUnusable,
     apply_picks,
     build_ranker_prompt,
+    cap_stale_top_tier,
     fail_open_slate,
     parse_ranking,
     render_candidate_line,
@@ -107,6 +111,7 @@ def _row(
     volume: float | None = None,
     bettors: int | None = None,
     answers: tuple[tuple[str, float], ...] = (),
+    close: datetime | None = None,
 ) -> MarketMatch:
     return MarketMatch(
         platform=platform,
@@ -117,7 +122,7 @@ def _row(
         ask=None,
         spread=None,
         volume_24h=None,
-        close_time=None,
+        close_time=close,
         is_resolved=resolved,
         match_confidence=1.0,
         raw_rules=rules,
@@ -393,6 +398,152 @@ class TestApplyPicks:
         assert pool[0].relation_tier == ""
 
 
+class TestCapStaleTopTier:
+    """The deterministic staleness backstop on the top relation tier.
+
+    Dates taken from the measured case, q45163: the question opened 2026-08-09 and its
+    best-ranked market had stopped trading on 2026-02-27, roughly five months earlier, while still
+    rendering `status=open` because Manifold's soft close dates leave `is_resolved` false. What the
+    cap asserts is narrow — a market that closed long before the question was askable is not
+    resolving on the question's date — and everything else about the row is left alone, because the
+    pipeline's measured stance is that a wrongly excluded market is evidence the forecaster never
+    sees. (These fixture instants give 163 days; the archived row's own close is 23:59 that day, so
+    prod would have recorded 162.)
+    """
+
+    QUESTION_OPENED = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+    STALE_CLOSE = datetime(2026, 2, 27, tzinfo=UTC)
+
+    def _capped_row(self) -> MarketMatch:
+        picks = [Pick(index=0, tier=TIERS[0], why="conditional country market")]
+        pool = [_row("manifold", close=self.STALE_CLOSE)]
+        return cap_stale_top_tier(apply_picks(pool, picks), question_open_time=self.QUESTION_OPENED)[0]
+
+    def test_a_market_closed_five_months_before_the_question_opened_loses_the_top_tier(self) -> None:
+        row = self._capped_row()
+
+        assert row.relation_tier == "same_quantity_other_cut"
+        assert row.tier_cap_note == "demoted from same-date: closed 163d before the question opened"
+
+    def test_the_note_states_the_demotion_once_and_not_the_withdrawn_grade(self) -> None:
+        """The note used to close with "(ranker said same_quantity_same_date)", which restated the
+        vocabulary word the cap had just withdrawn at the end of a rendered cell — in a table whose
+        preamble tells the forecaster to anchor on a same-date market's price, and directly ahead of
+        the ranker's own same-date phrase in the same cell. The grade stays recoverable without it:
+        only the top tier is ever capped, so a note at all means the ranker said tier 1."""
+        note = self._capped_row().tier_cap_note
+
+        assert TIERS[0] not in note
+        assert "ranker said" not in note
+        assert note.startswith("demoted from same-date:"), "the shape the rendered legend defines"
+
+    def test_the_demoted_row_keeps_its_rank_price_and_the_rankers_own_phrase(self) -> None:
+        """Disclosure, not a drop: the note is additive and nothing else about the row moves. The
+        ranker's phrase in particular stays verbatim, so the archive still records what the model
+        said about a row our arithmetic overruled."""
+        row = self._capped_row()
+
+        assert row.rank == 0
+        assert row.implied_prob_yes == 0.5
+        assert row.relevance_label == "conditional country market"
+        assert row.close_time == self.STALE_CLOSE
+
+    def test_exactly_one_rung_down_never_two(self) -> None:
+        """`driver_or_consequence` is what the forecaster prompt calls context rather than an
+        anchor, and a resolved market on an adjacent cut of the same quantity is genuinely
+        valuable — it says what happened. So the cap stops at tier 2."""
+        assert self._capped_row().relation_tier == TIERS[1]
+
+    @pytest.mark.parametrize("tier", [TIERS[1], TIERS[2], TIERS[3], TIER_UNSPECIFIED])
+    def test_only_the_top_tier_is_capped(self, tier: str) -> None:
+        """q45163's own offender was graded tier 2, so this pass would not have touched it. That is
+        deliberate: the render's `(Nd ago)` disclosure on the close cell and the prompt's recency
+        bullet are what cover the sub-top-tier case."""
+        rows = cap_stale_top_tier(
+            apply_picks([_row(close=self.STALE_CLOSE)], [Pick(index=0, tier=tier, why="w")]),
+            question_open_time=self.QUESTION_OPENED,
+        )
+
+        assert rows[0].relation_tier == tier
+        assert rows[0].tier_cap_note == ""
+
+    @pytest.mark.parametrize(
+        ("close", "reason"),
+        [
+            (datetime(2026, 8, 8, tzinfo=UTC), "closed the day before the question opened"),
+            (datetime(2026, 6, 10, tzinfo=UTC), "60 days before, exactly at the threshold"),
+            (datetime(2026, 12, 31, tzinfo=UTC), "closes well after the question opened"),
+            (None, "the venue published no close date"),
+        ],
+    )
+    def test_a_market_that_is_not_egregiously_stale_keeps_its_grade(self, close: datetime | None, reason: str) -> None:
+        rows = cap_stale_top_tier(
+            apply_picks([_row(close=close)], [Pick(index=0, tier=TIERS[0], why="same series, same month")]),
+            question_open_time=self.QUESTION_OPENED,
+        )
+
+        assert rows[0].relation_tier == TIERS[0], reason
+        assert rows[0].tier_cap_note == "", reason
+
+    def test_one_day_past_the_threshold_fires(self) -> None:
+        """Pinned beside the exactly-at-threshold case above so the boundary is a decision rather
+        than an accident of arithmetic."""
+        rows = cap_stale_top_tier(
+            apply_picks(
+                [_row(close=self.QUESTION_OPENED - timedelta(days=MARKET_STALENESS_TIER_CAP_DAYS + 1))],
+                [Pick(index=0, tier=TIERS[0], why="w")],
+            ),
+            question_open_time=self.QUESTION_OPENED,
+        )
+
+        assert rows[0].relation_tier == TIERS[1]
+
+    def test_a_question_with_no_open_time_caps_nothing(self) -> None:
+        """Nothing to compare against, so the ranker's grade stands. Metaculus does publish
+        `open_time`, but the pipeline reads the question duck-typed and a replay tool may not."""
+        rows = cap_stale_top_tier(
+            apply_picks([_row(close=self.STALE_CLOSE)], [Pick(index=0, tier=TIERS[0], why="w")]),
+            question_open_time=None,
+        )
+
+        assert rows[0].relation_tier == TIERS[0]
+        assert rows[0].tier_cap_note == ""
+
+    def test_a_naive_question_open_time_does_not_raise(self) -> None:
+        """Venue close times are UTC-aware by construction (`http.parse_iso`); a naive open time
+        from a caller would otherwise raise inside the ranking stage, where the snapshot-level net
+        turns it into an empty snapshot for the whole question."""
+        rows = cap_stale_top_tier(
+            apply_picks([_row(close=self.STALE_CLOSE)], [Pick(index=0, tier=TIERS[0], why="w")]),
+            question_open_time=datetime(2026, 8, 9, 9, 0),
+        )
+
+        assert rows[0].relation_tier == TIERS[1]
+
+    def test_the_input_rows_are_not_mutated(self) -> None:
+        """Same reason `apply_picks` returns copies: provider-health reads field presence off the
+        pool after ranking, and a rendered row is also a pool row."""
+        ranked = apply_picks([_row(close=self.STALE_CLOSE)], [Pick(index=0, tier=TIERS[0], why="w")])
+
+        cap_stale_top_tier(ranked, question_open_time=self.QUESTION_OPENED)
+
+        assert ranked[0].relation_tier == TIERS[0]
+        assert ranked[0].tier_cap_note == ""
+
+    def test_an_empty_slate_is_returned_unchanged(self) -> None:
+        assert cap_stale_top_tier([], question_open_time=self.QUESTION_OPENED) == []
+
+    def test_the_capped_tier_stays_in_the_vocabulary(self) -> None:
+        """The load-bearing shape constraint: `STRONG_TIERS` membership picks the rendered
+        preamble and every tier-conditioned residual cut tests the cell by equality, so the
+        demotion has to move the tier to another vocabulary word and put its prose somewhere
+        else."""
+        row = self._capped_row()
+
+        assert row.relation_tier in TIERS
+        assert row.relation_tier in STRONG_TIERS
+
+
 class TestFailOpenSlate:
     def test_the_slate_is_the_head_of_what_the_model_was_shown(self) -> None:
         """A fail-open must be a TRUNCATION of the input, not a different pipeline — which is
@@ -587,15 +738,30 @@ class TestRankerPrompt:
         assert "a different COUNTRY's version of the same statistic" in prompt
         assert "a different COMPANY's output or production" in prompt
 
-    def test_all_four_tier_names_and_the_three_signals_are_present(self) -> None:
+    def test_all_four_tier_names_and_the_four_signals_are_present(self) -> None:
         prompt = build_ranker_prompt(QUESTION, _pool(2))
 
         for tier in TIERS:
             assert f'"{tier}"' in prompt
-        assert "THREE SIGNALS IN THE CANDIDATE BLOCK:" in prompt
+        assert "FOUR SIGNALS IN THE CANDIDATE BLOCK:" in prompt
         assert "`settles via`" in prompt
         assert "`liquidity` is a QUALITY signal, never a relevance signal." in prompt
+        assert "`closes` is when the market stops trading" in prompt
         assert "`RESOLVED` means the market has already settled." in prompt
+
+    def test_the_recency_tiebreaker_asks_for_within_tier_ordering_not_exclusion(self) -> None:
+        """The renderer shows the ranker's order verbatim, so a within-tier recency preference has
+        nowhere to live but this prompt. It must order rather than drop: recall-first is the
+        pipeline's measured stance, and a long-closed market on the right quantity is still
+        evidence."""
+        prompt = build_ranker_prompt(QUESTION, _pool(2))
+
+        assert "RECENCY signal that breaks ties WITHIN a tier" in prompt
+        assert "rank the one still open or most recently trading ABOVE the long-closed one" in prompt
+        assert "Never exclude a relevant market for being closed." in prompt
+        # And it tells the model the same thing the deterministic cap enforces, so the two cannot
+        # disagree about which tier a long-closed market may hold.
+        assert 'grade it "same_quantity_other_cut" rather than "same_quantity_same_date"' in prompt
 
     def test_the_empty_array_is_offered_as_a_valid_answer(self) -> None:
         prompt = build_ranker_prompt(QUESTION, _pool(2))

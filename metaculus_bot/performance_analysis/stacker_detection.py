@@ -157,7 +157,7 @@ def compute_production_vs_median_delta(record: dict) -> float | None:
 _NUMERIC_KEY_LABELS: tuple[float, ...] = (10.0, 50.0, 90.0)
 
 
-def _base_or_per_model_forecasts(record: dict) -> dict:
+def base_or_per_model_forecasts(record: dict) -> dict:
     """Per-base-model forecasts when present, else the (possibly collapsed) per-model ones.
 
     On a stacked record ``per_model_forecasts`` holds only the stacker's single
@@ -169,7 +169,7 @@ def _base_or_per_model_forecasts(record: dict) -> dict:
 
 def _binary_spread_exceeded(record: dict) -> bool | None:
     """Whether the members' binary probability RANGE clears the production threshold."""
-    probs = [p for p in (_parse_probability(v) for v in _base_or_per_model_forecasts(record).values()) if p is not None]
+    probs = [p for p in (_parse_probability(v) for v in base_or_per_model_forecasts(record).values()) if p is not None]
     if len(probs) < 2:
         return None
     return (max(probs) - min(probs)) > CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD
@@ -182,7 +182,7 @@ def _mc_spread_exceeded(record: dict) -> bool | None:
     means the MC option parser found nothing and the collector fell back to single-string
     forecasts — no option vectors, so nothing to measure.
     """
-    model_option_dicts = [v for v in _base_or_per_model_forecasts(record).values() if isinstance(v, dict)]
+    model_option_dicts = [v for v in base_or_per_model_forecasts(record).values() if isinstance(v, dict)]
     if len(model_option_dicts) < 2:
         return None
 
@@ -378,6 +378,7 @@ def _verdict_from_spread_signals(
 
 __all__ = [
     "DetectorVerdict",
+    "base_or_per_model_forecasts",
     "compute_production_vs_median_delta",
     "detect_stacker_fired",
     "exceeded_spread_threshold",

@@ -1,4 +1,5 @@
-"""Post-processing steps applied after aggregation: Platt calibration and discrete integer snapping."""
+"""Post-processing steps applied after aggregation: Platt calibration, discrete integer
+snapping, and the single-survivor binary publish floor."""
 
 import logging
 
@@ -13,11 +14,31 @@ from metaculus_bot.constants import (
     PLATT_BINARY_MAX_ABS_DEVIATION,
     PLATT_CALIBRATION_ENABLED_ENV,
     PLATT_MC_MAX_ABS_DEVIATION,
+    THIN_PUBLISH_BINARY_CEIL,
+    THIN_PUBLISH_BINARY_FLOOR,
     env_flag_enabled,
 )
 from metaculus_bot.numeric.discrete_snap import majority_votes_discrete, snap_distribution_to_integers
 
 logger = logging.getLogger(__name__)
+
+
+def apply_thin_publish_floor(value: float, survivors: int) -> float:
+    """Clamp a PUBLISHED binary probability to [THIN_PUBLISH_BINARY_FLOOR, _CEIL] when
+    exactly one forecaster survived; any other survivor count passes ``value`` through.
+
+    Pure, and keyed on the survivor COUNT rather than the value, because the floor
+    prices a missing aggregation step: median-of-1 has no variance reduction, so the range
+    the published value may occupy is NARROWED in exactly that state — the band sits
+    strictly inside the per-model ``[BINARY_PROB_MIN, BINARY_PROB_MAX]`` clamp the member
+    already passed. The receipt behind the constants discusses a ``k <= 2`` generalisation
+    (at k=2 the median is the midpoint, so a lone outlier is averaged in at half weight
+    instead of outvoted); a k=2 publish has never happened, so there is nothing to fit it
+    on and the rule stays at ``== 1``. Do not loosen that trigger without data.
+    """
+    if survivors != 1:
+        return value
+    return max(THIN_PUBLISH_BINARY_FLOOR, min(THIN_PUBLISH_BINARY_CEIL, value))
 
 
 def apply_platt_calibration(

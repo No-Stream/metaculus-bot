@@ -52,6 +52,13 @@ def numeric_block(scale: float, *, trailing_comma: bool = False) -> str:
     return f'{{"question_type": "numeric", "declared_percentiles": {{{pcts}}}, "outcome_type": "continuous"{tail}}}'
 
 
+def numeric_block_from_values(values: list[float]) -> str:
+    """A full-13-percentile numeric block over EXPLICIT values, so a test can declare a tie or
+    a decrease that ``numeric_block``'s ``scale * (i + 1)`` cannot express."""
+    pcts = ", ".join(f'"{p}": {v}' for p, v in zip(STANDARD_PERCENTILES, values, strict=True))
+    return f'{{"question_type": "numeric", "declared_percentiles": {{{pcts}}}, "outcome_type": "continuous"}}'
+
+
 def mc_block(probs: list[float], *, trailing_comma: bool = False) -> str:
     body = ", ".join(f'"{name}": {prob}' for name, prob in zip(OPTIONS, probs, strict=False))
     tail = "," if trailing_comma else ""
@@ -94,7 +101,7 @@ class TestRungBlock:
             outcome = await extract_mc(rationale_with(VALID_MC_BLOCK), OPTIONS, PARSER_LLM)
         assert outcome.rung == "block"
         assert outcome.block_present is True
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert set(probs) == set(OPTIONS)
         assert probs["Option A"] == pytest.approx(0.5, abs=0.02)
         llm.assert_not_awaited()
@@ -162,7 +169,7 @@ class TestRungRepair:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(rationale_with(broken), OPTIONS, PARSER_LLM)
         assert outcome.rung == "repair"
-        assert {o.option_name for o in outcome.value.predicted_options} == set(OPTIONS)
+        assert {o.option_name for o in outcome.value.option_list.predicted_options} == set(OPTIONS)
         llm.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -262,7 +269,7 @@ class TestFinalBlockPrecedence:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
         assert outcome.rung == "repair"
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert probs["Option C"] == pytest.approx(0.7, abs=0.02)  # the final block's answer
         llm.assert_not_awaited()
 
@@ -316,7 +323,7 @@ class TestFinalBlockPrecedence:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
         assert outcome.rung == "block"
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert probs["Option A"] == pytest.approx(0.5, abs=0.02)
         llm.assert_not_awaited()
 
@@ -335,7 +342,7 @@ class TestFinalBlockPrecedence:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
         assert outcome.rung == "block"
-        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
         assert probs["Option C"] == pytest.approx(0.7, abs=0.02)
         llm.assert_not_awaited()
 
@@ -407,7 +414,7 @@ class TestRungLlm:
             outcome = await extract_mc("no block here at all", OPTIONS, PARSER_LLM)
         assert outcome.rung == "llm"
         assert calls == [PredictedOptionList, list[OptionProbability]]
-        assert {o.option_name for o in outcome.value.predicted_options} == set(OPTIONS)
+        assert {o.option_name for o in outcome.value.option_list.predicted_options} == set(OPTIONS)
 
     @pytest.mark.asyncio
     async def test_llm_out_of_contract_value_rejected(self) -> None:
@@ -510,6 +517,40 @@ class TestSalvageFidelity:
         assert [p.value for p in outcome.value] == [p.value for p in tied]
 
     @pytest.mark.asyncio
+    async def test_a_tied_block_is_read_by_the_block_rung(self) -> None:
+        """The tie tolerance exists for the BLOCK path, so pin it there and not only in salvage.
+
+        A count-like block (p1 = p2.5 = 0 on a quantity that usually reads zero) is valid JSON,
+        so a strictly-increasing schema failed rung 1, could not be repaired, and reached the
+        pipeline only through the paid LLM salvage rung. Re-tightening either the schema or
+        ``_numeric_from_block`` costs money and nothing else: in prod the extraction still
+        SUCCEEDS via salvage, so no other test notices. Patching the parser and asserting it was
+        never awaited is what makes rung 1 the thing under test.
+        """
+        values = [0.0, 0.0, *(float(i) for i in range(1, len(STANDARD_PERCENTILES) - 1))]
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_numeric(rationale_with(numeric_block_from_values(values)), PARSER_LLM)
+
+        assert outcome.rung == "block"
+        assert outcome.block_present is True
+        assert [float(p.value) for p in outcome.value] == values
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_value_disordered_block_still_fails_the_block_rung(self) -> None:
+        """Non-decreasing is the relaxation; a strict DECREASE with rising percentile stays
+        incoherent, and rejecting it at rung 1 is what keeps the tie tolerance from being a
+        blanket "any ordering parses"."""
+        values = [float(len(STANDARD_PERCENTILES) - i) for i in range(len(STANDARD_PERCENTILES))]
+        llm_mock = AsyncMock(return_value=full_percentile_list())
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_numeric(rationale_with(numeric_block_from_values(values)), PARSER_LLM)
+
+        assert outcome.rung == "llm"
+        assert outcome.block_present is True
+        llm_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_a_non_finite_salvaged_value_fails_the_rung(self) -> None:
         with_nan = full_percentile_list()
         with_nan[6] = Percentile(percentile=with_nan[6].percentile, value=float("nan"))
@@ -600,7 +641,7 @@ class TestMcCanonicalization:
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_mc(rationale_with(sloppy), OPTIONS, PARSER_LLM)
         assert outcome.rung == "block"
-        names = [o.option_name for o in outcome.value.predicted_options]
+        names = [o.option_name for o in outcome.value.option_list.predicted_options]
         assert names == OPTIONS  # canonical spellings, allowed order
         llm.assert_not_awaited()
 
@@ -703,6 +744,6 @@ class TestPropertyContract:
                 outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
             except ValueExtractionError:
                 return
-        assert {o.option_name for o in outcome.value.predicted_options} == set(OPTIONS)
-        total = sum(o.probability for o in outcome.value.predicted_options)
+        assert {o.option_name for o in outcome.value.option_list.predicted_options} == set(OPTIONS)
+        total = sum(o.probability for o in outcome.value.option_list.predicted_options)
         assert total == pytest.approx(1.0, abs=0.02)

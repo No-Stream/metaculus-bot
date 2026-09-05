@@ -13,6 +13,7 @@ import asyncio
 import functools
 import logging
 import os
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -22,11 +23,23 @@ from google.genai import types as genai_types
 
 from metaculus_bot.constants import (
     GEMINI_SEARCH_DEFAULT_MODEL,
+    GEMINI_SEARCH_HTTP_ATTEMPTS,
+    GEMINI_SEARCH_HTTP_TIMEOUT_MS,
     GEMINI_SEARCH_MODEL_ENV,
+    GEMINI_SEARCH_THINKING_LEVEL,
     GEMINI_SEARCH_TIMEOUT,
     GOOGLE_API_KEY_ENV,
 )
 from metaculus_bot.prompts import web_research_prompt
+from metaculus_bot.research.bracket_groups import (
+    BRACKET_GROUP_RE,
+    iter_group_items,
+    join_group_items,
+    rebuild_group,
+)
+from metaculus_bot.research.gemini_attribution import rewrite_unsupported_attributions
+from metaculus_bot.research.gemini_client_config import build_gemini_http_options, gemini_thinking_config
+from metaculus_bot.research.gemini_usage import log_gemini_usage
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
@@ -57,8 +70,18 @@ def _cached_client_for_key(api_key: str) -> genai.Client:
     lets TLS connections and HTTP/2 multiplexing be reused across the ~thousands
     of calls the Gemini provider + gap-fill make per round. Keyed on api_key so
     a rotated key (rare) produces a fresh client.
+
+    The retry ladder rides on the CLIENT rather than the per-request options because the
+    SDK builds its tenacity retryer once at construction from
+    ``http_options.retry_options``; a bare client stops after one attempt (see
+    ``research/gemini_client_config``).
     """
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options=build_gemini_http_options(
+            timeout_ms=GEMINI_SEARCH_HTTP_TIMEOUT_MS, attempts=GEMINI_SEARCH_HTTP_ATTEMPTS
+        ),
+    )
 
 
 def build_gemini_client() -> genai.Client:
@@ -164,6 +187,89 @@ def _splice_inline_citations(text: str, supports: Sequence[Any] | None) -> str:
         return text
 
 
+# Gemini writes its OWN hierarchical citation indices — ``[2.4.1]``, ``[1.1.1, 1.1.2]``,
+# ``[A: NASA, 1.1.2]`` — indexing a source list that does not exist on our side, alongside the
+# resolvable ``[N]`` markers ``_splice_inline_citations`` puts in from real grounding metadata.
+# 173 of 323 archived sections carry them and 163 carry BOTH families, so half the corpus hands a
+# forecaster a bracket field where some brackets resolve and some are decoration, with nothing to
+# tell them apart (scratch/residual_2026-08-31/gemini_search_audit/cutB_pattern.md §3.1).
+#
+# A dotted run only counts as an index when it is DELIMITED the way a citation is — sitting at a
+# group edge or against whitespace/``,``/``;``/``:`` — and when every component is at most two
+# digits. Both bounds are measured, not guessed: across the 2,609 archived bracket groups that
+# hold a dotted token, first components run 1..6 and the largest component anywhere is 39. The
+# two-digit bound is therefore comfortably above real indices while excluding the content classes
+# that would otherwise match — a year (``[2026.08]``), an IP octet (``[192.168.1.1]``) — and the
+# delimiter rule excludes a quantity (``[3.8%]``, ``[$1.5]``, ``[1.5 million]``) and a version
+# (``[v2.1.3]``). Zero of those 2,609 groups is anything but a citation index (validation:
+# scratch/next_season_bundle_2026-09/item3_citation_strip/VALIDATION.md).
+#
+# What a bracket group IS, where its items split, and how a rewritten one is put back
+# together all come from ``research/bracket_groups.py`` — the same grammar the attribution
+# check reads the same text through immediately after this pass, so the two cannot come to
+# disagree about one string. Only the index token itself is this pass's own.
+_CITATION_INDEX_RE = re.compile(r"(?<![^\s,;:])\d{1,2}(?:\.\d{1,2})+(?=\s*(?:[,;:]|$))")
+
+
+def _tidy_group_item(item: str) -> str:
+    """Normalize one comma/semicolon item of a bracket group after index removal.
+
+    Drops the separator a removed index left behind (``2.1.4: A`` -> ``A``,
+    ``A: official 2.4.1`` -> ``A: official``) and collapses the whitespace it opened up.
+    """
+    return re.sub(r"\s+", " ", item).strip().strip(":").strip()
+
+
+def _strip_model_citation_indices(text: str) -> str:
+    """Remove Gemini's self-authored hierarchical citation indices from bracket groups.
+
+    MUST run AFTER ``_splice_inline_citations``: that function indexes the ORIGINAL response
+    text by grounding-support BYTE offsets, so editing the text first would shift every offset
+    and land our real ``[N]`` markers mid-word. Our markers are plain integers, so they survive
+    this pass untouched; only dotted runs go.
+
+    A group emptied of everything but punctuation is removed along with one preceding space, so
+    ``"office [1.1.1, 1.1.2]. He"`` reads ``"office. He"`` rather than ``"office . He"``.
+    Idempotent: a second pass finds no qualifying token.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        inner = match.group("inner")
+        stripped_inner = _CITATION_INDEX_RE.sub("", inner)
+        if stripped_inner == inner:
+            return match.group(0)
+        # An item that is nothing but punctuation once its index is gone said only the
+        # index; dropping it (rather than emptying it) is this pass's own filter, which is
+        # why ``iter_group_items`` hands items over raw.
+        kept: list[tuple[str, str]] = []
+        for separator, item in iter_group_items(stripped_inner):
+            tidied = _tidy_group_item(item)
+            if any(char.isalnum() for char in tidied):
+                kept.append((separator, tidied))
+        if not kept:
+            return ""
+        return rebuild_group(match, join_group_items(kept))
+
+    return BRACKET_GROUP_RE.sub(replace, text)
+
+
+def _grounded_source_labels(chunks: Sequence[Any]) -> list[tuple[int, str]]:
+    """``(1-based chunk index, rendered label)`` for every chunk that carries a label.
+
+    The single derivation of "what our grounding record says", read by both the
+    ``### Sources`` block and the unsupported-attribution check — so the check can never
+    judge an attribution against a source list different from the one the forecaster is
+    shown. The index is the CHUNK's, not the surviving entry's, because the spliced inline
+    ``[N]`` markers point at chunk positions; renumbering would misaim them.
+    """
+    labels = []
+    for idx, chunk in enumerate(chunks, start=1):
+        label = _format_source_label(chunk.web)
+        if label:
+            labels.append((idx, label))
+    return labels
+
+
 def _render_sources_section(chunks: Sequence[Any]) -> str:
     """Render the trailing ``### Sources`` block, or ``""`` when no chunk carries a label.
 
@@ -175,11 +281,49 @@ def _render_sources_section(chunks: Sequence[Any]) -> str:
     would misalign them).
     """
     sources_lines = ["", "", "### Sources"]
-    for idx, chunk in enumerate(chunks, start=1):
-        label = _format_source_label(chunk.web)
-        if label:
-            sources_lines.append(f"[{idx}] {label}")
+    sources_lines.extend(f"[{idx}] {label}" for idx, label in _grounded_source_labels(chunks))
     return "\n".join(sources_lines) if len(sources_lines) > _SOURCES_HEADER_LEN else ""
+
+
+def _check_attributions(text: str, chunks: Sequence[Any], *, qid: int | None) -> str:
+    """Mark the tier-tag attributions this response's own grounding record cannot back.
+
+    Runs AFTER the citation-index strip, on the annotated body only (the ``### Sources``
+    block is appended afterwards and never passes through), and only where we have
+    renderable grounded labels to compare against — an empty label list is a measurement
+    failure rather than a verdict, so it leaves every tag standing and records nothing.
+    That absence is the signal: on a schema-v2 record, no ``unsupported_attributions``
+    count means the check had no evidence base (or the record predates it), while a
+    recorded 0 means it ran and found nothing.
+
+    Deliberately NOT alertable and nothing keys on the count: 70% of the archived corpus's
+    outlet-named tier tags are unsupported, so this is the model's habitual embellishment
+    rather than a bot defect, and an absent outlet does not make the FACT wrong.
+    """
+    labels = [label for _idx, label in _grounded_source_labels(chunks)]
+    if not labels:
+        return text
+    checked = rewrite_unsupported_attributions(text, labels)
+    # ``tier_tags`` rides alongside because the count this check exists to report is not
+    # readable without it: the marker below is gated on ``unsupported``, so a response that
+    # carried no tier tags at all and one whose every tag was backed both archive as
+    # ``unsupported_attributions=0`` and log nothing. It counts OUTLET-NAMED tier items only
+    # (generic tier words like "official" — 307 of the corpus's 790 items — are excluded
+    # before matching), so a 0 reads as "no outlet-named tags", not "no tier tags"; the
+    # definitive check for the latter is a grep for "[A: " over the archived section.
+    record_provider_detail(
+        qid,
+        "gemini_search",
+        {"counts": {"tier_tags": checked.tagged, "unsupported_attributions": checked.unsupported}},
+    )
+    if checked.unsupported:
+        # ``labels`` rides the line because the same count reads completely differently
+        # against it: q38195 named 21 outlets over ONE grounded domain.
+        logger.info(
+            f"GEMINI_UNSUPPORTED_ATTRIBUTION: question={qid} tagged={checked.tagged} "
+            f"unsupported={checked.unsupported} groups={checked.groups_rewritten} labels={len(labels)}"
+        )
+    return checked.text
 
 
 def _format_grounded_response(
@@ -201,7 +345,13 @@ def _format_grounded_response(
     Inline citation markers are inserted per-segment using
     grounding_metadata.grounding_supports, iterating in reverse end_index order
     so index offsets stay valid while we mutate the string. Falls back to a
-    plain-text + sources-list if supports are missing.
+    plain-text + sources-list if supports are missing. The model's own hierarchical
+    ``[2.4.1]`` indices are then stripped (``_strip_model_citation_indices``) so every
+    bracket left in the body resolves against the rendered ``### Sources`` list, and the
+    surviving source-tier tags are checked against that same list (``_check_attributions``)
+    so an outlet our own grounding record cannot back reads as
+    ``[unverified attribution]``; the sources block itself is appended after both passes
+    and never goes through either.
 
     Grounded-chunk floor: a response with no grounding evidence at all — zero
     google_search chunks AND no successful url_context read — is suppressed
@@ -248,11 +398,26 @@ def _format_grounded_response(
             return ""
         # url_context grounded the text but google_search produced no chunks: keep
         # the text as-is (no citation markers to splice, no Sources block). The
-        # caller appends the url_context fetch marker.
-        return text
+        # caller appends the url_context fetch marker. No GEMINI_GROUNDING_DENSITY here:
+        # the marker measures google_search support density, and a response with neither
+        # chunks nor supports has an undefined density rather than a zero one.
+        return _strip_model_citation_indices(text)
 
-    annotated = _splice_inline_citations(text, metadata.grounding_supports)
-    return annotated + _render_sources_section(metadata.grounding_chunks)
+    supports = metadata.grounding_supports or ()
+    # Grounding DENSITY, as telemetry and never as a gate: post-floor the median response
+    # carries one support per ~872 chars and 41% of passing responses have <=3 supports,
+    # which is the floor-immune surface where the ~33% embellishment rate lives. Not a gate
+    # because q44944's decisive, true, later-verified ICE figure came out of a 1-support
+    # response (gemini_search_audit/VERDICT.md §2-3). ``chars`` is the RAW model text — the
+    # denominator the audit measured — not the annotated or sources-appended length.
+    logger.info(
+        f"GEMINI_GROUNDING_DENSITY: question={qid} chunks={len(metadata.grounding_chunks)} "
+        f"supports={len(supports)} chars={len(text)}"
+    )
+    annotated = _strip_model_citation_indices(_splice_inline_citations(text, supports))
+    return _check_attributions(annotated, metadata.grounding_chunks, qid=qid) + _render_sources_section(
+        metadata.grounding_chunks
+    )
 
 
 async def invoke_gemini_grounded(
@@ -279,7 +444,14 @@ async def invoke_gemini_grounded(
     if include_url_context:
         tools.append({"url_context": {}})
 
-    config = genai_types.GenerateContentConfig(tools=tools)
+    # Thinking level is set explicitly rather than left at the model's default (HIGH on
+    # gemini-3-flash-preview), which was most of this provider's token bill; see
+    # GEMINI_SEARCH_THINKING_LEVEL. Still no max_tokens — capping output on a thinking
+    # model truncates.
+    config = genai_types.GenerateContentConfig(
+        tools=tools,
+        thinking_config=gemini_thinking_config(GEMINI_SEARCH_THINKING_LEVEL),
+    )
 
     logger.info(f"GeminiSearch: calling {model} with grounding")
     try:
@@ -290,6 +462,17 @@ async def invoke_gemini_grounded(
     except TimeoutError:
         logger.warning(f"GeminiSearch: {model} timed out after {GEMINI_SEARCH_TIMEOUT}s")
         raise
+
+    # Before any formatting branch, so the tokens are recorded on the suppressed-response
+    # paths too: an ungrounded response we refuse to publish was billed exactly like a
+    # useful one, and a spend line that only covers the responses we kept would understate
+    # the bill by precisely the wasted calls.
+    log_gemini_usage(
+        response,
+        role="grounded_search",
+        model=model,
+        question=str(qid) if qid is not None else None,
+    )
 
     # Capture the raw SDK response (text + grounding metadata: the actual Google
     # queries and sources) before formatting drops most of it.

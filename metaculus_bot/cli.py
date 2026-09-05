@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from forecasting_tools import MetaculusApi
@@ -15,11 +16,18 @@ from metaculus_bot.constants import (
     PERSIST_RESEARCH_ENABLED_ENV,
     TEST_QUESTIONS_OVERRIDE_ENV,
     TOURNAMENT_ID,
+    check_fall_cup_reminder,
     check_tournament_dates,
     credit_alerts_active,
     env_flag_enabled,
 )
-from metaculus_bot.credit_telemetry import CreditTelemetry, get_probed_donated_key_state
+from metaculus_bot.credit_telemetry import (
+    CreditTelemetry,
+    drain_litellm_callbacks,
+    get_probed_donated_key_state,
+    install_role_spend_tracker,
+    log_role_spend,
+)
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
     get_credit_key_fallback_count,
@@ -99,8 +107,28 @@ def _parse_run_mode() -> RunMode:
     return run_mode
 
 
-def _forecast_test_questions(template_bot: TemplateForecaster) -> list[Any]:
-    """Forecast the evergreen example set, or a TEST_QUESTIONS_OVERRIDE list."""
+async def _forecast_with_callback_drain(start_forecast: Callable[[], Awaitable[list[Any]]]) -> list[Any]:
+    """Run one forecast coroutine, then drain litellm's success callbacks on the SAME loop.
+
+    The ``CREDIT_ROLE_SPEND`` ledger is fed by a litellm callback that the logging worker
+    delivers a tick after each completion, on the loop the completion ran on; the worker's
+    queue is bound to that loop and ``asyncio.run`` tears it down on return, so the drain
+    cannot sit beside ``log_role_spend`` in ``main``'s ``finally`` — it has to happen here.
+    Takes a factory rather than a coroutine so the coroutine is created inside the loop it
+    runs on (and so a test stub that closes this wrapper unrun leaves nothing un-awaited).
+    """
+    try:
+        return await start_forecast()
+    finally:
+        await drain_litellm_callbacks()
+
+
+def _test_questions_source(template_bot: TemplateForecaster) -> Callable[[], Awaitable[list[Any]]]:
+    """Forecast-factory over the evergreen example set, or a TEST_QUESTIONS_OVERRIDE list.
+
+    Resolving the URLs is a synchronous Metaculus fetch and stays OUTSIDE the event loop,
+    where it has always been; only the forecast itself is deferred into the factory.
+    """
     EXAMPLE_QUESTIONS = [
         "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
         "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
@@ -122,11 +150,16 @@ def _forecast_test_questions(template_bot: TemplateForecaster) -> list[Any]:
             len(override_urls),
         )
     questions = [MetaculusApi.get_question_by_url(url) for url in question_urls]
-    return asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
+    return lambda: template_bot.forecast_questions(questions, return_exceptions=True)
 
 
-def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
-    """Dispatch one run mode to its question source and forecast it.
+def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Callable[[], Awaitable[list[Any]]]:
+    """Resolve one run mode to the factory that forecasts its questions.
+
+    Returns a factory rather than forecasting here so that every mode goes through the
+    single ``asyncio.run`` + callback drain in ``_run_forecasts``. The drain has to happen
+    on the loop the completions ran on, and stating it once means a mode added here cannot
+    silently report no per-role spend by forgetting to wrap itself.
 
     Every tournament-shaped mode pins ``skip_previously_forecasted_questions`` on so a
     re-run can't re-spend on questions already forecast.
@@ -135,22 +168,59 @@ def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[
         check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return asyncio.run(template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True))
+        return lambda: template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
     if run_mode == "minibench":
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return asyncio.run(
-            template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
-        )
+        return lambda: template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
     if run_mode in ("quarterly_cup", "metaculus_cup"):
         # The metaculus cup is a good way to test the bot's performance on regularly open questions
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return asyncio.run(template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True))
+        return lambda: template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
     if run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
-        return _forecast_test_questions(template_bot)
+        return _test_questions_source(template_bot)
     raise ValueError(f"Invalid run mode: {run_mode}")
+
+
+def persisted_tournament_id(run_mode: RunMode) -> str:
+    """The tournament label this run's research records are archived under.
+
+    Pure, and keyed on the run mode rather than pinned to ``TOURNAMENT_ID``, because
+    ``ResearchPersistenceWriter`` stamps ``tournament_id`` on every record and residual
+    analysis buckets and joins on it. A cup run labelled with the BOT tournament's slug
+    files cup questions inside the tournament's config eras and inside the supply probe's
+    per-slug rows, which is a silent data-corruption bug rather than a cosmetic one: the
+    label is the only thing on the record that says which competition the question came
+    from, since ``run_mode`` distinguishes the pipeline and not the object.
+
+    ``test_questions`` deliberately keeps ``TOURNAMENT_ID``. The evergreen example set
+    belongs to no tournament, so no label is right; it is ``run_mode`` that separates those
+    records, and re-labelling them now would make the archive's existing test-run records
+    incomparable with future ones for no gain.
+
+    Raises on an unknown mode for the same reason ``_question_source`` does: a mode added
+    to ``RunMode`` without a decision here should fail loudly at startup rather than
+    mislabel a whole run's archive.
+    """
+    if run_mode in ("tournament", "test_questions"):
+        return TOURNAMENT_ID
+    if run_mode == "minibench":
+        return str(MetaculusApi.CURRENT_MINIBENCH_ID)
+    if run_mode in ("quarterly_cup", "metaculus_cup"):
+        return METACULUS_CUP_ID
+    raise ValueError(f"Invalid run mode: {run_mode}")
+
+
+def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
+    """Forecast one run mode's questions, on one event loop, with the callback drain.
+
+    The only ``asyncio.run`` in the module: the loop is created here and torn down on
+    return, and ``_forecast_with_callback_drain`` drains litellm's success callbacks
+    inside it while the queue bound to it is still alive.
+    """
+    return asyncio.run(_forecast_with_callback_drain(_question_source(template_bot, run_mode)))
 
 
 def main() -> None:
@@ -163,13 +233,22 @@ def main() -> None:
     _configure_process()
     run_mode = _parse_run_mode()
 
+    # Fall-cup configuration reminder (constants.py): logs its ERROR here, at startup,
+    # so the operator sees it before the run's noise; the non-zero exit it demands
+    # happens in _report_degradation_and_exit AFTER forecasting/publishing complete,
+    # same shape as the credit-floor path. Checked in every run mode on purpose — the
+    # tournament crons stop reaching this from 2026-09-20 (check_tournament_dates
+    # raises), but the cup/minibench crons and manual runs keep reddening until the
+    # operator flips FALL_CUP_CONFIGURED.
+    fall_cup_reminder = check_fall_cup_reminder(logger)
+
     # Wire research persistence if enabled (production GHA runs set this env var)
     research_writer = None
     research_sink = None
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,
-            tournament_id=str(TOURNAMENT_ID),
+            tournament_id=persisted_tournament_id(run_mode),
             run_id=os.environ.get("GITHUB_RUN_ID", "local"),
         )
         research_sink = research_writer.record
@@ -202,6 +281,13 @@ def main() -> None:
     # on the shared donated key durably grep-able. The end fetch runs in a
     # finally so a crashed run still logs its spend; the floor check result is
     # consumed AFTER forecasting/publishing below (reminder signal, not abort).
+    #
+    # The per-role ledger (CREDIT_ROLE_SPEND) rides the same finally. Its tracker is a
+    # litellm success callback, installed here before the first completion; the
+    # callbacks themselves are drained inside the forecast loop
+    # (_forecast_with_callback_drain), so by the time log_role_spend runs every
+    # completion of the run has been booked.
+    install_role_spend_tracker()
     credit_telemetry = CreditTelemetry()
     credit_telemetry.log_start()
     donated_below_floor = False
@@ -209,6 +295,7 @@ def main() -> None:
         forecast_reports = _run_forecasts(template_bot, run_mode)
     finally:
         donated_below_floor = credit_telemetry.log_end_and_check_floor()
+        log_role_spend()
         # Flush inside the finally: records accumulate in memory for the whole run,
         # so an exception escaping asyncio.run (an OSError, the invalid-run-mode
         # ValueError above, a KeyboardInterrupt, the 300-minute timeout-minutes
@@ -240,6 +327,7 @@ def main() -> None:
         template_bot,
         report_summary_error=report_summary_error,
         donated_below_floor=donated_below_floor,
+        fall_cup_reminder=fall_cup_reminder,
     )
 
 
@@ -248,6 +336,7 @@ def _report_degradation_and_exit(
     *,
     report_summary_error: Exception | None,
     donated_below_floor: bool,
+    fall_cup_reminder: bool,
 ) -> None:
     """Emit the one-line degradation breakdown and decide the process exit status.
 
@@ -273,12 +362,11 @@ def _report_degradation_and_exit(
     # ``alertable`` — adding either subset too would double-count events already
     # inside that total.
     #
-    # Credit suppression (until CREDIT_ALERT_RESUME_DATE): the operator is
-    # self-funding the rest of the season, so an empty donated key is expected
-    # and its fallbacks are SUBTRACTED back out of the total. Every other cause
-    # keeps its full weight, because 401/404/429/guardrail each mean real
-    # breakage. Each event is still counted exactly once: generic adds it, and at
-    # most one subset subtracts it.
+    # Credit suppression (while today is before CREDIT_ALERT_RESUME_DATE): inside
+    # that window an empty donated key is an accepted state and its fallbacks are
+    # SUBTRACTED back out of the total. Every other cause keeps its full weight,
+    # because 401/404/429/guardrail each mean real breakage. Each event is still
+    # counted exactly once: generic adds it, and at most one subset subtracts it.
     #
     # ``credit_fallback`` counts only the SUPPRESSIBLE credit subset — the
     # donated key genuinely drained. A key that was revoked or re-capped to zero
@@ -336,6 +424,7 @@ def _report_degradation_and_exit(
         and alertable <= 0
         and generic_fallback <= 0
         and not (donated_below_floor and alerts_active)
+        and not fall_cup_reminder
         and not has_deprecation_alerts()
     )
     completion_phrase = "Run completed clean with" if run_clean else "Run completed with"
@@ -367,21 +456,26 @@ def _report_degradation_and_exit(
         # deprecation tripwire) still decides the exit status — no green claim.
         logger.info("%s a post-summary check below decides the exit status.", breakdown)
 
-    # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
-    # already logged by credit_telemetry). The run completed and published
-    # normally; exiting non-zero here is purely the reminder-to-refill signal —
-    # and it is suppressed until CREDIT_ALERT_RESUME_DATE, since a drained
-    # donated key is the expected state while the operator self-funds. The INFO
-    # line keeps the log self-explanatory: a reader who sees the breach WARNING
-    # but a green run should not have to guess why.
+    # Donated-key balance below the early-warning floor (CREDIT_FLOOR_BREACH
+    # warning already logged by credit_telemetry). The run completed and published
+    # normally; exiting non-zero here is purely the ask-Metaculus-for-a-top-up
+    # signal — and it is suppressed while today is before CREDIT_ALERT_RESUME_DATE.
+    # The INFO line keeps the log self-explanatory: a reader who sees the breach
+    # WARNING but a green run should not have to guess why.
     if donated_below_floor:
         if alerts_active:
             sys.exit(1)
         logger.info(
-            "Donated-key credit floor breached, but credit alerting is suppressed until %s "
-            "(operator is self-funding the rest of the season), so this run exits zero.",
+            "Donated-key credit floor breached, but credit alerting is suppressed until %s, so this run exits zero.",
             CREDIT_ALERT_RESUME_DATE.isoformat(),
         )
+
+    # Fall-cup configuration reminder: the FALL_CUP_REMINDER error was already logged at
+    # startup (check_fall_cup_reminder, constants.py). Same shape as the credit-floor
+    # path above — the run completed and published normally, and this non-zero exit is
+    # purely the reminder-to-configure signal, retired by flipping FALL_CUP_CONFIGURED.
+    if fall_cup_reminder:
+        sys.exit(1)
 
     # Post-submission deprecation tripwire. Runs LAST so submission has fully
     # completed (and so other alertable conditions exit first with their own

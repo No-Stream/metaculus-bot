@@ -12,6 +12,7 @@ import random
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import cast
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -35,11 +36,12 @@ from metaculus_bot.aggregation_strategies import (
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
+from metaculus_bot.member_forecast import MEMBER_FORECAST_ROLE_STACKER, format_member_forecast_marker, percentile_pairs
 from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages
 from metaculus_bot.numeric.validation import detect_unit_mismatch
-from metaculus_bot.post_processing import apply_platt_calibration, maybe_snap_to_integers
+from metaculus_bot.post_processing import apply_platt_calibration, apply_thin_publish_floor, maybe_snap_to_integers
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +199,16 @@ class AggregationPipeline:
         self.meta_reasoning[qid] = meta_text
 
         percentile_list, zero_point = sanitize_percentiles(list(perc_list), question, model_name=stacker_llm.model)
+        logger.info(
+            format_member_forecast_marker(
+                question_id=qid,
+                model=stacker_llm.model,
+                role=MEMBER_FORECAST_ROLE_STACKER,
+                qtype="numeric",
+                raw=percentile_pairs(perc_list),
+                published=percentile_pairs(percentile_list),
+            )
+        )
 
         mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
         if mismatch:
@@ -207,7 +219,7 @@ class AggregationPipeline:
                 f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
             )
 
-        prediction = build_numeric_distribution(percentile_list, question, zero_point)
+        prediction = build_numeric_distribution(percentile_list, question, zero_point, model_name=stacker_llm.model)
         log_open_bound_piling_diagnostics(prediction, question, stacker_llm.model, percentile_list)
         log_final_prediction(prediction, question)
         logger.info(f"Stacked numeric prediction for {page_url}")
@@ -266,13 +278,52 @@ class AggregationPipeline:
                 logger.info("STACKING base combine: single pre-stacked output; returning as-is")
             else:
                 logger.warning("Unexpected STACKING combine: single input without stacking context; returning as-is")
+            lone = predictions[0]
+            # Single-survivor binary publish floor. This branch serves two different
+            # objects — the lone RAW member the single-forecaster short-circuit hands
+            # through, and the single PRE-STACKED output of a fired stacker — so the
+            # count alone is not the trigger: the skip reason route_after_forecasts
+            # writes for exactly the first event is, and the stacked path never writes
+            # one. Read, not popped: the comment builder pops it to publish
+            # STACKER_SKIP_REASON. Binary only — a lone numeric survivor keeps its snap
+            # path below and a lone MC survivor is returned as is.
+            #
+            # Three asymmetries are accepted here rather than papered over with a second
+            # wiring. (1) skip_reasons is written only under STACKING /
+            # CONDITIONAL_STACKING, so a single survivor under plain MEAN/MEDIAN routes
+            # through _simple_aggregate and is NOT floored; prod and the code default
+            # both run CONDITIONAL_STACKING. (2) outcomes[qid] is overwritten by every
+            # routing path, while skip_reasons[qid] is written only by the skip paths and
+            # cleared only by the comment builder — so a stale reason could reach this
+            # read only if a run died between routing and comment-building AND the same
+            # qid were routed again on the same pipeline instance, which no entrypoint
+            # does. Clearing it on the stacked path would just trade that for the mirror
+            # case: with research_reports_per_question > 1 the reports share this
+            # instance, so one report's failed stack attempt would erase the reason a
+            # sibling report's genuine lone survivor wrote, un-flooring the value the
+            # framework then publishes and losing its STACKER_SKIP_REASON marker.
+            # (3) This branch returns above the Platt tail at the bottom of the method, so
+            # a lone raw binary member is the only published binary path that never
+            # receives Platt calibration — the exact mirror of _simple_aggregate, which
+            # calibrates a single prediction but never floors it. Inert today: no workflow
+            # sets PLATT_CALIBRATION_ENABLED, and the standing operator decision is that
+            # fitted calibration layers are not a lever, so this is recorded rather than
+            # wired. Whoever turns Platt on decides whether a floored single-survivor value
+            # should also be calibrated and in which order (see FUTURE.md's calibration
+            # entry, which carries the same note).
+            if (
+                isinstance(question, BinaryQuestion)
+                and qkey is not None
+                and self.skip_reasons.get(qkey) == "single_forecaster"
+            ):
+                return self._floor_single_survivor_binary(cast(float, lone), qkey)
             # Snap-to-integers for a lone numeric prediction — the
             # min-forecasters=1 single-survivor path (forecaster.py short-circuits
             # spread + stacking and hands the raw prediction through). No-op for
             # binary/MC and for the pre-stacked STACKING output (whose discrete
             # votes were already consumed in _stacking_aggregate, so the vote list
             # is empty and majority_votes_discrete([]) is False).
-            return self._maybe_snap_to_integers(predictions[0], question)
+            return self._maybe_snap_to_integers(lone, question)
 
         # CONDITIONAL_STACKING uses MEDIAN; regular STACKING uses MEAN
         base_combine_strategy = (
@@ -306,6 +357,26 @@ class AggregationPipeline:
         if apply_platt_after_combine:
             return self._apply_platt_calibration(combined, question)
         return combined
+
+    @staticmethod
+    def _floor_single_survivor_binary(raw: float, qid: int) -> float:
+        """Apply the k=1 publish floor and log the move, if any, as THIN_PUBLISH_FLOOR.
+
+        The value is a float by construction on this path: a BinaryQuestion's members
+        come out of run_binary_forecast as ``ReasonedPrediction[float]``. No line when the
+        lone value already sits inside the band — the single-survivor EVENT is already
+        observable via FORECASTERS_SURVIVED and the skip reason, so silence here means
+        exactly "nothing moved".
+        """
+        clamped = apply_thin_publish_floor(raw, survivors=1)
+        if clamped != raw:
+            logger.warning(
+                "THIN_PUBLISH_FLOOR: question=%s raw=%.4f clamped=%.4f survivors=1",
+                qid,
+                raw,
+                clamped,
+            )
+        return clamped
 
     def _log_base_combine_strategy(self, n_predictions: int, strategy_name: str, *, expected: bool) -> None:
         """One line naming how many pre-stacked outputs are being combined, and by what.

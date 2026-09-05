@@ -75,8 +75,13 @@ def generate_pchip_cdf_with_smoothing(
     percentile_list: list[Percentile],
     question: NumericQuestion,
     zero_point: float | None,
+    *,
+    model_name: str = "",
 ) -> tuple[list[float], bool, bool]:
-    """Generate PCHIP CDF with optional ramp smoothing."""
+    """Generate PCHIP CDF with optional ramp smoothing.
+
+    ``model_name`` only labels the ``CDF_MAXSTEP_CLIP`` marker (see ``safe_cdf_bounds``).
+    """
     from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415  # function-scoped: call-time lookup keeps tests patching metaculus_bot.numeric.pchip_cdf.* effective
         generate_pchip_cdf,
         percentiles_to_pchip_format,
@@ -98,6 +103,7 @@ def generate_pchip_cdf_with_smoothing(
             num_points=PCHIP_CDF_POINTS,
             question_id=getattr(question, "id_of_question", None),
             question_url=getattr(question, "page_url", None),
+            model_name=model_name,
         )
 
         if aggressive_enforcement_used:
@@ -109,11 +115,7 @@ def generate_pchip_cdf_with_smoothing(
         _pchip_stats["failed_entirely"] += 1
         raise
 
-    smoothing_applied = False
-    try:
-        smoothing_applied = _apply_ramp_smoothing(pchip_cdf, question)
-    except Exception:
-        logger.exception("Ramp smoothing skipped due to error")
+    smoothing_applied = _apply_ramp_smoothing(pchip_cdf, question, model_name=model_name)
 
     _validate_pchip_cdf(pchip_cdf, question)
     _log_pchip_success(pchip_cdf, question, smoothing_applied)
@@ -121,7 +123,7 @@ def generate_pchip_cdf_with_smoothing(
     return pchip_cdf, smoothing_applied, aggressive_enforcement_used
 
 
-def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion) -> bool:
+def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion, *, model_name: str = "") -> bool:
     """Apply ramp smoothing to enforce minimum step size."""
     diffs_before = np.diff(pchip_cdf)
     min_delta_before = float(np.min(diffs_before)) if len(diffs_before) else 1.0
@@ -145,6 +147,8 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion) -> 
             smoothed,
             open_lower=question.open_lower_bound,
             open_upper=question.open_upper_bound,
+            question_id=question.id_of_question,
+            model_name=model_name,
         )
         pchip_cdf[:] = smoothed.tolist()
 
@@ -273,6 +277,8 @@ def create_fallback_numeric_distribution(
     percentile_list: list[Percentile],
     question: NumericQuestion,
     zero_point: float | None,
+    *,
+    model_name: str = "",
 ) -> NumericDistribution:
     """Create fallback NumericDistribution when PCHIP fails.
 
@@ -296,16 +302,26 @@ def create_fallback_numeric_distribution(
     builder, which is its own change.
     """
 
+    # create_fallback_numeric_distribution builds exactly ONE instance, so a closure
+    # cell is a safe per-distribution cache. Memoizing keeps CDF_MAXSTEP_CLIP at one
+    # marker per BUILD rather than one per accessor read (validate + diagnostics +
+    # aggregate + publish all call get_cdf()), matching the PCHIP sibling's count.
+    cached_cdf: list[Percentile] | None = None
+
     class BoundSafeNumericDistribution(NumericDistribution):
         def get_cdf(self) -> list[Percentile]:
+            nonlocal cached_cdf
+            if cached_cdf is not None:
+                return cached_cdf
             base = super().get_cdf()
             if not (self.open_lower_bound or self.open_upper_bound):
-                return base
+                cached_cdf = base
+                return cached_cdf
             probs = np.array([p.percentile for p in base], dtype=float)
             # Scale the min/max-step constraints to the actual grid length. On a coarse
             # discrete grid (cdf_size < 201) the 201-grid defaults (max_step=0.2) would
             # wrongly clip each bin to 20%; grid_step_constraints mirrors the server's
-            # per-bin rules so the fallback matches the pipeline's resample path.
+            # per-bin rules so the fallback matches the pipeline's discrete-build path.
             min_step, max_step = grid_step_constraints(len(base))
             safe = safe_cdf_bounds(
                 probs,
@@ -313,8 +329,13 @@ def create_fallback_numeric_distribution(
                 self.open_upper_bound,
                 min_step=min_step,
                 max_step=max_step,
+                question_id=question.id_of_question,
+                model_name=model_name,
             )
-            return [Percentile(percentile=float(prob), value=p.value) for prob, p in zip(safe, base, strict=False)]
+            cached_cdf = [
+                Percentile(percentile=float(prob), value=p.value) for prob, p in zip(safe, base, strict=False)
+            ]
+            return cached_cdf
 
         @property
         def cdf(self) -> list[Percentile]:

@@ -82,14 +82,30 @@ def build_numeric_distribution(
     percentile_list: list[Percentile],
     question: NumericQuestion,
     zero_point: float | None,
+    *,
+    model_name: str = "",
 ) -> NumericDistribution:
-    """Create a numeric distribution, falling back to a heuristic on failure."""
+    """Create a numeric distribution, falling back to a heuristic on failure.
+
+    ``model_name`` only labels the ``CDF_MAXSTEP_CLIP`` marker (whose declaration the
+    platform's per-bin cap had to clip), the same way ``sanitize_percentiles`` labels
+    ``NUMERIC_DEGENERATE_DECLARATION``.
+    """
+
+    target_cdf_size = getattr(question, "cdf_size", None)
+    if target_cdf_size is not None and target_cdf_size != PCHIP_CDF_POINTS:
+        prediction = _build_discrete_distribution(
+            percentile_list, question, zero_point, target_cdf_size, model_name=model_name
+        )
+        validate_cdf_construction(prediction, question)
+        return prediction
 
     try:
         pchip_cdf, _smoothing_applied, _aggressive = generate_pchip_cdf_with_smoothing(
             percentile_list,
             question,
             zero_point,
+            model_name=model_name,
         )
         prediction = create_pchip_numeric_distribution(pchip_cdf, percentile_list, question, zero_point)
     # Documented soft-fail boundary: ANY PCHIP build failure delegates the CDF to
@@ -97,43 +113,59 @@ def build_numeric_distribution(
     # recoverable build failure into a dropped forecast.
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
         log_pchip_fallback(question, exc)
-        prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point)
+        prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point, model_name=model_name)
 
     validate_cdf_construction(prediction, question)
 
-    target_cdf_size = getattr(question, "cdf_size", None)
-    if target_cdf_size is not None and target_cdf_size != PCHIP_CDF_POINTS:
-        min_step, max_step = grid_step_constraints(target_cdf_size)
-        pchip_percentiles = percentiles_to_pchip_format(percentile_list)
-        resampled_cdf, _ = generate_pchip_cdf(
-            percentile_values=pchip_percentiles,
-            open_upper_bound=question.open_upper_bound,
-            open_lower_bound=question.open_lower_bound,
-            upper_bound=question.upper_bound,
-            lower_bound=question.lower_bound,
-            zero_point=zero_point,
-            min_step=min_step,
-            max_step=max_step,
-            num_points=target_cdf_size,
-            question_id=getattr(question, "id_of_question", None),
-            question_url=getattr(question, "page_url", None),
-        )
-        x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)
-        declared_percentiles = [
-            Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, resampled_cdf, strict=False)
-        ]
-        prediction = create_pchip_numeric_distribution(
-            pchip_cdf=list(map(float, resampled_cdf)),
-            percentile_list=declared_percentiles,
-            question=question,
-            zero_point=zero_point,
-        )
-        logger.info(
-            "Discrete resample in build_numeric_distribution | Q %s | 201 -> %d points",
-            getattr(question, "id_of_question", None),
-            target_cdf_size,
-        )
+    return prediction
 
+
+def _build_discrete_distribution(
+    percentile_list: list[Percentile],
+    question: NumericQuestion,
+    zero_point: float | None,
+    target_cdf_size: int,
+    *,
+    model_name: str = "",
+) -> NumericDistribution:
+    """Build a PCHIP distribution directly on the question's coarse discrete grid.
+
+    Built ONCE on the grid that publishes: a provisional 201-point build would apply
+    the fine-grid 0.2 cap and emit a phantom ``CDF_MAXSTEP_CLIP`` for a forecast whose
+    published coarse grid has a looser cap and never clipped. A coarse-build failure
+    escapes (no ft fallback), exactly as the post-provisional resample did before.
+    """
+    min_step, max_step = grid_step_constraints(target_cdf_size)
+    pchip_percentiles = percentiles_to_pchip_format(percentile_list)
+    resampled_cdf, _ = generate_pchip_cdf(
+        percentile_values=pchip_percentiles,
+        open_upper_bound=question.open_upper_bound,
+        open_lower_bound=question.open_lower_bound,
+        upper_bound=question.upper_bound,
+        lower_bound=question.lower_bound,
+        zero_point=zero_point,
+        min_step=min_step,
+        max_step=max_step,
+        num_points=target_cdf_size,
+        question_id=getattr(question, "id_of_question", None),
+        question_url=getattr(question, "page_url", None),
+        model_name=model_name,
+    )
+    x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)
+    declared_percentiles = [
+        Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, resampled_cdf, strict=False)
+    ]
+    prediction = create_pchip_numeric_distribution(
+        pchip_cdf=list(map(float, resampled_cdf)),
+        percentile_list=declared_percentiles,
+        question=question,
+        zero_point=zero_point,
+    )
+    logger.info(
+        "Discrete build in build_numeric_distribution | Q %s | built directly on the %d-point grid",
+        getattr(question, "id_of_question", None),
+        target_cdf_size,
+    )
     return prediction
 
 

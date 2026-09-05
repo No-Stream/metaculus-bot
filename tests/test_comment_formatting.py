@@ -479,3 +479,72 @@ class TestBuildUnifiedExplanation:
         )
         assert len(result) <= COMMENT_CHAR_LIMIT
         assert "<!-- FORECASTERS_USED=2/3 -->" in result
+
+    @pytest.mark.parametrize(
+        "question_cls",
+        [BinaryQuestion, NumericQuestion, MultipleChoiceQuestion],
+        ids=["binary", "numeric", "multiple_choice"],
+    )
+    @pytest.mark.parametrize(
+        ("strategy", "stacker_outcome"),
+        [
+            (AggregationStrategy.CONDITIONAL_STACKING, "skipped"),
+            (AggregationStrategy.MEAN, None),
+        ],
+        ids=["stacking_branch", "non_stacking_branch"],
+    )
+    def test_forecasters_used_marker_on_every_supported_question_type(
+        self,
+        question_cls: type[BinaryQuestion | NumericQuestion | MultipleChoiceQuestion],
+        strategy: AggregationStrategy,
+        stacker_outcome: str | None,
+    ):
+        """Presence sweep: no published comment may lack the ensemble-size disclosure.
+
+        The suffix is assembled once, before this function branches on question type
+        (only the TOOLS_USED marker reads the type) or on strategy. Moving it inside
+        either branch would publish some question types or strategies without the
+        marker, and residual analysis would read those records as pre-marker
+        "unknown" rather than as the degraded-or-not publishes they are.
+
+        Three classes cover every published question. ``forecast_questions`` drops
+        date and conditional questions up front (and ``_make_prediction`` raises
+        ``NotImplementedError`` if one reaches it anyway), and a discrete question is
+        a ``NumericQuestion`` subclass, so it takes the numeric branch here.
+        ``question_types.question_type_of`` knows only these three.
+        """
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        result = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(cls=question_cls),
+            aggregation_strategy=strategy,
+            stacker_outcome=stacker_outcome,
+            n_used=2,
+            n_configured=3,
+        )
+        assert "<!-- FORECASTERS_USED=2/3 -->" in result
+
+    def test_forecasters_used_marker_survives_trimming_on_non_stacking_path(self):
+        """Tail survival has to hold on the non-stacking early return too.
+
+        That branch trims through its own ``trim_comment`` call with no stacker
+        markers behind the disclosure, so the marker is the very last thing in the
+        comment there — the position most exposed to a future change in how the
+        trimmer picks what to keep. Backtests and the MEAN/MEDIAN strategies take
+        this path.
+        """
+        from metaculus_bot.comment.formatting import build_unified_explanation
+        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
+
+        huge_base = "# SUMMARY\n" + ("X" * (COMMENT_CHAR_LIMIT + 5000))
+        result = build_unified_explanation(
+            base_text=huge_base,
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.MEAN,
+            stacker_outcome=None,
+            n_used=2,
+            n_configured=3,
+        )
+        assert len(result) <= COMMENT_CHAR_LIMIT
+        assert "<!-- FORECASTERS_USED=2/3 -->" in result

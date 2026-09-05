@@ -12,8 +12,13 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 
 from metaculus_bot.calibration import PlattParams, apply_binary_platt, apply_mc_platt
-from metaculus_bot.constants import PLATT_BINARY_MAX_ABS_DEVIATION, PLATT_MC_MAX_ABS_DEVIATION
-from metaculus_bot.post_processing import apply_platt_calibration, maybe_snap_to_integers
+from metaculus_bot.constants import (
+    PLATT_BINARY_MAX_ABS_DEVIATION,
+    PLATT_MC_MAX_ABS_DEVIATION,
+    THIN_PUBLISH_BINARY_CEIL,
+    THIN_PUBLISH_BINARY_FLOOR,
+)
+from metaculus_bot.post_processing import apply_platt_calibration, apply_thin_publish_floor, maybe_snap_to_integers
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -137,3 +142,38 @@ class TestMaybeSnapToIntegers:
         result = maybe_snap_to_integers(dist, q, votes)
         # Should return something different from the input (snapped)
         assert result is not dist
+
+
+# ---------------------------------------------------------------------------
+# apply_thin_publish_floor
+# ---------------------------------------------------------------------------
+
+
+class TestApplyThinPublishFloor:
+    """The single-survivor binary floor is a function of the survivor COUNT, not the value.
+
+    Median-of-1 supplies no variance reduction, so the range the published value may
+    occupy is narrowed in exactly that state; at any other count the value passes through
+    untouched, however extreme (the multi-member median self-clamps, and the receipt priced
+    a global clamp at -52.02 spot peer). Bounds are THIN_PUBLISH_BINARY_FLOOR / _CEIL.
+    """
+
+    def test_lone_survivor_below_the_floor_is_raised_to_it(self) -> None:
+        assert apply_thin_publish_floor(0.03, survivors=1) == THIN_PUBLISH_BINARY_FLOOR
+
+    def test_lone_survivor_above_the_ceiling_is_lowered_to_it(self) -> None:
+        assert apply_thin_publish_floor(0.97, survivors=1) == THIN_PUBLISH_BINARY_CEIL
+
+    def test_lone_survivor_inside_the_band_passes_through_unchanged(self) -> None:
+        assert apply_thin_publish_floor(0.30, survivors=1) == 0.30
+
+    def test_values_exactly_on_the_edges_are_unchanged(self) -> None:
+        assert apply_thin_publish_floor(THIN_PUBLISH_BINARY_FLOOR, survivors=1) == THIN_PUBLISH_BINARY_FLOOR
+        assert apply_thin_publish_floor(THIN_PUBLISH_BINARY_CEIL, survivors=1) == THIN_PUBLISH_BINARY_CEIL
+
+    @pytest.mark.parametrize("survivors", [2, 3, 6])
+    def test_any_other_survivor_count_is_inert_even_below_the_floor(self, survivors: int) -> None:
+        # The k<=2 generalisation the receipt discusses is deliberately NOT enabled: a
+        # k=2 publish has never happened, so there is nothing to fit it on.
+        assert apply_thin_publish_floor(0.03, survivors=survivors) == 0.03
+        assert apply_thin_publish_floor(0.97, survivors=survivors) == 0.97

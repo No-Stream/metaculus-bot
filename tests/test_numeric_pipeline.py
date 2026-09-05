@@ -165,10 +165,12 @@ def test_build_numeric_distribution_fallback(monkeypatch):
         validate,
     )
 
-    result = build_numeric_distribution(sanitized, question, zero_point=None)
+    result = build_numeric_distribution(sanitized, question, zero_point=None, model_name="some/forecaster")
 
     assert result == "fallback"
-    fallback.assert_called_once_with(sanitized, question, None)
+    # model_name rides through to the fallback builder too: its get_cdf() runs its own
+    # safe_cdf_bounds pass, so a CDF_MAXSTEP_CLIP from there must name the forecaster.
+    fallback.assert_called_once_with(sanitized, question, None, model_name="some/forecaster")
     validate.assert_called_once_with("fallback", question)
 
 
@@ -197,10 +199,10 @@ def test_build_numeric_distribution_success(monkeypatch):
         validate,
     )
 
-    result = build_numeric_distribution(sanitized, question, zero_point=None)
+    result = build_numeric_distribution(sanitized, question, zero_point=None, model_name="some/forecaster")
 
     assert result == "pchip"
-    generator.assert_called_once_with(sanitized, question, None)
+    generator.assert_called_once_with(sanitized, question, None, model_name="some/forecaster")
     create_dist.assert_called_once_with(mock_cdf, sanitized, question, None)
     validate.assert_called_once_with("pchip", question)
 

@@ -28,10 +28,12 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any
 
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _liquidity_label
 from metaculus_bot.structured_output_schema import extract_json_block
+from metaculus_bot.time_utils import _as_utc
 
 # MAXIMUM rows the ranker may emit. A ceiling, not a target.
 RENDER_BUDGET = 8
@@ -55,6 +57,21 @@ TIER_UNSPECIFIED = "unspecified"
 # instead of respelled so the vocabulary cannot drift between the two; the legend's "only the
 # first two measure the quantity asked about" states the same fact to the forecaster.
 STRONG_TIERS: frozenset[str] = frozenset(TIERS[:2])  # HARNESS-SCAN-EXEMPT-subsampling
+
+# How far a market's close may precede the QUESTION's own open time before its top-tier grade is
+# refused deterministically. `same_quantity_same_date` asserts the market resolves on the same date
+# or over the same window as the question; a market that stopped trading two months before the
+# question was even askable cannot be doing that, whatever its title shares with it. The measured
+# case is q45163, whose rank-0 row closed 2026-02-27 against an 08-09 forecast — five months, and it
+# still rendered `status=open` because Manifold's `is_resolved` was false, so the table gave a
+# forecaster no cue at all.
+#
+# 60 days is deliberately far past any plausible same-window market and nowhere near the offender:
+# the point is to catch the EGREGIOUS case without second-guessing the ranker on a question whose
+# window genuinely straddles a nearby close. The cap costs the row nothing else — it keeps its rank,
+# its price and its rules text, and gains a note stating the demotion (`cap_stale_top_tier`), which
+# shares the `why` cell's phrase budget rather than widening the rendered section.
+MARKET_STALENESS_TIER_CAP_DAYS = 60
 
 # Per-row phrase cap. The label is one glanceable phrase a forecaster prompt can weight, not
 # a second rationale.
@@ -91,7 +108,7 @@ DEGRADED_RANKING_MARKER = "[ranking unavailable — showing retrieval order]"
 _DECODER = json.JSONDecoder()
 
 
-# The prompt. Two deliberate departures from the version the bake-off measured, both of them
+# The prompt. Three deliberate departures from the version the bake-off measured, all of them
 # fixes rather than tuning:
 #
 # 1. The DROP block's "a different OFFICE's or a different RACE's election result, even in the
@@ -105,6 +122,13 @@ _DECODER = json.JSONDecoder()
 # 2. The operator's relevance rule is carried verbatim at the top, and the signals block
 #    gained the RESOLVED bullet, because resolved markets now reach the ranker (the `as_of`
 #    filter that used to drop them is gone).
+# 3. The signals block gained the `closes` RECENCY bullet. The rendered slate is the
+#    model's order verbatim — no downstream re-sort, which is the measured design decision the
+#    rendering module's docstring defends — so a within-tier recency preference has nowhere to live
+#    except this prompt. Measured need: q45163's rank-0 row had closed five months before the
+#    forecast and was still graded above a $907k market on the question's own quantity.
+#    `cap_stale_top_tier` is the deterministic backstop for the egregious case; the bullet is what
+#    handles the ordinary one, since a cap cannot reorder rows.
 #
 # Do not touch the four tier names. Filled by `build_ranker_prompt`, never `.format`, because the
 # emitted-object example below is literal JSON braces that `.format` would read as a field name.
@@ -137,9 +161,10 @@ WIDTH IS YOURS TO CHOOSE, from 0 up to {budget} rows.
   - Lean toward INCLUDING: a wrongly included row costs the forecaster one line of reading, a wrongly excluded row is evidence they never see. The two errors are not symmetric. But do not pad -- an irrelevant row spends the forecaster's attention on nothing.
   - When you are genuinely torn about a candidate, INCLUDE it, at the bottom, tiered honestly.
 
-THREE SIGNALS IN THE CANDIDATE BLOCK:
+FOUR SIGNALS IN THE CANDIDATE BLOCK:
   - `settles via` is the market's own settlement source. When it names the same agency, index, publication, or price feed the question's resolution criteria names, that candidate is very likely tier 1 or tier 2 EVEN IF its title shares few words with the question -- this is the single most reliable cue in the block. A market that settles on the exchange's own price feed for the asset the question asks about is measuring the same quantity.
   - `liquidity` is a QUALITY signal, never a relevance signal. Between two otherwise equally relevant rows prefer the deeper one. Never rank a thin market above a more relevant one, and never exclude a relevant market for being thin.
+  - `closes` is when the market stops trading, and it is a RECENCY signal that breaks ties WITHIN a tier: between two candidates you would grade the same, rank the one still open or most recently trading ABOVE the long-closed one, whose price is old news. It also bounds the tier itself -- a market that closed months before this question's own window is not resolving on the same date, so grade it "same_quantity_other_cut" rather than "same_quantity_same_date". Never exclude a relevant market for being closed.
   - `RESOLVED` means the market has already settled. Its price is a realized outcome, not a forecast. A resolved market on an adjacent cut of the same quantity is still valuable -- it tells the forecaster what actually happened -- so keep and tier it normally; just do not treat its price as a live probability.
 
 QUESTION
@@ -492,6 +517,70 @@ def apply_picks(pool: Sequence[MarketMatch], picks: Sequence[Pick]) -> list[Mark
     return [
         replace(pool[pick.index], rank=position, relation_tier=pick.tier, relevance_label=pick.why)
         for position, pick in enumerate(picks)
+    ]
+
+
+def _tier_cap_note(row: MarketMatch, question_opened: datetime) -> str:
+    """The demotion note for a row the staleness threshold refuses the top tier to, else ``""``.
+
+    Split out so ``cap_stale_top_tier`` stays one comprehension: the decision and the sentence that
+    explains it are the same fact, and computing them apart is how the two drift.
+
+    The wording states the demotion ONCE and does not repeat the withdrawn grade as a grade. It
+    used to read "stale: closed 162d before the question opened (ranker said
+    same_quantity_same_date)", which put the vocabulary word `same_quantity_same_date` at the end
+    of a cell inside a table whose preamble tells the forecaster to anchor on a same-date market's
+    price — the one reading the cap exists to withdraw, restated last, immediately before the
+    ranker's own same-date phrase. Nothing is lost from the archive: only the top tier is ever
+    capped, so the note's presence names the grade the ranker gave, and `relevance_label` still
+    carries the model's phrase verbatim. `demoted from same-date:` is the shape the rendered
+    legend defines (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`); change one and change both.
+    """
+    if row.relation_tier != TIERS[0] or row.close_time is None:
+        return ""
+    stale_days = (question_opened - _as_utc(row.close_time)).days
+    if stale_days <= MARKET_STALENESS_TIER_CAP_DAYS:
+        return ""
+    return f"demoted from same-date: closed {stale_days}d before the question opened"
+
+
+def cap_stale_top_tier(rows: Sequence[MarketMatch], *, question_open_time: datetime | None) -> list[MarketMatch]:
+    """Refuse ``same_quantity_same_date`` on a row that closed long before the question opened.
+
+    DISCLOSURE, not a drop, and the distinction is the whole design. The row keeps its rank, its
+    price, its liquidity cells and its rules bullet; what changes is one rung of its relation grade
+    plus a ``tier_cap_note`` stating the demotion and its arithmetic, so a forecaster reading the
+    table sees that a grade was withdrawn and why. Dropping the row instead would delete evidence
+    on the recall-first side of a tradeoff this pipeline has measured (a wrongly excluded market is
+    evidence the forecaster never sees), and silently rewriting the tier would hide a disagreement
+    between our arithmetic and the model's reading.
+
+    Exactly ONE rung, and only from the top tier. Tier 1 makes a checkable claim — same date or
+    same window — and a market that stopped trading `MARKET_STALENESS_TIER_CAP_DAYS` before the
+    question was even askable cannot satisfy it. Tier 2 claims only "the same quantity, cut
+    differently", and a resolved market on an adjacent cut is legitimately valuable (it says what
+    actually happened), so demoting it to `driver_or_consequence` — which the forecaster prompt
+    calls context rather than an anchor — would be the wrong correction. Note the measured
+    consequence of that boundary: q45163's own offender was graded tier 2, so THIS pass would not
+    have touched it; the render's `(Nd ago)` disclosure on the close cell is what covers that case,
+    and the prompt's recency bullet is what should have ordered it lower. Across the whole archived
+    corpus the cap fires ZERO times (9 rows are graded tier 1 at all, none of them stale), so read
+    it as a guard on a claim a long-closed market cannot make rather than as a measured fix.
+
+    Keyed on the question's OPEN time rather than the forecast time deliberately. Open time is a
+    property of the question, so the same market is graded the same way whenever in the window the
+    bot runs — a market closing mid-window stays tier-1-eligible instead of being demoted by our
+    own latency.
+
+    No-ops when the question carries no open time (nothing to compare against) and when no row is
+    graded tier 1. Returns copies, matching `apply_picks`.
+    """
+    if question_open_time is None:
+        return list(rows)
+    opened = _as_utc(question_open_time)
+    return [
+        replace(row, relation_tier=TIERS[1], tier_cap_note=note) if (note := _tier_cap_note(row, opened)) else row
+        for row in rows
     ]
 
 

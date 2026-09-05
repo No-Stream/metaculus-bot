@@ -28,6 +28,10 @@ dependencies = [
     "trafilatura>=2.1.0",
     "json-repair>=0.61.1",
     "ijson>=3.5.1",
+    "pypdf>=6.16.2",
+    "certifi>=2026.5.20",
+    "brotli>=1.2.0",                                        # aiohttp's optional `br` decoder; see [tool.deptry] DEP002
+    "backports-zstd>=1.7.0 ; python_full_version < '3.14'", # aiohttp's optional `zstd` decoder; stdlib from 3.14 on
 ]
 # supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 # The freshness window is enforced at lock time via `uv lock --exclude-newer <ts>`
@@ -58,6 +62,7 @@ dev = [
     "deptry>=0.25.1",
     "import-linter>=2.13",
     "pytest-timeout>=2.4.0",
+    "curl-cffi>=0.15.0",
 ]
 
 [tool.uv]
@@ -295,9 +300,20 @@ extend_exclude = [
 ]
 
 [tool.deptry.per_rule_ignores]
+# DEP002 — declared but imported by nothing of ours. Both are aiohttp's OPTIONAL decoders,
+# imported by `aiohttp.compression_utils` and reached only through a response body read. They
+# are load-bearing on the one route where `Accept-Encoding` is not a contract: the Wayback rung
+# fetches captures in `id_` raw mode, which replays whatever `Content-Encoding` the ORIGIN sent
+# the archive's crawler. Without them aiohttp raises `Can not decode content-encoding` on the
+# read and the hop lands as `error` — measured 2026-09-03 on trueup.io's 21-day-old zstd
+# capture, which the rung then reported as "no archived copy served". `backports-zstd` carries
+# the `python_full_version < '3.14'` marker because aiohttp reads zstd from the stdlib
+# `compression.zstd` from 3.14 on, and the backport itself declares `Requires-Python <3.14`.
+# Pinned by tests/test_http_fetch.py::TestUnadvertisedContentEncoding.
+DEP002 = ["brotli", "backports-zstd"]
 # DEP003 — imported but only a transitive dependency. Both are guaranteed present by a
-# declared direct dependency, and both are imported for exception types that surface
-# through that dependency's own API rather than for their own client:
+# declared direct dependency, and declaring either directly would add a second version
+# constraint on a package those dependencies already resolve, for no gain in availability:
 #   urllib3 <- requests. `from urllib3 import exceptions` in metaculus_bot/http_status.py
 #     (the one importer, since the shared is_transient_question_fetch_error absorbed the
 #     per-file copies) exists to catch ul3_exc.ProtocolError next to requests' own
@@ -305,22 +321,37 @@ extend_exclude = [
 #   httpx <- openai (and asknews, exa-py, google-genai, litellm — five declared deps
 #     require it). Used directly in credit_telemetry.py, check_openrouter_credits.py and
 #     research/agentic/tools.py.
-# Declaring either directly would add a second version constraint on a package those
-# dependencies already resolve, for no gain in availability.
 DEP003 = ["urllib3", "httpx"]
-# DEP004 — dev dependency imported by the shipped package. matplotlib plotting is
-# optional at both call sites and neither is reachable on a live bot run:
-#   calibration/fit_platt_cli.py imports it inside try/except ImportError and returns a
-#     skip note that lands in the report, so the CLI works without it.
-#   research/ts_chart.py imports it at module scope, but ts_chart itself is imported
-#     lazily inside an ImportError guard in _maybe_stash_single_chart, only after the
-#     TS_ANCHOR_CHART_ENABLED gate ('false' in all five bot workflows). Under
-#     `uv sync --no-dev` that guard logs one ERROR naming matplotlib and degrades to
-#     the text-only anchor (pinned by tests/test_ts_chart.py::TestProviderChartHook::
-#     test_missing_matplotlib_degrades_to_text_only_anchor). So matplotlib must move to
-#     [project].dependencies when the flag is flipped on in a workflow — not to keep the
-#     run alive, but because otherwise the flag renders no chart at all.
-DEP004 = ["matplotlib"]
+# DEP004 — dev dependency imported by the shipped package. Neither import is reachable on a
+# live bot run, which installs with `uv sync --no-dev`:
+#   matplotlib. Plotting is optional at both call sites:
+#     calibration/fit_platt_cli.py imports it inside try/except ImportError and returns a
+#       skip note that lands in the report, so the CLI works without it.
+#     research/ts_chart.py imports it at module scope, but ts_chart itself is imported
+#       lazily inside an ImportError guard in _maybe_stash_single_chart, only after the
+#       TS_ANCHOR_CHART_ENABLED gate ('false' in all five bot workflows). Under
+#       `uv sync --no-dev` that guard logs one ERROR naming matplotlib and degrades to
+#       the text-only anchor (pinned by tests/test_ts_chart.py::TestProviderChartHook::
+#       test_missing_matplotlib_degrades_to_text_only_anchor). So matplotlib must move to
+#       [project].dependencies when the flag is flipped on in a workflow — not to keep the
+#       run alive, but because otherwise the flag renders no chart at all.
+#   curl_cffi. In the dev group because tests/conftest.py, the ROOT conftest, imports
+#     `curl_cffi.requests` at module scope to patch libcurl's request chokepoint for the
+#     native-egress guard (a money-safety backstop), so the whole suite fails at collection
+#     without it. Until 2026-09-04 it arrived only as yfinance's transitive dependency, which
+#     deptry accepted under DEP003 while leaving the suite one upstream client swap away from
+#     dying at import time; declaring it here is what lets that import stay hard rather than
+#     become a try/except that would silently disable the guard. A dev rather than a runtime
+#     dependency because neither importer ships in a bot run: the guard is test-only, and the
+#     other importer — scripts/probes/fetch_diagnostic.py, the operator-run egress diagnostic,
+#     which is the two lines deptry reports under this rule — needs a real Chrome TLS/HTTP2
+#     fingerprint to tell "this runner's fingerprint is being scored" from "this runner's
+#     egress IP is blocked", a debugging need that must not put a package into the runtime
+#     deps. That probe imports inside try/except ImportError and degrades to "impersonation
+#     rung unavailable"; its workflow syncs `--no-dev` and supplies the package with
+#     `uv run --with curl_cffi`. The cost of this entry is that a future prod import of
+#     curl_cffi would go unflagged.
+DEP004 = ["matplotlib", "curl_cffi"]
 
 # Import-direction contracts. Every contract below was derived from the real graph (grimp).
 # The first five passed as written, with no code change; the scoring one is the exception —

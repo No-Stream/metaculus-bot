@@ -18,15 +18,48 @@ from metaculus_bot.time_utils import _as_utc
 # =============================================================================
 # TOURNAMENT IDs - UPDATE THESE EACH QUARTER/SEASON
 # =============================================================================
-# AI Forecasting Benchmark tournament (bot-only competition)
+# AI Forecasting Benchmark / FutureEval tournament (bot-only competition)
 # Update when new season starts: https://www.metaculus.com/project/aib/
+# Read the object before editing: /api/projects/tournaments/<slug-or-id>/ is the route
+# that serves a project (a bare /api/projects/<id>/ 404s), and TOURNAMENT_END_DATE is its
+# `forecasting_end_date`, not its `close_date` (they differ by two months here).
 TOURNAMENT_ID: str = "summer-futureeval-2026"  # Summer 2026 FutureEval Bot Tournament (project ID: 33022)
-TOURNAMENT_END_DATE: str = "2026-09-06"  # Formal tournament close date
+TOURNAMENT_END_DATE: str = "2026-09-06"  # forecasting_end_date on project 33022 (API-verified 2026-09-03)
 TOURNAMENT_HARD_STOP_WEEKS: int = 2  # ~2 weeks of wiggle room past close before erroring
+# NO fall-2026 successor to summer-futureeval-2026 was published as of 2026-09-03, so
+# these stay on the summer season deliberately rather than being guessed. Evidence, all
+# read-only: /api/projects/tournaments/ listed 193 projects with no fall-2026 bot
+# tournament among them; every project id from 33100 to 33140 was fetched individually and
+# only 33108 (the fall cup) and 33109 (an unrelated question series) exist, so the id
+# space above the summer tournament is empty; the four plausible slugs
+# fall-futureeval-2026 / fall-aib-2026 / futureeval-fall-2026 / aib-fall-2026 all 404; and
+# forecasting-tools 0.2.92 still has CURRENT_AI_COMPETITION_ID == the summer id.
+# Consequence to expect: check_tournament_dates raises TournamentExpiredError from
+# 2026-09-20 (end date + hard stop), which reddens `--mode tournament` runs and the CI
+# freshness test in tests/test_tournament_dates.py. That is the intended reminder, and it
+# does NOT touch the cup — `--mode metaculus_cup` never calls that check.
 
-# Metaculus Cup tournament (human + bot competition)
-# Update when new cup starts: https://www.metaculus.com/tournament/metaculus-cup/
-METACULUS_CUP_ID: str = "metaculus-cup"  # Uses slug, auto-resolves to current cup
+# Metaculus Cup (human + bot competition). This used to hold the undated `metaculus-cup`
+# slug and rely on Metaculus redirecting it to whichever cup was current; Metaculus now
+# REJECTS that slug — the posts list answers HTTP 400 for `tournaments=metaculus-cup`
+# (verified 2026-09-03) — so the constant carries the SEASON's dated slug and has to be
+# re-pointed at each new cup. There is no auto-resolving spelling left.
+#
+# Fall 2026, read straight off /api/projects/tournaments/metaculus-cup-fall-2026/ on
+# 2026-09-03: project id 33108, name "Metaculus Cup Fall 2026", start_date
+# 2026-08-28T12:00:00Z, forecasting_end_date 2027-01-01T00:00:00Z, close_date
+# 2027-01-04T00:00:00Z, score_type peer_tournament, visibility unlisted,
+# bot_leaderboard_status exclude_and_show (bots forecast and are shown, but sit outside
+# the human leaderboard — every recent cup season reads the same, so this is the cup's
+# normal setting), questions_count 0 — the cup was open but had published nothing yet.
+# Slug or numeric id both resolve on that route; the slug is kept because it is what the
+# supply probe's per-slug rows and the research archive's labels read.
+#
+# NOTE for residual analysis: score_type peer_tournament means cup records carry a
+# coverage-scaled peer score and NO spot peer, unlike the bot tournament's
+# spot_peer_tournament. performance_analysis/platform_scores.py already keeps the two in
+# separate sort tiers; don't pool them on one score field.
+METACULUS_CUP_ID: str = "metaculus-cup-fall-2026"
 
 
 def gemini_use_donated_openrouter_key() -> bool:
@@ -100,6 +133,70 @@ def check_tournament_dates(logger: logging.Logger | None = None) -> None:
             f"({days_past} days ago). Update constants.py for the new season! "
             f"Bot will error out in {days_until_error} days."
         )
+
+
+# --- Cup-season configuration reminder (dated, DISCHARGED for fall 2026, re-armable) ---
+# This was a deliberate time bomb: from FALL_CUP_REMINDER_DATE every run reddened until
+# somebody pointed METACULUS_CUP_ID at the fall cup's dated slug and enabled the
+# 'Forecast on Metaculus Cup' workflow, because the undated `metaculus-cup` slug the
+# constant used to hold had started answering HTTP 400, so a cup run would simply have
+# found no questions.
+#
+# DISCHARGED on 2026-09-03: Metaculus granted $1,500 of API credits for the fall season,
+# METACULUS_CUP_ID above now names project 33108 (metadata verified against the API in
+# the comment there), the cup workflow runs the same hourly split cron the tournament
+# does, and FALL_CUP_CONFIGURED is True — which makes fall_cup_reminder_due() False on
+# every date, so the reminder cannot fire and the companion test in
+# tests/test_tournament_dates.py became a pin that the cup stays configured. The one
+# remaining operator step is enabling the workflow on GitHub (it is `disabled_manually`
+# there, which no file in this repo can change); see docs/operations.md.
+#
+# TO RE-ARM for the next cup (spring 2027): re-date FALL_CUP_REMINDER_DATE to a couple of
+# weeks before that cup opens and set FALL_CUP_CONFIGURED back to False. The names still
+# say FALL because that is the season they were written for and `FALL_CUP_SLUG` is
+# imported elsewhere (scripts/supply_probe.py's default slug list); a re-arm should rename
+# them to the new season and update those imports with it.
+FALL_CUP_SLUG: str = METACULUS_CUP_ID  # one definition, so the probe's slug list and the reminder can't drift
+FALL_CUP_REMINDER_DATE: str = "2026-09-15"
+FALL_CUP_CONFIGURED: bool = True  # set False to re-arm the reminder for the next cup season
+
+
+def fall_cup_reminder_due(today: date | None = None) -> bool:
+    """Whether the cup-season configuration reminder should redden runs.
+
+    False before ``FALL_CUP_REMINDER_DATE``, and always False while
+    ``FALL_CUP_CONFIGURED`` is True — which it is, so this returns False on every date
+    until somebody re-arms it. ``today`` defaults to the system clock read at CALL time,
+    same contract as ``credit_alerts_active`` below: tests inject a fixed date, and a
+    long-lived process crosses the date without a redeploy.
+    """
+    if FALL_CUP_CONFIGURED:
+        return False
+    # Local calendar day is deliberate on an operator-facing dated lever, and prod
+    # (UTC runners) sees no difference — same rationale as credit_alerts_active.
+    return (today or date.today()) >= date.fromisoformat(FALL_CUP_REMINDER_DATE)  # noqa: DTZ011  # see comment above
+
+
+def check_fall_cup_reminder(logger: logging.Logger | None = None, today: date | None = None) -> bool:
+    """Log the loud FALL_CUP_REMINDER line when due; return whether it fired.
+
+    Dormant while ``FALL_CUP_CONFIGURED`` is True (the shipped state since 2026-09-03).
+    When re-armed, the caller (cli.main) holds the returned bool and exits non-zero at end
+    of run, the same shape as the credit-floor path: forecasting and publishing complete
+    normally, and the red exit is purely the reminder signal.
+    """
+    if not fall_cup_reminder_due(today):
+        return False
+    log = logger or logging.getLogger(__name__)
+    log.error(
+        f"FALL_CUP_REMINDER: the Metaculus Cup season constants look unconfigured. "
+        f"METACULUS_CUP_ID still points at {FALL_CUP_SLUG} — re-point it at the new season's "
+        f"DATED slug (there is no auto-resolving 'metaculus-cup' spelling left; Metaculus "
+        f"answers HTTP 400 for that one) and enable the 'Forecast on Metaculus Cup' workflow "
+        f"on GitHub. Flip FALL_CUP_CONFIGURED=True in constants.py to retire this reminder. "
+        f"This run will exit non-zero as the reminder signal."
+    )
+    return True
 
 
 # Load .env early so ASKNEWS_* values are read correctly at import time in local runs
@@ -233,27 +330,37 @@ ASKNEWS_BACKOFF_SECS: float = max(0.0, _float_env("ASKNEWS_BACKOFF_SECS", 2.0))
 ASKNEWS_WALL_TIMEOUT: int = 300
 
 # --- OpenRouter credit telemetry ---
-# End-of-run floor for the DONATED key's remaining balance (limit_remaining).
+# EARLY-WARNING floor for the DONATED key's remaining balance (limit_remaining).
 # Below this, cli.main logs a loud warning and exits non-zero AFTER all
-# forecasting/publishing completes — a reminder-to-refill signal, not an abort.
+# forecasting/publishing completes — a reminder to ask Metaculus for a top-up, not
+# an abort, and not a claim that the key is empty.
+#
+# Sizing: $100 is roughly 250 questions of runway at the measured $0.38-0.41 per
+# question. The lead time is the point — only Metaculus can refill this key, the
+# operator cannot — so the warning has to arrive while there is still time to ask.
+# It was $1.00 until 2026-09-03, which fired only once the key was already dry.
+#
 # The floor is meaningless for the personal key (no limit_remaining), so it is
 # only checked against the donated key. See metaculus_bot/credit_telemetry.py.
-OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 1.0)
+OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 100.0)
 
-# Dated suppression of the credit ALERTS (not the logs). The operator is funding
-# the rest of the season out of pocket, so an empty donated key is expected
-# rather than a defect, and the two paths that turn a credit shortfall into a
-# non-zero exit — the floor breach in cli.main and the credit-caused
-# donated->personal fallbacks folded into ``alertable`` — must not redden CI
-# until this date. The tournament closes on TOURNAMENT_END_DATE (2026-09-06);
-# alerting resumes a few days later so a stale suppression can't outlive the
-# season. Every CREDIT_* log line, including CREDIT_FLOOR_BREACH, keeps firing
-# throughout: only the exit status and the alertable arithmetic change.
+# Dated suppression of the credit ALERTS (not the logs). Before this date, the two
+# paths that turn a credit shortfall into a non-zero exit — the floor breach in
+# cli.main and the credit-caused donated->personal fallbacks folded into
+# ``alertable`` — do not redden CI. Every CREDIT_* log line, including
+# CREDIT_FLOOR_BREACH, keeps firing throughout: only the exit status and the
+# alertable arithmetic change.
+#
+# History: alerting was suppressed from 2026-07-26, when the donated key drained and
+# the operator started self-funding the season, until 2026-09-03, when Metaculus
+# granted $1,500 of credits (the key read $1,449 remaining of a $2,300 limit) and the
+# resume date was moved up from 2026-09-10 to that day. Re-arm a window by pushing
+# this date forward, either here or through the env override.
 #
 # Non-credit fallback causes (401 invalid/disabled key, 404 no-allowed-providers,
 # 429 rate limit, guardrail/data-policy) stay fully alertable — each of those is
 # real breakage, not an expected empty wallet.
-CREDIT_ALERT_RESUME_DATE: date = _date_env("OPENROUTER_CREDIT_ALERT_RESUME_DATE", date(2026, 9, 10))
+CREDIT_ALERT_RESUME_DATE: date = _date_env("OPENROUTER_CREDIT_ALERT_RESUME_DATE", date(2026, 9, 3))
 
 
 def credit_alerts_active(today: date | None = None) -> bool:
@@ -308,6 +415,57 @@ def provider_degradation_alerts_active(venue: str, today: date | None = None) ->
 # See scratch_docs_and_planning/atlas_inspired_improvements.md Workstream B.
 BINARY_PROB_MIN: float = 0.02
 BINARY_PROB_MAX: float = 0.98
+
+# The "extreme band" on a binary probability: a member call at or past either edge.
+# Nothing here clamps or gates anything — the band only decides which per-member
+# EXTREME_CALL telemetry lines get logged (metaculus_bot/extreme_call.py), so that
+# the lone-versus-accompanied extreme split is a query instead of a hand
+# reconstruction from parsed comments every residual round. Membership is inclusive
+# at both edges.
+#
+# The clamp a single-survivor binary publish goes through is DEFINED as these two
+# constants: THIN_PUBLISH_BINARY_FLOOR / THIN_PUBLISH_BINARY_CEIL in this same section
+# alias them rather than restating the literals, so the telemetry that measures the
+# exposure and the clamp that prices it cannot drift apart. Retuning the band here
+# retunes both, which is the intent — retune them together or not at all.
+# Evidence for the 0.05/0.95 edges:
+# scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 ("The mechanism")
+# — 9 lone extreme binary calls, 4 right, at a mean stated confidence of 0.972.
+EXTREME_CALL_LOW: float = 0.05
+EXTREME_CALL_HIGH: float = 0.95
+
+# Floor on the PUBLISHED binary probability when exactly ONE forecaster survived
+# (apply_thin_publish_floor in post_processing.py, wired in
+# AggregationPipeline._base_combine on the "single_forecaster" skip reason).
+#
+# Mechanism, not a fit: the median of an intact ensemble absorbs a member's extreme
+# tail call, and median-of-1 supplies no such variance reduction, so the range the
+# published value may occupy is NARROWED in exactly that state to price the missing
+# aggregation — [0.05, 0.95] sits strictly inside the per-model clamp
+# [BINARY_PROB_MIN, BINARY_PROB_MAX] = [0.02, 0.98] the member already passed. It fires
+# ONLY on a single-survivor publish — a multi-member median publishes as is, even one
+# below 0.05 — and never touches the per-model record (the survivor's declared value
+# stays on the comment's summary bullet; only the published aggregate moves).
+#
+# Evidence, with its honest caveat: the whole measured benefit is ONE question. q44874
+# published gemini's lone 0.03 on a YES resolution and took -105.27 spot peer; at
+# [0.05, 0.95] it is +51.08 with zero measured cost on the other three archived solo
+# binaries (one win, three exact zeros — n=4, one non-zero row). The value 0.05 is
+# informed by that question; 0.07 / 0.10 buy more on 44874 but start taxing 44870 and
+# 44873, which were right. Bounded downside: publishing 5% where a correct sub-5% call
+# would have scored costs ~-3.11 spot peer per instance, against a -105 tail.
+# Always-on and global variants were priced and REJECTED (always-on never improves the
+# published pre-flip ensemble; global [0.05, 0.95] over 408 binaries is -52.02, 50
+# losses to 1 win) — do not widen the trigger. Receipt:
+# scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 (clamp-variant table
+# + "A synthesis correction the individual cuts miss") and §3 option "1=".
+#
+# The edges REUSE the extreme-band constants above by aliasing them, so there is one
+# definition of "extreme" serving both the telemetry and the clamp and no pair of
+# literals to fall out of step. Retune EXTREME_CALL_LOW / EXTREME_CALL_HIGH to move
+# both, or neither.
+THIN_PUBLISH_BINARY_FLOOR: float = EXTREME_CALL_LOW
+THIN_PUBLISH_BINARY_CEIL: float = EXTREME_CALL_HIGH
 
 # Multiple-choice prediction clamp. Aligned to forecasting-tools 0.2.92's
 # PredictedOptionList validator, which unconditionally clamps every option into
@@ -440,8 +598,91 @@ RESOLUTION_SOURCE_PER_URL_MAX_CHARS: int = 6000  # elbow of full-extraction dist
 RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = (
     18000  # headroom so per-URL cap binds (max observed section ~11.1k at 6k/URL); ~4.5k tokens worst case
 )
+# The smallest share of the total a success may render into; under it the section is omitted and
+# counted in the "[N additional source(s) omitted]" line instead. Below the truncation marker's own
+# length `_truncate_with_marker` degrades to a bare slice, so a rescued section landing on a
+# remainder shorter than its provenance lead rendered that lead cut mid-word with no marker
+# (`[Archived copy from the Wayback M`) while the route caveat above it promised a complete
+# disclosure. Sized above the longest lead, the derived_api other-page lead at about 260 chars.
+# Reachable on prod constants: 6000 + 6000 + 5900 direct pages ahead of a rescued fourth.
+RESOLUTION_SOURCE_MIN_SECTION_CHARS: int = 300
 RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
 RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
+# An extraction at or above the JS-wall floor can still be pure page chrome: a tab list,
+# a region selector, a feedback-form blurb, an "about the data" note. Below this many
+# extracted chars a 200-OK page is withheld as `no_resolving_content` rather than rendered
+# as grading evidence, whatever became of the content — `status_reason` records whether a
+# routeless data embed was named (`embed_shell`, Infogram / Flourish / Tableau, see
+# `unreadable_data_embed_providers`) or not (`thin_page`). The floor was gated on a named
+# provider when it shipped for qids 44554/44556, which withheld one shape of chrome and
+# published the other: the 2026-09-01 round found five content-free `success` renders and
+# not one of them named a provider.
+# Calibrated on the 89 archived resolution_source records, re-checked for the ungated rule
+# 2026-09-02: of 68 cited successes, 8 sit under 400 chars and all 8 are chrome — region
+# selectors (data.wastewaterscan.org, 127, twice), Kazakh region names (election.gov.kz,
+# 385), AP org boilerplate (355), an ABS release-date list with no figure (344), a tracker's
+# "about the data" note (262), a feedback-form blurb (camara.leg.br, 157), a
+# clinicaltrials.gov data-element pointer (111) — and the SHORTEST archived extraction that
+# actually carries the resolving content is 401 (myfloridaelections.com's election-date
+# table). So this is the observed elbow, and it stays deliberately below it: a page above
+# the floor keeps its text (plus the embed disclosure where one applies), because
+# withholding a terse-but-real data table costs more than leaving one shell visible.
+# UNMOVED but re-read 2026-09-03, when the extractor policy changed under it. That census was
+# measured on the precision extractor alone. The floor is now applied twice per page
+# (`resolution_source._extract_page_text`): first to the default (recall) extraction, which
+# only ever LENGTHENS a text relative to precision, so on that pass the floor binds on strictly
+# fewer pages — live over 149 archived HTML URLs, 10 crossed it upward and 9 of them carry the
+# resolving content (funding tables, two Yahoo history tables, a market's own resolution
+# rules); the tenth is a JS flight board whose column headers plus disclaimer total 644, i.e.
+# one shell published where one was withheld. Then, when the default text clears the floor on
+# chrome alone (the line-shape metric below), to the `favor_precision` re-extraction of the same
+# bytes, which is the extractor the census was fitted on, so a precision text under the floor
+# is withheld as `thin_page` exactly as before. Left where it is: the elbow it was fitted to is
+# a property of what chrome weighs, not of the extractor, and refitting it against a
+# recall-era census is its own measurement.
+RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS: int = 400
+# The line-shape check on an extraction that clears the floor (`resolution_source.content_share`):
+# navigation-tree chrome tops out at 0.329 (kasa homepage, ambiguous) and 0.239 (strictly labelled, the
+# manifold sidebar); the thinnest labelled content is 0.431 (wastewaterscan dashboard). Calibrated
+# 2026-09-03 on 118 bodies, receipt `scratch/fetch_ladder_2026-09-03/chrome_calibration.md`.
+RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS: int = 60  # a non-table line at least this long is content, shorter is chrome
+RESOLUTION_SOURCE_CONTENT_SHARE_MIN: float = 0.38
+# Wall budget under which the `favor_precision` re-extraction is skipped and the default text is
+# withheld as it would be had that pass failed (`resolution_source._extract_page_text`). The pass
+# is CPU, runs after the body is already in hand — on the rendered rung after the browser has
+# spent the whole remaining budget — and costs a little more than the default pass did on the
+# same bytes: on a synthetic div-soup dashboard DOM on the operator's laptop (2026-09-04) the
+# precision pass took 1.5 s at 1 MiB, 3.2 s at 2 MiB and 9.7 s at 5 MiB (nested list menus run
+# 5-10x cheaper; the second review pass measured 42 s at 5.2 MiB on a heavier synthetic tree),
+# against the 2 s margin the rung leaves the provider's wall. Sized so a body around 1-2 MiB
+# still gets its second pass on a slower GitHub runner; a bigger body near the wall is withheld
+# rather than published, and the real lever for those is `RENDERED_DOM_MAX_CHARS` (FUTURE.md).
+# Read against the wall remaining AFTER the default pass, so that pass's own cost counts.
+RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S: float = 5.0
+# --- Inline chart configs (Highcharts), read straight out of the page we already hold ---
+# qid 43949: the resolving IOM page fetched 200 and extracted ~80k chars of incident rows
+# and prose carrying none of the resolving figures, because the annual series lives in
+# `<div class="charts-highchart" data-chart="{...}">`. `research/resolution_chart_data.py`
+# unescapes and json.loads that config — zero LLM calls, no second request. Charts are read
+# on EVERY fetched HTML page, not only thin ones, because that page's prose was far above
+# the shell floor and a thin-only gate would miss the record the rung exists for.
+RESOLUTION_SOURCE_CHART_MAX_CHARTS: int = (
+    3  # the resolving chart is ~first in document order (IOM page carries 5), same assumption the Datawrapper hop makes
+)
+RESOLUTION_SOURCE_CHART_MAX_SERIES: int = 4  # IOM's widest chart is 3 series (Undetermined / Female / Male)
+# Points per series, kept from the END (the resolving value is the newest one). 16 keeps a
+# full annual series intact — IOM's is 13 points, 2014..2026 — while bounding its 149-point
+# monthly sibling to roughly the last year and a half.
+RESOLUTION_SOURCE_CHART_MAX_POINTS: int = 16
+# Hard cap on the whole rendered block, budgeted out of (never added on top of) the 6,000-char
+# per-URL page cap, so chart data can never evict more than a third of a cited page's text.
+# Measured: the IOM page's three readable charts render in ~700 chars together.
+RESOLUTION_SOURCE_CHART_BLOCK_MAX_CHARS: int = 2000
+# Configs examined per page before the scan stops, and the per-config char bound (which also
+# bounds the brace scan for the inline-script form). Both exist so a page with hundreds of
+# `data-chart` attributes, or one unclosed brace, costs a fixed amount of work.
+RESOLUTION_SOURCE_CHART_MAX_CANDIDATES: int = 20
+RESOLUTION_SOURCE_CHART_MAX_CONFIG_CHARS: int = 200_000
 # --- Datawrapper second hop (Tier 2) ---
 # Poll-tracker pages lock their resolving daily series inside Datawrapper
 # iframes that trafilatura drops (qids 44858/44841). The hop fetches the
@@ -470,6 +711,147 @@ RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S: float = 2.0
 # page text the section exists to serve.
 RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS: int = 3000
 RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS: float = 30.0  # freshness bound on the dataset's Last-Modified vs fetch time. Live trackers republish at least daily; the stale-route failure class this guards against served 5-14 MONTH old snapshots as HTTP 200 (2026-08-24 verifications). Older/undatable data is withheld (stale_data), never served as live.
+# How far ahead of our clock a timestamp a host or the archive gives us may sit before the
+# freshness guards treat it as unusable rather than as freshest-possible. ONE constant for both
+# guards — the Datawrapper dataset's `Last-Modified` and the Wayback rung's capture stamp —
+# because it is one judgment: tolerate ordinary CDN/host clock skew and nothing more, since past
+# that a future date means a broken clock or a misparse, and each stamp authorizes a lead that
+# asserts a date to forecasters. Unlike the two 30-day age bounds above and below, which are
+# per-artifact calls about how fast the underlying data moves, this one is about our own clock.
+RESOLUTION_SOURCE_CLOCK_SKEW_TOLERANCE: timedelta = timedelta(hours=6)
+
+# --- Local document text (PDFs read with pypdf, `research/document_text.py`) ---
+# Measured 2026-09-03: local pypdf pulled 833,450 chars out of a 6.7 MB 220-page PDF in
+# 5.3 s and the passage the research driver was looking for was in it, while the paid
+# Gemini url_context read of the same file returned nothing. So a PDF we already hold is
+# extracted and passage-selected locally, and a model call is spent only on a document we
+# cannot read at all.
+DOCUMENT_TEXT_MAX_PAGES: int = 400  # ~2x the 220-page document behind the measurement, so a normal government report reads whole while a 4,000-page appendix dump stays bounded
+# ~4x the measured 5.3 s for 220 pages; matches RESOLUTION_SOURCE_HTTP_TIMEOUT, so parsing a
+# document costs no more of the research phase than fetching it did. This is a BETWEEN-PAGES
+# CHECKPOINT, not an elapsed bound: `_read_pages` tests it only after each page returns, so a
+# single page can overrun it and no page is ever interrupted mid-parse (the extraction runs in a
+# thread that cannot be cancelled). What bounds one page is the decoded-bytes-per-stream cap set
+# at import in `research/document_text.py`, which turns a page whose content stream decompresses
+# past the cap into that page's `''` rather than an unbounded parse. The clock also starts late:
+# `extract_pdf_text` reads the declared page count and walks the whole bookmark outline before
+# `_read_pages` computes any deadline, and this budget covers neither (measured ceiling about 16 s
+# for a body built to maximize both, so the real worst case is that prologue plus this budget plus
+# one page; FUTURE.md, "The PDF parse overruns `max_seconds`").
+DOCUMENT_TEXT_MAX_SECONDS: float = 20.0
+DOCUMENT_TEXT_PDF_MAX_BYTES: int = (
+    40 * 1024 * 1024
+)  # ~6x the measured 6.7 MB file; above this the parse is not worth a research phase, and the bytes are refused before pypdf allocates
+DOCUMENT_DIGEST_TOP_K: int = 6  # passages per document: 6 x DOCUMENT_DIGEST_WINDOW_CHARS is ~3.6k chars (~900 tokens), the same order as one cited page under RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+DOCUMENT_DIGEST_WINDOW_CHARS: int = (
+    600  # ~1 paragraph of a report; mirrored as document_text.DEFAULT_WINDOW_CHARS, pinned equal by a test
+)
+# A document we ALREADY hold whose estimated token count (chars / 4) exceeds this is never
+# sent to a paid url_context read — the digest serves it instead. The nine archived documents
+# above this bound carried 67% of all reader tokens, and the 833k-char case above is the shape
+# that spends most: the paid read of it returned nothing, so the spend bought a null answer.
+URL_CONTEXT_SIZE_GATE_TOKENS: int = 100_000
+
+# --- Resolution-source escalation rungs (free ones: meta-refresh hop, local PDF read) ---
+# Every rung runs INSIDE the unchanged 45 s provider wall, and the outer `asyncio.wait_for`
+# discards every page that already fetched when it fires, so each rung is self-bounding on
+# the same pattern as the Datawrapper hop: wall minus elapsed minus a margin, skipped below
+# a floor, degrading to whatever the direct route already got.
+RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S: float = 2.0  # margin left to the outer wait_for so the rung returns first (the Datawrapper hop keeps its own historically-named twin)
+RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S: float = (
+    3.0  # the hop is one more page GET; same "0-2 s typical" probe basis as the HTTP timeout
+)
+# Floor for the LOCAL pypdf parse, which spends CPU rather than network. It doubles as the
+# minimum `max_seconds` handed to `extract_pdf_text` (the budget is capped at
+# DOCUMENT_TEXT_MAX_SECONDS above it), and 3 s is ~60% of the measured 5.3 s for 220 pages,
+# so a short document still reads whole and a long one comes back partial-but-labelled
+# rather than not at all.
+RESOLUTION_SOURCE_PDF_MIN_BUDGET_S: float = 3.0
+
+# --- Resolution-source escalation rungs that need a browser -------------------
+# The rendered rung launches headless Chromium (`research/rendered_fetch.py`, shared with the
+# gap-fill v2 fetch ladder and its process-global Semaphore(2) launch cap). Two reasons its
+# floor is far above the one-request rungs' 3 s: a launch plus a DOM-ready navigation measured
+# 3-8 s across the 2026-09-03 replay corpus even on pages that rendered cleanly, and the launch
+# slot is contended process-wide, so a question with no budget left would take a slot a sibling
+# question could still land a page with. This is the PRE-gate floor, read before the render
+# queues on the per-host gate and the launch cap. The transport's own POST-gate need is higher:
+# a 5 s navigation (RENDER_MIN_GOTO_MS), the 2 s settle plus the 5 s DOM-read bound
+# (RENDER_POST_GOTO_TAIL_MS, reserved so a goto that runs its budget out can still be salvaged),
+# and the 3 s exit reserve the rung subtracts from the deadline it hands over
+# (RENDER_EXIT_RESERVE_MS: the shared teardown bound plus a second for the launch and the driver
+# stop), 15 s in all. The floor deliberately sits below that: a render admitted with 12-15 s
+# declines at the gates with an honest `wall_budget` skip rather than launching, and raising the
+# floor to 15 s would make the pre-gate check truthful at the cost of that band's reach, which is
+# the operator's call. Left at 12 s pending it.
+RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S: float = 12.0
+# Ceiling on the rendered DOM, the browser rung's counterpart to RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
+# and sized to it. `page.content()` is a string, so this is a CHARACTER count taken before anything
+# copies the DOM: the Tier-1 caller encodes it, decodes it back, ARIA-rewrites it and hands
+# trafilatura a tree several times its size, all while the 100-300 MB browser is still resident,
+# so an 8 MB dashboard DOM was ~60-110 MB per in-flight classification. A DOM over the ceiling is
+# declined with the transport's own `RenderDomOverCeiling` (the rung's `render_dom_too_large`
+# skip, kept apart from a missing browser); the harvested JSON is declined with it.
+RENDERED_DOM_MAX_CHARS: int = RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
+# The derived-feed GET is one request against a JSON endpoint an earlier render on the same host
+# already found, so its floor is the meta-refresh hop's, on the same "0-2 s typical" probe basis
+# as the HTTP timeout — not the browser floor above. It has its own name because the two rungs
+# are tuned independently: this one gets cheaper as a run goes on, the browser never does.
+RESOLUTION_SOURCE_DERIVED_API_MIN_BUDGET_S: float = 3.0
+# --- Wayback Machine snapshots ---
+# The archive is the one free route whose egress is not ours, which is the whole reason it earns
+# a rung (measured 2026-09-03: identical client, identical headers, 403 from a GitHub Actions
+# runner and 200 from a residential address on the same three government hosts).
+#
+# Age bound. A snapshot is admissible as primary grading evidence only with its age disclosed
+# (operator decision, 2026-09-03) and only inside this bound. 30 days matches the Datawrapper
+# freshness guard's, and it is the same JUDGMENT rather than a measurement: it was calibrated on
+# daily-republishing trackers, so a question resolving on a weekly series arguably wants tighter.
+# Deliberately its own constant, not an alias of the Datawrapper bound: these are two independent
+# calls about two different artifacts and tying them would make one impossible to tune.
+RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS: float = 30.0
+# Floor for the snapshot fetch, which is one GET plus one redirect hop. Above the one-request
+# rungs' 3 s because the archive is measurably slower than an ordinary host — the verification
+# probe's own response carried `LoadShardBlock;dur=1048ms` in its server-timing header, and the
+# redirect means two round trips through that.
+RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S: float = 8.0
+# Snapshot attempts per QUESTION. Every snapshot shares netloc `web.archive.org`, so Tier-1's
+# per-host Semaphore(1) serializes them: N cited URLs would queue into N sequential archive
+# fetches behind one gate, inside a 45 s wall that discards every page already fetched when it
+# fires. Two is the documented trade — a question whose first two cited sources are both dead
+# gets both tried, and a question citing five gets its budget protected.
+RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS: int = 2
+# --- The one PAID rung: Gemini url_context, last and behind its own flag ---
+# It reaches hosts our client cannot (prod run 33775800806 read bls.gov and sagaftra.org PDFs
+# that our own fetch 403'd) because Gemini dials from Google's address, not ours. It is also the
+# only rung here that spends money and the only one that is model-MEDIATED — what comes back is
+# an answer about the page, not the page — so it defaults OFF in code and is turned on explicitly
+# per workflow yaml (on in every bot workflow since 2026-09-04, by the operator's decision).
+RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV: str = "RESOLUTION_SOURCE_URL_CONTEXT_ENABLED"
+# Floor for the read. Well above the free rungs' because a url_context call is a model
+# round-trip that also fetches: the v2 reader's measured budget is tens of seconds, and below
+# 15 s of remaining wall this cannot land an answer before the provider's outer wait_for
+# discards every page the question already fetched.
+RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S: float = 15.0
+# ONE attempt, against gap-fill v2's two. The retry there exists because a 503 UNAVAILABLE
+# returns in milliseconds and leaves most of a 55 s budget for a second try; inside a 45 s
+# provider wall shared with every other cited URL there is no such room, and a second attempt
+# would spend the budget that renders the pages already fetched.
+RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS: int = 1
+# PAID READS per QUESTION, the analogue of the Wayback cap and a different quantity from the SDK
+# retry count above: `_ATTEMPTS` is how many billed requests one read may dispatch, this is how
+# many url_context READS a single question may pay for across its cited URLs. Without it a
+# question citing several dead sources pays once per source inside the provider wall; two bounds
+# how much a single question can spend when the flag is on. Its own constant so the two paid
+# knobs tune independently.
+RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS: int = 2
+# How much of a WITHHELD url_context reply reaches the run log. A read we paid for and then
+# discarded is otherwise unauditable: the `not_addressed` sentinel means the model says the page
+# does not discuss the ask, and nothing on the record distinguishes that from the model dutifully
+# reading a bot-challenge page it was served instead — the question the smoke run could not answer
+# for sagaftra.org. A few hundred characters is enough to tell those apart and short enough that
+# the discarded answer cannot flood a log or read as evidence.
+RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS: int = 300
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
@@ -494,10 +876,18 @@ GOOGLE_API_KEY_ENV: str = "GOOGLE_API_KEY"
 # DONATED_KEY_BLOCKED_GOOGLE_MODELS blocklist (no donated attempt, no 429) pending
 # the Metaculus-side BYOK fix — see TODO(gemini-3.1-pro-donated) in fallback_openrouter.
 GEMINI_USE_DONATED_OPENROUTER_KEY_ENV: str = "GEMINI_USE_DONATED_OPENROUTER_KEY"
-# Gemini 3 Flash preview model with grounding support. Requires billing enabled
-# on the Google AI Studio project to unlock; falls back to gemini-2.5-flash on
-# free tier if needed. Override via GEMINI_SEARCH_MODEL env var.
-GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3-flash-preview"
+# Grounded-search model, verified live on the native google-genai SDK 2026-09-03
+# (scripts/probes/gemini_verify.py, three calls): the response reported
+# model_version gemini-3.8-flash, the google_search tool returned grounding chunks
+# with a web search query, thinking_level was accepted, and url_context retrieved a
+# robots-allowed host. Grounding still needs billing enabled on the Google AI Studio
+# project. Price (ai.google.dev, read 2026-09-03): $0.75 in / $3.75 out per 1M through
+# 2026-12-31, then $1.50 / $7.50 — against $0.50 / $3.00 for the gemini-3-flash-preview
+# this replaced, which is now labelled a legacy preview. Override via the
+# GEMINI_SEARCH_MODEL env var; the old note that a free-tier project can point that at
+# gemini-2.5-flash holds only with the thinking_level caveat below read first, since the
+# 2.5 line takes a thinking_budget and would reject the request as it is built today.
+GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3.8-flash"
 # No temperature / top_p / max_tokens overrides — use google-genai SDK defaults.
 # Gemini 3 Flash is a thinking model; Google's defaults are tuned for it and
 # capping either caused silent truncations in the past.
@@ -508,6 +898,47 @@ GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3-flash-preview"
 # Gap-fill runs overlapped with forecaster LLM calls, so higher timeout adds
 # zero wall-clock cost. Observed p99 of non-AFC calls ≈ 52s.
 GEMINI_SEARCH_TIMEOUT: int = 360
+# Thinking level for the grounded-search call, set EXPLICITLY (operator decision
+# 2026-09-03) rather than left at the model's default, which for
+# gemini-3-flash-preview is HIGH: 71% of the grounded-search output tokens measured
+# in the 2026-09 spend reconstruction were thinking tokens, and this is a retrieval
+# + summarise task rather than a reasoning one. Only the LEVEL is set — the
+# no-max_tokens rule above still holds, because capping output on a thinking model
+# is what caused the silent truncations. Re-pointing GEMINI_SEARCH_MODEL at the 2.5
+# line therefore also means editing the gemini_thinking_config(...) call in
+# research/gemini_search.py to send a thinking_budget (1-24,576 on 2.5 Flash) or no
+# thinking_config at all; there is deliberately no model-family gate in code.
+GEMINI_SEARCH_THINKING_LEVEL: str = "medium"
+# Client-side PER-ATTEMPT HTTP timeout (ms) and attempt count (including the first)
+# for the grounded-search client. The SDK retries nothing by default, so a fast
+# transient — the 503 UNAVAILABLE that killed two production calls — used to lose the
+# whole provider; one retry recovers it.
+#
+# Worst-case arithmetic. The hard bound is UNCHANGED: the outer
+# ``asyncio.wait_for(..., GEMINI_SEARCH_TIMEOUT)`` in ``research/gemini_search.py``
+# still cancels the whole call at 360s, and it genuinely can (an async coroutine,
+# unlike read_document's thread). So the nominal product 350 + <=2 (one jittered retry
+# sleep) + 350 never elapses: a first attempt that HANGS eats the window and the outer
+# wait_for fires exactly as it does today, while a retry only completes when the first
+# attempt failed FAST, which is the recovery case this exists for.
+#
+# Why the per-attempt cap is not sized so the PRODUCT fits under 360s: that would need
+# <=176s per attempt, and the comment above records legitimate AFC chains at 150-200s
+# ("180s was too tight — observed timeouts"). Shrinking the per-attempt allowance would
+# newly fail calls that succeed today, which is the one thing a timeout change here
+# must not do. 350s instead sits just under the outer deadline, so nothing a single
+# attempt can do today is cut short.
+GEMINI_SEARCH_HTTP_TIMEOUT_MS: int = 350_000
+GEMINI_SEARCH_HTTP_ATTEMPTS: int = 2
+# Same two settings for gap-fill v2's read_document backend, whose thinking level is a
+# tier lower (operator decision 2026-09-03): quoting a fetched document back is the
+# least reasoning-heavy of the Gemini calls. The reader's per-attempt TIMEOUT is not a
+# constant here because it is DERIVED from the total in-thread budget
+# (``_READ_DOCUMENT_HTTP_TIMEOUT_MS`` in ``research/agentic/tool_backends.py``, where the
+# arithmetic lives): that call runs under ``asyncio.to_thread``, so its outer wait_for
+# cannot cancel it and the retry has to fit INSIDE today's budget rather than beside it.
+GAP_FILL_V2_READER_THINKING_LEVEL: str = "low"
+GAP_FILL_V2_READER_HTTP_ATTEMPTS: int = 2
 
 # --- Second-pass gap-fill ---
 # After first-pass research completes, a cheap analyzer identifies up to
@@ -584,15 +1015,19 @@ GAP_FILL_V2_ENABLED_ENV: str = "GAP_FILL_V2_ENABLED"
 # OpenRouter key.
 GAP_FILL_V2_DRIVER_MODEL: str = os.getenv("GAP_FILL_V2_DRIVER_MODEL") or "openai/gpt-5.6-terra"
 GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "low"
-# read_document backend model on the NATIVE google-genai path (tools.py
-# _run_document_read_sync). CAUTION: this id is UNVERIFIED on the native
-# AI Studio API until the paid smoke test — the repo's verified-model notes
-# ("gemini-3.5-flash works") all refer to the OpenRouter slug route, which maps
-# ids differently; the only id verified on the native SDK here is
-# GEMINI_SEARCH_DEFAULT_MODEL ("gemini-3-flash-preview"). A wrong id soft-fails
-# read_document (model-not-found -> error outcome), silently disabling the
-# directed-reading rung.
-GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.5-flash"
+# read_document backend model on the NATIVE google-genai path
+# (research/agentic/tool_backends.py _run_document_read_sync). Verified live on that
+# SDK 2026-09-03 (scripts/probes/gemini_verify.py): url_context retrieval succeeded on
+# a robots-allowed host and thinking_level was accepted, so the old "this id is
+# UNVERIFIED on the native AI Studio API" caution is retired. It is the same id the
+# grounded-search provider runs, at $0.75 in / $3.75 out per 1M through 2026-12-31 then
+# $1.50 / $7.50 (ai.google.dev, read 2026-09-03), against $1.50 / $9.00 for the
+# gemini-3.5-flash it replaces. A wrong id still soft-fails read_document
+# (model-not-found -> error outcome), silently disabling the directed-reading rung.
+# url_context is also robots-gated, which is a separate cause of the same symptom: the
+# same probe got URL_RETRIEVAL_STATUS_ERROR on a host whose robots.txt disallows
+# Google-Extended, so a refusal can be the host's policy rather than a bad id.
+GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.8-flash"
 # Parallel tool calls each count against the cap; steps are where latency
 # lives, so batching is encouraged rather than rationed. Raised with the W2
 # ambition floor (2026-07-21): v2 runs 41-60s of the GAP_FILL_V2_WALL_DEADLINE
@@ -643,6 +1078,30 @@ FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
 #     windows), ~12 bars of margin where the old 372 measured margin EXACTLY zero.
 FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 390
 FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
+# Variance-ratio screen for a vendor-noise-dominated daily series (q44797: USD/SZL's
+# 17.8% "volatility" was 79% quote noise on a pegged cross, and all six forecasters sized
+# their intervals off it). VR(q) near 1 is a random walk; well below 1 means each day's
+# move is largely reversed the next, which is what a thin quote on a fixed cross looks
+# like and what cancels over multi-day windows.
+#   - LAG 5 (one trading week) because it is the horizon where the two cases separate: the
+#     44797 verification (§11) measured VR(5) 0.472 on the noisy series against 0.740 on
+#     the clean anchor, while at VR(10) the CLEAN series read 0.208 — no separation left.
+#   - FLOOR 0.6 sits between those two, and is calibrated against seeded fixtures in
+#     tests/test_timeseries_anchor_provider.py (TestVarianceRatio) rather than against the
+#     receipt's own numbers, which came from a differently-parameterised estimator.
+#   - MIN_RETURNS 120 because the null standard error of VR(5) is ~sqrt(4.8/n): ~0.20 at
+#     n=120 and ~0.40 at n=30, so the 30-row vol window cannot carry this statistic. The
+#     provider's own FINANCIAL_YFINANCE_LOOKBACK_DAYS window holds ~265 daily bars, so a
+#     normal fetch clears the floor with room; a short/gappy one gets no flag at all.
+FINANCIAL_VARIANCE_RATIO_LAG: int = 5
+FINANCIAL_VARIANCE_RATIO_FLOOR: float = 0.6
+FINANCIAL_VARIANCE_RATIO_MIN_RETURNS: int = 120
+# How many recent FRED prints the first-release-vs-current-vintage table covers. Revising
+# macro series resolve on the FIRST print (q44944 resolved on first-release Case-Shiller)
+# while the levels rendered beside it are today's revised vintage, so the gap between the
+# two is a forecastable, signed quantity. Four prints is enough to read a revision
+# direction on a monthly series without turning the block into a table nobody reads.
+FINANCIAL_FRED_VINTAGE_PRINTS: int = 4
 # Cap on how many tickers + FRED series one question may fetch. The identifier list is
 # whatever an LLM classifier named plus whatever URL extraction found, and it was
 # previously unbounded: each identifier gets its own asyncio.to_thread, all of them

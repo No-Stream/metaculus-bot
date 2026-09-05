@@ -33,11 +33,25 @@ stale archive silently drops recent questions and receipts. Non-negotiable first
   workflow yamls + a cheap API probe. Reuse verified-complete baselines from prior rounds
   (each round's README records which pulls are safe to reuse and why).
 - Era-tag every record on `bot_comment_created_at` (submission time) against the era map.
-  Tag exclusion cohorts: `known_bug` (43746/43747), `degraded_run` (dry-key 44870–44877),
-  `partial_degraded` (44841, 44856, 44912), plus anything new. Excluded from headline
-  aggregates, reported separately — never silently dropped.
+  Tag exclusion cohorts by IMPORTING the constants, never by retyping the ids:
+  `KNOWN_BUG_QIDS`, `DEGRADED_RUN_QIDS` (dry-key 1-of-3), `PARTIAL_DEGRADED_QIDS` (2-of-3)
+  from `metaculus_bot.performance_analysis` — the same sets the `known_bug` /
+  `degraded_run` / `partial_degraded` `--exclude-qids` shorthands expand to. Three rounds
+  hardcoded private copies of the degraded ids before the constants existed, and the
+  known-bug copies have drifted from the canonical set at least once. Excluded from
+  headline aggregates, reported separately — never silently dropped.
 - Diff vs prior round (`new_since_prior.json`): the new cohort is what the round is about.
-- Spot-check re-pull stability (a handful of prior peer scores must reproduce).
+- Diff the prior round's records at the VALUE level, not just by presence — pass
+  `--prior <prior dataset>` to the `performance_analysis` CLI, or call
+  `diff_platform_rescores(prior_records, new_records)`
+  (`metaculus_bot.performance_analysis.rescore_diff`). Metaculus re-resolves in place with no
+  timestamp moving: it edited q44798 from 80 to 82 and flipped that record's spot peer from
+  +5.41 to −5.42 while `resolution_set_time` still read a stamp preceding the pull that saw
+  80, so the 2026-08-31 round's tables for it went stale silently. Anything the diff tags
+  `platform_rescored` must be re-read before it is quoted, and the prior round's document
+  corrected. Read the tag as a ternary: None is "no prior record, never compared", only
+  False is "compared, nothing moved".
+- Spot-check re-pull stability (a handful of prior spot-peer scores must reproduce).
 
 ## Phase 3 — Automated dimensions (era-bucketed, parallel)
 
@@ -55,6 +69,11 @@ The standing set, each reconciling explicitly with the prior round's same-named 
 - ghosts + guards (score_ghosts, structured-JSON presence)
 - cross-tournament / category
 - consensus-miss mode statistics (see Phase 4 rules)
+- clip-threshold sweep (`performance_analysis.clip_threshold`; STRICT run `--exclude-qids
+  known_bug,degraded_run,partial_degraded` plus one unfiltered): each candidate binary/MC floor in spot
+  peer over `all` / `last_N` / `last_90d` / `current_clamp_regime` / `triple_era` and the disjoint `era_*`
+  slices; a floor fitted on older records must carry into the window (a fit that moves nothing is
+  vacuous, not a pass); a candidate looser than the in-force clamp is CENSORED, read `cen` / `cen_m` bounds
 
 ## Phase 4 — Per-question tracing (the centerpiece; often the highest-value output)
 
@@ -63,7 +82,9 @@ operator's standing directive (2026-08-24): human-style question-by-question tra
 frequently the most valuable part of a residual round — treat it as a first-class phase,
 not an optional garnish.
 
-1. **Rank.** Rolling-window miss ranking (peer score, all types) → `MISS_RANKING.md`.
+1. **Rank.** Rolling-window miss ranking (SPOT peer score, all types) → `MISS_RANKING.md`.
+   `audit.select_cohort` already ranks on spot and logs `PLATFORM_RANKING_SOURCE`; a WARN
+   there means some record fell back to coverage-scaled peer.
 2. **Select.** All material new misses, plus **good-call controls** (3–5). Controls are
    load-bearing, not decorative: the 2026-08-02 publish-vs-own-anchor metric only died
    because a hit-side baseline exposed it as outcome-tracking (63% miss vs 33% hit — and
@@ -112,6 +133,23 @@ after clustering (same-day resolutions share a world state).
 
 ## Standing gotchas (each has burned a round at least once)
 
+- **The tournament ranks on SPOT PEER; `peer_score` is `spot_peer_score × coverage`.**
+  Never rank, aggregate, or headline on the coverage-scaled figure — the bot submits once
+  and never revises, so its coverage is mostly submission timing, and the scaling flatters
+  misses (q44872: peer −15.0 vs spot peer −38.8). Read platform scores through
+  `performance_analysis/platform_scores.py`, which prefers spot and keeps peer-only records
+  in their own sort tier; report peer beside spot as a labelled secondary only.
+- **Price a counterfactual with `spot_peer_delta`, never by hand.** Metaculus halves the peer
+  score of a continuous question (numeric / discrete / date) and does not halve binary or
+  multiple choice, so moving only our own mass on the resolving outcome is worth
+  `100·ln(new/old)`, halved for continuous. Both conversions have already gone wrong in round
+  scripts, and both mistakes inflate the figure: `numeric_log_score` already carries the
+  halving (it returns `50·ln`), so doubling its difference to "convert to peer" over-prices
+  by 2× (the 2026-08-31 q45065 replay: +404 where the truth is +202), while
+  `binary_log_score` is log base 2, so quoting its difference as peer points over-prices by
+  1/ln2 ≈ 1.44 (thirteen 2026-09-01 dossier scripts). Correcting one of those archived binary
+  figures means multiplying it by ln 2 ≈ 0.693, not dividing. Import `spot_peer_delta` from
+  `metaculus_bot.performance_analysis.scoring`.
 - Merge dates, not authoring dates, for every era boundary.
 - `performance_analysis.id_mapping` for any marker↔record join; never "match either id".
 - Never pool research-archive record classes (`artifact` / `comment_backfill` /

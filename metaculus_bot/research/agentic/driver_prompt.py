@@ -21,6 +21,7 @@ from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQue
 
 from metaculus_bot.numeric.utils import bound_messages, nominal_bounds
 from metaculus_bot.prompts import (
+    MARKET_SNAPSHOT_SECTION_HEADER,
     _forecasting_window_str,
     binary_prompt,
     multiple_choice_prompt,
@@ -124,6 +125,12 @@ through the dry run, note:
     question looks fuzzy, the market's ACTUAL resolution terms (criteria,
     date) are a verify target — the panel weights markets heavily and
     discounts only by specifically named term mismatches.
+  - Any question that resolves off a live data source (a tracker, index,
+    average, counter, or dashboard): its CURRENT reading, together with the
+    date it was last updated, is a verify target, and it comes from the
+    instrument itself. Never make a target of what that source will read on
+    the resolution date — no source can answer that yet, and the budget is
+    spent for nothing.
 
   Common fill tells: the briefing uses vague quantifiers ("several", "high",
   "recently") where the question turns on a number or a date; or it shows no
@@ -239,8 +246,19 @@ SupportedQuestion = BinaryQuestion | MultipleChoiceQuestion | NumericQuestion
 
 # Fills the template builders' research slot. Everything else in the skeleton
 # (units, bounds, options, resolution criteria) is the question's REAL values.
+# It carries MARKET_SNAPSHOT_SECTION_HEADER because the panel's market-reading clause is
+# gated on that header being present in the research. Prod emits the header on effectively
+# every question: the provider omits it only on an empty pool, a soft-fail, a flag-off run
+# or benchmarking, measured present on 59 of the 60 newest archived artifact records. So
+# without it here the skeleton would drop a clause almost every real panel prompt carries.
+# Deliberately NOT extended to TS_ANCHOR_SECTION_HEADER, whose incidence runs the other way
+# (5 of 322 artifact records, 0 of the newest 30): hardcoding that one would manufacture a
+# divergence on ~98% of numeric prompts to close one on ~2%, and the numeric template already
+# names the anchor section in its resolution-metric bullets.
 _TEMPLATE_RESEARCH_PLACEHOLDER = (
     "[research placeholder — the actual briefing is in the 'Current briefing' section of this message]"
+    f"\n\n{MARKET_SNAPSHOT_SECTION_HEADER}\n"
+    "[snapshot placeholder — the real snapshot, if this question has one, is in that same section]"
 )
 
 

@@ -43,11 +43,18 @@ Per era it reports, on the bot's PUBLISHED 201-point CDF:
     opposite corrections.
 
 PIT is F_bot(resolution) evaluated on the canonical Metaculus value grid
-(``build_cdf_value_grid``); string out-of-bound resolutions map to PIT 0.0
-(below lower) / 1.0 (above upper), and a NUMERIC resolution beyond the grid is
-scored off the members' declared-percentile curves rather than the grid clamp
-(see ``compute_pit_details``). Method mirrors
+(``build_cdf_value_grid``). Two out-of-range cases, and they differ by what the
+platform told us (see ``compute_pit_reading``): a STRING marker
+(``below_lower_bound`` / ``above_upper_bound``) gives no value, so the reading is
+the INTERVAL our own tail mass pins F to and every coverage column counts it on
+band INTERSECTION while PIT std / mean PIT exclude it; a NUMERIC resolution
+beyond the grid keeps a point PIT, scored off the members' declared-percentile
+curves rather than the grid clamp. Method mirrors
 ``scratch/calibration_audit_2026-07-16/mc_numeric_calibration.py``.
+
+Alongside the era table this CLI prints a per-QUESTION section, the starved-outer-tail
+scan, which lives in ``outer_tail.py``: that failure is a cliff at a fixed location
+rather than a band of the wrong size, so it reads per question rather than per era.
 """
 
 from __future__ import annotations
@@ -56,22 +63,35 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 import numpy as np
-from scipy import stats
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
-from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
-from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, pit_on_grid
+from metaculus_bot.performance_analysis.analysis import (
+    B4E9DF0_MERGED_AT,
+    WIDENING_FLIP_MERGED_AT,
+    PitReading,
+    jeffreys_ci,
+    out_of_range_pit_reading,
+    pit_band_count,
+    pit_on_grid,
+    pit_point_values,
+)
+from metaculus_bot.performance_analysis.cohorts import (
+    EXCLUSION_COHORTS,
+    KNOWN_BUG_SHORTHAND,
+    parse_exclude_qids,
+)
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
-from metaculus_bot.performance_analysis.scaling import grid_zero_point as _grid_zero_point
+from metaculus_bot.performance_analysis.markdown import markdown_table
+from metaculus_bot.performance_analysis.outer_tail import render_starved_outer_tails, scan_outer_tails
+from metaculus_bot.performance_analysis.scaling import NUMERIC_TYPES, cdf_and_grid
 from metaculus_bot.time_utils import parse_iso_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-NUMERIC_TYPES: tuple[str, ...] = ("numeric", "discrete")
 
 # Calibrated reference values, surfaced in the legend so a reader knows which
 # direction "off" points.
@@ -114,48 +134,12 @@ class Era:
 # there. A branch can sit for days, and keying on the authoring date files every
 # run in that gap under the wrong config. Re-derive with
 # `TZ=UTC git log -1 --date=iso-local --format='%h %cd' <merge-sha>`.
-WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=UTC)  # 0e85e1b: k_tail 1.25 -> 1.0
+# 0e85e1b: k_tail 1.25 -> 1.0 — aliased for the same reason TS_ANCHOR_ENABLE below is, so
+# this boundary and the clip sweep's binary clamp regime can never disagree.
+WIDENING_FLIP = WIDENING_FLIP_MERGED_AT
 # b4e9df0 (july15 bundle) — aliased so this boundary and the max-step clamp screen's
 # era gate can never disagree; the timestamp's single home is analysis.py.
 TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
-
-# The CANONICAL known-pipeline-bug cohort: questions whose published forecast was
-# produced by a since-fixed pipeline defect rather than by judgment, so pooling them
-# into a calibration row measures the old bug instead of the current bot. Not
-# excluded by default — callers pass the set explicitly so an exclusion is always a
-# visible choice, and every row reports how many it dropped. Import this constant
-# rather than re-hardcoding the ids: analysis scripts that kept private copies have
-# already drifted from it.
-#
-# - 43746 (Minions & Monsters) and 43747 (Toy Story 5) opening-weekend gross:
-#   the pre-2026-07-07 open-bound arithmetic bug.
-# - 43913 (WSOP bracelets held by the 2026 Main Event winner), added 2026-08-25:
-#   the pre-`9f1175c` discrete max-step cap. All six forecasters stated 79.5-83%
-#   on the outcome that resolved (exactly 1 bracelet) and the published CDF carried
-#   20.00%, its first bin pinned at exactly 0.200000 on an 11-point grid — the
-#   201-grid ceiling applied to a 10-bin question whose real server ceiling was 4.0.
-#   Receipts: scratch/residual_2026-08-24/dossiers/43913_dossier.md and
-#   dim_discrete-maxstep-counterfactual.md. The fix reached prod inside `b4e9df0`
-#   (2026-07-21T17:07:37Z), so no post-triple-era question can carry this shape.
-KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747", "43913"})
-
-# The CLI token standing in for KNOWN_BUG_QIDS in --exclude-qids.
-KNOWN_BUG_SHORTHAND = "known_bug"
-
-
-def parse_exclude_qids(raw: str) -> frozenset[str]:
-    """A ``--exclude-qids`` comma list, with the ``known_bug`` shorthand expanded in place.
-
-    The shorthand COMPOSES with explicit ids rather than only standing alone. It used to be
-    recognized only as the whole argument, so ``--exclude-qids known_bug,43800`` produced the
-    literal set ``{"known_bug", "43800"}``: no question id matches the word, so the bug pair
-    stayed in every row while the table's ``excl`` column reported one exclusion and looked
-    like it had worked.
-    """
-    tokens = {token.strip() for token in raw.split(",") if token.strip()}
-    if KNOWN_BUG_SHORTHAND not in tokens:
-        return frozenset(tokens)
-    return frozenset((tokens - {KNOWN_BUG_SHORTHAND}) | KNOWN_BUG_QIDS)
 
 
 def default_eras() -> list[Era]:
@@ -193,74 +177,45 @@ def assign_era(record: dict, eras: list[Era]) -> str:
     return NO_TIMESTAMP_LABEL
 
 
-def jeffreys_ci(k: int, n: int, cl: float = 0.95) -> tuple[float, float, float]:
-    """Beta-Binomial posterior mean + equal-tailed CI under a Jeffreys(0.5, 0.5)
-    prior. Mirrors ``bb`` in mc_numeric_calibration.py."""
-    a = 0.5 + k
-    b = 0.5 + (n - k)
-    mean = a / (a + b)
-    lo = float(stats.beta.ppf((1 - cl) / 2, a, b))
-    hi = float(stats.beta.ppf(1 - (1 - cl) / 2, a, b))
-    return mean, lo, hi
-
-
-def _cdf_and_grid(record: dict) -> tuple[np.ndarray, np.ndarray] | None:
-    """Return (cdf, value_grid) for a numeric/discrete record, or None if the
-    record lacks the bounds / CDF needed to build the grid.
-
-    Prefers the API's grid-exact ``scaling.continuous_range`` when present (it
-    already encodes log-vs-linear spacing, so no scale has to be re-derived from
-    ``zero_point``); falls back to reconstructing via ``build_cdf_value_grid``
-    with a zero_point interpretation that handles the ``zero_point == 0`` log
-    case (see ``_grid_zero_point``).
-    """
-    cdf = record.get("our_forecast_values")
-    scaling = record.get("scaling") or {}
-    lo, hi = scaling.get("range_min"), scaling.get("range_max")
-    if cdf is None or lo is None or hi is None or len(cdf) < 3:
-        return None
-    cdf_arr = np.asarray(cdf, dtype=float)
-    api_grid = scaling.get("continuous_range")
-    if api_grid is not None and len(api_grid) == len(cdf):
-        return cdf_arr, np.asarray(api_grid, dtype=float)
-    zp = _grid_zero_point(scaling.get("zero_point"), float(lo))
-    grid = build_cdf_value_grid(float(lo), float(hi), zp, len(cdf))
-    return cdf_arr, grid
-
-
 def compute_pit(record: dict) -> float | None:
-    """PIT = F_bot(resolution) on the canonical value grid.
+    """The record's POINT PIT = F_bot(resolution) on the canonical value grid.
 
-    STRING out-of-bound resolutions (``below_lower_bound`` / ``above_upper_bound``)
-    map to 0.0 / 1.0; a NUMERIC resolution beyond the grid is read off the members'
-    declared-percentile curves instead of the grid clamp (see
-    :func:`compute_pit_details` for why). Returns None when the record can't be
-    scored."""
-    return compute_pit_details(record)[0]
+    None when the record can't be scored AND when the reading is set-valued (a STRING
+    out-of-range resolution, whose PIT is an interval — see :func:`compute_pit_reading`).
+    A NUMERIC resolution beyond the grid still has a point PIT, read off the members'
+    declared-percentile curves rather than the grid clamp."""
+    reading = compute_pit_reading(record)
+    return reading.point if reading is not None else None
 
 
-def compute_pit_details(record: dict) -> tuple[float | None, str | None]:
-    """``(pit, oob_side)`` — ``oob_side`` is ``"low"``/``"high"`` when the resolution
-    fell beyond the value grid (string marker or numeric), else None.
+def compute_pit_reading(record: dict) -> PitReading | None:
+    """The record's :class:`PitReading`, or None when the record can't be scored.
 
-    String out-of-bound markers map to 0.0/1.0; a numeric resolution goes through
-    the shared :func:`pit_on_grid`, whose docstring holds the out-of-grid rule
-    (declared-percentile fallback beyond the grid, endpoint clamp only when no
-    member curve is usable). ``oob_side`` surfaces beyond-grid records in the
-    ``n_oob_*`` counters either way.
+    Two cases, and the difference is what the platform told us:
+
+    * A STRING out-of-range resolution (``below_lower_bound`` / ``above_upper_bound``)
+      gives no value, so the reading is the INTERVAL our own published tail mass pins
+      ``F(resolution)`` to — ``[cdf[-1], 1]`` or ``[0, cdf[0]]``. The convention lives in
+      ``analysis.out_of_range_pit_reading``.
+    * A NUMERIC resolution gives a point PIT through the shared :func:`pit_on_grid`, whose
+      docstring holds the out-of-grid rule (declared-percentile fallback beyond the grid,
+      endpoint clamp only when no member curve is usable).
+
+    ``PitReading.oob_side`` reports the beyond-grid side in both cases, which is what the
+    ``n_oob_*`` counters read.
     """
-    built = _cdf_and_grid(record)
+    built = cdf_and_grid(record)
     if built is None:
-        return None, None
+        return None
     cdf, grid = built
     res = record.get("resolution_parsed")
-    if res == "below_lower_bound":
-        return 0.0, "low"
-    if res == "above_upper_bound":
-        return 1.0, "high"
+    out_of_range = out_of_range_pit_reading(res, cdf)
+    if out_of_range is not None:
+        return out_of_range
     if isinstance(res, (int, float)) and not isinstance(res, bool):
-        return pit_on_grid(float(res), grid, cdf, record.get("per_model_numeric_percentiles"))
-    return None, None
+        pit, oob_side = pit_on_grid(float(res), grid, cdf, record.get("per_model_numeric_percentiles"))
+        return PitReading.from_point(pit, oob_side=oob_side)
+    return None
 
 
 def relative_band_width(record: dict, *, median_floor: float = 1e-9) -> float | None:
@@ -270,7 +225,7 @@ def relative_band_width(record: dict, *, median_floor: float = 1e-9) -> float | 
     ``median_floor`` (the ratio blows up for questions centred on ~0, e.g. a
     signed-change quantity; those are excluded and counted rather than
     poisoning the median)."""
-    built = _cdf_and_grid(record)
+    built = cdf_and_grid(record)
     if built is None:
         return None
     cdf, grid = built
@@ -285,6 +240,15 @@ def relative_band_width(record: dict, *, median_floor: float = 1e-9) -> float | 
 class EraWidthMetrics:
     label: str
     n_pit: int
+    """PIT READINGS in this row — the coverage denominator, points and intervals together."""
+    n_point: int
+    """Readings carrying a point value: the denominator of pit_std / mean_pit."""
+    n_oob_interval: int
+    """``n_pit - n_point``: out-of-range resolutions whose PIT is a set (see ``PitReading``).
+
+    A subset of ``n_oob_low + n_oob_high``, which also counts NUMERIC beyond-grid
+    resolutions — those keep a point PIT off the members' declared curves.
+    """
     n_eff: int
     n_width: int
     n_excluded: int
@@ -295,8 +259,8 @@ class EraWidthMetrics:
     cov_at_10: float
     cov_at_50: float
     cov_at_90: float
-    pit_std: float
-    mean_pit: float
+    pit_std: float | None
+    mean_pit: float | None
     median_rel_width: float | None
     band_miss: float
     band_lo: float
@@ -316,13 +280,26 @@ class EraWidthMetrics:
 
     @property
     def underpowered(self) -> bool:
-        """True when this row has too few PITs for its point metrics to be read."""
+        """True when this row has too few PIT readings for its point metrics to be read."""
         return self.n_pit < MIN_N_FOR_POINT_METRICS
+
+    @property
+    def point_metrics_underpowered(self) -> bool:
+        """Same floor applied to the point-only denominator, which set-valued readings shrink.
+
+        pit_std and mean_pit are computed over ``n_point``, so a row can clear the floor on
+        readings and still be under it on point values — that row's std is as uninformative
+        as any other under-floor one.
+        """
+        return self.n_point < MIN_N_FOR_POINT_METRICS
 
     def to_dict(self) -> dict:
         return {
             "label": self.label,
             "n_pit": self.n_pit,
+            "n_point": self.n_point,
+            "n_oob_interval": self.n_oob_interval,
+            "point_metrics_underpowered": self.point_metrics_underpowered,
             "n_eff": self.n_eff,
             "ci_clustered": self.ci_clustered,
             "underpowered": self.underpowered,
@@ -374,7 +351,7 @@ def _n_effective_clusters(post_ids: list[object]) -> int:
 class _EraSamples:
     """The per-record readings one era contributes: PITs, their posts, and band widths."""
 
-    pits: list[float]
+    readings: list[PitReading]
     pit_post_ids: list[object]
     widths: list[float]
     n_oob_low: int
@@ -382,15 +359,15 @@ class _EraSamples:
 
 
 def _collect_era_samples(records: list[dict]) -> _EraSamples:
-    """Read every numeric/discrete record's PIT and relative band width.
+    """Read every numeric/discrete record's PIT reading and relative band width.
 
     OOB is a property of the RESOLUTION (beyond the grid), not of the PIT value: an
     out-of-grid resolution scored off the declared-percentile curves rarely lands at
     exactly 0.0/1.0, and an in-grid PIT of exactly 0.0 (closed bound, resolution at the
-    minimum) is not OOB — which is why the side comes from ``compute_pit_details`` rather
-    than from comparing the PIT against 0 or 1.
+    minimum) is not OOB — which is why the side comes from the reading rather than from
+    comparing the PIT against 0 or 1.
     """
-    pits: list[float] = []
+    readings: list[PitReading] = []
     pit_post_ids: list[object] = []
     widths: list[float] = []
     n_oob_low = 0
@@ -399,25 +376,30 @@ def _collect_era_samples(records: list[dict]) -> _EraSamples:
     for r in records:
         if r.get("type") not in NUMERIC_TYPES:
             continue
-        pit, oob_side = compute_pit_details(r)
-        if pit is not None:
-            pits.append(pit)
+        reading = compute_pit_reading(r)
+        if reading is not None:
+            readings.append(reading)
             pit_post_ids.append(r.get("post_id"))
-            if oob_side == "low":
+            if reading.oob_side == "low":
                 n_oob_low += 1
-            elif oob_side == "high":
+            elif reading.oob_side == "high":
                 n_oob_high += 1
         w = relative_band_width(r)
         if w is not None:
             widths.append(w)
 
     return _EraSamples(
-        pits=pits,
+        readings=readings,
         pit_post_ids=pit_post_ids,
         widths=widths,
         n_oob_low=n_oob_low,
         n_oob_high=n_oob_high,
     )
+
+
+def _fraction(readings: list[PitReading], predicate: Callable[[PitReading], bool]) -> float:
+    """Fraction of readings satisfying ``predicate`` (readings is never empty here)."""
+    return sum(1 for reading in readings if predicate(reading)) / len(readings)
 
 
 def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) -> EraWidthMetrics | None:
@@ -429,13 +411,16 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
     that rows were dropped rather than silently reporting a smaller n.
     """
     samples = _collect_era_samples(records)
-    if not samples.pits:
+    if not samples.readings:
         return None
 
-    arr = np.asarray(samples.pits, dtype=float)
-    n = len(arr)
-    cov80_k = int(((arr >= 0.10) & (arr <= 0.90)).sum())
-    cov50_k = int(((arr >= 0.25) & (arr <= 0.75)).sum())
+    readings = samples.readings
+    n = len(readings)
+    # Point statistics run on the point readings only: a set-valued (out-of-range)
+    # reading has no value to average, and imputing its midpoint would manufacture one.
+    points = np.asarray(pit_point_values(readings), dtype=float)
+    cov80_k = pit_band_count(readings, 0.10, 0.90)
+    cov50_k = pit_band_count(readings, 0.25, 0.75)
 
     # Coverage CIs are computed at n_eff (distinct post_ids) rather than the raw
     # question count, so that a post carrying several correlated sub-questions
@@ -455,12 +440,17 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
     # a band that is too tight (both tails elevated) from one of roughly the
     # right width that is mis-centered (misses piled in one tail), which cov80
     # cannot, and which call for opposite corrections.
-    band_lo = float((arr < 0.10).mean())
-    band_hi = float((arr > 0.90).mean())
+    # A set-valued reading misses a tail only when the WHOLE interval lies outside it,
+    # which keeps the band_miss == 1 - cov80 identity exact (an interval that fails to
+    # intersect [0.10, 0.90] lies entirely on one side of it).
+    band_lo = _fraction(readings, lambda reading: reading.entirely_below(0.10))
+    band_hi = _fraction(readings, lambda reading: reading.entirely_above(0.90))
 
     return EraWidthMetrics(
         label=label,
         n_pit=n,
+        n_point=len(points),
+        n_oob_interval=n - len(points),
         n_eff=n_eff,
         n_width=len(samples.widths),
         n_excluded=n_excluded,
@@ -468,11 +458,11 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
         n_oob_high=samples.n_oob_high,
         cov80=cov80,
         cov50=cov50,
-        cov_at_10=float((arr <= 0.10).mean()),
-        cov_at_50=float((arr <= 0.50).mean()),
-        cov_at_90=float((arr <= 0.90).mean()),
-        pit_std=float(arr.std()),
-        mean_pit=float(arr.mean()),
+        cov_at_10=_fraction(readings, lambda reading: reading.at_or_below(0.10)),
+        cov_at_50=_fraction(readings, lambda reading: reading.at_or_below(0.50)),
+        cov_at_90=_fraction(readings, lambda reading: reading.at_or_below(0.90)),
+        pit_std=(float(points.std()) if len(points) else None),
+        mean_pit=(float(points.mean()) if len(points) else None),
         median_rel_width=(float(np.median(samples.widths)) if samples.widths else None),
         band_miss=band_lo + band_hi,
         band_lo=band_lo,
@@ -490,9 +480,11 @@ def compute_all_eras(
 
     ``exclude_qids`` drops the named questions from every row and reports the
     dropped count per row (``EraWidthMetrics.n_excluded``, rendered in the
-    table), so an exclusion is never silent. Pass ``KNOWN_BUG_QIDS`` for the
-    documented known-pipeline-bug cohort, which every other dimension of the
-    residual analysis already excludes.
+    table), so an exclusion is never silent. Pass one of the documented cohorts in
+    ``EXCLUSION_COHORTS`` — ``KNOWN_BUG_QIDS`` (known pipeline bugs),
+    ``DEGRADED_RUN_QIDS`` (dry-key 1-of-3 publishes) or ``PARTIAL_DEGRADED_QIDS``
+    (2-of-3) — rather than re-hardcoding ids: the known-bug set's private copies have
+    already drifted, and three rounds retyped the degraded ids before they had a home.
     """
     if eras is None:
         eras = default_eras()
@@ -575,18 +567,38 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "declared-percentile curves). excl = records dropped by --exclude-qids."
     )
     lines.append("")
-    header = (
-        "| era | n | excl | n_eff | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
-        "| PIT std | mean PIT | med rel width (n) | band_miss (lo/hi) | OOB lo/hi |"
+    lines.append(
+        "set-valued (pt n) = out-of-range resolutions whose PIT is an INTERVAL rather than a value "
+        "(`above_upper_bound` -> [cdf[-1], 1], `below_lower_bound` -> [0, cdf[0]]: the platform gives "
+        "no value, and on an open bound our own CDF says how much mass we put out there), with the "
+        "point-metric denominator beside it. Those readings count in every coverage column when the "
+        "interval INTERSECTS the band, and are EXCLUDED from PIT std / mean PIT, which is why the two "
+        "denominators can differ. No midpoint is imputed."
     )
-    sep = "|" + "|".join(["---"] * (header.count("|") - 1)) + "|"
-    lines.append(header)
-    lines.append(sep)
+    lines.append("")
+    header = [
+        "era",
+        "n",
+        "excl",
+        "n_eff",
+        "cov80 [95% CI]",
+        "cov50 [95% CI]",
+        "cov@10",
+        "cov@50",
+        "cov@90",
+        "PIT std",
+        "mean PIT",
+        "med rel width (n)",
+        "band_miss (lo/hi)",
+        "OOB lo/hi",
+        "set-valued (pt n)",
+    ]
+    rows: list[list[str]] = []
     for m in metrics:
         rel = f"{m.median_rel_width:.3f} ({m.n_width})" if m.median_rel_width is not None else f"n/a ({m.n_width})"
 
-        def _point(value: float, *, underpowered: bool = m.underpowered) -> str:
-            return "n/a" if underpowered else f"{value:.3f}"
+        def _point(value: float | None, *, underpowered: bool = m.underpowered) -> str:
+            return "n/a" if underpowered or value is None else f"{value:.3f}"
 
         band = "n/a" if m.underpowered else f"{m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f})"
         cells = [
@@ -599,13 +611,15 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
             _point(m.cov_at_10),
             _point(m.cov_at_50),
             _point(m.cov_at_90),
-            _point(m.pit_std),
-            _point(m.mean_pit),
+            _point(m.pit_std, underpowered=m.point_metrics_underpowered),
+            _point(m.mean_pit, underpowered=m.point_metrics_underpowered),
             rel,
             band,
             f"{m.n_oob_low}/{m.n_oob_high}",
+            f"{m.n_oob_interval} ({m.n_point})",
         ]
-        lines.append("| " + " | ".join(cells) + " |")
+        rows.append(cells)
+    lines += markdown_table(header, rows)
     return "\n".join(lines)
 
 
@@ -623,14 +637,23 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--output-json", default=None, help="Optional path to also write the metrics as JSON.")
     parser.add_argument(
+        "--output-starved-json",
+        default=None,
+        help=(
+            "Optional path to write the starved-outer-tail scan as JSON (every scanned side with "
+            "its verdict, not just the flagged ones). The markdown section is always printed."
+        ),
+    )
+    parser.add_argument(
         "--exclude-qids",
         default="",
         help=(
             "Comma-separated question ids to drop from every row (the count is rendered in the table "
-            "so the exclusion is visible). The documented known-pipeline-bug cohort is "
-            f"{','.join(sorted(KNOWN_BUG_QIDS))}; pass '{KNOWN_BUG_SHORTHAND}' as shorthand for it, "
-            f"anywhere in the list — it composes with explicit ids, so '{KNOWN_BUG_SHORTHAND},43800' "
-            "excludes the cohort AND 43800. Default: exclude nothing."
+            "so the exclusion is visible). Each cohort shorthand below composes with explicit ids "
+            "and is recognized anywhere in the list: "
+            + "; ".join(f"'{name}' = {','.join(sorted(ids))}" for name, ids in sorted(EXCLUSION_COHORTS.items()))
+            + f". So '{KNOWN_BUG_SHORTHAND},43800' excludes that cohort AND 43800. An unrecognized "
+            "non-numeric token is an error rather than a silent no-op. Default: exclude nothing."
         ),
     )
     args = parser.parse_args(argv)
@@ -648,15 +671,50 @@ def main(argv: list[str] | None = None) -> None:
 
     metrics = compute_all_eras(data, exclude_qids=exclude_qids)
     if exclude_qids:
-        logger.info(f"Excluding question ids from every row: {sorted(exclude_qids)}")
+        numeric_qids = {str(r.get("question_id")) for r in data if r.get("type") in NUMERIC_TYPES}
+        matched = len(exclude_qids & numeric_qids)
+        logger.info(
+            f"--exclude-qids: {len(exclude_qids)} requested id(s), {matched} matched a "
+            "numeric/discrete record in this pull"
+        )
+        # A cohort is defined by an incident, not by what resolved into a pull, so an
+        # absent cohort id is normal and gets no alarm. The id-space trap — question and
+        # post ids share one integer namespace — is only worth a WARN on ids the operator
+        # typed explicitly.
+        explicit_ids = {
+            token.strip()
+            for token in args.exclude_qids.split(",")
+            if token.strip() and token.strip() not in EXCLUSION_COHORTS
+        }
+        all_qids = {str(r.get("question_id")) for r in data}
+        post_ids = {str(r.get("post_id")) for r in data}
+        id_space_confused = sorted((explicit_ids - all_qids) & post_ids)
+        if id_space_confused:
+            logger.warning(
+                f"--exclude-qids: {id_space_confused} matched no question_id but IS a post_id in "
+                "this pull — question and post ids share one integer space; translate through "
+                "performance_analysis.id_mapping"
+            )
     # The rendered markdown IS this CLI's product and belongs on stdout; logging above
     # is deliberately pinned to stderr so the report can be piped on its own.
     print(render_markdown(metrics))  # noqa: T201
+
+    # The starved-outer-tail scan reads the same records and the same exclusions. It is a
+    # per-QUESTION report rather than a per-era one, so it renders as its own section instead
+    # of a column, and it is printed unconditionally — a monitor nobody has to ask for.
+    scan = scan_outer_tails(data, exclude_qids=exclude_qids)
+    print()  # noqa: T201
+    print(render_starved_outer_tails(scan))  # noqa: T201
 
     if args.output_json:
         with open(args.output_json, "w") as f:
             json.dump([m.to_dict() for m in metrics], f, indent=2)
         logger.info(f"Wrote {len(metrics)} era rows to {args.output_json}")
+
+    if args.output_starved_json:
+        with open(args.output_starved_json, "w") as f:
+            json.dump(scan.to_dict(), f, indent=2)
+        logger.info(f"Wrote {scan.n_scanned} outer-tail side readings to {args.output_starved_json}")
 
 
 if __name__ == "__main__":

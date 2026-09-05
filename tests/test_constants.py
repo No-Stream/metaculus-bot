@@ -10,6 +10,10 @@ from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
     BINARY_STACKING_ENABLED_ENV,
+    EXTREME_CALL_HIGH,
+    EXTREME_CALL_LOW,
+    GAP_FILL_V2_READER_MODEL,
+    GEMINI_SEARCH_DEFAULT_MODEL,
     MC_PROB_MAX,
     MC_PROB_MIN,
     MC_STACKING_ENABLED_ENV,
@@ -18,6 +22,8 @@ from metaculus_bot.constants import (
     NATIVE_SEARCH_TIMEOUT,
     NATIVE_SEARCH_VERBOSITY_DEFAULT,
     NUMERIC_STACKING_ENABLED_ENV,
+    THIN_PUBLISH_BINARY_CEIL,
+    THIN_PUBLISH_BINARY_FLOOR,
     env_flag_enabled,
 )
 
@@ -94,6 +100,28 @@ class TestNativeSearchDefaults:
         assert NATIVE_SEARCH_TIMEOUT == 360
 
 
+class TestGeminiNativeSdkModelDefaults:
+    """Pin both native google-genai model ids to gemini-3.8-flash.
+
+    Verified live on that SDK 2026-09-03 by scripts/probes/gemini_verify.py: grounding
+    chunks came back from the google_search tool, thinking_level was accepted, and
+    url_context retrieved a robots-allowed host. The grounded-search provider and the
+    gap-fill v2 reader deliberately run the SAME id so one verification covers both, and
+    so the shared 5k/month grounded-prompt pool is drawn by one model.
+    """
+
+    def test_grounded_search_default_model_is_gemini_3_8_flash(self):
+        assert GEMINI_SEARCH_DEFAULT_MODEL == "gemini-3.8-flash"
+
+    def test_gap_fill_v2_reader_model_is_gemini_3_8_flash(self):
+        assert GAP_FILL_V2_READER_MODEL == "gemini-3.8-flash"
+
+    def test_both_native_surfaces_run_the_same_id(self):
+        # Trivially true while they match, which is the point: it fails the moment one
+        # surface is flipped to a model the other has not been verified on.
+        assert GEMINI_SEARCH_DEFAULT_MODEL == GAP_FILL_V2_READER_MODEL
+
+
 class TestEnvFlagEnabledDefaultKwarg:
     """Tests for the ``default`` keyword argument on ``env_flag_enabled``."""
 
@@ -154,3 +182,29 @@ class TestPerTypeStackingEnvVarNames:
 
     def test_numeric_stacking_enabled_env_name(self):
         assert NUMERIC_STACKING_ENABLED_ENV == "NUMERIC_STACKING_ENABLED"
+
+
+class TestThinPublishBinaryFloor:
+    """The single-survivor publish floor is [0.05, 0.95], aliased to the EXTREME_CALL band.
+
+    One definition of "extreme" serves both the telemetry that measures the exposure and
+    the clamp that prices it, so the two cannot drift apart. Receipt for the values:
+    scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md §2 (clamp-variant table).
+    """
+
+    def test_floor_is_0_05(self):
+        assert THIN_PUBLISH_BINARY_FLOOR == 0.05
+
+    def test_ceiling_is_0_95(self):
+        assert THIN_PUBLISH_BINARY_CEIL == 0.95
+
+    def test_floor_and_ceiling_alias_the_extreme_call_band(self):
+        # Trivially true while the alias holds, which is the point: paired with the two
+        # literal pins above, it fails the moment somebody re-hardcodes either edge.
+        assert THIN_PUBLISH_BINARY_FLOOR == EXTREME_CALL_LOW
+        assert THIN_PUBLISH_BINARY_CEIL == EXTREME_CALL_HIGH
+
+    def test_floor_sits_strictly_inside_the_per_model_clamp(self):
+        # A 0.03 member call passes the per-model [0.02, 0.98] clamp untouched, which is
+        # why the floor is a new mechanism rather than a retune of BINARY_PROB_MIN/MAX.
+        assert BINARY_PROB_MIN < THIN_PUBLISH_BINARY_FLOOR < THIN_PUBLISH_BINARY_CEIL < BINARY_PROB_MAX

@@ -8,6 +8,7 @@ Tests cover:
   - Round-trip validation against Metaculus constraints
 """
 
+import logging
 from typing import ClassVar
 
 import numpy as np
@@ -227,6 +228,26 @@ class TestEdgeCases:
         assert result is not None
         max_diff = float(np.max(np.diff(result)))
         assert max_diff <= NUM_MAX_STEP + 1e-10
+
+    def test_snap_clip_marker_names_the_stage_and_the_question(self, caplog):
+        """The snap-stage CDF_MAXSTEP_CLIP must carry the QUESTION id and its own label.
+
+        The question id is the telemetry archive's join key (markers.py pins the
+        marker to QID_KIND_QUESTION_ID); a snap clip logging question=None silently
+        orphans every clip on a published discrete forecast.
+        """
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=0.3)
+        dist = create_pchip_distribution_from_cdf(cdf, question)
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pchip_cdf"):
+            result = snap_distribution_to_integers(dist, question)
+
+        assert result is not None
+        markers = [r.getMessage() for r in caplog.records if "CDF_MAXSTEP_CLIP:" in r.getMessage()]
+        assert len(markers) == 1
+        assert f"question={question.id_of_question}" in markers[0]
+        assert "model=ensemble_discrete_snap" in markers[0]
 
     def test_too_many_integers_returns_none(self):
         """More than DISCRETE_SNAP_MAX_INTEGERS → skip snapping."""
@@ -626,27 +647,33 @@ class TestSnapCdfGoldenOutputs:
             0.95,
             0.999,
         ],
+        # Recaptured 2026-08-31: this is the only golden with over-cap bins, so it is the
+        # only one the max-step repair touches, and that repair deliberately changed policy
+        # from slack-proportional to nearest-first (see ``_pack_excess_nearest_first``). The
+        # old capture spread the three spikes' 0.399 of clipped mass as a flat 0.0235/bin
+        # across all 20 bins — including the eight the input CDF puts at zero; the new one
+        # keeps it in the neighbours of the bins it was declared in.
         "conc21_closed": [
             0.0,
-            0.023529411764706,
-            0.047058823529412,
-            0.070588235294118,
-            0.094117647058824,
-            0.117647058823529,
-            0.141176470588235,
-            0.164705882352941,
-            0.364705882352941,
-            0.388235294117647,
-            0.588235294117647,
-            0.611764705882353,
-            0.811764705882353,
-            0.835294117647059,
-            0.858823529411765,
-            0.882352941176471,
-            0.905882352941177,
-            0.929411764705882,
-            0.952941176470588,
-            0.976470588235294,
+            5.775e-05,
+            0.0001155,
+            0.00017325,
+            0.000231,
+            0.00028875,
+            0.0003465,
+            0.02528875,
+            0.22528875,
+            0.3900345699585,
+            0.5900345699585,
+            0.758111680732088,
+            0.958111680732088,
+            0.99959575,
+            0.9996535,
+            0.99971125,
+            0.999769,
+            0.99982675,
+            0.9998845,
+            0.99994225,
             1.0,
         ],
     }

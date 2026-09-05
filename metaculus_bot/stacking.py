@@ -17,6 +17,7 @@ from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, STACKER_SOFT_DEADLINE
 from metaculus_bot.forecaster_runners import build_parse_notes
 from metaculus_bot.llm_retry import invoke_with_transient_retry
+from metaculus_bot.member_forecast import MEMBER_FORECAST_ROLE_STACKER, format_member_forecast_marker, option_vector
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 from metaculus_bot.prompts import stacking_binary_prompt, stacking_multiple_choice_prompt, stacking_numeric_prompt
 from metaculus_bot.value_extraction import extract_binary, extract_mc, extract_numeric
@@ -110,6 +111,16 @@ async def run_stacking_binary(
         model_name=stacker_llm.model,
     )
     decimal_pred = max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, outcome.value))
+    logger.info(
+        format_member_forecast_marker(
+            question_id=question.id_of_question,
+            model=stacker_llm.model,
+            role=MEMBER_FORECAST_ROLE_STACKER,
+            qtype="binary",
+            raw=outcome.value,
+            published=decimal_pred,
+        )
+    )
     return decimal_pred, meta_reasoning
 
 
@@ -152,11 +163,21 @@ async def run_stacking_mc(
         question_id=question.id_of_question,
         model_name=stacker_llm.model,
     )
-    predicted_option_list = outcome.value
+    predicted_option_list = outcome.value.option_list
     try:
         predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
     except ValueError as e:
         logger.warning(f"MC clamp/renormalize failed: {e}")
+    logger.info(
+        format_member_forecast_marker(
+            question_id=question.id_of_question,
+            model=stacker_llm.model,
+            role=MEMBER_FORECAST_ROLE_STACKER,
+            qtype="multiple_choice",
+            raw=outcome.value.declared_probs,  # the list is clamped on construction; see McForecast
+            published=option_vector(predicted_option_list),
+        )
+    )
     return predicted_option_list, meta_reasoning
 
 

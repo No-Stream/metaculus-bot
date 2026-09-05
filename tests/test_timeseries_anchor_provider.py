@@ -31,6 +31,7 @@ The fetch layer itself is covered in ``test_ts_fetch.py`` and routing in
 from __future__ import annotations
 
 import logging
+import math
 from datetime import UTC, date, datetime
 from unittest.mock import MagicMock
 
@@ -39,6 +40,11 @@ import pandas as pd
 import pytest
 from forecasting_tools import BinaryQuestion
 
+from metaculus_bot.constants import (
+    FINANCIAL_VARIANCE_RATIO_FLOOR,
+    FINANCIAL_VARIANCE_RATIO_LAG,
+    FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+)
 from metaculus_bot.research import timeseries_anchor as ts
 from metaculus_bot.research import ts_fetch as tf
 from metaculus_bot.research import ts_render as tsrender
@@ -62,8 +68,10 @@ from metaculus_bot.research.ts_estimators import (
     annualized_realized_vol_pct,
     clock_matches_cadence,
     horizon_steps,
+    multi_period_annualized_vol_pct,
     observed_periods_per_year,
     series_clock,
+    variance_ratio,
 )
 from metaculus_bot.research.ts_fetch import FRED_CSV_URL, SeriesSpec
 from metaculus_bot.research.ts_render import (
@@ -74,7 +82,15 @@ from metaculus_bot.research.ts_render import (
     _truncate_section,
 )
 from metaculus_bot.research.ts_routing import _Route
-from tests.ts_anchor_fakes import _DGS10_RC, FakeHttp, _csv, _make_numeric_q
+from scripts.telemetry.markers import MARKER_SPECS
+from tests.ts_anchor_fakes import (
+    _DGS10_RC,
+    FakeHttp,
+    _csv,
+    _make_numeric_q,
+    noise_dominated_close_series,
+    random_walk_close_series,
+)
 
 
 # Test isolation: the provider keeps a rendered-section cache and the fetch layer
@@ -667,9 +683,9 @@ class TestSeriesClockAndCalendarBases:
         expected = float(returns.std() * np.sqrt(CALENDAR_DAYS_PER_YEAR) * 100.0)
         shipped_252 = float(returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
 
-        line = tsrender._realized_vol_line(continuous, clock)
+        lines = tsrender._realized_vol_lines(continuous, clock, symbol="BTC-USD")
 
-        assert line == f"- 30-calendar-day annualized realized volatility: {expected:.1f}%"
+        assert lines == [f"- 30-calendar-day annualized realized volatility: {expected:.1f}%"]
         # The defect was worth a factor of sqrt(365/252) = 1.2035; make sure the old number is
         # genuinely different at the rendered precision rather than a rounding coincidence.
         assert f"{shipped_252:.1f}" != f"{expected:.1f}"
@@ -683,9 +699,9 @@ class TestSeriesClockAndCalendarBases:
         returns = business.pct_change().dropna().tail(tsrender.REALIZED_VOL_WINDOW)
         expected = float(returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
 
-        assert tsrender._realized_vol_line(business, clock) == (
+        assert tsrender._realized_vol_lines(business, clock, symbol="^GSPC") == [
             f"- 30-trading-day annualized realized volatility: {expected:.1f}%"
-        )
+        ]
 
     def test_rendered_band_on_a_24_7_series_uses_calendar_steps_and_says_so(self):
         continuous = _twenty_four_seven_series("BTC-USD")
@@ -893,6 +909,124 @@ class TestCoarseCadenceClocks:
             assert clock_matches_cadence(series_clock(index), index) is True, series.name
 
 
+class TestAnchorRealizedVolNoiseFlag:
+    """The anchor's own one-day-return volatility line carries the same noise screen.
+
+    This is the second place the bot annualizes ONE-step returns for a forecaster, and the
+    anchor routes to any URL-cited Yahoo ticker — so q44797's pegged cross would render an
+    equally inflated figure here. The change BAND is a different story: it is built from
+    h-step changes at h of tens of observations, where independent quote noise contributes
+    ~2/h of the variance, so the flag must say the band is unaffected rather than casting
+    doubt on the whole section.
+    """
+
+    @staticmethod
+    def _clock() -> SeriesClock:
+        return SeriesClock(freq="daily", periods_per_year=TRADING_DAYS_PER_YEAR)
+
+    def test_a_clean_series_renders_one_unqualified_line(self):
+        lines = tsrender._realized_vol_lines(random_walk_close_series(seed=3), self._clock(), symbol="CSUSHPISA")
+
+        assert len(lines) == 1
+        assert lines[0].startswith("- 30-trading-day annualized realized volatility:")
+        assert "noise-suspect" not in lines[0]
+
+    def test_a_noise_dominated_series_flags_and_offers_the_robust_figure(self):
+        noisy = noise_dominated_close_series(seed=3)
+        robust = multi_period_annualized_vol_pct(
+            noisy,
+            lag=FINANCIAL_VARIANCE_RATIO_LAG,
+            periods_per_year=TRADING_DAYS_PER_YEAR,
+            min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+        )
+        assert robust is not None
+
+        lines = tsrender._realized_vol_lines(noisy, self._clock(), symbol="CSUSHPISA")
+
+        assert len(lines) == 2
+        assert lines[0].endswith("— noise-suspect")
+        assert "Vendor-noise flag" in lines[1]
+        assert f"the volatility is {robust:.1f}%" in lines[1]
+        assert "The change band above is unaffected" in lines[1]
+
+    def test_the_emitted_marker_line_parses_under_the_spec(self, caplog: pytest.LogCaptureFixture):
+        """This surface had NO emitter-side assertion at all — deleting its `logger.info` was
+        green, and so was any field reorder, while the archive harvested nothing. The parser
+        tests could not catch it: they parse hand-typed strings whose comments only claim to
+        match what the emitter produces. Same pattern as test_ts_routing's ts_anchor_route test.
+
+        `long_vol` reads None here because the anchor computes no long-horizon window; the
+        field is present because both surfaces share one emitter and one shape.
+        """
+        noisy = noise_dominated_close_series(seed=3)
+        clock = self._clock()
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.ts_render"):
+            tsrender._realized_vol_lines(noisy, clock, symbol="CSUSHPISA")
+
+        ratio = variance_ratio(
+            noisy, lag=FINANCIAL_VARIANCE_RATIO_LAG, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS
+        )
+        robust = multi_period_annualized_vol_pct(
+            noisy,
+            lag=FINANCIAL_VARIANCE_RATIO_LAG,
+            periods_per_year=clock.periods_per_year,
+            min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+        )
+        short = annualized_realized_vol_pct(
+            noisy, window=tsrender.REALIZED_VOL_WINDOW, periods_per_year=clock.periods_per_year
+        )
+        assert ratio is not None
+        assert robust is not None
+        assert short is not None
+
+        (line,) = [r.getMessage() for r in caplog.records if "FINANCIAL_NOISE_FLAG" in r.getMessage()]
+        spec = next(s for s in MARKER_SPECS if s.name == "financial_noise_flag")
+        match = spec.regex.search(line)
+        assert match is not None
+        assert match.groupdict() == {
+            "surface": "ts_anchor",
+            "symbol": "CSUSHPISA",
+            "vr_lag": str(FINANCIAL_VARIANCE_RATIO_LAG),
+            "vr": f"{ratio:.3f}",
+            "floor": str(FINANCIAL_VARIANCE_RATIO_FLOOR),
+            "short_vol": f"{short:.1f}",
+            "long_vol": "None",
+            "robust_vol": str(round(robust, 1)),
+        }
+
+    def test_a_short_series_renders_nothing(self):
+        short = random_walk_close_series(seed=3, n=20)
+        assert tsrender._realized_vol_lines(short, self._clock(), symbol="CSUSHPISA") == []
+
+
+class TestAnchorValueFormatter:
+    """`_fmt` renders the anchor's levels, history rows, 52-week range and band quantiles.
+
+    It was the last `.4g`-class precision sibling: `:,.1f` between 100 and 10,000 rounded a
+    Case-Shiller level of 331.893 to "331.9" on a question with 0.02-point buckets, and
+    `:,.0f` above that dropped an index level's decimals entirely — while the FRED block in
+    the OTHER provider rendered the same observation at full precision in the same bundle
+    (q44944 carried both providers, with true prints 331.020 / 331.172 / 332.105 / 327.462).
+    """
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (331.893, "331.893"),  # the motivating case: was "331.9"
+            (334.5123456, "334.512"),  # capped at three decimals, not six
+            (20150.55, "20,150.55"),  # was "20,151" — decimals dropped above 10,000
+            (6699580.0, "6,699,580"),  # WALCL: thousands-separated, never scientific
+            (1200.0, "1,200"),  # rstrip halts at the "." — integer zeros survive
+            (100.0, "100"),  # the branch boundary
+            (-331.893, "-331.893"),  # sign does not change the branch
+            (4.2, "4.2"),  # below 100 keeps 4 significant figures
+            (0.00012345, "0.0001234"),  # a MoM % change must not round to "0.000"
+        ],
+    )
+    def test_the_four_magnitude_bands(self, value: float, expected: str) -> None:
+        assert tsrender._fmt(value) == expected
+
+
 class TestSharedVolEstimator:
     """The one vol definition (`annualized_realized_vol_pct`), after the q44882 defect was
     fixed in one of its two byte-identical copies weeks before the other."""
@@ -910,6 +1044,183 @@ class TestSharedVolEstimator:
             index=pd.date_range(end="2026-06-30", periods=30, freq="D"),
         )
         assert annualized_realized_vol_pct(short, window=30, periods_per_year=365) is None
+
+
+class TestVarianceRatio:
+    """`variance_ratio` is the vendor-noise screen behind financial_data's noise flag.
+
+    q44797 handed six forecasters a 17.8% "volatility" computed on a pegged cross whose
+    daily returns were 79% quote noise; the honest like-for-like figure off the liquid
+    anchor was ~10.6%. The screen has to separate those two regimes at the sample size the
+    provider actually holds (~265 daily bars) and stay silent on a clean series, since a
+    false flag would demote a perfectly good short-window volatility.
+    """
+
+    def test_clean_random_walk_reads_near_one_and_clears_the_floor(self):
+        clean = random_walk_close_series(seed=3)
+        ratio = variance_ratio(
+            clean,
+            lag=FINANCIAL_VARIANCE_RATIO_LAG,
+            min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+        )
+        assert ratio is not None
+        # A walk's null value is 1; the null sd of VR(5) at n~264 is ~0.13, so anything in
+        # this band is ordinary sampling noise and must NOT fire the flag.
+        assert 0.7 <= ratio <= 1.3
+        assert ratio > FINANCIAL_VARIANCE_RATIO_FLOOR
+
+    def test_quote_noise_dominated_series_falls_below_the_floor(self):
+        noisy = noise_dominated_close_series(seed=3)
+        ratio = variance_ratio(
+            noisy,
+            lag=FINANCIAL_VARIANCE_RATIO_LAG,
+            min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+        )
+        assert ratio is not None
+        # iid quote noise contributing a fraction p of return variance drives VR(5) to
+        # 1 - 0.8p; at p ~ 2/3 that is ~0.47, the value the 44797 verification measured on
+        # USDSZL=X. The floor must sit between this and the clean case above.
+        assert ratio == pytest.approx(0.47, abs=0.12)
+        assert ratio < FINANCIAL_VARIANCE_RATIO_FLOOR
+
+    def test_the_floor_operating_point_across_twenty_seeds(self):
+        """One seed proves nothing about a threshold, and the two distributions genuinely
+        overlap in the tails, so the honest claim is an operating point rather than perfect
+        separation. Measured over seeds 0-19 (scratch/next_season_bundle_2026-09/item10/
+        vr_calibration.py): clean VR mean 1.005, min 0.636; noisy VR mean 0.465, max 0.617.
+        At the 0.60 floor that is 0 of 20 clean series flagged and 18 of 20 noisy ones
+        caught. A false positive costs a demoted-but-still-printed short-window figure; a
+        false negative reproduces q44797, so the asymmetry favours keeping the floor high
+        enough to catch most noise and low enough to never flag a walk."""
+        flagged_clean = 0
+        flagged_noisy = 0
+        for seed in range(20):
+            clean = variance_ratio(
+                random_walk_close_series(seed=seed),
+                lag=FINANCIAL_VARIANCE_RATIO_LAG,
+                min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+            )
+            noisy = variance_ratio(
+                noise_dominated_close_series(seed=seed),
+                lag=FINANCIAL_VARIANCE_RATIO_LAG,
+                min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+            )
+            assert clean is not None
+            assert noisy is not None
+            flagged_clean += clean < FINANCIAL_VARIANCE_RATIO_FLOOR
+            flagged_noisy += noisy < FINANCIAL_VARIANCE_RATIO_FLOOR
+        assert flagged_clean == 0, "a clean random walk must never be called vendor noise"
+        assert flagged_noisy >= 17, f"the screen caught only {flagged_noisy}/20 noise-dominated series"
+
+    def test_the_thirty_row_vol_window_is_refused_not_estimated(self):
+        """The 44797 verification's §11 constraint: the null sd of VR(5) is ~0.40 at n=30,
+        so the statistic is uninformative on the window the volatility line uses. Refusing
+        it is the only honest answer — a number there would read as measurement."""
+        thirty_rows = noise_dominated_close_series(seed=1, n=31)
+        assert (
+            variance_ratio(
+                thirty_rows,
+                lag=FINANCIAL_VARIANCE_RATIO_LAG,
+                min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS,
+            )
+            is None
+        )
+
+    def test_a_momentum_series_reads_above_one(self):
+        """Sign check in the other direction. Returns with positive autocorrelation (rho =
+        0.3) persist rather than reverse, so VR(5) sits above 1 — around 1.6 by
+        1 + (2/q)*sum_k (q-k)*rho^k. Confirms the statistic is measuring return
+        autocorrelation and not just any departure from a straight line."""
+        rng = np.random.default_rng(5)
+        shocks = rng.normal(0.0, 0.006, 300)
+        returns = np.zeros(300)
+        for i in range(1, 300):
+            returns[i] = 0.3 * returns[i - 1] + shocks[i]
+        momentum = pd.Series(
+            16.4 * np.exp(np.cumsum(returns)),
+            index=pd.bdate_range(end="2026-07-17", periods=300),
+        )
+        ratio = variance_ratio(momentum, lag=5, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS)
+        assert ratio is not None
+        assert ratio > 1.2
+
+    def test_hand_computed_ratio_on_a_short_deterministic_series(self):
+        """VR(2) = 1.5375 on log prices [0, 1, 2, 4, 7, 11, 16], by hand.
+
+        Every other numeric assertion on this estimator is a tolerance band on a seeded
+        pseudo-random series, and both it and `multi_period_annualized_vol_pct` read their
+        multi-period returns from the same helper — so the sqrt(VR) identity between them is
+        algebraically vacuous on the lag window, and a consistent slip in the window shifts
+        both together. Four plausible mutations of `_overlapping_log_return_sample` left the
+        whole suite green: a lag off-by-one, numpy's default ddof=0 on the multi variance, a
+        NON-overlapping window (`lp[lag::lag]`), and simple instead of log returns.
+
+        The arithmetic, all exact in binary except the final division:
+          1-step log returns [1, 1, 2, 3, 4, 5], mean 8/3, sum of squared deviations 120/9,
+            so var(ddof=1) = 120/45 = 8/3.
+          2-step log returns [2, 3, 5, 7, 9], mean 26/5, sum of squared deviations 32.8,
+            so var(ddof=1) = 8.2.
+          VR(2) = 8.2 / (2 * 8/3) = 1.5375.
+        A non-overlapping window gives 2.3125, ddof=0 gives 1.23.
+        """
+        series = pd.Series(np.exp(np.array([0.0, 1.0, 2.0, 4.0, 7.0, 11.0, 16.0])))
+        assert variance_ratio(series, lag=2, min_returns=6) == pytest.approx(8.2 / (2 * 8 / 3))
+
+    def test_an_alternating_series_reads_exactly_zero_at_the_reversal_lag(self):
+        """Lag sensitivity, which the series above lacks (it is nearly lag-invariant).
+
+        On log prices [0, 1, 0, 1, ...] every 2-step return is zero — perfect mean reversion
+        — so VR(2) is 0, while the 3-step returns are [1, -1, 1, -1, 1, -1] with
+        var(ddof=1) = 6/5 = 1.2 against a 1-step var of 8/7, giving VR(3) = 1.2 / (3 * 8/7) =
+        0.35. A lag off-by-one flips the first value from 0 to 1.0, which no tolerance band on
+        a random series would have caught.
+        """
+        series = pd.Series(np.exp(np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0])))
+        # Tolerance rather than `== 0.0`: the 2-step differences are zero only because
+        # log(exp(x)) round-trips exactly here, which is a libm property, not arithmetic.
+        assert variance_ratio(series, lag=2, min_returns=6) == pytest.approx(0.0, abs=1e-12)
+        assert variance_ratio(series, lag=3, min_returns=6) == pytest.approx(1.2 / (3 * 8 / 7))
+
+    def test_hand_computed_multi_period_volatility_on_the_same_series(self):
+        """`multi_period_annualized_vol_pct` = sd(lag-step) / sqrt(lag) * sqrt(252) * 100.
+
+        On the same log prices the 2-step returns have var(ddof=1) = 8.2, so the annualized
+        figure is sqrt(8.2 / 2 * 252) * 100 = 3214.3428... — an absurd volatility, which is
+        the point: the series is a synthetic ramp chosen so the arithmetic is checkable by
+        hand rather than a tolerance band on a random walk. This is the number the flagged
+        block promotes to the headline and tells a forecaster to size intervals from, so it
+        needs one assertion that is not the vacuous sqrt(VR) identity.
+        """
+        series = pd.Series(np.exp(np.array([0.0, 1.0, 2.0, 4.0, 7.0, 11.0, 16.0])))
+        vol = multi_period_annualized_vol_pct(series, lag=2, periods_per_year=252, min_returns=6)
+        assert vol == pytest.approx(math.sqrt(8.2 / 2 * 252) * 100)
+
+    def test_a_constant_step_series_returns_none_rather_than_float_noise(self):
+        """A series with no measurable return variation — an administratively fixed quote,
+        or a constant-log-step ramp — makes the ratio a quotient of float rounding noise. An
+        exact ramp read 0.369 before the degeneracy guard, i.e. a confident noise flag
+        manufactured out of the last bits of two mantissas."""
+        ramp = pd.Series(
+            100.0 * np.exp(np.linspace(0.0, 0.5, 300)),
+            index=pd.bdate_range(end="2026-07-17", periods=300),
+        )
+        assert variance_ratio(ramp, lag=5, min_returns=FINANCIAL_VARIANCE_RATIO_MIN_RETURNS) is None
+
+    def test_a_non_positive_value_returns_none_rather_than_a_nan(self):
+        """Log returns are undefined at or below zero (a spread series crosses it), and a
+        nan ratio compares False against the floor — a silent no-flag."""
+        crosses_zero = pd.Series(
+            np.linspace(-1.0, 1.0, 200),
+            index=pd.bdate_range(end="2026-07-17", periods=200),
+        )
+        assert variance_ratio(crosses_zero, lag=5, min_returns=120) is None
+
+    def test_a_flat_series_returns_none_rather_than_dividing_by_zero(self):
+        flat = pd.Series(
+            np.full(200, 5.0),
+            index=pd.bdate_range(end="2026-07-17", periods=200),
+        )
+        assert variance_ratio(flat, lag=5, min_returns=120) is None
 
 
 class TestDerivationFrequencyInvariant:

@@ -2,30 +2,35 @@
 
 Right-sized extraction (2026-07 resolution-source plan): only the genuinely
 generic pieces live here — session construction, a size-capped body read, and
-provider-agnostic HTML/URL helpers (the Datawrapper embed scan below, shared
-so the resolution-source Tier-2 hop and any future agentic-fetch integration
-can't drift on the route). Retry/backoff logic stays provider-private
-(prediction_market's is JSON-API shaped; the resolution-source fetcher
-deliberately does no retries).
+provider-agnostic HTML/URL helpers (the two embed scans below: Datawrapper
+charts, shared so the resolution-source Tier-2 hop and any future
+agentic-fetch integration can't drift on the route, and the routeless
+data-embed providers a page can hide its numbers behind). Retry/backoff logic
+stays provider-private (prediction_market's is JSON-API shaped; the
+resolution-source fetcher deliberately does no retries).
 """
 
 from __future__ import annotations
 
+import asyncio
 import codecs
 import html as html_entities
 import ipaddress
 import logging
 import re
 import socket
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 import aiohttp.abc
 import aiohttp.resolver
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,15 @@ MAX_REDIRECTS: int = 5
 REDIRECT_STATUSES: frozenset[int] = frozenset({301, 302, 303, 307, 308})
 
 
+# Per-header and per-status-line byte cap for every session this module builds. aiohttp's
+# default is 8,190 B, which is smaller than the Content-Security-Policy header real sources
+# send (measured: who.int 8,765 B, visitwales.com 9,697 B) — and a header over the cap
+# rejects the response before any body is read, so the page arrives as `error http=None`,
+# indistinguishable from a host that never answered. 64 KiB is far above anything observed
+# while still bounding what one response's headers can buffer.
+_MAX_HEADER_BYTES: int = 65536
+
+
 # Safari-like UA + full Accept / Accept-Language / Accept-Encoding.
 # FINDINGS (resolution_source_probe): this exact header set recovered
 # 6 extra sources vs Chrome-UA-only (38/50 vs 32/50).
@@ -108,11 +122,18 @@ BROWSER_HEADERS: dict[str, str] = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    # Advertise only codecs the runtime can decode: aiohttp needs the `brotli`
-    # package for `br` (HAS_BROTLI=False here — not a project dep). If we
-    # advertised `br` anyway, a Brotli-preferring server would send it and
-    # aiohttp would raise ClientResponseError on decode, silently dropping the
-    # source. Servers fall back to gzip/deflate cleanly.
+    # The pair the measurement above was taken with, pinned as measured for the resolution-source
+    # fetcher: widening what THIS header set asks for would change the negotiation on every fetch
+    # the 38/50 figure covers, and no measurement covers the wider set. `br` and `zstd` became
+    # DECODABLE when both decoders were declared in pyproject — needed for a body we never
+    # negotiate at all, the Wayback rung's `id_` replay, which carries whatever encoding the
+    # origin sent the archive's crawler. Pinning here does NOT mean nothing we send asks for
+    # them: a session built without explicit headers (`build_session(headers=None)`, which is
+    # what the prediction-market JSON-API providers use) inherits aiohttp's own default
+    # `Accept-Encoding`, and `_gen_default_accept_encoding()` widens that to
+    # `gzip, deflate, br, zstd` the moment both decoders are importable (aiohttp 3.14.3,
+    # measured 2026-09-04). Both facts are pinned by
+    # tests/test_http_fetch.py::TestUnadvertisedContentEncoding.
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -127,20 +148,150 @@ def build_session(
     """Construct a fresh aiohttp session with total + sock_read timeouts and a connection cap.
 
     ``headers=None`` (the default) adds no session-level headers — prediction_market's
-    JSON-API calls rely on that; the resolution-source fetcher passes BROWSER_HEADERS.
+    JSON-API calls rely on that; the resolution-source fetcher passes BROWSER_HEADERS. "No
+    session-level headers" is not "no headers": each request then carries aiohttp's own
+    defaults, whose ``Accept-Encoding`` advertises ``br`` and ``zstd`` as well as the
+    ``gzip, deflate`` pair now that both decoders are installed (see ``BROWSER_HEADERS``).
 
     ``resolver=None`` (the default) uses aiohttp's built-in ThreadedResolver.
     Callers that need to vet resolved IPs (SSRF-sensitive fetchers) pass a
     :class:`FilteringResolver` so aiohttp's own connect-time DNS lookup goes
     through the same predicate as the preflight guard — closing the classic
     DNS-rebinding TOCTOU.
+
+    TLS trust is pinned to certifi's bundle rather than left to whatever store the
+    machine happens to carry. Measured 2026-09-03: trade.gov, a cited government source
+    that fetched fine when it was archived, failed the handshake here with
+    ``CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain`` against
+    the default store and succeeded against certifi's — so which sources are reachable
+    was a property of the machine, and a source lost that way is indistinguishable in
+    telemetry from a dead host.
+
+    The header-size caps are raised from aiohttp's 8,190-byte default because two
+    corpus hosts send a Content-Security-Policy header larger than that (who.int
+    8,765 B, visitwales.com 9,697 B) and aiohttp rejects the whole response before any
+    body is read, landing as ``error http=None``. At 64 KiB who.int returns a readable
+    200 and visitwales an honest 404.
     """
     timeout = aiohttp.ClientTimeout(total=timeout_s, sock_read=timeout_s)
-    connector_kwargs: dict[str, Any] = {"limit": connector_limit}
+    connector_kwargs: dict[str, Any] = {
+        "limit": connector_limit,
+        "ssl": ssl.create_default_context(cafile=certifi.where()),
+    }
     if resolver is not None:
         connector_kwargs["resolver"] = resolver
     connector = aiohttp.TCPConnector(**connector_kwargs)
-    return aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers)
+    return aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        headers=headers,
+        max_line_size=_MAX_HEADER_BYTES,
+        max_field_size=_MAX_HEADER_BYTES,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-host politeness gate (one in-flight request per netloc)
+# ---------------------------------------------------------------------------
+#
+# The map has to outlive a single provider call. The Tier-1 fetcher used to build a
+# fresh dict per call, so six questions running concurrently each got their own
+# semaphore for the same host and hit it six times at once — the opposite of the
+# politeness the semaphore exists to provide, and a plausible contributor to the 403s
+# the escalation ladder is being built to route around.
+#
+# Scoped to the RUNNING event loop, not to the process: an `asyncio.Semaphore` binds to
+# the loop that first blocks on it and raises from any other, so a second `asyncio.run`
+# in the same process (a backtest question loop, the test suite) would otherwise crash
+# on contention. Clearing on a loop change keeps "shared across every concurrent
+# question", which is what one loop means here, without that hazard.
+#
+# The tradeoff, priced after the fact: sharing the map serializes same-host requests ACROSS
+# the concurrent questions, inside a per-question wall that was not raised and that discards
+# pages which already fetched when it fires — so a question that loses the queue can lose its
+# whole section rather than one page. The acquire wait is deliberately unbounded; FUTURE.md
+# item 5 holds both remedies (partial harvest, or a budget-bounded wait) as operator calls.
+_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
+_HOST_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def host_semaphores() -> dict[str, asyncio.Semaphore]:
+    """The shared netloc -> ``Semaphore(1)`` map for the running event loop."""
+    global _HOST_SEMAPHORE_LOOP  # noqa: PLW0603  # module-level cache of the loop the map is bound to
+    loop = asyncio.get_running_loop()
+    if loop is not _HOST_SEMAPHORE_LOOP:
+        _HOST_SEMAPHORES.clear()
+        _HOST_SEMAPHORE_LOOP = loop
+    return _HOST_SEMAPHORES
+
+
+def reset_host_semaphores() -> None:
+    """Drop every cached semaphore. For tests, so one test's gate can't hold another's."""
+    global _HOST_SEMAPHORE_LOOP  # noqa: PLW0603  # paired with host_semaphores' cache
+    _HOST_SEMAPHORES.clear()
+    _HOST_SEMAPHORE_LOOP = None
+
+
+# ---------------------------------------------------------------------------
+# Shared PDF-parse gate (at most two documents parsing at once, loop-wide)
+# ---------------------------------------------------------------------------
+#
+# Every route that parses a fetched document contends here — the Tier-1 resolution-source
+# rung and the gap-fill v2 local-document ladder — because the bound has to hold across
+# them, not inside each. The rationale is the one `agentic/local_document.py` states for
+# its own cap verbatim: pypdf decodes every content stream, so a parse is CPU-bound AND
+# holds its body for the duration; a Tier-1 fan-out is up to RESOLUTION_SOURCE_MAX_URLS
+# per question across DEFAULT_MAX_CONCURRENT_RESEARCH questions, so unbounded that is
+# ~30 bodies of up to DOCUMENT_TEXT_PDF_MAX_BYTES plus their parse arenas — a MemoryError
+# no soft-fail boundary catches. Two slots covers a real burst while bounding the peak,
+# and measurement says more would not buy throughput anyway: pypdf is pure Python, so six
+# concurrent parses of a 220-page document took 10.20 s against 1.66 s solo (6.13x on a
+# 10-core machine) while starving the loop that every other provider's I/O runs on.
+#
+# Deliberately hardcoded rather than a constants.py entry: it is a property of pypdf and
+# the default ThreadPoolExecutor's width, not a tuning knob anyone should reach for
+# without re-measuring the numbers above.
+_PDF_PARSE_SLOTS = 2
+_PDF_PARSE_SEMAPHORE: asyncio.Semaphore | None = None
+_PDF_PARSE_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def pdf_parse_semaphore() -> asyncio.Semaphore:
+    """The shared ``Semaphore(2)`` bounding concurrent document parses on the running loop.
+
+    Loop-scoped for the same reason :func:`host_semaphores` is: an ``asyncio.Semaphore``
+    binds to the loop that first blocks on it and raises from any other, so a second
+    ``asyncio.run`` in one process (a backtest's question loop, the test suite) would
+    otherwise crash on contention.
+    """
+    global _PDF_PARSE_SEMAPHORE, _PDF_PARSE_SEMAPHORE_LOOP  # noqa: PLW0603  # module-level cache of the loop's gate
+    loop = asyncio.get_running_loop()
+    if _PDF_PARSE_SEMAPHORE is None or loop is not _PDF_PARSE_SEMAPHORE_LOOP:
+        _PDF_PARSE_SEMAPHORE = asyncio.Semaphore(_PDF_PARSE_SLOTS)
+        _PDF_PARSE_SEMAPHORE_LOOP = loop
+    return _PDF_PARSE_SEMAPHORE
+
+
+def reset_pdf_parse_semaphore() -> None:
+    """Drop the cached parse gate. For tests, so one test's held slot can't gate another's."""
+    global _PDF_PARSE_SEMAPHORE, _PDF_PARSE_SEMAPHORE_LOOP  # noqa: PLW0603  # paired with pdf_parse_semaphore's cache
+    _PDF_PARSE_SEMAPHORE = None
+    _PDF_PARSE_SEMAPHORE_LOOP = None
+
+
+def semaphore_for_host(url: str, sems: dict[str, asyncio.Semaphore]) -> asyncio.Semaphore:
+    """Get-or-create the ``Semaphore(1)`` gating requests to ``url``'s netloc.
+
+    Takes the map explicitly so both callers keep their own scope: Tier-1 passes
+    :func:`host_semaphores` (shared across concurrent questions) and the gap-fill v2
+    loop passes its own module global.
+    """
+    host = urlparse(url).netloc
+    sem = sems.get(host)
+    if sem is None:
+        sem = asyncio.Semaphore(1)
+        sems[host] = sem
+    return sem
 
 
 _READ_CHUNK_BYTES = 65536
@@ -374,6 +525,248 @@ def extract_datawrapper_charts(html_text: str) -> list[DatawrapperChartRef]:
         title = html_entities.unescape(raw_title) if raw_title else None
         charts.append(DatawrapperChartRef(chart_id=chart_id, title=title))
     return charts
+
+
+# ---------------------------------------------------------------------------
+# Third-party data embeds we have NO route to (resolution-source Tier-1)
+# ---------------------------------------------------------------------------
+#
+# The Datawrapper scan above exists because trafilatura drops embeds; these
+# providers are the same failure with no second hop behind it. Flourish's own
+# developer docs state the mechanism: "A Flourish embed is a placeholder plus a
+# script that builds the chart in the browser. AI assistants and crawlers
+# usually read a page's raw HTML once and don't run JavaScript, so to them the
+# chart doesn't exist."
+#
+# qids 44554/44556 (2026-08-31 dossiers): racetothewh.com/senate/26 returned
+# HTTP 200 and extracted 2.9k chars of forecast background, while the resolving
+# Nebraska polling average lived in two Infogram iframes. The fetch reported an
+# unqualified `success` and the section rendered under the "primary grading
+# evidence" caveat with zero polling numbers in it, byte-identical across three
+# questions. Naming the providers is what lets a caller either withhold an
+# embed-only page (`no_resolving_content`) or tell the forecaster the numbers
+# are not in the text it did get.
+#
+# Datawrapper is deliberately NOT here: it has a live-dataset route (the Tier-2
+# hop), so its embeds are readable and its outcome is carried by the hop's own
+# FetchStatus.
+#
+# Each provider matches either its embed-container marker (the class/element the
+# loader script looks for) or its own host, with `\\?/` after the host so a
+# JSON-escaped embed URL inside a `data-attrs` blob still matches — the same
+# tolerance the Datawrapper id regex carries.
+_DATA_EMBED_PROVIDER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("infogram", re.compile(r"infogram-embed|infogram-async|(?:e\.)?infogram\.com\\?/", re.IGNORECASE)),
+    ("flourish", re.compile(r"flourish-embed|(?:public\.)?flourish\.studio\\?/|flo\.uri\.sh\\?/", re.IGNORECASE)),
+    (
+        "tableau",
+        re.compile(
+            r"tableauPlaceholder|tableauViz|<tableau-viz|public\.tableau\.com\\?/"
+            r"|tableauusercontent\.com\\?/|tableau\.com\\?/views\\?/",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def unreadable_data_embed_providers(html_text: str) -> list[str]:
+    """Names of third-party data-embed providers referenced by ``html_text``.
+
+    Runs on RAW page HTML for the same reason the Datawrapper scan does:
+    trafilatura emits neither iframe ``src`` attributes nor embed-script URLs at
+    any setting, so extracted text can never reveal that a chart was there.
+
+    One entry per provider, ordered by where each first appears. Only providers
+    with no fetch route of their own are reported (see the note above on Datawrapper's exemption), so a
+    non-empty return means "this page displays data we cannot read".
+    """
+    if not html_text:
+        return []
+    hits: list[tuple[int, str]] = []
+    for provider, pattern in _DATA_EMBED_PROVIDER_PATTERNS:
+        match = pattern.search(html_text)
+        if match is not None:
+            hits.append((match.start(), provider))
+    return [provider for _, provider in sorted(hits)]
+
+
+# ---------------------------------------------------------------------------
+# Meta-refresh redirects (a hop no HTTP status announces)
+# ---------------------------------------------------------------------------
+#
+# cdc.gov's surveillance pages answer 200 with a 234-340 byte stub whose only content is
+# `<meta http-equiv="refresh" content="0; url=...">` pointing at the real page. The
+# manual redirect loop never sees it — there is no 3xx and no `Location` header — so the
+# fetch classified the stub as a JS wall and the resolving numbers were never fetched.
+#
+# The target is returned RAW (not joined against a base) so the caller keeps ownership of
+# resolution and of the SSRF re-guard every derived URL has to pass: this module has no
+# business deciding what is safe to fetch.
+_META_TAG_RE = re.compile(r"<meta\s([^>]*)>", re.IGNORECASE)
+_HTTP_EQUIV_REFRESH_RE = re.compile(r"http-equiv\s*=\s*[\"']?\s*refresh\b", re.IGNORECASE)
+_CONTENT_ATTR_RE = re.compile(r"content\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.IGNORECASE)
+# `content="0; url=/real/page"`, `content='0;URL=…'`, and the unquoted-inner-value form.
+# The delay is deliberately ignored: a long delay is still a redirect, and the pages that
+# use one for a "you are being redirected" interstitial carry no resolving content either.
+_REFRESH_URL_RE = re.compile(r"""\burl\s*=\s*['\"]?([^'\"\s;]+)""", re.IGNORECASE)
+
+
+def meta_refresh_target(html_text: str) -> str | None:
+    """The (possibly relative) URL a ``<meta http-equiv="refresh">`` tag points at, or None.
+
+    Attribute order is not assumed — both ``http-equiv``-first and ``content``-first
+    spellings occur — and HTML entities in the target are unescaped, since a query string
+    written ``&amp;`` in markup has to be dialled as ``&``. The first such tag wins: a page
+    with two conflicting refresh targets has a browser race in it, and taking the first is
+    what a browser does.
+
+    A ``;`` ends the target, which is the delimiter the unquoted ``content=0;url=/p`` form
+    needs; the cost is a target carrying a literal semicolon (``;jsessionid=``), which no
+    observed stub has.
+    """
+    if not html_text:
+        return None
+    for tag in _META_TAG_RE.finditer(html_text):
+        attrs = tag.group(1)
+        if not _HTTP_EQUIV_REFRESH_RE.search(attrs):
+            continue
+        content = _CONTENT_ATTR_RE.search(attrs)
+        if content is None:
+            continue
+        # Unescaped BEFORE the url match, not after: markup writes the target's own
+        # quotes as `&#x27;` and its query separators as `&amp;`, and matching first
+        # would stop at the `;` ending the entity — returning a bare `'` for
+        # `content="0; URL=&#x27;/page&#x27;"` and truncating `?a=1&amp;b=2` at the `&`.
+        value = html_entities.unescape(content.group(1) or content.group(2) or content.group(3) or "")
+        url_match = _REFRESH_URL_RE.search(value)
+        if url_match is None:
+            continue
+        target = url_match.group(1).strip()
+        if target:
+            return target
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ARIA tables (a real table wearing a div costume)
+# ---------------------------------------------------------------------------
+#
+# cdc.gov's outbreak stat blocks are `<div role="table">` / `role="row"` /
+# `role="rowheader"` / `role="cell"`, which is valid accessible markup and completely
+# invisible to trafilatura's table handling: it flattens the block to whichever values
+# happened to sit inside a `<p>` and drops the rest, so the cyclosporiasis page rendered
+# "17,180 / 2 / 48 plus the District of Columbia" with no labels and no hospitalization
+# count at all (922, in a bare `<div role="cell">`). Rewritten to real table tags, the
+# same page extracts "| Hospitalizations | 922 |".
+#
+# `rowgroup` is mapped too even though ARIA-wise it is optional scaffolding: the CDC block
+# has one, and a `<tr>` whose parent is neither `table` nor `tbody` is dropped by lxml's
+# HTML parser, so leaving it a div would defeat the whole rewrite.
+_ARIA_ROLE_TAGS: dict[str, str] = {
+    "table": "table",
+    "grid": "table",
+    "rowgroup": "tbody",
+    "row": "tr",
+    "rowheader": "th",
+    "columnheader": "th",
+    "cell": "td",
+    "gridcell": "td",
+}
+# One `[^>]*` for the attribute region, deliberately not quote-aware: a `>` inside an
+# attribute value truncates our view of that ONE tag (costing at most a rewrite we would
+# have made), whereas a quote-aware form desynchronises for the rest of the document the
+# moment a page carries an unbalanced quote — which real pages, and truncated captures of
+# them, routinely do. Single quantifier, so no backtracking cliff either (the measured
+# 3.4 s-at-200-KiB shape in `resolution_body_text` needed two).
+_ARIA_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>")
+_ARIA_ROLE_ATTR_RE = re.compile(r"""(?:^|\s)role\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
+# Tags that never close, so they must not go on the nesting stack.
+_VOID_HTML_TAGS: frozenset[str] = frozenset(
+    {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+)
+
+
+def rewrite_aria_tables(html_text: str) -> str | None:
+    """``html_text`` with ARIA-table roles rewritten to real table tags, or None.
+
+    None means no role-bearing element was found, which lets the caller hand trafilatura
+    the ORIGINAL bytes — so a page with no ARIA table extracts byte-identically to before
+    this rung existed, and the encoding detection stays trafilatura's job.
+
+    Nesting is tracked with an explicit stack rather than by pairing a tag with the next
+    close of its name: every element in the CDC block is a ``div``, so "the next
+    ``</div>``" is the innermost cell, not the table. A close tag matches the nearest
+    open of the same name and discards whatever was left unclosed above it, which is how
+    the unclosed ``<p>`` inside a cell is absorbed. Anything still open at the end is
+    rewritten WITHOUT a close tag: a truncated capture (and plenty of live HTML) never
+    closes its outer divs, and lxml's recovering parser closes them for us — whereas
+    leaving the outer ``role="table"`` div alone would strand every rewritten ``<tr>``
+    outside a table and lose the block entirely.
+    """
+    if not html_text:
+        return None
+    edits = _aria_table_edits(html_text)
+    if not edits:
+        return None
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, replacement in sorted(edits):
+        pieces.append(html_text[cursor:start])
+        pieces.append(replacement)
+        cursor = end
+    pieces.append(html_text[cursor:])
+    return "".join(pieces)
+
+
+def _aria_role_tag(attrs: str) -> str | None:
+    """The real tag name an element's ``role`` attribute maps to, if any."""
+    role_match = _ARIA_ROLE_ATTR_RE.search(attrs)
+    if role_match is None:
+        return None
+    role = (role_match.group(1) or role_match.group(2) or role_match.group(3) or "").strip().lower()
+    return _ARIA_ROLE_TAGS.get(role)
+
+
+def _aria_table_edits(html_text: str) -> list[tuple[int, int, str]]:
+    """``(start, end, replacement)`` spans rewriting every ARIA-table tag pair."""
+    # (tag name, mapped tag or None, open-tag start, open-tag end)
+    stack: list[tuple[str, str | None, int, int]] = []
+    edits: list[tuple[int, int, str]] = []
+    for tag in _ARIA_TAG_RE.finditer(html_text):
+        name = tag.group(2).lower()
+        if tag.group(1):
+            _close_aria_tag(stack, edits, name, tag)
+            continue
+        attrs = tag.group(3)
+        if name in _VOID_HTML_TAGS or attrs.rstrip().endswith("/"):
+            continue
+        stack.append((name, _aria_role_tag(attrs), tag.start(), tag.end()))
+    edits.extend(
+        (open_start, open_end, f"<{mapped}>") for _name, mapped, open_start, open_end in stack if mapped is not None
+    )
+    return edits
+
+
+def _close_aria_tag(
+    stack: list[tuple[str, str | None, int, int]],
+    edits: list[tuple[int, int, str]],
+    name: str,
+    tag: re.Match[str],
+) -> None:
+    """Pair a close tag with the nearest open of the same name, recording the rewrite.
+
+    Whatever sat above the match was left unclosed (the ``<p>`` inside a CDC cell) and is
+    dropped with it. A close tag matching nothing on the stack is ignored.
+    """
+    for depth in range(len(stack) - 1, -1, -1):
+        if stack[depth][0] != name:
+            continue
+        _, mapped, open_start, open_end = stack[depth]
+        if mapped is not None:
+            edits.append((open_start, open_end, f"<{mapped}>"))
+            edits.append((tag.start(), tag.end(), f"</{mapped}>"))
+        del stack[depth:]
+        return
 
 
 _DATAWRAPPER_CHART_ID_SHAPE = re.compile(r"[A-Za-z0-9]{5}\Z")

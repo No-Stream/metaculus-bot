@@ -12,10 +12,21 @@ tests loudly instead of silently dropping records from the archive:
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
 * MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
+* RESOLUTION_SOURCE_FETCH -> metaculus_bot/research/resolution_source.py:_log_fetch_outcome_markers
+* RESOLUTION_SOURCE_ESCALATION -> metaculus_bot/research/resolution_source.py (per escalated rung)
+* RESOLUTION_SOURCE_URLCONTEXT_{ROBOTS_SKIP,UNGROUNDED_SUPPRESSED,NOT_ADDRESSED}
+  -> metaculus_bot/research/resolution_source.py (the paid rung's three per-URL lines)
+* RENDERED_FETCH_OFF_HOST -> metaculus_bot/research/rendered_fetch.py:render_page
+  (the shared render transport refusing a DOM for landing off its DNS pin)
+* GEMINI_USAGE       -> metaculus_bot/research/gemini_search.py,
+  metaculus_bot/research/agentic/tool_backends.py and
+  metaculus_bot/research/resolution_source.py (one emitter shape, three surfaces,
+  told apart by the role field)
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
-* STACKER_OUTCOME/TOOLS_USED/ANCHOR_OVERSHOOT_PP/CLAUSE_PRODUCT_DIVERGENCE_PP
-  -> metaculus_bot/comment/markers.py (HTML-comment markers; see module docstring
-     in markers.py for why they rarely appear in run logs).
+* LITELLM_CALLBACK_DRAIN_TIMEOUT -> metaculus_bot/credit_telemetry.py:drain_litellm_callbacks
+  (the completeness flag on that run's CREDIT_ROLE_SPEND rows)
+* STACKER_OUTCOME/TOOLS_USED -> metaculus_bot/comment/markers.py (HTML-comment
+  markers; see module docstring in markers.py for why they rarely appear in run logs).
 """
 
 import json
@@ -159,8 +170,9 @@ CREDIT_SPEND_UNSETTLED_SOURCE_LINE = (
 )
 CREDIT_FLOOR_BREACH_LINE = (
     PFX_WARN + "CREDIT_FLOOR_BREACH: key=donated remaining=45.00 floor=50.00 — donated OpenRouter "
-    "balance needs a top-up; run completed normally. cli.main logs the resulting "
-    "exit decision (non-zero unless credit alerting is currently suppressed)."
+    "balance is below the early-warning floor, so ask Metaculus for a top-up before it runs dry; "
+    "the key is not necessarily empty and the run completed normally. cli.main logs the exit "
+    "decision unless a higher-priority degradation alert exits first."
 )
 
 _META = {
@@ -402,6 +414,155 @@ class TestGhostForecastJson:
         assert _parse_one(GHOST_FORECAST_JSON_LINE)["marker"] == "ghost_forecast_json"
 
 
+# Copied from the one emitting format string
+# (research/agentic/tools.py:_throttled_fetch_outcome). `phrase` is last because it holds a
+# multi-word entry of `fetch_outcomes.FETCH_THROTTLE_PHRASES`, so the spec captures it to
+# end-of-line. The URL and body below are the q45191 event: this is the 2022-08-31 daily
+# summary the loop asked for at step 11 and again at step 23 (from that run's archived
+# transcript), and ogimet.com answered both with a rate-limit interstitial under HTTP 200.
+# `chars` is the whitespace-stripped length the rule measured, 303 of the archived body's 304.
+_OGIMET_2022_URL = (
+    "https://www.ogimet.com/cgi-bin/gsynext?lang=en&state=United+S&rank=10&ano=2022&mes=08&day=31&hora=23&Send=send"
+)
+AGENTIC_FETCH_THROTTLED_LINE = (
+    PFX + "AGENTIC_FETCH_THROTTLED: url=" + _OGIMET_2022_URL + " method=rendered chars=303 phrase=query per"
+)
+
+
+class TestAgenticFetchThrottled:
+    """Per-fetch throttle-interstitial record.
+
+    Worth a spec because the event had no trace whatever before it, and its failure mode is
+    looking like a success: on q45191 two throttled fetches reached the driver as
+    ``status: ok``, were cached, and were replayed on its own retry. The pair of fields the
+    archive needs is ``chars`` + ``phrase`` — together they say whether a prod fire was a real
+    throttle or the rule over-reaching, which is what the cap and the phrase list get retuned
+    on.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(AGENTIC_FETCH_THROTTLED_LINE)
+        assert rec["marker"] == "agentic_fetch_throttled"
+        # A query-string URL with & and + survives the \S+ capture whole.
+        assert rec["url"] == _OGIMET_2022_URL
+        # Which rung served the interstitial: the receipt's arrived on the rendered one, and a
+        # plain-vs-rendered split says whether escalating spent a second same-host request.
+        assert rec["method"] == "rendered"
+        assert rec["chars"] == 303
+        assert rec["phrase"] == "query per"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        # The tool handlers run below the loop's log_prefix and have no question id, exactly
+        # like the credit markers. Asserting it here keeps a future "add question=" edit from
+        # landing without also declaring a qid_kind.
+        rec = _parse_one(AGENTIC_FETCH_THROTTLED_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_a_single_word_phrase_still_parses(self):
+        rec = _parse_one(PFX + "AGENTIC_FETCH_THROTTLED: url=https://x.test/a method=plain chars=42 phrase=ratelimit")
+        assert rec["phrase"] == "ratelimit"
+        assert rec["chars"] == 42
+
+
+# Copied from the one emitting format string
+# (research/agentic/local_document.py:log_local_document_read). The pdf_local figures are the
+# 2026-09-03 measurement this rung was built on: pypdf pulled 833,450 chars out of the 220-page
+# 6.7 MB International AI Safety Report in 5.3 s while the paid reader returned nothing for the
+# same file. `passages` is n/a there because a pdf_local fetch serves the text itself and
+# selects nothing; the digest_local line below is where the count carries information.
+AGENTIC_FETCH_LOCAL_DOC_PDF_LINE = (
+    PFX + "AGENTIC_FETCH_LOCAL_DOC: url=https://internationalaisafetyreport.org/report.pdf "
+    "method=pdf_local chars=833450 pages=220 passages=n/a"
+)
+AGENTIC_FETCH_LOCAL_DOC_DIGEST_LINE = (
+    PFX + "AGENTIC_FETCH_LOCAL_DOC: url=https://example.gov/tracker method=digest_local "
+    "chars=41200 pages=n/a passages=6"
+)
+
+
+class TestAgenticFetchLocalDoc:
+    """Per-document record of a read the ladder did for free.
+
+    Worth a spec because it is how the local-first rung gets measured at all: before it, every
+    PDF the gap-fill v2 driver met went to a paid Gemini url_context read and the only trace of
+    one was the month's spend. The two methods are different reads — a fetch serving a PDF's
+    extracted text, and a read_document answering an ask from selected passages — so the rate
+    of each, and the digest's passage count, are what say whether the free route is working.
+    """
+
+    def test_pdf_fields(self):
+        rec = _parse_one(AGENTIC_FETCH_LOCAL_DOC_PDF_LINE)
+        assert rec["marker"] == "agentic_fetch_local_doc"
+        assert rec["url"] == "https://internationalaisafetyreport.org/report.pdf"
+        assert rec["method"] == "pdf_local"
+        assert rec["chars"] == 833450
+        assert rec["pages"] == 220
+        # A pdf_local fetch serves the text and selects nothing, so there is no count to give.
+        assert rec["passages"] is None
+
+    def test_digest_fields(self):
+        rec = _parse_one(AGENTIC_FETCH_LOCAL_DOC_DIGEST_LINE)
+        assert rec["method"] == "digest_local"
+        assert rec["chars"] == 41200
+        # An HTML page has no pages to number; the passage count is the digest's own answer.
+        assert rec["pages"] is None
+        assert rec["passages"] == 6
+
+    def test_zero_passages_is_recorded_not_dropped(self):
+        # The reading that matters most: the digest ran and the document does not discuss what
+        # was asked. In the block itself that reads like any other successful read, so a 0 here
+        # must survive as 0 rather than as "no data".
+        rec = _parse_one(
+            PFX + "AGENTIC_FETCH_LOCAL_DOC: url=https://x.test/a method=digest_local chars=900 pages=3 passages=0"
+        )
+        assert rec["passages"] == 0
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(AGENTIC_FETCH_LOCAL_DOC_PDF_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+
+# Copied from the one emitting format string (research/agentic/tools.py:read_document). The host
+# is the 2026-09-03 receipt: the verification probe's url_context call returned
+# URL_RETRIEVAL_STATUS_ERROR on internationalaisafetyreport.org, whose robots.txt carries
+# `User-agent: Google-Extended` / `Disallow: /`, while the identical call on a robots-allowed host
+# retrieved.
+AGENTIC_URLCONTEXT_ROBOTS_SKIP_LINE = (
+    PFX + "AGENTIC_URLCONTEXT_ROBOTS_SKIP: url=https://internationalaisafetyreport.org/chapters/2/ "
+    "host=internationalaisafetyreport.org"
+)
+
+
+class TestAgenticUrlContextRobotsSkip:
+    """Per-URL record of a paid document read the robots pre-check refused to make.
+
+    Worth a spec because the pre-check trades one free request per host for a possible paid call,
+    and this line is the only measurement of that trade: each record is a call not billed, while a
+    rate far above the handful of hosts that publish the directive would mean the group parser is
+    over-matching and withholding reads we could have had.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(AGENTIC_URLCONTEXT_ROBOTS_SKIP_LINE)
+        assert rec["marker"] == "agentic_urlcontext_robots_skip"
+        assert rec["url"] == "https://internationalaisafetyreport.org/chapters/2/"
+        # The verdict is cached and applied per HOST, so the host is the unit a rate is taken over.
+        assert rec["host"] == "internationalaisafetyreport.org"
+
+    def test_a_query_string_url_survives_whole(self):
+        rec = _parse_one(
+            PFX + "AGENTIC_URLCONTEXT_ROBOTS_SKIP: url=https://x.test/a?b=1&c=2+3 host=x.test",
+        )
+        assert rec["url"] == "https://x.test/a?b=1&c=2+3"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(AGENTIC_URLCONTEXT_ROBOTS_SKIP_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+
 class TestOpenBoundPiling:
     def test_fields(self):
         rec = _parse_one(OPEN_BOUND_PILING_LINE)
@@ -588,6 +749,55 @@ class TestMarketRankingDegraded:
         assert len(harvested["market_ranking"]) == 1
 
 
+# Copied from the emitting format string (prediction_market.py:_log_tier_caps). One line per
+# question whose top-tier grade the staleness cap refused, and none at all otherwise.
+MARKET_TIER_CAPPED_LINE = PFX + "MARKET_TIER_CAPPED: question=45163 rows=1 capped=manifold@0"
+MARKET_TIER_CAPPED_MULTI_LINE = PFX + "MARKET_TIER_CAPPED: question=45163 rows=2 capped=manifold@0,kalshi@3"
+
+
+class TestMarketTierCapped:
+    """The staleness tier cap, harvested because it fires on nothing yet.
+
+    Zero of the 102 archived snapshots carry a cap, and q45163's own offending row was graded
+    one tier below the cap's reach, so the interesting record is the FIRST one: it means the
+    ranker called a long-closed market same-quantity-same-date. A marker that is expected to
+    stay empty still needs a spec, or "did this ever fire in prod" becomes a re-scrape of GHA
+    logs that expire at 90 days.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(MARKET_TIER_CAPPED_LINE)
+        assert rec["marker"] == "market_tier_capped"
+        assert rec["rows"] == 1
+        assert rec["capped"] == "manifold@0"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(MARKET_TIER_CAPPED_LINE)
+        # prediction_market.py emits question.id_of_question, matching its three siblings.
+        assert rec["qid"] == 45163
+        assert rec["qid_kind"] == "question_id"
+
+    def test_a_multi_row_cap_survives_whole(self):
+        # `capped` is a comma-joined venue@rank list with no spaces, so the whole field has
+        # to arrive as one string — a per-row split is the analyst's job, not the parser's.
+        rec = _parse_one(MARKET_TIER_CAPPED_MULTI_LINE)
+        assert rec["rows"] == 2
+        assert rec["capped"] == "manifold@0,kalshi@3"
+
+    def test_does_not_collide_with_the_two_market_ranking_specs(self):
+        # All three tokens start `MARKET_`, and both ranking specs sit EARLIER in
+        # MARKER_SPECS, so under the one-marker-per-line break a loose prefix match there
+        # would have swallowed every cap line before its own spec was reached. Pinned in
+        # both directions: each of the three lines harvests as exactly itself.
+        harvested = parse_log_text(
+            "\n".join([MARKET_TIER_CAPPED_LINE, MARKET_RANKING_RANKED_LINE, MARKET_RANKING_DEGRADED_SHAPE_LINE]) + "\n",
+            **_META,
+        )
+        assert len(harvested["market_tier_capped"]) == 1
+        assert len(harvested["market_ranking"]) == 1
+        assert len(harvested["market_ranking_degraded"]) == 1
+
+
 # Verbatim emitted bytes from metaculus_bot/numeric/pipeline.py (captured under the prod log
 # format), metaculus_bot/numeric/utils.py, and metaculus_bot/spread_metrics.py. All three
 # lines carry trailing em-dash prose, so none of the specs may be end-anchored.
@@ -610,6 +820,21 @@ SPREAD_UNDEFINED_LINE = (
     "2026-08-25 23:07:17,044 - metaculus_bot.spread_metrics - WARNING - "
     "SPREAD_UNDEFINED: question=45363 qtype=numeric denominator=-0 models=3 — key-percentile spread "
     "is unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement"
+)
+# Verbatim bytes from replaying q45065's opus-4.8 declaration through
+# build_numeric_distribution (numeric/pchip_cdf.py safe_cdf_bounds), and from the
+# conc21_closed snap golden in tests/test_discrete_snap.py.
+CDF_MAXSTEP_CLIP_LINE = (
+    "2026-08-31 23:02:02,257 - metaculus_bot.numeric.pchip_cdf - WARNING - "
+    "CDF_MAXSTEP_CLIP: question=45065 model=openrouter/anthropic/claude-opus-4.8 "
+    "clipped_mass=0.517852 over_cap_bins=1 bins_displaced=4 max_offset_bins=2 "
+    "pre_max_step=0.717852 max_step=0.200000"
+)
+CDF_MAXSTEP_CLIP_ENSEMBLE_LINE = (
+    "2026-08-31 23:02:02,258 - metaculus_bot.numeric.pchip_cdf - WARNING - "
+    "CDF_MAXSTEP_CLIP: question=None model=ensemble_discrete_snap "
+    "clipped_mass=0.399018 over_cap_bins=3 bins_displaced=4 max_offset_bins=1 "
+    "pre_max_step=0.499480 max_step=0.200000"
 )
 NUMERIC_PCHIP_FALLBACK_LINE = (
     "2026-06-11 21:14:03,512 - metaculus_bot.numeric.diagnostics - WARNING - "
@@ -677,6 +902,41 @@ class TestNumericAggregateGridMismatch:
         rec = _parse_one(NUMERIC_AGGREGATE_GRID_MISMATCH_LINE)
         assert rec["qid"] == 44620
         assert rec["qid_kind"] == "question_id"
+
+
+class TestCdfMaxstepClip:
+    """The repair that reshaped 47% of q45065's published mass while logging at DEBUG.
+
+    Not alertable — the per-bin cap is the platform's — but the two displacement fields
+    are what make the repair's own POLICY auditable after the fact, which is exactly
+    what was missing when the retired slack-proportional redistribution was diagnosed
+    a month after the forecast resolved.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(CDF_MAXSTEP_CLIP_LINE)
+        assert rec["marker"] == "cdf_maxstep_clip"
+        assert rec["model"] == "openrouter/anthropic/claude-opus-4.8"
+        assert rec["clipped_mass"] == pytest.approx(0.517852)
+        assert rec["over_cap_bins"] == 1
+        assert rec["bins_displaced"] == 4
+        assert rec["max_offset_bins"] == 2
+        assert rec["pre_max_step"] == pytest.approx(0.717852)
+        assert rec["max_step"] == pytest.approx(0.2)
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(CDF_MAXSTEP_CLIP_LINE)
+        assert rec["qid"] == 45065
+        assert rec["qid_kind"] == "question_id"
+
+    def test_ensemble_stage_label_and_absent_question(self):
+        # The aggregation stages have no forecaster to name, so they label the stage; a
+        # caller with no question in scope renders "None", which must coerce to a real
+        # absent field rather than the string.
+        rec = _parse_one(CDF_MAXSTEP_CLIP_ENSEMBLE_LINE)
+        assert rec["model"] == "ensemble_discrete_snap"
+        assert rec["qid"] is None
+        assert rec["over_cap_bins"] == 3
 
 
 class TestNumericPchipFallback:
@@ -802,6 +1062,559 @@ class TestFinancialStaleLatest:
         assert "qid_kind" not in rec
 
 
+# Copied from the one emitting format string (research/noise_flag.py:noise_flag_line, called
+# by financial_data.py:_volatility_lines and ts_render.py:_realized_vol_lines). One shape for
+# both surfaces: only financial_data computes a long volatility window, so `long_vol` reads
+# None on the anchor surface exactly as it does on a series too short to hold one.
+FINANCIAL_NOISE_FLAG_YFINANCE_LINE = (
+    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data symbol=USDSZL=X vr_lag=5 vr=0.369 floor=0.6 "
+    "short_vol=17.9 long_vol=15.2 robust_vol=10.8"
+)
+FINANCIAL_NOISE_FLAG_TS_ANCHOR_LINE = (
+    PFX + "FINANCIAL_NOISE_FLAG: surface=ts_anchor symbol=CSUSHPISA vr_lag=5 vr=0.412 floor=0.6 "
+    "short_vol=14.6 long_vol=None robust_vol=9.4"
+)
+FINANCIAL_NOISE_FLAG_NO_ESTIMATES_LINE = (
+    PFX + "FINANCIAL_NOISE_FLAG: surface=financial_data symbol=USDSZL=X vr_lag=5 vr=0.369 floor=0.6 "
+    "short_vol=17.9 long_vol=None robust_vol=None"
+)
+
+
+class TestFinancialNoiseFlag:
+    """The vendor-noise flag, one spec for both emitting surfaces.
+
+    Informational and not alertable, like its stale-latest sibling: the rendered block already
+    tells the forecaster the one-day-return volatility is inflated and leads with the
+    noise-robust figure instead. Harvesting it is what turns "how often does each surface
+    serve a noise-dominated volatility" into a query after the 90-day GHA log expiry.
+    """
+
+    def test_yfinance_surface_fields(self):
+        rec = _parse_one(FINANCIAL_NOISE_FLAG_YFINANCE_LINE)
+        assert rec["marker"] == "financial_noise_flag"
+        assert rec["surface"] == "financial_data"
+        # The ticker the flagged volatility was computed on: without it two flagged
+        # identifiers in one run harvest as byte-identical anonymous records.
+        assert rec["symbol"] == "USDSZL=X"
+        assert rec["vr_lag"] == 5
+        assert rec["vr"] == 0.369
+        assert rec["floor"] == 0.6
+        assert rec["short_vol"] == 17.9
+        assert rec["long_vol"] == 15.2
+        assert rec["robust_vol"] == 10.8
+
+    def test_ts_anchor_surface_reads_none_for_the_long_window(self):
+        # The anchor renders one volatility and computes no long window, so `long_vol` reads
+        # None there. Same field set as the yfinance surface, which is what lets the spec
+        # require every group: `surface` is what tells "this emitter has no long window" from
+        # "this series was too short for one".
+        rec = _parse_one(FINANCIAL_NOISE_FLAG_TS_ANCHOR_LINE)
+        assert rec["surface"] == "ts_anchor"
+        assert rec["symbol"] == "CSUSHPISA"
+        assert rec["short_vol"] == 14.6
+        assert rec["robust_vol"] == 9.4
+        assert rec["long_vol"] is None
+
+    def test_a_refused_estimate_reads_none(self):
+        # Both estimators return None on a series with no measurable return variation (an
+        # administratively fixed quote), and the emitter renders that as "None" — a
+        # _NONE_SENTINELS member, so it coerces to None instead of a fabricated 0.0.
+        rec = _parse_one(FINANCIAL_NOISE_FLAG_NO_ESTIMATES_LINE)
+        assert rec["long_vol"] is None
+        assert rec["robust_vol"] is None
+        assert rec["short_vol"] == 17.9
+
+    def test_no_question_ref(self):
+        # Per-identifier like the stale-latest sibling, and neither call site has the
+        # question in scope, so the record carries no qid at all.
+        rec = _parse_one(FINANCIAL_NOISE_FLAG_YFINANCE_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_collide_with_the_stale_latest_spec(self):
+        # Both tokens start `FINANCIAL_`, and financial_stale_latest sits EARLIER in
+        # MARKER_SPECS, so under the one-marker-per-line break a loose prefix match there
+        # would have swallowed every noise-flag line.
+        harvested = parse_log_text(
+            FINANCIAL_NOISE_FLAG_YFINANCE_LINE + "\n" + FINANCIAL_STALE_LATEST_YFINANCE_LINE + "\n", **_META
+        )
+        assert len(harvested["financial_noise_flag"]) == 1
+        assert len(harvested["financial_stale_latest"]) == 1
+
+
+# Copied from the emitting format string
+# (resolution_source.py:_log_fetch_outcome_markers). One line per fetched URL: a
+# Tier-1 cited page, and a Tier-2 Datawrapper dataset hop told apart by its CDN url.
+RESOLUTION_SOURCE_FETCH_OK_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
+    "status=ok http=200 embeds=none"
+)
+RESOLUTION_SOURCE_FETCH_EMBED_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
+    "status=ok http=200 embeds=infogram,tableau"
+)
+RESOLUTION_SOURCE_FETCH_NO_CONTENT_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44556 url=https://tracker.example.com/senate "
+    "status=no_resolving_content http=200 embeds=infogram reason=embed_shell"
+)
+RESOLUTION_SOURCE_FETCH_THIN_PAGE_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=45088 url=https://data.wastewaterscan.org/ "
+    "status=no_resolving_content http=200 embeds=none reason=thin_page"
+)
+RESOLUTION_SOURCE_FETCH_NO_MATCHING_PASSAGE_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=45363 url=https://www.bls.gov/news.release/pdf/wkstp.pdf "
+    "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local"
+)
+RESOLUTION_SOURCE_FETCH_BLOCKED_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
+    "status=blocked http=403 embeds=none"
+)
+RESOLUTION_SOURCE_FETCH_NO_RESPONSE_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://slow.example.com/x status=error http=n/a embeds=none"
+)
+RESOLUTION_SOURCE_FETCH_DATASET_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44841 url=https://static.dwcdn.net/data/kSCt4.csv "
+    "status=ok http=200 embeds=none"
+)
+# The `route` tail names which rung of the escalation ladder produced the outcome. It is
+# keyed and last, so all four presence combinations of the two optional tails parse: neither
+# (every archived line), reason only, route only, and both.
+RESOLUTION_SOURCE_FETCH_ROUTE_ONLY_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
+    "status=ok http=200 embeds=none route=wayback"
+)
+RESOLUTION_SOURCE_FETCH_REASON_AND_ROUTE_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44556 url=https://tracker.example.com/senate "
+    "status=no_resolving_content http=200 embeds=infogram reason=embed_shell route=rendered"
+)
+# The failure-diagnostics tail: an egress-reputation 403 with its CDN named. `failure_class`,
+# `exc` and `server` are keyed and sit after `route`, so all subsets parse.
+RESOLUTION_SOURCE_FETCH_FAILURE_CLASS_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
+    "status=blocked http=403 embeds=none failure_class=http_403 server=akamaighost"
+)
+RESOLUTION_SOURCE_FETCH_TRANSPORT_ERROR_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://slow.example.com/x "
+    "status=error http=n/a embeds=none failure_class=timeout exc=ServerTimeoutError"
+)
+
+
+class TestResolutionSourceFetch:
+    """Per-URL fetch outcomes, harvested (item 19d).
+
+    They used to live only in free-text log lines and the published comment's
+    provider-diagnostics block, so "cdc.gov is 0 successes in 1,069 fetch records"
+    meant re-scraping run logs that expire from GHA at 90 days.
+    """
+
+    def test_success_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_OK_LINE)
+        assert rec["marker"] == "resolution_source_fetch"
+        assert rec["url"] == "https://www.racetothewh.com/senate/26"
+        assert rec["status"] == "ok"
+        assert rec["http"] == 200
+        # The `none` sentinel harvests as None rather than the string "none".
+        assert rec["embeds"] is None
+        assert rec["qid"] == 44554
+        assert rec["qid_kind"] == "question_id"
+
+    def test_unreadable_embeds_are_captured_on_a_successful_fetch(self):
+        # The qids 44554/44556 shape: the fetch legitimately succeeded and the page
+        # carried prose, so this field is the only thing that makes the missing
+        # embedded figures queryable.
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_EMBED_LINE)
+        assert rec["status"] == "ok"
+        assert rec["embeds"] == "infogram,tableau"
+
+    def test_no_resolving_content_status(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_NO_CONTENT_LINE)
+        assert rec["status"] == "no_resolving_content"
+        assert rec["http"] == 200  # the FETCH succeeded; the content did not arrive
+        assert rec["embeds"] == "infogram"
+        assert rec["reason"] == "embed_shell"
+        assert rec["qid"] == 44556
+
+    def test_the_thin_page_reason_separates_the_ungated_population(self):
+        # q45088's 127-char SPA tab list: withheld by the same chrome floor with no
+        # embed provider anywhere in the raw HTML. Without `reason` the two rules are
+        # one bucket, and "how often does the floor catch a page the embed gate would
+        # have published?" stops being answerable from the archive.
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_THIN_PAGE_LINE)
+        assert rec["status"] == "no_resolving_content"
+        assert rec["embeds"] is None
+        assert rec["reason"] == "thin_page"
+
+    def test_the_no_matching_passage_reason_separates_a_document_from_a_page(self):
+        # The third `no_resolving_content` reason, and the only one that is a DOCUMENT we read
+        # end to end rather than a page we could not read. Without it a withheld PDF is one
+        # bucket with the chrome floor's pages, and "how often does a cited document not
+        # discuss its own question?" stops being answerable from the archive.
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_NO_MATCHING_PASSAGE_LINE)
+        assert rec["status"] == "no_resolving_content"
+        assert rec["http"] == 200  # the fetch and the READ both succeeded; the content did not
+        assert rec["reason"] == "no_matching_passage"
+        assert rec["route"] == "pdf_local"
+        assert rec["qid"] == 45363
+
+    def test_lines_without_a_reason_still_parse_and_harvest_it_as_none(self):
+        # Back-compat in both directions: every line the archive already holds predates
+        # the field, and a fresh line whose status carries no reason omits it too. None
+        # means "no reason applies", which is what the absence has to keep meaning.
+        for line in (RESOLUTION_SOURCE_FETCH_OK_LINE, RESOLUTION_SOURCE_FETCH_BLOCKED_LINE):
+            assert _parse_one(line).get("reason") is None
+
+    def test_non_success_status_keeps_its_http_code(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_BLOCKED_LINE)
+        assert rec["status"] == "blocked"
+        assert rec["http"] == 403
+
+    def test_a_fetch_with_no_response_harvests_a_null_http_code(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_NO_RESPONSE_LINE)
+        assert rec["status"] == "error"
+        assert rec["http"] is None
+
+    def test_a_datawrapper_hop_is_identifiable_by_its_url(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_DATASET_LINE)
+        assert rec["url"] == "https://static.dwcdn.net/data/kSCt4.csv"
+        assert rec["status"] == "ok"
+
+    def test_route_names_the_ladder_rung_that_produced_the_outcome(self):
+        # A page the direct fetch could not read and an escalated rung rescued reads `ok` on
+        # this marker either way, so without `route` "what did the ladder buy" is not a query.
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_ROUTE_ONLY_LINE)
+        assert rec["status"] == "ok"
+        assert rec["route"] == "wayback"
+        # `route` present with `reason` absent is the combination a middle-positioned optional
+        # group would break: it would swallow the route value into the reason field.
+        assert rec["reason"] is None
+
+    def test_both_optional_tails_parse_together(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_REASON_AND_ROUTE_LINE)
+        assert rec["status"] == "no_resolving_content"
+        assert rec["reason"] == "embed_shell"
+        assert rec["route"] == "rendered"
+
+    def test_lines_without_a_route_still_parse_and_harvest_it_as_none(self):
+        # Every line the archive already holds predates the field, and a direct fetch on a
+        # provider that has not been taught the ladder omits it too.
+        for line in (
+            RESOLUTION_SOURCE_FETCH_OK_LINE,
+            RESOLUTION_SOURCE_FETCH_NO_CONTENT_LINE,
+            RESOLUTION_SOURCE_FETCH_DATASET_LINE,
+        ):
+            assert _parse_one(line).get("route") is None
+
+    def test_an_http_failure_carries_its_class_and_server(self):
+        # The egress-vs-host measurement: a 403 with the CDN that served it, so the archive can
+        # ask "how often is a cited host giving the runner IP a 403 from Akamai".
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_FAILURE_CLASS_LINE)
+        assert rec["status"] == "blocked"
+        assert rec["failure_class"] == "http_403"
+        assert rec["server"] == "akamaighost"
+        # No transport exception on an HTTP response, so `exc` stays absent.
+        assert rec["exc"] is None
+
+    def test_a_transport_error_carries_its_class_and_exception(self):
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_TRANSPORT_ERROR_LINE)
+        assert rec["status"] == "error"
+        assert rec["http"] is None
+        assert rec["failure_class"] == "timeout"
+        assert rec["exc"] == "ServerTimeoutError"
+        assert rec["server"] is None
+
+    def test_lines_without_the_failure_fields_harvest_them_as_none(self):
+        # Additive at the tail: every archived line and every success predates them.
+        for line in (RESOLUTION_SOURCE_FETCH_OK_LINE, RESOLUTION_SOURCE_FETCH_BLOCKED_LINE):
+            rec = _parse_one(line)
+            assert rec.get("failure_class") is None
+            assert rec.get("exc") is None
+            assert rec.get("server") is None
+
+
+# Copied from the emitting format string (resolution_source.py). One line per ESCALATED rung:
+# the direct route could not read the page, so a heavier rung was tried. The fetch marker above
+# records only the FINAL per-URL outcome, so it is silent on the path taken and on its cost.
+RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE = (
+    PFX + "RESOLUTION_SOURCE_ESCALATION: question=44556 url=https://tracker.example.com/senate "
+    "from_status=js_wall rung=rendered outcome=success wall_s=12.44"
+)
+RESOLUTION_SOURCE_ESCALATION_FAILED_LINE = (
+    PFX + "RESOLUTION_SOURCE_ESCALATION: question=44211 url=https://www.cbp.gov/newsroom/stats "
+    "from_status=blocked rung=impersonate outcome=blocked wall_s=3.07"
+)
+
+
+class TestResolutionSourceEscalation:
+    """Per-rung escalation attempts, harvested.
+
+    A rung that fires often and rescues nothing has to be distinguishable from one that never
+    fires at all, and `wall_s` is what decides whether a rung earns its latency on a question
+    running under a close-derived time budget.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE)
+        assert rec["marker"] == "resolution_source_escalation"
+        assert rec["url"] == "https://tracker.example.com/senate"
+        # The verbatim FetchStatus that triggered the escalation, so the trigger population is
+        # queryable without joining back to the fetch marker.
+        assert rec["from_status"] == "js_wall"
+        assert rec["rung"] == "rendered"
+        assert rec["outcome"] == "success"
+        assert rec["wall_s"] == 12.44
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE)
+        # resolution_source.py emits question.id_of_question, same as its fetch sibling.
+        assert rec["qid"] == 44556
+        assert rec["qid_kind"] == "question_id"
+
+    def test_a_rung_that_rescued_nothing_is_still_recorded(self):
+        rec = _parse_one(RESOLUTION_SOURCE_ESCALATION_FAILED_LINE)
+        assert rec["rung"] == "impersonate"
+        assert rec["outcome"] == "blocked"
+        assert rec["wall_s"] == 3.07
+
+    def test_does_not_collide_with_the_fetch_marker(self):
+        # Both tokens start RESOLUTION_SOURCE_, and resolution_source_fetch sits EARLIER in
+        # MARKER_SPECS, so under the one-marker-per-line break a loose prefix match there would
+        # have swallowed every escalation line.
+        harvested = parse_log_text(
+            RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE + "\n" + RESOLUTION_SOURCE_FETCH_OK_LINE + "\n", **_META
+        )
+        assert len(harvested["resolution_source_escalation"]) == 1
+        assert len(harvested["resolution_source_fetch"]) == 1
+
+
+# Copied from the three emitting format strings in metaculus_bot/research/resolution_source.py
+# (_url_context_admission for the robots skip, _url_context_rung for the other two). The URL is
+# the one tests/resolution_source/test_resolution_source_url_context_rung.py pins the spellings
+# on, so the emitter and the spec are checked against the same bytes. All three were registered
+# on 2026-09-04, when RESOLUTION_SOURCE_URL_CONTEXT_ENABLED went on in every bot workflow; until
+# then none could fire in production, so no archived run from before that merge carries one.
+RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE = (
+    PFX + "RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP: url=https://tracker.example.com/senate host=tracker.example.com"
+)
+RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE = (
+    PFX_WARN + "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate "
+    "statuses=URL_RETRIEVAL_STATUS_ERROR"
+)
+RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_NO_STATUSES_LINE = (
+    PFX_WARN + "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://tracker.example.com/senate "
+    "statuses=none"
+)
+RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED_LINE = (
+    PFX_WARN + "RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED: url=https://tracker.example.com/senate "
+    "host=tracker.example.com"
+)
+
+
+class TestResolutionSourceUrlContextRobotsSkip:
+    """The resolution-source ladder's paid read, refused by the free robots pre-check.
+
+    Each record is a paid call NOT billed, and the rate against the handful of hosts publishing
+    the Google-Extended directive is what says whether the group parser is over-matching and
+    withholding reads we could have had.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE)
+        assert rec["marker"] == "resolution_source_urlcontext_robots_skip"
+        assert rec["url"] == "https://tracker.example.com/senate"
+        # The verdict is cached and applied per HOST, so the host is the unit a rate is taken over.
+        assert rec["host"] == "tracker.example.com"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_collide_with_the_gap_fill_twin_or_the_ladder_markers(self):
+        # The gap-fill twin shares this token's suffix and the two ladder markers share its
+        # prefix, and the one-marker-per-line break routes a line to the FIRST spec that matches,
+        # so each spec has to claim only its own full word.
+        harvested = parse_log_text(
+            "\n".join(
+                [
+                    RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE,
+                    AGENTIC_URLCONTEXT_ROBOTS_SKIP_LINE,
+                    RESOLUTION_SOURCE_FETCH_OK_LINE,
+                    RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE,
+                ]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["resolution_source_urlcontext_robots_skip"]) == 1
+        assert len(harvested["agentic_urlcontext_robots_skip"]) == 1
+        assert len(harvested["resolution_source_fetch"]) == 1
+        assert len(harvested["resolution_source_escalation"]) == 1
+
+
+class TestResolutionSourceUrlContextUngroundedSuppressed:
+    """A paid read discarded for retrieving nothing: money spent on nothing served."""
+
+    def test_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE)
+        assert rec["marker"] == "resolution_source_urlcontext_ungrounded_suppressed"
+        assert rec["url"] == "https://tracker.example.com/senate"
+        assert rec["statuses"] == "URL_RETRIEVAL_STATUS_ERROR"
+
+    def test_the_none_sentinel_harvests_as_none(self):
+        # `none` is the emitter's word for "the SDK attached no url_metadata at all", which is the
+        # no-data reading rather than a status called none.
+        assert _parse_one(RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_NO_STATUSES_LINE)["statuses"] is None
+
+    def test_several_statuses_survive_as_one_comma_joined_string(self):
+        rec = _parse_one(
+            PFX_WARN + "RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_SUPPRESSED: url=https://x.test/a "
+            "statuses=URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+        )
+        assert rec["statuses"] == "URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_collide_with_the_other_two_ungrounded_markers(self):
+        # Three tokens end in UNGROUNDED_SUPPRESSED; each spec must claim only its own line or the
+        # archive would count one suppression family as another.
+        harvested = parse_log_text(
+            "\n".join(
+                [RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE, GEMINI_UNGROUNDED_LINE, AGENTIC_DOCUMENT_UNGROUNDED_LINE]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["resolution_source_urlcontext_ungrounded_suppressed"]) == 1
+        assert len(harvested["gemini_ungrounded_suppressed"]) == 1
+        assert len(harvested["agentic_document_ungrounded_suppressed"]) == 1
+
+
+class TestResolutionSourceUrlContextNotAddressed:
+    """A paid read that retrieved the page and found nothing on the ask: a true negative, bought."""
+
+    def test_fields(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED_LINE)
+        assert rec["marker"] == "resolution_source_urlcontext_not_addressed"
+        assert rec["url"] == "https://tracker.example.com/senate"
+        # The rollout question is which hosts Gemini reaches but finds nothing on.
+        assert rec["host"] == "tracker.example.com"
+
+    def test_no_question_ref_so_a_join_goes_through_the_run(self):
+        rec = _parse_one(RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_the_three_paid_rung_lines_are_told_apart(self):
+        harvested = parse_log_text(
+            "\n".join(
+                [
+                    RESOLUTION_SOURCE_URLCONTEXT_ROBOTS_SKIP_LINE,
+                    RESOLUTION_SOURCE_URLCONTEXT_UNGROUNDED_LINE,
+                    RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED_LINE,
+                ]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["resolution_source_urlcontext_robots_skip"]) == 1
+        assert len(harvested["resolution_source_urlcontext_ungrounded_suppressed"]) == 1
+        assert len(harvested["resolution_source_urlcontext_not_addressed"]) == 1
+
+
+# Copied from the WARN in rendered_fetch.render_page's RenderOffHost boundary, with the hosts the
+# emitter side pins in tests/test_rendered_fetch.py::TestTheLandingHost so both sides are checked
+# against the same bytes. Registered 2026-09-04 with the landing-host check itself, so no archived
+# run carries a record and a first one is itself the finding.
+RENDERED_FETCH_OFF_HOST_LINE = (
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+    "landed_host=internal.example.net same_publisher=false"
+)
+RENDERED_FETCH_OFF_HOST_GAP_FILL_LINE = (
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=gap_fill_v2 pinned_host=dashboard.example.com "
+    "landed_host=169.254.169.254 same_publisher=false"
+)
+# A landing with no hostname at all (an http(s) URL with an empty authority, or a non-http(s)
+# scheme the fail-shut guard refuses): ``urlparse(...).hostname`` is None and the %s renders it as
+# the word the parser reads as no data. No hostname is never the same publisher.
+RENDERED_FETCH_OFF_HOST_NO_HOSTNAME_LINE = (
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+    "landed_host=None same_publisher=false"
+)
+# A benign client-side hop inside the publisher's own registrable domain, refused by strict
+# hostname equality: the record that prices the strictness rather than the security signal.
+RENDERED_FETCH_OFF_HOST_SAME_PUBLISHER_LINE = (
+    PFX_WARN + "RENDERED_FETCH_OFF_HOST: scope=resolution_source pinned_host=dashboard.example.com "
+    "landed_host=www.dashboard.example.com same_publisher=true"
+)
+
+
+class TestRenderedFetchOffHost:
+    """The only per-event record that a page sent headless Chromium off its DNS pin.
+
+    The resolution-source caller counts the refusal under ``render_off_host_skips`` in its
+    ``details["counts"]``, a per-question total that names neither host, and the gap-fill v2 caller
+    keeps no count at all, so without this row a security-relevant event leaves nothing durable.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_LINE)
+        assert rec["marker"] == "rendered_fetch_off_host"
+        # The render transport is shared, so the row has to say which caller asked for it.
+        assert rec["scope"] == "resolution_source"
+        assert rec["pinned_host"] == "dashboard.example.com"
+        # A HOSTNAME, never the landing URL, which can carry a session token or a credential.
+        assert rec["landed_host"] == "internal.example.net"
+        # Another registrable domain: the security signal.
+        assert rec["same_publisher"] is False
+
+    def test_the_gap_fill_callers_render_is_told_apart_by_scope(self):
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_GAP_FILL_LINE)
+        assert rec["scope"] == "gap_fill_v2"
+        # The IMDS shape: an IP literal is a stranger like any other host.
+        assert rec["landed_host"] == "169.254.169.254"
+        assert rec["same_publisher"] is False
+
+    def test_a_landing_with_no_hostname_harvests_as_no_data(self):
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_NO_HOSTNAME_LINE)
+        assert rec["landed_host"] is None
+        assert rec["same_publisher"] is False
+
+    def test_a_benign_hop_inside_the_publisher_prices_the_strictness(self):
+        # Strict hostname equality also refuses `example.com` to `www.example.com`; this field is
+        # what keeps that population from diluting the security signal.
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_SAME_PUBLISHER_LINE)
+        assert rec["landed_host"] == "www.dashboard.example.com"
+        assert rec["same_publisher"] is True
+
+    def test_no_question_ref(self):
+        # The transport runs per URL with no question in scope, so a join goes through the run id.
+        rec = _parse_one(RENDERED_FETCH_OFF_HOST_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_collide_with_the_resolution_source_ladder_markers(self):
+        # The refused render is the rung a resolution-source fetch escalated into, so all three
+        # lines show up in the same run's logs, and ``parse_log_text`` routes a line to the FIRST
+        # spec that matches: each has to claim only its own marker word.
+        harvested = parse_log_text(
+            "\n".join(
+                [
+                    RENDERED_FETCH_OFF_HOST_LINE,
+                    RESOLUTION_SOURCE_FETCH_OK_LINE,
+                    RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE,
+                ]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["rendered_fetch_off_host"]) == 1
+        assert len(harvested["resolution_source_fetch"]) == 1
+        assert len(harvested["resolution_source_escalation"]) == 1
+
+
 class TestCredit:
     def test_balance(self):
         rec = _parse_one(CREDIT_BALANCE_LINE)
@@ -858,6 +1671,103 @@ class TestCredit:
         assert rec["floor"] == 50.00
 
 
+# Verbatim from credit_telemetry.log_role_spend — the source of truth, so a
+# producer-side shape change breaks these loudly.
+CREDIT_ROLE_SPEND_LINE = (
+    PFX + "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000"
+)
+CREDIT_ROLE_SPEND_NA_LINE = (
+    PFX + "CREDIT_ROLE_SPEND: role=perplexity_research key=direct usd=n/a calls=2 costed_calls=0 byok_usd=n/a"
+)
+CREDIT_ROLE_SPEND_EMPTY_LEDGER_LINE = (
+    PFX + "CREDIT_ROLE_SPEND: no successful LLM completions reached the litellm success callback this run"
+)
+
+
+class TestCreditRoleSpend:
+    def test_row_fields(self):
+        rec = _parse_one(CREDIT_ROLE_SPEND_LINE)
+        assert rec["marker"] == "credit_role_spend"
+        # The vendor-slot role carries a colon; it must survive as the string it is.
+        assert rec["role"] == "forecaster:openai"
+        assert rec["key"] == "donated"
+        assert rec["usd"] == 0.2030
+        assert rec["calls"] == 2
+        assert rec["costed_calls"] == 2
+        assert rec["byok_usd"] == 0.2000
+
+    def test_uncosted_row_reads_none_not_zero(self):
+        # ``n/a`` is the whole point of ``costed_calls``: the calls happened, the dollars are
+        # unknown, and a 0.0 here would read as "this role is free".
+        rec = _parse_one(CREDIT_ROLE_SPEND_NA_LINE)
+        assert rec["role"] == "perplexity_research"
+        assert rec["key"] == "direct"
+        assert rec["usd"] is None
+        assert rec["byok_usd"] is None
+        assert (rec["calls"], rec["costed_calls"]) == (2, 0)
+
+    def test_empty_ledger_line_is_not_a_row(self):
+        # The no-completions line shares the token so it is greppable, but it must not
+        # harvest as a (role, key) record.
+        harvested = parse_log_text(CREDIT_ROLE_SPEND_EMPTY_LEDGER_LINE + "\n", **_META)
+        assert harvested["credit_role_spend"] == []
+
+    def test_no_question_ref(self):
+        # Per-run, per-role — same qid-less shape as the other credit markers.
+        rec = _parse_one(CREDIT_ROLE_SPEND_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_shadow_the_per_key_spend_marker(self):
+        # ``CREDIT_SPEND`` and ``CREDIT_ROLE_SPEND`` share a prefix; each line must land in
+        # exactly its own file.
+        harvested = parse_log_text("\n".join([CREDIT_SPEND_LINE, CREDIT_ROLE_SPEND_LINE]) + "\n", **_META)
+        assert len(harvested["credit_spend"]) == 1
+        assert len(harvested["credit_role_spend"]) == 1
+
+
+# Verbatim from the WARN in credit_telemetry.drain_litellm_callbacks, with ``%.1f`` rendered at the
+# LITELLM_CALLBACK_DRAIN_TIMEOUT_S default of 10 s. Registered 2026-09-04: the row is the only
+# durable record of WHY a run's CREDIT_ROLE_SPEND rows under-count, so the emitter side is pinned
+# too (tests/test_credit_telemetry.py, where the drain's own test renders the bound as 0.0).
+LITELLM_CALLBACK_DRAIN_TIMEOUT_LINE = (
+    PFX_WARN + "LITELLM_CALLBACK_DRAIN_TIMEOUT: litellm's logging worker did not deliver its queued "
+    "success callbacks within 10.0s; continuing so the run can finish. The CREDIT_ROLE_SPEND "
+    "ledger below may under-count this run's last completions."
+)
+
+
+class TestLitellmCallbackDrainTimeout:
+    """The completeness flag on a run's role ledger: a record means those rows are a lower bound.
+
+    At most one line per run, from the drain in ``cli._forecast_with_callback_drain``'s ``finally``.
+    """
+
+    def test_fields(self):
+        rec = _parse_one(LITELLM_CALLBACK_DRAIN_TIMEOUT_LINE)
+        assert rec["marker"] == "litellm_callback_drain_timeout"
+        # The bound the run used. Near-constant, so the row's value is its presence.
+        assert rec["timeout_s"] == 10.0
+
+    def test_no_question_ref(self):
+        # Per-run, like the credit markers it qualifies.
+        rec = _parse_one(LITELLM_CALLBACK_DRAIN_TIMEOUT_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_steal_or_lose_the_credit_spend_markers(self):
+        # The WARN names ``CREDIT_ROLE_SPEND`` in its prose — that is the whole reason the emitter
+        # chose a distinct prefix — and ``parse_log_text`` breaks on the first matching spec, so
+        # all three lines must land in exactly their own files whichever order the specs sit in.
+        harvested = parse_log_text(
+            "\n".join([LITELLM_CALLBACK_DRAIN_TIMEOUT_LINE, CREDIT_ROLE_SPEND_LINE, CREDIT_SPEND_LINE]) + "\n",
+            **_META,
+        )
+        assert len(harvested["litellm_callback_drain_timeout"]) == 1
+        assert len(harvested["credit_role_spend"]) == 1
+        assert len(harvested["credit_spend"]) == 1
+
+
 class TestHtmlCommentMarkers:
     def test_stacker_outcome(self):
         rec = _parse_one("<!-- STACKER_OUTCOME=primary -->")
@@ -898,16 +1808,6 @@ class TestHtmlCommentMarkers:
         rec = _parse_one("<!-- TOOLS_USED=false -->")
         assert rec["marker"] == "tools_used"
         assert rec["value"] is False
-
-    def test_anchor_overshoot(self):
-        rec = _parse_one("<!-- ANCHOR_OVERSHOOT_PP=+16.2 -->")
-        assert rec["marker"] == "anchor_overshoot_pp"
-        assert rec["pp"] == 16.2
-
-    def test_clause_divergence(self):
-        rec = _parse_one("<!-- CLAUSE_PRODUCT_DIVERGENCE_PP=-4.0 -->")
-        assert rec["marker"] == "clause_product_divergence_pp"
-        assert rec["pp"] == -4.0
 
 
 class TestQidKindAcrossMarkers:
@@ -1064,6 +1964,168 @@ class TestForecastersSurvived:
         # — a None here would be indistinguishable from a missing field.
         rec = _parse_one(FORECASTERS_SURVIVED_UNKNOWN_LINE)
         assert rec["models"] == "unknown"
+
+
+# Verbatim from metaculus_bot/extreme_call.py:format_extreme_call_markers, which
+# forecaster.py logs immediately after the survivor count above. One line per
+# extreme-band member of a BINARY question; the lone/accompanied flag is the
+# measurement (see the spec comment in scripts/telemetry/markers.py).
+EXTREME_CALL_LONE_LINE = (
+    PFX + "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=3"
+)
+EXTREME_CALL_ACCOMPANIED_LINE = (
+    PFX + "EXTREME_CALL: question=44870 model=gpt-5.6-sol p=0.9700 side=high lone=false survivors=3"
+)
+EXTREME_CALL_SOLO_PUBLISH_LINE = (
+    PFX + "EXTREME_CALL: question=44874 model=gemini-3.1-pro-preview p=0.0300 side=low lone=true survivors=1"
+)
+EXTREME_CALL_UNKNOWN_MODEL_LINE = (
+    PFX + "EXTREME_CALL: question=44874 model=unknown p=0.0200 side=low lone=true survivors=2"
+)
+
+
+class TestExtremeCall:
+    def test_lone_low_call_fields(self):
+        rec = _parse_one(EXTREME_CALL_LONE_LINE)
+        assert rec["marker"] == "extreme_call"
+        assert rec["model"] == "gemini-3.1-pro-preview"
+        assert rec["p"] == 0.03
+        assert rec["side"] == "low"
+        assert rec["lone"] is True
+        assert rec["survivors"] == 3
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # forecaster.py emits question.id_of_question, the same space as
+        # forecasters_survived, which is what makes the join to the survivor count free.
+        rec = _parse_one(EXTREME_CALL_LONE_LINE)
+        assert rec["qid"] == 44874
+        assert rec["qid_kind"] == "question_id"
+
+    def test_accompanied_high_call_is_distinguishable_from_a_lone_one(self):
+        # The whole finding lives in this field: lone extremes were right 4 of 9,
+        # accompanied ones 21 of 23. A lone flag that harvested as a string ("true")
+        # rather than a bool would still filter, but a `rec["lone"] is True` cut
+        # elsewhere would silently select nothing.
+        rec = _parse_one(EXTREME_CALL_ACCOMPANIED_LINE)
+        assert rec["lone"] is False
+        assert rec["side"] == "high"
+        assert rec["p"] == 0.97
+
+    def test_single_survivor_publish_carries_its_survivor_count(self):
+        # "lone" is vacuous when the member WAS the ensemble, so a rate cut has to be
+        # able to drop these records; survivors=1 is how it finds them.
+        rec = _parse_one(EXTREME_CALL_SOLO_PUBLISH_LINE)
+        assert rec["survivors"] == 1
+        assert rec["lone"] is True
+
+    def test_unknown_model_sentinel_survives_as_a_string(self):
+        # Same sentinel and same reason as forecasters_survived's models= field: it is
+        # not in _NONE_SENTINELS, so it must not coerce to None.
+        rec = _parse_one(EXTREME_CALL_UNKNOWN_MODEL_LINE)
+        assert rec["model"] == "unknown"
+
+
+# Verbatim from metaculus_bot/member_forecast.py:format_member_forecast_marker — one line
+# per forecast VALUE that leaves a runner, raw and published as compact JSON literals.
+MEMBER_FORECAST_BINARY_LINE = (
+    PFX + "MEMBER_FORECAST: question=44874 model=openrouter/google/gemini-3.1-pro-preview role=member qtype=binary "
+    "raw=0.005 published=0.02"
+)
+MEMBER_FORECAST_MC_LINE = (
+    PFX + "MEMBER_FORECAST: question=45189 model=openrouter/openai/gpt-5.6-sol role=member qtype=multiple_choice "
+    "raw=[0.9,0.005,0.095] published=[0.891,0.01,0.099]"
+)
+MEMBER_FORECAST_NUMERIC_STACKER_LINE = (
+    PFX + "MEMBER_FORECAST: question=45065 model=openrouter/anthropic/claude-opus-4.8 role=stacker qtype=numeric "
+    "raw=[[0.025,9.2],[0.05,9.6],[0.5,12.1]] published=[[0.025,9.2],[0.05,9.6],[0.5,12.100000001]]"
+)
+
+
+class TestMemberForecast:
+    """The one marker that carries a member's forecast VALUE on every question.
+
+    Before it (2026-09-02) the raw value lived only inside the published comment's fenced
+    block, which is middle-trimmed and only present since 2026-05: the clip-threshold
+    re-read recovered a raw binary probability for 74 of 451 resolved binaries. The two
+    JSON fields are kept VERBATIM (the spec's ``raw_fields``) so a consumer ``json.loads``
+    them whatever the type, rather than a binary line coercing to a float while the
+    vectors stay strings.
+    """
+
+    def test_binary_fields_stay_json_literals(self):
+        rec = _parse_one(MEMBER_FORECAST_BINARY_LINE)
+        assert rec["marker"] == "member_forecast"
+        assert rec["model"] == "openrouter/google/gemini-3.1-pro-preview"
+        assert rec["role"] == "member"
+        assert rec["qtype"] == "binary"
+        assert rec["raw"] == "0.005"
+        assert rec["published"] == "0.02"
+        assert json.loads(rec["raw"]) == 0.005
+
+    def test_mc_vector_survives_whole(self):
+        # Compact JSON carries no whitespace, so ``\S+`` takes the whole array and the
+        # generic comma-splitting key=value pattern never sees it.
+        rec = _parse_one(MEMBER_FORECAST_MC_LINE)
+        assert json.loads(rec["raw"]) == [0.9, 0.005, 0.095]
+        assert json.loads(rec["published"]) == [0.891, 0.01, 0.099]
+
+    def test_numeric_stacker_pairs_and_role(self):
+        rec = _parse_one(MEMBER_FORECAST_NUMERIC_STACKER_LINE)
+        assert rec["role"] == "stacker"
+        assert rec["qtype"] == "numeric"
+        assert json.loads(rec["raw"]) == [[0.025, 9.2], [0.05, 9.6], [0.5, 12.1]]
+        assert json.loads(rec["published"])[2] == [0.5, 12.100000001]
+
+    def test_question_ref_is_a_question_id(self):
+        # Every emitter passes question.id_of_question, the same space as extraction_rung
+        # and forecasters_survived, so the per-member join is free.
+        rec = _parse_one(MEMBER_FORECAST_BINARY_LINE)
+        assert rec["qid"] == 44874
+        assert rec["qid_kind"] == "question_id"
+
+    def test_does_not_collide_with_the_thin_publish_floor_raw_field(self):
+        # Both specs spell a field ``raw``; the per-spec raw_fields keeps this one verbatim
+        # without turning the floor marker's float into a string.
+        assert _parse_one(THIN_PUBLISH_FLOOR_LOW_LINE)["raw"] == 0.03
+
+
+# Verbatim from metaculus_bot/aggregation_pipeline.py:_floor_single_survivor_binary —
+# the single-survivor binary publish floor, logged at WARNING from the base-combine
+# re-entry only when the lone value actually moved.
+THIN_PUBLISH_FLOOR_LOW_LINE = PFX_WARN + "THIN_PUBLISH_FLOOR: question=44874 raw=0.0300 clamped=0.0500 survivors=1"
+THIN_PUBLISH_FLOOR_HIGH_LINE = PFX_WARN + "THIN_PUBLISH_FLOOR: question=44870 raw=0.9700 clamped=0.9500 survivors=1"
+
+
+class TestThinPublishFloor:
+    def test_low_side_fields(self):
+        rec = _parse_one(THIN_PUBLISH_FLOOR_LOW_LINE)
+        assert rec["marker"] == "thin_publish_floor"
+        # raw is the member's declared value (still on the comment bullet); clamped is
+        # what was published. Both harvest as floats so a cut can difference them.
+        assert rec["raw"] == 0.03
+        assert rec["clamped"] == 0.05
+        assert rec["survivors"] == 1
+
+    def test_high_side_fields(self):
+        rec = _parse_one(THIN_PUBLISH_FLOOR_HIGH_LINE)
+        assert rec["raw"] == 0.97
+        assert rec["clamped"] == 0.95
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # aggregation_pipeline.py emits question.id_of_question — the same space as
+        # forecasters_survived and extreme_call, so the join to the survivor count and
+        # to the member's own EXTREME_CALL line is free.
+        rec = _parse_one(THIN_PUBLISH_FLOOR_LOW_LINE)
+        assert rec["qid"] == 44874
+        assert rec["qid_kind"] == "question_id"
+
+    def test_does_not_collide_with_the_extreme_call_line_it_follows(self):
+        # The two markers fire on the same question in the same run (the member's
+        # EXTREME_CALL at the fan-out, then the floor at aggregation); each must harvest
+        # into its own file with its own fields.
+        harvested = parse_log_text(EXTREME_CALL_SOLO_PUBLISH_LINE + "\n" + THIN_PUBLISH_FLOOR_LOW_LINE + "\n", **_META)
+        assert [r["p"] for r in harvested["extreme_call"]] == [0.03]
+        assert [r["clamped"] for r in harvested["thin_publish_floor"]] == [0.05]
 
 
 # The FORECASTERS_USED ensemble-size marker is an HTML comment injected into the
@@ -1720,11 +2782,201 @@ class TestGeminiUngroundedSuppressed:
         assert rec["queries"] == 0
 
 
-# read_document's twin of the WARN above (metaculus_bot/research/agentic/tools.py): Gemini's
+# The floor's complement (metaculus_bot/research/gemini_search.py _format_grounded_response):
+# one INFO row per response that PASSED the grounded-chunk floor, recording how thinly the
+# passing text is attributed. ``chars`` is the raw model text, so supports/chars reproduces the
+# audit's density denominator (median ~872 chars per attributed span post-floor).
+GEMINI_GROUNDING_DENSITY_LINE = PFX + "GEMINI_GROUNDING_DENSITY: question=44944 chunks=4 supports=1 chars=3535"
+
+
+class TestGeminiGroundingDensity:
+    def test_fields(self):
+        rec = _parse_one(GEMINI_GROUNDING_DENSITY_LINE)
+        assert rec["marker"] == "gemini_grounding_density"
+        assert rec["chunks"] == 4
+        assert rec["supports"] == 1
+        assert rec["chars"] == 3535
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GEMINI_GROUNDING_DENSITY_LINE)
+        # gemini_search.py passes question.id_of_question, same as its suppression twin.
+        assert rec["qid"] == 44944
+        assert rec["qid_kind"] == "question_id"
+
+    def test_absent_qid_coerces_to_none(self):
+        # qid is Optional at the call site; "None" renders into the line verbatim.
+        rec = _parse_one(PFX + "GEMINI_GROUNDING_DENSITY: question=None chunks=1 supports=0 chars=812")
+        assert rec["qid"] is None
+        assert rec["supports"] == 0
+
+    def test_does_not_collide_with_the_suppression_marker(self):
+        # Both markers start GEMINI_ and are emitted from the same function; each spec must
+        # claim only its own line or one of them would be double-counted in the archive.
+        assert _parse_one(GEMINI_GROUNDING_DENSITY_LINE)["marker"] == "gemini_grounding_density"
+        assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
+
+
+# The embellishment channel, per response (metaculus_bot/research/gemini_search.py
+# _check_attributions): outlet-named tier tags the same response's own grounded-domain list
+# does not name, rewritten to ``[unverified attribution]``. ``labels`` is what makes the count
+# readable — q38195 named 21 outlets over one grounded domain.
+GEMINI_UNSUPPORTED_ATTRIBUTION_LINE = (
+    PFX + "GEMINI_UNSUPPORTED_ATTRIBUTION: question=44953 tagged=2 unsupported=1 groups=1 labels=7"
+)
+
+
+class TestGeminiUnsupportedAttribution:
+    def test_fields(self):
+        rec = _parse_one(GEMINI_UNSUPPORTED_ATTRIBUTION_LINE)
+        assert rec["marker"] == "gemini_unsupported_attribution"
+        assert rec["tagged"] == 2
+        assert rec["unsupported"] == 1
+        assert rec["groups"] == 1
+        # The denominator the count has to be read against; without it a bare
+        # ``unsupported=21`` cannot be told from a thin grounding record.
+        assert rec["labels"] == 7
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GEMINI_UNSUPPORTED_ATTRIBUTION_LINE)
+        # gemini_search.py passes question.id_of_question, same as its two siblings.
+        assert rec["qid"] == 44953
+        assert rec["qid_kind"] == "question_id"
+
+    def test_absent_qid_coerces_to_none(self):
+        rec = _parse_one(
+            PFX + "GEMINI_UNSUPPORTED_ATTRIBUTION: question=None tagged=21 unsupported=21 groups=14 labels=1"
+        )
+        assert rec["qid"] is None
+        assert rec["unsupported"] == 21
+
+    def test_does_not_collide_with_its_two_gemini_siblings(self):
+        # All three start GEMINI_ and two of the three come out of the same function, so each
+        # spec must claim only its own line or the archive double-counts.
+        assert _parse_one(GEMINI_UNSUPPORTED_ATTRIBUTION_LINE)["marker"] == "gemini_unsupported_attribution"
+        assert _parse_one(GEMINI_GROUNDING_DENSITY_LINE)["marker"] == "gemini_grounding_density"
+        assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
+
+
+# Copied from the shared emitting format string, which both Gemini surfaces write:
+# metaculus_bot/research/gemini_search.py (grounded search, question in scope) and
+# metaculus_bot/research/agentic/tool_backends.py (gap-fill v2's read_document, no question).
+# Neither surface bills through OpenRouter, so neither appears in CREDIT_ROLE_SPEND.
+GEMINI_USAGE_GROUNDED_LINE = (
+    PFX + "GEMINI_USAGE: role=grounded_search model=gemini-3.5-flash prompt_tokens=1420 "
+    "tool_use_prompt_tokens=8305 candidates_tokens=2011 thoughts_tokens=944 total_tokens=12680 "
+    "search_queries=3 question=44944"
+)
+GEMINI_USAGE_READ_DOCUMENT_LINE = (
+    PFX + "GEMINI_USAGE: role=read_document model=gemini-3.5-flash prompt_tokens=214 "
+    "tool_use_prompt_tokens=n/a candidates_tokens=1877 thoughts_tokens=n/a total_tokens=2091 "
+    "search_queries=0"
+)
+
+
+class TestGeminiUsage:
+    """The Google AI Studio side of a run's spend.
+
+    Grounding is metered against a monthly grounded-prompt allowance per project and billed per
+    QUERY on overage, so `search_queries` is the billable unit and any feature that multiplies
+    grounded calls re-eats the same pool. Before this marker none of it was in the archive.
+    """
+
+    def test_grounded_search_fields(self):
+        rec = _parse_one(GEMINI_USAGE_GROUNDED_LINE)
+        assert rec["marker"] == "gemini_usage"
+        assert rec["role"] == "grounded_search"
+        assert rec["model"] == "gemini-3.5-flash"
+        assert rec["prompt_tokens"] == 1420
+        assert rec["tool_use_prompt_tokens"] == 8305
+        assert rec["candidates_tokens"] == 2011
+        assert rec["thoughts_tokens"] == 944
+        assert rec["total_tokens"] == 12680
+        assert rec["search_queries"] == 3
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GEMINI_USAGE_GROUNDED_LINE)
+        # gemini_search.py passes question.id_of_question, same as its density sibling.
+        assert rec["qid"] == 44944
+        assert rec["qid_kind"] == "question_id"
+
+    def test_read_document_omits_the_question_and_still_parses(self):
+        # read_document is a per-URL tool running below the loop's log prefix with no question
+        # in scope, so the keyed tail group is what lets one spec serve both surfaces.
+        rec = _parse_one(GEMINI_USAGE_READ_DOCUMENT_LINE)
+        assert rec["role"] == "read_document"
+        assert rec["qid"] is None
+        assert rec["prompt_tokens"] == 214
+        assert rec["total_tokens"] == 2091
+
+    def test_absent_counts_harvest_as_none_not_as_zero(self):
+        # Every usage_metadata field is individually optional on the SDK response, and a count
+        # the API never reported must not read as a measured zero.
+        rec = _parse_one(GEMINI_USAGE_READ_DOCUMENT_LINE)
+        assert rec["tool_use_prompt_tokens"] is None
+        assert rec["thoughts_tokens"] is None
+        # search_queries is the exception, and deliberately so: the SDK omits web_search_queries
+        # when the search tool issued none, so an absent list IS a count of none and the emitter
+        # renders a real 0 (gemini_usage._render_search_queries). n/a on THIS field means only
+        # that the grounding metadata could not be walked, which the all-nulls case below pins.
+        assert rec["search_queries"] == 0
+
+    def test_a_wholly_unreported_usage_block_harvests_all_nulls(self):
+        # The n/a path for search_queries specifically: the emitter renders it only when the
+        # grounding metadata could not be walked, never merely because no search was issued.
+        rec = _parse_one(
+            PFX + "GEMINI_USAGE: role=grounded_search model=gemini-3.5-flash prompt_tokens=n/a "
+            "tool_use_prompt_tokens=n/a candidates_tokens=n/a thoughts_tokens=n/a total_tokens=n/a "
+            "search_queries=n/a question=None"
+        )
+        assert rec["marker"] == "gemini_usage"
+        assert rec["qid"] is None
+        assert all(
+            rec[field] is None
+            for field in (
+                "prompt_tokens",
+                "tool_use_prompt_tokens",
+                "candidates_tokens",
+                "thoughts_tokens",
+                "total_tokens",
+                "search_queries",
+            )
+        )
+
+    def test_does_not_collide_with_its_gemini_siblings(self):
+        # Four markers now start GEMINI_ and three come out of gemini_search.py, so each spec
+        # must claim only its own line or the archive double-counts.
+        harvested = parse_log_text(
+            "\n".join(
+                [
+                    GEMINI_USAGE_GROUNDED_LINE,
+                    GEMINI_GROUNDING_DENSITY_LINE,
+                    GEMINI_UNSUPPORTED_ATTRIBUTION_LINE,
+                    GEMINI_UNGROUNDED_LINE,
+                ]
+            )
+            + "\n",
+            **_META,
+        )
+        assert len(harvested["gemini_usage"]) == 1
+        assert len(harvested["gemini_grounding_density"]) == 1
+        assert len(harvested["gemini_unsupported_attribution"]) == 1
+        assert len(harvested["gemini_ungrounded_suppressed"]) == 1
+
+
+# read_document's twin of GEMINI_UNGROUNDED_SUPPRESSED (metaculus_bot/research/agentic/tools.py): Gemini's
 # url_context tool retrieved nothing, so the "fetched" tier is withheld rather than granting a
 # parametric-recall answer the authority to supersede the briefing for every forecaster.
 AGENTIC_DOCUMENT_UNGROUNDED_LINE = (
     PFX_WARN + "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/filing.pdf"
+)
+# The `statuses` tail carries the url_context retrieval statuses the SDK reported for the call,
+# or the `none` sentinel when it reported none at all.
+AGENTIC_DOCUMENT_UNGROUNDED_WITH_STATUSES_LINE = (
+    PFX_WARN + "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/filing.pdf "
+    "statuses=URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+)
+AGENTIC_DOCUMENT_UNGROUNDED_NO_STATUSES_LINE = (
+    PFX_WARN + "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/filing.pdf statuses=none"
 )
 
 
@@ -1733,6 +2985,18 @@ class TestAgenticDocumentUngroundedSuppressed:
         rec = _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_LINE)
         assert rec["marker"] == "agentic_document_ungrounded_suppressed"
         assert rec["url"] == "https://example.com/filing.pdf"
+
+    def test_statuses_split_a_failed_retrieval_from_no_retrieval_at_all(self):
+        # A bare suppression cannot say which happened; the SDK's own status names can.
+        rec = _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_WITH_STATUSES_LINE)
+        assert rec["url"] == "https://example.com/filing.pdf"
+        assert rec["statuses"] == "URL_RETRIEVAL_STATUS_ERROR,URL_RETRIEVAL_STATUS_UNSAFE"
+
+    def test_the_none_sentinel_and_an_archived_line_both_harvest_as_none(self):
+        # Every line the archive already holds predates the field, and `none` means the SDK
+        # reported no statuses — the same reading, which is why the sentinel is used.
+        for line in (AGENTIC_DOCUMENT_UNGROUNDED_LINE, AGENTIC_DOCUMENT_UNGROUNDED_NO_STATUSES_LINE):
+            assert _parse_one(line).get("statuses") is None
 
     def test_does_not_collide_with_the_gemini_search_marker(self):
         # Both markers end in UNGROUNDED_SUPPRESSED; each spec must claim only its own

@@ -25,17 +25,45 @@ from metaculus_bot.constants import (
     ASKNEWS_MAX_TRIES,
     ASKNEWS_SECRET_ENV,
     EXA_API_KEY_ENV,
+    GAP_FILL_V2_READER_HTTP_ATTEMPTS,
     GAP_FILL_V2_READER_MODEL,
+    GAP_FILL_V2_READER_THINKING_LEVEL,
     GOOGLE_API_KEY_ENV,
 )
 from metaculus_bot.research import providers as research_providers
-from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
+from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
+from metaculus_bot.research.url_context_reader import run_url_context_read
 
-# Client-side HTTP ceilings sized just UNDER the tools' loop budgets so the
-# underlying socket is torn down before the loop's asyncio.wait_for fires — a
-# hung endpoint then frees its slot instead of pinning it to the wall deadline.
+# Client-side HTTP ceilings sized against the tools' loop budgets so the underlying socket is
+# torn down rather than left pinned to a wall deadline — a hung endpoint then frees its slot.
+# Exa's sits strictly UNDER its tool's budget. The reader's is FIXED while the budget it runs
+# under became variable, so the two no longer nest: see the paragraph below the constant.
 _EXA_HTTP_TIMEOUT_S = 18.0  # under search_web's ToolSpec timeout_s in build_gap_fill_tools
-_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # under _READ_DOCUMENT_TIMEOUT_S, read_document's own deadline
+_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # fixed; read_document's own wait is 40-60 s (below)
+# The retry ladder has to fit INSIDE that budget rather than beside it: read_document's
+# outer ``asyncio.wait_for`` cancels the coroutine but not the ``to_thread`` worker, so a
+# retried attempt that ran past the budget would leak a pooled thread for longer than
+# today's 55s — a worse worst case, which this path will not take. So the budget stays put
+# and the ATTEMPTS divide it, after the backoff sleeps are set aside:
+# (55_000 - 2_000) // 2 = 26_500ms each, worst case 26.5 + <=2 + 26.5 = 55.0s. The cost is that
+# ONE attempt now gets 26.5s instead of 55s; the retry is worth it because the failure it
+# recovers (a 503 UNAVAILABLE) returns in milliseconds and leaves nearly the whole budget
+# for the second try, and the reader's thinking level dropped a tier in the same change.
+#
+# That 55 s is NOT under read_document's wait any more. Since the free local-acquisition ladder
+# landed ahead of the paid read, the coroutine waits
+# ``min(_READ_DOCUMENT_TIMEOUT_S=60, _READ_DOCUMENT_TOTAL_BUDGET_S=65 - acquisition_elapsed)``,
+# which is 55 s at 10 s of acquisition and 40 s at the 25 s acquisition cap. So past ~10 s of
+# acquisition the worker can outlive the wait by up to 15 s and finish a billed call whose
+# answer is thrown away. It cannot start a new billed request after the wait fires: the second
+# attempt begins by 26.5 + 2 = 28.5 s, inside the 40 s floor. Deriving the per-attempt timeout
+# from the variable wait instead would cut an attempt to 19 s on the 25 s-acquisition handover
+# path, failing 20-26 s reads that succeed today, so the fixed arithmetic stays and the overrun
+# is documented. ``tests/test_agentic_tools.py`` pins both halves of that claim.
+_READ_DOCUMENT_HTTP_PER_ATTEMPT_TIMEOUT_MS = int(
+    (_READ_DOCUMENT_HTTP_TIMEOUT_MS - 1000 * gemini_retry_sleep_allowance_s(GAP_FILL_V2_READER_HTTP_ATTEMPTS))
+    // GAP_FILL_V2_READER_HTTP_ATTEMPTS
+)
 _EXA_RETRY_DELAYS_S = (1.0, 4.0)
 _EXA_GLOBAL_SEMAPHORE = asyncio.Semaphore(4)
 
@@ -216,40 +244,29 @@ async def _call_exa_search(query: str, end_published_date: str | None) -> list[A
     return []
 
 
-def _build_document_prompt(ask: str) -> str:
-    return (
-        f"{ask}\n\n"
-        "Answer using verbatim quotes from the document whenever possible. Include the document's stated dates. "
-        "If the document does not address the ask, say that plainly."
-    )
+def _run_document_read_sync(url: str, ask: str) -> tuple[str, int, list[str]]:
+    """Read ``url`` via Gemini url_context. Returns ``(text, n_successful_retrievals, statuses)``.
 
+    A thin binding of this tool's own settings onto the shared reader
+    (``research/url_context_reader``), which the Tier-1 resolution-source ladder also calls.
+    It stays HERE, with this name, because ``tools.read_document`` resolves
+    ``_run_document_read_sync`` as a module attribute the suite monkeypatches — and because the
+    timeout arithmetic above is this tool's, not the reader's.
 
-def _run_document_read_sync(url: str, ask: str) -> tuple[str, int]:
-    """Read ``url`` via Gemini url_context. Returns ``(text, n_url_retrievals_that_succeeded)``.
-
-    The retrieval count is returned, not discarded, because the text alone cannot tell a
-    real document read from a fluent answer out of parametric memory — Gemini produces
-    both happily, and ``read_document`` grants the highest verification tier the artifact
-    renderer has. Same reader the grounded-search provider uses for the same reason (see
-    ``research/url_context_telemetry``).
+    The retrieval count is returned, not discarded, because the text alone cannot tell a real
+    document read from a fluent answer out of parametric memory, and ``read_document`` grants
+    the highest verification tier the artifact renderer has.
     """
-    from google import genai  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-    from google.genai import types as genai_types  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import
-
     api_key = os.getenv(GOOGLE_API_KEY_ENV)
     if not api_key:
         raise ValueError(f"Missing Google API key: {GOOGLE_API_KEY_ENV}")
-    # Client-side timeout (ms) so a hung Gemini endpoint returns the thread —
-    # read_document runs this sync call under asyncio.to_thread, and wait_for
-    # cancels the coroutine but can't cancel the thread; without this ceiling a
-    # stuck endpoint leaks the worker into the shared ThreadPoolExecutor.
-    client = genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=_READ_DOCUMENT_HTTP_TIMEOUT_MS))
-    tools: list[Any] = [{"url_context": {}}]
-    config = genai_types.GenerateContentConfig(tools=tools)
-    response = client.models.generate_content(
+    return run_url_context_read(
+        url,
+        ask,
+        api_key=api_key,
+        role="read_document",
         model=GAP_FILL_V2_READER_MODEL,
-        contents=f"{_build_document_prompt(ask)}\n\nURL: {url}",
-        config=config,
+        thinking_level=GAP_FILL_V2_READER_THINKING_LEVEL,
+        timeout_ms=_READ_DOCUMENT_HTTP_PER_ATTEMPT_TIMEOUT_MS,
+        attempts=GAP_FILL_V2_READER_HTTP_ATTEMPTS,
     )
-    _, _, n_url_success, _ = extract_url_context_telemetry(response)
-    return (_stringify(getattr(response, "text", "")) or "", n_url_success)

@@ -659,3 +659,51 @@ class TestCommentContainsExpectedMarkers:
         assert "STACKER_OUTCOME=primary" in explanation
         assert "STACKED=true" in explanation
         assert "TOOLS_USED=" in explanation
+
+    @pytest.mark.e2e
+    @pytest.mark.parametrize("question_type", ["numeric", "multiple_choice"])
+    def test_non_binary_comment_carries_ensemble_size_marker(self, question_type: str):
+        """The ensemble-size disclosure must ride the numeric and MC comments too.
+
+        FORECASTERS_USED=n/N is what lets residual analysis tell a publish on a
+        THINNED ensemble from a publish on a smaller roster; a comment missing it
+        reads as a pre-marker record instead. Numeric and MC comments are assembled
+        by a different report type than binary's (the summary bullets render
+        percentiles and option ballots rather than a probability), so the marker is
+        asserted on the real producer path for each. Binary's producer-path coverage
+        lives in tests/test_main_comment_output.py::TestForecastersUsedDisclosure.
+        """
+        from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
+
+        bot = _make_bot(n_forecasters=2)
+        question: NumericQuestion | MultipleChoiceQuestion
+        if question_type == "numeric":
+            question = _make_numeric_question()
+            prediction_values = [_build_numeric_distribution(8.0), _build_numeric_distribution(9.0)]
+            aggregated_prediction = _build_numeric_distribution(8.5)
+        else:
+            question = _make_mc_question()
+            prediction_values = [_mc_option_list([0.5, 0.3, 0.2]), _mc_option_list([0.4, 0.4, 0.2])]
+            aggregated_prediction = _mc_option_list([0.45, 0.35, 0.20])
+
+        assert question.id_of_question is not None
+        bot._stacker_outcome[question.id_of_question] = "primary"
+        collection = ResearchWithPredictions(
+            research_report="Research text",
+            summary_report="Research text",
+            errors=[],
+            predictions=[
+                ReasonedPrediction(prediction_value=value, reasoning=f"Model: m{i}\n\nbody")
+                for i, value in enumerate(prediction_values, start=1)
+            ],
+        )
+
+        explanation = bot._create_unified_explanation(
+            question,
+            [collection],
+            aggregated_prediction=aggregated_prediction,
+            final_cost=0.0,
+            time_spent_in_minutes=1.0,
+        )
+
+        assert "<!-- FORECASTERS_USED=2/2 -->" in explanation

@@ -132,7 +132,7 @@ class TestHighCardinalityMcSurvivesRealPipeline:
         )
         assert outcome.rung == "block", f"expected the deterministic block rung, got {outcome.rung!r}"
         assert outcome.block_present is True
-        return clamp_and_renormalize_mc(outcome.value)
+        return clamp_and_renormalize_mc(outcome.value.option_list)
 
     def test_per_model_extract_and_clamp_is_bounded(self, parser_llm: MagicMock) -> None:
         """One model's extract+clamp keeps all options in [MC_PROB_MIN, MC_PROB_MAX] for the near-floor ballot."""

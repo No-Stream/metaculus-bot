@@ -3,12 +3,18 @@
 Covers:
 - `BROWSER_HEADERS` completeness (Safari-like UA + Accept / Accept-Language / Accept-Encoding)
 - `build_session` config plumbing (ClientTimeout total+sock_read, TCPConnector limit, headers, resolver)
+- `Content-Encoding` decoding of a body a BROWSER_HEADERS session never advertised (brotli,
+  zstd), against a loopback server, because the Wayback rung's `id_` replay carries the
+  origin's encoding regardless of what we asked for; and the counterpart, that a session built
+  with `headers=None` inherits aiohttp's default `Accept-Encoding`, which DOES advertise both
 - `read_body_capped` under/at/over the byte cap (over -> None + WARNING), including
   multi-chunk streaming and mid-stream abort without consuming the remaining stream
 - `FilteringResolver` filters private IPs, raises OSError when everything is filtered,
   and delegates `close()` to its inner resolver.
 - Datawrapper embed detection (`extract_datawrapper_charts`) on real-shaped
   tracker HTML, the live-data URL builder, and Last-Modified parsing.
+- Routeless data-embed detection (`unreadable_data_embed_providers`) on each
+  provider's own published embed snippet.
 - `decode_text_body`: BOM-then-declared-charset precedence, and the undecodable-char
   score that lets a caller refuse mojibake instead of rendering it as evidence.
 
@@ -21,12 +27,20 @@ import codecs
 import ipaddress
 import logging
 import socket
+import ssl
+import sys
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
+import certifi
 import pytest
+from aiohttp import hdrs, web
 from aiohttp.abc import AbstractResolver
+from aiohttp.client_reqrep import ClientRequest
+from aiohttp.compression_utils import HAS_BROTLI, HAS_ZSTD
+from aiohttp.test_utils import TestServer
 
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
@@ -39,6 +53,7 @@ from metaculus_bot.research.http_fetch import (
     parse_http_last_modified,
     read_body_capped,
     undecodable_char_ratio,
+    unreadable_data_embed_providers,
 )
 
 
@@ -104,6 +119,10 @@ class FakeStreamResponse:
         self.content = FakeStreamContent(chunks)
 
 
+def _certifi_context() -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 class TestBrowserHeaders:
     def test_contains_required_keys(self):
         for key in ("User-Agent", "Accept", "Accept-Language", "Accept-Encoding"):
@@ -117,13 +136,12 @@ class TestBrowserHeaders:
     def test_accept_negotiates_html(self):
         assert "text/html" in BROWSER_HEADERS["Accept"]
 
-    def test_accept_encoding_excludes_brotli(self):
-        # aiohttp's brotli decoder isn't a project dep (HAS_BROTLI=False), so
-        # advertising `br` would have Brotli-preferring servers return content
-        # aiohttp can't decode -> ClientResponseError -> silent source drop.
-        # We advertise only gzip/deflate.
+    def test_accept_encoding_stays_the_measured_pair(self):
+        """The advertised set is the one the 38/50-vs-32/50 header measurement was taken with,
+        so it is pinned rather than widened. Brotli and zstd decoders ARE installed now (see
+        `TestUnadvertisedContentEncoding`), which is what makes a body we did not ask for
+        readable; asking for one is a separate, unmeasured change to every live fetch."""
         assert BROWSER_HEADERS["Accept-Encoding"] == "gzip, deflate"
-        assert "br" not in BROWSER_HEADERS["Accept-Encoding"]
 
 
 class TestBuildSession:
@@ -146,6 +164,29 @@ class TestBuildSession:
             # at request time; prediction_market relies on this no-header default).
             assert "User-Agent" not in session.headers
 
+    async def test_tls_trust_is_pinned_to_certifis_bundle(self):
+        """Which sources are reachable must not depend on the machine's CA store: trade.gov
+        failed CERTIFICATE_VERIFY_FAILED against the default store on 2026-09-03 and
+        succeeded against certifi's, and a source lost that way reads as a dead host."""
+        expected = {(cert.get("serialNumber"), cert.get("issuer")) for cert in _certifi_context().get_ca_certs()}
+
+        async with build_session(timeout_s=5.0) as session:
+            assert session.connector is not None
+            # aiohttp keeps the connector's TLS config on the private `_ssl`; peeking is the
+            # only way to assert the wiring without opening a real connection.
+            context = getattr(session.connector, "_ssl", None)
+            assert isinstance(context, ssl.SSLContext)
+            assert {(cert.get("serialNumber"), cert.get("issuer")) for cert in context.get_ca_certs()} == expected
+            assert expected, "a context loading no CA at all would verify nothing"
+
+    async def test_header_size_caps_are_raised_above_aiohttps_default(self):
+        """who.int (8,765 B) and visitwales.com (9,697 B) send a Content-Security-Policy
+        header over aiohttp's 8,190-byte default, and the response is rejected before any
+        body is read — arriving as `error http=None`, same as a host that never answered."""
+        async with build_session(timeout_s=5.0) as session:
+            assert session._max_line_size == 65536
+            assert session._max_field_size == 65536
+
     async def test_resolver_kwarg_flows_into_connector(self):
         # build_session must plumb the resolver into TCPConnector so aiohttp's
         # connect-time DNS lookup goes through the caller's predicate.
@@ -157,6 +198,125 @@ class TestBuildSession:
             # a private attribute — we peek at it as the only reliable way to
             # assert wiring without opening a real connection.
             assert getattr(session.connector, "_resolver", None) is resolver
+
+
+# The body a capture replays, shaped like the tracker page the defect was found on.
+_REPLAYED_PAGE = "<html><body><p>Layoff tracker: 1,234 employees affected in August 2026.</p></body></html>"
+
+
+def _zstd_compress(payload: bytes) -> bytes:
+    """Compress with the zstd encoder aiohttp's decoder is paired with.
+
+    Mirrors aiohttp's own conditional import: `compression.zstd` is stdlib from 3.14 on, and
+    `backports.zstd` is the declared dependency that supplies it below that, which is where
+    CI and every bot workflow sit (`python-version: "3.12"`).
+    """
+    if sys.version_info >= (3, 14):
+        from compression.zstd import compress
+    else:
+        from backports.zstd import compress
+
+    return compress(payload)
+
+
+@asynccontextmanager
+async def _encoded_body_server(body: bytes, encoding: str) -> AsyncIterator[tuple[str, list[str]]]:
+    """A loopback server answering every GET with `body` under `Content-Encoding: encoding`.
+
+    Yields the URL and the list of `Accept-Encoding` values the server saw, so a test can
+    assert the encoding arrived UNASKED-FOR — which is the whole shape of the defect.
+    """
+    accept_encodings: list[str] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        accept_encodings.append(request.headers.get("Accept-Encoding", ""))
+        return web.Response(
+            body=body,
+            headers={"Content-Encoding": encoding, "Content-Type": "text/html; charset=utf-8"},
+        )
+
+    app = web.Application()
+    app.router.add_get("/layoffs", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        yield str(server.make_url("/layoffs")), accept_encodings
+    finally:
+        await server.close()
+
+
+class TestUnadvertisedContentEncoding:
+    """Decoding a `Content-Encoding` we never advertised.
+
+    `Accept-Encoding` does not bound what arrives on every route. The Wayback rung fetches
+    captures in `id_` raw mode, which replays whatever encoding the ORIGIN sent the archive's
+    crawler, so our `gzip, deflate` is not a contract there. Measured 2026-09-03: trueup.io's
+    21-day-old capture (inside the rung's age bound, the one fresh capture of a host four
+    archived questions cite) replays as `zstd`, aiohttp raised `Can not decode content-encoding:
+    zstandard (zstd)`, the hop landed as `error` and the rung reported "no archived copy served"
+    for a capture the archive had served in full. Both decoders are declared dependencies so the
+    replay decodes instead of being lost.
+
+    "Never advertised" is a property of the BROWSER_HEADERS session, whose explicit `gzip, deflate`
+    is what keeps the encoding unasked-for; a session built with `headers=None` (the
+    prediction-market JSON-API providers) inherits aiohttp's own default `Accept-Encoding`, which
+    advertises `br` and `zstd` as soon as both decoders are importable, and the last test here
+    pins that.
+    """
+
+    def test_both_decoders_are_available_to_aiohttp(self):
+        """The dependency-level pin, separate from the wire tests so a dropped dependency names
+        itself instead of surfacing as a 400 from the decode path."""
+        assert HAS_BROTLI, "aiohttp has no brotli decoder — is `Brotli` still a dependency?"
+        assert HAS_ZSTD, "aiohttp has no zstd decoder — is `backports.zstd` still a dependency?"
+
+    async def test_browser_headers_session_decodes_zstd_it_never_advertised(self):
+        async with (
+            _encoded_body_server(_zstd_compress(_REPLAYED_PAGE.encode()), "zstd") as (url, accept_encodings),
+            build_session(timeout_s=5.0, headers=BROWSER_HEADERS) as session,
+            session.get(url) as resp,
+        ):
+            assert resp.status == 200
+            assert await resp.text() == _REPLAYED_PAGE
+
+        assert "zstd" not in accept_encodings[0], "the point is that BROWSER_HEADERS never asked for zstd"
+
+    async def test_browser_headers_session_decodes_brotli_it_never_advertised(self):
+        import brotli
+
+        async with (
+            _encoded_body_server(brotli.compress(_REPLAYED_PAGE.encode()), "br") as (url, accept_encodings),
+            build_session(timeout_s=5.0, headers=BROWSER_HEADERS) as session,
+            session.get(url) as resp,
+        ):
+            assert resp.status == 200
+            assert await resp.text() == _REPLAYED_PAGE
+
+        assert "br" not in accept_encodings[0], "the point is that BROWSER_HEADERS never asked for brotli"
+
+    async def test_default_headers_session_advertises_br_and_zstd(self):
+        """A session built WITHOUT explicit headers advertises the installed decoders on the wire.
+
+        aiohttp fills in its own `Accept-Encoding` when the caller sets none, and
+        `_gen_default_accept_encoding()` appends `br` and `zstd` whenever the decoders import, so
+        this is the header the prediction-market fetches really send. Two assertions on purpose:
+        the wire value equals aiohttp's `DEFAULT_HEADERS` entry, which proves the widening is
+        aiohttp's automatic header and not something of ours; and `br` / `zstd` are each present
+        as tokens, which is the part that fails if either decoder dependency is dropped or aiohttp
+        stops advertising them — the derived comparison alone would follow aiohttp down.
+        """
+        async with (
+            _encoded_body_server(_zstd_compress(_REPLAYED_PAGE.encode()), "zstd") as (url, accept_encodings),
+            build_session(timeout_s=5.0, headers=None) as session,
+            session.get(url) as resp,
+        ):
+            assert resp.status == 200
+            assert await resp.text() == _REPLAYED_PAGE
+
+        assert accept_encodings[0] == ClientRequest.DEFAULT_HEADERS[hdrs.ACCEPT_ENCODING]
+        advertised = [token.strip() for token in accept_encodings[0].split(",")]
+        assert "br" in advertised, f"aiohttp's automatic Accept-Encoding no longer advertises brotli: {advertised}"
+        assert "zstd" in advertised, f"aiohttp's automatic Accept-Encoding no longer advertises zstd: {advertised}"
 
 
 class TestReadBodyCapped:
@@ -405,6 +565,86 @@ class TestExtractDatawrapperCharts:
     def test_no_embeds_returns_empty(self):
         assert extract_datawrapper_charts("<html><body>No charts here.</body></html>") == []
         assert extract_datawrapper_charts("") == []
+
+
+# Each snippet below is the provider's OWN published embed code (Infogram's
+# embed-code generator, Flourish's developer docs, Tableau's "Writing Embed
+# Code" help page), trimmed of the minified loader body. They are what a page
+# author pastes in, so they are the shapes the scan has to recognize.
+_INFOGRAM_EMBED_SNIPPET = (
+    '<div class="infogram-embed" data-id="_/vs9b6iAeARko8cuwH51x" data-type="interactive" '
+    'data-title="NE - Osborn v. Ricketts"></div>'
+    '<script>!function(e,i,n,s){var t="InfogramEmbeds";}(document,0,"infogram-async",'
+    '"https://e.infogram.com/js/dist/embed-loader-min.js");</script>'
+)
+_FLOURISH_EMBED_SNIPPET = (
+    '<div class="flourish-embed flourish-chart" data-src="visualisation/4853699">'
+    '<script src="https://public.flourish.studio/resources/embed.js"></script></div>'
+)
+_TABLEAU_V1_EMBED_SNIPPET = (
+    "<script type='text/javascript' src='https://public.tableau.com/javascripts/api/viz_v1.js'></script>"
+    "<div class='tableauPlaceholder' style='width:800; height:600;'>"
+    "<object class='tableauViz' width='800' height='600' style='display:none;'></object></div>"
+)
+_TABLEAU_V3_EMBED_SNIPPET = (
+    '<script type="module" src="https://public.tableau.com/javascripts/api/tableau.embedding.3.latest.min.js">'
+    '</script><tableau-viz id="tableauViz" src="https://public.tableau.com/views/wb/view"></tableau-viz>'
+)
+
+
+class TestUnreadableDataEmbedProviders:
+    """The routeless half of embed detection: providers whose numbers we cannot reach.
+
+    qids 44554/44556 — a tracker page served 2.9k chars of forecast background over
+    HTTP 200 while the resolving polling average sat in two Infogram iframes, and the
+    fetch reported an unqualified success. Naming the provider is what lets the caller
+    withhold an embed-only page or disclose the gap on a page that also carried prose.
+    """
+
+    def test_infogram_embed_snippet(self):
+        assert unreadable_data_embed_providers(_INFOGRAM_EMBED_SNIPPET) == ["infogram"]
+
+    def test_flourish_embed_snippet(self):
+        assert unreadable_data_embed_providers(_FLOURISH_EMBED_SNIPPET) == ["flourish"]
+
+    def test_tableau_v1_and_v3_embed_snippets(self):
+        assert unreadable_data_embed_providers(_TABLEAU_V1_EMBED_SNIPPET) == ["tableau"]
+        assert unreadable_data_embed_providers(_TABLEAU_V3_EMBED_SNIPPET) == ["tableau"]
+
+    def test_infogram_iframe_form_matches_on_the_host(self):
+        # The iframe variant carries no `infogram-embed` class — only the host.
+        html = '<iframe src="https://e.infogram.com/_/vs9b6iAeARko8cuwH51x?src=embed"></iframe>'
+        assert unreadable_data_embed_providers(html) == ["infogram"]
+
+    def test_json_escaped_embed_url_matches(self):
+        # Same tolerance the Datawrapper id regex carries: a `data-attrs` JSON blob
+        # escapes its slashes.
+        html = r'{"url":"https:\/\/public.flourish.studio\/visualisation\/4853699\/"}'
+        assert unreadable_data_embed_providers(html) == ["flourish"]
+
+    def test_datawrapper_is_not_reported(self):
+        # Datawrapper HAS a route (the Tier-2 live-dataset hop), so its embeds are not
+        # unreadable and its outcome rides that hop's own FetchStatus. Reporting it here
+        # would relabel every js-walled tracker the hop already rescues.
+        assert unreadable_data_embed_providers(_IRAN_TRACKER_SHAPED_HTML) == []
+
+    def test_multiple_providers_in_document_order(self):
+        html = f"<body><p>intro</p>{_TABLEAU_V1_EMBED_SNIPPET}<p>mid</p>{_INFOGRAM_EMBED_SNIPPET}</body>"
+        assert unreadable_data_embed_providers(html) == ["tableau", "infogram"]
+
+    def test_one_entry_per_provider_however_many_embeds(self):
+        html = _INFOGRAM_EMBED_SNIPPET + _INFOGRAM_EMBED_SNIPPET
+        assert unreadable_data_embed_providers(html) == ["infogram"]
+
+    def test_prose_naming_a_provider_is_not_an_embed(self):
+        # The disclosure this feeds is forecaster-facing ("the figures are NOT in the
+        # page text below"), so a page that merely CREDITS a tool in prose must not trip it.
+        html = "<p>The chart was built with Infogram and Tableau by our data team.</p>"
+        assert unreadable_data_embed_providers(html) == []
+
+    def test_no_embeds_returns_empty(self):
+        assert unreadable_data_embed_providers("<html><body>Plain prose.</body></html>") == []
+        assert unreadable_data_embed_providers("") == []
 
 
 class TestDatawrapperLiveDataUrl:

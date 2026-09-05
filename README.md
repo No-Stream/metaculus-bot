@@ -15,7 +15,7 @@ What's inside:
 - **Two gap-fill research passes.** After the first research round, the bot looks for missing facts. v1 (`research/targeted.py`) has an analyzer LLM list up to `GAP_FILL_MAX_GAPS` factual gaps and resolves each with a parallel web search. v2 (`research/agentic/`) runs an agentic tool loop: a driver LLM searches, fetches, and reads documents until it has what it needs, then appends a citation-only findings block. Both passes are on in production.
 - **Numeric CDF pipeline.** Each forecaster declares the canonical percentile set (`STANDARD_PERCENTILES` in `metaculus_bot/numeric/config.py`); the bot turns them into a PCHIP CDF on the `PCHIP_CDF_POINTS` grid and enforces Metaculus's constraints (min/max step per bin, bound pinning, strictly increasing).
 - **Backtest-first benchmarking.** Scores the bot's predictions against real question resolutions on binary, numeric, and multiple-choice questions (`backtest.py`).
-- **Credit telemetry.** Logs OpenRouter balance and spend per run, and flags when the shared donated key drops below a refill floor (`metaculus_bot/credit_telemetry.py`, `make check_credits`).
+- **Credit telemetry.** Logs OpenRouter balance and spend per run, and flags when the shared donated key drops below an early-warning floor (`metaculus_bot/credit_telemetry.py`, `make check_credits`).
 
 ## Quick Start
 
@@ -248,6 +248,10 @@ metaculus-bot/
 - **[docs/research.md](docs/research.md)** — every research provider, what it does, and how the flags gate it.
 - **[docs/agentic_gap_fill.md](docs/agentic_gap_fill.md)** — the v2 agentic gap-fill loop and its tools.
 - **[docs/numeric_pipeline.md](docs/numeric_pipeline.md)** — percentiles → PCHIP CDF and the Metaculus constraints.
+- **[docs/value_extraction.md](docs/value_extraction.md)** — how a forecast value is read out of a model's rationale.
+- **[docs/prompts.md](docs/prompts.md)** — every forecasting-prompt rule and the failure it corrects.
+- **[docs/roster_history.md](docs/roster_history.md)** — the ensemble roster, its history, and the dormant subsystems.
+- **[docs/performance_analysis.md](docs/performance_analysis.md)** — residual-analysis conventions: eras, cohorts, scoring.
 - **[docs/operations.md](docs/operations.md)** — running the bot, workflows, cost discipline, and credit telemetry.
 
 ## Framework Integration
@@ -262,7 +266,7 @@ This project builds on the [`forecasting-tools`](https://github.com/Metaculus/fo
 
 ## Additional Resources
 
-- **[AGENTS.md](AGENTS.md)** — detailed, current-state repository guidelines (the maintained map of the codebase).
+- **[AGENTS.md](AGENTS.md)** — the terse agent-facing starting point: the cost gate, repo overrides, layout, pipeline outline, standing rules, and an index into `docs/`.
 - **[metac-bot-template](https://github.com/Metaculus/metac-bot-template)** — the upstream starter template this repo forked from.
 - **[forecasting-tools](https://github.com/Metaculus/forecasting-tools)** — framework documentation.
 

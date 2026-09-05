@@ -1841,8 +1841,10 @@ class TestMcSummaryBulletsStayProseOnly:
 # Tolerant raw-JSON salvage rung (strict block > prose > tolerant).
 #
 # Historical 2026-05/06-era blocks carry retired tier-2 scaffold fields
-# (mixture_components, tails, distribution_family_hint) or values the current
-# strict schemas reject (concentration=0.0). parse_structured_block's
+# (mixture_components, tails, distribution_family_hint), which is what still needs
+# this rung. The other historical offender, an edge-value concentration=0.0, is
+# now read as absent by the strict MC schema (2026-09-02, when the field left the
+# prompt), so those comments resolve one rung earlier. parse_structured_block's
 # extra="forbid" schemas return None for the whole block, and block-only
 # rationales (gemini-3.1-pro in that era) have no prose value lines either —
 # so those models silently vanished from recovered per-model data. That parse
@@ -1907,10 +1909,12 @@ class TestTolerantBlockSalvage:
         result = parse_per_model_numeric_percentiles(comment)
         assert result == {"gpt-5.5": [(50.0, 150.0)]}
 
-    def test_mc_block_with_zero_concentration_salvaged(self):
-        # Gemini's actual Q43656-era MC block: concentration=0.0 fails the
-        # strict >0 validator and the trailing prose lines lack the "- "
-        # bullet prefix the regex fallback needs.
+    def test_mc_block_with_zero_concentration_recovers(self):
+        # Gemini's actual Q43656-era MC block. concentration=0.0 used to fail the strict
+        # >0 validator, which pushed this comment onto the tolerant rung (its trailing
+        # prose lines lack the "- " bullet prefix the regex fallback needs); since
+        # 2026-09-02 the strict schema reads the value as absent and resolves it directly.
+        # Either way the recovered ballot is the same, which is what this pins.
         block = _fenced_json_block(
             {
                 "question_type": "multiple_choice",
