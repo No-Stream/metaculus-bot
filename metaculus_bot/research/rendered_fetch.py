@@ -455,6 +455,27 @@ def _block_web_socket(web_socket_route: Any) -> None:
     ``Network.webSocket*`` events, and an IP-literal target such as ``ws://127.0.0.1`` never
     consults the resolver the DNS pin rewrites.
 
+    The mechanism, and its limits, read out of the pinned Playwright 1.61 driver source on
+    2026-09-04. Registering the pattern makes the driver inject an init script into the context
+    at that moment, before any socket exists, and that script runs in every frame of every page
+    the context opens and replaces ``globalThis.WebSocket`` with a routed stand-in; the page
+    then sees an object that reports itself open and delivers nothing. So this is an IN-PAGE
+    mitigation rather than a network boundary: a dedicated Worker has its own global scope,
+    which the injected script does not reach, so a socket opened from one very likely keeps the
+    native constructor and is not routed here. The injection also leaves two enumerable globals
+    in every frame, ``__pwWebSocketBinding`` and ``__pwWebSocketDispatch``, which a page can
+    read; that is a fingerprinting surface on the one rung whose job is getting past hostile
+    edges, and it is unmeasured. Chromium's own Local Network Access check stands behind the
+    Worker residual for local and loopback targets (see the route-guard comment in
+    :func:`_render_in_context`), and a filtering forward proxy is the remedy that would make
+    this a boundary (FUTURE.md item 8).
+
+    The log line is INFO, deliberately: ``cli.py`` configures the root logger at INFO, so a DEBUG
+    line is dropped in every real run, and this line is the only record that a page's socket-fed
+    content was withheld from the render. There is no count key or marker for it yet; the
+    2026-09-04 probe measured 0 of 22 render targets opening a socket, so the counter waits for
+    a real INFO line to show up in a run log.
+
     Provably raise-free, deliberately. Playwright dispatches this on a task it creates itself, the
     detached-listener shape behind the 2026-07-25 traceback storm, and it stays registered through
     the context close (``unroute_all`` clears HTTP routes only and there is no
@@ -463,7 +484,7 @@ def _block_web_socket(web_socket_route: Any) -> None:
     dropped so a credentialled socket URL does not reach the log.
     """
     host_port = web_socket_route.url.partition("//")[2].partition("/")[0].rpartition("@")[2]
-    logger.debug("rendered fetch blocked a page WebSocket to %s", host_port)
+    logger.info("rendered fetch blocked a page WebSocket to %s", host_port)
 
 
 def _landed_off_host(final_url: str, pinned_host: str) -> bool:
@@ -1092,10 +1113,11 @@ async def _render_in_context(
     # host. A request Playwright cannot attribute to a frame is auto-continued the same way, and stays the
     # one channel with no check of ours. A WebSocket handshake is invisible to `context.route` by
     # construction, because HTTP interception is the CDP `Fetch.enable` domain while WebSockets surface only
-    # on the report-only `Network.webSocket*` events; it is closed by the `route_web_socket` handler
-    # registered below, `_block_web_socket`, which never connects the socket to a server (see its
-    # docstring for the mechanism and its limits: it is Playwright's in-page replacement of
-    # `globalThis.WebSocket`, so a dedicated Worker very likely keeps the native constructor). Service-worker
+    # on the report-only `Network.webSocket*` events; it is closed for page scripts by the `route_web_socket`
+    # handler registered below, `_block_web_socket`, which never connects the socket to a server. Its
+    # docstring carries the mechanism and its limits, the short form being that it is an in-page replacement
+    # of `globalThis.WebSocket` rather than a network boundary, so a dedicated Worker very likely keeps the
+    # native constructor. Service-worker
     # traffic is a fourth such channel and is closed by `service_workers="block"` on the context above. One
     # shape that looks like a hole and is not: a CORS preflight OPTIONS is auto-fulfilled by the driver with
     # a synthetic 204 and never reaches the network.
@@ -1107,10 +1129,12 @@ async def _render_in_context(
     # is refused. A subresource host is guarded only by this per-request preflight, whose getaddrinfo
     # resolves independently of Chromium's connect, so a rebinding host (TTL 0) can still win that race.
     # Chromium 149 (the build Playwright 1.61 pins) narrows that: Local Network Access gates a public page's
-    # subresource requests to local and loopback addresses behind a permission this headless context never
-    # grants. That mitigation is INFERRED from Chromium's feature lists and vendor docs rather than observed,
-    # because the test suite blocks every real browser launch, and it is a browser default we neither pin
-    # nor assert. A filtering forward proxy is the only remedy that covers every channel at connect time,
+    # subresource requests, and since Chrome 147 its WebSocket handshakes, to local and loopback addresses
+    # behind a permission this headless context never grants, which is the one boundary-level mitigation
+    # standing behind the in-page WebSocket block's Worker residual. That mitigation is INFERRED from
+    # Chromium's feature lists and vendor docs rather than observed, because the test suite blocks every real
+    # browser launch, and it is a browser default we neither pin nor assert. A filtering forward proxy is the
+    # only remedy that covers every channel at connect time,
     # and it stays deferred as its own change: FUTURE.md item 8 under "Resolution-source fetcher: Tier-2 LLM
     # fetch + oversized-source summarization" carries the ranked candidates. Harvested JSON passes the guard
     # below like any other response, so a harvestable response is one Chromium was allowed to dial.

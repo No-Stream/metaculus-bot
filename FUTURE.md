@@ -1455,8 +1455,11 @@ Follow-ups:
    the caller's own classification, and `RenderedPage.url` still carries the REQUESTED URL, because
    that is the base for link resolution and for both render memos. Second,
    `context.route_web_socket("**/*", _block_web_socket)` is registered before the page is opened,
-   and the handler logs one DEBUG line and never calls `connect_to_server`, so no page socket is
-   dialed. Third, the rendered rung hands the browser `direct.url`, the URL the direct fetch landed
+   and the handler logs one INFO line (raised from DEBUG in the fix wave, because `cli.py` configures
+   the root logger at INFO and the line is the only record of a content-affecting block) and never
+   calls `connect_to_server`, so no page socket is dialed; the mechanism and its limits, including
+   the two enumerable `__pwWebSocket*` globals the injection leaves in every frame, are recorded on
+   `_block_web_socket`'s docstring. Third, the rendered rung hands the browser `direct.url`, the URL the direct fetch landed
    on once its own redirect hops were followed and re-guarded, rather than the cited URL, so the pin
    covers the host that actually serves the content and a page whose canonical form is one ordinary
    hop away (`example.com` to `www.example.com`) is not refused for taking it. Where the two URLs

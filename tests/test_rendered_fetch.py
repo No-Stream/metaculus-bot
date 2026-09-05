@@ -777,16 +777,20 @@ class TestTheWebSocketChannel:
     def test_the_block_never_connects_and_returns_normally(self, caplog):
         """The handler runs on a task Playwright creates, where a raise is a detached-listener
         traceback (the 2026-07-25 storm), and ``connect_to_server()`` is the handshake being
-        refused; the one thing it does is name the host it refused, at DEBUG."""
+        refused; the one thing it does is name the host it refused, at INFO, because ``cli.py``
+        configures the root logger at INFO and this line is the only record that a page's
+        socket-fed content was withheld from the render."""
         socket = FakeWebSocketRoute("ws://user:secret@127.0.0.1:8080/feed?token=abc")
 
-        with caplog.at_level(logging.DEBUG, logger="metaculus_bot.research.rendered_fetch"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.rendered_fetch"):
             result = rendered_fetch._block_web_socket(socket)
 
         assert result is None
         assert socket.connect_calls == 0
         assert socket.close_calls == []
-        (message,) = [message for message in caplog.messages if "WebSocket" in message]
+        (record,) = [record for record in caplog.records if "WebSocket" in record.getMessage()]
+        assert record.levelno == logging.INFO
+        message = record.getMessage()
         assert "127.0.0.1:8080" in message
         assert "secret" not in message
         assert "token" not in message
