@@ -504,10 +504,10 @@ def _build_stacker_inputs(
     ``run_tools_for_forecaster`` checks the env flag internally and returns "" when
     off, so on arm A this produces no augmentations and each rationale passes through
     unchanged; base texts are stripped of the leading ``Model: <name>`` tag, mirroring
-    production at main.py:375 inside ``_run_stacking``. Then the once-per-question
+    ``AggregationPipeline.run_stacking``. Then the once-per-question
     cross-model aggregation, which receives the *raw* (with-Model-tag) rationales for
     parsing — the structured-block extractors don't depend on the tag, and production
-    at main.py:798-803 and 890-897 passes raw rationales too. Finally the prompt-size
+    in ``stacking_route._finalize_stacked_prediction`` passes raw rationales too. Finally the prompt-size
     budget trim.
     """
     per_forecaster_md: dict[str, str] = {}

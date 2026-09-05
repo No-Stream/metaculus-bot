@@ -117,9 +117,9 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
 
     bot._forecasters_dropped_count = 1
     bot._questions_failed_to_publish = 2
-    bot._stacker_primary_failed_count = 4
-    bot._stacker_fallback_used_count = 8
-    bot._stacker_fallback_failed_count = 16
+    bot._pipeline.counters.stacker_primary_failed_count = 4
+    bot._pipeline.counters.stacker_fallback_used_count = 8
+    bot._pipeline.counters.stacker_fallback_failed_count = 16
     bot._research_provider_failure_count = 32
     bot._gap_fill_v2_error_count = 64
     # prediction_market_degraded is read-only — it reads the prediction-market
@@ -170,7 +170,7 @@ async def test_run_summary_lines_name_what_they_count(mock_general_llm, caplog):
     bot = _bot(mock_general_llm, with_stacker=True, aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING)
     bot._research_provider_failure_count = 3
     bot._summarizer_failure_count = 1
-    bot._conditional_stacking_skipped_single_forecaster_count = 2
+    bot._pipeline.counters.conditional_stacking_skipped_single_forecaster_count = 2
 
     with caplog.at_level(logging.INFO, logger="metaculus_bot.forecaster"):
         await bot.forecast_questions([])

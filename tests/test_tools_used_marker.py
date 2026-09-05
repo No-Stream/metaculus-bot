@@ -69,7 +69,7 @@ _BASE_EXPLANATION = "# SUMMARY\n\nBase body."
 
 class TestToolsUsedMarker:
     """Verifies the TOOLS_USED marker emission logic against Phase 1's
-    _stacker_outcome tri-state (``primary`` | ``fallback_llm`` |
+    pipeline outcomes tri-state (``primary`` | ``fallback_llm`` |
     ``fallback_median`` | ``skipped``) rather than the retired
     _question_was_stacked boolean."""
 
@@ -77,7 +77,7 @@ class TestToolsUsedMarker:
         monkeypatch.setenv(FEATURE_FLAG_ENV, "1")
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_q()
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -89,7 +89,7 @@ class TestToolsUsedMarker:
         monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_q()
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -103,7 +103,7 @@ class TestToolsUsedMarker:
         q = _make_q()
         # fallback_median: stacker LLMs both failed, MEDIAN used. Was previously
         # labelled _question_was_stacked=False by the boolean marker.
-        bot._stacker_outcome[q.id_of_question] = "fallback_median"
+        bot._pipeline.outcomes[q.id_of_question] = "fallback_median"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -142,7 +142,7 @@ class TestToolsUsedMarkerPerTypeDispatch:
         monkeypatch.setenv(TYPES_ENV, "binary,multiple_choice")
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_q(spec=NumericQuestion)
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -155,7 +155,7 @@ class TestToolsUsedMarkerPerTypeDispatch:
         monkeypatch.setenv(TYPES_ENV, "binary")
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_q(spec=BinaryQuestion)
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -170,7 +170,7 @@ class TestToolsUsedMarkerPerTypeDispatch:
         monkeypatch.setenv(TYPES_ENV, "binary,numeric,multiple_choice")
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_q(spec=BinaryQuestion)
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -185,7 +185,7 @@ class TestToolsUsedMarkerPerTypeDispatch:
         monkeypatch.setenv(TYPES_ENV, "numeric")
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_q(spec=MultipleChoiceQuestion)
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)

@@ -61,8 +61,8 @@ class TestBinaryLowSpreadSkipsStacking:
         assert len(result.predictions) == 3
         qid = question.id_of_question
         assert qid is not None
-        assert bot._stacker_outcome[qid] == "skipped"
-        assert bot._conditional_stacking_skipped_count == 1
+        assert bot._pipeline.outcomes[qid] == "skipped"
+        assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
 
 
 class TestBinaryHighSpreadTriggersStacking:
@@ -103,7 +103,7 @@ class TestBinaryHighSpreadTriggersStacking:
                 new_callable=AsyncMock,
                 return_value="Targeted results",
             ) as mock_search,
-            patch.object(bot, "_run_stacking", return_value=0.45) as mock_stacking,
+            patch.object(bot._pipeline, "run_stacking", return_value=0.45) as mock_stacking,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
 
@@ -114,7 +114,7 @@ class TestBinaryHighSpreadTriggersStacking:
         mock_stacking.assert_called_once()
 
         assert len(result.predictions) == 1
-        assert bot._conditional_stacking_triggered_count == 1
+        assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
 
 class TestBinaryStackerPrimaryFailsFallbackSucceeds:
@@ -154,7 +154,7 @@ class TestBinaryStackerPrimaryFailsFallbackSucceeds:
                 "_forecaster_with_soft_deadline",
                 new=AsyncMock(return_value=predictions[0]),
             ),
-            patch.object(bot, "_run_stacking", side_effect=stacking_side_effect),
+            patch.object(bot._pipeline, "run_stacking", side_effect=stacking_side_effect),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
 
@@ -162,8 +162,8 @@ class TestBinaryStackerPrimaryFailsFallbackSucceeds:
 
         qid = question.id_of_question
         assert qid is not None
-        assert bot._stacker_outcome[qid] == "fallback_llm"
-        assert bot._stacker_primary_failed_count == 1
+        assert bot._pipeline.outcomes[qid] == "fallback_llm"
+        assert bot._pipeline.counters.stacker_primary_failed_count == 1
 
 
 class TestBinaryBothStackersFailMedianFallback:
@@ -197,7 +197,7 @@ class TestBinaryBothStackersFailMedianFallback:
                 "_forecaster_with_soft_deadline",
                 new=AsyncMock(return_value=predictions[0]),
             ),
-            patch.object(bot, "_run_stacking", side_effect=always_fail),
+            patch.object(bot._pipeline, "run_stacking", side_effect=always_fail),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
 
@@ -205,8 +205,8 @@ class TestBinaryBothStackersFailMedianFallback:
 
         qid = question.id_of_question
         assert qid is not None
-        assert bot._stacker_outcome[qid] == "fallback_median"
-        assert bot._stacker_fallback_failed_count == 1
+        assert bot._pipeline.outcomes[qid] == "fallback_median"
+        assert bot._pipeline.counters.stacker_fallback_failed_count == 1
 
         final_prediction = result.predictions[0].prediction_value
         assert isinstance(final_prediction, float)

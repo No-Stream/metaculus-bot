@@ -124,9 +124,9 @@ def _option_list(option_probabilities: Sequence[tuple[str, float]]) -> Predicted
 
 
 def _assert_qid_state_consumed(bot: TemplateForecaster, qid: int) -> None:
-    assert qid not in bot._stacker_outcome
-    assert qid not in bot._stacker_skip_reason
-    assert qid not in bot._stack_meta_reasoning
+    assert qid not in bot._pipeline.outcomes
+    assert qid not in bot._pipeline.skip_reasons
+    assert qid not in bot._pipeline.meta_reasoning
     assert qid not in bot._contributing_forecasters
     assert qid not in bot._pipeline.expected_base_combines
 

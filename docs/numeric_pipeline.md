@@ -359,7 +359,7 @@ Step 3 no longer spreads whole-set collapses.
 
 Percentile-space averaging would blur multi-modal disagreement; CDF-space averaging
 preserves it. In production the base-combine path uses **MEDIAN** of the raw per-model
-CDFs (`_base_combine` in `aggregation_pipeline.py`, because the default strategy is
+CDFs (`base_combine` in `aggregation_pipeline.py`, because the default strategy is
 `CONDITIONAL_STACKING` and stacking is disabled in prod). Backtests and the mean arm use
 MEAN.
 

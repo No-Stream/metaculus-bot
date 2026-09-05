@@ -20,7 +20,6 @@ from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ForecastReport, ResearchWithPredictions
 from forecasting_tools.data_models.questions import ConditionalQuestion, DateQuestion
 
-from metaculus_bot import stacking as stacking
 from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
@@ -37,7 +36,6 @@ from metaculus_bot.constants import (
     FORECASTER_SOFT_DEADLINE,
     MIN_FORECASTERS_TO_PUBLISH,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
-    STACKER_SOFT_DEADLINE,
     TIME_BUDGET_MIN_VIABLE_S,
     TS_ANCHOR_CHART_ENABLED_ENV,
     env_flag_enabled,
@@ -81,7 +79,7 @@ from metaculus_bot.time_budget import (
     format_time_budget_marker,
 )
 from metaculus_bot.time_utils import _as_utc
-from metaculus_bot.tool_runner import build_cross_model_aggregation, run_tools_for_forecaster
+from metaculus_bot.tool_runner import run_tools_for_forecaster
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
@@ -118,16 +116,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
     ) -> None:
         if not isinstance(aggregation_strategy, AggregationStrategy):
             raise ValueError(f"aggregation_strategy must be an AggregationStrategy enum, got {aggregation_strategy}")
-        self.aggregation_strategy: AggregationStrategy = aggregation_strategy
 
         setup = prepare_llm_config(
             llms=llms,
-            aggregation_strategy=self.aggregation_strategy,
+            aggregation_strategy=aggregation_strategy,
             predictions_per_report=predictions_per_research_report,
         )
 
         self._forecaster_llms: list[GeneralLlm] = setup.forecaster_llms
-        self.__stacker_llm: GeneralLlm | None = setup.stacker_llm
         self._analyzer_llm: GeneralLlm | None = setup.analyzer_llm
         normalized_llms: dict[str, str | GeneralLlm] = setup.normalized_llms
         predictions_per_research_report = setup.predictions_per_report
@@ -158,11 +154,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 self.min_forecasters_to_publish,
                 len(self._forecaster_llms),
             )
-        self.stacking_fallback_on_failure: bool = stacking_fallback_on_failure
-        self.stacking_randomize_order: bool = stacking_randomize_order
-
-        # Per-question votes from each LLM on whether outcomes are discrete integers
-        self._discrete_integer_votes: defaultdict[int, list[bool]] = defaultdict(list)
         # Conditional stacking thresholds (overridable per question type)
         _valid_threshold_keys = {"binary", "mc", "numeric"}
         if stacking_spread_thresholds is not None:
@@ -171,7 +162,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 raise ValueError(
                     f"Unknown stacking_spread_thresholds keys: {unknown_keys}. Valid keys: {_valid_threshold_keys}"
                 )
-        self._stacking_spread_thresholds: dict[str, float] = {
+        stacking_spread_thresholds_by_type: dict[str, float] = {
             "binary": CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
             "mc": CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
             "numeric": CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
@@ -179,13 +170,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         # Aggregation pipeline owns stacking state, counters, and dispatch
         self._pipeline = AggregationPipeline(
-            strategy=self.aggregation_strategy,
-            stacker_llm=self._stacker_llm,
+            strategy=aggregation_strategy,
+            stacker_llm=setup.stacker_llm,
             parser_llm=GeneralLlm(model="placeholder"),  # replaced after super().__init__
             stacking_fallback_on_failure=stacking_fallback_on_failure,
             stacking_randomize_order=stacking_randomize_order,
-            stacking_spread_thresholds=self._stacking_spread_thresholds,
-            discrete_integer_votes=self._discrete_integer_votes,
+            stacking_spread_thresholds=stacking_spread_thresholds_by_type,
         )
 
         self._init_alerting_counters()
@@ -222,11 +212,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # attribute is statically known instead of needing scattered ignores.
         self.name: str = getattr(self, "name", type(self).__name__)
 
-        # Now that super().__init__ has run, resolve the parser LLM and wire the
-        # stacking function so that mocking bot._run_stacking flows through.
-        # Use a lambda with dynamic attribute lookup so mock.patch replaces propagate.
+        # Now that super().__init__ has run, resolve the parser LLM.
         self._pipeline.parser_llm = self.get_llm("parser", "llm")
-        self._pipeline.run_stacking_fn = lambda *args, **kwargs: self._run_stacking(*args, **kwargs)  # noqa: PLW0108  # deliberate: the lambda defers attribute lookup so mock.patch of _run_stacking propagates
 
         self._research = ResearchOrchestrator(
             default_llm=self.get_llm("default", "llm"),
@@ -265,17 +252,29 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # single aggregated prediction, so the published collection can't be counted.
         self._contributing_forecasters: defaultdict[int, int] = defaultdict(int)
 
-        self._conditional_stacking_triggered_count: int = 0
-        self._conditional_stacking_skipped_count: int = 0
-        # Skips from the single-forecaster short-circuit, kept in their own bucket so
-        # the two skip reasons stay separable (mirroring the STACKER_OUTCOME split of
-        # "skipped_config_off" out of "skipped"). That branch returns above both of
-        # stacking_route's increment sites, so it has to bump its own counter or the
-        # per-question "SKIPPED: single forecaster survived" logs would end the run at
-        # "skipped=0".
-        self._conditional_stacking_skipped_single_forecaster_count: int = 0
-        self._conditional_stacking_crux_failures: int = 0
-        self._conditional_stacking_search_failures: int = 0
+    @property
+    def aggregation_strategy(self) -> AggregationStrategy:
+        return self._pipeline.strategy
+
+    @aggregation_strategy.setter
+    def aggregation_strategy(self, value: AggregationStrategy) -> None:
+        self._pipeline.strategy = value
+
+    @property
+    def stacking_fallback_on_failure(self) -> bool:
+        return self._pipeline.stacking_fallback_on_failure
+
+    @stacking_fallback_on_failure.setter
+    def stacking_fallback_on_failure(self, value: bool) -> None:
+        self._pipeline.stacking_fallback_on_failure = value
+
+    @property
+    def stacking_randomize_order(self) -> bool:
+        return self._pipeline.stacking_randomize_order
+
+    @stacking_randomize_order.setter
+    def stacking_randomize_order(self, value: bool) -> None:
+        self._pipeline.stacking_randomize_order = value
 
     def _log_ensemble_configuration(self) -> None:
         """Log the ensemble + aggregation configuration once on init."""
@@ -288,7 +287,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if self.aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
             return
 
-        stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
+        stacker_name = self._pipeline.stacker_llm.model if self._pipeline.stacker_llm else "<missing>"
         base_models = [m.model for m in self._forecaster_llms]
         # Display truncation for one log line, not a computation over a sample.
         short_list = (
@@ -311,88 +310,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             analyzer_name,
             len(base_models),
             short_list,
-            self._stacking_spread_thresholds,
+            self._pipeline.stacking_spread_thresholds,
         )
-
-    def _get_threshold_for_question(self, question: MetaculusQuestion) -> float:
-        return self._pipeline.get_threshold_for_question(question)
-
-    def _register_expected_base_combine(self, question: MetaculusQuestion) -> None:
-        self._pipeline.register_expected_base_combine(question)
-
-    @property
-    def _stacker_llm(self) -> GeneralLlm | None:
-        return self.__stacker_llm
-
-    @_stacker_llm.setter
-    def _stacker_llm(self, value: GeneralLlm | None) -> None:
-        self.__stacker_llm = value
-        if hasattr(self, "_pipeline"):
-            self._pipeline.stacker_llm = value
-
-    @property
-    def _stack_meta_reasoning(self) -> dict[int, str]:
-        return self._pipeline.meta_reasoning
-
-    @property
-    def _stacker_outcome(self) -> dict[int, str]:
-        return self._pipeline.outcomes
-
-    @property
-    def _stacker_skip_reason(self) -> dict[int, str]:
-        return self._pipeline.skip_reasons
-
-    @property
-    def _stack_expected_base_combine(self) -> set[int]:
-        return self._pipeline.expected_base_combines
-
-    @property
-    def _stacking_expected_combine_count(self) -> int:
-        return self._pipeline.counters.stacking_expected_combine_count
-
-    @_stacking_expected_combine_count.setter
-    def _stacking_expected_combine_count(self, value: int) -> None:
-        self._pipeline.counters.stacking_expected_combine_count = value
-
-    @property
-    def _stacking_unexpected_combine_count(self) -> int:
-        return self._pipeline.counters.stacking_unexpected_combine_count
-
-    @_stacking_unexpected_combine_count.setter
-    def _stacking_unexpected_combine_count(self, value: int) -> None:
-        self._pipeline.counters.stacking_unexpected_combine_count = value
-
-    @property
-    def _stacking_fallback_count(self) -> int:
-        return self._pipeline.counters.stacking_fallback_count
-
-    @_stacking_fallback_count.setter
-    def _stacking_fallback_count(self, value: int) -> None:
-        self._pipeline.counters.stacking_fallback_count = value
-
-    @property
-    def _stacker_primary_failed_count(self) -> int:
-        return self._pipeline.counters.stacker_primary_failed_count
-
-    @_stacker_primary_failed_count.setter
-    def _stacker_primary_failed_count(self, value: int) -> None:
-        self._pipeline.counters.stacker_primary_failed_count = value
-
-    @property
-    def _stacker_fallback_used_count(self) -> int:
-        return self._pipeline.counters.stacker_fallback_used_count
-
-    @_stacker_fallback_used_count.setter
-    def _stacker_fallback_used_count(self, value: int) -> None:
-        self._pipeline.counters.stacker_fallback_used_count = value
-
-    @property
-    def _stacker_fallback_failed_count(self) -> int:
-        return self._pipeline.counters.stacker_fallback_failed_count
-
-    @_stacker_fallback_failed_count.setter
-    def _stacker_fallback_failed_count(self, value: int) -> None:
-        self._pipeline.counters.stacker_fallback_failed_count = value
 
     async def forecast_questions(  # pyright: ignore[reportIncompatibleMethodOverride]  # matches base's broadest @overload; base declares Literal overloads we deliberately don't replicate
         self,
@@ -542,12 +461,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         forecasting, while the end-of-run log reads happen earlier in the lifecycle.
         Each read must see any counters changed since the previous one.
         """
+        aggregation_counters = self._pipeline.counters
         return DegradationSnapshot(
             forecasters_dropped=self._forecasters_dropped_count,
             questions_failed_to_publish=self._questions_failed_to_publish,
-            stacker_primary_failed=self._stacker_primary_failed_count,
-            stacker_fallback_used=self._stacker_fallback_used_count,
-            stacker_fallback_failed=self._stacker_fallback_failed_count,
+            stacker_primary_failed=aggregation_counters.stacker_primary_failed_count,
+            stacker_fallback_used=aggregation_counters.stacker_fallback_used_count,
+            stacker_fallback_failed=aggregation_counters.stacker_fallback_failed_count,
             research_provider_failures=self._research_provider_failure_count,
             summarizer_failures=self._summarizer_failure_count,
             gap_fill_v2_errors=self._gap_fill_v2_error_count,
@@ -558,11 +478,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
             publish_skipped_closed=self._publish_skipped_closed_count,
             time_budget_fast_path=self._time_budget_fast_path_count,
             research_budget_cuts=self._research.research_budget_cut_count,
-            conditional_stacking_triggered=self._conditional_stacking_triggered_count,
-            conditional_stacking_skipped=self._conditional_stacking_skipped_count,
-            conditional_stacking_skipped_single_forecaster=self._conditional_stacking_skipped_single_forecaster_count,
-            conditional_stacking_crux_failures=self._conditional_stacking_crux_failures,
-            conditional_stacking_search_failures=self._conditional_stacking_search_failures,
+            conditional_stacking_triggered=aggregation_counters.conditional_stacking_triggered_count,
+            conditional_stacking_skipped=aggregation_counters.conditional_stacking_skipped_count,
+            conditional_stacking_skipped_single_forecaster=(
+                aggregation_counters.conditional_stacking_skipped_single_forecaster_count
+            ),
+            conditional_stacking_crux_failures=aggregation_counters.conditional_stacking_crux_failures,
+            conditional_stacking_search_failures=aggregation_counters.conditional_stacking_search_failures,
         )
 
     def _record_forecaster_drop(self, *, model: str, qid: int | None, cause: str) -> None:
@@ -579,25 +501,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
     def _emit_forecaster_drop_telemetry(self) -> None:
         """Emit this run's per-model drop attribution (see drop_telemetry)."""
         emit_drop_telemetry(self._forecaster_drops)
-
-    async def _run_stacking(
-        self,
-        question: MetaculusQuestion,
-        research: str,
-        reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
-        *,
-        stacker_llm_override: GeneralLlm | None = None,
-        aggregated_tool_output: str | None = None,
-        stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
-    ) -> PredictionTypes:
-        return await self._pipeline.run_stacking(
-            question,
-            research,
-            reasoned_predictions,
-            stacker_llm_override=stacker_llm_override,
-            aggregated_tool_output=aggregated_tool_output,
-            stacker_wall_timeout=stacker_wall_timeout,
-        )
 
     async def run_research(self, question: MetaculusQuestion, time_budget: QuestionTimeBudget | None = None) -> str:
         return await self._research.run_research(question, time_budget=time_budget)
@@ -700,65 +603,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
             ExceptionGroup(f"Errors: {errors}", cast(list[Exception], exceptions)) if exceptions else None
         )
         return valid_predictions, errors, exception_group
-
-    async def _finalize_stacked_prediction(
-        self,
-        question: MetaculusQuestion,
-        valid_predictions: list[ReasonedPrediction[PredictionTypes]],
-        *,
-        research_for_stacking: str,
-        research_report: str,
-        summary_report: str,
-        errors: list[str],
-        default_meta_reasoning: str,
-    ) -> ResearchWithPredictions[PredictionTypes]:
-        """Run the stacker and package the single aggregated prediction.
-
-        Shared by the STACKING and the CONDITIONAL_STACKING-triggered branches:
-        both compute the deterministic cross-model math, invoke
-        ``_aggregate_predictions`` (which runs the stacker LLM), then preserve
-        the stacker meta-analysis alongside the base-model reasonings so
-        residual analysis can recover per-model attribution even when stacking
-        overrode the base aggregation.
-
-        The two branches differ only in which research text feeds the stacker
-        (``research_for_stacking``), which text is surfaced in the published
-        comment (``research_report``), and the meta-reasoning fallback string.
-        ``_stacker_outcome`` is populated by ``_aggregate_predictions`` on the
-        path that actually produced ``aggregated_value``; it is not set here.
-        """
-        prediction_values = [pred.prediction_value for pred in valid_predictions]
-        # Probabilistic tools: deterministic cross-model math runs once per
-        # question and rides at the top of the stacker prompt. No-ops when
-        # PROBABILISTIC_TOOLS_ENABLED is unset.
-        aggregated_tool_output = (
-            build_cross_model_aggregation(
-                question=question,
-                rationales=[p.reasoning for p in valid_predictions],
-                prediction_values=prediction_values,
-            )
-            or None
-        )
-        aggregated_value = await self._aggregate_predictions(
-            prediction_values,
-            question,
-            research=research_for_stacking,
-            reasoned_predictions=valid_predictions,
-            aggregated_tool_output=aggregated_tool_output,
-        )
-        qid = question.id_of_question
-        if qid is None:
-            raise ValueError("Question must have id_of_question to finalize stacked prediction")
-        meta_text = self._stack_meta_reasoning.pop(qid, default_meta_reasoning)
-        combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
-        aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
-        self._register_expected_base_combine(question)
-        return ResearchWithPredictions(
-            research_report=research_report,
-            summary_report=summary_report,
-            errors=errors,
-            predictions=[aggregated_prediction],
-        )
 
     async def _run_individual_question(self, question: MetaculusQuestion) -> ForecastReport:
         """Run the base per-question pipeline, then log the close-margin marker on submit.
@@ -887,7 +731,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Contributor count for the FORECASTERS_USED marker, recorded HERE — the one
         # point every branch below shares, so the stacked, single-forecaster, and
         # base-combine paths agree on "forecasters that fed the published value" by
-        # construction. It cannot be recovered downstream: _finalize_stacked_prediction
+        # construction. It cannot be recovered downstream: route finalization
         # collapses `predictions` to a single aggregate, so counting the published
         # collection reports 1 no matter how many forecasters contributed. Accumulated
         # rather than assigned so research_reports_per_question > 1 keeps the count
@@ -951,7 +795,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 logger.info(marker)
 
         return await route_after_forecasts(
-            self,
+            self._pipeline,
+            analyzer_llm=self._analyzer_llm,
+            is_benchmarking=self.is_benchmarking,
+            research_reports_per_question=self.research_reports_per_question,
             question=question,
             qid=qid_for_log,
             valid_predictions=valid_predictions,
@@ -1019,8 +866,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             time_spent_in_minutes,
         )
         qid = question.id_of_question
-        stacker_outcome = self._stacker_outcome.pop(qid, None) if qid is not None else None
-        stacker_skip_reason = self._stacker_skip_reason.pop(qid, None) if qid is not None else None
+        stacker_outcome = self._pipeline.outcomes.pop(qid, None) if qid is not None else None
+        stacker_skip_reason = self._pipeline.skip_reasons.pop(qid, None) if qid is not None else None
         # Ensemble-size disclosure: forecasters that CONTRIBUTED (== the number of
         # per-model summary bullets) out of those CONFIGURED. Makes a degraded
         # publish self-describing in the durable comment record, so residual
@@ -1161,13 +1008,17 @@ class TemplateForecaster(CompactLoggingForecastBot):
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]] | None = None,
         aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
-        return await self._pipeline.aggregate(
-            predictions,
-            question,
-            research=research,
-            reasoned_predictions=reasoned_predictions,
-            aggregated_tool_output=aggregated_tool_output,
-        )
+        if self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
+            if reasoned_predictions is None and research is None:
+                return self._pipeline.base_combine(predictions, question)
+            return await self._pipeline.stack_predictions(
+                predictions,
+                question,
+                research=research,
+                reasoned_predictions=reasoned_predictions,
+                aggregated_tool_output=aggregated_tool_output,
+            )
+        return self._pipeline.simple_combine(predictions, question)
 
     def _pull_research_chart(self, qid: int | None) -> str | None:
         """Pop the time-series-anchor chart image for this qid from the provider's
@@ -1205,5 +1056,5 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
         qid = question.id_of_question
         if qid is not None and discrete_vote is not None:
-            self._discrete_integer_votes[qid].append(discrete_vote)
+            self._pipeline.discrete_integer_votes[qid].append(discrete_vote)
         return prediction

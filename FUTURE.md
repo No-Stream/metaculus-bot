@@ -2365,7 +2365,7 @@ benchmark.
 **1. Stacker deviation cap from the base-model median (experiment; needs benchmark).** Bound stacker
 output to within K of the base median (binary in prob points — ABSOLUTE, not their unstable-near-0/1
 multiplicative "±20% of average"; numeric as a percentile/location shift), in
-`aggregation_pipeline.py::_stacking_aggregate` just before `_apply_platt_calibration`, new caps in
+`aggregation_pipeline.py::stack_predictions` just before `_apply_platt_calibration`, new caps in
 `constants.py`. *Grounding:* GreeneiBot2 caps consolidated updates to ±20% of the panel average (line 1352).
 *Why:* a cap might let us safely re-enable the numeric stacker MEDIAN beat (CRPS p=0.042). *Caution:* too
 tight defeats the point of stacking — ablate, don't assume. **Gate:** `make backtest_medium` capped-stacker
@@ -3127,6 +3127,13 @@ so any v2 gate tightening is a cost-gate item; and nothing today records that a 
 abandoned at all, so the frequency of the whole failure is unmeasured.
 
 ## Maintainability review decisions (2026-09-05)
+
+Aggregation now has one owner for configuration, question state, and counters:
+`AggregationPipeline`. Its explicit combine and stack operations replace nullable internal
+dispatch; only the framework adapter retains that calling convention. Keep the separate
+question-id maps: multiple research reports share them, and stack meta reasoning is consumed
+before comment metadata. Replacing them with a single per-question record would require a
+separate lifecycle design. Tests patch the pipeline's actual stacker method directly.
 
 The resolution-source presentation extraction separates evidence rendering from fetching.
 Keep the remaining escalation ladder together: its rungs reuse direct-fetch classification,

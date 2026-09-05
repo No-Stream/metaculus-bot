@@ -283,7 +283,7 @@ class TestNumericDiscreteIntegerSnap:
 
         qid = question.id_of_question
         assert qid is not None
-        bot._discrete_integer_votes[qid] = [True, True, True]
+        bot._pipeline.discrete_integer_votes[qid] = [True, True, True]
 
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
@@ -307,7 +307,7 @@ class TestNumericDiscreteIntegerSnap:
 
         aggregated = await bot._aggregate_predictions([p.prediction_value for p in result.predictions], question)
         assert isinstance(aggregated, NumericDistribution)
-        assert qid not in bot._discrete_integer_votes, (
+        assert qid not in bot._pipeline.discrete_integer_votes, (
             "_maybe_snap_to_integers should pop the votes after consuming them"
         )
 
@@ -384,7 +384,7 @@ class TestNumericHighSpreadTriggersStacking:
                 new_callable=AsyncMock,
                 return_value="Targeted results",
             ) as mock_search,
-            patch.object(bot, "_run_stacking", return_value=stacked_dist) as mock_stacking,
+            patch.object(bot._pipeline, "run_stacking", return_value=stacked_dist) as mock_stacking,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
 
@@ -395,7 +395,7 @@ class TestNumericHighSpreadTriggersStacking:
         mock_stacking.assert_called_once()
 
         assert len(result.predictions) == 1
-        assert bot._conditional_stacking_triggered_count == 1
+        assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +446,7 @@ class TestMCLowSpreadMedianPath:
             result = await bot._research_and_make_predictions(question)
 
         assert len(result.predictions) == 3
-        assert bot._conditional_stacking_skipped_count == 1
+        assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
 
         aggregated = await bot._aggregate_predictions([p.prediction_value for p in result.predictions], question)
         assert isinstance(aggregated, PredictedOptionList)
@@ -523,7 +523,7 @@ class TestMCHighSpreadTriggersStacking:
             patch(
                 "metaculus_bot.stacking_route.run_targeted_search", new_callable=AsyncMock, return_value="MC Targeted"
             ) as mock_search,
-            patch.object(bot, "_run_stacking", return_value=stacked_result) as mock_stacking,
+            patch.object(bot._pipeline, "run_stacking", return_value=stacked_result) as mock_stacking,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
 
@@ -534,7 +534,7 @@ class TestMCHighSpreadTriggersStacking:
         mock_stacking.assert_called_once()
 
         assert len(result.predictions) == 1
-        assert bot._conditional_stacking_triggered_count == 1
+        assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +637,7 @@ class TestCommentContainsExpectedMarkers:
         ]
 
         assert question.id_of_question is not None
-        bot._stacker_outcome[question.id_of_question] = "primary"
+        bot._pipeline.outcomes[question.id_of_question] = "primary"
 
         from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
 
@@ -687,7 +687,7 @@ class TestCommentContainsExpectedMarkers:
             aggregated_prediction = _mc_option_list([0.45, 0.35, 0.20])
 
         assert question.id_of_question is not None
-        bot._stacker_outcome[question.id_of_question] = "primary"
+        bot._pipeline.outcomes[question.id_of_question] = "primary"
         collection = ResearchWithPredictions(
             research_report="Research text",
             summary_report="Research text",

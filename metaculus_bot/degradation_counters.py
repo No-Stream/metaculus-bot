@@ -1,8 +1,8 @@
 """Run-level degradation accounting: what reddens CI, and the lines that say why.
 
-``TemplateForecaster`` owns the counters themselves (some as plain ints it bumps,
-some as pass-through properties onto the research orchestrator and the aggregation
-pipeline). It constructs a fresh ``DegradationSnapshot`` at each read. This module
+``TemplateForecaster``, its research orchestrator, and its aggregation pipeline own
+their respective counters. The forecaster constructs a fresh ``DegradationSnapshot``
+at each read. This module
 owns the immutable read boundary and the two things done WITH it: the alertable sum
 ``cli.py`` turns into an exit status, and the two end-of-run summary lines an
 operator greps first.

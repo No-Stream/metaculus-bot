@@ -436,7 +436,7 @@ EXTREME_CALL_HIGH: float = 0.95
 
 # Floor on the PUBLISHED binary probability when exactly ONE forecaster survived
 # (apply_thin_publish_floor in post_processing.py, wired in
-# AggregationPipeline._base_combine on the "single_forecaster" skip reason).
+# AggregationPipeline.base_combine on the "single_forecaster" skip reason).
 #
 # Mechanism, not a fit: the median of an intact ensemble absorbs a member's extreme
 # tail call, and median-of-1 supplies no such variance reduction, so the range the

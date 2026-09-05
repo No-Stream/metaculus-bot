@@ -114,9 +114,9 @@ def _interleave_report_tasks(
 
 
 def _assert_qid_state_consumed(bot: TemplateForecaster) -> None:
-    assert QID not in bot._stacker_outcome
-    assert QID not in bot._stacker_skip_reason
-    assert QID not in bot._stack_meta_reasoning
+    assert QID not in bot._pipeline.outcomes
+    assert QID not in bot._pipeline.skip_reasons
+    assert QID not in bot._pipeline.meta_reasoning
     assert QID not in bot._contributing_forecasters
     assert QID not in bot._pipeline.expected_base_combines
 
@@ -153,13 +153,13 @@ class TestSharedQidReportLifecycle:
                 return _prediction(values[llm.model], llm.model)
             raise AssertionError(f"unexpected research: {report_research}")
 
-        assert bot._stacker_llm is not None
+        assert bot._pipeline.stacker_llm is not None
         stacker_invoke = AsyncMock(side_effect=RuntimeError("stacker unavailable"))
         with (
             patch.object(bot, "run_research", research),
             patch.object(bot, "_make_prediction", new=model_call),
             patch.object(bot, "_research_and_make_predictions", new=_interleave_report_tasks(original_report_pipeline)),
-            patch.object(bot._stacker_llm, "invoke", new=stacker_invoke),
+            patch.object(bot._pipeline.stacker_llm, "invoke", new=stacker_invoke),
         ):
             report = await bot._run_individual_question(question)
 
@@ -276,13 +276,13 @@ The low call remains plausible after comparing both models.
 {"question_type": "binary", "posterior_prob": 0.03}
 ```
 """
-        assert bot._stacker_llm is not None
+        assert bot._pipeline.stacker_llm is not None
         stacker_invoke = AsyncMock(return_value=stacker_response)
         with (
             patch.object(bot, "run_research", research),
             patch.object(bot, "_make_prediction", new=model_call),
             patch.object(bot, "_research_and_make_predictions", new=_interleave_report_tasks(original_report_pipeline)),
-            patch.object(bot._stacker_llm, "invoke", new=stacker_invoke),
+            patch.object(bot._pipeline.stacker_llm, "invoke", new=stacker_invoke),
         ):
             report = await bot._run_individual_question(question)
 

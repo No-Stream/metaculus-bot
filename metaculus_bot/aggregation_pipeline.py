@@ -10,7 +10,6 @@ import asyncio
 import logging
 import random
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -54,9 +53,11 @@ class AggregationCounters:
     stacker_primary_failed_count: int = 0
     stacker_fallback_used_count: int = 0
     stacker_fallback_failed_count: int = 0
-
-
-RunStackingFn = Callable[..., Awaitable[PredictionTypes]]
+    conditional_stacking_triggered_count: int = 0
+    conditional_stacking_skipped_count: int = 0
+    conditional_stacking_skipped_single_forecaster_count: int = 0
+    conditional_stacking_crux_failures: int = 0
+    conditional_stacking_search_failures: int = 0
 
 
 @dataclass
@@ -68,7 +69,6 @@ class AggregationPipeline:
     stacking_randomize_order: bool = True
     stacking_spread_thresholds: dict[str, float] = field(default_factory=dict)
     discrete_integer_votes: defaultdict[int, list[bool]] = field(default_factory=lambda: defaultdict(list))
-    run_stacking_fn: RunStackingFn | None = None
 
     # Per-question state
     meta_reasoning: dict[int, str] = field(default_factory=dict)
@@ -225,45 +225,14 @@ class AggregationPipeline:
         logger.info(f"Stacked numeric prediction for {page_url}")
         return prediction
 
-    async def aggregate(
+    def base_combine(  # noqa: PLR0912  # explicit type/state branches preserve the base-combine lifecycle
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
-        *,
-        research: str | None = None,
-        reasoned_predictions: list[ReasonedPrediction[PredictionTypes]] | None = None,
-        aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
-        """Full aggregation: stacking fallback chain OR simple combine."""
+        """Combine report outputs after routing has selected the base path."""
         if not predictions:
             raise ValueError("Cannot aggregate empty list of predictions")
-
-        # Base-combine re-entry: parent class calls aggregate after stacking already happened
-        if (
-            self.strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
-            and reasoned_predictions is None
-            and research is None
-        ):
-            return self._base_combine(predictions, question)
-
-        # Stacking path
-        if self.strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
-            return await self._stacking_aggregate(
-                predictions,
-                question,
-                research=research,
-                reasoned_predictions=reasoned_predictions,
-                aggregated_tool_output=aggregated_tool_output,
-            )
-
-        # Simple MEAN/MEDIAN path
-        return self._simple_aggregate(predictions, question)
-
-    def _base_combine(
-        self,
-        predictions: list[PredictionTypes],
-        question: MetaculusQuestion,
-    ) -> PredictionTypes:
         qkey = question.id_of_question
 
         expected = qkey in self.expected_base_combines
@@ -291,7 +260,7 @@ class AggregationPipeline:
             # Three asymmetries are accepted here rather than papered over with a second
             # wiring. (1) skip_reasons is written only under STACKING /
             # CONDITIONAL_STACKING, so a single survivor under plain MEAN/MEDIAN routes
-            # through _simple_aggregate and is NOT floored; prod and the code default
+            # through simple_combine and is NOT floored; prod and the code default
             # both run CONDITIONAL_STACKING. (2) outcomes[qid] is overwritten by every
             # routing path, while skip_reasons[qid] is written only by the skip paths and
             # cleared only by the comment builder — so a stale reason could reach this
@@ -304,7 +273,7 @@ class AggregationPipeline:
             # framework then publishes and losing its STACKER_SKIP_REASON marker.
             # (3) This branch returns above the Platt tail at the bottom of the method, so
             # a lone raw binary member is the only published binary path that never
-            # receives Platt calibration — the exact mirror of _simple_aggregate, which
+            # receives Platt calibration — the exact mirror of simple_combine, which
             # calibrates a single prediction but never floors it. Inert today: no workflow
             # sets PLATT_CALIBRATION_ENABLED, and the standing operator decision is that
             # fitted calibration layers are not a lever, so this is recorded rather than
@@ -321,7 +290,7 @@ class AggregationPipeline:
             # min-forecasters=1 single-survivor path (forecaster.py short-circuits
             # spread + stacking and hands the raw prediction through). No-op for
             # binary/MC and for the pre-stacked STACKING output (whose discrete
-            # votes were already consumed in _stacking_aggregate, so the vote list
+            # votes were already consumed in stack_predictions, so the vote list
             # is empty and majority_votes_discrete([]) is False).
             return self._maybe_snap_to_integers(lone, question)
 
@@ -397,20 +366,18 @@ class AggregationPipeline:
                 strategy_name,
             )
 
-    def _get_stacking_fn(self) -> Callable[..., Awaitable[PredictionTypes]]:
-        if self.run_stacking_fn is not None:
-            return self.run_stacking_fn
-        return self.run_stacking
-
-    async def _stacking_aggregate(
+    async def stack_predictions(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
         *,
         research: str | None,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]] | None,
-        aggregated_tool_output: str | None,
+        aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
+        """Run the primary/fallback stacker ladder for one research report."""
+        if not predictions:
+            raise ValueError("Cannot aggregate empty list of predictions")
         if self.stacker_llm is None:
             raise ValueError("STACKING aggregation strategy requires a stacker LLM to be configured")
         if reasoned_predictions is None:
@@ -421,11 +388,9 @@ class AggregationPipeline:
         qid_for_outcome = question.id_of_question
         assert qid_for_outcome is not None
 
-        stacking_fn = self._get_stacking_fn()
-
         try:
             stacked = await asyncio.wait_for(
-                stacking_fn(
+                self.run_stacking(
                     question,
                     research,
                     reasoned_predictions,
@@ -453,7 +418,7 @@ class AggregationPipeline:
             try:
                 self.counters.stacker_fallback_used_count += 1
                 stacked = await asyncio.wait_for(
-                    stacking_fn(
+                    self.run_stacking(
                         question,
                         research,
                         reasoned_predictions,
@@ -495,11 +460,14 @@ class AggregationPipeline:
         )
         return self._apply_platt_calibration(self._maybe_snap_to_integers(combined, question), question)
 
-    def _simple_aggregate(
+    def simple_combine(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
     ) -> PredictionTypes:
+        """Combine raw member predictions under a non-stacking strategy."""
+        if not predictions:
+            raise ValueError("Cannot aggregate empty list of predictions")
         first_prediction = predictions[0]
         logger.info(
             "Aggregating %s predictions with %s", self._prediction_type_label(first_prediction), self.strategy.value
@@ -555,7 +523,7 @@ class AggregationPipeline:
     ) -> PredictionTypes:
         """Filter predictions to the first one's type and run the matching combiner.
 
-        Shared dispatch core for ``_base_combine`` / ``_median_fallback`` / ``_simple_aggregate``;
+        Shared dispatch core for ``base_combine`` / ``_median_fallback`` / ``simple_combine``;
         callers layer their own logging and post-processing (snap/platt) around the result.
         """
         first = predictions[0]
