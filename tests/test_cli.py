@@ -1172,6 +1172,7 @@ class _RealAlertableCountBot(MagicMock):
     """
 
     alertable_count = TemplateForecaster.alertable_count
+    _degradation_snapshot = TemplateForecaster._degradation_snapshot
     _research_provider_failure_count = TemplateForecaster._research_provider_failure_count
     _summarizer_failure_count = TemplateForecaster._summarizer_failure_count
     _gap_fill_v2_error_count = TemplateForecaster._gap_fill_v2_error_count
@@ -1202,6 +1203,11 @@ def _bot_with_real_alertable_count() -> _RealAlertableCountBot:
         "_stacker_fallback_used_count",
         "_stacker_fallback_failed_count",
         "_time_budget_fast_path_count",
+        "_conditional_stacking_triggered_count",
+        "_conditional_stacking_skipped_count",
+        "_conditional_stacking_skipped_single_forecaster_count",
+        "_conditional_stacking_crux_failures",
+        "_conditional_stacking_search_failures",
     ):
         setattr(stub_bot, counter, 0)
     return stub_bot

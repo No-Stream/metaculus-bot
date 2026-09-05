@@ -43,6 +43,7 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.degradation_counters import (
+    DegradationSnapshot,
     alertable_total,
     format_conditional_stacking_summary,
     format_degradation_summary,
@@ -467,13 +468,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         log_pchip_summary()
 
         if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
-            logger.info(format_conditional_stacking_summary(self))
+            logger.info(format_conditional_stacking_summary(self._degradation_snapshot()))
 
         # Loud end-of-run degradation summary. Any non-zero counter here means
         # something got dropped, the stacker fell back, or a research provider
         # failed — all states where CI (cli.py) should exit non-zero so we get
         # paged, but every publishable question has already been published.
-        logger.info(format_degradation_summary(self))
+        logger.info(format_degradation_summary(self._degradation_snapshot()))
         # Per-model attribution for the forecasters_dropped scalar above: which
         # model failed, how often, and why (one grep on FORECASTER_DROPS), plus a
         # WARNING when one model failed across multiple questions this run.
@@ -532,7 +533,37 @@ class TemplateForecaster(CompactLoggingForecastBot):
     @property
     def alertable_count(self) -> int:
         """Sum of counters whose non-zero value should page us (see degradation_counters)."""
-        return alertable_total(self)
+        return alertable_total(self._degradation_snapshot())
+
+    def _degradation_snapshot(self) -> DegradationSnapshot:
+        """Read the current counters into one immutable, point-in-time value.
+
+        This is deliberately uncached: ``cli.py`` reads ``alertable_count`` after
+        forecasting, while the end-of-run log reads happen earlier in the lifecycle.
+        Each read must see any counters changed since the previous one.
+        """
+        return DegradationSnapshot(
+            forecasters_dropped=self._forecasters_dropped_count,
+            questions_failed_to_publish=self._questions_failed_to_publish,
+            stacker_primary_failed=self._stacker_primary_failed_count,
+            stacker_fallback_used=self._stacker_fallback_used_count,
+            stacker_fallback_failed=self._stacker_fallback_failed_count,
+            research_provider_failures=self._research_provider_failure_count,
+            summarizer_failures=self._summarizer_failure_count,
+            gap_fill_v2_errors=self._gap_fill_v2_error_count,
+            prediction_market_degraded=self._prediction_market_degraded_count,
+            prediction_market_source_losses=self._prediction_market_source_loss_count,
+            provider_degradation=self._provider_degradation_count,
+            publish_attempt_failures=self._publish_attempt_failures,
+            publish_skipped_closed=self._publish_skipped_closed_count,
+            time_budget_fast_path=self._time_budget_fast_path_count,
+            research_budget_cuts=self._research.research_budget_cut_count,
+            conditional_stacking_triggered=self._conditional_stacking_triggered_count,
+            conditional_stacking_skipped=self._conditional_stacking_skipped_count,
+            conditional_stacking_skipped_single_forecaster=self._conditional_stacking_skipped_single_forecaster_count,
+            conditional_stacking_crux_failures=self._conditional_stacking_crux_failures,
+            conditional_stacking_search_failures=self._conditional_stacking_search_failures,
+        )
 
     def _record_forecaster_drop(self, *, model: str, qid: int | None, cause: str) -> None:
         """Record ONE dropped ensemble member with attribution, bumping the scalar.

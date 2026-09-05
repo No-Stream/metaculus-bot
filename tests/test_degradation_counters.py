@@ -7,6 +7,7 @@ telemetry parser reads them, so the text is a contract, not a convenience.
 """
 
 import logging
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,6 +17,12 @@ from forecasting_tools.data_models.questions import BinaryQuestion
 from main import TemplateForecaster
 from metaculus_bot import publish_gate, publish_hardening
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.degradation_counters import (
+    DegradationSnapshot,
+    alertable_total,
+    format_conditional_stacking_summary,
+    format_degradation_summary,
+)
 from metaculus_bot.research import prediction_market, provider_health
 
 
@@ -33,6 +40,72 @@ def _bot(mock_general_llm, *, with_stacker: bool = False, **kwargs: Any) -> Temp
         llms_config["stacker"] = mock_general_llm
         llms_config["analyzer"] = mock_general_llm
     return TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1, **kwargs)
+
+
+def _snapshot(**overrides: int) -> DegradationSnapshot:
+    values = {
+        "forecasters_dropped": 0,
+        "questions_failed_to_publish": 0,
+        "stacker_primary_failed": 0,
+        "stacker_fallback_used": 0,
+        "stacker_fallback_failed": 0,
+        "research_provider_failures": 0,
+        "summarizer_failures": 0,
+        "gap_fill_v2_errors": 0,
+        "prediction_market_degraded": 0,
+        "prediction_market_source_losses": 0,
+        "provider_degradation": 0,
+        "publish_attempt_failures": 0,
+        "publish_skipped_closed": 0,
+        "time_budget_fast_path": 0,
+        "research_budget_cuts": 0,
+        "conditional_stacking_triggered": 0,
+        "conditional_stacking_skipped": 0,
+        "conditional_stacking_skipped_single_forecaster": 0,
+        "conditional_stacking_crux_failures": 0,
+        "conditional_stacking_search_failures": 0,
+    }
+    values.update(overrides)
+    return DegradationSnapshot(**values)
+
+
+def test_snapshot_is_immutable_and_conditional_counts_are_not_alertable() -> None:
+    snapshot = _snapshot(
+        forecasters_dropped=2,
+        conditional_stacking_triggered=3,
+        conditional_stacking_skipped=5,
+    )
+
+    assert alertable_total(snapshot) == 2
+    with pytest.raises(FrozenInstanceError):
+        snapshot.forecasters_dropped = 4  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_formatters_accept_snapshot_without_a_forecaster() -> None:
+    snapshot = _snapshot(
+        forecasters_dropped=1,
+        conditional_stacking_triggered=2,
+        conditional_stacking_skipped_single_forecaster=3,
+    )
+
+    assert format_degradation_summary(snapshot).startswith("Degradation counters: forecasters_dropped=1")
+    assert format_conditional_stacking_summary(snapshot) == (
+        "Conditional stacking summary: triggered=2, skipped=0, skipped_single_forecaster=3, "
+        "crux_failures=0, search_failures=0"
+    )
+
+
+def test_forecaster_reads_a_fresh_snapshot_after_counter_updates(mock_general_llm) -> None:
+    bot = _bot(mock_general_llm)
+
+    first_snapshot = bot._degradation_snapshot()
+    bot._forecasters_dropped_count = 7
+    second_snapshot = bot._degradation_snapshot()
+
+    assert first_snapshot.forecasters_dropped == 0
+    assert second_snapshot.forecasters_dropped == 7
+    assert alertable_total(first_snapshot) == 0
+    assert alertable_total(second_snapshot) == 7
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):

@@ -2,7 +2,8 @@
 
 ``TemplateForecaster`` owns the counters themselves (some as plain ints it bumps,
 some as pass-through properties onto the research orchestrator and the aggregation
-pipeline). This module owns the two things done WITH them: the alertable sum
+pipeline). It constructs a fresh ``DegradationSnapshot`` at each read. This module
+owns the immutable read boundary and the two things done WITH it: the alertable sum
 ``cli.py`` turns into an exit status, and the two end-of-run summary lines an
 operator greps first.
 
@@ -14,13 +15,41 @@ exact text assertable without a caplog round-trip. The text is a parsed contract
 harvesting (see the 2026-07-26 ``research_provider_timeouts`` rename).
 """
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from metaculus_bot.forecaster import TemplateForecaster
+from dataclasses import dataclass
 
 
-def alertable_total(bot: "TemplateForecaster") -> int:
+@dataclass(frozen=True, slots=True)
+class DegradationSnapshot:
+    """Immutable values read from one point in a bot run.
+
+    Conditional-stacking values travel with the snapshot so the summary formatters
+    have no dependency on the bot adapter. They are intentionally excluded from
+    ``alertable_total``: normal conditional-stacking decisions do not redden CI.
+    """
+
+    forecasters_dropped: int
+    questions_failed_to_publish: int
+    stacker_primary_failed: int
+    stacker_fallback_used: int
+    stacker_fallback_failed: int
+    research_provider_failures: int
+    summarizer_failures: int
+    gap_fill_v2_errors: int
+    prediction_market_degraded: int
+    prediction_market_source_losses: int
+    provider_degradation: int
+    publish_attempt_failures: int
+    publish_skipped_closed: int
+    time_budget_fast_path: int
+    research_budget_cuts: int
+    conditional_stacking_triggered: int
+    conditional_stacking_skipped: int
+    conditional_stacking_skipped_single_forecaster: int
+    conditional_stacking_crux_failures: int
+    conditional_stacking_search_failures: int
+
+
+def alertable_total(snapshot: DegradationSnapshot) -> int:
     """Sum of counters whose non-zero value should page us.
 
     Consumed by ``cli.py`` to decide whether to ``sys.exit(1)`` after all
@@ -31,25 +60,25 @@ def alertable_total(bot: "TemplateForecaster") -> int:
     skipped stacker is normal operation, not degradation.
     """
     return (
-        bot._forecasters_dropped_count
-        + bot._questions_failed_to_publish
-        + bot._stacker_primary_failed_count
-        + bot._stacker_fallback_used_count
-        + bot._stacker_fallback_failed_count
-        + bot._research_provider_failure_count
-        + bot._summarizer_failure_count
-        + bot._gap_fill_v2_error_count
-        + bot._prediction_market_degraded_count
-        + bot._prediction_market_source_loss_count
-        + bot._provider_degradation_count
-        + bot._publish_attempt_failures
-        + bot._publish_skipped_closed_count
-        + bot._time_budget_fast_path_count
-        + bot._research.research_budget_cut_count
+        snapshot.forecasters_dropped
+        + snapshot.questions_failed_to_publish
+        + snapshot.stacker_primary_failed
+        + snapshot.stacker_fallback_used
+        + snapshot.stacker_fallback_failed
+        + snapshot.research_provider_failures
+        + snapshot.summarizer_failures
+        + snapshot.gap_fill_v2_errors
+        + snapshot.prediction_market_degraded
+        + snapshot.prediction_market_source_losses
+        + snapshot.provider_degradation
+        + snapshot.publish_attempt_failures
+        + snapshot.publish_skipped_closed
+        + snapshot.time_budget_fast_path
+        + snapshot.research_budget_cuts
     )
 
 
-def format_degradation_summary(bot: "TemplateForecaster") -> str:
+def format_degradation_summary(snapshot: DegradationSnapshot) -> str:
     """The loud end-of-run degradation line.
 
     Any non-zero counter here means something got dropped, the stacker fell back,
@@ -90,25 +119,25 @@ def format_degradation_summary(bot: "TemplateForecaster") -> str:
     it is worth alerting on separately.
     """
     return (
-        f"Degradation counters: forecasters_dropped={bot._forecasters_dropped_count}, "
-        f"questions_failed_to_publish={bot._questions_failed_to_publish}, "
-        f"stacker_primary_failed={bot._stacker_primary_failed_count}, "
-        f"stacker_fallback_used={bot._stacker_fallback_used_count}, "
-        f"stacker_fallback_failed={bot._stacker_fallback_failed_count}, "
-        f"research_provider_failures={bot._research_provider_failure_count}, "
-        f"summarizer_failures={bot._summarizer_failure_count}, "
-        f"gap_fill_v2_errors={bot._gap_fill_v2_error_count}, "
-        f"prediction_market_degraded={bot._prediction_market_degraded_count}, "
-        f"prediction_market_source_losses={bot._prediction_market_source_loss_count}, "
-        f"provider_degradation={bot._provider_degradation_count}, "
-        f"publish_attempt_failures={bot._publish_attempt_failures}, "
-        f"publish_skipped_closed={bot._publish_skipped_closed_count}, "
-        f"time_budget_fast_path={bot._time_budget_fast_path_count}, "
-        f"research_budget_cuts={bot._research.research_budget_cut_count}"
+        f"Degradation counters: forecasters_dropped={snapshot.forecasters_dropped}, "
+        f"questions_failed_to_publish={snapshot.questions_failed_to_publish}, "
+        f"stacker_primary_failed={snapshot.stacker_primary_failed}, "
+        f"stacker_fallback_used={snapshot.stacker_fallback_used}, "
+        f"stacker_fallback_failed={snapshot.stacker_fallback_failed}, "
+        f"research_provider_failures={snapshot.research_provider_failures}, "
+        f"summarizer_failures={snapshot.summarizer_failures}, "
+        f"gap_fill_v2_errors={snapshot.gap_fill_v2_errors}, "
+        f"prediction_market_degraded={snapshot.prediction_market_degraded}, "
+        f"prediction_market_source_losses={snapshot.prediction_market_source_losses}, "
+        f"provider_degradation={snapshot.provider_degradation}, "
+        f"publish_attempt_failures={snapshot.publish_attempt_failures}, "
+        f"publish_skipped_closed={snapshot.publish_skipped_closed}, "
+        f"time_budget_fast_path={snapshot.time_budget_fast_path}, "
+        f"research_budget_cuts={snapshot.research_budget_cuts}"
     )
 
 
-def format_conditional_stacking_summary(bot: "TemplateForecaster") -> str:
+def format_conditional_stacking_summary(snapshot: DegradationSnapshot) -> str:
     """The per-run conditional-stacking tally.
 
     ``skipped_single_forecaster`` is its own key rather than folded into
@@ -117,9 +146,9 @@ def format_conditional_stacking_summary(bot: "TemplateForecaster") -> str:
     forecaster survived" per question and then ``skipped=0`` at the end.
     """
     return (
-        f"Conditional stacking summary: triggered={bot._conditional_stacking_triggered_count}, "
-        f"skipped={bot._conditional_stacking_skipped_count}, "
-        f"skipped_single_forecaster={bot._conditional_stacking_skipped_single_forecaster_count}, "
-        f"crux_failures={bot._conditional_stacking_crux_failures}, "
-        f"search_failures={bot._conditional_stacking_search_failures}"
+        f"Conditional stacking summary: triggered={snapshot.conditional_stacking_triggered}, "
+        f"skipped={snapshot.conditional_stacking_skipped}, "
+        f"skipped_single_forecaster={snapshot.conditional_stacking_skipped_single_forecaster}, "
+        f"crux_failures={snapshot.conditional_stacking_crux_failures}, "
+        f"search_failures={snapshot.conditional_stacking_search_failures}"
     )
