@@ -6,7 +6,7 @@ from collections.abc import Callable, Coroutine, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from forecasting_tools import (  # AskNewsSearcher,
+from forecasting_tools import (
     BinaryQuestion,
     GeneralLlm,
     MetaculusQuestion,
@@ -25,8 +25,12 @@ from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
 )
 from metaculus_bot.close_margin import format_close_margin_marker
-from metaculus_bot.comment.formatting import build_unified_explanation
-from metaculus_bot.comment.trimming import trim_section
+from metaculus_bot.comment.formatting import (
+    build_unified_explanation,
+    format_forecaster_rationales_section,
+    format_main_research_section,
+    format_research_summary_with_models,
+)
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
     CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
@@ -57,10 +61,7 @@ from metaculus_bot.extreme_call import format_extreme_call_markers
 from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
-from metaculus_bot.performance_analysis.parsing import (
-    annotate_forecaster_bullets_with_models,
-    extract_model_display_name_from_reasoning,
-)
+from metaculus_bot.performance_analysis.parsing import extract_model_display_name_from_reasoning
 from metaculus_bot.publish_gate import (
     publish_skipped_closed_count,
     record_publish_skipped_closed,
@@ -817,14 +818,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         predicted_research: ResearchWithPredictions,
     ) -> str:
         text = super()._format_and_expand_research_summary(report_number, report_type, predicted_research)
-        # Inject model name into summary bullets so per-model attribution survives comment trimming.
-        model_names_by_index: dict[int, str] = {}
-        for j, forecast in enumerate(predicted_research.predictions):
-            name = extract_model_display_name_from_reasoning(forecast.reasoning)
-            if name is not None:
-                model_names_by_index[j + 1] = name
-        text = annotate_forecaster_bullets_with_models(text, model_names_by_index)
-        return trim_section(text, f"report_{report_number}_summary")
+        return format_research_summary_with_models(text, predicted_research.predictions, report_number)
 
     @classmethod
     def _format_main_research(
@@ -833,17 +827,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
         predicted_research: ResearchWithPredictions,
     ) -> str:
         text = super()._format_main_research(report_number, predicted_research)
-        return trim_section(text, f"report_{report_number}_research")
+        return format_main_research_section(text, report_number)
 
     def _format_forecaster_rationales(
         self,
         report_number: int,
         researched_predictions: ResearchWithPredictions,
     ) -> str:
-        # Param name mirrors the 0.2.92 base signature (renamed from the earlier
-        # positional name) so the override stays keyword-compatible with callers.
         text = super()._format_forecaster_rationales(report_number, researched_predictions).lstrip()
-        return trim_section(text, f"report_{report_number}_rationales")
+        return format_forecaster_rationales_section(text, report_number)
 
     # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
     # ForecastBot._create_unified_explanation, which forecasting-tools calls POSITIONALLY

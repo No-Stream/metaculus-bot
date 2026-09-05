@@ -124,6 +124,11 @@ make backtest_large        # 100 questions
 
 Analyze correlations and recompute ensembles from prior benchmark runs without re-forecasting. Model filters are case-insensitive substring matches.
 
+Unsupported prediction types and non-finite values are excluded from correlation inputs. Numeric
+ensemble scoring requires a usable CDF from every member; it can rebuild a CDF from declared
+percentiles but does not substitute a uniform forecast when reconstruction fails. Fallback
+model identifiers use a deterministic digest so repeated analyses keep the same labels.
+
 ```bash
 # Analyze the most recent benchmark file
 make analyze_correlations_latest

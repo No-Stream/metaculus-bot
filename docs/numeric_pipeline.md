@@ -98,7 +98,7 @@ a clean, strictly-increasing, in-bounds set. In order:
 2. `validate_percentile_count_and_values` — assert the count and label set match
    `EXPECTED_PERCENTILE_COUNT` / `STANDARD_PERCENTILES` exactly
    (`numeric/validation.py`).
-3. `sort_percentiles_by_value` — order by percentile.
+3. `sort_by_percentile_level` — order by percentile level.
 4. `_apply_jitter_and_clamp` (`numeric/pipeline.py`) — detect count-like (integer-
    adjacent) clusters and spread them, jitter exact duplicates, clamp values into the
    question bounds with a safety buffer, then enforce strictly increasing values.
@@ -117,6 +117,15 @@ a clean, strictly-increasing, in-bounds set. In order:
    (`grid_step_constraints` relaxes the max step there) and is the faithful third option
    if the marker starts firing on real forecasts.
 5. `_maybe_widen_tails` — optional tail widening (Step 4).
+
+The schema deliberately accepts non-decreasing values: tied values are valid concentrated
+declarations and the sanitizer can separate partial clusters. The prompt still asks for
+strictly increasing values, while the schema rejects decreases before
+`sort_by_percentile_level` can order the declarations. A whole-set collapse remains valid
+schema input, but sanitization does not invent width for it; the unit-mismatch guard then
+withholds the member. The archive audit found exact ties in 2 of 346 declarations and no
+whole-set collapses, supporting this distinction without adding a separate distinct-value
+requirement.
 
 It also decides whether to force `zero_point=None`: discrete questions and questions
 whose `zero_point` equals the lower bound fall back to a linear axis
@@ -286,7 +295,7 @@ artifact of its old DEBUG level, not evidence it never fires.
 
 The result is wrapped in a `PchipNumericDistribution` (`pchip_processing.py`), a
 subclass of forecasting-tools' `NumericDistribution` whose `get_cdf()` override returns
-the pre-computed 201-point CDF instead of rebuilding it. `get_cdf()` is the real
+the pre-computed CDF on the canonical question grid instead of rebuilding it. `get_cdf()` is the real
 override — the `.cdf` property is a deprecated shim that delegates to it, so overriding
 `.cdf` alone would miss the publish and aggregate paths. The `_pchip_cdf_values` attribute
 also acts as the marker that CDF validation should be skipped (the constraints were

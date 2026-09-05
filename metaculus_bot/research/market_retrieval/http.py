@@ -177,7 +177,7 @@ async def _read_one_attempt(
     client_timeout: aiohttp.ClientTimeout,
     retryable: set[int],
     label: str,
-) -> Any | None | _RetryableStatus:
+) -> Any | _RetryableStatus | None:
     """One GET: the parsed body, ``None`` on a non-retryable outcome, or a ``_RetryableStatus``.
 
     Split out of ``http_get_with_backoff`` so the retry bookkeeping and the response reading are

@@ -7,10 +7,8 @@ performance with diversity.
 ``CorrelationAnalyzer`` owns the correlation-math, ingestion, and reporting
 concerns. The identity helpers, safe-CDF cache, and ensemble simulation were
 extracted into ``benchmark_identity``, ``cdf_cache``, and
-``ensemble_simulator`` respectively. Thin delegating wrappers are kept on the
-analyzer for every method that external callers (``analyze_correlations.py``,
-``community_benchmark.py``) and the test suite reach into, so the split is
-non-breaking for the public + private API surface.
+``ensemble_simulator`` respectively. The analyzer keeps only the simulator and
+cache methods used by the analysis scripts as delegating wrappers.
 """
 
 from __future__ import annotations
@@ -39,9 +37,14 @@ from metaculus_bot.ensemble_analysis.benchmark_identity import (
 from metaculus_bot.ensemble_analysis.cdf_cache import NumericCdfCache
 from metaculus_bot.ensemble_analysis.ensemble_simulator import EnsembleSimulator
 from metaculus_bot.ensemble_analysis.types import CorrelationMatrix, EnsembleCandidate, ModelPrediction
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+_COMPONENT_PERCENTILES: tuple[float, ...] = tuple(
+    percentile for percentile in STANDARD_PERCENTILES if 0.1 <= percentile <= 0.9 and percentile != 0.5
+)
 
 
 def _any_token_in_idents(tokens: list[str], idents: list[str]) -> bool:
@@ -216,10 +219,9 @@ class CorrelationAnalyzer:
         """Extract predictions from benchmark results."""
         self.benchmarks = benchmarks
         self.predictions.clear()
-        # NOTE: the safe-CDF cache (`self._cdf_cache`) is intentionally NOT cleared here.
-        # A fresh CorrelationAnalyzer is constructed per analysis run, so its (model, qid)
-        # keys never collide across benchmark sets in practice. Clear it explicitly if that
-        # assumption changes (see NumericCdfCache.clear).
+        self._model_name_to_benchmark.clear()
+        self._filter_summary_lines = []
+        self._cdf_cache.clear()
         self._simulator.invalidate_caches()  # Clear derived caches when data changes
 
         for benchmark in benchmarks:
@@ -228,8 +230,16 @@ class CorrelationAnalyzer:
             self._model_name_to_benchmark[model_name] = benchmark
 
             for report in benchmark.forecast_reports:
-                # Convert prediction to float for correlation analysis
+                # Unsupported report shapes have no meaningful scalar representation and
+                # must not enter the pivot as fabricated data.
                 pred_value = self._extract_prediction_value(report)
+                if pred_value is None:
+                    logger.warning(
+                        "Skipping unsupported prediction for model=%s question=%s",
+                        model_name,
+                        report.question.id_of_question,
+                    )
+                    continue
 
                 prediction = ModelPrediction(
                     model_name=model_name,
@@ -381,7 +391,9 @@ class CorrelationAnalyzer:
             models_for_question = question_data.setdefault(pred.question_id, {})
             report = self._find_report(pred.question_id, pred.model_name)
             if report is not None:
-                models_for_question[pred.model_name] = self._extract_prediction_components(report)
+                components = self._extract_prediction_components(report)
+                if components is not None:
+                    models_for_question[pred.model_name] = components
         return question_data
 
     def calculate_correlation_matrix_by_components(self) -> CorrelationMatrix:
@@ -394,7 +406,7 @@ class CorrelationAnalyzer:
         """
         question_data = self._components_by_question()
 
-        model_names = list({pred.model_name for pred in self.predictions})
+        model_names = sorted({pred.model_name for pred in self.predictions})
         n_models = len(model_names)
         model_indices = {name: i for i, name in enumerate(model_names)}
 
@@ -469,14 +481,11 @@ class CorrelationAnalyzer:
         candidates.sort(key=lambda x: x.ensemble_score, reverse=True)
 
         logger.info(f"Generated {len(candidates)} viable ensemble candidates")
-        # Log numeric CDF fallback summary once per search to detect systemic issues
-        try:
-            self.log_numeric_cdf_summary()
-        except Exception:  # noqa: BLE001  # soft-fail boundary: end-of-search diagnostics must never lose a completed candidate search
-            logger.debug("Failed to log numeric CDF summary")
+        # Log numeric CDF fallback summary once per search to detect systemic issues.
+        self._cdf_cache.log_numeric_cdf_summary()
         return candidates
 
-    def _extract_prediction_value(self, report) -> float:
+    def _extract_prediction_value(self, report: Any) -> float | None:
         """Convert prediction to float for correlation analysis.
 
         This method is used for backward compatibility. For mixed question types,
@@ -485,25 +494,34 @@ class CorrelationAnalyzer:
         prediction = report.prediction
 
         # Binary questions: return probability directly
-        if isinstance(prediction, (int, float)):
-            return float(prediction)
+        if isinstance(prediction, (int, float)) and not isinstance(prediction, bool):
+            value = float(prediction)
+            return value if np.isfinite(value) else None
 
         # Numeric questions: use median or mean of distribution
         if isinstance(prediction, NumericDistribution) and prediction.declared_percentiles:
-            percentiles = prediction.declared_percentiles
-            median_percentile = next((p for p in percentiles if p.percentile == 50), None)
-            if median_percentile:
-                return float(median_percentile.value)
-            return float(np.mean([p.value for p in percentiles]))
+            try:
+                values = [(float(p.percentile), float(p.value)) for p in prediction.declared_percentiles]
+            except (TypeError, ValueError):
+                return None
+            if not values or not all(np.isfinite(label) and np.isfinite(value) for label, value in values):
+                return None
+            median_value = next((value for label, value in values if label == 0.5), None)
+            return median_value if median_value is not None else float(np.mean([value for _, value in values]))
 
         # Multiple choice: convert to single numeric score (entropy or max probability)
         if isinstance(prediction, PredictedOptionList):
-            return max(opt.probability for opt in prediction.predicted_options)
+            if not prediction.predicted_options:
+                return None
+            try:
+                probabilities = [float(option.probability) for option in prediction.predicted_options]
+            except (TypeError, ValueError):
+                return None
+            return max(probabilities) if all(np.isfinite(probability) for probability in probabilities) else None
 
-        # Last resort: hash the prediction for some numeric value
-        return float(hash(str(prediction)) % 1000) / 1000.0
+        return None
 
-    def _extract_prediction_components(self, report) -> tuple[str, list[float]]:
+    def _extract_prediction_components(self, report: Any) -> tuple[str, list[float]] | None:
         """Extract prediction components for improved correlation analysis.
 
         Returns:
@@ -515,42 +533,37 @@ class CorrelationAnalyzer:
         prediction = report.prediction
 
         # Binary questions: return probability directly
-        if isinstance(prediction, (int, float)):
-            return ("binary", [float(prediction)])
+        if isinstance(prediction, (int, float)) and not isinstance(prediction, bool):
+            value = float(prediction)
+            return ("binary", [value]) if np.isfinite(value) else None
 
         # Multiple choice: extract all option probabilities (check this first to avoid median conflicts)
         if isinstance(prediction, PredictedOptionList) and prediction.predicted_options:
             try:
-                sorted_options = sorted(
-                    prediction.predicted_options,
-                    key=lambda opt: opt.option_name,
-                )
+                sorted_options = sorted(prediction.predicted_options, key=lambda opt: opt.option_name)
                 option_probs = [float(opt.probability) for opt in sorted_options]
-                return ("multiple_choice", option_probs)
-            except (TypeError, AttributeError):
-                return ("multiple_choice", [0.5, 0.5])
+            except (TypeError, ValueError, AttributeError):
+                return None
+            return ("multiple_choice", option_probs) if all(np.isfinite(option_probs)) else None
 
         # Numeric questions: extract all percentiles
         if isinstance(prediction, NumericDistribution) and prediction.declared_percentiles:
-            target_percentiles = [10, 20, 40, 60, 80, 90]
-            percentile_values = []
-
             try:
-                percentile_dict = {p.percentile: p.value for p in prediction.declared_percentiles}
-            except (TypeError, AttributeError):
-                percentile_dict = {}
+                percentile_pairs = [(float(p.percentile), float(p.value)) for p in prediction.declared_percentiles]
+            except (TypeError, ValueError):
+                return None
+            if not percentile_pairs or not all(
+                np.isfinite(label) and np.isfinite(value) for label, value in percentile_pairs
+            ):
+                return None
+            percentile_dict = dict(percentile_pairs)
+            if len(percentile_dict) != len(percentile_pairs) or any(
+                label not in percentile_dict for label in _COMPONENT_PERCENTILES
+            ):
+                return None
+            return ("numeric", [percentile_dict[label] for label in _COMPONENT_PERCENTILES])
 
-            for target_p in target_percentiles:
-                if target_p in percentile_dict:
-                    percentile_values.append(float(percentile_dict[target_p]))
-                else:
-                    available_values = list(percentile_dict.values())
-                    percentile_values.append(float(np.mean(available_values)) if available_values else 0.0)
-
-            return ("numeric", percentile_values)
-
-        # Fallback: treat as binary with neutral prediction
-        return ("binary", [0.5])
+        return None
 
     def _has_mixed_question_types(self) -> bool:
         """Check if the benchmarks contain mixed question types."""
@@ -558,8 +571,9 @@ class CorrelationAnalyzer:
 
         for benchmark in self.benchmarks:
             for report in benchmark.forecast_reports:
-                q_type, _ = self._extract_prediction_components(report)
-                question_types.add(q_type)
+                components = self._extract_prediction_components(report)
+                if components is not None:
+                    question_types.add(components[0])
 
         return len(question_types) > 1
 
@@ -569,8 +583,10 @@ class CorrelationAnalyzer:
 
         for benchmark in self.benchmarks:
             for report in benchmark.forecast_reports:
-                q_type, _ = self._extract_prediction_components(report)
-                type_counts[q_type] = type_counts.get(q_type, 0) + 1
+                components = self._extract_prediction_components(report)
+                if components is not None:
+                    q_type = components[0]
+                    type_counts[q_type] = type_counts.get(q_type, 0) + 1
 
         return type_counts
 
@@ -589,30 +605,10 @@ class CorrelationAnalyzer:
         """Delegates to ``EnsembleSimulator.simulate_ensemble_performance``."""
         return self._simulator.simulate_ensemble_performance(models, aggregation_strategy)
 
-    def _aggregate_predictions(
-        self,
-        individual_preds: dict[str, Any],
-        models: list[str],
-        question_type: str,
-        aggregation_strategy: AggregationStrategy | str,
-    ) -> float:
-        """Delegates to ``EnsembleSimulator.aggregate_predictions``."""
-        return self._simulator.aggregate_predictions(individual_preds, models, question_type, aggregation_strategy)
-
-    def _calculate_baseline_score(
-        self, prediction_value: float, community_prediction: Any, question_type: str
-    ) -> float | None:
-        """Delegates to ``EnsembleSimulator.calculate_baseline_score``."""
-        return self._simulator.calculate_baseline_score(prediction_value, community_prediction, question_type)
-
     # --- delegating wrappers: numeric CDF cache (see numeric_cdf_cache) -------
     def _get_safe_numeric_cdf(self, model_name: str, question: Any, prediction: Any) -> list[Any] | None:
         """Delegates to ``NumericCdfCache.get_safe_numeric_cdf``."""
         return self._cdf_cache.get_safe_numeric_cdf(model_name, question, prediction)
-
-    def log_numeric_cdf_summary(self) -> None:
-        """Delegates to ``NumericCdfCache.log_numeric_cdf_summary``."""
-        self._cdf_cache.log_numeric_cdf_summary()
 
     def _question_type_section(self) -> list[str]:
         """Type mix + the note that correlations came off component vectors."""

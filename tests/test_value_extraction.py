@@ -487,7 +487,7 @@ class TestSalvageFidelity:
     async def test_a_value_disordered_llm_salvage_fails_the_rung(self) -> None:
         """One out-of-place value must fail rather than be force-monotonized.
 
-        ``sort_percentiles_by_value`` sorts by LABEL, so downstream never reorders a
+        ``sort_by_percentile_level`` orders by percentile label, so downstream never reorders a
         value-disordered set — it force-monotonizes it, which on one bad value pinned 10 of
         13 percentiles at the upper bound and published. A full reversal was already caught
         by the unit-mismatch guard; PARTIAL disorder was the hole.

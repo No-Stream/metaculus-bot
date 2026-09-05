@@ -803,7 +803,4 @@ def _dedup_articles_by_url(articles: list[Any]) -> list[Any]:
         seen.add(norm)
         result.append(item)
 
-    # Defensive: ensure not all items were dropped; if so, keep the first
-    if not result and articles:
-        result.append(articles[0])
     return result

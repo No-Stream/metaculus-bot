@@ -16,9 +16,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 import sys
 from datetime import datetime
+from numbers import Real
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -182,6 +184,16 @@ def _aggregate(values: list[float], agg: str) -> float:
     return float(np.mean(values)) if agg == "mean" else float(np.median(values))
 
 
+def _validated_probability(value: Any) -> float | None:
+    """Return a finite probability in [0, 1], rejecting booleans and other values."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    probability = float(value)
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        return None
+    return probability
+
+
 def _aggregate_binary_score(
     analyzer: CorrelationAnalyzer,
     m2r: dict[str, Any],
@@ -197,35 +209,66 @@ def _aggregate_binary_score(
     del analyzer  # analyzer hooks aren't needed for the binary path
     rep0 = next(iter(m2r.values()))
     community = getattr(rep0.question, "community_prediction_at_access_time", None)
-    if community is None:
+    community_probability = _validated_probability(community)
+    if community_probability is None:
         return None
-    agg_p = _aggregate([float(m2r[m].prediction) for m in models_list], agg)
+    probabilities: list[float] = []
+    for model in models_list:
+        probability = _validated_probability(m2r[model].prediction)
+        if probability is None:
+            return None
+        probabilities.append(probability)
+    agg_p = _aggregate(probabilities, agg)
     p = max(0.001, min(0.999, agg_p))
-    return float(100.0 * (community * (np.log2(p) + 1.0) + (1.0 - community) * (np.log2(1.0 - p) + 1.0)))
+    return float(
+        100.0 * (community_probability * (np.log2(p) + 1.0) + (1.0 - community_probability) * (np.log2(1.0 - p) + 1.0))
+    )
 
 
-def _aggregate_mc_option_probs(m2r: dict[str, Any], models_list: list[str], agg: str) -> tuple[list[str], list[float]]:
+def _aggregate_mc_option_probs(
+    m2r: dict[str, Any], models_list: list[str], agg: str
+) -> tuple[list[str], list[float]] | None:
     """Option names (first model's ballot order) and the renormalized aggregate probabilities.
 
     Options are matched BY NAME across models, not by position, since ballots can arrive
-    in different orders. An option no model quoted contributes 0.0, and a ballot that
-    sums to 0 degrades to uniform rather than dividing by zero.
+    in different orders. Every model must provide the same option names with finite,
+    nonnegative probabilities, and zero-total ballots are unscoreable.
     """
     first = m2r[models_list[0]].prediction
-    option_names = [getattr(o, "option_name", str(o)) for o in first.predicted_options]
-    agg_probs: list[float] = []
-    for name in option_names:
-        values: list[float] = []
-        for model in models_list:
-            for opt in m2r[model].prediction.predicted_options:
-                if getattr(opt, "option_name", str(opt)) == name:
-                    values.append(float(getattr(opt, "probability", 0.0)))
-                    break
-        agg_probs.append(_aggregate(values, agg) if values else 0.0)
+    first_options = getattr(first, "predicted_options", None)
+    if not first_options:
+        return None
+    option_names: list[str] = []
+    for option in first_options:
+        option_name = getattr(option, "option_name", None)
+        if not isinstance(option_name, str) or option_name in option_names:
+            return None
+        option_names.append(option_name)
+
+    expected_option_names = set(option_names)
+    model_probabilities: list[dict[str, float]] = []
+    for model in models_list:
+        predicted_options = getattr(m2r[model].prediction, "predicted_options", None)
+        if not predicted_options:
+            return None
+        probabilities_by_name: dict[str, float] = {}
+        for option in predicted_options:
+            option_name = getattr(option, "option_name", None)
+            probability = _validated_probability(getattr(option, "probability", None))
+            if not isinstance(option_name, str) or option_name in probabilities_by_name or probability is None:
+                return None
+            probabilities_by_name[option_name] = probability
+        if set(probabilities_by_name) != expected_option_names or sum(probabilities_by_name.values()) <= 0.0:
+            return None
+        model_probabilities.append(probabilities_by_name)
+
+    agg_probs = [
+        _aggregate([probabilities[name] for probabilities in model_probabilities], agg) for name in option_names
+    ]
     total = sum(agg_probs)
-    if total > 0:
-        return option_names, [p / total for p in agg_probs]
-    return option_names, [1.0 / len(option_names)] * len(option_names)
+    if not math.isfinite(total) or total <= 0:
+        return None
+    return option_names, [probability / total for probability in agg_probs]
 
 
 def _aggregate_mc_score(
@@ -240,7 +283,10 @@ def _aggregate_mc_score(
     first = m2r[models_list[0]].prediction
     if not hasattr(first, "predicted_options") or not first.predicted_options:
         return None
-    option_names, agg_probs = _aggregate_mc_option_probs(m2r, models_list, agg)
+    aggregated = _aggregate_mc_option_probs(m2r, models_list, agg)
+    if aggregated is None:
+        return None
+    option_names, agg_probs = aggregated
     pred_obj = SimpleNamespace(
         predicted_options=[
             SimpleNamespace(option_name=name, probability=prob)

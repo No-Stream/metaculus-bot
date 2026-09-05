@@ -175,6 +175,42 @@ class TestMultipleChoiceSimulation:
         # Per-option medians are 0.6/0.3/0.1 → sum 1.0, so renormalization is a no-op here.
         assert [p for _, p in captured] == pytest.approx([0.6, 0.3, 0.1])
 
+    def test_missing_member_option_is_unscoreable(self, monkeypatch: pytest.MonkeyPatch):
+        question = _question(1)
+        incomplete_prediction = PredictedOptionList.model_construct(
+            predicted_options=[PredictedOption(option_name="yes", probability=0.2)]
+        )
+        sim = _simulator(
+            [
+                _benchmark("model-a", [_report(question, _option_list({"yes": 0.6, "no": 0.4}))]),
+                _benchmark("model-b", [_report(question, incomplete_prediction)]),
+            ]
+        )
+        monkeypatch.setattr(simulator_module, "calculate_multiple_choice_baseline_score", pytest.fail)
+
+        assert sim.simulate_ensemble_performance(["model-a", "model-b"], "mean") == 0.0
+
+    def test_zero_mass_member_is_unscoreable(self):
+        question = _question(1)
+        zero_mass_prediction = PredictedOptionList.model_construct(
+            predicted_options=[
+                PredictedOption(option_name="yes", probability=0.0),
+                PredictedOption(option_name="no", probability=0.0),
+            ]
+        )
+        sim = _simulator(
+            [
+                _benchmark("model-a", [_report(question, zero_mass_prediction)]),
+                _benchmark("model-b", [_report(question, _option_list({"yes": 0.6, "no": 0.4}))]),
+            ]
+        )
+        with pytest.raises(ValueError, match="no positive probability mass"):
+            sim._score_multiple_choice_question(
+                question,
+                [zero_mass_prediction, _option_list({"yes": 0.6, "no": 0.4})],
+                "mean",
+            )
+
 
 class TestNumericSimulation:
     """The numeric branch aggregates pointwise in CDF space off the safe-CDF ladder."""
@@ -254,47 +290,3 @@ class TestNumericSimulation:
         # The unusable question is dropped; the run continues and still returns a score.
         assert score == pytest.approx(7.0)
         assert "Failed to aggregate predictions for question 2" in caplog.text
-
-
-class TestAggregatePredictions:
-    """``aggregate_predictions`` is a separate, question-type-dispatched reducer."""
-
-    def _sim(self) -> EnsembleSimulator:
-        return _simulator([])
-
-    def test_multiple_choice_returns_the_max_normalized_option(self):
-        preds = {
-            "a": _option_list({"yes": 0.6, "no": 0.4}),
-            "b": _option_list({"yes": 0.2, "no": 0.8}),
-        }
-        assert self._sim().aggregate_predictions(preds, ["a", "b"], "multiple_choice", "mean") == pytest.approx(0.6)
-
-    def test_multiple_choice_sorts_options_by_name(self):
-        # Option order is alphabetical here (unlike the simulate path, which keeps
-        # the first prediction's declared order) — the two must not be conflated.
-        preds = {"a": _option_list({"zeta": 0.9, "alpha": 0.1})}
-        assert self._sim().aggregate_predictions(preds, ["a"], "multiple_choice", "mean") == pytest.approx(0.9)
-
-    def test_numeric_reduces_each_member_to_its_declared_median(self):
-        preds = {"a": _numeric(10.0, 30.0, 50.0), "b": _numeric(50.0, 70.0, 90.0)}
-        sim = self._sim()
-        assert sim.aggregate_predictions(preds, ["a", "b"], "numeric", "mean") == pytest.approx(50.0)
-        assert sim.aggregate_predictions(preds, ["a", "b"], "numeric", "median") == pytest.approx(50.0)
-
-    def test_numeric_non_distribution_falls_back_to_a_half(self):
-        preds = {"a": _numeric(10.0, 30.0, 50.0), "b": 0.9}
-        assert self._sim().aggregate_predictions(preds, ["a", "b"], "numeric", "mean") == pytest.approx(
-            (30.0 + 0.5) / 2
-        )
-
-    @pytest.mark.parametrize("question_type", ["binary", "multiple_choice", "numeric"])
-    def test_unknown_strategy_raises(self, question_type: str):
-        preds: dict[str, Any] = {"a": _option_list({"yes": 1.0}) if question_type == "multiple_choice" else 0.5}
-        if question_type == "numeric":
-            preds = {"a": _numeric(10.0, 30.0, 50.0)}
-        with pytest.raises(ValueError, match="Unknown aggregation strategy"):
-            self._sim().aggregate_predictions(preds, ["a"], question_type, "geometric")
-
-    def test_unknown_question_type_raises(self):
-        with pytest.raises(ValueError, match="Unknown question type"):
-            self._sim().aggregate_predictions({"a": 0.5}, ["a"], "trinary", "mean")

@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from metaculus_bot.numeric.validation import (
     check_discrete_question_properties,
     detect_unit_mismatch,
-    sort_percentiles_by_value,
+    sort_by_percentile_level,
     validate_percentile_count_and_values,
 )
 
@@ -163,8 +163,8 @@ class TestPercentileValidation:
         msg = str(exc_info.value)
         assert "1,2.5,5,10,20,40,50,60,80,90,95,97.5,99" in msg
 
-    def test_sort_percentiles_by_value(self):
-        """Test sorting percentiles by percentile value."""
+    def test_sort_by_percentile_level(self):
+        """Test sorting declarations by percentile level."""
         # Create unsorted percentiles
         percentiles = [
             Percentile(percentile=0.90, value=90.0),
@@ -173,9 +173,9 @@ class TestPercentileValidation:
             Percentile(percentile=0.20, value=20.0),
         ]
 
-        sorted_percentiles = sort_percentiles_by_value(percentiles)
+        sorted_percentiles = sort_by_percentile_level(percentiles)
 
-        # Check they are sorted by percentile value
+        # Check they are sorted by percentile level
         expected_order = [0.05, 0.20, 0.60, 0.90]
         actual_order = [p.percentile for p in sorted_percentiles]
 

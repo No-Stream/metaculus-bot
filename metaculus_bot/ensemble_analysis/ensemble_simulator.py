@@ -5,7 +5,7 @@ concern: per-model performance/cost statistics, candidate evaluation, and the
 question-by-question aggregation+scoring simulation. It reads benchmarks live off
 the owning analyzer (so in-place filtering is reflected) and shares the safe-CDF
 cache via a ``NumericCdfCache`` instance. ``CorrelationAnalyzer`` keeps thin
-delegating wrappers for every externally-touched method.
+delegating wrappers for the analysis-script entry points.
 
 Cache ownership / sharing
 -------------------------
@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from forecasting_tools.cp_benchmarking.benchmark_for_bot import BenchmarkForBot
 from forecasting_tools.data_models.multiple_choice_report import PredictedOptionList
-from forecasting_tools.data_models.numeric_report import NumericDistribution
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.ensemble_analysis.benchmark_identity import extract_model_name, get_question_type
@@ -60,8 +59,8 @@ def _normalize_strategy(strategy: AggregationStrategy | str) -> str:
 def _option_probability(prediction: Any, option_name: str) -> float | None:
     """One prediction's probability for ``option_name``, or None if it doesn't name it."""
     for opt in prediction.predicted_options:
-        if getattr(opt, "option_name", str(opt)) == option_name:
-            return float(getattr(opt, "probability", 0))
+        if opt.option_name == option_name:
+            return float(opt.probability)
     return None
 
 
@@ -74,56 +73,6 @@ def _member_option_probabilities(predictions: list[Any], option_names: list[str]
     return [
         [prob for pred in predictions if (prob := _option_probability(pred, name)) is not None] for name in option_names
     ]
-
-
-def _reduce_by_strategy(values: list[Any], strategy: str) -> Any:
-    """Mean or median of ``values``; any other strategy is one we do not implement."""
-    if strategy == "mean":
-        return np.mean(values)
-    if strategy == "median":
-        return np.median(values)
-    raise ValueError(f"Unknown aggregation strategy: {strategy}")
-
-
-def _aggregate_option_distributions(predictions: list[Any], strategy: str) -> float:
-    """Aggregate MC option vectors (alphabetical option order) down to one scalar.
-
-    The scalar is the largest normalized option probability, which is what the
-    scoring proxy this function feeds expects — not a distribution.
-    """
-    # Extract options from first prediction for consistency
-    first_pred = predictions[0]
-    if not isinstance(first_pred, PredictedOptionList) or not first_pred.predicted_options:
-        raise ValueError("Multiple choice prediction missing predicted_options")
-
-    option_names = [opt.option_name for opt in sorted(first_pred.predicted_options, key=lambda opt: opt.option_name)]
-    # Strict reducer here (unlike the simulation path): an unimplemented strategy is an
-    # error, not a silent median.
-    aggregated_probs = [
-        _reduce_by_strategy(probs, strategy) if probs else 0.0
-        for probs in _member_option_probabilities(predictions, option_names)
-    ]
-
-    # Normalize to sum to 1
-    total_prob = sum(aggregated_probs)
-    if total_prob > 0:
-        aggregated_probs = [p / total_prob for p in aggregated_probs]
-
-    # Return max probability as representative value for scoring
-    return max(aggregated_probs) if aggregated_probs else 0.5
-
-
-def _representative_value(prediction: Any) -> float:
-    """One numeric prediction reduced to a single value: its declared median, else the
-    mean of its declared values. A non-distribution falls back to 0.5 (treat as binary).
-    """
-    if not (isinstance(prediction, NumericDistribution) and prediction.declared_percentiles):
-        return 0.5
-    percentiles = prediction.declared_percentiles
-    median_percentile = next((p for p in percentiles if p.percentile == 50), None)
-    if median_percentile:
-        return float(median_percentile.value)
-    return float(np.mean([p.value for p in percentiles]))
 
 
 @dataclass(slots=True)
@@ -209,20 +158,20 @@ class EnsembleSimulator:
                 "efficiency_ratio": benchmark.average_expected_baseline_score / max(total_cost, 0.001),
             }
 
-        self.model_stats_cache = model_stats  # Cache the results
+        self.model_stats_cache = model_stats
         return model_stats
 
     def _estimate_avg_reasoning_length(self, benchmark: BenchmarkForBot) -> float:
         """Estimate average reasoning text length for cost calculation."""
-        total_chars = 0
-        count = 0
+        total_reasoning_characters = 0
+        reports_with_reasoning = 0
 
         for report in benchmark.forecast_reports:
             if report.explanation:
-                total_chars += len(report.explanation)
-                count += 1
+                total_reasoning_characters += len(report.explanation)
+                reports_with_reasoning += 1
 
-        return total_chars / max(count, 1) if count > 0 else 2000  # Default estimate
+        return total_reasoning_characters / reports_with_reasoning if reports_with_reasoning else 2000
 
     def evaluate_ensemble(
         self,
@@ -235,13 +184,9 @@ class EnsembleSimulator:
         strategy = _normalize_strategy(aggregation_strategy)
         models = list(model_names)
 
-        # Calculate ensemble performance by simulating actual aggregation
         ensemble_performance = self.simulate_ensemble_performance(models, strategy)
-
-        # Calculate average cost (same as before)
         avg_cost = float(np.mean([model_stats[m]["avg_cost"] for m in models]))
 
-        # Calculate average pairwise correlation
         correlations = []
         for i in range(len(models)):
             for j in range(i + 1, len(models)):
@@ -301,6 +246,11 @@ class EnsembleSimulator:
     def _score_binary_question(self, question: Any, preds: list[Any], strategy: str) -> float | None:
         """Aggregate scalar probabilities and score with the binary baseline formula."""
         pred_vals = [float(p) for p in preds]
+        if any(
+            isinstance(pred, bool) or not np.isfinite(value) or not 0.0 <= value <= 1.0
+            for pred, value in zip(preds, pred_vals, strict=True)
+        ):
+            raise ValueError("Binary prediction contains a non-finite or out-of-range probability")
         agg_p = float(np.mean(pred_vals)) if strategy == "mean" else float(np.median(pred_vals))
         community = getattr(question, "community_prediction_at_access_time", None)
         return self.calculate_baseline_score(agg_p, community, "binary")
@@ -310,16 +260,31 @@ class EnsembleSimulator:
         first_pred = preds[0]
         if not isinstance(first_pred, PredictedOptionList) or not first_pred.predicted_options:
             raise ValueError("Multiple choice prediction missing predicted_options")
-        option_names = [getattr(opt, "option_name", str(opt)) for opt in first_pred.predicted_options]
+        option_names = [opt.option_name for opt in first_pred.predicted_options]
 
+        member_option_probabilities = _member_option_probabilities(preds, option_names)
+        if any(len(probabilities) != len(preds) for probabilities in member_option_probabilities):
+            raise ValueError("Multiple choice prediction is missing a declared option")
+        if any(
+            not np.isfinite(probability) or not 0.0 <= probability <= 1.0
+            for probabilities in member_option_probabilities
+            for probability in probabilities
+        ):
+            raise ValueError("Multiple choice prediction contains an invalid probability")
+        if any(
+            sum(option_probabilities[member_index] for option_probabilities in member_option_probabilities) <= 0.0
+            for member_index in range(len(preds))
+        ):
+            raise ValueError("Multiple choice prediction has a member with no positive probability mass")
         aggregated = [
-            (float(np.mean(probs)) if strategy == "mean" else float(np.median(probs))) if probs else 0.0
-            for probs in _member_option_probabilities(preds, option_names)
+            float(np.mean(probabilities)) if strategy == "mean" else float(np.median(probabilities))
+            for probabilities in member_option_probabilities
         ]
         total = sum(aggregated)
-        aggregated = [x / total for x in aggregated] if total > 0 else [1.0 / len(aggregated)] * len(aggregated)
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("Multiple choice prediction has no positive probability mass")
+        aggregated = [probability / total for probability in aggregated]
 
-        # Build lightweight report-like object
         pred_obj = SimpleNamespace(
             predicted_options=[
                 SimpleNamespace(option_name=n, probability=p) for n, p in zip(option_names, aggregated, strict=True)
@@ -397,60 +362,19 @@ class EnsembleSimulator:
         logger.debug(f"Ensemble {models} with {strategy}: {len(ensemble_scores)} questions, avg score {result:.2f}")
         return result
 
-    def aggregate_predictions(
-        self,
-        individual_preds: dict[str, Any],
-        models: list[str],
-        question_type: str,
-        aggregation_strategy: AggregationStrategy | str,
-    ) -> float:
-        """Aggregate individual model predictions based on question type and strategy.
-
-        NOTE: dead in production — only exercised by ``test_real_ensemble_aggregation``.
-        Retained (with a delegating wrapper on the analyzer) to preserve the test contract.
-        """
-        strategy = _normalize_strategy(aggregation_strategy)
-        predictions = [individual_preds[model] for model in models]
-
-        if question_type == "binary":
-            # Direct aggregation of probabilities
-            return float(_reduce_by_strategy(predictions, strategy))
-        if question_type == "multiple_choice":
-            return _aggregate_option_distributions(predictions, strategy)
-        if question_type == "numeric":
-            return float(_reduce_by_strategy([_representative_value(p) for p in predictions], strategy))
-
-        raise ValueError(f"Unknown question type: {question_type}")
-
     def calculate_baseline_score(
         self, prediction_value: float, community_prediction: Any, question_type: str
     ) -> float | None:
-        """Calculate baseline score using the same logic as forecasting_tools."""
+        """Calculate a binary baseline score using the same logic as forecasting_tools."""
         if community_prediction is None:
             return None
+        if question_type != "binary":
+            raise ValueError(f"Baseline scoring is only implemented for binary questions, got {question_type!r}")
 
-        try:
-            if question_type == "binary":
-                # Use the exact formula from binary_report.py line 86
-                c = float(community_prediction)
-                p = float(prediction_value)
+        # Use the exact formula from binary_report.py line 86.
+        c = float(community_prediction)
+        p = float(prediction_value)
 
-                # Clamp prediction to avoid log errors (same as BinaryPrediction validation)
-                p = max(0.001, min(0.999, p))
-
-                return 100.0 * (c * (math.log2(p) + 1.0) + (1.0 - c) * (math.log2(1.0 - p) + 1.0))
-
-            if question_type in ["multiple_choice", "numeric"]:
-                # For now, use a simplified scoring approach
-                # This could be improved by implementing full PDF-based scoring for numeric
-                # and log scoring for multiple choice, but this provides a reasonable proxy
-
-                # Use a neutral baseline score for non-binary questions
-                # This ensures ensemble comparison still works while avoiding complex scoring
-                return 15.0  # Approximate average score
-
-            return None
-
-        except (ValueError, TypeError, ZeroDivisionError) as e:
-            logger.warning(f"Error calculating baseline score: {e}")
-            return None
+        # Clamp prediction to avoid log errors (same as BinaryPrediction validation).
+        p = max(0.001, min(0.999, p))
+        return 100.0 * (c * (math.log2(p) + 1.0) + (1.0 - c) * (math.log2(1.0 - p) + 1.0))

@@ -1,5 +1,6 @@
 """Test correlation analysis with the new ensemble naming convention."""
 
+import hashlib
 import logging
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8,9 +9,11 @@ from unittest.mock import Mock
 import pytest
 from forecasting_tools.cp_benchmarking.benchmark_for_bot import BenchmarkForBot
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption, PredictedOptionList
+from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
 
 def _report(question_id: int, prediction: Any) -> SimpleNamespace:
@@ -36,6 +39,19 @@ def _mc_report(question_id: int, option_probs: dict[str, float]) -> SimpleNamesp
         predicted_options=[PredictedOption(option_name=name, probability=p) for name, p in option_probs.items()]
     )
     return _report(question_id, options)
+
+
+def _numeric_report(question_id: int, percentile_values: dict[float, float]) -> SimpleNamespace:
+    prediction = NumericDistribution(
+        declared_percentiles=[Percentile(percentile=p, value=value) for p, value in percentile_values.items()],
+        open_upper_bound=False,
+        open_lower_bound=False,
+        upper_bound=100.0,
+        lower_bound=0.0,
+        zero_point=None,
+        cdf_size=201,
+    )
+    return _report(question_id, prediction)
 
 
 def _analyzer_over(reports_by_model: dict[str, list[SimpleNamespace]]) -> CorrelationAnalyzer:
@@ -118,6 +134,47 @@ def test_extract_model_name_ensemble_from_forecasters():
     result = analyzer._extract_model_name(ensemble_benchmark)
     # Should generate ensemble name from components
     assert result == "glm_qwen3_mean"  # sorted alphabetically
+
+
+def test_unidentified_model_name_uses_a_process_stable_digest():
+    analyzer = CorrelationAnalyzer()
+    benchmark = Mock()
+    benchmark.name = "Two Fields Only"
+    benchmark.forecast_bot_config = {"llms": {}}
+
+    expected = f"model_{hashlib.sha256(benchmark.name.encode()).hexdigest()[:12]}"
+
+    assert analyzer._extract_model_name(benchmark) == expected
+
+
+def test_unsupported_prediction_is_excluded_from_analysis():
+    analyzer = _analyzer_over(
+        {
+            "model-a": [_report(1, object())],
+            "model-b": [_binary_report(1, 0.42)],
+        }
+    )
+
+    assert [prediction.model_name for prediction in analyzer.predictions] == ["model-b"]
+    assert analyzer._extract_prediction_value(_report(1, object())) is None
+
+
+def test_numeric_components_use_framework_fractional_percentile_labels():
+    values = {percentile: percentile * 100.0 for percentile in STANDARD_PERCENTILES}
+    analyzer = CorrelationAnalyzer()
+    extracted = analyzer._extract_prediction_components(_numeric_report(1, values))
+
+    assert extracted is not None
+    question_type, components = extracted
+    assert question_type == "numeric"
+    assert components == pytest.approx([values[p] for p in STANDARD_PERCENTILES if 0.1 <= p <= 0.9 and p != 0.5])
+
+
+def test_numeric_components_reject_missing_required_percentiles():
+    analyzer = CorrelationAnalyzer()
+    extracted = analyzer._extract_prediction_components(_numeric_report(1, {0.1: 10.0, 0.9: 90.0}))
+
+    assert extracted is None
 
 
 class TestComponentWiseCorrelation:

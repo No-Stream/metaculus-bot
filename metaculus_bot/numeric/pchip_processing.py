@@ -15,7 +15,7 @@ from metaculus_bot.numeric.config import (
     PCHIP_CDF_POINTS,
     grid_step_constraints,
 )
-from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -238,13 +238,16 @@ def create_pchip_numeric_distribution(
             we override the *method* — not just the property — to guarantee our
             PCHIP output is what gets submitted, never the base-class builder's.
             """
-            # Create the value axis (201 points from lower to upper bound).
-            # _pchip_cdf_values holds the probability heights (0-1); x_vals the
-            # corresponding question values.
-            x_vals = np.linspace(self.lower_bound, self.upper_bound, len(self._pchip_cdf_values))
+            # Probability heights were evaluated on this canonical question grid.
+            question_values = build_cdf_value_grid(
+                self.lower_bound,
+                self.upper_bound,
+                self.zero_point,
+                len(self._pchip_cdf_values),
+            )
             return [
                 Percentile(percentile=prob_val, value=question_val)
-                for question_val, prob_val in zip(x_vals, self._pchip_cdf_values, strict=True)
+                for question_val, prob_val in zip(question_values, self._pchip_cdf_values, strict=True)
             ]
 
         @property
