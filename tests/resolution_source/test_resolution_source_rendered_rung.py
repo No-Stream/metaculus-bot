@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from metaculus_bot.research import rendered_fetch, resolution_source
+from metaculus_bot.research import rendered_fetch, resolution_presentation, resolution_source
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
@@ -669,7 +669,7 @@ class TestRenderedRungClassification:
         assert [chart.chart_id for chart in result.datawrapper_charts] == ["aB3dE"]
 
     async def test_the_per_url_cap_still_binds_on_a_rendered_page(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 200)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 200)
         monkeypatch.setattr(
             resolution_source,
             "render_page",

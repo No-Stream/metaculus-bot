@@ -33,12 +33,12 @@ import pytest
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import DatawrapperChartRef
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
+from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from metaculus_bot.research.resolution_source import (
     _fetch_datawrapper_dataset,
     _truncate_csv_middle,
     _truncate_with_marker,
     fetch_resolution_sources,
-    format_resolution_sections,
     resolution_source_provider,
 )
 from tests.resolution_source_fakes import (
