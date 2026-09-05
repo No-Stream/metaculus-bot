@@ -260,23 +260,34 @@ Each of these has cost real work at least once. The pointer is where the reasoni
   a count (`details["counts"]`) is how "ran and found none" stays distinguishable from "never
   ran". Detail: `docs/research.md`.
 
+**Proportion**
+
+- **The medicine must be better than the disease.** Fix what has cost or plausibly will cost
+  forecasts: missed deadlines, wrong values, silent drops, spend. Refuse a fix, a review finding or
+  a hardening request whose remedy adds a flag, a branch, a mechanism or a parallel path for a case
+  this deployment does not produce, even when the finding is technically correct. Simplicity is for
+  the agents who work here next, so a review verdict of "real but not worth it" is a normal
+  outcome, not a deferral. Operator ruling, 2026-09-04.
+
 **Guards and safety**
 
 - **A guard fails SHUT.** The unit-mismatch guard is the worked example: wrapping it in
   try/except made a guard crash byte-identical to a passing check, so it published the
   order-of-magnitude error the guard exists to block. Let it raise.
-- **Any new outbound HTTP path goes through `research/http_fetch.py`.** It owns the SSRF
-  invariants: the `is_public_http_url` preflight, the connect-time `FilteringResolver` (the
-  resolver, not the preflight, is the real DNS-rebinding boundary), a bounded manual redirect
-  loop that re-guards every hop, the meta-refresh hop that no HTTP status announces, and the
-  per-host politeness semaphores. Two transports sit beside it and are SHARED with gap-fill v2
-  rather than copied: `research/rendered_fetch.py` owns the headless-Chromium render, including
-  the DNS pin, the per-request route guard, the landing-host check after navigation, the
-  WebSocket block and the process-global launch cap, and
-  `research/url_context_reader.py` owns the one paid Gemini `url_context` read, with
-  `research/robots_policy.py` the per-host `Google-Extended` pre-check in front of it. Do not
-  hand-roll a fetch, a render or a reader.
-- **Timing, deadline and fallback code gets strictly-safer changes only.** A tidy-up in a
+- **Reuse the existing fetch transports; bound every fetch; skip the security theater.** New
+  outbound fetches go through `research/http_fetch.py` (aiohttp), `research/rendered_fetch.py`
+  (headless Chromium), `research/impersonated_fetch.py` (curl-cffi with a Chrome fingerprint) or
+  `research/url_context_reader.py` (the paid Gemini read) rather than a hand-rolled client, because
+  those already carry what matters: a total timeout inside the 45 s wall, a byte cap, a redirect
+  hop limit, the Metaculus self-reference refusal and per-host politeness. The DNS pins,
+  connection-time IP assertions, landing-host checks and WebSocket block that also live there were
+  built for a threat this deployment cannot realise (the bot runs on GitHub-hosted runners with no
+  internal network and no readable metadata endpoint), so they stay as they are but are NOT to be
+  extended, re-implemented for a new transport, or cited as a reason to add branches. Operator
+  ruling, 2026-09-04.
+- **Timing, deadline and fallback code gets strictly-safer changes only, and its robustness is
+  a priority.** Missed deadlines cost real forecasts this quarter (a few questions, tens of points),
+  so a fetch or rung that can overrun the 45 s wall is a bug to fix, while a tidy-up in a
   soft-deadline, retry or key-fallback path can silently thin the ensemble or strand it on a dead
   key. If a change is not obviously safer, leave it and note it in `FUTURE.md`.
 - **Benchmarking leakage guards are hard returns.** `prediction_market` and `resolution_source`
