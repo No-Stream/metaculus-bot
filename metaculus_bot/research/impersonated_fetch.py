@@ -66,7 +66,7 @@ import asyncio
 import ipaddress
 import logging
 import time
-from collections.abc import Awaitable
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin, urlparse
@@ -475,19 +475,23 @@ async def _fetch_pinned_hop(
         gate.release()
 
 
-async def _within_budget[T](awaitable: Awaitable[T], deadline_monotonic_s: float) -> T:
-    """Await ``awaitable`` inside what is left of the budget, or decline as a timeout.
+async def _within_budget[T](coro: Coroutine[Any, Any, T], deadline_monotonic_s: float) -> T:
+    """Await ``coro`` inside what is left of the budget, or decline as a timeout.
 
     The ``asyncio.timeout`` here bounds the WAIT, not a transfer: the vetting lookup and the
     gate acquisition are the two awaits before the dial. A lookup that outlives the budget is
     abandoned to its thread and declined; a gate not acquired by the deadline is declined
     without dialing, which is the same outcome the post-gate check would have produced, only at
-    the deadline instead of whenever the holder let go.
+    the deadline instead of whenever the holder let go. On an already-spent budget the coroutine
+    the caller built is closed before the decline, so it is never left un-awaited.
     """
-    remaining = _remaining_s(deadline_monotonic_s)
+    remaining = deadline_monotonic_s - time.monotonic()
+    if remaining <= 0.0:
+        coro.close()
+        raise ImpersonateTransportError(failure_class="timeout", exc="TimeoutError")
     try:
         async with asyncio.timeout(remaining):
-            return await awaitable
+            return await coro
     except TimeoutError:
         raise ImpersonateTransportError(failure_class="timeout", exc="TimeoutError") from None
 
