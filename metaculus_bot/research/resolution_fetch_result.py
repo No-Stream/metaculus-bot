@@ -361,11 +361,12 @@ class RungAttempt:
 
     ``skipped_reason`` marks an attempt that produced no result for the page. Most never
     ran: no wall budget left, a per-question cap spent, the fast path, a memo hit, no
-    browser, no key, a robots refusal. Three DID run a browser and were thrown away: ``render_timeout``
+    browser, no key, a robots refusal. Four DID run a browser and were thrown away: ``render_timeout``
     is a render cut off before its DOM could be read, ``render_non_200`` one whose main frame
     the edge answered with something other than a 200, ``render_dom_too_large`` one whose DOM
-    exceeded the ceiling; so a skip means "nothing came of this
-    rung", not "no work was done". Skips are NOT escalation lines — the marker means "a rung
+    exceeded the ceiling, ``render_off_host`` one whose main frame landed off the DNS-pinned
+    host, refused before its DOM was read or discarded unpublished; so a skip means "nothing
+    came of this rung", not "no work was done". Skips are NOT escalation lines — the marker means "a rung
     fired and finished" — so they ride the provider's ``details["counts"]`` instead, where a
     zero renders nothing but survives into the archive; that is also why the most expensive
     render the ladder produces, a cut-off one, shows up in ``render_timeout_skips`` and never

@@ -52,7 +52,20 @@ _RENDER_TAIL_MS = rendered_fetch.RENDER_SETTLE_MS + rendered_fetch.RENDER_DOM_RE
 
 
 @pytest.fixture(autouse=True)
-def _reset_state():
+def _reset_state(monkeypatch):
+    """Run-scoped transport state around every test, plus the DNS stub ``tests/resolution_source/``
+    has and this module lacked. Neither suite-level guard covers ``socket.getaddrinfo``
+    (``_block_network_egress`` patches connect, ``_block_native_egress`` patches the browser and
+    curl entry points), and the Tier-1 rung's re-vet of a redirected landing resolves its
+    hostname through ``is_public_http_url``; without the stub that lookup leaves the process,
+    and on a resolver that returns nothing for ``*.example.com`` it comes back ``ssrf_blocked``,
+    so a test would assert the decline branch while looking green."""
+
+    def _public_dns(host, port, *args, **kwargs):
+        del host, port, args, kwargs
+        return [(0, 0, 0, "", ("8.8.8.8", 0))]
+
+    monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _public_dns)
     rendered_fetch.reset_render_state()
     FakeResponse.reset_read_tracking()
     yield
@@ -1191,6 +1204,25 @@ class TestTheLandingHost:
         assert rendered is not None
         assert rendered.http_status is None
         assert rendered.final_url == landed
+
+    async def test_the_tier_1_rung_renders_a_redirected_same_publisher_landing(self, monkeypatch):
+        """The rung re-vets ``direct.url`` when it differs from the cited URL, and that re-vet
+        resolves the hostname; through the module's DNS stub it is public and the render proceeds
+        on the landing URL. Kept in this module so the stub is proven load-bearing here."""
+        calls: list[str] = []
+
+        async def _recording_render(url: str, **_kwargs: Any) -> None:
+            calls.append(url)
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(resolution_source, "render_page", _recording_render)
+        landed = "https://www.dashboard.example.com/senate"
+        direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
+
+        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, FetchContext())
+
+        assert result is None
+        assert calls == [landed]
 
     async def test_the_tier_1_rung_records_an_off_host_landing_as_its_own_skip(self, monkeypatch):
         """Folded into ``renderer_unavailable`` it would point triage at the Playwright install;

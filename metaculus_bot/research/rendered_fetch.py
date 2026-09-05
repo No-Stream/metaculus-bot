@@ -1150,7 +1150,10 @@ async def _render_in_context(
     page = await context.new_page()
     harvest: _JsonHarvest | None = None
     if harvest_json:
-        harvest = _JsonHarvest(page_host=urlparse(url).hostname or "", playwright_error=playwright_error)
+        # The same-publisher filter on harvested JSON judges against the host this render is
+        # allowed to be on, which is the host the landing check holds the browser to: one fact,
+        # not two derivations of it that a reader has to prove agree.
+        harvest = _JsonHarvest(page_host=pinned_host, playwright_error=playwright_error)
         page.on("response", harvest.on_response)
     try:
         return await _navigate_and_read_dom(
