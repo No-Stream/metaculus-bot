@@ -267,6 +267,7 @@ from metaculus_bot.research.resolution_body_text import (
 from metaculus_bot.research.resolution_chart_data import render_inline_chart_data
 from metaculus_bot.research.resolution_fetch_result import (
     _NON_OK_FETCH_STATUS,
+    PDF_CONTENT_TYPES,
     ROUTE_CAVEATS,
     FetchResult,
     FetchRoute,
@@ -822,7 +823,6 @@ def _get_session() -> aiohttp.ClientSession:
 
 _HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 _RAW_TEXT_CONTENT_TYPES = ("text/plain", "text/csv")
-_PDF_CONTENT_TYPES = ("application/pdf", "application/x-pdf")
 
 
 @dataclass
@@ -1712,7 +1712,7 @@ async def _resolution_pdf_outcome(
     """
     status = resp.status
     netloc = urlparse(current_url).netloc
-    declared_pdf = any(ct in content_type for ct in _PDF_CONTENT_TYPES)
+    declared_pdf = any(ct in content_type for ct in PDF_CONTENT_TYPES)
     body = await read_body_capped(
         resp,
         max_bytes=DOCUMENT_TEXT_PDF_MAX_BYTES if declared_pdf else RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
@@ -2232,12 +2232,18 @@ async def _impersonate_rung(
             dialed_url=retry_url, answered_url=response.url, status=response.status
         )
         attempt.outcome = outcome
+        # The Server header names which CDN refused the impersonated GET (a host that refuses both
+        # clients is otherwise indistinguishable from one whose fingerprint scoring changed), and
+        # the elapsed time separates an edge's instant refusal from a challenge that ran the clock.
         logger.info(
-            "resolution_source: the impersonated retry of %s was answered %d by %s (%s); the direct result stands",
+            "resolution_source: the impersonated retry of %s was answered %d by %s (%s; server=%s elapsed=%.1fs); "
+            "the direct result stands",
             netloc,
             response.status,
             urlparse(response.url).netloc,
             outcome,
+            server_header_token(response.server) or "none",
+            response.elapsed_s,
         )
         return None
     result = await _impersonated_body_outcome(response, ctx)

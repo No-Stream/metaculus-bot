@@ -48,7 +48,8 @@ from curl_cffi.requests import Headers, Response
 from curl_cffi.requests import exceptions as curl_exceptions
 
 from metaculus_bot.constants import IMPERSONATE_BROWSER_TARGET, RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
-from metaculus_bot.research import impersonated_fetch, rendered_fetch, resolution_source
+from metaculus_bot.research import impersonated_fetch, rendered_fetch, resolution_fetch_result, resolution_source
+from metaculus_bot.research.agentic import fetch_outcomes
 from metaculus_bot.research.http_fetch import MAX_REDIRECTS
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_BLOCK_STATUSES,
@@ -1494,6 +1495,17 @@ class TestDeclaredPdf:
     def test_declared_pdf_matches_the_direct_paths_test(self, content_type: str, expected: bool) -> None:
         """The same declared-PDF test both callers' direct paths use to pick the larger cap."""
         assert declared_pdf(content_type) is expected
+
+    def test_the_three_fetch_paths_read_one_pdf_vocabulary(self) -> None:
+        """One definition, on the result module all three already import: the transport's
+        re-dial test, Tier 1's larger-cap test and gap-fill v2's ``pdf_local`` routing. The third
+        copy had drifted (v2 read ``application/pdf`` alone), so an ``application/x-pdf`` PDF was
+        read as a document by one path and escalated as unknown by the other."""
+        assert impersonated_fetch.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
+        assert resolution_source.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
+        assert fetch_outcomes.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
+        for content_type in ("application/pdf", "application/x-pdf; charset=binary", "text/html", ""):
+            assert fetch_outcomes._content_type_is_pdf(content_type) is declared_pdf(content_type)
 
 
 class TestEgressGuard:

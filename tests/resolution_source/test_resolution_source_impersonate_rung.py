@@ -235,10 +235,11 @@ class TestImpersonateRungRescue:
 
 
 class TestImpersonateRungStillRefused:
-    async def test_a_still_403_leaves_the_direct_result_standing_and_memoizes_the_host(self, monkeypatch):
+    async def test_a_still_403_leaves_the_direct_result_standing_and_memoizes_the_host(self, monkeypatch, caplog):
         _transport(monkeypatch, _impersonated(403, body=b"denied", server="AkamaiGHost"))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
 
         # The DIRECT result, diagnostics intact, with the fired rung stamped onto it.
         assert result.status == "blocked"
@@ -250,6 +251,10 @@ class TestImpersonateRungStillRefused:
             ("impersonate", "blocked", "blocked")
         ]
         assert impersonation_refused(_URL) is True
+        # The log line names the CDN that refused the impersonated GET and how long it took, so a
+        # host refusing both clients records which edge did it (the `server_header_token` form).
+        (record,) = [r for r in caplog.records if "was answered 403" in r.getMessage()]
+        assert "server=akamaighost elapsed=0.3s" in record.getMessage()
 
     @pytest.mark.parametrize(
         ("status", "outcome"),
@@ -312,7 +317,10 @@ class TestImpersonateRungStillRefused:
         assert impersonation_refused(answered) is True
         assert impersonation_refused(_URL) is True
         assert impersonation_refused(_SECOND_URL) is False
-        assert any("answered 403 by edge.example.net (blocked)" in message for message in caplog.messages)
+        assert any(
+            "answered 403 by edge.example.net (blocked; server=none elapsed=0.3s)" in message
+            for message in caplog.messages
+        )
 
     @pytest.mark.parametrize(("status", "outcome"), [(404, "not_found"), (410, "not_found"), (500, "error")])
     async def test_a_non_block_answer_stamps_its_own_outcome_and_does_not_memoize(self, monkeypatch, status, outcome):

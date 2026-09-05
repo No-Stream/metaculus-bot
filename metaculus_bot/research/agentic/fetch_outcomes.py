@@ -33,11 +33,11 @@ import aiohttp
 from metaculus_bot.constants import GAP_FILL_V2_MIN_CONTENT_CHARS
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO
+from metaculus_bot.research.resolution_fetch_result import PDF_CONTENT_TYPES
 
 _FETCH_LINK_CAP = 25
 _FETCH_MIN_CONTENT_CHARS = GAP_FILL_V2_MIN_CONTENT_CHARS
 
-_PDF_CONTENT_TYPE_TOKENS = ("application/pdf",)
 _IMAGE_CONTENT_TYPE_PREFIXES = ("image/",)
 _RETRYABLE_FETCH_BLOCK_STATUSES = {403, 406, 429}
 _TEXTUAL_CONTENT_TYPE_TOKENS = ("text/plain", "text/csv", "application/json")
@@ -154,7 +154,7 @@ def _content_type_is_pdf(content_type: str | None) -> bool:
     """True for a declared PDF, which the ladder reads locally rather than escalating."""
     if not content_type:
         return False
-    return any(token in content_type.lower() for token in _PDF_CONTENT_TYPE_TOKENS)
+    return any(token in content_type.lower() for token in PDF_CONTENT_TYPES)
 
 
 def _content_type_is_image(content_type: str | None) -> bool:

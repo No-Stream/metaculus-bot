@@ -329,6 +329,14 @@ _NON_OK_FETCH_STATUS: dict[int, FetchStatus] = {
     410: "not_found",
 }
 
+# The declared Content-Types every fetch path reads as a PDF: the ONE vocabulary the Tier-1 page
+# fetch (the larger body cap and the local document read), the impersonated transport (its
+# document re-dial) and gap-fill v2's plain rung (its `pdf_local` routing) all test against, kept
+# here because all three already import this module and a third copy had drifted (v2 read
+# `application/pdf` alone). Matched as substrings of the lower-cased header, so a charset suffix
+# does not defeat it.
+PDF_CONTENT_TYPES: tuple[str, ...] = ("application/pdf", "application/x-pdf")
+
 # The `Server` header is free text and delimiter-hostile; bound it so one hostile value cannot
 # blow the marker line's width, and lower-case it so `akamaighost` and `AkamaiGHost` bucket
 # together.

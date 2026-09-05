@@ -86,7 +86,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.research import rendered_fetch
 from metaculus_bot.research.http_fetch import MAX_REDIRECTS, REDIRECT_STATUSES, semaphore_for_host
-from metaculus_bot.research.resolution_fetch_result import _NON_OK_FETCH_STATUS
+from metaculus_bot.research.resolution_fetch_result import _NON_OK_FETCH_STATUS, PDF_CONTENT_TYPES
 
 if TYPE_CHECKING:
     from metaculus_bot.research.resolution_source import HopRefusal
@@ -124,12 +124,6 @@ IMPERSONATE_BLOCK_STATUSES: frozenset[int] = frozenset(
         503,
     }
 )
-
-# The declared types the larger body cap applies to: the same declared-PDF test both callers'
-# direct paths use to read a document under ``DOCUMENT_TEXT_PDF_MAX_BYTES`` instead of the page
-# cap (``resolution_source._PDF_CONTENT_TYPES``; gap-fill v2 checks ``application/pdf`` alone).
-# An undeclared body keeps the page cap there too, so it does here.
-PDF_CONTENT_TYPES: tuple[str, ...] = ("application/pdf", "application/x-pdf")
 
 
 def impersonation_enabled() -> bool:
