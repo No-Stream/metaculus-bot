@@ -28,6 +28,7 @@ from metaculus_bot.research import impersonated_fetch, resolution_source
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_TRIGGER_STATUSES,
     ImpersonateBodyTooLarge,
+    ImpersonateBudgetExhausted,
     ImpersonateDeclined,
     ImpersonateHopRefused,
     ImpersonatePinNotHeld,
@@ -432,6 +433,31 @@ class TestImpersonateRungSkips:
         assert counts["rung_budget_skips"] == 1
         assert counts["impersonate_budget_skips"] == 1
         assert _escalation_lines(caplog) == []
+
+    async def test_a_budget_spent_before_the_dial_is_the_wall_budget_skip(self, monkeypatch, caplog):
+        """The transport declines with `ImpersonateBudgetExhausted` when the wall runs out while it
+        waits on a pre-dial await (the vetting lookup, a redirect re-guard, the host gate). Nothing
+        was dialed against the host, so the record is the provider's wall binding, the same
+        `wall_budget` skip the pre-gate floor records, and not a fired attempt whose `blocked`
+        outcome would read as the host having refused the fingerprint."""
+        _transport(monkeypatch, ImpersonateBudgetExhausted(waiting_on="the host gate"))
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            resolution_source._log_fetch_outcome_markers(1, [result])
+
+        assert result.status == "blocked"
+        assert result.route == "direct"
+        assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("impersonate", "wall_budget")]
+        counts = _rung_counts([result])
+        assert counts["rung_budget_skips"] == 1
+        assert counts["impersonate_budget_skips"] == 1
+        assert counts["impersonate_attempts"] == 0
+        assert impersonation_refused(_URL) is False
+        assert _escalation_lines(caplog) == []
+        (record,) = [r for r in caplog.records if "budget exhausted" in r.getMessage()]
+        assert record.levelno == logging.WARNING
+        assert "the host gate" in record.getMessage()
 
     async def test_an_unpinnable_host_is_its_own_skip_on_the_attempt_already_started(self, monkeypatch, caplog):
         """Near-impossible in practice (the direct fetch resolved this host through the filtering

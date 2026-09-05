@@ -161,7 +161,9 @@ FetchStatusReason = Literal[
 # `FetchStatusReason`: a held document declined for want of a parse slot both records the skip
 # here and stamps the withheld result's `status_reason` there.
 #
-# `wall_budget` — the rung's own floor was below the remaining provider wall (`claim_rung_budget`).
+# `wall_budget` — the rung's own floor was below the remaining provider wall (`claim_rung_budget`),
+#   or, for the impersonated retry, the wall ran out while the transport waited on a pre-dial
+#   await (`impersonated_fetch.ImpersonateBudgetExhausted`); nothing was dialed either way.
 # `wayback_cap` — the question spent its per-question snapshot attempts on earlier cited URLs.
 # `url_context_cap` — the question spent its per-question PAID-read attempts on earlier cited URLs
 #   (the paid rung's analogue of `wayback_cap`, bounding spend when the flag is on).

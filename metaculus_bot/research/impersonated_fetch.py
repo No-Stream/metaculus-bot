@@ -263,18 +263,36 @@ class ImpersonateBodyTooLarge(ImpersonateDeclined):
 
 
 class ImpersonateTransportError(ImpersonateDeclined):
-    """A libcurl failure, the wall bound firing, or a redirect that cannot be followed.
+    """A libcurl failure, libcurl's own timer firing mid-transfer, or a redirect that cannot be followed.
 
     ``failure_class`` speaks the direct path's small vocabulary (``timeout``, ``tls``, ``dns``,
-    ``connection``, ``decode``) and is ``None`` where the direct path's own equivalent carries
-    none (a redirect with no target, a target whose port cannot be pinned); ``exc`` is the
-    exception class name, or the shape's name for those.
+    ``connection``, ``decode``, ``malformed_response``) and is ``None`` where the direct path's
+    own equivalent carries none (a redirect with no target, a target whose port cannot be pinned);
+    ``exc`` is the exception class name, or the shape's name for those.
     """
 
     def __init__(self, *, failure_class: str | None, exc: str) -> None:
         super().__init__(f"impersonated fetch failed ({failure_class or exc})")
         self.failure_class = failure_class
         self.exc = exc
+
+
+class ImpersonateBudgetExhausted(ImpersonateDeclined):
+    """The caller's budget ran out before a hop could be dialed.
+
+    Raised by the budget bound around the three awaits that precede a dial (the vetting lookup,
+    the redirect re-guard and the host gate, :func:`_within_budget`) and by the timeout sizing
+    that runs once the gate is held, when the deadline has passed before or during one of them.
+    Nothing was dialed on THIS hop; on a redirect hop the earlier hops were. Its own class rather
+    than a ``timeout`` transport error because the two mean different things to the Tier-1 rung's
+    record: a transfer that timed out is an attempt that FIRED against the host, while a budget
+    spent before the dial is the provider's wall binding, the ``wall_budget`` skip every other
+    rung records. ``waiting_on`` names the await the budget ran out in.
+    """
+
+    def __init__(self, *, waiting_on: str) -> None:
+        super().__init__(f"impersonated fetch budget exhausted before the dial, waiting on {waiting_on}")
+        self.waiting_on = waiting_on
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +397,9 @@ async def fetch_impersonated(
     returned as data. The loop runs at most ``MAX_REDIRECTS + 1`` times, exactly like the direct
     fetch, and every hop after the first is a derived URL that owes the two checks every derived
     URL owes (the public preflight, then the Metaculus self-reference refusal, in that order,
-    which is a telemetry contract) before it is pinned and dialed.
+    which is a telemetry contract) before it is pinned and dialed. Every await that precedes a
+    dial, that re-guard included, runs inside :func:`_within_budget`, so the deadline bounds when
+    the call STOPS and not merely when its next hop starts.
 
     curl-cffi 0.15.0 advertises ``allow_redirects="safe"`` (``CurlFollow.SAFE``) as protection
     against internal and private addresses. It is NOT used here and this loop must not be
@@ -410,7 +430,9 @@ async def fetch_impersonated(
                 primary_ip=hop.primary_ip,
             )
         next_url = _redirect_target(hop)
-        await _refuse_derived_hop(next_url, from_url=hop_url)
+        await _within_budget(
+            _refuse_derived_hop(next_url, from_url=hop_url), deadline_monotonic_s, waiting_on="the redirect re-guard"
+        )
         logger.debug(f"impersonated fetch following {hop.status} {urlparse(hop_url).netloc} -> {next_url}")
         redirected_from = hop_url
         hop_url = next_url
@@ -434,10 +456,10 @@ async def _fetch_pinned_hop(
     queued behind a slow host does not then help itself to a fresh ceiling; and the gate is
     released before the next hop acquires its own, never nested, because ``asyncio.Semaphore``
     is not reentrant and an A to B to A chain would self-deadlock. Both awaits that precede the
-    dial are bounded by the remaining budget too (:func:`_within_budget`): the vetting lookup is
-    an uncancellable ``getaddrinfo`` thread, and the gate's holder can keep it for a whole hop
-    timeout, so without the bound the caller's floor would bound when this rung STARTS rather
-    than when it stops.
+    dial here are bounded by the remaining budget too (:func:`_within_budget`), as is the redirect
+    re-guard in the loop above: the vetting lookup and the re-guard each run an uncancellable
+    ``getaddrinfo`` thread, and the gate's holder can keep it for a whole hop timeout, so without
+    the bound the caller's floor would bound when this rung STARTS rather than when it stops.
 
     The two caps. The write callback cannot see the headers, so the first dial runs under
     ``max_bytes`` whatever the body is. When that dial aborts at the cap and the aborted
@@ -447,14 +469,16 @@ async def _fetch_pinned_hop(
     direct path it substitutes for, which reads a declared PDF under the document cap. A second
     abort, or an oversized body of any other type, is the decline.
     """
-    pinned = await _within_budget(rendered_fetch.resolve_pinned_host(hop_url), deadline_monotonic_s)
+    pinned = await _within_budget(
+        rendered_fetch.resolve_pinned_host(hop_url), deadline_monotonic_s, waiting_on="the vetting lookup"
+    )
     if pinned is None:
         raise ImpersonateUnpinnable(hop_url, redirected_from=redirected_from)
     host, vetted_ip = pinned
     resolve_entry = _resolve_entry(host, _hop_port(hop_url), vetted_ip)
 
     gate = semaphore_for_host(hop_url, host_sems)
-    await _within_budget(gate.acquire(), deadline_monotonic_s)
+    await _within_budget(gate.acquire(), deadline_monotonic_s, waiting_on="the host gate")
     try:
         try:
             return await _dial(
@@ -484,25 +508,27 @@ async def _fetch_pinned_hop(
         gate.release()
 
 
-async def _within_budget[T](coro: Coroutine[Any, Any, T], deadline_monotonic_s: float) -> T:
-    """Await ``coro`` inside what is left of the budget, or decline as a timeout.
+async def _within_budget[T](coro: Coroutine[Any, Any, T], deadline_monotonic_s: float, *, waiting_on: str) -> T:
+    """Await ``coro`` inside what is left of the budget, or decline as a spent budget.
 
-    The ``asyncio.timeout`` here bounds the WAIT, not a transfer: the vetting lookup and the
-    gate acquisition are the two awaits before the dial. A lookup that outlives the budget is
-    abandoned to its thread and declined; a gate not acquired by the deadline is declined
-    without dialing, which is the same outcome the post-gate check would have produced, only at
-    the deadline instead of whenever the holder let go. On an already-spent budget the coroutine
-    the caller built is closed before the decline, so it is never left un-awaited.
+    The ``asyncio.timeout`` here bounds a WAIT, not a transfer: the vetting lookup, the redirect
+    re-guard and the gate acquisition are the three awaits before a dial, and the first two run
+    an uncancellable ``getaddrinfo`` thread. A lookup that outlives the budget is abandoned to
+    its thread and declined; a gate not acquired by the deadline is declined without dialing,
+    which is the same outcome the post-gate check would have produced, only at the deadline
+    instead of whenever the holder let go. On an already-spent budget the coroutine the caller
+    built is closed before the decline, so it is never left un-awaited. ``waiting_on`` names the
+    await for the decline's message.
     """
     remaining = deadline_monotonic_s - time.monotonic()
     if remaining <= 0.0:
         coro.close()
-        raise ImpersonateTransportError(failure_class="timeout", exc="TimeoutError")
+        raise ImpersonateBudgetExhausted(waiting_on=waiting_on)
     try:
         async with asyncio.timeout(remaining):
             return await coro
     except TimeoutError:
-        raise ImpersonateTransportError(failure_class="timeout", exc="TimeoutError") from None
+        raise ImpersonateBudgetExhausted(waiting_on=waiting_on) from None
 
 
 async def _dial(
@@ -697,10 +723,14 @@ def _hop_port(hop_url: str) -> int:
 
 
 def _remaining_s(deadline_monotonic_s: float) -> float:
-    """Seconds left before the deadline, or the timeout decline when it has passed."""
+    """Seconds left before the deadline, or the spent-budget decline when it has passed.
+
+    Read with the gate already held and nothing dialed yet, so a budget that ran out here ran
+    out in the queue behind the gate's holder, which is what the decline names.
+    """
     remaining = deadline_monotonic_s - time.monotonic()
     if remaining <= 0.0:
-        raise ImpersonateTransportError(failure_class="timeout", exc="TimeoutError")
+        raise ImpersonateBudgetExhausted(waiting_on="the host gate")
     return remaining
 
 

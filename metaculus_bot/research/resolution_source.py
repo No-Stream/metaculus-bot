@@ -234,6 +234,7 @@ from metaculus_bot.research.http_fetch import (
     unreadable_data_embed_providers,
 )
 from metaculus_bot.research.impersonated_fetch import (
+    ImpersonateBudgetExhausted,
     ImpersonateDeclined,
     ImpersonatedResponse,
     ImpersonateTransportError,
@@ -2075,18 +2076,23 @@ async def _impersonate_or_record_the_skip(
 ) -> ImpersonatedResponse | None:
     """Dial the transport, or turn its decline into the record the attempt should carry.
 
-    The one decline that is a SKIP rather than a fired attempt is :class:`ImpersonateUnpinnable`,
-    raised when a hop's host would not pin to a vetted public address: stamped on the attempt
-    already started rather than appended as a second one, the pattern
-    :func:`_render_or_record_the_skip` uses for its skips. The pin can fail on the FIRST hop, where
-    nothing was dialed, or on a later redirect hop, where the earlier hops were; the skip says the
-    pin failed on some hop, not that no wall was spent. Every other :class:`ImpersonateDeclined`
-    leaves the attempt fired, so the dispatcher closes it on the direct status and the archive
-    reads ``route=impersonate status=blocked``: we tried the fingerprint and this is still the
-    answer. Logged at the level the shape deserves. A transport failure at INFO, as the direct
-    path's own are, because a reset or a handshake failure is a fact about the host rather than
-    about this rung; a refused hop, an oversized body, a redirect chain past the cap or a pin that
-    did not hold at WARNING, and the transport already logged that last one at ERROR.
+    Two declines are SKIPS rather than fired attempts, each stamped on the attempt already started
+    rather than appended as a second one, the pattern :func:`_render_or_record_the_skip` uses for
+    its skips. :class:`ImpersonateUnpinnable` is a hop whose host would not pin to a vetted public
+    address; the pin can fail on the FIRST hop, where nothing was dialed, or on a later redirect
+    hop, where the earlier hops were, so the skip says the pin failed on some hop, not that no
+    wall was spent. :class:`ImpersonateBudgetExhausted` is the wall running out while the
+    transport waited on a pre-dial await (the vetting lookup, a redirect re-guard, the host gate):
+    nothing was dialed on that hop, so it is the ``wall_budget`` skip the pre-gate floor records,
+    and not a fired attempt whose ``blocked`` outcome would read as the host refusing the
+    fingerprint. Every other :class:`ImpersonateDeclined` leaves the attempt fired, so the
+    dispatcher closes it on the direct status and the archive reads ``route=impersonate
+    status=blocked``: we tried the fingerprint and this is still the answer. Logged at the level
+    the shape deserves. A transport failure at INFO, as the direct path's own are, because a reset
+    or a handshake failure is a fact about the host rather than about this rung; the spent
+    budget at WARNING like every other wall skip; a refused hop, an oversized body, a redirect
+    chain past the cap or a pin that did not hold at WARNING, and the transport already logged
+    that last one at ERROR.
 
     The two body caps are the direct path's own: ``RESOLUTION_SOURCE_MAX_RESPONSE_BYTES`` for a
     page and ``DOCUMENT_TEXT_PDF_MAX_BYTES`` for a declared PDF, exactly the pair
@@ -2106,6 +2112,9 @@ async def _impersonate_or_record_the_skip(
     except ImpersonateUnpinnable as exc:
         logger.warning("resolution_source: the impersonated retry of %s could not pin its host (%s)", netloc, exc)
         attempt.skipped_reason = "impersonate_unpinnable"
+    except ImpersonateBudgetExhausted as exc:
+        logger.warning("resolution_source: skipping the impersonated retry for %s: %s", netloc, exc)
+        attempt.skipped_reason = "wall_budget"
     except ImpersonateTransportError as exc:
         logger.info(
             "resolution_source: the impersonated retry of %s failed in transport (failure_class=%s exc=%s)",

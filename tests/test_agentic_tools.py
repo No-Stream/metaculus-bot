@@ -39,6 +39,7 @@ from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allow
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_TRIGGER_STATUSES,
     ImpersonateBodyTooLarge,
+    ImpersonateBudgetExhausted,
     ImpersonatedResponse,
     ImpersonateHopRefused,
     ImpersonatePinNotHeld,
@@ -3569,6 +3570,7 @@ class TestGapFillV2ImpersonatedRetry:
             ImpersonateHopRefused("ssrf_blocked", hop_url="http://10.0.0.8/status", from_url=_URL),
             ImpersonateBodyTooLarge(_URL, bytes_read=6_000_000, max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES),
             ImpersonateRedirectLimit(_URL, final_url=f"{_URL}?hop=6"),
+            ImpersonateBudgetExhausted(waiting_on="the host gate"),
         ],
         ids=lambda decline: type(decline).__name__,
     )

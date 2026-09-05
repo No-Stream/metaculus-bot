@@ -54,6 +54,7 @@ from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_BLOCK_STATUSES,
     IMPERSONATE_TRIGGER_STATUSES,
     ImpersonateBodyTooLarge,
+    ImpersonateBudgetExhausted,
     ImpersonateDeclined,
     ImpersonatedResponse,
     ImpersonateHopRefused,
@@ -914,14 +915,24 @@ class TestBodyCapAgainstLibcurl:
 
 class TestTimeouts:
     async def test_a_past_deadline_makes_no_request(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A budget already spent is its own decline, not a ``timeout`` transport error: nothing
+        was dialed, so the Tier-1 rung records the provider's wall binding rather than an attempt
+        that fired against the host."""
         curl = install_fake_curl(monkeypatch, _page())
 
-        with pytest.raises(ImpersonateTransportError) as excinfo:
+        with pytest.raises(ImpersonateBudgetExhausted) as excinfo:
             await _fetch(deadline_in_s=-1.0)
 
-        assert excinfo.value.failure_class == "timeout"
-        assert excinfo.value.exc == "TimeoutError"
+        assert excinfo.value.waiting_on == "the vetting lookup"
         assert curl.sessions == []
+
+    def test_sizing_a_hop_timeout_on_a_spent_budget_is_budget_exhausted(self) -> None:
+        """The last pre-dial check, run with the gate already held: the budget spent in the queue
+        behind the gate's holder is the same decline as a gate never acquired."""
+        with pytest.raises(ImpersonateBudgetExhausted) as excinfo:
+            impersonated_fetch._hop_timeout_s(time.monotonic() - 0.01, 20.0)
+
+        assert excinfo.value.waiting_on == "the host gate"
 
     async def test_the_per_hop_timeout_is_clamped_to_the_remaining_budget(
         self, monkeypatch: pytest.MonkeyPatch
@@ -971,16 +982,16 @@ class TestTimeouts:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """R14: the gate acquire is bounded by the budget, so a hop that never gets the gate before
-        the deadline declines as a timeout rather than dialing late or waiting forever."""
+        the deadline declines as a spent budget rather than dialing late or waiting forever."""
         curl = install_fake_curl(monkeypatch, _page())
         sems: dict[str, asyncio.Semaphore] = {}
         gate = impersonated_fetch.semaphore_for_host(_URL, sems)
         await gate.acquire()
 
-        with pytest.raises(ImpersonateTransportError) as excinfo:
+        with pytest.raises(ImpersonateBudgetExhausted) as excinfo:
             await _fetch(_URL, host_sems=sems, deadline_in_s=0.2, per_hop_timeout_s=20.0)
 
-        assert excinfo.value.failure_class == "timeout"
+        assert excinfo.value.waiting_on == "the host gate"
         assert curl.sessions == []
         gate.release()
 
@@ -993,7 +1004,7 @@ class TestTimeouts:
 
 
 class TestBudgetBoundedLookup:
-    async def test_a_lookup_that_outlives_the_budget_declines_as_a_timeout(
+    async def test_a_lookup_that_outlives_the_budget_declines_as_budget_exhausted(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """R14: the vetting lookup is an uncancellable ``getaddrinfo`` thread, so it is awaited
@@ -1007,11 +1018,31 @@ class TestBudgetBoundedLookup:
         monkeypatch.setattr(rendered_fetch, "resolve_pinned_host", _slow_resolve)
         curl = install_fake_curl(monkeypatch, _page())
 
-        with pytest.raises(ImpersonateTransportError) as excinfo:
+        with pytest.raises(ImpersonateBudgetExhausted) as excinfo:
             await _fetch(deadline_in_s=0.2)
 
-        assert excinfo.value.failure_class == "timeout"
+        assert excinfo.value.waiting_on == "the vetting lookup"
         assert curl.sessions == []
+
+    async def test_a_redirect_re_guard_that_outlives_the_budget_declines_without_dialing_the_hop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The third pre-dial await. ``_hop_refusal`` runs ``is_public_http_url``, another
+        uncancellable ``getaddrinfo`` thread, on every redirect target; unbounded, it let the
+        caller's deadline bound when the next hop STARTED rather than when the rung stopped."""
+
+        async def _slow_refusal(candidate_url: str) -> None:
+            del candidate_url
+            await asyncio.sleep(5.0)
+
+        monkeypatch.setattr(resolution_source, "_hop_refusal", _slow_refusal)
+        curl = install_fake_curl(monkeypatch, _redirect(f"https://{_OTHER_HOST}/x"), _page())
+
+        with pytest.raises(ImpersonateBudgetExhausted) as excinfo:
+            await _fetch(deadline_in_s=0.3)
+
+        assert excinfo.value.waiting_on == "the redirect re-guard"
+        assert len(curl.sessions) == 1, "the first hop was dialed; the redirect target never was"
 
 
 # ---------------------------------------------------------------------------
@@ -1310,6 +1341,7 @@ class TestDeclineFamily:
             ImpersonateRedirectLimit,
             ImpersonateBodyTooLarge,
             ImpersonateTransportError,
+            ImpersonateBudgetExhausted,
         ],
     )
     def test_every_decline_is_an_impersonate_declined(self, decline: type[BaseException]) -> None:
