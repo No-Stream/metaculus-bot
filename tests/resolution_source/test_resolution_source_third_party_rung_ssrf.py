@@ -26,10 +26,10 @@ from typing import get_args
 
 import pytest
 
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import impersonated_fetch, resolution_source
+from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus
 from metaculus_bot.research.resolution_source import (
-    _IMPERSONATE_TRIGGER_HTTP_STATUS,
     _URL_CONTEXT_TRIGGER_STATUSES,
     _WAYBACK_TRIGGER_STATUSES,
     FetchContext,
@@ -168,7 +168,7 @@ class TestTheImpersonatedRetryNeverDialsAUrlWeRefused:
 
     @pytest.fixture(autouse=True)
     def _arm_the_retry(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "_IMPERSONATE_TRIGGER_HTTP_STATUS", _IMPERSONATE_TRIGGER_HTTP_STATUS)
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
 
     @pytest.mark.parametrize("url", _REFUSED_URLS)
     async def test_a_refused_url_is_never_retried_under_impersonation(self, url, monkeypatch):

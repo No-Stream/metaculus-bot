@@ -18,20 +18,26 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from metaculus_bot.constants import (
+    DOCUMENT_TEXT_PDF_MAX_BYTES,
     RESOLUTION_SOURCE_HTTP_TIMEOUT,
     RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV,
     RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import impersonated_fetch, resolution_source
 from metaculus_bot.research.impersonated_fetch import (
+    IMPERSONATE_TRIGGER_STATUSES,
+    ImpersonateBodyTooLarge,
+    ImpersonateDeclined,
+    ImpersonateHopRefused,
+    ImpersonatePinNotHeld,
+    ImpersonateRedirectLimit,
     ImpersonateTransportError,
     ImpersonateUnpinnable,
     impersonation_refused,
 )
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS, FetchResult, FetchStatus
 from metaculus_bot.research.resolution_source import (
-    _IMPERSONATE_TRIGGER_HTTP_STATUS,
     _WAYBACK_TRIGGER_STATUSES,
     FetchContext,
     _fetch_one,
@@ -50,6 +56,7 @@ from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
     _impersonated,
+    _menu_tree_page,
     _prose_page,
     arm_paid_rung,
     fake_impersonated_fetch,
@@ -86,12 +93,12 @@ def _refused_page(*, server: str = "AkamaiGHost") -> FakeSession:
 
 @pytest.fixture(autouse=True)
 def _arm_the_retry(monkeypatch):
-    """Restore the rung's own trigger set, which this package's conftest empties by default.
+    """Restore the transport's trigger set, which this package's conftest empties by default.
 
-    The module's constant OBJECT is restored rather than a copy, so the trigger population these
+    The transport's constant OBJECT is restored rather than a copy, so the trigger population these
     tests assert on cannot drift from the one prod uses.
     """
-    monkeypatch.setattr(resolution_source, "_IMPERSONATE_TRIGGER_HTTP_STATUS", _IMPERSONATE_TRIGGER_HTTP_STATUS)
+    monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
 
 
 def _transport(monkeypatch, answer) -> list[dict[str, object]]:
@@ -136,11 +143,15 @@ class TestImpersonateRungTrigger:
     def test_the_trigger_population(self, status, http_status, reason, fires):
         assert _impersonate_rung_applies(_direct(status, http_status, reason=reason)) is fires
 
-    def test_the_trigger_is_read_off_the_module_constant(self, monkeypatch):
-        """What the package conftest relies on to decline the rung for every other test."""
-        monkeypatch.setattr(resolution_source, "_IMPERSONATE_TRIGGER_HTTP_STATUS", frozenset())
+    def test_the_trigger_is_read_off_the_transport_at_call_time(self, monkeypatch):
+        """What the package conftest relies on to decline the rung for every other test, and what
+        keeps gap-fill v2 on the same population: both fetchers read the transport's attribute."""
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", frozenset())
 
         assert _impersonate_rung_applies(_direct("blocked", 403)) is False
+
+    def test_the_transport_owns_a_403_only_trigger(self):
+        assert frozenset({403}) == IMPERSONATE_TRIGGER_STATUSES
 
 
 class TestImpersonateRungRescue:
@@ -167,12 +178,15 @@ class TestImpersonateRungRescue:
         )
         assert attempt.wall_s is not None
         assert _rung_counts([result])["impersonate_attempts"] == 1
-        # The transport was handed the direct path's own bounds and the caller's host map.
+        # The transport was handed the direct path's own bounds and the caller's host map: both
+        # body caps, so a declared PDF between them is read here as `_resolution_pdf_outcome`
+        # would have read it rather than declined as oversized.
         (call,) = calls
         assert call["url"] == _URL
         assert call["host_sems"] is host_sems
         assert call["per_hop_timeout_s"] == RESOLUTION_SOURCE_HTTP_TIMEOUT
         assert call["max_bytes"] == RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
+        assert call["document_max_bytes"] == DOCUMENT_TEXT_PDF_MAX_BYTES
 
     async def test_the_retry_is_bounded_by_the_remaining_wall(self, monkeypatch):
         monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 7.5)
@@ -270,6 +284,36 @@ class TestImpersonateRungStillRefused:
         # A skip emits no escalation line: the memo hit rides the counts.
         assert _escalation_lines(caplog) == []
 
+    async def test_a_block_answered_by_a_redirect_target_memoizes_both_hosts(self, monkeypatch, caplog):
+        """The transport follows redirects itself, so the block can come from a later hop's netloc.
+        Memoizing only the host DIALED would ban a host that never refused us and keep dialing the
+        one that did, so the rung hands the transport both URLs and the memo covers both; the log
+        line names the host that answered."""
+        answered = "https://edge.example.net/denied"
+        _transport(monkeypatch, _impersonated(403, body=b"denied", url=answered))
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+
+        assert result.status == "blocked"
+        assert [a.outcome for a in result.rung_attempts] == ["blocked"]
+        assert impersonation_refused(answered) is True
+        assert impersonation_refused(_URL) is True
+        assert any("answered 403 by edge.example.net (blocked)" in message for message in caplog.messages)
+
+    @pytest.mark.parametrize(("status", "outcome"), [(404, "not_found"), (410, "not_found"), (503, "error")])
+    async def test_a_non_block_answer_stamps_its_own_outcome_and_does_not_memoize(self, monkeypatch, status, outcome):
+        """`not_found` and `error` are in the rung's outcome domain too: `_NON_OK_FETCH_STATUS` maps
+        404 and 410, and every other non-200 falls through to its `error` default. Neither says
+        anything about the host's view of our fingerprint, so neither writes the memo."""
+        _transport(monkeypatch, _impersonated(status, body=b""))
+
+        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+
+        assert result.status == "blocked"
+        assert [a.outcome for a in result.rung_attempts] == [outcome]
+        assert impersonation_refused(_URL) is False
+
     async def test_a_404_under_impersonation_does_not_memoize(self, monkeypatch):
         """The path is gone, which says nothing about the host's view of our fingerprint."""
         calls = _transport(monkeypatch, _impersonated(404, body=b""))
@@ -322,6 +366,25 @@ class TestImpersonateRungStillRefused:
         assert result.status == "blocked"
         assert result.route == "impersonate"
         assert [a.outcome for a in result.rung_attempts] == ["js_wall"]
+
+    async def test_a_withheld_impersonated_body_is_counted_on_the_direct_result(self, monkeypatch):
+        """`chrome_metric_withholds` counts a withhold anywhere on the URL's ladder, and a 403 direct
+        fetch carried no body for the metric to withhold, so the impersonated body's withhold is the
+        only one this URL can produce. It is stamped on the direct result (as the rendered rung
+        stamps its DOM's withhold), which `_fetch_one` carries onto whatever the ladder leaves
+        standing, here the direct `blocked`; the discarded rung result would otherwise take the
+        fact with it."""
+        _transport(monkeypatch, _impersonated(200, body=_menu_tree_page()))
+
+        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+
+        assert result.status == "blocked"
+        assert result.route == "impersonate"
+        assert [(a.outcome, a.skipped_reason) for a in result.rung_attempts] == [("no_resolving_content", "")]
+        assert result.chrome_metric_withheld is True
+        counts = _rung_counts([result])
+        assert counts["chrome_metric_withholds"] == 1
+        assert counts["chrome_metric_withholds_rescued"] == 0
 
 
 class TestImpersonateRungSkips:
@@ -391,7 +454,45 @@ class TestImpersonateRungSkips:
         assert impersonation_refused(_URL) is False
         (line,) = _escalation_lines(caplog)
         assert "from_status=blocked rung=impersonate outcome=blocked" in line
-        assert any("tls" in message and "SSLError" in message for message in caplog.messages)
+        # A transport failure is a fact about the host, logged at INFO as the direct path's own are.
+        (record,) = [r for r in caplog.records if "failed in transport" in r.getMessage()]
+        assert record.levelno == logging.INFO
+        assert "failure_class=tls" in record.getMessage()
+        assert "exc=SSLError" in record.getMessage()
+
+    @pytest.mark.parametrize(
+        "decline",
+        [
+            ImpersonatePinNotHeld(_URL, expected_ip="93.184.216.34", actual_ip="10.0.0.8"),
+            ImpersonateHopRefused("ssrf_blocked", hop_url="http://10.0.0.8/status", from_url=_URL),
+            ImpersonateBodyTooLarge(_URL, bytes_read=6_000_000, max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES),
+            ImpersonateRedirectLimit(_URL, final_url=f"{_URL}?hop=6"),
+        ],
+        ids=lambda decline: type(decline).__name__,
+    )
+    async def test_a_guard_decline_is_a_fired_attempt_logged_at_warning(self, monkeypatch, caplog, decline):
+        """The generic `except ImpersonateDeclined` branch: a pin that did not hold, a refused
+        redirect hop, an oversized body and a redirect chain past the cap are each a FIRED attempt
+        that leaves the direct `blocked` standing and the host un-memoized (nothing was learned
+        about the host's view of our fingerprint), logged at WARNING because each is a guard or a
+        cap firing rather than the host's own behaviour."""
+        assert isinstance(decline, ImpersonateDeclined)
+        _transport(monkeypatch, decline)
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            resolution_source._log_fetch_outcome_markers(1, [result])
+
+        assert result.status == "blocked"
+        assert result.route == "impersonate"
+        assert [(a.rung, a.outcome, a.skipped_reason) for a in result.rung_attempts] == [("impersonate", "blocked", "")]
+        assert _rung_counts([result])["impersonate_attempts"] == 1
+        assert impersonation_refused(_URL) is False
+        (line,) = _escalation_lines(caplog)
+        assert "from_status=blocked rung=impersonate outcome=blocked" in line
+        (record,) = [r for r in caplog.records if "produced nothing" in r.getMessage()]
+        assert record.levelno == logging.WARNING
+        assert type(decline).__name__ in record.getMessage()
 
 
 class TestImpersonateRungLadderPosition:
@@ -592,6 +693,65 @@ class TestImpersonateRungBodyClassification:
 
         assert result.status == "blocked"
         assert [a.outcome for a in result.rung_attempts] == ["unsupported_type"]
+
+    @pytest.mark.parametrize(
+        ("content_type", "body"),
+        [
+            ("text/html; charset=utf-8", _prose_page(_RENDERED_PROSE)),
+            ("text/html", _JS_SHELL),
+            ("text/html", _menu_tree_page()),
+            ("application/json", b'{"stoppages": 12, "as_of": "2026-08-28"}'),
+            ("application/json", b"   \n"),
+            ("text/csv", b'date,count\n2026-08-01,<a href="/x">11</a>\n2026-08-02,12\n'),
+            ("text/plain", b"Major work stoppages beginning in 2026: 12 through August."),
+            ("image/png", b"\x89PNG\r\n\x1a\nbinary"),
+            ("application/octet-stream", b"\x89PNG\r\n\x1a\nbinary"),
+            ("", b"\x89PNG\r\n\x1a\nbinary"),
+            ("application/pdf", build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2"]])),
+            ("application/pdf", b"<html>not a document</html>"),
+            ("application/octet-stream", build_text_pdf([["Hospitalizations reported: 922"]])),
+        ],
+        ids=lambda value: value if isinstance(value, str) else f"{len(value)}B",
+    )
+    async def test_the_two_routers_agree_on_every_body_shape(self, content_type, body):
+        """The three-way content-type router is stated twice, in `_resolution_response_outcome` for
+        the aiohttp path and in `_impersonated_body_outcome` for this rung, off the same vocabularies
+        in the same order. Adding a token to a shared vocabulary propagates; adding or reordering a
+        BRANCH does not, so the two are pinned equal on every body shape, the pending-document case
+        resolved through `_finish_document` on both sides, down to the `pdf_local` attempt each
+        opens on its own context."""
+        direct_ctx = FetchContext(now=_NOW, query="hospitalizations reported")
+        impersonated_ctx = FetchContext(now=_NOW, query="hospitalizations reported")
+
+        via_direct = await resolution_source._resolution_response_outcome(
+            FakeResponse(200, body=body, content_type=content_type), _URL, direct_ctx
+        )
+        if isinstance(via_direct, resolution_source._PendingDocument):
+            via_direct = await resolution_source._finish_document(via_direct, direct_ctx)
+        via_impersonated = await resolution_source._impersonated_body_outcome(
+            _impersonated(200, body=body, content_type=content_type), impersonated_ctx
+        )
+
+        assert isinstance(via_direct, FetchResult), "no fixture here carries a meta-refresh hop"
+        assert self._shape(via_direct) == self._shape(via_impersonated)
+        assert [(a.rung, a.from_status) for a in direct_ctx.rungs] == [
+            (a.rung, a.from_status) for a in impersonated_ctx.rungs
+        ]
+
+    @staticmethod
+    def _shape(result: FetchResult) -> tuple[object, ...]:
+        return (
+            result.status,
+            result.http_status,
+            result.status_reason,
+            result.text,
+            result.content_type,
+            result.chrome_metric_withheld,
+            result.precision_rescued,
+            result.unreadable_embeds,
+            result.server,
+            result.failure_class,
+        )
 
 
 class TestImpersonateRungMarkerLines:

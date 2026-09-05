@@ -360,6 +360,18 @@ _RENDERED_PROSE = (
 )
 
 
+def _menu_tree_page() -> bytes:
+    """A page the line-shape metric withholds: the abs.gov.au shape the extractor policy was
+    calibrated on, about 2,000 chars of 48-char listing lines, well over the chrome floor and
+    nothing but a release archive, so real trafilatura extracts it and the metric withholds it."""
+    return (
+        "<!doctype html><html><head><title>Labour Force, Australia</title></head><body><nav>Home</nav><main>"
+        "<h1>Labour Force, Australia</h1><ul>"
+        + "".join(f"<li>Labour Force, Australia, release {i:02d} 2026 Archive release</li>" for i in range(36))
+        + "</ul></main></body></html>"
+    ).encode()
+
+
 def _rendered(html: str, *, content_type: str = "text/html") -> RenderedPage:
     return RenderedPage(url=_URL, content_type=content_type, html=html)
 
@@ -501,10 +513,13 @@ def _impersonated(
 
 
 def fake_impersonated_fetch(answer: ImpersonatedResponse | BaseException, calls: list[dict[str, Any]]):
-    """A stand-in for ``fetch_impersonated`` that records every keyword the rung handed it.
+    """A stand-in for ``fetch_impersonated`` that records every keyword the caller handed it.
 
     ``answer`` is returned, or raised when it is an exception, so one double covers a rescue,
-    a still-refused host and every member of the ``ImpersonateDeclined`` family.
+    a still-refused host and every member of the ``ImpersonateDeclined`` family. The one double
+    for BOTH callers (the Tier-1 rung patches it on ``resolution_source``, gap-fill v2 on
+    ``agentic.tools``), so the transport's keyword contract is spelled once: a keyword the
+    transport gains or loses changes this signature, and both suites go red together.
     """
 
     async def _fetch(
@@ -514,6 +529,7 @@ def fake_impersonated_fetch(answer: ImpersonatedResponse | BaseException, calls:
         deadline_monotonic_s: float,
         per_hop_timeout_s: float,
         max_bytes: int,
+        document_max_bytes: int,
     ) -> ImpersonatedResponse:
         calls.append(
             {
@@ -522,6 +538,7 @@ def fake_impersonated_fetch(answer: ImpersonatedResponse | BaseException, calls:
                 "deadline_monotonic_s": deadline_monotonic_s,
                 "per_hop_timeout_s": per_hop_timeout_s,
                 "max_bytes": max_bytes,
+                "document_max_bytes": document_max_bytes,
             }
         )
         # A real yield point, so the double schedules like the transport it replaces.

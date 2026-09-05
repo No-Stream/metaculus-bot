@@ -1,9 +1,9 @@
 # SMELL-EXEMPT-monolithic-file-loc: what stays here is fixed by the test suites'
 # monkeypatch surface, not by the layer diagram. Ten `RESOLUTION_SOURCE_*` caps
 # plus `_get_session`, `render_page`, `run_url_context_read`, `fetch_impersonated`,
-# `_WAYBACK_TRIGGER_STATUSES`, `_IMPERSONATE_TRIGGER_HTTP_STATUS`, `is_public_http_url`,
+# `_WAYBACK_TRIGGER_STATUSES`, `is_public_http_url`,
 # `_extract_main_text` and `_sem_for_host` are patched on THIS module
-# (tests/resolution_source/*.py, tests/test_agentic_tools.py) — 24 distinct names in all,
+# (tests/resolution_source/*.py, tests/test_agentic_tools.py) — 23 distinct names in all,
 # plus the `resolution_source.asyncio` / `.socket` attribute-of-import targets — so every
 # reader of one has to stay here to resolve it as a module global at call time, which pins the
 # network layer, the section renderer, the escalation ladder and the provider factory.
@@ -181,7 +181,6 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_ENABLED_ENV,
     RESOLUTION_SOURCE_GLOBAL_CONCURRENCY,
     RESOLUTION_SOURCE_HTTP_TIMEOUT,
-    RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV,
     RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_JS_WALL_MIN_CHARS,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
@@ -206,7 +205,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS,
     env_flag_enabled,
 )
-from metaculus_bot.research import derived_api
+from metaculus_bot.research import derived_api, impersonated_fetch
 from metaculus_bot.research.document_text import (
     DocumentDigest,
     PdfText,
@@ -241,7 +240,6 @@ from metaculus_bot.research.impersonated_fetch import (
     ImpersonateUnpinnable,
     fetch_impersonated,
     impersonation_refused,
-    note_impersonation_refused,
 )
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -1095,6 +1093,33 @@ async def _hop_refusal(candidate_url: str) -> HopRefusal | None:
     if is_metaculus_self_ref(candidate_url):
         return "metaculus_self_ref"
     return None
+
+
+async def _landing_refused(landing_url: str, cited_url: str, *, action: str) -> bool:
+    """Whether a second transport must NOT be handed the URL the direct fetch LANDED on.
+
+    The one home of the re-vet every rung that dials ``direct.url`` owes, today the browser rung
+    and the impersonated retry: a landing that differs from the cited URL is a DERIVED URL, so it
+    goes back through :func:`_hop_refusal` before a transport that never passed aiohttp's
+    connect-time resolver dials it. A guard surface, so one copy: a copy that dropped the
+    equality short-circuit or the refusal check would read exactly like the correct one, and this
+    check is what stops a second transport from dialing a host the direct path refused. The
+    equality short-circuit is not an optimisation but the rule that a cited URL owes nothing
+    here, because :func:`_fetch_direct` already vetted every hop it followed. ``action`` is the
+    verb the WARNING names; the callers own what they return, which is a decline with no attempt
+    recorded, because the refusal is decided where the dialed URL is decided.
+    """
+    if landing_url == cited_url:
+        return False
+    if await _hop_refusal(landing_url) is None:
+        return False
+    logger.warning(
+        "resolution_source: not %s %s, where the cited %s landed: a host we do not fetch",
+        action,
+        urlparse(landing_url).netloc,
+        urlparse(cited_url).netloc,
+    )
+    return True
 
 
 async def _vetted_hop_target(
@@ -1960,22 +1985,22 @@ async def _fetch_one_hop(
     return outcome
 
 
-# The direct-fetch HTTP statuses the impersonated retry fires on, read through
-# `_impersonate_rung_applies`. A module constant rather than a literal in the predicate for the
-# reason `_WAYBACK_TRIGGER_STATUSES` is one: the test package empties it to decline the rung by
-# default, and tests that exercise the rung restore this object. 403 only; the predicate's
-# docstring says why each neighbour is out.
-_IMPERSONATE_TRIGGER_HTTP_STATUS: frozenset[int] = frozenset({403})
-
-
 def _impersonate_rung_applies(direct: FetchResult) -> bool:
     """Whether a browser's TLS fingerprint could plausibly turn ``direct`` into a readable page.
 
-    ``blocked`` with HTTP 403, and both halves are load-bearing. ``blocked`` has four producers:
+    ``blocked`` with an HTTP status in ``impersonated_fetch.IMPERSONATE_TRIGGER_STATUSES`` (403
+    today), and both halves are load-bearing. ``blocked`` has four producers:
     ``_NON_OK_FETCH_STATUS`` maps 403, 406 and 429 to it, and :func:`_vetted_hop_target` returns
     it for a Metaculus self-reference hop carrying the REDIRECT's 301 or 302. The 403 test
     excludes that last case exactly, which matters: handing a URL this module refused to a second
     transport is the bypass the guard exists to prevent.
+
+    The trigger set is the TRANSPORT's, read as a module attribute at call time rather than
+    imported, for two reasons. It is the one trigger both fetchers share (gap-fill v2's ``fetch``
+    and ``read_document`` ladders key on the same object), so the population cannot drift between
+    them; and the test packages empty that attribute to decline the rung by default and restore the
+    transport's own object in the tests that exercise it, which only bites on a read that resolves
+    the name at call time.
 
     Excluded on purpose, each for its own reason. 429 is a throttle, not a fingerprint verdict,
     and retrying at once with a different fingerprint against a host that just asked us to slow
@@ -1989,7 +2014,7 @@ def _impersonate_rung_applies(direct: FetchResult) -> bool:
     page classifies as ``js_wall`` or ``thin_page``; FUTURE.md carries that entry, and the
     ``error`` with ``failure_class="tls"`` widening nothing has measured.
     """
-    return direct.status == "blocked" and direct.http_status in _IMPERSONATE_TRIGGER_HTTP_STATUS
+    return direct.status == "blocked" and direct.http_status in impersonated_fetch.IMPERSONATE_TRIGGER_STATUSES
 
 
 async def _impersonated_body_outcome(response: ImpersonatedResponse, ctx: FetchContext) -> FetchResult:
@@ -2052,14 +2077,22 @@ async def _impersonate_or_record_the_skip(
     """Dial the transport, or turn its decline into the record the attempt should carry.
 
     The one decline that is a SKIP rather than a fired attempt is :class:`ImpersonateUnpinnable`,
-    raised before anything was dialed: stamped on the attempt already started rather than appended
-    as a second one, the pattern :func:`_render_or_record_the_skip` uses for its skips. Every other
-    :class:`ImpersonateDeclined` leaves the attempt fired, so the dispatcher closes it on the direct
-    status and the archive reads ``route=impersonate status=blocked``: we tried the fingerprint and
-    this is still the answer. Logged at the level the shape deserves. A transport failure at INFO,
-    as the direct path's own are, because a reset or a handshake failure is a fact about the host
-    rather than about this rung; a refused hop, an oversized body, a redirect chain past the cap or
-    a pin that did not hold at WARNING, and the transport already logged that last one at ERROR.
+    raised when a hop's host would not pin to a vetted public address: stamped on the attempt
+    already started rather than appended as a second one, the pattern
+    :func:`_render_or_record_the_skip` uses for its skips. The pin can fail on the FIRST hop, where
+    nothing was dialed, or on a later redirect hop, where the earlier hops were; the skip says the
+    pin failed on some hop, not that no wall was spent. Every other :class:`ImpersonateDeclined`
+    leaves the attempt fired, so the dispatcher closes it on the direct status and the archive
+    reads ``route=impersonate status=blocked``: we tried the fingerprint and this is still the
+    answer. Logged at the level the shape deserves. A transport failure at INFO, as the direct
+    path's own are, because a reset or a handshake failure is a fact about the host rather than
+    about this rung; a refused hop, an oversized body, a redirect chain past the cap or a pin that
+    did not hold at WARNING, and the transport already logged that last one at ERROR.
+
+    The two body caps are the direct path's own: ``RESOLUTION_SOURCE_MAX_RESPONSE_BYTES`` for a
+    page and ``DOCUMENT_TEXT_PDF_MAX_BYTES`` for a declared PDF, exactly the pair
+    :func:`_resolution_pdf_outcome` reads under, so a cited PDF between the two is read on this
+    rung as the direct fetch would have read it rather than declined as oversized.
     """
     netloc = urlparse(retry_url).netloc
     try:
@@ -2069,6 +2102,7 @@ async def _impersonate_or_record_the_skip(
             deadline_monotonic_s=time.monotonic() + budget_s,
             per_hop_timeout_s=RESOLUTION_SOURCE_HTTP_TIMEOUT,
             max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+            document_max_bytes=DOCUMENT_TEXT_PDF_MAX_BYTES,
         )
     except ImpersonateUnpinnable as exc:
         logger.warning("resolution_source: the impersonated retry of %s could not pin its host (%s)", netloc, exc)
@@ -2107,24 +2141,27 @@ async def _impersonate_rung(
     invariants itself because libcurl never touches aiohttp's connect-time ``FilteringResolver``:
     it pre-resolves the host through the repo's own vetting predicate, pins the connection to the
     vetted address, re-guards and re-pins every redirect hop under the shared ``MAX_REDIRECTS``
-    cap, and caps the body at the direct fetch's response cap. That one cap applies whatever the
-    body turns out to be, so an impersonated PDF over it is declined where the direct path would
-    have read it under the larger document cap: a deliberate trade for a transport that cannot know
-    the content type before it dials, and the measured PDF is a fraction of it.
+    cap, and caps the body as the direct fetch does: the page cap for every body, and one re-dial
+    under the document cap when a declared PDF aborts on the first, so a cited PDF between the two
+    caps (one of the four measured recoverable URLs is a PDF) is read here as the direct path
+    would have read it (:func:`_impersonate_or_record_the_skip` names the two constants).
 
     Ordered gates, cheapest first, after the trigger (:func:`_impersonate_rung_applies`). The kill
-    switch (``RESOLUTION_SOURCE_IMPERSONATE_ENABLED``, ON by default in code, unlike the paid rung's
+    switch (``impersonated_fetch.impersonation_enabled``, the transport's own reading of
+    ``RESOLUTION_SOURCE_IMPERSONATE_ENABLED``, ON by default in code unlike the paid rung's
     default-off) records ``impersonate_disabled``. The URL dialed is ``direct.url``, the hop that
     ANSWERED 403 rather than the cited URL, because :func:`_resolution_status_outcome` sets ``url``
     to the answering hop and that is the URL the host actually refused; when the two differ the
-    landing is re-vetted through :func:`_hop_refusal`, and a refusal is a decline with no attempt,
-    mirroring :func:`_rendered_rung`. The rung's ATTEMPT stays keyed on the cited ``url``, which is
-    what the escalation line names. The per-run memo (:func:`impersonation_refused`, keyed by HOST
-    and shared with gap-fill v2) records ``impersonate_host_refused``: a host that answered the
-    impersonated client with a block status is not going to answer the next cited URL on it
-    differently in the same run. Then the wall budget, through :meth:`FetchContext.claim_rung_budget`
-    with the meta-refresh hop's floor: one GET against a host that just answered us, no launch and no
-    gate contended process-wide.
+    landing is re-vetted through :func:`_landing_refused`, and a refusal is a decline with no
+    attempt, the same helper :func:`_rendered_rung` runs. The rung's ATTEMPT stays keyed on the
+    cited ``url``, which is what the escalation line names. The per-run memo
+    (:func:`impersonation_refused`, keyed by HOST) records ``impersonate_host_refused``: a host
+    that answered the impersonated client with a block status is not going to answer the next
+    cited URL on it differently in the same run. The memo is process-global and shared with
+    gap-fill v2, whose ``fetch`` and ``read_document`` ladders write it too, so the earlier
+    refusal it records may have been a v2 fetch of a URL no question ever cited. Then the wall
+    budget, through :meth:`FetchContext.claim_rung_budget` with the meta-refresh hop's floor: one
+    GET against a host that just answered us, no launch and no gate contended process-wide.
 
     Deliberately NO fast-path skip (:func:`_skip_for_fast_path`). That token separates "the
     question's close left no room for a browser" from "this rung ran out of the provider's own
@@ -2135,32 +2172,31 @@ async def _impersonate_rung(
     Outcomes. A decline from the transport (:class:`ImpersonateDeclined`) leaves the attempt FIRED
     and :func:`_run_rung` closes it on the direct status, which is the ``route=impersonate
     status=blocked`` record the archive wants: we tried the fingerprint and this is still the
-    answer. The one exception is :class:`ImpersonateUnpinnable`, raised before anything was dialed,
-    which is stamped on the attempt already started as its own skip rather than appended as a second
-    one (the pattern :func:`_rendered_rung` uses for ``render_non_200``); near-impossible in
-    practice, since the direct fetch resolved this host through the filtering resolver moments
-    earlier. A non-200 answer stamps the rung's own outcome (``blocked`` for a still-403, so the
-    escalation line reads ``rung=impersonate outcome=blocked``), memoizes the host when the status
-    is block-shaped, and returns None. A 200 goes through :func:`_impersonated_body_outcome`, the
-    same classification a direct 200 gets, and is returned ONLY when it is ``success``. An
-    impersonated 200 that classified as unreadable stamps its verdict on the attempt
-    (``outcome=js_wall``) and leaves ``blocked`` standing, because replacing it would change the
-    fetch line's status without giving any later rung a way to act on it (the dispatcher's browser
-    block keys on ``direct``, not on a rung's result), and ``blocked`` is what keeps the paid rung
-    reachable for that URL. FUTURE.md carries letting the dispatcher escalate on a rung's result.
+    answer. The one exception is :class:`ImpersonateUnpinnable`, a hop whose host would not pin
+    to a vetted public address, which is stamped on the attempt already started as its own skip
+    rather than appended as a second one (the pattern :func:`_rendered_rung` uses for
+    ``render_non_200``). On the first hop that is near-impossible in practice, since the direct
+    fetch resolved this host through the filtering resolver moments earlier; on a later redirect
+    hop it is a target the direct fetch never resolved, so the skip means the pin failed on some
+    hop rather than that nothing was dialed. A non-200 answer stamps the rung's own outcome
+    (``blocked`` for a still-403, so the escalation line reads ``rung=impersonate
+    outcome=blocked``; ``not_found`` for a 404 or 410; ``error`` for anything else), memoizes the
+    host when the status is block-shaped, and returns None. A 200 goes through
+    :func:`_impersonated_body_outcome`, the same classification a direct 200 gets, and is returned
+    ONLY when it is ``success``. An impersonated 200 that classified as unreadable stamps its
+    verdict on the attempt (``outcome=js_wall``) and leaves ``blocked`` standing, because
+    replacing it would change the fetch line's status without giving any later rung a way to act
+    on it (the dispatcher's browser block keys on ``direct``, not on a rung's result), and
+    ``blocked`` is what keeps the paid rung reachable for that URL. FUTURE.md carries letting the
+    dispatcher escalate on a rung's result.
     """
     if not _impersonate_rung_applies(direct):
         return None
-    if not env_flag_enabled(RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV, default=True):
+    if not impersonated_fetch.impersonation_enabled():
         ctx.skip_rung("impersonate", direct.status, url, "impersonate_disabled")
         return None
     retry_url = direct.url
-    if retry_url != url and await _hop_refusal(retry_url) is not None:
-        logger.warning(
-            "resolution_source: not retrying %s under impersonation, where the cited %s landed: a host we do not fetch",
-            urlparse(retry_url).netloc,
-            urlparse(url).netloc,
-        )
+    if await _landing_refused(retry_url, url, action="retrying under impersonation"):
         return None
     if impersonation_refused(retry_url):
         ctx.skip_rung("impersonate", direct.status, url, "impersonate_host_refused")
@@ -2175,19 +2211,31 @@ async def _impersonate_rung(
     netloc = urlparse(retry_url).netloc
     if response.status != 200:
         outcome = _NON_OK_FETCH_STATUS.get(response.status, "error")
-        if outcome == "blocked":
-            # Written for a block-shaped answer only: a 404 says the path is gone, which says
-            # nothing about the host's view of our fingerprint.
-            note_impersonation_refused(retry_url)
+        # The memo write is the transport's rule (`IMPERSONATE_BLOCK_STATUSES`: a 404 says the path
+        # is gone, which says nothing about the host's view of our fingerprint), keyed on the host
+        # dialed AND the host that answered: the impersonated client follows redirects itself, so
+        # the block can come from a later hop's netloc, and that is the host that refused us.
+        impersonated_fetch.note_refusal_if_block_shaped(
+            dialed_url=retry_url, answered_url=response.url, status=response.status
+        )
         attempt.outcome = outcome
         logger.info(
-            "resolution_source: the impersonated retry of %s was answered %d (%s); the direct result stands",
+            "resolution_source: the impersonated retry of %s was answered %d by %s (%s); the direct result stands",
             netloc,
             response.status,
+            urlparse(response.url).netloc,
             outcome,
         )
         return None
     result = await _impersonated_body_outcome(response, ctx)
+    if result.chrome_metric_withheld:
+        # The metric withheld the impersonated body's extraction. `chrome_metric_withholds` counts a
+        # withhold anywhere on the URL's ladder, and a 403 direct fetch had no body for the metric
+        # to withhold, so the fact is stamped on the direct result: `_fetch_one` carries it from
+        # there onto whatever this ladder leaves standing, the direct result when nothing rescues
+        # the page or a later rung's result when one does. Idempotent on a rescue, whose own
+        # result already carries the flag.
+        direct.chrome_metric_withheld = True
     # The rung's own verdict, stamped before deciding: a body that classified as unreadable is a
     # fact about the page the escalation line has to keep even though the direct status stands.
     attempt.outcome = result.status
@@ -2381,9 +2429,10 @@ async def _rendered_rung(
     host that actually serves the content, which is also the host the landing check holds the
     browser to, and a page whose canonical form is one ordinary hop away (``example.com`` to
     ``www.example.com``) is not refused for taking it. When the two differ, the landing is
-    re-vetted here through :func:`_hop_refusal`, the one home of the two checks every derived
-    URL owes, because this is where the URL the browser dials is decided; the refusal is a
-    decline rather than a terminal result, so this site logs and returns None. The render memos are keyed on
+    re-vetted through :func:`_landing_refused`, the one home of that re-vet (shared with the
+    impersonated retry, which dials ``direct.url`` for the same reason), because this is where
+    the URL the browser dials is decided; the refusal is a decline rather than a terminal
+    result, so this site returns None with no attempt. The render memos are keyed on
     the URL rendered; the classifier's base, and so the ``FetchResult.url`` a rescue carries onto
     the ``RESOLUTION_SOURCE_FETCH`` line and into the published ``### <url>`` heading, is the URL
     the browser's main frame LANDED on (``RenderedPage.document_url``: the direct fetch's final
@@ -2395,12 +2444,7 @@ async def _rendered_rung(
     if not _rendered_rung_applies(direct):
         return None
     render_url = direct.url
-    if render_url != url and await _hop_refusal(render_url) is not None:
-        logger.warning(
-            "resolution_source: not rendering %s, where the cited %s landed: a host we do not fetch",
-            urlparse(render_url).netloc,
-            urlparse(url).netloc,
-        )
+    if await _landing_refused(render_url, url, action="rendering"):
         return None
     if rendered_to_nothing(render_url, memo_scope=_RENDER_MEMO_SCOPE):
         ctx.skip_rung("rendered", direct.status, url, "rendered_no_text")
@@ -3717,14 +3761,18 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # nowhere, and without this key that run is byte-identical in the archive to one where no
         # cited page ever earned the retry.
         "impersonate_disabled_skips": skips_by_reason["impersonate_disabled"],
-        # Its own count: the impersonated retry raised before anything was dialed because the host
-        # would not pin to a vetted public address. The direct fetch resolved the same host through
-        # the filtering resolver moments earlier, so a nonzero count means DNS disagreed with
-        # itself (a flake, or a rebinding host that flipped) rather than a host refusing us.
+        # Its own count: the impersonated retry declined because a hop's host would not pin to a
+        # vetted public address. On the first hop nothing was dialed, and since the direct fetch
+        # resolved that host through the filtering resolver moments earlier a nonzero count means
+        # DNS disagreed with itself (a flake, or a rebinding host that flipped); on a later redirect
+        # hop the earlier hops WERE dialed and the target is one the direct fetch never resolved, so
+        # the DNS-disagreement reading does not apply to that case.
         "impersonate_unpinnable_skips": skips_by_reason["impersonate_unpinnable"],
-        # Its own count: the per-run memo declining a second cited URL on a host that already
-        # answered the impersonated client with a block status, which is the memo doing its job
-        # rather than a failure, the distinction `rendered_no_text_skips` draws for the browser.
+        # Its own count: the per-run memo declining a cited URL on a host that already answered the
+        # impersonated client with a block status this run, which is the memo doing its job rather
+        # than a failure, the distinction `rendered_no_text_skips` draws for the browser. The memo
+        # is process-global and shared with gap-fill v2, so the earlier refusal may have been a v2
+        # fetch of a URL no question cited.
         "impersonate_host_refused_skips": skips_by_reason["impersonate_host_refused"],
         # The extractor policy's decisions, per cited URL. `chrome_metric_withholds`: the
         # line-shape metric withheld an HTML extraction of the URL somewhere on its ladder — the

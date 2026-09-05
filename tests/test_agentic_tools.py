@@ -28,7 +28,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     URL_CONTEXT_SIZE_GATE_TOKENS,
 )
-from metaculus_bot.research import http_fetch, rendered_fetch, robots_policy
+from metaculus_bot.research import http_fetch, impersonated_fetch, rendered_fetch, robots_policy
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import fetch_outcomes, local_document, provenance, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -37,12 +37,18 @@ from metaculus_bot.research.agentic.types import ToolOutcome
 from metaculus_bot.research.document_text import extract_pdf_text
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
 from metaculus_bot.research.impersonated_fetch import (
+    IMPERSONATE_TRIGGER_STATUSES,
+    ImpersonateBodyTooLarge,
     ImpersonatedResponse,
+    ImpersonateHopRefused,
+    ImpersonatePinNotHeld,
+    ImpersonateRedirectLimit,
     ImpersonateTransportError,
     impersonation_refused,
     reset_impersonation_memo,
 )
 from tests.playwright_fakes import FakeBrowser, FakeChromium, FakePage, FakePlaywrightManager, install_fake_playwright
+from tests.resolution_source_fakes import _impersonated, fake_impersonated_fetch
 from tests.test_document_text import build_text_pdf
 
 
@@ -105,6 +111,22 @@ def _serve_pdf(monkeypatch: pytest.MonkeyPatch, body: bytes, *, content_type: st
     monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
     monkeypatch.setattr(agentic_tools, "_read_response_body", read_body)
     return read_body
+
+
+@pytest.fixture(autouse=True)
+def _decline_the_impersonated_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty the impersonated retry's trigger set for every test in this module by default.
+
+    The same switch ``tests/resolution_source/conftest.py`` flips for the Tier-1 rung, because both
+    fetchers read ``impersonated_fetch.IMPERSONATE_TRIGGER_STATUSES`` at call time: a plain 403 is a
+    result many tests here produce on purpose (the robots pre-check tests, the paid-reader tests),
+    and with no transport double installed an unwanted fire would reach the real
+    ``fetch_impersonated`` and trip the suite's ``_block_native_egress`` guard. Emptying the set
+    declines before the retry looks at anything, so the plain ``blocked`` stands exactly as it did
+    before the rung existed. ``TestGapFillV2ImpersonatedRetry`` restores the transport's own
+    constant object and installs the shared double.
+    """
+    monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", frozenset())
 
 
 @pytest.fixture(autouse=True)
@@ -1040,7 +1062,7 @@ class TestFetchPlainTerminalStatuses:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", sorted(agentic_tools._RETRYABLE_FETCH_BLOCK_STATUSES))
+    @pytest.mark.parametrize("status", sorted(fetch_outcomes._RETRYABLE_FETCH_BLOCK_STATUSES))
     async def test_anti_bot_status_is_blocked(self, status: int, monkeypatch: pytest.MonkeyPatch) -> None:
         session = _FakeSession(_FakeResponse(status=status, headers={"Content-Type": "text/html"}))
         monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
@@ -2513,18 +2535,20 @@ class TestReadDocumentAcquiresBeforePaying:
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("_robots_allowed")
     async def test_a_blocked_url_still_reaches_the_paid_reader(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The reader's remaining job: a host our own client cannot read from at all."""
+        """The reader's remaining job: a host our own client cannot read from at all. A real 403
+        result, so it would earn the impersonated retry; the module fixture declines that retry,
+        which is the DataDome-fronted shape (sagaftra.org refused both clients on 2026-09-04)."""
         monkeypatch.setattr(
             agentic_tools,
             "_fetch_plain",
             AsyncMock(
-                return_value=SimpleNamespace(
+                return_value=fetch_outcomes.PlainFetchResult(
                     status="blocked",
                     method="plain",
                     text="Fetch blocked with HTTP 403.",
                     links=[],
                     url="https://sagaftra.org/contract",
-                    escalate_rendered=False,
+                    http_status=403,
                 )
             ),
         )
@@ -3185,9 +3209,14 @@ _GOOGLE_EXTENDED_BLOCKED_ROBOTS = "User-agent: Google-Extended\nDisallow: /\n"
 _GENERIC_CRAWLER_BLOCKED_ROBOTS = "User-agent: *\nDisallow: /\nCrawl-delay: 10\n"
 
 
-def _plain_result_stub(url: str, *, status: str, text: str) -> Any:
-    return SimpleNamespace(
-        status=status, method="plain", text=text, links=[], url=url, escalate_rendered=False, content_type=None
+def _plain_result_stub(
+    url: str, *, status: str, text: str, http_status: int | None = None
+) -> fetch_outcomes.PlainFetchResult:
+    """A plain-rung result as production builds it: the real dataclass, so a field the ladder
+    gains (``http_status``, 2026-09-04) cannot be missing from the stand-in and a stub that
+    claims a 403 carries the status a real one carries."""
+    return fetch_outcomes.PlainFetchResult(
+        status=status, method="plain", text=text, links=[], url=url, http_status=http_status
     )
 
 
@@ -3195,7 +3224,9 @@ def _fetch_plain_serving_robots(robots_txt: str | None, *, calls: list[str]) -> 
     """A ``_fetch_plain`` double: ``/robots.txt`` gets ``robots_txt``, every other URL a 403.
 
     The 403 is what leaves ``read_document``'s free ladder holding nothing, which is the state the
-    pre-check guards. ``robots_txt=None`` stands for a robots.txt we could not read at all.
+    pre-check guards; it is a real host 403 (``http_status=403``), so it would earn the impersonated
+    retry, and the module fixture that declines that retry is what keeps these tests about the
+    pre-check. ``robots_txt=None`` stands for a robots.txt we could not read at all.
     """
 
     async def fetch_plain(url: str) -> Any:
@@ -3205,7 +3236,7 @@ def _fetch_plain_serving_robots(robots_txt: str | None, *, calls: list[str]) -> 
             if robots_txt is None:
                 return _plain_result_stub(url, status="error", text="Fetch error: TimeoutError:")
             return _plain_result_stub(url, status="ok", text=robots_txt)
-        return _plain_result_stub(url, status="blocked", text="Fetch blocked with HTTP 403.")
+        return _plain_result_stub(url, status="blocked", text="Fetch blocked with HTTP 403.", http_status=403)
 
     return fetch_plain
 
@@ -3414,48 +3445,27 @@ class TestGapFillV2ImpersonatedRetry:
         yield
         reset_impersonation_memo()
 
+    @pytest.fixture(autouse=True)
+    def _arm_the_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Restore the transport's trigger set, which this module's fixture empties by default.
+
+        The transport's constant OBJECT, not a copy, so the population asserted on here is the one
+        prod and Tier 1 read.
+        """
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
+
     @staticmethod
     def _transport(monkeypatch: pytest.MonkeyPatch, answer: Any) -> list[dict[str, Any]]:
+        """The one transport double both suites share, patched at THIS ladder's import seam."""
         calls: list[dict[str, Any]] = []
-
-        async def _fetch(
-            url: str,
-            *,
-            host_sems: dict[str, asyncio.Semaphore],
-            deadline_monotonic_s: float,
-            per_hop_timeout_s: float,
-            max_bytes: int,
-        ) -> ImpersonatedResponse:
-            calls.append(
-                {
-                    "url": url,
-                    "host_sems": host_sems,
-                    "deadline_monotonic_s": deadline_monotonic_s,
-                    "per_hop_timeout_s": per_hop_timeout_s,
-                    "max_bytes": max_bytes,
-                }
-            )
-            await asyncio.sleep(0)
-            if isinstance(answer, BaseException):
-                raise answer
-            return answer
-
-        monkeypatch.setattr(agentic_tools, "fetch_impersonated", _fetch)
+        monkeypatch.setattr(agentic_tools, "fetch_impersonated", fake_impersonated_fetch(answer, calls))
         return calls
 
     @classmethod
     def _response(
         cls, status: int, *, body: bytes = b"", content_type: str = "text/html", url: str | None = None
     ) -> ImpersonatedResponse:
-        return ImpersonatedResponse(
-            status=status,
-            url=url or cls._URL,
-            content_type=content_type,
-            server=None,
-            body=body,
-            elapsed_s=0.4,
-            primary_ip="23.0.0.1",
-        )
+        return _impersonated(status, body=body, content_type=content_type, url=url or cls._URL)
 
     @staticmethod
     def _blocked(url: str, http_status: int | None) -> fetch_outcomes.PlainFetchResult:
@@ -3510,10 +3520,12 @@ class TestGapFillV2ImpersonatedRetry:
         assert _method_to_tier(outcome.method) == "fetched", "the retry read the host's own bytes"
         (call,) = calls
         assert call["url"] == self._URL
-        # This ladder's own host map and the plain rung's own bounds, not Tier 1's.
+        # This ladder's own host map and the plain rung's own bounds, not Tier 1's: both body caps,
+        # so a declared PDF between them is read as `_plain_response_outcome` would have read it.
         assert call["host_sems"] is agentic_tools._FETCH_HOST_SEMAPHORES
         assert call["per_hop_timeout_s"] == RESOLUTION_SOURCE_HTTP_TIMEOUT
         assert call["max_bytes"] == RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
+        assert call["document_max_bytes"] == DOCUMENT_TEXT_PDF_MAX_BYTES
         assert call["deadline_monotonic_s"] <= monotonic() + RESOLUTION_SOURCE_HTTP_TIMEOUT
 
     @pytest.mark.asyncio
@@ -3549,9 +3561,23 @@ class TestGapFillV2ImpersonatedRetry:
         assert calls == []
 
     @pytest.mark.asyncio
-    async def test_a_decline_leaves_the_blocked_outcome_byte_identical(self, monkeypatch) -> None:
+    @pytest.mark.parametrize(
+        "decline",
+        [
+            ImpersonateTransportError(failure_class="connection", exc="ConnectionError"),
+            ImpersonatePinNotHeld(_URL, expected_ip="23.0.0.1", actual_ip="10.0.0.8"),
+            ImpersonateHopRefused("ssrf_blocked", hop_url="http://10.0.0.8/status", from_url=_URL),
+            ImpersonateBodyTooLarge(_URL, bytes_read=6_000_000, max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES),
+            ImpersonateRedirectLimit(_URL, final_url=f"{_URL}?hop=6"),
+        ],
+        ids=lambda decline: type(decline).__name__,
+    )
+    async def test_a_decline_leaves_the_blocked_outcome_byte_identical(self, decline, monkeypatch) -> None:
+        """Every member of the `ImpersonateDeclined` family folds back into `None` here, so the
+        driver sees exactly the `blocked` outcome it saw before the rung existed, and none of them
+        says anything about the host's view of our fingerprint, so none writes the memo."""
         monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
-        self._transport(monkeypatch, ImpersonateTransportError(failure_class="connection", exc="ConnectionError"))
+        self._transport(monkeypatch, decline)
 
         outcome = await agentic_tools.fetch(self._URL)
 
@@ -3565,8 +3591,8 @@ class TestGapFillV2ImpersonatedRetry:
     async def test_a_still_403_declines_and_memoizes_the_host_for_the_run(self, monkeypatch) -> None:
         calls = self._transport(monkeypatch, self._response(403))
 
-        first = await agentic_tools._try_impersonated_fetch(self._blocked(self._URL, 403))
-        second = await agentic_tools._try_impersonated_fetch(self._blocked(self._SECOND_URL, 403))
+        first = await agentic_tools._try_impersonated_fetch(self._URL)
+        second = await agentic_tools._try_impersonated_fetch(self._SECOND_URL)
 
         assert first is None
         assert second is None
@@ -3574,11 +3600,24 @@ class TestGapFillV2ImpersonatedRetry:
         assert impersonation_refused(self._URL) is True
 
     @pytest.mark.asyncio
+    async def test_a_block_answered_by_a_redirect_target_memoizes_both_hosts(self, monkeypatch) -> None:
+        """The transport follows redirects itself, so the block can come from a later hop's netloc;
+        the memo is written for the host dialed and the host that answered, through the same
+        transport rule Tier 1 uses."""
+        answered = "https://edge.example.net/denied"
+        self._transport(monkeypatch, self._response(403, url=answered))
+
+        assert await agentic_tools._try_impersonated_fetch(self._URL) is None
+
+        assert impersonation_refused(answered) is True
+        assert impersonation_refused(self._URL) is True
+
+    @pytest.mark.asyncio
     async def test_a_404_under_impersonation_declines_without_memoizing(self, monkeypatch) -> None:
         calls = self._transport(monkeypatch, self._response(404))
 
-        assert await agentic_tools._try_impersonated_fetch(self._blocked(self._URL, 403)) is None
-        assert await agentic_tools._try_impersonated_fetch(self._blocked(self._SECOND_URL, 403)) is None
+        assert await agentic_tools._try_impersonated_fetch(self._URL) is None
+        assert await agentic_tools._try_impersonated_fetch(self._SECOND_URL) is None
 
         assert len(calls) == 2
         assert impersonation_refused(self._URL) is False
@@ -3588,8 +3627,63 @@ class TestGapFillV2ImpersonatedRetry:
         monkeypatch.setenv(RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV, "false")
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
 
-        assert await agentic_tools._try_impersonated_fetch(self._blocked(self._URL, 403)) is None
+        assert await agentic_tools._try_impersonated_fetch(self._URL) is None
         assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_trigger_is_the_transports_read_at_call_time(self, monkeypatch) -> None:
+        """One switch for both fetchers: emptying the transport's set declines the retry here
+        exactly as it declines the Tier-1 rung, with the plain `blocked` standing."""
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", frozenset())
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert calls == []
+        assert (outcome.status, outcome.method) == ("blocked", "plain")
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_robots_allowed")
+    async def test_read_document_rescues_a_403_for_free_before_the_paid_read(self, monkeypatch) -> None:
+        """The second free ladder: `read_document`'s local acquisition sits immediately in front of
+        the paid `url_context` read, so a cold `read_document` on a host whose 403 is a fingerprint
+        verdict must be rescued by the same retry `fetch` runs and digested for free. Before this
+        wiring the ladder held nothing and the reader was paid for bytes the retry fetches."""
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        rendered = AsyncMock(return_value=None)
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+        reader = _no_paid_reader(monkeypatch)
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+
+        outcome = await agentic_tools.read_document(self._URL, "how many major work stoppages began in 2026")
+
+        assert outcome.method == "digest_local"
+        assert _method_to_tier(outcome.method) == "fetched", "the retry read the host's own bytes"
+        assert "12 major work stoppages" in outcome.content_markdown
+        assert [call["url"] for call in calls] == [self._URL]
+        reader.assert_not_called()
+        rendered.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_robots_allowed")
+    async def test_read_document_on_a_host_that_refuses_both_clients_still_pays(self, monkeypatch) -> None:
+        """The DataDome shape: a still-403 under impersonation leaves the ladder holding nothing,
+        the host is memoized, and the paid reader (which dials from Gemini's address) gets its turn."""
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        calls = self._transport(monkeypatch, self._response(403))
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr(
+            agentic_tools, "_run_document_read_sync", MagicMock(return_value=("Model read.", 1, ["SUCCESS"]))
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+        outcome = await agentic_tools.read_document(self._URL, "how many major work stoppages began in 2026")
+
+        assert outcome.method == "document"
+        assert len(calls) == 1
+        assert impersonation_refused(self._URL) is True
 
     @pytest.mark.asyncio
     async def test_the_retry_dials_the_plain_rungs_final_url(self, monkeypatch) -> None:
@@ -3612,7 +3706,7 @@ class TestGapFillV2ImpersonatedRetry:
         pdf = build_text_pdf([["The unemployment rate was 4.1 percent in May 2026, revised from 4.0 percent."]])
         self._transport(monkeypatch, self._response(200, body=pdf, content_type="application/pdf"))
 
-        result = await agentic_tools._try_impersonated_fetch(self._blocked(self._URL, 403))
+        result = await agentic_tools._try_impersonated_fetch(self._URL)
 
         assert result is not None
         assert result.method == local_document.PDF_LOCAL_METHOD
@@ -3647,6 +3741,10 @@ class TestGapFillV2ImpersonatedRetry:
             ("application/pdf", build_text_pdf([["A PDF the local rung reads whichever transport fetched it."]])),
             ("text/csv", b"date,count\n2026-08-01,11\n2026-08-02,12\n"),
             ("image/png", b"\x89PNG\r\n\x1a\nbinary"),
+            # A declared image whose bytes the magic sniff does not know: the header clause is what
+            # keeps the two paths agreeing, since the aiohttp path decides on the header alone.
+            ("image/webp", b"RIFF\x24\x00\x00\x00WEBPVP8 binary"),
+            ("image/svg+xml", b'<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'),
             ("application/octet-stream", b"\x89PNG\r\n\x1a\nbinary"),
         ],
     )

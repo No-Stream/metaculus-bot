@@ -9,12 +9,12 @@ import re
 from datetime import UTC, datetime, timedelta
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import impersonated_fetch, resolution_source
+from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
 from metaculus_bot.research.resolution_source import (
-    _IMPERSONATE_TRIGGER_HTTP_STATUS,
     _WAYBACK_TRIGGER_STATUSES,
     FetchContext,
     _fetch_one,
@@ -237,7 +237,7 @@ class TestFastPath:
     async def test_the_impersonated_retry_still_runs_on_the_fast_path(self, monkeypatch):
         """One GET against a host that just answered us, so it is a cheap rung like the hop above
         and records no `fast_path` skip; the gate is reserved for the browser and the paid read."""
-        monkeypatch.setattr(resolution_source, "_IMPERSONATE_TRIGGER_HTTP_STATUS", _IMPERSONATE_TRIGGER_HTTP_STATUS)
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(
             resolution_source,
@@ -333,6 +333,55 @@ class TestProviderLevelRungMarkers:
         assert counts["derived_api_reads"] == 1
         assert counts["rendered_attempts"] == 1
         assert ROUTE_CAVEATS["derived_api"] in section
+
+    async def test_the_impersonated_retry_names_its_route_through_the_provider(self, monkeypatch, caplog):
+        """One cited URL through the provider: ``route=impersonate`` on the FETCH line with the
+        impersonated response's own 200, the escalation line's ``from_status=blocked`` carrying the
+        refusal, ``counts["impersonate_attempts"]`` with the rung's four skip keys at zero (they
+        exist in the archive even when nothing skipped), and the retry's caveat in the section.
+        The seam tests pin the rung; this is the only place the ``record_provider_detail`` path
+        that carries those keys is exercised."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            resolution_source,
+            "fetch_impersonated",
+            fake_impersonated_fetch(_impersonated(200, body=_prose_page(_RENDERED_PROSE)), calls),
+        )
+        session = FakeSession({_URL: FakeResponse(403, body=b"denied", content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+            section = await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=impersonate"
+        ]
+        assert re.fullmatch(
+            rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
+            r"from_status=blocked rung=impersonate outcome=success wall_s=\d+\.\d\d",
+            next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
+        )
+        assert [call["url"] for call in calls] == [_URL]
+        counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
+        assert counts["impersonate_attempts"] == 1
+        assert {
+            key: counts[key]
+            for key in (
+                "impersonate_budget_skips",
+                "impersonate_disabled_skips",
+                "impersonate_unpinnable_skips",
+                "impersonate_host_refused_skips",
+            )
+        } == {
+            "impersonate_budget_skips": 0,
+            "impersonate_disabled_skips": 0,
+            "impersonate_unpinnable_skips": 0,
+            "impersonate_host_refused_skips": 0,
+        }
+        assert ROUTE_CAVEATS["impersonate"] in section
 
     async def test_the_wayback_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
         """One cited URL through the provider: ``route=wayback`` on the FETCH line, the escalation

@@ -13,7 +13,7 @@ import asyncio
 
 import pytest
 
-from metaculus_bot.research import rendered_fetch, resolution_source
+from metaculus_bot.research import impersonated_fetch, rendered_fetch, resolution_source
 from metaculus_bot.research.derived_api import reset_derived_endpoints
 from metaculus_bot.research.http_fetch import reset_host_semaphores, reset_pdf_parse_semaphore
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
@@ -122,13 +122,15 @@ def _decline_the_impersonate_rung(monkeypatch):
     the trigger set declines before the rung looks at anything, so it records no attempt, claims
     no ``route`` and dials nothing, and every pre-rung expectation in this package holds.
 
-    Tests that exercise the rung restore the module's OWN constant object
-    (``_IMPERSONATE_TRIGGER_HTTP_STATUS``, imported so the two cannot drift) and patch
-    ``resolution_source.fetch_impersonated`` with a double. The trigger population is pinned in
-    ``test_resolution_source_impersonate_rung.py`` and its ``ssrf_blocked`` exclusion in
-    ``test_resolution_source_third_party_rung_ssrf.py``.
+    The trigger set is the TRANSPORT's (``impersonated_fetch.IMPERSONATE_TRIGGER_STATUSES``), read
+    by both fetchers as a module attribute at call time, so emptying it here is one switch for the
+    Tier-1 rung and for gap-fill v2's two ladders alike (``tests/test_agentic_tools.py`` flips the
+    same switch). Tests that exercise the rung restore the transport's OWN constant object
+    (imported, so the two cannot drift) and patch ``resolution_source.fetch_impersonated`` with a
+    double. The trigger population is pinned in ``test_resolution_source_impersonate_rung.py`` and
+    its ``ssrf_blocked`` exclusion in ``test_resolution_source_third_party_rung_ssrf.py``.
     """
-    monkeypatch.setattr(resolution_source, "_IMPERSONATE_TRIGGER_HTTP_STATUS", frozenset())
+    monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", frozenset())
 
 
 @pytest.fixture(autouse=True)
