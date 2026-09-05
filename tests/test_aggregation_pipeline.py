@@ -8,8 +8,9 @@ Exercises AggregationPipeline's three main paths:
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -81,6 +82,23 @@ class TestAggregationCounters:
 
 class TestBaseCombineReentry:
     """Test the base-combine path: reasoned_predictions=None and research=None."""
+
+    @pytest.mark.asyncio
+    async def test_empty_predictions_do_not_consume_expected_combine_state(self) -> None:
+        pipeline = _make_pipeline()
+        question = _make_binary_question(qid=106)
+        pipeline.register_expected_base_combine(question)
+
+        with pytest.raises(ValueError, match="Cannot aggregate empty list of predictions"):
+            await pipeline.aggregate(
+                predictions=[],
+                question=question,
+                research=None,
+                reasoned_predictions=None,
+            )
+
+        assert pipeline.expected_base_combines == {106}
+        assert pipeline.counters == AggregationCounters()
 
     @pytest.mark.asyncio
     async def test_single_prediction_returns_as_is(self):
@@ -193,6 +211,94 @@ class TestBaseCombineReentry:
 
 class TestStackingFallbackChain:
     """Test the primary -> fallback -> median chain."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_cancelling_primary_attempt_propagates_without_recording_a_failure(self) -> None:
+        pipeline = _make_pipeline()
+        question = _make_binary_question(qid=205)
+        predictions: list[PredictionTypes] = [0.20, 0.80]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
+            ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nLow"),
+            ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nHigh"),
+        ]
+        attempt_started = asyncio.Event()
+        attempt_cancelled = asyncio.Event()
+
+        async def wait_for_cancellation(*args: Any, **kwargs: Any) -> PredictionTypes:
+            attempt_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                attempt_cancelled.set()
+            raise AssertionError("unreachable")
+
+        with patch.object(pipeline, "run_stacking", side_effect=wait_for_cancellation):
+            aggregate_task = asyncio.create_task(
+                pipeline.aggregate(
+                    predictions=predictions,
+                    question=question,
+                    research="test research",
+                    reasoned_predictions=reasoned,
+                )
+            )
+            await attempt_started.wait()
+            aggregate_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await aggregate_task
+
+        assert attempt_cancelled.is_set()
+        assert 205 not in pipeline.outcomes
+        assert pipeline.counters == AggregationCounters()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_cancelling_fallback_attempt_preserves_primary_failure_counts(self) -> None:
+        pipeline = _make_pipeline()
+        question = _make_binary_question(qid=206)
+        predictions: list[PredictionTypes] = [0.20, 0.80]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
+            ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nLow"),
+            ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nHigh"),
+        ]
+        fallback_started = asyncio.Event()
+        fallback_cancelled = asyncio.Event()
+        attempt_count = 0
+
+        async def fail_primary_then_wait(*args: Any, **kwargs: Any) -> PredictionTypes:
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                raise RuntimeError("primary failed")
+            fallback_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                fallback_cancelled.set()
+            raise AssertionError("unreachable")
+
+        with patch.object(pipeline, "run_stacking", side_effect=fail_primary_then_wait):
+            aggregate_task = asyncio.create_task(
+                pipeline.aggregate(
+                    predictions=predictions,
+                    question=question,
+                    research="test research",
+                    reasoned_predictions=reasoned,
+                )
+            )
+            await fallback_started.wait()
+            aggregate_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await aggregate_task
+
+        assert fallback_cancelled.is_set()
+        assert 206 not in pipeline.outcomes
+        assert pipeline.counters == AggregationCounters(
+            stacker_primary_failed_count=1,
+            stacker_fallback_used_count=1,
+        )
 
     @pytest.mark.asyncio
     async def test_primary_success_sets_outcome(self):
