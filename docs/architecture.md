@@ -304,10 +304,12 @@ Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and neve
 | Startup / CLI | `main.py`, `metaculus_bot/cli.py` |
 | Per-question orchestration | `metaculus_bot/forecaster.py` |
 | Post-fan-out aggregation routing | `metaculus_bot/stacking_route.py` |
-| Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`, `degradation_counters.py` |
+| Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`; `degradation_counters.py` formats immutable snapshots built by `forecaster.py` |
 | Research fan-out | `metaculus_bot/research/orchestrator.py`, `research/providers.py` |
 | Outbound fetch transports | `research/http_fetch.py` (plain HTTP, SSRF guards, redirects, per-host gates), `research/impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry of a 403, with its own DNS pin and per-hop re-guard), `research/rendered_fetch.py` (headless Chromium), `research/url_context_reader.py` (one paid Gemini `url_context` read), `research/robots_policy.py` (the `Google-Extended` pre-check in front of that read) |
 | Resolution-source fetcher and its escalation rungs | `research/resolution_source.py`, `research/resolution_fetch_result.py` (the status, reason and route vocabularies), `research/derived_api.py`, `research/wayback.py` |
+| Resolution-source text and section budgets | `research/resolution_presentation.py` |
+| Datawrapper response classification, freshness and dataset ordering | `research/resolution_datawrapper.py`; requests and question budgets remain in `research/resolution_source.py` |
 | Gap-fill v1 / v2 | `research/targeted.py`, `research/agentic/` |
 | Forecaster runners | `metaculus_bot/forecaster_runners.py` |
 | Value extraction | `metaculus_bot/value_extraction.py` |

@@ -84,6 +84,7 @@ What's inside:
   - `financial_data.py` — yfinance + FRED for financial and economic questions
   - `prediction_market.py` — Polymarket / Kalshi / Manifold / PredictIt snapshot
   - `resolution_source.py` — fetches and extracts the URLs cited in the question
+  - `resolution_presentation.py` — renders fetched evidence with provenance and text budgets
   - `timeseries_anchor.py` — historical base-rate / time-series anchor data
   - `targeted.py` — disagreement-crux search and the v1 gap-fill pass
   - `agentic/` (+ `agentic_gap_fill.py`) — the v2 agentic gap-fill tool loop

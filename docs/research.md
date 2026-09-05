@@ -71,6 +71,15 @@ specific primary regardless of credentials, set `RESEARCH_PROVIDER=<name>`
 auto. Forcing `asknews` without the AskNews creds fails loudly rather than
 silently picking a different provider.
 
+Exa and Perplexity client construction and invocation live in
+`research/providers.py` (`_invoke_exa_research` and
+`_invoke_perplexity_research`). Both the standalone provider factories and the
+orchestrator use these helpers. Each caller retains its existing prompt and
+constructor options: the Exa factory explicitly disables citation formatting,
+while the orchestrator uses SDK defaults; the Perplexity factory omits `api_key`,
+while the orchestrator passes `None` for direct access or resolves the OpenRouter
+key. These distinctions remain part of the call contract.
+
 ### AskNews fallback (primary-only)
 
 AskNews is the only primary that gets a runtime fallback. If the AskNews fetch
@@ -80,6 +89,8 @@ OpenRouter-Perplexity first (cheapest, prose-returning), then direct Perplexity,
 then Exa last (its `SmartSearcher` spins up its own multi-search loop, the most
 expensive path). The primary ladder orders by index quality; this fallback list
 orders by cost, because it only ever fires after AskNews has already failed.
+It selects the first fallback with credentials; failure of that selected provider
+does not advance to another fallback.
 
 One AskNews error is treated specially: a `403011` "subscription is not currently
 active" signature (`is_asknews_subscription_error`, `research/providers.py`) is
@@ -877,6 +888,17 @@ so a rescued page is indistinguishable downstream from a directly-fetched one; t
 on every result says which rung produced it. The four rungs added on 2026-09-03, the
 TLS-impersonating retry added on 2026-09-04, and the one paid rung among them, are described
 under "The escalation ladder" below.
+
+`research/resolution_presentation.py` owns the pure rendering step: provenance
+leads, unreadable-embed disclosures, page and dataset text budgets, route caveats,
+and the final section. Fetching, rung counts, and registered telemetry emission
+remain in `resolution_source`. Presentation tests patch the constants
+on `resolution_presentation`, where the renderer reads them.
+
+`research/resolution_datawrapper.py` owns Datawrapper response classification,
+freshness checks, dataset text, chart selection, and result ordering. Its diagnostic
+warnings retain their text and use that module's logger. Requests, host limits,
+timeouts, cancellation, and registered result markers remain in `resolution_source`.
 
 It deterministically extracts URLs from resolution criteria + fine print (markdown
 links and bare URLs, order-preserving dedup, Metaculus markdown-escapes undone),

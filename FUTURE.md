@@ -3125,3 +3125,20 @@ gap. Two costs to price at the same time: bounding v2's currently-bare acquire h
 to the PAID Gemini `url_context` reader on expiry, as that module's own comment at :164-167 says,
 so any v2 gate tightening is a cost-gate item; and nothing today records that a worker was
 abandoned at all, so the frequency of the whole failure is unmeasured.
+
+## Maintainability review decisions (2026-09-05)
+
+The resolution-source presentation extraction separates evidence rendering from fetching.
+Keep the remaining escalation ladder together: its rungs reuse direct-fetch classification,
+mutable question context, host gates, and direct fetch itself. Moving it today would require
+callbacks mirroring the source module or circular imports. The existing agentic split has the
+same constraint: `local_document` already imports response types from `fetch_outcomes`, while
+the response dispatcher must call local-document handling. Further handler or ghost-phase
+splits mostly move code and patch targets. Do not introduce those layers just to shorten files.
+
+The Exa and Perplexity invocation helpers now have one implementation in `research/providers.py`,
+but preserve caller-specific prompt and constructor options. In particular, the orchestrator's
+Exa prompt contains joined words (`giveyou`, `generatea`, `newswould`); its standalone factory
+does not. Correcting those prompt bytes belongs in a deliberate behavior change, separate from
+the ownership refactor. The Perplexity factory's omitted key and orchestrator's explicit key
+remain distinct too; any future credential-policy change must address both callers.
