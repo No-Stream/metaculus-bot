@@ -5,25 +5,35 @@
 `No-Stream/metaculus-bot`, `upstream` is the Metaculus template, so every `gh` call needs
 `--repo No-Stream/metaculus-bot`)
 **Repo:** `/Users/flatljan/personal/metaculus-bot`
-**Status (updated 2026-09-04, late afternoon PT):** DONE except the operator's push and merge. The pushed head
-`1f2b504` has PR CI green (run 33917127083). After it, the Codex review triage landed as four worktree merges
-plus three small commits ending at `c07d7cf`: the browser route-guard comment and docs now say what the guard
-covers (server-side redirect hops are unguarded), the model-id rule in AGENTS.md and `docs/roster_history.md`
-states the real split with `tests/test_model_name_locations.py` pinning it, the
-`litellm_callback_drain_timeout` marker spec is registered, and FUTURE.md carries the browser-transport fix
-(item 8, deferred at that point) and the un-clocked PDF prologue (LOW). The full free gate on `c07d7cf` is
-green (7,592 passed, 14 skipped, 33 deselected, `~/logs/gate17.log`). The commit after `c07d7cf` adds the
-tracked PR description (`scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`, 97 KB,
-over GitHub's 65,536-character body cap) and this status; the PR body on GitHub is the 14.7 KB condensed
-version. Then, on the operator's instruction the same afternoon, the browser-transport follow-up was BUILT
-into this PR rather than deferred to its own: `6646a0b` refuses a render whose main frame landed off the
-pinned host and blocks page WebSockets, and `8ced8a5` hands the browser the direct fetch's landing URL so the
-pin covers the host that serves the content. A free local render probe priced strict host equality first, at
-zero refusals across 22 real render targets. The full free gate on the implementation worktree is green (7,608
-passed, 22 skipped, 33 deselected); the transport's off-host WARNING is being registered as the marker spec
-`rendered_fetch_off_host` in a parallel worktree, and the lead re-gates the merged tip once that and the
-documentation commit have landed. Next: operator pushes, PR CI reruns, operator merges PR #66, then the
-post-merge commands in "Operator follow-ups" at the end of this doc.
+**Status (updated 2026-09-04, evening PT):** DONE except the operator's push and merge. The branch tip is
+`001b6f9`. The pushed head `1f2b504` has PR CI green (run 33917127083). After it, the Codex review triage
+landed as four worktree merges plus three small commits ending at `c07d7cf`: the browser route-guard comment
+and docs now say what the guard covers, the model-id rule in AGENTS.md and `docs/roster_history.md` states the
+real split with `tests/test_model_name_locations.py` pinning it, the `litellm_callback_drain_timeout` marker
+spec is registered, and FUTURE.md carries the browser-transport fix (item 8, deferred at that point) and the
+un-clocked PDF prologue (LOW). Then, on the operator's instruction the same afternoon, the browser-transport
+follow-up was BUILT into this PR rather than deferred to its own: `6646a0b` refuses a render whose main frame
+landed off the pinned host and blocks page WebSockets, `8ced8a5` hands the browser the direct fetch's landing
+URL so the pin covers the host that serves the content, and `aa37f11` registered the off-host WARNING as the
+marker spec `rendered_fetch_off_host`. A free local render probe priced strict host equality first, at zero
+refusals across 22 real render targets. A 22-agent forge over that closure returned 8 fix findings, 13
+report-only items and 14 verification gates, and the fix wave applied all 8 in eight test-first commits,
+`c4b8a57` through `001b6f9`: the landing check now runs before and after the DOM read, the guard fails shut,
+the two-check hop policy has one home, the shared Playwright fake pins the requested host, the WebSocket block
+logs at INFO, and both the Tier-1 classifier and gap-fill v2 resolve against the document the browser landed
+on. Live QA against real Chromium ran twice, free and with every provider key blanked: round one, against
+`8ced8a5` and `91b6845`, found the transport fit to merge and turned up the one gap the fail-shut guard then
+closed (a redirect to a private target that was not listening landed on `chrome-error://chromewebdata/` and
+came back as an empty page), and round two, against `001b6f9`, passed all 8 cases in 32 s. The full free gate
+on `001b6f9` is green (`make lint`, `make typecheck` 0 errors, `make lint_imports` 6 contracts, `make deps`,
+`make test_fast`: 7,655 passed, 14 skipped, 33 deselected, `~/logs/gate18.log`), and `make cov` on the main
+checkout ran clean at 7,649 passed with 92 percent total branch coverage.
+Verification pass result: see the sentence the lead appends.
+The commit after `001b6f9` brings the tracked PR description
+(`scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`, about 113,000 characters, well over
+GitHub's 65,536-character body cap), the condensed body and this status to the final state of the branch; the
+PR body on GitHub is the condensed version, about 17,000 characters. Next: operator pushes, PR CI
+reruns, operator merges PR #66, then the post-merge commands in "Operator follow-ups" at the end of this doc.
 
 The operator does NOT read plan docs; every decision or approval you need from them goes inline in
 chat, self-contained, with a recommendation. They sign off on any paid run before it fires.
@@ -92,8 +102,8 @@ earlier in the day, the last (Phase 3: rendered, derived-API, Wayback and url_co
 `dd1074b`. The earlier work of the day (Phases 1 and 2, the first review and QA wave, the AGENTS.md
 de-bloat, the fall Metaculus Cup configuration, credit alerting, the `gemini-3.8-flash` move, the
 operator-run diagnostics) is written up in the PR description
-(`scratch/next_season_bundle_2026-09/PR_DESCRIPTION.md`, section "The 2026-09-03 work") and is
-not repeated here.
+(`scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`, section "The 2026-09-03
+work") and is not repeated here.
 
 Tonight's session (roughly 19:00 to 22:00 PT) reviewed Phase 3, ran a live QA pass over it, and
 fixed what both found. Starting point: HEAD `16ca9ab`, gates green at 7,291 tests.
@@ -432,8 +442,11 @@ Everything below needs the operator or is the operator's call. Do not drip these
    questions. QA it as Test Bot #67 was, plus `route=`, per-rung `RESOLUTION_SOURCE_ESCALATION`,
    `failure_class`, the three `RESOLUTION_SOURCE_URLCONTEXT_*` markers, `GEMINI_USAGE
    role=resolution_source`, and the counts keys.
-3. **Merge PR #66** to `main` (paste `scratch/next_season_bundle_2026-09/PR_DESCRIPTION.md`; append a line
-   for the flag flip and the two live probes).
+3. **Merge PR #66** to `main`. The PR body is the condensed version (`PR_BODY_condensed.md`, in the
+   untracked receipts directory of the main checkout, about 17,000 characters); the full description
+   does not fit GitHub's 65,536-character body cap and lives in the repo at
+   `scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`. Both already cover the flag
+   flip, the two live probes, the smoke run and the browser-transport closure.
 4. **After the merge, three commands:** `gh workflow enable "Forecast on Metaculus Cup" --repo
    No-Stream/metaculus-bot`; `gh workflow run fetch_diagnostic.yaml --repo No-Stream/metaculus-bot` (free;
    rows 1 to 4 of its table are the Akamai federal hosts: bot client 403 and impersonated 200 means build
@@ -459,19 +472,29 @@ Everything below needs the operator or is the operator's call. Do not drip these
    `constants.py` size (own PR); Tier-1 paid rung configured by `GAP_FILL_V2_READER_*` constants (R18);
    policy D re-calibration once a season of `chrome_metric_withholds` counts exists; Accept-Encoding
    widening (now safe, unmeasured); and, from the 2026-09-04 Codex triage, item 8 (the browser transport's
-   three unguarded channels, now BUILT on 2026-09-04 with one residual left, FUTURE.md ~1409-1500), the
-   un-clocked PDF parse prologue (LOW, ~2929-3029), and the stale per-model cost heuristic in
+   three unguarded channels, now BUILT on 2026-09-04 with one residual left, FUTURE.md ~1409-1521), the
+   un-clocked PDF parse prologue (LOW, ~2950-3050), and the stale per-model cost heuristic in
    `ensemble_analysis/ensemble_simulator.py` (adjacent rot, offline only, found by the model-id inventory).
 8. **Record, not a decision: the browser-transport follow-up was BUILT on 2026-09-04**, on the operator's
    instruction the same afternoon, and it is in this PR rather than a later one. `6646a0b` refuses a render
    whose main frame landed on a host other than the pinned one and blocks page WebSockets with
    `route_web_socket`; `8ced8a5` hands the browser the direct fetch's landing URL so the pin covers the host
-   that serves the content. The decline is the skip token `render_off_host`, counted as
-   `render_off_host_skips`, and the transport's WARNING is the marker `RENDERED_FETCH_OFF_HOST`. The free
-   local render probe that priced strict host equality ran first and its numbers are in the PR description under
-   "The browser transport closure". One residual is left, a cross-host subresource Chromium resolves with no
-   pin of ours, recorded in FUTURE.md item 8 with the single observation that would settle it. Nothing here
-   needs the operator, and the smoke was not re-run for it.
+   that serves the content; `aa37f11` registered the transport's WARNING as the marker
+   `RENDERED_FETCH_OFF_HOST`. The decline is the skip token `render_off_host`, counted as
+   `render_off_host_skips`. The free local render probe that priced strict host equality ran first and its
+   numbers are in the PR description under "The browser transport closure". A 22-agent forge then reviewed the
+   closure and returned 8 fix findings, 13 report-only items and 14 verification gates, and the fix wave
+   applied all 8 in eight test-first commits, `c4b8a57` through `001b6f9`: the landing check runs before and
+   after the DOM read, so a navigation that commits during the read is discarded unpublished; the guard fails
+   shut, so Chromium's own error document after a failed navigation is refused; the two-check hop policy has
+   one home, `_hop_refusal`; the shared Playwright fake pins the requested host by default; the WebSocket
+   block logs at INFO; and both the Tier-1 classifier and gap-fill v2's link extractor resolve against the
+   document the browser landed on. Two rounds of free live QA against real Chromium bracket that wave: round
+   one found the one gap the fail-shut guard then closed, and round two passed all 8 cases against `001b6f9`
+   in 32 s. The description's subsection carries the findings, the wave and both QA rounds. One residual is
+   left, a cross-host subresource Chromium resolves with no pin of ours, recorded in FUTURE.md item 8 with the
+   single observation that would settle it. Nothing here needs the operator, and the smoke was not re-run for
+   it.
 
 ## References
 
@@ -485,7 +508,8 @@ Everything below needs the operator or is the operator's call. Do not drip these
   `/tmp/forge-lWgyXJ/` and `/tmp/qa_test_bot_67/` until reboot.
 - Gate logs: `~/logs/gate.log` through `~/logs/gate8.log` (`gate8.log` is the green run at
   `55e02f5`).
-- PR: https://github.com/No-Stream/metaculus-bot/pull/66 (description at
-  `scratch/next_season_bundle_2026-09/PR_DESCRIPTION.md`, refreshed tonight, untracked).
+- PR: https://github.com/No-Stream/metaculus-bot/pull/66 (full description tracked at
+  `scratch_docs_and_planning/next_season_bundle_2026-09_PR66_description.md`, with a byte-identical
+  untracked copy and the condensed PR body beside the other receipts in the main checkout).
 - Test Bot #67 run: https://github.com/No-Stream/metaculus-bot/actions/runs/33775800806;
   cup QA run: https://github.com/No-Stream/metaculus-bot/actions/runs/33815141451.

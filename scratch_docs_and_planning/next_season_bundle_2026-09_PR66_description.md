@@ -21,10 +21,9 @@ HEAD f6eae2b, the end of the eighteen-item block (all 18 items + codex fixes + f
 `make format` no changes,
 `make lint` clean, `make typecheck` 0 errors, `make lint_imports` 6/6 contracts, `make deps` clean,
 `make test` 6562 passed / 14 skipped / 5 deselected in 139 s. Forge review and its fix pass: see
-the section at the end. Every later block re-ran the same gates; the last, at 2ceb481, is in the
-final section (7,592 passed at c07d7cf, the last code commit), and PR CI is green on the pushed
-1f2b504; the commits after it carry only the documentation, comments and tests from the Codex
-review triage.
+the section at the end. Every later block re-ran the same gates; the last, at the tip 001b6f9, is in
+the final section (7,655 passed), and PR CI is green on the pushed 1f2b504; the commits after it
+carry the Codex review triage, the browser-transport closure and the closure's review fix wave.
 
 ## Tier A: publish path
 
@@ -555,8 +554,8 @@ was dd1074b; the two commits above it (9e1a66a, 16ca9ab) only update the tracked
 `scratch_docs_and_planning/HANDOFF_2026-09-03_fetch_ladder_wrapup.md`, so the branch tip was 16ca9ab
 when this section was first written. The evening's review and fix wave and the 2026-09-04 work (both
 below) carried it to 1f2b504, and the Codex review triage carried it to c07d7cf. Against d38980b the day
-changed 104 files (+21,604 / -1,676 lines); against `main` the whole PR at c07d7cf is 352 commits
-and 246 files (+55,958 / -6,352).
+changed 104 files (+21,604 / -1,676 lines); against `main` the whole PR at 001b6f9 is 366 commits
+and 247 files (+58,570 / -6,362).
 `resids-sept1` is still unmerged (10 ahead of `main`, 0 behind) and is an ancestor of this branch, so
 the branch-base decision above stands. The pushed head on GitHub is 1f2b504, where PR CI is green
 (run 33917127083).
@@ -1152,49 +1151,73 @@ since that branch also covers an empty reply. `docs/operations.md` documents bot
 
 Two commits, `6646a0b` and `8ced8a5`, close the two P1 findings from the Codex review below, plus a
 third channel the verification turned up, instead of deferring them to a follow-up PR; the operator
-asked for the work the same afternoon. Three terms, because the rest of this leans on them: the
+asked for the work the same afternoon. A forge review, an eight-commit fix wave and two rounds of
+free live QA followed, all recorded below. Three terms, because the rest of this leans on them: the
 PINNED HOST is the one hostname the `--host-resolver-rules` launch argument holds Chromium to, the
 ROUTE HANDLER is the `context.route` callback that re-runs `is_public_http_url` on each request the
 browser is about to make, and the LANDING HOST is the hostname `page.url` carries once the
 navigation has settled.
 
-**An off-host landing is refused before the DOM is read.** The route handler never sees a
+**An off-host landing is refused unread, or discarded unpublished.** The route handler never sees a
 server-side redirect hop, because Playwright auto-continues a request that carries a
 `redirectedFrom`, so a page that walled the plain aiohttp GET with a 200 and answered the browser
 with a 302 to a private address was rendered and handed back attached to the cited URL.
 `rendered_fetch` now reads `page.url` after the settle on the normal path and on the salvage path
-where the goto raised, and raises `RenderOffHost` before `page.content()` is ever called when the
-landing host is not the pinned one, an IP literal included. A navigation that never committed leaves
+where the goto raised, and raises `RenderOffHost` before `page.content()` is called when the landing
+host is not the pinned one, an IP literal included. The same comparison runs a second time on
+`page.url` immediately after the DOM read, because `page.url` is a client-side cache the driver
+updates on its `navigated` event while `page.content()` is a driver round trip evaluated in whatever
+document is current, so a navigation that commits inside that window would otherwise hand back the
+other host's DOM with the pre-read check already passed. The second read costs no await and a DOM
+that fails it is discarded unpublished, which is why the guarantee is "refused unread, or discarded
+unpublished" rather than "never read". The predicate, `_landed_off_host`, fails shut: only an empty
+landing URL and the `about:` scheme are no-document landings, and every other scheme is a stranger,
+so Chromium's own `chrome-error://chromewebdata/` document after a failed navigation is refused too
+and `render_off_host_skips` is an upper bound on hostile landings that also counts failed
+navigations, told apart by the marker's `landed_host`. A navigation that never committed leaves
 `about:blank`, which is nobody's host and falls through to the empty-DOM read it always produced.
-`RenderedPage` gained `final_url`, and `RenderedPage.url` still carries the requested URL, because
-that is the base for link resolution and for both render memos.
+`RenderedPage` gained `final_url`, taken from that second read, and `RenderedPage.document_url`, the
+landing URL when a navigation committed and the requested URL otherwise; `RenderedPage.url` still
+carries the requested URL, because that is the key for both render memos.
 
 **Page WebSockets are blocked.** A WebSocket handshake is invisible to `context.route` by
 construction, since HTTP interception is the CDP `Fetch` domain while WebSockets surface only on the
 report-only `Network.webSocket*` events. `context.route_web_socket("**/*", _block_web_socket)` is
 registered before the page exists, because only sockets created after the registration are routed,
-and the handler logs one DEBUG line and never calls `connect_to_server`, which is the whole block.
-It is written to be provably raise-free, because `unroute_all` clears HTTP routes only and
-Playwright has no `unroute_web_socket`, so the handler stays registered through the context close by
-design.
+and the handler logs one INFO line, the level `cli.py` configures the root logger at, and never
+calls `connect_to_server`, which is the whole block. It is written to be provably raise-free, because
+`unroute_all` clears HTTP routes only and Playwright has no `unroute_web_socket`, so the handler
+stays registered through the context close by design. The block is an in-page mitigation rather than
+a network boundary, and `_block_web_socket`'s docstring now says so and records the limits: the
+driver injects an init script at registration that replaces `globalThis.WebSocket` in every frame,
+leaves the enumerable `__pwWebSocketBinding` and `__pwWebSocketDispatch` globals behind, and does not
+reach a dedicated Worker's global scope.
 
 **The browser is handed the URL the direct fetch landed on.** `FetchResult.url` is already the last
 hop of the direct fetch's re-guarded redirect loop, so the rendered rung passes that rather than the
 cited URL. The pin and the landing check then hold Chromium to the host that serves the content, and
 a page whose canonical form is one ordinary hop away (`example.com` to `www.example.com`) is not
 refused for taking it. When the two URLs differ the landing is re-vetted with the same
-self-reference and public-URL checks every derived hop owes. Both render memos and the HTML
-classifier key on the rendered URL; the rung's attempt stays keyed on the cited URL, which is what
-the escalation line names.
+self-reference and public-URL checks every derived hop owes, and those two checks now have one home,
+`_hop_refusal`, which `_vetted_hop_target`, this render-landing re-vet and the Wayback
+innermost-URL check all call, publicness first so a URL that is both non-public and a self-reference
+still reports `ssrf_blocked`. The HTML classifier's base URL is `RenderedPage.document_url`, and
+gap-fill v2 resolves the links it harvests against the same document URL, so a same-host redirect
+from `/senate` to `/senate/2026/` resolves a relative `href` against the document the browser
+actually landed on; both render memos stay keyed on the requested URL. One accounting consequence,
+recorded where the archive reader looks: on a `route=rendered` rescue the `FetchResult.url` is the
+landing URL, which is what the fetch line's `url=` and the published section heading carry, while the
+`RESOLUTION_SOURCE_ESCALATION` line's `url=` is the cited URL, so a per-URL join between the two
+lines keys on the escalation line.
 
 **The names the decline gets.** Tier-1 records it as its own skip token `render_off_host`, added to
 `RungSkipReason`, counted as `render_off_host_skips` in `details["counts"]`; the direct result
 stands and nothing from the render is published. Gap-fill v2 folds it into the None outcome it
 already returns for its sibling declines. A skipped attempt emits no `RESOLUTION_SOURCE_ESCALATION`
-line, so the per-event record is the transport's WARNING, which a parallel worktree is registering
-as the marker
+line, so the per-event record is the transport's WARNING, registered in `aa37f11` as the marker
 `RENDERED_FETCH_OFF_HOST: scope=<resolution_source|gap_fill_v2> pinned_host=<host> landed_host=<host>`
-(spec `rendered_fetch_off_host`).
+(spec `rendered_fetch_off_host`), which names hostnames only because a landing URL can carry a
+session token.
 
 **The probe that priced strict host equality, free and local.** Playwright 1.61 was driven directly
 with the transport's navigation shape and no pin, over the 106-URL Phase 3 QA sweep united with the
@@ -1211,6 +1234,52 @@ headless Chromium with a 403, which is a fingerprinting result rather than a hos
 pinned-host refusal costs no recall on this corpus, and a re-render hop to the landing host is not
 worth building for a case the corpus does not contain.
 
+**Review and fix wave.** A 22-agent forge over the closure (11 reviewers, 4 batched verifiers and a
+triage pass) returned needs-work: 8 fix findings, 13 report-only items, 1 dropped, and 14
+verification gates, almost all of them the same gate under different names, that real Chromium
+behaviour is unobservable in a suite which refuses every browser launch. Three of the eight fix
+findings were important. The landing check was taken once before the DOM read and never re-taken
+after it, so a navigation committing inside the `page.content()` round trip handed back the other
+host's DOM with the check already passed. The two-check hop policy had a third hand-rolled copy, on
+the one surface where a missed check means Chromium dials the host. And nothing in the suite pinned
+that gap-fill v2 renders the plain fetch's post-redirect URL: two reviewers independently rewrote
+both call sites to the pre-redirect URL and the whole suite stayed green. The five minor findings
+were the tri-state landing helper failing open on every non-http(s) scheme, the shared Playwright
+fake pinning a fixed host whatever URL a test rendered, a launch-cap test green only because the
+fake's settle happens not to suspend, the WebSocket block logging at a level the root logger drops,
+and the in-page shim's limits recorded nowhere. One reviewer could not read line coverage because
+`pytest --cov` died in its own checkout; `make cov` on the main checkout ran clean at 7,649 passed
+and 92 percent total branch coverage. Of the report-only items the lead fixed R1 (the `final_url`
+production wrote and nothing read), R4, R5, R6, R9, R10, R12 and R13 anyway, and left four alone: R2
+and R3, R7 (two file sizes, their own PR), R8 (a harvested data endpoint remembered under the cited
+host on a cross-host redirect, measured at 0 of 47 replay URLs) and R11, already fixed by then. The
+forge report and its execution plan are in the session's receipts.
+
+The fix wave is 8 commits, `c4b8a57` to `001b6f9`, each written test-first: fail the landing-host
+guard shut and re-check it after the DOM read; pin that gap-fill v2 renders the plain rung's
+post-redirect URL; give the two-check hop policy one home; pin the requested host by default in the
+shared Playwright fake, which is also what fixed the launch-cap test; log the WebSocket block at INFO
+and record the shim's limits; fold in the small review items; classify and resolve links against the
+document the browser landed on; and drop the em dashes from the re-wrapped Wayback docstring. Both
+new tripwires were verified by re-applying the defect they exist for. Rewriting both gap-fill v2 call
+sites to the pre-redirect URL turns three new tests red, and an `await asyncio.sleep(0)` in the
+fake's settle leaves the semaphore test green. Both mutations were reverted.
+
+Live QA against real Chromium ran twice, free, with every provider key blanked and no LLM or paid
+call. Round one, against `8ced8a5` and `91b6845`, found the branch fit to merge from the transport's
+point of view: a live loopback canary landing and a public off-host landing were both refused with
+the marker line, a same-host redirect, a bot-challenge reload and a meta refresh were let through,
+the WebSocket block fired on manifold.markets where a control run without the transport exchanged
+frames on the same socket, and the render rung handed the transport the post-redirect https URL end
+to end for two `http://` inputs. It found one gap, the one the fail-shut predicate then closed: a
+redirect to a private target that was not listening landed on `chrome-error://chromewebdata/` and
+came back as an empty page rather than a refusal. Round two ran the same launcher against `001b6f9`
+and all 8 cases passed in 32 s. The two chrome-error landings now refuse with
+`landed_host=chromewebdata`, the loopback canary and the example.org landing refuse with the marker,
+the same-host redirect and the meta refresh render with `final_url` recorded, the WebSocket block
+line appears at INFO under the default root logger, and the dcas.dmdc.osd.mil casualty page renders
+through the provider as `status=ok route=rendered` with `render_off_host_skips=0`.
+
 **What is left.** A cross-host SUBRESOURCE is still resolved by Chromium with no pin, so the route
 handler's own `getaddrinfo` and Chromium's connect resolve independently and a rebinding host with
 TTL 0 can win that race. Chromium 149's Local Network Access enforcement is believed to gate a
@@ -1220,34 +1289,43 @@ because the test suite refuses every real browser launch. The main-frame channel
 FUTURE.md item 8 is now a record of what shipped, carrying that residual and the single observation
 that would settle it.
 
-**Tests and the gate.** `tests/test_rendered_fetch.py` gains `TestTheLandingHost`, eight cases
-covering the refusal before the DOM read, an IP-literal landing, a same-host landing on another
-path, a case-only difference, an uncommitted navigation, the salvage path, a salvaged same-host
-`final_url`, and the Tier-1 rung's own skip; and `TestTheWebSocketChannel`, four covering
-registration before the page, the handler never connecting, the handler not raising on an odd URL,
-and a Playwright error at the registration taking the pre-page path.
+**Tests and the gate.** `tests/test_rendered_fetch.py` gains `TestTheLandingHost`, fifteen cases
+after the fix wave, covering the refusal before the DOM read, a navigation that commits during the
+read being discarded unpublished, `final_url` coming from the post-read landing, `document_url` being
+the landing when one committed, an IP-literal landing, a same-host landing on another path, a
+case-only difference, an uncommitted navigation, Chromium's own error document, a landing on some
+other scheme, the no-document allowlist, the salvage path, a salvaged same-host `final_url`, and the
+Tier-1 rung's own skip; and `TestTheWebSocketChannel`, four covering registration before the page,
+the handler never connecting, the handler not raising on an odd URL, and a Playwright error at the
+registration taking the pre-page path.
 `tests/resolution_source/test_resolution_source_rendered_rung.py` gains
 `TestRenderedRungLandedOffHost` and `TestRenderedRungRendersTheFinalUrl`, which pin the skip
 claiming no route, the count reaching the provider's details, the final URL being what the browser
-is handed, the memos keyed on it, and a landing the ladder would not fetch never being rendered. The
-shared Playwright fakes gained `page.url`, `land_on`, `content_reads`, `route_web_socket` and a
-`WebSocketRoute` double, and the OS-timeout test now pins the classification it exists for instead
-of accepting any logged exception. The full free gate on the implementation worktree: 7,608 passed,
-22 skipped, 33 deselected.
+is handed, the memos keyed on it, and a landing the ladder would not fetch never being rendered.
+`tests/test_agentic_tools.py` gains `TestGapFillV2RendersThePlainRungsFinalUrl`, three cases: one per
+v2 call site with a recording browser rung, and one end to end through `fetch` with a scripted 302.
+The shared Playwright fakes gained `page.url`, `land_on`, `content_reads`, `route_web_socket` and a
+`WebSocketRoute` double whose `close` takes Playwright 1.61's keyword-only arguments, they now pin
+the requested host by default, and the OS-timeout test pins the classification it exists for instead
+of accepting any logged exception.
 
 ### Gates and CI at the tip
 
-The full free gate on c07d7cf (`make lint`, `make typecheck`, `make lint_imports`, `make deps`,
-`make test_fast`): 7,592 passed, 14 skipped, 33 deselected, exit 0 (`~/logs/gate17.log`). The five
-tests above the previous gate's 7,587 are the Codex triage's: three for the drain-timeout marker and
-two for model-id locations. The browser-transport closure that followed gated green on its own
-implementation worktree at 7,608 passed, 22 skipped, 33 deselected, and the merged tip was re-gated
-by the session lead once that work and the marker spec beside it had landed, so the tip's numbers
-are the lead's run rather than any worktree run quoted here. PR CI on the pushed 1f2b504 (run
-33917127083: lint, test, secret scan, audit) completed green at 20:43 UTC on 2026-09-04; the commits
-between 1f2b504 and c07d7cf carry documentation, comments and tests only, and the commits after
-c07d7cf add this description to the repo, the browser-transport closure and its documentation. The
-marker registry stood at 60 specs at c07d7cf, and the closure adds `rendered_fetch_off_host`.
+The full free gate on 001b6f9, the branch tip (`make lint`, `make typecheck` at 0 errors,
+`make lint_imports` with 6 contracts kept, `make deps`, `make test_fast`): 7,655 passed, 14 skipped,
+33 deselected, exit 0 (`~/logs/gate18.log`). The commit after 001b6f9 is this documentation update.
+The 63 tests above the earlier gate's 7,592 on c07d7cf are the browser-transport closure's and its
+fix wave's; the five above the gate before that were the Codex triage's, three for the drain-timeout
+marker and two for model-id locations. Line coverage was read separately, because one reviewer's
+`pytest --cov` died in its own checkout: `make cov` on the main checkout ran clean at 7,649 passed
+and 92 percent total branch coverage.
+Verification pass result: see the sentence the lead appends.
+PR CI on the pushed 1f2b504 (run 33917127083: lint, test, secret scan, audit) completed green at
+20:43 UTC on 2026-09-04; the commits after it carry the Codex triage's documentation, comments and
+tests,
+this description, the browser-transport closure with its documentation, and the closure's review fix
+wave. The marker registry stands at 61 specs at 001b6f9, the last of them `rendered_fetch_off_host`.
+Against `main` the whole PR at 001b6f9 is 366 commits and 247 files (+58,570 / -6,362).
 
 ### Codex review triage
 
@@ -1259,4 +1337,4 @@ The GitHub-side Codex reviewer left five comments on the PR, four against ad9fec
 
 **Enforce the PDF wall-clock bound (P2): real, low severity, deferred.** The page count, the outline walk and the digest run before or after the parse clock, a started thread worker cannot be cancelled, and both routes hand the shared parse permit back while the worker keeps running. The magnitude is finite rather than unbounded: pypdf's own caps hold the un-clocked prologue to about 16 s on an adversarial 40 MB file (a nested outline of 100,000 entries alone costs 13.7 s), so an abandoned worker lives about 36 to 40 s at worst. Each remedy either drops the outline in a corner case, can wedge the two-slot parse gate, or is a subprocess build, so under the standing rule that timing code takes only strictly-safer changes the code fix is deferred. FUTURE.md carries the design and the measurements, and the comments that described the worker as bounded were corrected.
 
-**Block WebSocket requests during browser renders (P1) and Pin DNS for every redirected browser host (P1): both real, both built in this PR.** The transport's own comment already named both as accepted residuals. Verification found a third channel nobody had recorded: Playwright never runs a route handler on a server-side redirect hop, so a cited page that answers the bot's plain fetch with a JavaScript wall and answers Chromium with a 302 to a private address rendered that response into the main frame with no check at all. Chromium 149's Local Network Access enforcement gates the subresource and WebSocket channels (inferred from the feature lists; no browser was launched to observe it), and it does not cover a main-frame navigation, so the redirect was the exploitable channel. Neither fix is strictly safer on its face, which is why the plan had been to defer them: the WebSocket block turns a socket-fed page into a run-long no-text memo, and strict host pinning refuses cross-host redirects at a recall cost the replay never measured. The operator asked for the work the same afternoon, so a free local render probe measured the recall cost first, at zero cross-host landings and zero WebSockets across 22 real render targets, and the transport then gained a landing-host refusal, a WebSocket route that never connects, and the direct fetch's landing URL as what the browser is handed. The subsection "The browser transport closure" above carries the commits, the probe numbers, the skip token and count key, the marker, the tests and the one residual left. The route-guard comment, `docs/agentic_gap_fill.md`, `docs/research.md`, `docs/operations.md`, AGENTS.md and FUTURE.md all state what the guard now covers.
+**Block WebSocket requests during browser renders (P1) and Pin DNS for every redirected browser host (P1): both real, both built in this PR.** The transport's own comment already named both as accepted residuals. Verification found a third channel nobody had recorded: Playwright never runs a route handler on a server-side redirect hop, so a cited page that answers the bot's plain fetch with a JavaScript wall and answers Chromium with a 302 to a private address rendered that response into the main frame with no check at all. Chromium 149's Local Network Access enforcement gates the subresource and WebSocket channels (inferred from the feature lists; no browser was launched to observe it), and it does not cover a main-frame navigation, so the redirect was the exploitable channel. Neither fix is strictly safer on its face, which is why the plan had been to defer them: the WebSocket block turns a socket-fed page into a run-long no-text memo, and strict host pinning refuses cross-host redirects at a recall cost the replay never measured. The operator asked for the work the same afternoon, so a free local render probe measured the recall cost first, at zero cross-host landings and zero WebSockets across 22 real render targets, and the transport then gained a landing-host refusal, a WebSocket route that never connects, and the direct fetch's landing URL as what the browser is handed. The closure was then reviewed on its own: a 22-agent forge returned 8 fix findings, a fix wave of 8 commits applied all of them, and two rounds of free live QA against real Chromium observed the landing refusal and the WebSocket block working. Both P1s are therefore built, reviewed and QA'd. The subsection "The browser transport closure" above carries the commits, the probe numbers, the review and the fix wave, both live QA rounds, the skip token and count key, the marker, the tests and the one residual left. The route-guard comment, `docs/agentic_gap_fill.md`, `docs/research.md`, `docs/operations.md`, AGENTS.md and FUTURE.md all state what the guard now covers.
