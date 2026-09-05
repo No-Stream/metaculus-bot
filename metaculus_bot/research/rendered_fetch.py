@@ -192,14 +192,24 @@ class RenderDomOverCeiling(Exception):
 class RenderOffHost(Exception):
     """Chromium's main frame landed on a host other than the one the DNS pin covers.
 
-    Raised BEFORE ``page.content()`` is read, so no DOM from the other host ever exists in this
-    process. The pin (``--host-resolver-rules=MAP <host> <ip>``) forces the resolution of ONE
-    hostname, the one the render was asked for; a server-side redirect hop is dialed by the
-    browser with no route handler of ours involved (Playwright constructs a Route only for a
-    request with no ``redirectedFrom``), so a main frame that ended up anywhere else was reached
-    through Chromium's own resolver, outside every check this transport makes. Refusing the DOM
-    is what closes that channel: an attacker who answers our aiohttp GET with a wall and the
-    browser with a 302 to a private address gets nothing published for it.
+    The landing is checked before AND after ``page.content()`` is read, so a DOM from the other
+    host is either refused unread or, when the navigation committed during the read itself,
+    discarded unpublished; either way none of it leaves :func:`_navigate_and_read_dom`. The pin
+    (``--host-resolver-rules=MAP <host> <ip>``) forces the resolution of ONE hostname, the one the
+    render was asked for; a server-side redirect hop is dialed by the browser with no route
+    handler of ours involved (Playwright constructs a Route only for a request with no
+    ``redirectedFrom``), so a main frame that ended up anywhere else was reached through
+    Chromium's own resolver, outside every check this transport makes. Refusing the DOM is what
+    closes that channel: an attacker who answers our aiohttp GET with a wall and the browser with
+    a 302 to a private address gets nothing published for it.
+
+    "Off the pinned host" is read fail-shut (:func:`_landed_off_host`), so it also covers
+    Chromium's own error document: a navigation that fails outright can leave the frame on
+    ``chrome-error://chromewebdata/`` rather than ``about:blank`` (observed live on 2026-09-04
+    after ``net::ERR_UNSAFE_PORT`` and after ``net::ERR_CONNECTION_REFUSED`` on a redirect to a
+    loopback target), and that is refused like any other stranger. The callers' ``render_off_host``
+    count is therefore an UPPER bound on hostile landings: it also counts failed navigations, and
+    the marker's ``landed_host`` tells the two apart (``chromewebdata`` is the error document).
 
     Its own class for the same reason as :class:`RenderDomOverCeiling`: the page rendered, so it
     is a fact about the page rather than about the browser install, and the callers count it
@@ -239,11 +249,12 @@ class RenderedPage:
     about that.
 
     ``url`` is the URL the render was ASKED for, and stays so: both callers key their memos on
-    it and one uses it as the base for link resolution. ``final_url`` is ``page.url`` after the
-    settle, the URL the main frame actually landed on, and is always on the same host as ``url``
-    by the time a page is returned (:class:`RenderOffHost` is raised otherwise). It is
-    ``about:blank`` when the navigation never committed, which is the salvage of a genuine
-    navigation error.
+    it. ``final_url`` is ``page.url`` as it stood after the DOM read, the URL of the document the
+    DOM came from, and it is on the same host as ``url`` whenever a page is returned: the landing
+    is checked before and after the read, and a stranger's DOM is refused unread or discarded
+    unpublished (:class:`RenderOffHost`), with Chromium's own error document counted as a
+    stranger. It is ``about:blank`` when the navigation never committed, which is the salvage of a
+    genuine navigation error.
     """
 
     url: str
@@ -455,17 +466,27 @@ def _block_web_socket(web_socket_route: Any) -> None:
     logger.debug("rendered fetch blocked a page WebSocket to %s", host_port)
 
 
-def _landed_host(final_url: str) -> str | None:
-    """Hostname of the URL the main frame landed on, or None when no navigation committed.
+def _landed_off_host(final_url: str, pinned_host: str) -> bool:
+    """Whether the main frame's landing URL is anywhere but ``pinned_host``.
 
-    ``page.url`` is ``about:blank`` (or empty) when a genuine navigation error left nothing
-    behind, which is nobody's host and falls through to the empty DOM read it always did. An
-    http(s) URL with no hostname at all yields ``""``, which matches no pin and so fails closed.
+    A guard that fails SHUT. The only landings it lets through without a matching hostname are
+    the no-document ones: an empty ``page.url`` and the ``about:`` scheme (``about:blank`` when a
+    navigation never committed, ``about:srcdoc``), which are nobody's host and fall through to the
+    empty DOM read they always produced. Everything else is compared by ``urlparse`` hostname,
+    lower-cased with the brackets stripped, the same form the pin was built from, and a URL with no
+    hostname at all is off-host. That covers an http(s) URL with an empty authority, every
+    non-http(s) scheme Chromium can leave the frame on (``data:``, ``file:``, ``blob:``), and
+    Chromium's own error document: live QA on 2026-09-04 observed
+    ``page.url == "chrome-error://chromewebdata/"`` after a goto that failed with
+    ``net::ERR_UNSAFE_PORT`` and after ``net::ERR_CONNECTION_REFUSED`` on a redirect to a loopback
+    target, and the tri-state predecessor of this helper, which allowed every non-http(s) scheme,
+    let that landing through to a DOM read that returned an empty page carrying that URL. Under a
+    boolean whose allow case is the named sentinel it is refused with no arm of its own.
     """
     parsed = urlparse(final_url)
-    if parsed.scheme.lower() not in ("http", "https"):
-        return None
-    return parsed.hostname or ""
+    if not final_url or parsed.scheme.lower() == "about":
+        return False
+    return parsed.hostname != pinned_host
 
 
 def _goto_budget_ms(goto_timeout_ms: int, deadline_monotonic_s: float | None) -> int | None:
@@ -572,16 +593,30 @@ async def _navigate_and_read_dom(
     rescues came from exactly that. A genuine navigation error lands here too and salvages an
     empty ``about:blank``, which reaches the ladder as the same "rendered read nothing".
 
-    Before anything is read, the main frame has to be on ``pinned_host``, the one hostname the
-    launch's ``--host-resolver-rules`` covers. A server-side redirect hop is followed by Chromium
-    with no route handler of ours involved, so ``page.url`` is the only record of where the frame
-    actually went, and it is read after the settle on BOTH paths: on the salvage path ``response``
-    is None and there is no other source, and that path is where a timed-out navigation may
-    already have landed on a redirect target. A landing on any other host, an IP literal
-    included, raises :class:`RenderOffHost` with ``page.content()`` never called. Hostnames are
-    compared as ``urlparse`` normalises them (lower-cased, brackets stripped), which is the same
-    form the pin was built from, so the compare is like with like. ``about:blank`` is nobody's
-    host and falls through to the empty read it always produced.
+    The main frame has to be on ``pinned_host``, the one hostname the launch's
+    ``--host-resolver-rules`` covers, and that is checked twice. A server-side redirect hop is
+    followed by Chromium with no route handler of ours involved, so ``page.url`` is the only
+    record of where the frame actually went, and it is read after the settle on BOTH paths: on the
+    salvage path ``response`` is None and there is no other source, and that path is where a
+    timed-out navigation may already have landed on a redirect target. A landing on any other
+    host, an IP literal included, raises :class:`RenderOffHost` before ``page.content()`` is
+    called, which is the cheap early exit. Then the same check runs again on ``page.url`` as it
+    stands after the read, because a navigation can commit in the one driver round trip between
+    the first check and the read (see the comment at that line), and a mismatch there raises the
+    same exception with the DOM that was read discarded unpublished. The page's ``final_url`` is
+    that second read, the document the DOM came from. Hostnames are compared as ``urlparse``
+    normalises them (lower-cased, brackets stripped), which is the same form the pin was built
+    from, so the compare is like with like, and the predicate fails shut
+    (:func:`_landed_off_host`): ``about:blank`` is nobody's host and falls through to the empty
+    read it always produced, and every other scheme is a stranger. One deliberate departure from
+    the design note in FUTURE.md item 8, which also asked for the goto response's URL to be
+    compared when a response exists: only ``page.url`` is checked, because after the settle it is
+    the authoritative record of the document whose DOM is read, and the response URL adds no
+    DOM-safety value (an off-host response whose document then navigated the frame back onto the
+    pinned host inside the settle leaves ``content_type`` and ``http_status`` from that response
+    beside a DOM from the pinned host, a provenance mismatch on two metadata fields rather than a
+    hole). Refusing it would also cost recall on a benign bounce, on a surface reserved for
+    strictly-safer changes.
 
     The DOM read is bounded by ``RENDER_DOM_READ_TIMEOUT_MS`` and raises :class:`RenderTimeout`
     when it fires — deliberately NOT swallowed into the salvage, because a page that keeps
@@ -612,8 +647,7 @@ async def _navigate_and_read_dom(
         response = None
     await page.wait_for_timeout(RENDER_SETTLE_MS)
     final_url: str = page.url
-    landed_host = _landed_host(final_url)
-    if landed_host is not None and landed_host != pinned_host:
+    if _landed_off_host(final_url, pinned_host):
         raise RenderOffHost(requested_url=url, final_url=final_url, pinned_host=pinned_host)
     # ``goto`` returns None for an about:blank or same-document navigation, and the salvage
     # above leaves no response either; both read as "no main-frame response".
@@ -627,6 +661,16 @@ async def _navigate_and_read_dom(
         raise RenderTimeout(
             f"the DOM read of {urlparse(url).netloc} outlived {RENDER_DOM_READ_TIMEOUT_MS}ms: the page kept navigating"
         ) from exc
+    # The same check again, on the document the read actually came from. `page.url` is a cached
+    # attribute the driver updates on its `navigated` event and `page.content()` is a round trip
+    # evaluated in whatever document is current when the driver handles it, so a navigation that
+    # committed between the check above and the read hands back the other host's DOM with that
+    # check already passed. The driver's pipe is ordered, so that commit's `navigated` event
+    # arrived before the content reply and this second read sees it. No await and no protocol
+    # call: reading `page.url` costs a local attribute access, so the render is no longer for it.
+    final_url = page.url
+    if _landed_off_host(final_url, pinned_host):
+        raise RenderOffHost(requested_url=url, final_url=final_url, pinned_host=pinned_host)
     if len(html) > RENDERED_DOM_MAX_CHARS:
         logger.warning(
             "rendered fetch declined the DOM of %s: %d chars is over the %d-char ceiling",
@@ -824,7 +868,7 @@ async def render_page(
     ``RENDERED_DOM_MAX_CHARS`` raises :class:`RenderDomOverCeiling` (the page rendered and is too
     big to read safely), and a main frame that landed on a host other than the pinned one raises
     :class:`RenderOffHost` (the page sent the browser somewhere the pin does not cover, and its
-    DOM was refused unread). A caller that wants to tell the ``None`` causes apart reads
+    DOM was refused unread or discarded unpublished). A caller that wants to tell the ``None`` causes apart reads
     :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
 
     A render that ran and was CUT OFF is different, and raises :class:`RenderTimeout` (a
@@ -915,7 +959,7 @@ async def render_page(
             )
     # The three declines the caller records under their own tokens: nothing is memoised for any
     # of them (nothing ran for the first; the second rendered content, just too much of it; the
-    # third rendered a page on a host the pin does not cover, and read none of it).
+    # third rendered a page on a host the pin does not cover, and published none of it).
     except (RenderBudgetExpired, RenderDomOverCeiling):
         raise
     except RenderOffHost as exc:
@@ -1096,8 +1140,11 @@ async def _render_in_context(
             pinned_host=pinned_host,
         )
     finally:
-        # A body read still pending here (the DOM read timed out, or the DOM was over the
-        # ceiling) would otherwise race the close below and raise into its own swallowed path.
+        # A body read still pending here (the DOM read timed out, the DOM was over the ceiling, or
+        # the main frame landed off the pinned host) would otherwise race the close below and raise
+        # into its own swallowed path. The off-host raise is the one where a read is likeliest to
+        # be in flight: on the pre-read refusal no `page.content()` round trip ran between the
+        # settle and the raise to give the body tasks time to finish.
         if harvest is not None:
             harvest.cancel_pending()
         # Drain in-flight route handlers BEFORE teardown. Without this, a request still in

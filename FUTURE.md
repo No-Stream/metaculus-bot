@@ -1436,7 +1436,21 @@ Follow-ups:
    and on the salvage path where the goto raised and there is no response object to read, it
    compares the landing host with the pinned host under the same normalisation the pin was built
    from, and any other host, an IP literal included, raises `RenderOffHost` before `page.content()`
-   is ever called. A navigation that never committed leaves `about:blank`, which is nobody's host
+   is called. The same comparison runs again on `page.url` immediately after the read (added
+   2026-09-04 in the fix wave after the forge review, which reproduced the gap): `page.url` is a
+   client-side cache updated by the driver's `navigated` event and `page.content()` is a driver round
+   trip evaluated in whatever document is current when the driver handles it, so a navigation that
+   committed in that one round trip handed back the other host's DOM with the first check already
+   passed; the second read costs no await, and a DOM that fails it is discarded unpublished. So the
+   guarantee is "refused unread, or discarded unpublished", not "never read". The predicate fails
+   shut: only an empty `page.url` and the `about:` scheme pass without a matching hostname, and every
+   other scheme is a stranger, which covers Chromium's own error document. Live QA against real
+   Chromium the same day found `page.url == "chrome-error://chromewebdata/"` after a goto that failed
+   with `net::ERR_UNSAFE_PORT` and after `net::ERR_CONNECTION_REFUSED` on a redirect to a loopback
+   target, a landing the earlier tri-state helper (None for every non-http(s) scheme) let through to
+   an empty DOM read; it is now refused, so `render_off_host_skips` is an upper bound on hostile
+   landings that also counts failed navigations, told apart by the marker's `landed_host`
+   (`chromewebdata`). A navigation that never committed leaves `about:blank`, which is nobody's host
    and falls through to the empty-DOM read it always produced. `RenderedPage` gained `final_url` for
    the caller's own classification, and `RenderedPage.url` still carries the REQUESTED URL, because
    that is the base for link resolution and for both render memos. Second,

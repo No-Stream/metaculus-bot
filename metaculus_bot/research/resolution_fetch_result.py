@@ -198,9 +198,10 @@ FetchStatusReason = Literal[
 #   kept out of `renderer_unavailable` whose comment points triage at the Playwright install.
 # `render_off_host`: the browser's main frame landed on a host other than the one its DNS pin
 #   covers (`rendered_fetch.RenderOffHost`), a server-side redirect hop the route guard never sees,
-#   so the transport refused the DOM before reading it. A fact about the page, kept out of
-#   `renderer_unavailable` for the same reason as the two above. The URL is not memoised, because
-#   nothing about the page was read.
+#   so the transport refused the DOM unread or discarded it unpublished. Read fail-shut, so it also
+#   counts Chromium's own error document after a failed navigation, which makes it an upper bound
+#   on hostile landings. A fact about the page, kept out of `renderer_unavailable` for the same
+#   reason as the two above. The URL is not memoised, because nothing about the page was published.
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",

@@ -1046,8 +1046,11 @@ so it is not read as content, and the URL is not memoised because a 429 is retry
 DOM over `RENDERED_DOM_MAX_CHARS`, which the transport signals with `RenderDomOverCeiling`, is
 `render_dom_too_large`, declined before anything copies it. And a main frame that landed on a host
 other than the pinned one, which the transport signals with `RenderOffHost`, is `render_off_host`:
-the transport refuses the DOM before `page.content()` is read, so nothing from that render reaches
-the classifier and the direct result stands. It emits one WARNING under the marker
+the transport checks the landing before and after `page.content()`, so the DOM is refused unread
+or discarded unpublished, nothing from that render reaches the classifier and the direct result
+stands. The check fails shut, so Chromium's own error document after a failed navigation
+(`chrome-error://chromewebdata/`, seen live after `net::ERR_UNSAFE_PORT`) is refused under the same
+token, which makes the count an upper bound on hostile landings. It emits one WARNING under the marker
 `RENDERED_FETCH_OFF_HOST` (below) and, like every skip, no `RESOLUTION_SOURCE_ESCALATION` line.
 Two more bounds hold the rung inside the wall, and which one fired is what the skip reason says.
 Inside the transport, `page.content()` is capped at `RENDER_DOM_READ_TIMEOUT_MS`: on a settled DOM

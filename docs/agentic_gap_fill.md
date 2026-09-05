@@ -190,7 +190,9 @@ escalates when the lighter one comes up short:
    for the main frame is the transport's landing-host check, which after the navigation
    settles compares the LANDING HOST, the hostname `page.url` ended up on, with the PINNED
    HOST that its `--host-resolver-rules` launch argument covers, and refuses the DOM
-   unread when the two differ. This ladder folds that refusal into the same None it
+   unread when the two differ (the comparison runs again after the read, so a navigation that
+   commits during `page.content()` is discarded unpublished, and it fails shut, so Chromium's
+   own error document after a failed navigation is refused too). This ladder folds that refusal into the same None it
    returns for a render that read nothing. A WebSocket handshake, which routes through a
    separate Playwright API, is blocked by a `route_web_socket` handler that never connects
    the socket to a server. What is left is a request Playwright cannot attribute to a

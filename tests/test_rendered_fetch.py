@@ -917,8 +917,9 @@ class TestTheLandingHost:
     only for a request with no ``redirectedFrom``, so a 302 to a private address was followed,
     rendered, and handed back attached to the cited URL. The DNS pin covers ONE hostname, so a
     main frame that landed anywhere else was reached through Chromium's own resolver, and its DOM
-    is refused before it is read. ``page.url`` is read after the settle on both paths, because on
-    the salvage path (the goto raised, no response object) it is the only source of the landing."""
+    is refused before it is read, or discarded unpublished when the navigation committed during the
+    read. ``page.url`` is read after the settle on both paths, because on the salvage path (the goto
+    raised, no response object) it is the only source of the landing, and again after the read."""
 
     _OFF_HOST = "https://internal.example.net/admin/secrets"
 
@@ -999,6 +1000,116 @@ class TestTheLandingHost:
         assert rendered.final_url == "about:blank"
         assert rendered.html == _EMPTY_DOM
         assert page.content_reads == 1
+
+    async def test_chromiums_own_error_document_after_a_failed_navigation_is_refused(self, monkeypatch, caplog):
+        """Live QA (2026-09-04) against real Chromium: a goto that failed with ``net::ERR_UNSAFE_PORT``,
+        and one that failed with ``net::ERR_CONNECTION_REFUSED`` on a redirect to a loopback target,
+        both left ``page.url`` at ``chrome-error://chromewebdata/`` rather than ``about:blank``. A
+        helper that allowed every non-http(s) scheme read that document and handed back an empty
+        page carrying that URL; fail-shut, it is off the pinned host like any other stranger."""
+        page = FakePage(
+            [], goto_raises=PlaywrightError("net::ERR_UNSAFE_PORT"), land_on="chrome-error://chromewebdata/"
+        )
+
+        with (
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"),
+            pytest.raises(rendered_fetch.RenderOffHost) as raised,
+        ):
+            await _render(monkeypatch, page)
+
+        assert page.content_reads == 0
+        assert raised.value.final_url == "chrome-error://chromewebdata/"
+        (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
+        assert "landed_host=chromewebdata" in message
+
+    @pytest.mark.parametrize(
+        "landed",
+        [
+            "data:text/html,<p>built by the page</p>",
+            "file:///etc/hostname",
+            "blob:https://dashboard.example.com/3f1c9a2e",
+            "chrome-error://chromewebdata/",
+        ],
+    )
+    async def test_a_landing_on_a_scheme_that_is_not_the_pinned_host_is_refused(self, monkeypatch, landed):
+        """The guard answers "is this document from the host we vetted and pinned?", and fails SHUT:
+        every scheme it does not name is refused rather than read, so a scheme Chromium adds later
+        cannot slip through an allowlist nobody updated."""
+        page = FakePage([], land_on=landed)
+
+        with pytest.raises(rendered_fetch.RenderOffHost):
+            await _render(monkeypatch, page)
+
+        assert page.content_reads == 0
+
+    @pytest.mark.parametrize(
+        ("final_url", "expected"),
+        [
+            ("", False),
+            ("about:blank", False),
+            ("about:srcdoc", False),
+            ("ABOUT:BLANK", False),
+            ("https://dashboard.example.com/senate", False),
+            ("http://Dashboard.Example.COM:8443/x", False),
+            ("https://other.example.com/", True),
+            ("http://169.254.169.254/latest/meta-data/", True),
+            # An http(s) URL with no hostname at all matches no pin.
+            ("https:///no-host", True),
+            ("data:text/html,x", True),
+            ("chrome-error://chromewebdata/", True),
+        ],
+    )
+    def test_the_no_document_landings_are_the_only_allowlist(self, final_url, expected):
+        assert rendered_fetch._landed_off_host(final_url, "dashboard.example.com") is expected
+
+    async def test_a_navigation_that_commits_during_the_dom_read_is_discarded_unpublished(self, monkeypatch, caplog):
+        """The window between the pre-read check and the read. ``page.url`` is a client-side cache
+        updated by the driver's ``navigated`` event, and ``page.content()`` is a driver round trip
+        evaluated in whatever document is current when the driver handles it, so a main frame whose
+        navigation commits in that window hands back the OTHER host's DOM with the pre-read check
+        already passed. The driver's pipe is ordered, so the commit's ``navigated`` event lands
+        before the content reply and the post-read ``page.url`` reflects it: the check runs again
+        after the read, and the DOM that was read is thrown away rather than returned."""
+        internal_markup = "<html><body><p>ami-id: ami-0abc</p></body></html>"
+
+        class _NavigatesDuringTheRead(FakePage):
+            async def content(self) -> str:
+                html = await super().content()
+                self.url = "http://169.254.169.254/latest/meta-data/"
+                del html
+                return internal_markup
+
+        page = _NavigatesDuringTheRead([])
+
+        with (
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.research.rendered_fetch"),
+            pytest.raises(rendered_fetch.RenderOffHost) as raised,
+        ):
+            await _render(monkeypatch, page)
+
+        assert page.content_reads == 1
+        assert raised.value.final_url == "http://169.254.169.254/latest/meta-data/"
+        assert raised.value.pinned_host == "dashboard.example.com"
+        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
+        (message,) = [message for message in caplog.messages if "RENDERED_FETCH_OFF_HOST" in message]
+        assert "landed_host=169.254.169.254" in message
+        assert not [message for message in caplog.messages if "ami-0abc" in message]
+
+    async def test_the_final_url_is_the_post_read_landing(self, monkeypatch):
+        """The URL the page carries names the document whose DOM was read, so it is the second
+        read of ``page.url``, not the one taken before ``page.content()``."""
+        landed = "https://dashboard.example.com/senate/2026/"
+
+        class _HopsOnTheSameHostDuringTheRead(FakePage):
+            async def content(self) -> str:
+                html = await super().content()
+                self.url = landed
+                return html
+
+        rendered = await _render(monkeypatch, _HopsOnTheSameHostDuringTheRead([]))
+
+        assert rendered is not None
+        assert rendered.final_url == landed
 
     async def test_the_salvage_path_applies_the_check_too(self, monkeypatch):
         """A timed-out goto may already have landed on the redirect target (4 of the replay's 10

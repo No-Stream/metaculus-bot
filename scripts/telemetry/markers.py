@@ -945,8 +945,11 @@ MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "rendered_fetch_off_host",
         # Per-REFUSED RENDER: headless Chromium's main frame ended up on a host other than the one
-        # its DNS pin covers, so the DOM was refused before ``page.content()`` was ever called
-        # (research/rendered_fetch.py render_page). A server-side redirect hop is dialed by the
+        # its DNS pin covers, so the DOM was refused unread, or discarded unpublished when the
+        # navigation committed during the read itself (research/rendered_fetch.py render_page; the
+        # landing is checked before and after ``page.content()``). Read fail-shut, so Chromium's own
+        # error document after a failed navigation (``landed_host=chromewebdata``) is refused too,
+        # which makes the record an upper bound on hostile landings. A server-side redirect hop is dialed by the
         # browser with no route handler of ours involved, so the landing is reached through
         # Chromium's own resolver, outside every check the transport makes; a record therefore says
         # a cited page tried to send us somewhere the pin does not cover, which is a
