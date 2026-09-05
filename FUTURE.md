@@ -2917,10 +2917,23 @@ giving any later rung a way to act on it. That page is exactly the shape the bro
 built for, except that Chromium dials from our own address and would be answered 403 like the
 aiohttp client was. Wiring it up means letting the dispatcher escalate on a RUNG's result, a
 restructure with its own review, and would need a browser that presents the impersonated
-fingerprint too. Related: the impersonated router deliberately runs no meta-refresh hop, because
-following one would mean deciding which transport dials the target and re-entering the hop loop
-from inside a rung. A cdc.gov surveillance stub that answers 403 to aiohttp, 200 to the
-impersonated client and carries only `<meta http-equiv="refresh">` therefore still declines.
+fingerprint too.
+
+### A meta-refresh hop from an impersonated page (added 2026-09-04; LOW)
+
+The impersonated router (`_impersonated_body_outcome`) deliberately runs no meta-refresh hop:
+`_resolution_html_outcome` follows one after a no-content classification on the direct path, but
+following it from inside the rung would mean deciding which transport dials the target (the
+direct fetch was refused by this host, so the hop would have to go out impersonated too) and
+re-entering the whole hop loop from inside a rung, so the router calls `_classify_html_body`
+directly. The consequence is one shape that still declines: a cdc.gov surveillance stub that
+answers 403 to aiohttp, 200 to the impersonated client, and carries only
+`<meta http-equiv="refresh">` classifies as `js_wall` on the impersonated body and leaves the
+direct `blocked` standing. The shape is a hypothesis built from two receipts (the cdc.gov
+refresh stubs the meta-refresh hop was added for, and cdc.gov's 403 to aiohttp), not a measured
+case; wiring it means the transport following the refresh target as one more re-guarded,
+re-pinned hop under the shared `MAX_REDIRECTS` cap, which is the same decision the rendered rung
+avoids for the same reason.
 
 ### Chromium teardown noise after a render: cause found, fix not shipped (added 2026-09-03; LOW)
 

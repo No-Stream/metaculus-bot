@@ -1019,9 +1019,15 @@ position among the earlier rungs is a reading choice, because the browser rungs 
 `blocked`. Free (no key, no model, no spend), floored at
 `RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S` like the other one-GET rungs, never fast-path
 gated, memoized per HOST for the run once a host answers the impersonated client with a block
-status (the memo is shared with gap-fill v2, which dials the same transport from its `fetch`
-tool), and behind a kill switch that is ON by default in code,
-`RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, unlike the paid rung's default-off. A rescue's fetch
+status (the memo is process-global and shared with gap-fill v2, which dials the same transport
+from both of its free ladders, the `fetch` tool's and `read_document`'s local acquisition; the
+transport writes it for the host dialed AND the host that answered, since the impersonated
+client follows redirects itself and the block can come from a later hop), and behind a kill
+switch that is ON by default in code, `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, unlike the paid
+rung's default-off. The trigger set, the block-shaped set the memo keys on and the kill switch
+all live on the transport (`IMPERSONATE_TRIGGER_STATUSES`, `IMPERSONATE_BLOCK_STATUSES`,
+`impersonation_enabled`, `note_refusal_if_block_shaped`), read by both fetchers at call time so
+neither can drift from the other. A rescue's fetch
 line reads `status=ok http=200 route=impersonate` because the bytes came with a 200; the refusal
 lives on the escalation line's `from_status=blocked`, as a Wayback rescue already reports the
 snapshot's own status. An impersonated 200 that still classifies as unreadable stamps its verdict
@@ -1295,13 +1301,17 @@ signal, and counted precisely because without it "flag on, key missing" is byte-
 archive to "flag off". Three keys belong to the impersonated retry. `impersonate_disabled_skips`
 is the kill switch (`RESOLUTION_SOURCE_IMPERSONATE_ENABLED`) set to off, a configuration rather
 than a tuning signal and counted for the same reason as the missing-key skip above.
-`impersonate_unpinnable_skips` is a retry that raised before anything was dialed because the host
-would not resolve to a vetted public address to pin the connection to; the direct fetch resolved
-the same host moments earlier, so what binds is DNS disagreeing with itself, and a nonzero count
-is a flake or a rebinding host rather than a refusal. `impersonate_host_refused_skips` is the
-per-run host memo declining a second cited URL on a host that already answered the impersonated
-client with a block status, the memo doing its job rather than a failure, which is the same
-distinction `rendered_no_text_skips` draws for the browser.
+`impersonate_unpinnable_skips` is a retry declined because a hop's host would not resolve to a
+vetted public address to pin the connection to, on the first hop (nothing dialed; the direct fetch
+resolved the same host moments earlier, so what binds is DNS disagreeing with itself, and a
+nonzero count is a flake or a rebinding host rather than a refusal) or on a later redirect hop
+(the earlier hops were dialed, and the target is one the direct fetch never resolved, so the
+DNS-disagreement reading does not apply). `impersonate_host_refused_skips` is the per-run host
+memo declining a cited URL on a host that already answered the impersonated client with a block
+status this run, the memo doing its job rather than a failure, which is the same distinction
+`rendered_no_text_skips` draws for the browser; the memo is process-global and shared with
+gap-fill v2, so the earlier refusal may have been a v2 `fetch` or `read_document` of a URL no
+question cited.
 
 It is **SSRF-hardened** because these URLs are user-authored and fetches run from
 CI: a preflight `is_public_http_url` check rejects private / loopback /
@@ -1332,7 +1342,10 @@ against the address libcurl reports it connected to, refusing the body unread on
 mismatch. No automatic redirects: every hop is re-guarded through `_hop_refusal`,
 re-resolved and re-pinned under the shared `MAX_REDIRECTS` cap, the proxy environment is
 disabled so a pin cannot be bypassed by an `HTTP_PROXY` libcurl would otherwise honour,
-and the body is capped at the same decompressed byte count as the direct fetch. Every
+and the body is capped at the same decompressed byte counts as the direct fetch: the page cap
+(`RESOLUTION_SOURCE_MAX_RESPONSE_BYTES`) for every body, with one re-dial under the document
+cap (`DOCUMENT_TEXT_PDF_MAX_BYTES`) when a declared PDF aborts on the first, so a cited PDF
+between the two is read on this rung as `_resolution_pdf_outcome` would have read it. Every
 refusal raises, and nothing from a refused response is returned. Per-URL truncation appends a
 `[truncated at N chars — full source at URL]` marker, the aggregate section-budget
 trim routes through the same marker-emitting truncator (a bare slice could cut

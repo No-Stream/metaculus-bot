@@ -123,7 +123,8 @@ and turns a breach into an error `ToolOutcome` rather than a crash.
   fetch budget for the document auto-escalation on the last rung.
 - **`read_document`** — ask a specific question of a specific document, and get
   back the passages of it that bear on the ask. Acquisition-first: it runs the
-  free rungs (this run's cache, then plain HTTP and headless Chromium) and
+  free rungs (this run's cache, then plain HTTP, the impersonated retry of a 403,
+  and headless Chromium) and
   answers from the page's own text with a deterministic BM25 passage digest
   (`method=digest_local`), and only where the ladder holds nothing usable — no text at
   all, or the one refused shape described below — does Gemini read the URL through the
@@ -165,7 +166,15 @@ escalates when the lighter one comes up short:
    `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, the per-run host memo shared with Tier 1,
    a still-refused host, any transport refusal) leaves the `blocked` outcome exactly
    as it was. Bounded to one plain hop's `RESOLUTION_SOURCE_HTTP_TIMEOUT` for the whole
-   retry.
+   retry, and to the plain rung's own two body caps (`RESOLUTION_SOURCE_MAX_RESPONSE_BYTES`
+   for a page, `DOCUMENT_TEXT_PDF_MAX_BYTES` for a declared PDF). The trigger set, the kill
+   switch and the memo-write rule are the transport's (`IMPERSONATE_TRIGGER_STATUSES`,
+   `impersonation_enabled`, `note_refusal_if_block_shaped`, which memoizes both the host
+   dialed and the host that answered a block), read at call time so this ladder and Tier 1
+   cannot drift apart. The same retry runs in `read_document`'s local-document ladder
+   (`_fetch_plain_with_impersonated_retry` is the shared step), which matters more there:
+   that ladder sits immediately in front of the paid `url_context` read, so a cold
+   `read_document` on a bls.gov or cdc.gov page is digested for free instead of paid for.
 3. **Local PDF extraction** (`local_document.pdf_fetch_result`). A body that is
    a PDF — by content type or by magic bytes — is decoded with pypdf in a worker
    thread and served as its own full text (`method=pdf_local`), which paginates
