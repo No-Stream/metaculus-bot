@@ -250,14 +250,20 @@ class TestImpersonateRungStillRefused:
         ]
         assert impersonation_refused(_URL) is True
 
-    @pytest.mark.parametrize("status", [406, 429])
-    async def test_the_other_block_shapes_memoize_too(self, monkeypatch, status):
+    @pytest.mark.parametrize(
+        ("status", "outcome"),
+        [(406, "blocked"), (429, "blocked"), (401, "error"), (503, "error")],
+    )
+    async def test_the_other_block_shapes_memoize_too(self, monkeypatch, status, outcome):
+        """The memo set is the transport's `IMPERSONATE_BLOCK_STATUSES`: the three `blocked` rows of
+        the status table plus 401 and 503, which the table does not carry, so the rung stamps them
+        `error` exactly as before while the host is still switched off for the run."""
         _transport(monkeypatch, _impersonated(status, body=b""))
 
         result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
 
         assert result.status == "blocked"
-        assert [a.outcome for a in result.rung_attempts] == ["blocked"]
+        assert [a.outcome for a in result.rung_attempts] == [outcome]
         assert impersonation_refused(_URL) is True
 
     async def test_the_memo_saves_the_second_url_on_the_host(self, monkeypatch, caplog):
@@ -301,11 +307,13 @@ class TestImpersonateRungStillRefused:
         assert impersonation_refused(_URL) is True
         assert any("answered 403 by edge.example.net (blocked)" in message for message in caplog.messages)
 
-    @pytest.mark.parametrize(("status", "outcome"), [(404, "not_found"), (410, "not_found"), (503, "error")])
+    @pytest.mark.parametrize(("status", "outcome"), [(404, "not_found"), (410, "not_found"), (500, "error")])
     async def test_a_non_block_answer_stamps_its_own_outcome_and_does_not_memoize(self, monkeypatch, status, outcome):
         """`not_found` and `error` are in the rung's outcome domain too: `_NON_OK_FETCH_STATUS` maps
-        404 and 410, and every other non-200 falls through to its `error` default. Neither says
-        anything about the host's view of our fingerprint, so neither writes the memo."""
+        404 and 410, and every other non-200 falls through to its `error` default. A 404 says the
+        path is gone and a 500 that the origin fell over, and neither says anything about the host's
+        view of our fingerprint, so neither writes the memo (a 503 is the exception: the edge's
+        interstitial, memoized above)."""
         _transport(monkeypatch, _impersonated(status, body=b""))
 
         result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))

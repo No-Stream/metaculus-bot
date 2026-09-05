@@ -1019,10 +1019,13 @@ position among the earlier rungs is a reading choice, because the browser rungs 
 `blocked`. Free (no key, no model, no spend), floored at
 `RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S` like the other one-GET rungs, never fast-path
 gated, memoized per HOST for the run once a host answers the impersonated client with a block
-status (the memo is process-global and shared with gap-fill v2, which dials the same transport
-from both of its free ladders, the `fetch` tool's and `read_document`'s local acquisition; the
-transport writes it for the host dialed AND the host that answered, since the impersonated
-client follows redirects itself and the block can come from a later hop), and behind a kill
+status (`IMPERSONATE_BLOCK_STATUSES`: the three `blocked` rows of the status table, 403, 406 and
+429, plus 401 and 503, which the fetch line still records as `error` because the status table is
+a telemetry contract and the memo is a policy; the memo is process-global and shared with
+gap-fill v2, which dials the same transport from both of its free ladders, the `fetch` tool's
+and `read_document`'s local acquisition; the transport writes it for the host dialed AND the
+host that answered, since the impersonated client follows redirects itself and the block can
+come from a later hop), and behind a kill
 switch that is ON by default in code, `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, unlike the paid
 rung's default-off. The trigger set, the block-shaped set the memo keys on and the kill switch
 all live on the transport (`IMPERSONATE_TRIGGER_STATUSES`, `IMPERSONATE_BLOCK_STATUSES`,

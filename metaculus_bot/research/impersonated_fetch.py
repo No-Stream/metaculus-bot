@@ -109,10 +109,19 @@ IMPERSONATE_TRIGGER_STATUSES: frozenset[int] = frozenset({403})
 
 # The impersonated answers that switch the host off for the rest of the run: every status the
 # fetch vocabulary calls ``blocked``, derived from the one table both fetch paths already read
-# rather than spelled a third time. A 404 says the path is gone and a 200 whose body classified
-# as a JavaScript wall means the fingerprint DID get us in, so neither is here.
+# rather than spelled a third time, plus two refusals that table records as ``error`` and the
+# rung keeps stamping that way (the table is a telemetry contract; this set is a memo policy).
+# A 404 says the path is gone and a 200 whose body classified as a JavaScript wall means the
+# fingerprint DID get us in, so neither is here.
 IMPERSONATE_BLOCK_STATUSES: frozenset[int] = frozenset(
     status for status, fetch_status in _NON_OK_FETCH_STATUS.items() if fetch_status == "blocked"
+) | frozenset(
+    {
+        # An authentication wall raised for the impersonated client; no fingerprint gets past it.
+        401,
+        # The challenge interstitial an edge serves a client it has scored, in place of the page.
+        503,
+    }
 )
 
 # The declared types the larger body cap applies to: the same declared-PDF test both callers'

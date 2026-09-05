@@ -69,6 +69,7 @@ from metaculus_bot.research.impersonated_fetch import (
     note_refusal_if_block_shaped,
     reset_impersonation_memo,
 )
+from metaculus_bot.research.resolution_fetch_result import _NON_OK_FETCH_STATUS
 
 _URL = "https://www.example.com/report"
 _HOST = "www.example.com"
@@ -298,16 +299,19 @@ class TestPolicy:
     def test_the_trigger_set_is_403_only(self) -> None:
         assert frozenset({403}) == IMPERSONATE_TRIGGER_STATUSES
 
-    def test_the_block_set_is_derived_from_the_one_status_table(self) -> None:
-        """Not a third copy of ``{403, 406, 429}``: the set is every status the fetch vocabulary
-        calls ``blocked``, read off the one table both fetch paths already share."""
-        from metaculus_bot.research.resolution_fetch_result import _NON_OK_FETCH_STATUS
+    def test_the_block_set_is_the_blocked_rows_plus_the_two_edge_refusals(self) -> None:
+        """Every status the fetch vocabulary calls ``blocked``, read off the one table both fetch
+        paths already share rather than spelled a third time, plus 401 and 503: an authentication
+        wall and a challenge interstitial the edge puts up for the impersonated client. Neither is
+        a ``blocked`` row, so the rung keeps stamping ``error`` for them (a telemetry table is not
+        touched to widen a memo), and without them a host refusing both clients with a 503 earned a
+        full impersonated dial per cited URL inside one provider wall."""
+        blocked_rows = frozenset(status for status, token in _NON_OK_FETCH_STATUS.items() if token == "blocked")
 
-        assert (
-            frozenset(status for status, token in _NON_OK_FETCH_STATUS.items() if token == "blocked")
-            == IMPERSONATE_BLOCK_STATUSES
-        )
-        assert frozenset({403, 406, 429}) == IMPERSONATE_BLOCK_STATUSES
+        assert blocked_rows < IMPERSONATE_BLOCK_STATUSES
+        assert frozenset({401, 403, 406, 429, 503}) == IMPERSONATE_BLOCK_STATUSES
+        assert _NON_OK_FETCH_STATUS.get(401, "error") == "error"
+        assert _NON_OK_FETCH_STATUS.get(503, "error") == "error"
 
     def test_the_kill_switch_defaults_on_and_honours_an_explicit_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("RESOLUTION_SOURCE_IMPERSONATE_ENABLED", raising=False)

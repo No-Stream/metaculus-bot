@@ -2180,7 +2180,9 @@ async def _impersonate_rung(
     hop rather than that nothing was dialed. A non-200 answer stamps the rung's own outcome
     (``blocked`` for a still-403, so the escalation line reads ``rung=impersonate
     outcome=blocked``; ``not_found`` for a 404 or 410; ``error`` for anything else), memoizes the
-    host when the status is block-shaped, and returns None. A 200 goes through
+    host when the status is block-shaped (``impersonated_fetch.IMPERSONATE_BLOCK_STATUSES``: the
+    three ``blocked`` rows of the status table plus 401 and 503, which stamp ``error`` here and
+    still switch the host off), and returns None. A 200 goes through
     :func:`_impersonated_body_outcome`, the same classification a direct 200 gets, and is returned
     ONLY when it is ``success``. An impersonated 200 that classified as unreadable stamps its
     verdict on the attempt (``outcome=js_wall``) and leaves ``blocked`` standing, because
