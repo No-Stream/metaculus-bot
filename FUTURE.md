@@ -2936,6 +2936,18 @@ re-pinned hop under the shared `MAX_REDIRECTS` cap, dialed impersonated because 
 the direct client. The browser rung has no such decision to make: Chromium follows a meta refresh
 itself and the route guard re-checks the hop, which is why `RenderedPage.document_url` exists.
 
+### Cross-question host-gate contention from the impersonation rung (added 2026-09-04; LOW)
+
+The impersonation rung acquires the shared per-host politeness semaphore once more per 403, on top of
+the direct fetch and any later rung, so several questions citing the same refusing host in one run
+queue behind each other inside their claimed budgets. The wait is bounded by the budget re-check after
+the gate is acquired (a spent budget declines without dialing), so the 45 s provider wall is safe, and
+the free suite cannot measure how often the queue costs a rescue. Only a real multi-question run can,
+and every bot run is a paid surface, so the measurement waits for the season's first archived runs:
+compare `impersonate_budget_skips` against `impersonate_attempts` across questions sharing a host. A
+non-trivial skip share would argue for a per-host memo of "answered 200 under impersonation" that
+lets later questions skip the queue, which is a design change and not a tuning knob.
+
 ### Chromium teardown noise after a render: cause found, fix not shipped (added 2026-09-03; LOW)
 
 The phase-3 QA sweep (`/tmp/fetchprobe/qa_report_phase3.md`, P3-10) still saw two
