@@ -24,14 +24,20 @@ So this script runs four probes per URL and prints one table plus a ladder block
   D  the real Tier-1 provider entry point, ``fetch_resolution_sources``, run on the
      URL alone: the direct fetch plus every FREE rung of the escalation ladder (the
      impersonation rung among them), reported as the status, the route and the rung
-     outcomes production would record. A row whose impersonate ATTEMPT came back
-     anything but ``blocked`` on an Akamai host, from the runner, is the live proof
-     that the rung works from production egress; B says the fingerprint is the
-     problem, D says the shipped code fixes it. Note the route read is NOT
-     ``route=impersonate``: an impersonated document rescue fires ``pdf_local`` after
-     ``impersonate``, so ``route`` (the last rung that fired) reads ``pdf_local`` while
-     the impersonate attempt itself succeeded. Column D reads the impersonate ATTEMPT,
-     not the route, for exactly that reason.
+     outcomes production would record. A row whose impersonate ATTEMPT answered on an
+     Akamai host, from the runner, is the live proof that the rung works from
+     production egress; B says the fingerprint is the problem, D says the shipped
+     code fixes it. The verdict sorts every URL column B recovered into four buckets
+     read off that one attempt and nothing else (``LadderOutcome.impersonate_verdict``):
+     ``answered`` (the attempt fired and its outcome is neither ``blocked`` nor
+     ``error``), ``still_blocked`` (fired, outcome ``blocked``), ``errored`` (fired,
+     outcome ``error``: a 5xx interstitial) and ``not_attempted`` (skipped or never
+     reached). Neither ``route`` nor the final ``status`` is a usable signal: an
+     impersonated document rescue fires ``pdf_local`` after ``impersonate``, so ``route``
+     (the last rung that fired) reads ``pdf_local``, and this probe carries no query, so
+     a rescued document digests to ``no_resolving_content`` or ends ``blocked`` downstream
+     however well the fetch went, while a decline the archive then rescues ends
+     ``success`` with the attempt still ``blocked``.
 
 Everything here is free: no LLM call, no API key spent, no paid provider, and no write
 of any kind. Column D runs the production escalation ladder, whose one PAID rung (the
@@ -55,14 +61,16 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 from urllib.parse import urlparse
 
 import aiohttp
+from curl_cffi import CurlError
 from curl_cffi import requests as curl_requests
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_MAX_RESPONSE_BYTES, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research.http_fetch import read_body_capped
+from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.resolution_fetch_result import FetchResult, RungAttempt
 from metaculus_bot.research.resolution_source import _get_session, fetch_resolution_sources, is_public_http_url
 from metaculus_bot.research.wayback import parse_snapshot_url, snapshot_age_days, wayback_snapshot_url
@@ -190,7 +198,9 @@ def probe_impersonated(url: str) -> ProbeOutcome:
     """
     try:
         resp = curl_requests.get(url, impersonate="chrome", allow_redirects=True, timeout=_IMPERSONATE_TIMEOUT_S)
-    except (curl_requests.RequestsError, OSError) as exc:
+    # ``CurlError`` is the bare parent ``RequestsError`` subclasses: a rejected option or the multi
+    # layer raises it, and uncaught it aborted the whole table mid-row on one host's failure.
+    except (curl_requests.RequestsError, CurlError, OSError) as exc:
         return ProbeOutcome(None, 0, _short_error(exc))
     server = (resp.headers.get("Server") or "").strip()[:_SERVER_HEADER_MAX_CHARS]
     # Server header AND round-trip time on the note: an Akamai 403 comes back near-instantly
@@ -212,7 +222,7 @@ def probe_wayback(url: str) -> ProbeOutcome:
         resp = curl_requests.get(
             archive_url, impersonate="chrome", allow_redirects=True, timeout=_IMPERSONATE_TIMEOUT_S
         )
-    except (curl_requests.RequestsError, OSError) as exc:
+    except (curl_requests.RequestsError, CurlError, OSError) as exc:
         return ProbeOutcome(None, 0, _short_error(exc))
     return ProbeOutcome(resp.status_code, len(resp.content), _snapshot_note(resp.url))
 
@@ -240,6 +250,17 @@ def _snapshot_note(final_url: str) -> str:
     return f"{stamp} ({int(age_days)}d old)"
 
 
+# What the impersonate ATTEMPT itself says about a URL, and the only signal the verdict reads.
+# ``answered``: the attempt fired and its outcome is neither ``blocked`` nor ``error``, so the
+# fingerprint got a response from the edge. ``still_blocked``: fired and refused again (a pin
+# that did not hold or a transport failure also closes on the direct ``blocked``, which is why
+# the sentence points at the run log). ``errored``: fired and answered with a status the fetch
+# vocabulary calls ``error``, a 5xx interstitial, which is neither a rescue nor a refusal and
+# must not be lumped with either. ``not_attempted``: skipped (no budget, the kill switch, the
+# memo) or never reached.
+ImpersonateVerdict = Literal["answered", "still_blocked", "errored", "not_attempted"]
+
+
 class LadderOutcome(NamedTuple):
     """Probe D's result: what the production ladder recorded for the URL."""
 
@@ -256,22 +277,35 @@ class LadderOutcome(NamedTuple):
         return f"{head} {' '.join(_render_rung_attempt(attempt) for attempt in self.rung_attempts)}"
 
     @property
-    def impersonation_answered(self) -> bool:
-        """The impersonated retry fired on this URL and came back anything but still-blocked.
+    def impersonate_attempt(self) -> RungAttempt | None:
+        """The impersonate attempt that FIRED on this URL, or None when it was skipped or never reached."""
+        for attempt in self.rung_attempts:
+            if attempt.rung == "impersonate" and not attempt.skipped_reason:
+                return attempt
+        return None
 
-        Keyed on the rung's own ATTEMPT rather than on ``route``, and on "not blocked" rather than
-        on "success", for two reasons the route reading cannot honour. ``route`` is the LAST rung
-        that fired, and an impersonated document rescue fires ``pdf_local`` after ``impersonate``,
-        so a working PDF rescue reads ``route=pdf_local`` (F3). And this probe carries no query, so
-        ``select_passages`` returns nothing and a rescued document digests to ``no_resolving_content``
-        however well the fetch went, which a ``success`` predicate would read as a defect. What the
-        rung proves from production egress is that it DIALED and was not refused, which is
-        ``outcome != "blocked"`` on a fired (un-skipped) impersonate attempt.
+    @property
+    def impersonate_verdict(self) -> ImpersonateVerdict:
+        """Classify the URL by its impersonate ATTEMPT alone, never by ``route`` or the final ``status``.
+
+        Neither of those is a usable signal, and both misread the 2026-09-04 corpus. ``route`` is
+        the LAST rung that fired, and an impersonated document rescue fires ``pdf_local`` after
+        ``impersonate``, so a working PDF rescue reads ``route=pdf_local`` (F3). The final ``status``
+        mixes in every later rung: this probe carries no query, so ``select_passages`` returns
+        nothing and a rescued document digests to ``no_resolving_content`` or leaves ``blocked``
+        standing however well the fetch went (the ``wkstp.pdf`` row printed as still blocked that
+        way), while a decline the archive then rescues ends ``success`` with the attempt still
+        ``blocked``. What the rung proves from production egress is what its own attempt recorded:
+        that it DIALED, and whether the edge answered, refused, or served an interstitial.
         """
-        return any(
-            attempt.rung == "impersonate" and not attempt.skipped_reason and attempt.outcome != "blocked"
-            for attempt in self.rung_attempts
-        )
+        attempt = self.impersonate_attempt
+        if attempt is None:
+            return "not_attempted"
+        if attempt.outcome == "blocked":
+            return "still_blocked"
+        if attempt.outcome == "error":
+            return "errored"
+        return "answered"
 
 
 def _render_rung_attempt(attempt: RungAttempt) -> str:
@@ -334,6 +368,11 @@ async def read_egress_ip(session: aiohttp.ClientSession) -> str:
 async def run_probes(session: aiohttp.ClientSession, pacer: HostPacer) -> list[ProbeRow]:
     rows: list[ProbeRow] = []
     for probe_url in PROBE_URLS:
+        # Every row is an independent measurement of the ladder. The transport's refused-host memo
+        # is process-global by design (a bot run should not re-dial a host that refused it), but
+        # two rows here share a host (bls.gov), and a memo hit on the second would print as the
+        # rung never firing rather than as what that URL's edge does to the fingerprint.
+        reset_impersonation_memo()
         await pacer.wait(probe_url.url)
         bot = await probe_bot_client(session, probe_url.url)
         await pacer.wait(probe_url.url)
@@ -398,14 +437,41 @@ def _hosts(subset: list[ProbeRow]) -> str:
     return ", ".join(seen) or "none"
 
 
+class VerdictBuckets(NamedTuple):
+    """Column D's reading of every URL column B recovered, one bucket per :data:`ImpersonateVerdict`.
+
+    The four lists PARTITION the rows handed in: every row lands in exactly one, so the sentence
+    built from them accounts for the whole population and never lumps a 5xx interstitial in
+    with a rescue or a refusal.
+    """
+
+    answered: list[ProbeRow]
+    still_blocked: list[ProbeRow]
+    errored: list[ProbeRow]
+    not_attempted: list[ProbeRow]
+
+
+def verdict_buckets(helped: list[ProbeRow]) -> VerdictBuckets:
+    """Sort ``helped`` by each row's impersonate attempt (:attr:`LadderOutcome.impersonate_verdict`)."""
+    by_verdict: dict[ImpersonateVerdict, list[ProbeRow]] = {
+        "answered": [],
+        "still_blocked": [],
+        "errored": [],
+        "not_attempted": [],
+    }
+    for row in helped:
+        by_verdict[row.ladder.impersonate_verdict].append(row)
+    return VerdictBuckets(**by_verdict)
+
+
 def print_verdict(rows: list[ProbeRow]) -> None:
     """Print the one paragraph the operator actually reads."""
     helped = [r for r in rows if r.bot.status == 403 and r.impersonated.status == 200]
     both_refused = [r for r in rows if r.bot.status == 403 and r.impersonated.status == 403]
     both_ok = [r for r in rows if r.bot.status == 200 and r.impersonated.status == 200]
     archived = [r for r in rows if r.wayback.status == 200]
-    answered = [r for r in rows if r.ladder.impersonation_answered]
-    still_blocked = [r for r in helped if r.ladder.status == "blocked"]
+    buckets = verdict_buckets(helped)
+    answered_elsewhere = [r for r in rows if r not in helped and r.ladder.impersonate_verdict == "answered"]
 
     print("Verdict")
     print(
@@ -419,11 +485,16 @@ def print_verdict(rows: list[ProbeRow]) -> None:
         "treating any of them as a live source."
     )
     print(
-        f"  The production ladder's impersonate attempt answered on {_count(answered)} ({_hosts(answered)}); read "
-        "the attempt, not route=, since an impersonated PDF rescue fires pdf_local after impersonate. "
-        f"{_count(still_blocked)} that column B recovered came back still blocked from the ladder "
-        f"({_hosts(still_blocked)}); read those rows' rung pairs and the run log for an ImpersonatePinNotHeld "
-        "error or a failure_class=tls before merging."
+        f"  Of the {_count(helped)} column B recovered, the production ladder's impersonate attempt answered on "
+        f"{_count(buckets.answered)} ({_hosts(buckets.answered)}), came back still blocked on "
+        f"{_count(buckets.still_blocked)} ({_hosts(buckets.still_blocked)}), was answered with an error status such "
+        f"as a 5xx interstitial on {_count(buckets.errored)} ({_hosts(buckets.errored)}), and never fired on "
+        f"{_count(buckets.not_attempted)} ({_hosts(buckets.not_attempted)}). Every bucket reads the impersonate "
+        "ATTEMPT alone, never route= or the final status: an impersonated PDF rescue fires pdf_local after "
+        "impersonate, and with no query a rescued document ends no_resolving_content or blocked downstream however "
+        "well the fetch went. Read the still-blocked rows' rung pairs and the run log for an ImpersonatePinNotHeld "
+        f"error or a failure_class=tls before merging. Outside that population the attempt answered on "
+        f"{_count(answered_elsewhere)} ({_hosts(answered_elsewhere)})."
     )
 
 

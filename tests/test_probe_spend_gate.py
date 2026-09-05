@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, Literal
+from urllib.parse import urlparse
 
 import pytest
 from google.genai import types as genai_types
@@ -42,6 +44,7 @@ from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import reset_host_semaphores
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
+from metaculus_bot.research.resolution_fetch_result import FetchRoute, FetchStatus, RungAttempt, RungSkipReason
 from metaculus_bot.research.robots_policy import reset_robots_cache
 from scripts.probes import fetch_diagnostic, gemini_verify
 from tests.resolution_source_fakes import _URL, _impersonated, arm_paid_rung, paid_reader, refused_page_with_robots
@@ -172,14 +175,19 @@ class TestFetchDiagnosticForcesThePaidRungOff:
     """
 
     @pytest.fixture
-    def forced_403_ladder(self, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    def forced_403_ladder(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]:
         """Arm the paid rung, force the 403 population, and neutralise the intervening free rungs.
 
         The reader spy is armed (flag on, key set, budget granted) so a call would be recorded; the
         cited page answers 403 via ``refused_page_with_robots`` so the ladder reaches the paid gate;
         and the impersonation, browser and Wayback rungs are stubbed to decline without a network
-        hop so the only rung whose gate is under test is ``url_context``. Returns the reader's
+        hop so the only rung whose gate is under test is ``url_context``. Yields the reader's
         recorded calls.
+
+        The three resets run on the way out as well as on the way in, matching
+        ``tests/resolution_source/conftest.py``: the stubbed still-403 writes ``tracker.example.com``
+        into the process-global refused-host memo, and a setup-only reset left that entry for every
+        module collected after this one.
         """
         reset_host_semaphores()
         reset_robots_cache()
@@ -212,7 +220,10 @@ class TestFetchDiagnosticForcesThePaidRungOff:
 
         monkeypatch.setattr(resolution_source, "render_page", _no_browser)
         monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", frozenset())
-        return calls
+        yield calls
+        reset_host_semaphores()
+        reset_robots_cache()
+        reset_impersonation_memo()
 
     async def test_the_forced_population_would_otherwise_reach_the_paid_reader(
         self, forced_403_ladder: list[dict[str, Any]]
@@ -278,3 +289,183 @@ class TestFetchDiagnosticForcesThePaidRungOff:
         assert order[0] == "force"
         assert order.index("force") < order.index("probes")
         assert os.environ[RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV] == "false"
+
+
+def _attempt(
+    rung: FetchRoute, outcome: FetchStatus | None, *, skipped: RungSkipReason | Literal[""] = ""
+) -> RungAttempt:
+    """One closed rung attempt as the dispatcher leaves it: ``outcome`` stamped, or a skip reason."""
+    return RungAttempt(
+        rung=rung, from_status="blocked", url=_URL, started_at=0.0, wall_s=0.3, outcome=outcome, skipped_reason=skipped
+    )
+
+
+def _ladder(status: str, route: str, *attempts: RungAttempt) -> fetch_diagnostic.LadderOutcome:
+    return fetch_diagnostic.LadderOutcome(
+        status=status, route=route, http_status=200 if status == "success" else 403, n_chars=0, rung_attempts=attempts
+    )
+
+
+def _row(url: str, *, bot: int | None, impersonated: int | None, ladder: fetch_diagnostic.LadderOutcome) -> Any:
+    """A probe row whose columns A and B are the synthetic statuses and whose column D is ``ladder``."""
+    return fetch_diagnostic.ProbeRow(
+        probe_url=fetch_diagnostic.ProbeUrl(url, "synthetic"),
+        bot=fetch_diagnostic.ProbeOutcome(bot, 512, "AkamaiGHost"),
+        impersonated=fetch_diagnostic.ProbeOutcome(impersonated, 512, "AkamaiGHost 0.3s"),
+        wayback=fetch_diagnostic.ProbeOutcome(200, 512, "20260901000000 (3d old)"),
+        ladder=ladder,
+    )
+
+
+class TestFetchDiagnosticVerdict:
+    """The verdict paragraph is the sentence the operator's merge decision is read from, and its D
+    buckets read ONE signal: the impersonate attempt that fired on the URL, never ``route`` (the
+    last rung that fired) and never the ladder's final ``status`` (which mixes in every later
+    rung). The corpus misfired both ways on the final status: the ``wkstp.pdf`` rescue, digested
+    with an empty query, ended ``blocked`` downstream and printed as still blocked, and a decline
+    the archive then served ended ``success`` and printed as recovered. No network, no provider:
+    every ``LadderOutcome`` here is built from synthetic ``RungAttempt``s.
+    """
+
+    # Column B recovered every one of these (A 403, B 200); column D differs per row.
+    RESCUED_HTML = _row(
+        "https://www.bls.gov/wsp/",
+        bot=403,
+        impersonated=200,
+        ladder=_ladder("success", "impersonate", _attempt("impersonate", "success")),
+    )
+    # The bls.gov PDF: the impersonated fetch worked, the local read fired after it and, with no
+    # query to select passages, digested to no_resolving_content, so the direct blocked stood.
+    RESCUED_PDF_ENDING_BLOCKED = _row(
+        "https://www.bls.gov/news.release/pdf/wkstp.pdf",
+        bot=403,
+        impersonated=200,
+        ladder=_ladder(
+            "blocked",
+            "pdf_local",
+            _attempt("impersonate", "no_resolving_content"),
+            _attempt("pdf_local", "no_resolving_content"),
+        ),
+    )
+    RESCUED_PDF_ENDING_NO_CONTENT = _row(
+        "https://www.bls.gov/opub/ted/2026/report.pdf",
+        bot=403,
+        impersonated=200,
+        ladder=_ladder(
+            "no_resolving_content",
+            "pdf_local",
+            _attempt("impersonate", "no_resolving_content"),
+            _attempt("pdf_local", "no_resolving_content"),
+        ),
+    )
+    STILL_403 = _row(
+        "https://www.fsis.usda.gov/",
+        bot=403,
+        impersonated=200,
+        ladder=_ladder("blocked", "impersonate", _attempt("impersonate", "blocked")),
+    )
+    ANSWERED_503 = _row(
+        "https://www.cdc.gov/cyclosporiasis/php/surveillance/index.html",
+        bot=403,
+        impersonated=200,
+        ladder=_ladder("blocked", "impersonate", _attempt("impersonate", "error")),
+    )
+    # A genuine ImpersonatePinNotHeld decline: the rung fired and closed on the direct blocked,
+    # then Wayback served the page, so the FINAL status is success with the attempt still blocked.
+    PIN_NOT_HELD_THEN_ARCHIVED = _row(
+        "https://www.congress.gov/bill/119th-congress/house-bill/2913",
+        bot=403,
+        impersonated=200,
+        ladder=_ladder(
+            "success",
+            "wayback",
+            _attempt("impersonate", "blocked"),
+            _attempt("wayback", "success"),
+        ),
+    )
+    NEVER_FIRED = _row(
+        "https://tracxn.com/d/companies/deepseek/x",
+        bot=403,
+        impersonated=200,
+        ladder=_ladder("blocked", "direct", _attempt("impersonate", None, skipped="wall_budget")),
+    )
+    # Not in the recovered population: A got 200, so the rung had nothing to do.
+    OPEN_CONTROL = _row(
+        "https://en.wikipedia.org/wiki/Nuri_(rocket)",
+        bot=200,
+        impersonated=200,
+        ladder=_ladder("success", "direct"),
+    )
+    # Not in the recovered population either (B was refused), yet the shipped rung got through:
+    # column B and column D diverging is itself a finding, so it is counted on its own.
+    DIVERGENT = _row(
+        "https://www.trueup.io/big-tech-hiring",
+        bot=403,
+        impersonated=403,
+        ladder=_ladder("success", "impersonate", _attempt("impersonate", "success")),
+    )
+    HELPED = (
+        RESCUED_HTML,
+        RESCUED_PDF_ENDING_BLOCKED,
+        RESCUED_PDF_ENDING_NO_CONTENT,
+        STILL_403,
+        ANSWERED_503,
+        PIN_NOT_HELD_THEN_ARCHIVED,
+        NEVER_FIRED,
+    )
+    ROWS = (*HELPED, OPEN_CONTROL, DIVERGENT)
+
+    @pytest.mark.parametrize(
+        ("row", "verdict"),
+        [
+            (RESCUED_HTML, "answered"),
+            (RESCUED_PDF_ENDING_BLOCKED, "answered"),
+            (RESCUED_PDF_ENDING_NO_CONTENT, "answered"),
+            (STILL_403, "still_blocked"),
+            (ANSWERED_503, "errored"),
+            (PIN_NOT_HELD_THEN_ARCHIVED, "still_blocked"),
+            (NEVER_FIRED, "not_attempted"),
+            (OPEN_CONTROL, "not_attempted"),
+            (DIVERGENT, "answered"),
+        ],
+        ids=lambda value: value if isinstance(value, str) else urlparse(value.probe_url.url).netloc,
+    )
+    def test_the_verdict_reads_the_impersonate_attempt_alone(self, row: Any, verdict: str) -> None:
+        assert row.ladder.impersonate_verdict == verdict
+
+    def test_the_four_buckets_partition_the_recovered_population(self) -> None:
+        buckets = fetch_diagnostic.verdict_buckets(list(self.HELPED))
+
+        assert buckets.answered == [
+            self.RESCUED_HTML,
+            self.RESCUED_PDF_ENDING_BLOCKED,
+            self.RESCUED_PDF_ENDING_NO_CONTENT,
+        ]
+        assert buckets.still_blocked == [self.STILL_403, self.PIN_NOT_HELD_THEN_ARCHIVED]
+        assert buckets.errored == [self.ANSWERED_503]
+        assert buckets.not_attempted == [self.NEVER_FIRED]
+        placed = [*buckets.answered, *buckets.still_blocked, *buckets.errored, *buckets.not_attempted]
+        assert sorted(placed, key=lambda r: r.probe_url.url) == sorted(self.HELPED, key=lambda r: r.probe_url.url)
+        assert len(placed) == len(self.HELPED), "a row landed in two buckets or in none"
+
+    def test_the_sentence_names_each_bucket_with_its_hosts(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The final status would have printed the working PDF rescue as still blocked and the
+        archived pin failure as recovered; the sentence built from the attempt says the opposite,
+        and the 503 answer sits in its own clause rather than in either."""
+        fetch_diagnostic.print_verdict(list(self.ROWS))
+
+        out = capsys.readouterr().out
+        assert "Of the 7 URLs column B recovered" in out
+        assert "answered on 3 URLs (www.bls.gov)" in out
+        assert "still blocked on 2 URLs (www.fsis.usda.gov, www.congress.gov)" in out
+        assert "5xx interstitial on 1 URL (www.cdc.gov)" in out
+        assert "never fired on 1 URL (tracxn.com)" in out
+        assert "Outside that population the attempt answered on 1 URL (www.trueup.io)" in out
+        assert "reads the impersonate ATTEMPT alone, never route= or the final status" in out
+
+    def test_an_empty_run_still_prints_a_well_formed_verdict(self, capsys: pytest.CaptureFixture[str]) -> None:
+        fetch_diagnostic.print_verdict([])
+
+        out = capsys.readouterr().out
+        assert "Of the 0 URLs column B recovered" in out
+        assert "answered on 0 URLs (none)" in out
