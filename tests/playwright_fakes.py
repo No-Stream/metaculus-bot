@@ -113,11 +113,15 @@ class FakePage:
     """A page that replays a fixed list of response events during ``goto``.
 
     ``content_hangs`` is the ogimet shape (P3-1): a DOM read that never answers because the page
-    keeps navigating. ``goto_raises`` is the salvage shape: the navigation times out with the DOM
-    already rendered. ``goto_runs_its_budget_out`` puts the clock on that shape: the navigation
-    sleeps for its whole ``timeout`` before it raises or returns, as a real goto timeout does,
-    so a test can measure what the transport spends AFTER the budget is gone. ``status`` is the
-    main-frame response's HTTP status.
+    keeps navigating. ``content_raises`` is the driver's other answer to that page: in Playwright
+    1.61 ``Frame.content()`` evaluates ``outerHTML`` once and, when the page navigates
+    mid-evaluate, raises its plain ``Error("Unable to retrieve content because the page is
+    navigating and changing the content.")`` rather than a ``TimeoutError``. ``goto_raises`` is the
+    salvage shape: the navigation times out with the DOM already rendered.
+    ``goto_runs_its_budget_out`` puts the clock on that shape: the navigation sleeps for its whole
+    ``timeout`` before it raises or returns, as a real goto timeout does, so a test can measure
+    what the transport spends AFTER the budget is gone. ``status`` is the main-frame response's
+    HTTP status.
 
     ``land_on`` is where the main frame ends up, when that is not the URL ``goto`` was given: the
     server-side redirect hop Playwright follows without consulting any route handler. ``url``
@@ -142,6 +146,7 @@ class FakePage:
         *,
         html: str = DEFAULT_DOM,
         content_hangs: bool = False,
+        content_raises: BaseException | None = None,
         goto_raises: BaseException | None = None,
         goto_runs_its_budget_out: bool = False,
         status: int = 200,
@@ -150,6 +155,7 @@ class FakePage:
         self._responses = responses or []
         self._html = html
         self._content_hangs = content_hangs
+        self._content_raises = content_raises
         self._goto_raises = goto_raises
         self._goto_runs_its_budget_out = goto_runs_its_budget_out
         self._status = status
@@ -201,6 +207,8 @@ class FakePage:
         # The real read is a round trip; yielding here lets the detached handler tasks run
         # between goto and the snapshot, which is where the un-joined harvest lost bodies.
         await asyncio.sleep(0)
+        if self._content_raises is not None:
+            raise self._content_raises
         return self._html
 
 

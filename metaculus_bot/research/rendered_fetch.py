@@ -52,14 +52,15 @@ logger = logging.getLogger(__name__)
 RENDER_TIMEOUT_MS: int = 35_000
 RENDER_SETTLE_MS: int = 2_000
 # Bound on ``page.content()``. On a settled DOM it is a sub-second round trip to the browser; it
-# runs long only when the page keeps navigating after the settle, which Playwright retries
-# internally before giving up ("the page is navigating and changing the content"). Measured
-# 2026-09-03 on ogimet.com: the goto timed out at 33 s as designed, the settle ran, and the
-# unbounded read then blocked for a further 40 s, so the render ran 76 s against a Tier-1
-# provider wall of 45 s and every page that question had already fetched was discarded. A DOM
-# that has not answered in this long is one that will not settle. Fixed rather than derived
-# from the remaining goto budget, because the read that matters most is the salvage AFTER a
-# goto timeout, when that remainder is zero by construction.
+# runs long only when the page keeps navigating after the settle. Measured 2026-09-03 on
+# ogimet.com: the goto timed out at 33 s as designed, the settle ran, and the unbounded read then
+# blocked for a further 40 s, so the render ran 76 s against a Tier-1 provider wall of 45 s and
+# every page that question had already fetched was discarded. A DOM that has not answered in this
+# long is one that will not settle. The pinned 1.61 driver does NOT retry the read: it evaluates
+# ``outerHTML`` once and, when the page navigates mid-evaluate, raises its plain ``Error`` ("the
+# page is navigating and changing the content"), which :func:`_navigate_and_read_dom` reads as the
+# same cut-off. Fixed rather than derived from the remaining goto budget, because the read that
+# matters most is the salvage AFTER a goto timeout, when that remainder is zero by construction.
 RENDER_DOM_READ_TIMEOUT_MS: int = 5_000
 # What a render spends AFTER its goto returns or times out, at worst: the settle, then the DOM
 # read at its bound. A caller-derived deadline has to leave this much room past the goto, or the
@@ -147,6 +148,15 @@ _JSON_CONTENT_TYPE_TOKENS = ("application/json", "text/json", "+json")
 
 class RenderTimeout(TimeoutError):
     """A render that ran and was CUT OFF, or a URL whose render already was in this run.
+
+    "Cut off" has two shapes, and both are the page keeping on navigating after the settle: the
+    DOM read outlives ``RENDER_DOM_READ_TIMEOUT_MS``, or the browser refuses it first, because the
+    pinned 1.61 driver evaluates ``outerHTML`` once and raises its plain ``Error`` ("Unable to
+    retrieve content because the page is navigating and changing the content.") when the document
+    changes under the evaluate. The second is caught at that one call and re-raised as this class,
+    since at the transport's Playwright boundary it read as "the renderer is unavailable", burned
+    the once-per-run warn latch (so a real install failure later in the run logged nothing) and
+    wrote no memo (so the next question relaunched Chromium for the same page).
 
     A subclass of the builtin so both callers' ``except TimeoutError`` catch it unchanged, and a
     class of its own so the transport can tell its deliberate cut-off from a raw OS-level
@@ -660,7 +670,10 @@ async def _navigate_and_read_dom(
     The DOM read is bounded by ``RENDER_DOM_READ_TIMEOUT_MS`` and raises :class:`RenderTimeout`
     when it fires — deliberately NOT swallowed into the salvage, because a page that keeps
     navigating has no DOM to salvage and the caller needs to tell this from a browser that is
-    missing or broken (see :func:`render_page`). The timed-out memo for ``memo_scope`` is written
+    missing or broken (see :func:`render_page`). The browser's own refusal of the read, Playwright's
+    plain ``Error`` for a page that navigated during the evaluate, is the same fact about the page
+    and is caught at this one call and raised as the same class; every other Playwright error on
+    the render path keeps its own boundary. The timed-out memo for ``memo_scope`` is written
     here, immediately before the raise, so it lands even when the caller's own cut arrives while
     the exception is still unwinding through teardown. The harvest's in-flight body reads are
     drained INSIDE what is left of that same bound, never after it, and no later than the
@@ -699,6 +712,18 @@ async def _navigate_and_read_dom(
         _note_render_timeout(url, memo_scope=memo_scope)
         raise RenderTimeout(
             f"the DOM read of {urlparse(url).netloc} outlived {RENDER_DOM_READ_TIMEOUT_MS}ms: the page kept navigating"
+        ) from exc
+    except playwright_error as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # Playwright's own Error class, passed in from the optional import; this one call only
+        # The driver's other answer to the same page (see :class:`RenderTimeout`): in 1.61,
+        # ``Frame.content()`` evaluates ``outerHTML`` once and raises its plain ``Error`` when the
+        # page navigates mid-evaluate. Left to the boundary in ``render_page`` it was classified
+        # as the renderer being unavailable, which latched the once-per-run warning and memoised
+        # nothing. Every Playwright error out of this one call is read as the page rather than the
+        # install; the browser dying during this exact call would ride along, a shape the
+        # 2026-09-04 probe never produced, and the alternative is matching on the message text.
+        _note_render_timeout(url, memo_scope=memo_scope)
+        raise RenderTimeout(
+            f"the browser refused the DOM read of {urlparse(url).netloc}: the page kept navigating ({exc})"
         ) from exc
     # The same check again, on the document the read actually came from. `page.url` is a cached
     # attribute the driver updates on its `navigated` event and `page.content()` is a round trip
@@ -911,8 +936,9 @@ async def render_page(
     :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
 
     A render that ran and was CUT OFF is different, and raises :class:`RenderTimeout` (a
-    builtin ``TimeoutError``) instead: the DOM read outlived ``RENDER_DOM_READ_TIMEOUT_MS``
-    because the page kept navigating. It is not folded into ``None`` because the two mean
+    builtin ``TimeoutError``) instead: the DOM read outlived ``RENDER_DOM_READ_TIMEOUT_MS``, or the
+    browser refused it with its own "navigating" error, because the page kept navigating. It is
+    not folded into ``None`` because the two mean
     different things to a caller — a timeout says nothing about whether Chromium works, so it
     must neither trip the once-per-process unavailable warning nor be recorded as the browser
     being absent — and it is its own class so the Tier-1 rung, which also bounds this whole call
@@ -1020,12 +1046,10 @@ async def render_page(
     # Playwright's TimeoutError derives from its own Error, not the builtin, so this clause never
     # sees one, and a raw OS-level TimeoutError is not a RenderTimeout and falls through to the
     # logged boundary below. The memo was already written at the raise site; only the log is here.
-    except RenderTimeout:
-        logger.warning(
-            "rendered fetch timed out reading the DOM of %s after %dms: the page kept navigating",
-            urlparse(url).netloc,
-            RENDER_DOM_READ_TIMEOUT_MS,
-        )
+    except RenderTimeout as exc:
+        # The exception's own message says which shape it was: the bound firing, or the browser
+        # refusing the read because the page was navigating.
+        logger.warning("rendered fetch timed out reading the DOM of %s: %s", urlparse(url).netloc, exc)
         raise
     except PlaywrightError as exc:
         _warn_playwright_unavailable_once(exc)

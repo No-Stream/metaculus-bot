@@ -1474,6 +1474,55 @@ class TestTheDomReadIsBounded:
         assert rendered is not None
         assert "rendered" in rendered.html
 
+    _NAVIGATING = "Unable to retrieve content because the page is navigating and changing the content."
+
+    async def test_the_browsers_own_navigating_error_is_the_same_cut_off(self, monkeypatch, caplog):
+        """The driver's other answer to the ogimet page. In the pinned Playwright 1.61,
+        ``Frame.content()`` evaluates ``outerHTML`` once and, when the page navigates mid-evaluate,
+        raises its plain ``Error`` (not a ``TimeoutError``) with this message. Caught only at the
+        transport's Playwright boundary, that error was "the renderer is unavailable": it burned the
+        once-per-run warn latch, so a real install failure later in the run logged nothing, and it
+        wrote no memo, so the next question relaunched Chromium for the same page. It is the same
+        fact about the page as the bound firing, and now reaches the caller the same way."""
+        page = FakePage([], content_raises=PlaywrightError(self._NAVIGATING))
+        install_fake_playwright(monkeypatch, page)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="metaculus_bot.research.rendered_fetch"),
+            pytest.raises(rendered_fetch.RenderTimeout) as raised,
+        ):
+            await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert page.content_reads == 1
+        assert isinstance(raised.value.__cause__, PlaywrightError)
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
+        assert rendered_fetch._PLAYWRIGHT_WARNED is False
+        assert not [message for message in caplog.messages if "rung unavailable" in message]
+        assert not [record for record in caplog.records if record.exc_info is not None]
+        (cut_off,) = [record for record in caplog.records if "timed out reading the DOM" in record.getMessage()]
+        assert cut_off.levelno == logging.WARNING
+        assert "navigating" in cut_off.getMessage()
+        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
+
+    async def test_the_tier_1_rung_records_the_navigating_error_as_render_timeout(self, monkeypatch):
+        """Through the real transport and the real caller: the skip token the operator reads is
+        ``render_timeout``, and ``renderer_unavailable`` (the install-failed count) stays at zero."""
+        page = FakePage([], content_raises=PlaywrightError(self._NAVIGATING))
+        install_fake_playwright(monkeypatch, page)
+        direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
+        ctx = FetchContext()
+
+        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+
+        assert result is None
+        assert [attempt.skipped_reason for attempt in ctx.rungs] == ["render_timeout"]
+        direct.rung_attempts = list(ctx.rungs)
+        counts = resolution_source._rung_counts([direct])
+        assert counts["render_timeout_skips"] == 1
+        assert counts["renderer_unavailable_skips"] == 0
+        assert counts["rendered_attempts"] == 0
+        assert rendered_fetch._PLAYWRIGHT_WARNED is False
+
 
 class TestTheFailureBoundary:
     """Every failure out of the browser used to go through one once-per-process warn latch, so a
