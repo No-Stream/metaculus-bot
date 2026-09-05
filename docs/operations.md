@@ -1440,8 +1440,10 @@ the telemetry markers:
   landed_host=<host>`, a WARNING, one per headless-Chromium render whose main frame ended up on a
   host other than the one the transport pinned at launch, emitted by the shared transport
   `research/rendered_fetch.py` and so fired for either caller, which is what `scope` names. The
-  DOM was refused before it was read, so nothing from that render is published and the direct
-  fetch's result stands. Hostnames only, never the landing URL, which can carry a session token.
+  DOM was refused unread on the transport's pre-read check, or discarded unpublished when the
+  navigation committed during the read itself, so nothing from that render is published either way
+  and the direct fetch's result stands. Hostnames only, never the landing URL, which can carry a
+  session token.
   This is the ONLY per-event record of an off-host landing, because a refused render is a skip and
   a skip emits no `RESOLUTION_SOURCE_ESCALATION` line; the per-question rate is
   `render_off_host_skips` in the resolution-source provider's `details["counts"]`. Registered on

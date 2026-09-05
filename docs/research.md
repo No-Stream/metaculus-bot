@@ -1023,11 +1023,11 @@ cited URL, so the DNS pin the transport sets covers the host that actually serve
 page whose canonical form is one ordinary hop away (`example.com` to `www.example.com`) is not
 refused for taking it; when the two differ, the landing is re-vetted with the same self-reference
 and public-URL checks every derived hop owes. Both render memos key on the URL rendered, the HTML
-classifier keys on the URL the browser's main frame LANDED on (`RenderedPage.final_url`, the
-rendered URL or a same-host hop past it), and the rung's attempt stays keyed on the cited URL,
-which is what the escalation line names. One accounting consequence, since 2026-09-04: on a
-`route=rendered` rescue the `FetchResult.url`, which is the `url=` of the `RESOLUTION_SOURCE_FETCH`
-line and the published `### <url>` heading, is that landing URL, while the
+classifier keys on the URL the browser's main frame LANDED on (`RenderedPage.document_url`, the
+landing when a navigation committed, else the rendered URL), and the rung's attempt stays keyed on
+the cited URL, which is what the escalation line names. One accounting consequence, since
+2026-09-04: on a `route=rendered` rescue the `FetchResult.url`, which is the `url=` of the
+`RESOLUTION_SOURCE_FETCH` line and the published `### <url>` heading, is that landing URL, while the
 `RESOLUTION_SOURCE_ESCALATION` line's `url=` is the cited URL, so a per-URL join between the two
 lines must key on the escalation line; before that boundary the two agreed. The transport's own post-gate need is
 higher: `RENDER_MIN_GOTO_MS` (5 s of navigation) plus `RENDER_POST_GOTO_TAIL_MS` (the 2 s settle
@@ -1234,8 +1234,9 @@ page to a DOM over `RENDERED_DOM_MAX_CHARS` and was declined unread; what binds 
 ceiling, a fact about the page that used to be folded into `renderer_unavailable_skips`, where it
 pointed triage at the Playwright install. `render_off_host_skips` is a browser whose main frame
 landed on a host other than the pinned one, a server-side redirect hop the route handler never
-sees, so the transport refused the DOM unread; it is the one count that says how often a cited page
-sends the browser somewhere else, which is what prices the host-equality rule.
+sees, so the transport refused the DOM unread on its pre-read check, or discarded it unpublished
+when the navigation committed during the read itself; it is the one count that says how often a
+cited page sends the browser somewhere else, which is what prices the host-equality rule.
 `wayback_cap_skips` is a question that spent its snapshot attempts on earlier cited URLs, so the
 per-question cap is what binds; `url_context_cap_skips` is the paid rung's analogue, a question
 that spent its per-question paid-read budget (`RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`) on
@@ -1262,7 +1263,9 @@ request interception never sees a server-side redirect hop. Since 2026-09-04 the
 transport closes that channel for the main frame rather than accepting it: once the
 navigation has settled it compares the LANDING HOST, the hostname `page.url` ended
 up on, with the PINNED HOST that its `--host-resolver-rules` launch argument covers,
-and refuses the DOM unread when the two differ. It also registers a
+and refuses the DOM unread when the two differ. The same comparison runs again after
+the DOM read, because a navigation can commit inside that one driver round trip, and a
+DOM that fails it is discarded unpublished. It also registers a
 `route_web_socket` handler that never connects the socket to a server, so a page
 WebSocket, which HTTP interception cannot see at all, is blocked. What is left is a
 cross-host SUBRESOURCE, whose host Chromium resolves with no pin of ours, and the
@@ -1316,7 +1319,8 @@ fires while the render is still queued behind the launch gates or once the trans
 its exit reserve; a browser answered a non-200 where the direct GET got 200 is `render_non_200`;
 a rendered DOM over `RENDERED_DOM_MAX_CHARS` is `render_dom_too_large`; and a main frame that
 landed on a host other than the pinned one is `render_off_host`, the server-side redirect hop the
-route handler never sees, refused before the DOM was read.
+route handler never sees, whose DOM was refused unread on the transport's pre-read check or
+discarded unpublished when the navigation committed during the read itself.
 `no_resolving_content` has four reasons (`embed_shell`, `thin_page`, `no_matching_passage` and
 `not_addressed`): the third is the only one that is a document rather than a page, and the fourth
 is the paid reader's, a page Gemini retrieved whose answer said it does not discuss the ask. All

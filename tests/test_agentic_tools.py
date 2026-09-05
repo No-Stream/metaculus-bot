@@ -3015,9 +3015,11 @@ class TestRenderedRungTimeoutAtTheV2Wrapper:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The transport's third non-``None`` decline: Chromium's main frame landed off the pinned
-        host, so the DOM was never read. This wrapper folds it into ``None`` like the other two,
-        because its callers know no other signal, and nothing from that render reaches the driver.
-        Not memoised: the page rendered, on a host that was not the one asked for."""
+        host, so the DOM was refused unread on the pre-read check, or discarded unpublished when
+        the navigation committed during the read itself. This wrapper folds it into ``None`` like
+        the other two, because its callers know no other signal, and nothing from that render
+        reaches the driver. Not memoised: the page rendered, on a host that was not the one asked
+        for."""
         url = "https://example.com/redirects-inward"
 
         async def _off_host(target: str, **kwargs: object) -> None:

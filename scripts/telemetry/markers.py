@@ -127,7 +127,8 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   ``AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED``)
 * ``RENDERED_FETCH_OFF_HOST`` — ``metaculus_bot/research/rendered_fetch.py``
   ``render_page`` (per-REFUSED RENDER: the headless-Chromium main frame landed on a host
-  the DNS pin does not cover, so its DOM was refused unread. The transport is shared, so
+  the DNS pin does not cover, so its DOM was refused unread, or discarded unpublished when
+  the navigation committed during the read itself. The transport is shared, so
   the row covers both callers and ``scope`` says which one asked for the render)
 * ``GEMINI_USAGE`` — ``metaculus_bot/research/gemini_search.py``,
   ``metaculus_bot/research/agentic/tool_backends.py`` and
