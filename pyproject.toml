@@ -32,6 +32,7 @@ dependencies = [
     "certifi>=2026.5.20",
     "brotli>=1.2.0",                                        # aiohttp's optional `br` decoder; see [tool.deptry] DEP002
     "backports-zstd>=1.7.0 ; python_full_version < '3.14'", # aiohttp's optional `zstd` decoder; stdlib from 3.14 on
+    "curl-cffi>=0.15.0",
 ]
 # supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 # The freshness window is enforced at lock time via `uv lock --exclude-newer <ts>`
@@ -62,7 +63,6 @@ dev = [
     "deptry>=0.25.1",
     "import-linter>=2.13",
     "pytest-timeout>=2.4.0",
-    "curl-cffi>=0.15.0",
 ]
 
 [tool.uv]
@@ -335,23 +335,13 @@ DEP003 = ["urllib3", "httpx"]
 #       test_missing_matplotlib_degrades_to_text_only_anchor). So matplotlib must move to
 #       [project].dependencies when the flag is flipped on in a workflow — not to keep the
 #       run alive, but because otherwise the flag renders no chart at all.
-#   curl_cffi. In the dev group because tests/conftest.py, the ROOT conftest, imports
-#     `curl_cffi.requests` at module scope to patch libcurl's request chokepoint for the
-#     native-egress guard (a money-safety backstop), so the whole suite fails at collection
-#     without it. Until 2026-09-04 it arrived only as yfinance's transitive dependency, which
-#     deptry accepted under DEP003 while leaving the suite one upstream client swap away from
-#     dying at import time; declaring it here is what lets that import stay hard rather than
-#     become a try/except that would silently disable the guard. A dev rather than a runtime
-#     dependency because neither importer ships in a bot run: the guard is test-only, and the
-#     other importer — scripts/probes/fetch_diagnostic.py, the operator-run egress diagnostic,
-#     which is the two lines deptry reports under this rule — needs a real Chrome TLS/HTTP2
-#     fingerprint to tell "this runner's fingerprint is being scored" from "this runner's
-#     egress IP is blocked", a debugging need that must not put a package into the runtime
-#     deps. That probe imports inside try/except ImportError and degrades to "impersonation
-#     rung unavailable"; its workflow syncs `--no-dev` and supplies the package with
-#     `uv run --with curl_cffi`. The cost of this entry is that a future prod import of
-#     curl_cffi would go unflagged.
-DEP004 = ["matplotlib", "curl_cffi"]
+#   curl_cffi. A runtime dependency since 2026-09-04: the resolution-source fetcher's
+#     impersonation rung (research/impersonated_fetch.py) presents a Chrome TLS/HTTP2 fingerprint
+#     through it, after the free egress diagnostic showed Akamai-fronted federal hosts answer the
+#     runner's aiohttp client with 403 and an impersonated client with 200. The ROOT conftest also
+#     imports `curl_cffi.requests` at module scope to patch libcurl's request chokepoint for the
+#     native-egress guard, and scripts/probes/fetch_diagnostic.py uses it for its column B.
+DEP004 = ["matplotlib"]
 
 # Import-direction contracts. Every contract below was derived from the real graph (grimp).
 # The first five passed as written, with no code change; the scoring one is the exception —
