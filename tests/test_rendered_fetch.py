@@ -1132,6 +1132,49 @@ class TestTheLandingHost:
 
         assert page.content_reads == 0
 
+    async def test_chromiums_own_error_document_is_memoised_so_the_run_does_not_relaunch_for_it(self, monkeypatch):
+        """The fail-shut guard folded a FAILED navigation into the off-host refusal, and for that
+        population the page rendered nothing and a retry changes nothing, exactly the case the old
+        empty-DOM path memoised. Left unmemoised, a run relaunched Chromium (100-300 MB and one of
+        the two slots) for the same dead URL on every later question that cited it. So a landing
+        on a scheme that is not http(s), Chromium's own document rather than a redirect to a
+        stranger's host, writes the timed-out memo at the raise site, and the second render under
+        the same scope declines without a launch."""
+        page = FakePage(
+            [], goto_raises=PlaywrightError("net::ERR_CONNECTION_REFUSED"), land_on="chrome-error://chromewebdata/"
+        )
+        chromium = install_fake_playwright(monkeypatch, page)
+
+        with pytest.raises(rendered_fetch.RenderOffHost):
+            await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+        assert len(chromium.launch_args) == 1
+
+        with pytest.raises(rendered_fetch.RenderTimeout):
+            await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert len(chromium.launch_args) == 1
+        assert page.content_reads == 0
+        # The other caller's scope is its own, as for every memo.
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_V2_SCOPE) is False
+
+    async def test_a_genuine_off_host_landing_is_not_memoised_and_renders_again(self, monkeypatch):
+        """The other half: an http(s) landing on a stranger's host is a fact about where the page
+        sent the browser, not about the page rendering nothing, and it is memoised by nobody, so a
+        later question citing the same URL runs the render again and is refused again."""
+        page = FakePage([], land_on="https://evil.example/")
+        chromium = install_fake_playwright(monkeypatch, page)
+
+        for _ in range(2):
+            with pytest.raises(rendered_fetch.RenderOffHost):
+                await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert len(chromium.launch_args) == 2
+        assert rendered_fetch.render_timed_out(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
+
     @pytest.mark.parametrize(
         ("final_url", "expected"),
         [

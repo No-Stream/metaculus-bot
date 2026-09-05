@@ -178,8 +178,10 @@ FetchStatusReason = Literal[
 #   broken, a host that will not pin to a public IP, or a browser error. Nothing was rendered, so
 #   nothing about the page changed, which is why it is a skip reason and not a `status_reason`.
 # `render_timeout` — the browser rung CUT OFF by the transport's own bound: Chromium launched and
-#   navigated, and the DOM read outlived `RENDER_DOM_READ_TIMEOUT_MS` because the page kept
-#   navigating (or the URL was already cut off that way earlier in the run). A fact about the
+#   navigated, and the DOM read outlived `RENDER_DOM_READ_TIMEOUT_MS` or the browser refused it
+#   because the page kept navigating (or the URL was memoised earlier in the run: cut off that way,
+#   or a navigation that failed onto Chromium's own error document, which the transport memoises
+#   the same way so a dead URL is not relaunched for). A fact about the
 #   page. The rung's own outer bound firing is NOT this token but `wall_budget`: it fires while the
 #   render is still queued behind the launch gates, which says nothing about the page. Its own
 #   token rather than `renderer_unavailable` because it says nothing about whether Chromium works
@@ -201,7 +203,10 @@ FetchStatusReason = Literal[
 #   so the transport refused the DOM unread or discarded it unpublished. Read fail-shut, so it also
 #   counts Chromium's own error document after a failed navigation, which makes it an upper bound
 #   on hostile landings. A fact about the page, kept out of `renderer_unavailable` for the same
-#   reason as the two above. The URL is not memoised, because nothing about the page was published.
+#   reason as the two above. A genuine http(s) landing on another host is not memoised, because
+#   nothing about the page was published and the next question should be refused on its own
+#   record; the error-document landing is memoised by the transport (its timed-out memo), so a
+#   later question in the run records `render_timeout` for it without a launch.
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",
