@@ -22,7 +22,7 @@ writes itself, because only the transport knows whether a browser actually ran b
 clock cut it off (see :class:`RenderTimeout`).
 
 The SSRF guard is resolved through ``resolution_source`` at call time, from inside the two
-functions that need it, and both halves of that are deliberate — see :func:`_resolve_pinned_host`.
+functions that need it, and both halves of that are deliberate — see :func:`resolve_pinned_host`.
 """
 
 from __future__ import annotations
@@ -369,14 +369,14 @@ def _host_resolver_rule(host: str, ip: str) -> str:
     IPv6 literals must be bracketed in the MAP target per Chromium's rule parser
     (``MAP host [dead::beef]``); IPv4 literals are bare. A malformed ``ip`` is
     passed through unbracketed — callers only ever feed this a value already
-    vetted by :func:`_resolve_pinned_host`, so that branch is defensive only.
+    vetted by :func:`resolve_pinned_host`, so that branch is defensive only.
     """
     parsed_ip = _ip_literal(ip)
     target = f"[{ip}]" if parsed_ip is not None and parsed_ip.version == 6 else ip
     return f"--host-resolver-rules=MAP {host} {target}"
 
 
-def _pinnable_url_host(url: str) -> str | None:
+def pinnable_url_host(url: str) -> str | None:
     """Hostname of a URL eligible for DNS pinning, or None when the URL itself disqualifies it.
 
     The pin is only as good as the MAP pattern's match. Chromium canonicalises a hostname
@@ -404,7 +404,7 @@ def _pinnable_url_host(url: str) -> str | None:
     return host
 
 
-async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
+async def resolve_pinned_host(url: str) -> tuple[str, str] | None:
     """Vet ``url``'s host and resolve it to ONE public IP for Chromium DNS pinning.
 
     Returns ``(host, vetted_ip)`` — the ``--host-resolver-rules=MAP`` operands — or
@@ -436,7 +436,7 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
         resolution_source,
     )
 
-    host = _pinnable_url_host(url)
+    host = pinnable_url_host(url)
     if not host:
         return None
 
@@ -467,9 +467,9 @@ async def _vet_route(route: Any, request: Any, playwright_error: type[BaseExcept
     propagates.
 
     The guard is resolved through ``resolution_source`` at call time for the reasons
-    :func:`_resolve_pinned_host` states.
+    :func:`resolve_pinned_host` states.
     """
-    from metaculus_bot.research import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real cycle + the guard's single patch surface, see _resolve_pinned_host
+    from metaculus_bot.research import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real cycle + the guard's single patch surface, see resolve_pinned_host
         resolution_source,
     )
 
@@ -984,7 +984,7 @@ async def render_page(
     big to read safely), and a main frame that landed on a host other than the pinned one raises
     :class:`RenderOffHost` (the page sent the browser somewhere the pin does not cover, and its
     DOM was refused unread or discarded unpublished). A caller that wants to tell the ``None`` causes apart reads
-    :func:`rendered_to_nothing` and :func:`_resolve_pinned_host` itself.
+    :func:`rendered_to_nothing` and :func:`resolve_pinned_host` itself.
 
     A render that ran and was CUT OFF is different, and raises :class:`RenderTimeout` (a
     builtin ``TimeoutError``) instead: the DOM read outlived ``RENDER_DOM_READ_TIMEOUT_MS``, or the
@@ -1059,7 +1059,7 @@ async def render_page(
     # Pin Chromium's DNS to a single pre-vetted public IP BEFORE launch. If the host can't be
     # resolved to a public address, fail closed: skip Chromium and let the caller's ladder fall
     # back (same graceful-failure signal as a playwright-unavailable / render-error return).
-    pinned = await _resolve_pinned_host(url)
+    pinned = await resolve_pinned_host(url)
     if pinned is None:
         logger.warning("rendered fetch skipped (host not pinnable to a public IP): %s", urlparse(url).netloc)
         return None
