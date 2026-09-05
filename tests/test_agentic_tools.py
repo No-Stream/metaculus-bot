@@ -8,7 +8,6 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-from urllib.parse import urlparse
 
 import aiohttp
 import pytest
@@ -1599,11 +1598,15 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     """Fix 1: concurrent headless-Chromium launches must never exceed the
     module-global cap, even across questions (the semaphore is per-process).
 
-    Fires more concurrent _try_rendered_fetch calls than the cap — each to a
-    distinct host so the per-host gate never serializes them — and gates each
-    fake launch on a barrier so we can measure the true concurrent-launch peak.
-    The peak must equal the cap (proving contention was actually reached) and
-    never exceed it."""
+    Fires more concurrent _try_rendered_fetch calls than the cap and gates each fake launch on a
+    barrier so we can measure the true concurrent-launch peak. The peak must equal the cap
+    (proving contention was actually reached) and never exceed it. The per-host gate never
+    serializes the renders because ``_sem_for_host`` is stubbed to hand back a FRESH
+    ``asyncio.Semaphore(1)`` on every call, so the five URLs deliberately share ONE host and
+    differ only by path: the renders share one ``FakePage`` whose ``url`` every goto overwrites,
+    and the transport reads that URL back for its landing-host check on either side of the DOM
+    read, so a sibling's goto landing between those reads must be on the same host or the check
+    would refuse it as a stranger, a spurious failure that looks like a transport bug."""
     cap = 2
     monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(cap))
 
@@ -1627,13 +1630,6 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
 
     page = FakePage(html="<html><body><p>rendered body</p></body></html>")
     install_fake_playwright(monkeypatch, page, chromium=_BarrierChromium(page))
-
-    async def _pin_each_host(url: str) -> tuple[str, str]:
-        # Each render is to its own host, and the transport holds the landing to the pinned one,
-        # so the pin has to be the requested host as the real resolver returns it.
-        return urlparse(url).hostname or "", "93.184.216.34"
-
-    monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", _pin_each_host)
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr(
@@ -1642,7 +1638,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
     tasks = [
-        asyncio.create_task(agentic_tools._try_rendered_fetch(f"https://host{index}.example.com/page"))
+        asyncio.create_task(agentic_tools._try_rendered_fetch(f"https://host.example.com/page{index}"))
         for index in range(cap + 3)
     ]
 

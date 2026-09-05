@@ -18,12 +18,14 @@ would make every race look sound.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from typing import Any
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import WebSocketRoute
 
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -817,6 +819,59 @@ class TestTheWebSocketChannel:
         # run, and the two closes still happen.
         assert page.teardown == ["context.close", "browser.close"]
         assert [message for message in caplog.messages if "rung unavailable" in message]
+
+
+class TestTheSharedPlaywrightFake:
+    """The one fake object graph every render test drives has to honour the two transport contracts
+    a test cannot see it breaking: the DNS pin names the host the transport asked for, as the real
+    resolver does, and the WebSocket double accepts exactly the calls the real one does."""
+
+    async def test_the_default_pin_is_the_requested_host(self, monkeypatch):
+        """With a fixed default pin, a render of any other host took the off-host refusal instead of
+        rendering, so a test asserting a decline passed while the mechanism it pinned never ran."""
+        page = FakePage([])
+        chromium = install_fake_playwright(monkeypatch, page)
+
+        rendered = await rendered_fetch.render_page(
+            "https://other.example.org/page", memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1)
+        )
+
+        assert rendered is not None
+        assert page.content_reads == 1
+        assert chromium.launch_args == [["--host-resolver-rules=MAP other.example.org 93.184.216.34"]]
+
+    async def test_an_explicit_pin_still_lets_a_test_pin_the_wrong_host(self, monkeypatch):
+        page = FakePage([])
+        install_fake_playwright(monkeypatch, page, pinned=("elsewhere.example.net", "93.184.216.34"))
+
+        with pytest.raises(rendered_fetch.RenderOffHost):
+            await rendered_fetch.render_page(_PAGE_URL, memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1))
+
+        assert page.content_reads == 0
+
+    async def test_the_default_pin_declines_a_host_the_real_resolver_would(self, monkeypatch):
+        """A unicode hostname is unpinnable for real (Chromium canonicalises it before matching the
+        MAP rule), so the default derives eligibility the same way rather than pinning it anyway."""
+        page = FakePage([])
+        chromium = install_fake_playwright(monkeypatch, page)
+
+        rendered = await rendered_fetch.render_page(
+            "https://münchen.example/x", memo_scope=_TIER1_SCOPE, host_gate=asyncio.Semaphore(1)
+        )
+
+        assert rendered is None
+        assert chromium.launch_args == []
+
+    def test_the_socket_double_is_keyword_only_like_the_real_close(self):
+        """A handler rewritten to ``close(1008, "blocked")`` would pass the suite and raise
+        ``TypeError`` inside a Playwright-dispatched task in the one path the suite never runs, so
+        the double must refuse exactly the call the real driver refuses."""
+        for close in (FakeWebSocketRoute.close, WebSocketRoute.close):
+            signature = inspect.signature(close)
+            for name in ("code", "reason"):
+                assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+            with pytest.raises(TypeError):
+                signature.bind(None, 1008, "blocked")
 
 
 class TestDnsPinEligibility:

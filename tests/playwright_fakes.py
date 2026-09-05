@@ -33,6 +33,7 @@ from playwright.async_api import Error as PlaywrightError
 from metaculus_bot.research import rendered_fetch
 
 __all__ = [
+    "PIN_THE_REQUESTED_HOST",
     "FakeBrowser",
     "FakeChromium",
     "FakeContext",
@@ -46,7 +47,16 @@ __all__ = [
 ]
 
 DEFAULT_DOM = "<!doctype html><html><head><title>Dashboard</title></head><body><p>rendered</p></body></html>"
-DEFAULT_PIN = ("dashboard.example.com", "93.184.216.34")
+# The one public address every default pin resolves to. Which HOST is pinned is derived from the
+# URL under test (see `install_fake_playwright`), never fixed here.
+DEFAULT_PIN_IP = "93.184.216.34"
+
+
+class _PinTheRequestedHost:
+    """The ``pinned`` default: pin whatever host the transport asks for, as the real resolver does."""
+
+
+PIN_THE_REQUESTED_HOST = _PinTheRequestedHost()
 
 
 class FakeResponse:
@@ -214,7 +224,9 @@ class FakeWebSocketRoute:
 
     A routed socket dials the server only if the handler calls ``connect_to_server()``, so the
     count of those calls is the whole claim a blocking handler makes. ``close`` takes ``code`` and
-    ``reason`` like the real one, so a handler that reached for it would still run here.
+    ``reason`` KEYWORD-ONLY, exactly as Playwright 1.61's ``WebSocketRoute.close`` does, so a
+    handler that reached for it with positional arguments fails here rather than only inside a
+    Playwright-dispatched task in production, the one path the suite never runs.
     """
 
     def __init__(self, url: str) -> None:
@@ -226,7 +238,7 @@ class FakeWebSocketRoute:
         self.connect_calls += 1
         return self
 
-    async def close(self, code: int | None = None, reason: str | None = None) -> None:
+    async def close(self, *, code: int | None = None, reason: str | None = None) -> None:
         self.close_calls.append((code, reason))
 
 
@@ -322,23 +334,41 @@ def _async_return(value: Any):
     return _call
 
 
+async def _pin_the_requested_host(url: str) -> tuple[str, str] | None:
+    """The default DNS pin: the host the transport asked for, at ``DEFAULT_PIN_IP``.
+
+    Eligibility comes from the transport's own ``_pinnable_url_host``, so a URL the real resolver
+    would refuse to pin (a unicode or trailing-dot host, userinfo, a non-http(s) scheme) declines
+    here too rather than being pinned anyway.
+    """
+    await asyncio.sleep(0)
+    host = rendered_fetch._pinnable_url_host(url)
+    return None if host is None else (host, DEFAULT_PIN_IP)
+
+
 def install_fake_playwright(
     monkeypatch: pytest.MonkeyPatch,
     page: FakePage,
     *,
     faults: Faults | None = None,
     launch_delay_s: float = 0.0,
-    pinned: tuple[str, str] | None = DEFAULT_PIN,
+    pinned: tuple[str, str] | None | _PinTheRequestedHost = PIN_THE_REQUESTED_HOST,
     chromium: FakeChromium | None = None,
     manager_cls: type[FakePlaywrightManager] = FakePlaywrightManager,
 ) -> FakeChromium:
     """Wire the fakes in and return the launcher, whose ``launch_args`` say what was launched.
 
     ``faults`` says where the browser should misbehave (see :class:`Faults`). ``pinned`` is what
-    the transport's DNS pin resolves to, ``(host, vetted_ip)``; ``None`` makes the host
-    unpinnable, so the transport declines before any launch. A bespoke ``chromium`` (a subclass
-    with its own ``launch``) or ``manager_cls`` (a subclass with its own ``__aenter__``) replaces
-    the default of that one piece; everything else stays shared.
+    the transport's DNS pin resolves to. The pinned host MUST equal the rendered URL's host or the
+    transport refuses the DOM as an off-host landing, so the default,
+    :data:`PIN_THE_REQUESTED_HOST`, derives the host from whatever URL the transport asks for and
+    pins it to ``DEFAULT_PIN_IP``, which is what the real resolver does; with a fixed default, a
+    render test on any other host silently took the refusal path while the mechanism it meant to
+    pin never ran. Pass an explicit ``(host, vetted_ip)`` only to pin a host that deliberately
+    does NOT match the URL, and ``None`` to make the host unpinnable, so the transport declines
+    before any launch. A bespoke ``chromium`` (a subclass with its own ``launch``) or
+    ``manager_cls`` (a subclass with its own ``__aenter__``) replaces the default of that one
+    piece; everything else stays shared.
     """
     launcher = chromium or FakeChromium(page, faults, launch_delay_s=launch_delay_s)
     manager = manager_cls(launcher)
@@ -347,5 +377,6 @@ def install_fake_playwright(
         "playwright.async_api",
         SimpleNamespace(async_playwright=lambda: manager, Error=PlaywrightError),
     )
-    monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", _async_return(pinned))
+    resolve = _pin_the_requested_host if isinstance(pinned, _PinTheRequestedHost) else _async_return(pinned)
+    monkeypatch.setattr(rendered_fetch, "_resolve_pinned_host", resolve)
     return launcher
