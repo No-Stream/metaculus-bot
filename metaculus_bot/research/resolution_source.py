@@ -2273,11 +2273,11 @@ async def _wayback_snapshot_result(
 
     Three outcomes, in this order, and the order is the design.
 
-    The inner URL is UNWRAPPED — repeatedly, since a capture OF a capture presents
-    ``web.archive.org`` as its own inner host — and re-checked first through
+    The inner URL is UNWRAPPED (repeatedly, since a capture OF a capture presents
+    ``web.archive.org`` as its own inner host) and re-checked first through
     :func:`_hop_refusal`, the one home of the two checks every derived URL owes, because a
     hostname check on ``web.archive.org/web/…/metaculus.com/…`` sails past every self-reference
-    filter in the pipeline — an archived Metaculus page in front of a forecaster is the question
+    filter in the pipeline: an archived Metaculus page in front of a forecaster is the question
     quoting itself. Then a snapshot the archive could not serve at all (no capture, or a capture that
     404s) DECLINES: there is no archived copy, which is a different fact from a stale one, and
     the direct route's own status says more about the source than a fact about the archive would.
