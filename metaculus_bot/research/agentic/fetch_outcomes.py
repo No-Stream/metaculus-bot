@@ -100,6 +100,11 @@ class PlainFetchResult:
     url: str
     content_type: str | None = None
     escalate_rendered: bool = False
+    # The HTTP status behind a non-200 terminal result (`_non_ok_status_result`); None on a 200 and
+    # on every refusal this ladder makes itself. It is what lets the impersonated retry key on a
+    # host's 403 alone: `blocked` is also what a non-public URL and a Metaculus self-reference come
+    # back as, and handing either of those to a second transport is the bypass the guard prevents.
+    http_status: int | None = None
 
 
 class _LinkCollector(HTMLParser):
@@ -233,6 +238,7 @@ def _non_ok_status_result(status: int, current_url: str, content_type: str) -> P
             links=[],
             url=current_url,
             content_type=content_type or None,
+            http_status=status,
         )
     if status != 200:
         return PlainFetchResult(
@@ -242,6 +248,7 @@ def _non_ok_status_result(status: int, current_url: str, content_type: str) -> P
             links=[],
             url=current_url,
             content_type=content_type or None,
+            http_status=status,
         )
     return None
 

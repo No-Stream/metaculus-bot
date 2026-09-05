@@ -62,6 +62,10 @@ _METHOD_TO_TIER: dict[str, str] = {
     "document": "fetched",
     "rendered": "fetched",
     "plain": "fetched",
+    # The impersonated retry read the host's own bytes through libcurl (tools._try_impersonated_fetch);
+    # absent from here a page it really did retrieve would stay untiered and its discrepancy
+    # silently demoted below the briefing, the 131.3 failure mode above.
+    "impersonate": "fetched",
     "cache": "fetched",
     "pdf_local": "fetched",
     "digest_local": "fetched",

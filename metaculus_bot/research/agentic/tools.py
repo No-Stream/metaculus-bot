@@ -14,14 +14,17 @@ headless-Chromium TRANSPORT moved out one level, to ``research.rendered_fetch``,
 Tier-1 resolution-source fetcher gained the same rung — the DNS pin, the route guard and the
 process-global launch cap are all load-bearing and a second copy of any of them would drift.
 ``_try_rendered_fetch`` stays here because what a rendered page MEANS is this ladder's
-business: extracted text plus outbound links for a driver model.
+business: extracted text plus outbound links for a driver model. The TLS-impersonating retry
+(``research.impersonated_fetch``, added 2026-09-04) follows the same split: the transport is
+shared with Tier 1, and ``_try_impersonated_fetch`` here maps its response onto this ladder.
 
 The seams the suite monkeypatches
 — ``_read_response_body``, ``_fetch_plain``, ``_try_rendered_fetch``,
+``_try_impersonated_fetch``, ``fetch_impersonated``,
 ``_acquire_local_document``, ``_run_document_read_sync``, ``read_document``,
 ``_READ_DOCUMENT_TIMEOUT_S`` — are attributes of THIS module and are resolved here at call
 time, so their callers stay here even where the callee moved out. The render transport's own
-seams (``_resolve_pinned_host``, the launch semaphore) are attributes of ``rendered_fetch``
+seams (``resolve_pinned_host``, the launch semaphore) are attributes of ``rendered_fetch``
 and are patched there.
 """
 
@@ -45,14 +48,17 @@ from metaculus_bot.constants import (
     DOCUMENT_TEXT_PDF_MAX_BYTES,
     EXA_API_KEY_ENV,
     GOOGLE_API_KEY_ENV,
+    RESOLUTION_SOURCE_HTTP_TIMEOUT,
+    RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+    env_flag_enabled,
 )
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.agentic import local_document
 from metaculus_bot.research.agentic.fetch_outcomes import (
     _FETCH_MIN_CONTENT_CHARS,
     _HTML_CONTENT_TYPE_TOKENS,
-    _RETRYABLE_FETCH_BLOCK_STATUSES,  # noqa: F401  # re-export: the suite parametrizes the blocked-status set off this module
+    _RETRYABLE_FETCH_BLOCK_STATUSES,
     _TEXTUAL_CONTENT_TYPE_TOKENS,
     DOCUMENT_NEEDED_METHOD,
     PlainFetchResult,
@@ -93,6 +99,12 @@ from metaculus_bot.research.http_fetch import (
     REDIRECT_STATUSES,
     decode_text_body,
     read_body_capped,
+)
+from metaculus_bot.research.impersonated_fetch import (
+    ImpersonateDeclined,
+    fetch_impersonated,
+    impersonation_refused,
+    note_impersonation_refused,
 )
 from metaculus_bot.research.rendered_fetch import (
     MemoScope,
@@ -289,7 +301,17 @@ async def _plain_response_outcome(resp: aiohttp.ClientResponse, current_url: str
     )
     if body is None:
         return _body_too_large_result(current_url, content_type, declared_pdf=declared_pdf)
-    if declared_pdf or is_pdf_body(body):
+    return await _plain_body_outcome(body, content_type, current_url)
+
+
+async def _plain_body_outcome(body: bytes, content_type: str, current_url: str) -> PlainFetchResult:
+    """Classify a body this ladder already holds, whichever transport read it.
+
+    The bytes-level tail of :func:`_plain_response_outcome`, split from the read so the
+    impersonated retry (:func:`_try_impersonated_fetch`) gets this ladder's FULL classification,
+    the local PDF rung and the document escalation included, rather than a second partial copy.
+    """
+    if _content_type_is_pdf(content_type) or is_pdf_body(body):
         # Local extraction first, whether the header said PDF or only the magic bytes did.
         return await local_document.pdf_fetch_result(body, url=current_url, content_type=content_type)
     if _body_is_document(body):
@@ -415,6 +437,64 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
         url=url,
         content_type=page.content_type or None,
     )
+
+
+async def _try_impersonated_fetch(plain: PlainFetchResult) -> PlainFetchResult | None:
+    """Re-dial a page the plain rung was answered 403, presenting a real browser's fingerprint.
+
+    The transport is ``research.impersonated_fetch``, shared with the Tier-1 resolution-source
+    rung, which is where the measurement behind it lives (2026-09-04, from a GitHub Actions
+    runner: four Akamai-fronted federal hosts answered the bot's aiohttp client 403 and the same
+    GET under Chrome impersonation 200). What stays here is the MAPPING onto ``PlainFetchResult``,
+    this ladder's own contract. A 200 goes through :func:`_plain_body_outcome`, the same
+    classification a plain body gets, with ``method="impersonate"`` stamped on the plain-shaped
+    results so the loop's tier map (``provenance._METHOD_TO_TIER``) grants ``fetched``; a document
+    keeps the method its own rung stamps (``pdf_local``, ``document_needed``), which the ``fetch``
+    handler keys on.
+
+    Every decline folds back into ``None``, because this ladder's callers only know ``None``: the
+    kill switch (``RESOLUTION_SOURCE_IMPERSONATE_ENABLED``, on by default in code), the per-run
+    host memo shared with Tier 1 (a host that refused the impersonated client once this run will
+    not answer the next URL on it differently), every :class:`ImpersonateDeclined` (a host that
+    will not pin, a refused hop, an oversized body, a transport failure), and a non-200 answer,
+    which is memoized when it is block-shaped. The direct ``blocked`` result then stands, byte for
+    byte what it was before the rung existed.
+
+    The URL dialed is ``plain.url``, the last hop of the plain rung's own guarded redirect loop,
+    the same choice :func:`_try_rendered_fetch` documents. The wall is one plain hop's worth
+    (``RESOLUTION_SOURCE_HTTP_TIMEOUT``, the timeout the plain rung's session already runs under)
+    for the whole retry, redirect hops included, so the retry costs the ``fetch`` tool's ceiling at
+    most what one more plain hop would have. The host gate is this ladder's own map.
+    """
+    if not env_flag_enabled(RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV, default=True):
+        return None
+    if impersonation_refused(plain.url):
+        return None
+    netloc = urlparse(plain.url).netloc
+    try:
+        response = await fetch_impersonated(
+            plain.url,
+            host_sems=_FETCH_HOST_SEMAPHORES,
+            deadline_monotonic_s=monotonic() + RESOLUTION_SOURCE_HTTP_TIMEOUT,
+            per_hop_timeout_s=RESOLUTION_SOURCE_HTTP_TIMEOUT,
+            max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+        )
+    except ImpersonateDeclined as exc:
+        logger.info(
+            "agentic fetch: the impersonated retry of %s produced nothing (%s: %s)", netloc, type(exc).__name__, exc
+        )
+        return None
+    if response.status != 200:
+        if response.status in _RETRYABLE_FETCH_BLOCK_STATUSES:
+            # A block-shaped answer only: a 404 says the path is gone, which says nothing about
+            # the host's view of our fingerprint.
+            note_impersonation_refused(plain.url)
+        logger.info("agentic fetch: the impersonated retry of %s was answered %d", netloc, response.status)
+        return None
+    result = await _plain_body_outcome(response.body, response.content_type, response.url)
+    if result.method == "plain":
+        result.method = "impersonate"
+    return result
 
 
 async def search_news(query: str) -> ToolOutcome:
@@ -601,6 +681,13 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
         return cached
 
     plain = await _fetch_plain(url)
+    # The one trigger both fetchers share, read off Tier 1 at call time so the population cannot
+    # drift between them: a host's 403, never the `blocked` this ladder produces itself for a
+    # non-public URL or a Metaculus self-reference (both carry no `http_status`).
+    if plain.status == "blocked" and plain.http_status in resolution_source._IMPERSONATE_TRIGGER_HTTP_STATUS:
+        impersonated = await _try_impersonated_fetch(plain)
+        if impersonated is not None:
+            plain = impersonated
     if plain.status == "blocked":
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="blocked")
     if plain.method == local_document.PDF_LOCAL_METHOD:

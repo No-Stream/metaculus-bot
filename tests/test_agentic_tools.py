@@ -5,6 +5,7 @@ import io
 import logging
 import socket
 import sys
+from time import monotonic
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -22,15 +23,25 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_READER_HTTP_ATTEMPTS,
     GAP_FILL_V2_READER_MODEL,
     GAP_FILL_V2_READER_THINKING_LEVEL,
+    RESOLUTION_SOURCE_HTTP_TIMEOUT,
+    RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV,
+    RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     URL_CONTEXT_SIZE_GATE_TOKENS,
 )
 from metaculus_bot.research import http_fetch, rendered_fetch, robots_policy
 from metaculus_bot.research import providers as research_providers
-from metaculus_bot.research.agentic import fetch_outcomes, local_document, tool_backends
+from metaculus_bot.research.agentic import fetch_outcomes, local_document, provenance, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
+from metaculus_bot.research.agentic.types import ToolOutcome
 from metaculus_bot.research.document_text import extract_pdf_text
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
+from metaculus_bot.research.impersonated_fetch import (
+    ImpersonatedResponse,
+    ImpersonateTransportError,
+    impersonation_refused,
+    reset_impersonation_memo,
+)
 from tests.playwright_fakes import FakeBrowser, FakeChromium, FakePage, FakePlaywrightManager, install_fake_playwright
 from tests.test_document_text import build_text_pdf
 
@@ -3369,3 +3380,286 @@ class TestGoogleExtendedRobotsRules:
 
     def test_an_empty_robots_txt_says_nothing(self) -> None:
         assert robots_policy.google_extended_disallows("", "/x") is False
+
+
+# An article-shaped page well over GAP_FILL_V2_MIN_CONTENT_CHARS once extracted, so a rescue
+# through it is a complete read rather than one the ladder escalates to the browser.
+_IMPERSONATED_PAGE = (
+    "<!doctype html><html><head><title>Work Stoppages</title></head><body><nav>Home | Data</nav><article>"
+    "<h1>Major Work Stoppages in 2026</h1>"
+    + "".join(
+        f"<p>The Bureau of Labor Statistics counted 12 major work stoppages beginning in 2026 through August, "
+        f"paragraph {index} of the summary table dated 2026-08-28, covering 1,000 or more workers each.</p>"
+        for index in range(6)
+    )
+    + "</article></body></html>"
+).encode()
+
+
+class TestGapFillV2ImpersonatedRetry:
+    """The plain rung's 403, re-dialed under a real browser's TLS fingerprint through the transport
+    Tier 1 shares (`research/impersonated_fetch.py`) and mapped onto this ladder's result type.
+
+    The transport is patched at the import seam `agentic_tools.fetch_impersonated`, never at its
+    own session, so the suite's `_block_native_egress` guard stays armed underneath every test.
+    """
+
+    _URL = "https://www.bls.gov/wsp/"
+    _SECOND_URL = "https://www.bls.gov/news.release/wkstp.htm"
+
+    @pytest.fixture(autouse=True)
+    def _fresh_memo(self):
+        """The host memo is process-wide by design (shared with Tier 1), so isolate it per test."""
+        reset_impersonation_memo()
+        yield
+        reset_impersonation_memo()
+
+    @staticmethod
+    def _transport(monkeypatch: pytest.MonkeyPatch, answer: Any) -> list[dict[str, Any]]:
+        calls: list[dict[str, Any]] = []
+
+        async def _fetch(
+            url: str,
+            *,
+            host_sems: dict[str, asyncio.Semaphore],
+            deadline_monotonic_s: float,
+            per_hop_timeout_s: float,
+            max_bytes: int,
+        ) -> ImpersonatedResponse:
+            calls.append(
+                {
+                    "url": url,
+                    "host_sems": host_sems,
+                    "deadline_monotonic_s": deadline_monotonic_s,
+                    "per_hop_timeout_s": per_hop_timeout_s,
+                    "max_bytes": max_bytes,
+                }
+            )
+            await asyncio.sleep(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        monkeypatch.setattr(agentic_tools, "fetch_impersonated", _fetch)
+        return calls
+
+    @classmethod
+    def _response(
+        cls, status: int, *, body: bytes = b"", content_type: str = "text/html", url: str | None = None
+    ) -> ImpersonatedResponse:
+        return ImpersonatedResponse(
+            status=status,
+            url=url or cls._URL,
+            content_type=content_type,
+            server=None,
+            body=body,
+            elapsed_s=0.4,
+            primary_ip="23.0.0.1",
+        )
+
+    @staticmethod
+    def _blocked(url: str, http_status: int | None) -> fetch_outcomes.PlainFetchResult:
+        return fetch_outcomes.PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text=f"Fetch blocked with HTTP {http_status}.",
+            links=[],
+            url=url,
+            http_status=http_status,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [403, 406, 429, 503])
+    async def test_a_non_200_plain_result_carries_its_http_status(self, status: int, monkeypatch) -> None:
+        session = _FakeSession(_FakeResponse(status=status, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+        result = await agentic_tools._fetch_plain("https://example.com/gated")
+
+        assert result.http_status == status
+
+    @pytest.mark.asyncio
+    async def test_the_refusals_this_ladder_makes_itself_carry_no_http_status(self, monkeypatch) -> None:
+        """Both come back `blocked`, and neither is a host's verdict: the trigger must not fire on them."""
+
+        async def is_public(url: str) -> bool:
+            return "metaculus.com" in url
+
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", is_public)
+        get_session = MagicMock(side_effect=AssertionError("neither refusal opens a session"))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", get_session)
+
+        non_public = await agentic_tools._fetch_plain("http://169.254.169.254/latest/meta-data/")
+        self_reference = await agentic_tools._fetch_plain("https://www.metaculus.com/questions/1/")
+
+        assert (non_public.status, non_public.http_status) == ("blocked", None)
+        assert (self_reference.status, self_reference.http_status) == ("blocked", None)
+
+    @pytest.mark.asyncio
+    async def test_a_403_is_retried_and_a_rescue_is_the_fetch_outcome(self, monkeypatch) -> None:
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert outcome.status == "ok"
+        assert outcome.method == "impersonate"
+        assert "12 major work stoppages" in outcome.content_markdown
+        assert _method_to_tier(outcome.method) == "fetched", "the retry read the host's own bytes"
+        (call,) = calls
+        assert call["url"] == self._URL
+        # This ladder's own host map and the plain rung's own bounds, not Tier 1's.
+        assert call["host_sems"] is agentic_tools._FETCH_HOST_SEMAPHORES
+        assert call["per_hop_timeout_s"] == RESOLUTION_SOURCE_HTTP_TIMEOUT
+        assert call["max_bytes"] == RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
+        assert call["deadline_monotonic_s"] <= monotonic() + RESOLUTION_SOURCE_HTTP_TIMEOUT
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("http_status", [406, 429])
+    async def test_the_other_block_statuses_are_not_retried(self, http_status: int, monkeypatch) -> None:
+        monkeypatch.setattr(
+            agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, http_status))
+        )
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert calls == []
+        assert (outcome.status, outcome.method) == ("blocked", "plain")
+
+    @pytest.mark.asyncio
+    async def test_a_url_this_ladder_refused_itself_is_never_retried(self, monkeypatch) -> None:
+        """The SSRF bypass case, end to end through the real plain rung: a non-public URL and a
+        Metaculus self-reference both reach `blocked` with no `http_status`, so the transport,
+        whose libcurl connection never passes aiohttp's filtering resolver, is never handed them."""
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+
+        async def is_public(url: str) -> bool:
+            return "metaculus.com" in url
+
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", is_public)
+
+        non_public = await agentic_tools.fetch("http://169.254.169.254/latest/meta-data/")
+        self_reference = await agentic_tools.fetch("https://www.metaculus.com/questions/1/")
+
+        assert non_public.status == "blocked"
+        assert self_reference.status == "blocked"
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_decline_leaves_the_blocked_outcome_byte_identical(self, monkeypatch) -> None:
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        self._transport(monkeypatch, ImpersonateTransportError(failure_class="connection", exc="ConnectionError"))
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert outcome == ToolOutcome(content_markdown="Fetch blocked with HTTP 403.", method="plain", status="blocked")
+        assert _method_to_tier(outcome.method) == "fetched", (
+            "unchanged: `plain` was always tiered, `blocked` never grants it"
+        )
+        assert impersonation_refused(self._URL) is False
+
+    @pytest.mark.asyncio
+    async def test_a_still_403_declines_and_memoizes_the_host_for_the_run(self, monkeypatch) -> None:
+        calls = self._transport(monkeypatch, self._response(403))
+
+        first = await agentic_tools._try_impersonated_fetch(self._blocked(self._URL, 403))
+        second = await agentic_tools._try_impersonated_fetch(self._blocked(self._SECOND_URL, 403))
+
+        assert first is None
+        assert second is None
+        assert len(calls) == 1, "the second URL on the host never dialed"
+        assert impersonation_refused(self._URL) is True
+
+    @pytest.mark.asyncio
+    async def test_a_404_under_impersonation_declines_without_memoizing(self, monkeypatch) -> None:
+        calls = self._transport(monkeypatch, self._response(404))
+
+        assert await agentic_tools._try_impersonated_fetch(self._blocked(self._URL, 403)) is None
+        assert await agentic_tools._try_impersonated_fetch(self._blocked(self._SECOND_URL, 403)) is None
+
+        assert len(calls) == 2
+        assert impersonation_refused(self._URL) is False
+
+    @pytest.mark.asyncio
+    async def test_the_kill_switch_declines_before_dialing(self, monkeypatch) -> None:
+        monkeypatch.setenv(RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV, "false")
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+
+        assert await agentic_tools._try_impersonated_fetch(self._blocked(self._URL, 403)) is None
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_retry_dials_the_plain_rungs_final_url(self, monkeypatch) -> None:
+        """`plain.url` is the last hop of the plain rung's own guarded redirect loop, the host that
+        actually refused us, the same choice the browser rung makes."""
+        final = "https://www.bls.gov/wsp/index.htm"
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(final, 403)))
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE, url=final))
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert [call["url"] for call in calls] == [final]
+        assert outcome.method == "impersonate"
+
+    @pytest.mark.asyncio
+    async def test_an_impersonated_pdf_keeps_the_local_document_rungs_method(self, monkeypatch) -> None:
+        """The bls.gov `wkstp.pdf` case: the body goes through the same local PDF rung a plain body
+        does, and the `fetch` handler keys on that method, so it is not renamed."""
+        pdf = build_text_pdf([["The unemployment rate was 4.1 percent in May 2026, revised from 4.0 percent."]])
+        self._transport(monkeypatch, self._response(200, body=pdf, content_type="application/pdf"))
+
+        result = await agentic_tools._try_impersonated_fetch(self._blocked(self._URL, 403))
+
+        assert result is not None
+        assert result.method == local_document.PDF_LOCAL_METHOD
+        assert "4.1 percent in May 2026" in result.text
+
+    def test_every_retrieval_method_is_tiered(self) -> None:
+        """A method absent from `_METHOD_TO_TIER` grants NO verification tier, so a page the rung
+        really did retrieve would stay untiered and its discrepancy silently demoted below the
+        briefing (the 131.3 failure mode). Every method a real retrieval can carry is pinned here so
+        the next one cannot land untiered."""
+        retrieval_methods = {
+            "plain",
+            "rendered",
+            "impersonate",
+            "cache",
+            "document",
+            local_document.PDF_LOCAL_METHOD,
+            local_document.DIGEST_LOCAL_METHOD,
+        }
+
+        assert retrieval_methods <= set(provenance._METHOD_TO_TIER)
+        assert all(_method_to_tier(method) == "fetched" for method in retrieval_methods)
+        # The placeholders that mean nothing was read stay untiered.
+        assert _method_to_tier(fetch_outcomes.DOCUMENT_NEEDED_METHOD) is None
+        assert _method_to_tier(local_document.OVERSIZE_DOCUMENT_METHOD) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("content_type", "body"),
+        [
+            ("text/html", _IMPERSONATED_PAGE),
+            ("application/pdf", build_text_pdf([["A PDF the local rung reads whichever transport fetched it."]])),
+            ("text/csv", b"date,count\n2026-08-01,11\n2026-08-02,12\n"),
+            ("image/png", b"\x89PNG\r\n\x1a\nbinary"),
+            ("application/octet-stream", b"\x89PNG\r\n\x1a\nbinary"),
+        ],
+    )
+    async def test_the_body_classification_is_the_same_whichever_transport_read_it(
+        self, content_type: str, body: bytes, monkeypatch
+    ) -> None:
+        """`_plain_body_outcome` is the one copy of the classification rule: the aiohttp path and the
+        impersonated path must agree on every body shape."""
+        url = "https://example.com/parity"
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
+        resp: Any = _FakeResponse(status=200, headers={"Content-Type": content_type})
+
+        via_aiohttp = await agentic_tools._plain_response_outcome(resp, url)
+        via_body = await agentic_tools._plain_body_outcome(body, content_type, url)
+
+        assert via_aiohttp == via_body
