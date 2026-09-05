@@ -124,8 +124,8 @@ and turns a breach into an error `ToolOutcome` rather than a crash.
 - **`read_document`** — ask a specific question of a specific document, and get
   back the passages of it that bear on the ask. Acquisition-first: it runs the
   free rungs (this run's cache, then plain HTTP, the impersonated retry of a 403,
-  and headless Chromium) and
-  answers from the page's own text with a deterministic BM25 passage digest
+  and headless Chromium) and answers from the page's own text with a deterministic
+  BM25 passage digest
   (`method=digest_local`), and only where the ladder holds nothing usable — no text at
   all, or the one refused shape described below — does Gemini read the URL through the
   `url_context` tool on the native `google-genai` SDK (`method=document`). So it is

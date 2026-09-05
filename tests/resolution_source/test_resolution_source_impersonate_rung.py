@@ -315,7 +315,9 @@ class TestImpersonateRungStillRefused:
         assert impersonation_refused(_URL) is False
 
     async def test_a_404_under_impersonation_does_not_memoize(self, monkeypatch):
-        """The path is gone, which says nothing about the host's view of our fingerprint."""
+        """The path is gone, which says nothing about the host's view of our fingerprint, so the
+        next cited URL on the host still earns its own dial (the contract the parametrized
+        outcome test above does not cover)."""
         calls = _transport(monkeypatch, _impersonated(404, body=b""))
         session = FakeSession(
             {
@@ -605,7 +607,7 @@ class TestImpersonateRungDialsTheLandingUrl:
         assert result is None
         assert calls == []
         assert ctx.rungs == []
-        assert [message for message in caplog.messages if "not retrying" in message]
+        assert [message for message in caplog.messages if "not re-dialing" in message]
 
 
 class TestImpersonateRungBodyClassification:
@@ -719,7 +721,8 @@ class TestImpersonateRungBodyClassification:
         in the same order. Adding a token to a shared vocabulary propagates; adding or reordering a
         BRANCH does not, so the two are pinned equal on every body shape, the pending-document case
         resolved through `_finish_document` on both sides, down to the `pdf_local` attempt each
-        opens on its own context."""
+        opens on its own context. Equal on every field a classification decides (`_shape`); the
+        attempts are compared by rung and trigger because their wall times cannot be."""
         direct_ctx = FetchContext(now=_NOW, query="hospitalizations reported")
         impersonated_ctx = FetchContext(now=_NOW, query="hospitalizations reported")
 
@@ -749,8 +752,10 @@ class TestImpersonateRungBodyClassification:
             result.chrome_metric_withheld,
             result.precision_rescued,
             result.unreadable_embeds,
+            result.datawrapper_charts,
             result.server,
             result.failure_class,
+            result.exc,
         )
 
 

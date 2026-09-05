@@ -1,4 +1,5 @@
-"""Fake aiohttp session and HTML page builders for the resolution-source tests.
+"""Fake aiohttp session and HTML page builders for the resolution-source tests, plus the
+impersonated-transport double that ``tests/test_agentic_tools.py`` shares with them.
 
 Copied and extended from ``tests/market_retrieval_fakes.py``. Extensions versus the
 prediction-market template:
@@ -486,10 +487,12 @@ def refused_page_with_robots(*, robots: bytes = ROBOTS_ALLOW_ALL, extra: _Handle
     )
 
 
-# --- Impersonated-retry rung scaffolding (shared by the rung, SSRF and dispatch modules) ---
-# The transport is `research/impersonated_fetch.py`; every test here patches the import seam
-# `resolution_source.fetch_impersonated` with the double below rather than the transport's own
-# session, so the suite's `_block_native_egress` guard stays armed underneath it.
+# --- Impersonated-retry scaffolding (shared by the Tier-1 rung, SSRF, dispatch and fetch modules
+# and by gap-fill v2's `tests/test_agentic_tools.py`) ---
+# The transport is `research/impersonated_fetch.py`; every test patches its own ladder's import
+# seam (`resolution_source.fetch_impersonated` for Tier 1, `agentic_tools.fetch_impersonated` for
+# gap-fill v2) with the double below rather than the transport's own session, so the suite's
+# `_block_native_egress` guard stays armed underneath it.
 
 
 def _impersonated(

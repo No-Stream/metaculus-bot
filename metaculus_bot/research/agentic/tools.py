@@ -102,7 +102,6 @@ from metaculus_bot.research.http_fetch import (
 from metaculus_bot.research.impersonated_fetch import (
     ImpersonateDeclined,
     fetch_impersonated,
-    impersonation_refused,
 )
 from metaculus_bot.research.rendered_fetch import (
     MemoScope,
@@ -478,7 +477,7 @@ async def _try_impersonated_fetch(url: str) -> PlainFetchResult | None:
     """
     if not impersonated_fetch.impersonation_enabled():
         return None
-    if impersonation_refused(url):
+    if impersonated_fetch.impersonation_refused(url):
         return None
     netloc = urlparse(url).netloc
     try:
@@ -611,8 +610,7 @@ def _held_from_result(url: str, result: PlainFetchResult) -> local_document.Held
 
 
 async def _run_local_document_ladder(url: str) -> local_document.HeldDocument:
-    """The free rungs ``fetch`` runs, for a document read: plain, the impersonated retry of a
-    403, then rendered.
+    """The free rungs ``fetch`` runs, for a document read: plain, the impersonated retry, then rendered.
 
     Escalation follows ``fetch``'s own rule rather than a looser one: a page whose plain text is
     thin enough to look like a JavaScript shell goes to the browser even though we hold
@@ -805,11 +803,11 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     """Answer ``ask`` about ``url``: from the page's own text where we can get it, else Gemini.
 
     Acquisition-first. The free ladder runs before anything is spent (this run's cache, then
-    the plain, impersonated-retry and rendered rungs ``fetch`` uses), and any text it holds is answered with a
-    deterministic BM25 passage digest — ``method="digest_local"``. The paid ``url_context``
-    read happens only when the ladder holds nothing: a host that refuses us, a page with no
-    text at all, or a PDF with no text layer. Measured 2026-09-03, that is two of 47 archived
-    fetch failures, against 191 reader calls over the 2026 summer season.
+    the plain, impersonated-retry and rendered rungs ``fetch`` uses), and any text it holds is
+    answered with a deterministic BM25 passage digest — ``method="digest_local"``. The paid
+    ``url_context`` read happens only when the ladder holds nothing: a host that refuses us, a
+    page with no text at all, or a PDF with no text layer. Measured 2026-09-03, that is two of 47
+    archived fetch failures, against 191 reader calls over the 2026 summer season.
 
     The retrieval-count guard on the paid rung stays exactly as it was, because it is what
     keeps that rung honest: ``method="document"`` maps to the ``fetched`` tier

@@ -1437,16 +1437,14 @@ class TestTheHopRefusalPolicy:
         with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
             same = await resolution_source._landing_refused(_URL, _URL, action="rendering")
             allowed = await resolution_source._landing_refused(allowed_landing, _URL, action="rendering")
-            refused = await resolution_source._landing_refused(
-                "http://10.0.0.8/status", _URL, action="retrying under impersonation"
-            )
+            refused = await resolution_source._landing_refused("http://10.0.0.8/status", _URL, action="re-dialing")
 
         assert (same, allowed, refused) == (False, False, True)
         assert calls == [allowed_landing, "http://10.0.0.8/status"]
         assert [
             message
             for message in caplog.messages
-            if "not retrying under impersonation 10.0.0.8, where the cited tracker.example.com landed" in message
+            if "not re-dialing 10.0.0.8, where the cited tracker.example.com landed" in message
         ]
         assert not any("not rendering" in message for message in caplog.messages)
 
@@ -1479,7 +1477,7 @@ class TestTheHopRefusalPolicy:
         assert await resolution_source._rendered_rung(_URL, walled, {}, ctx) is None
         assert await resolution_source._impersonate_rung(_URL, refused, host_sems={}, ctx=ctx) is None
 
-        assert seen == [(landed, _URL, "rendering"), (landed, _URL, "retrying under impersonation")]
+        assert seen == [(landed, _URL, "rendering"), (landed, _URL, "re-dialing")]
         assert renders == []
         assert dials == []
         assert ctx.rungs == []

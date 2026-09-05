@@ -2932,8 +2932,9 @@ answers 403 to aiohttp, 200 to the impersonated client, and carries only
 direct `blocked` standing. The shape is a hypothesis built from two receipts (the cdc.gov
 refresh stubs the meta-refresh hop was added for, and cdc.gov's 403 to aiohttp), not a measured
 case; wiring it means the transport following the refresh target as one more re-guarded,
-re-pinned hop under the shared `MAX_REDIRECTS` cap, which is the same decision the rendered rung
-avoids for the same reason.
+re-pinned hop under the shared `MAX_REDIRECTS` cap, dialed impersonated because this host refused
+the direct client. The browser rung has no such decision to make: Chromium follows a meta refresh
+itself and the route guard re-checks the hop, which is why `RenderedPage.document_url` exists.
 
 ### Chromium teardown noise after a render: cause found, fix not shipped (added 2026-09-03; LOW)
 

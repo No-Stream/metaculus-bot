@@ -1,9 +1,9 @@
 # SMELL-EXEMPT-monolithic-file-loc: what stays here is fixed by the test suites'
 # monkeypatch surface, not by the layer diagram. Ten `RESOLUTION_SOURCE_*` caps
 # plus `_get_session`, `render_page`, `run_url_context_read`, `fetch_impersonated`,
-# `_WAYBACK_TRIGGER_STATUSES`, `is_public_http_url`,
+# `_WAYBACK_TRIGGER_STATUSES`, `is_public_http_url`, `_hop_refusal`, `_landing_refused`,
 # `_extract_main_text` and `_sem_for_host` are patched on THIS module
-# (tests/resolution_source/*.py, tests/test_agentic_tools.py) — 23 distinct names in all,
+# (tests/resolution_source/*.py, tests/test_agentic_tools.py) — more than two dozen names in all,
 # plus the `resolution_source.asyncio` / `.socket` attribute-of-import targets — so every
 # reader of one has to stay here to resolve it as a module global at call time, which pins the
 # network layer, the section renderer, the escalation ladder and the provider factory.
@@ -239,7 +239,6 @@ from metaculus_bot.research.impersonated_fetch import (
     ImpersonateTransportError,
     ImpersonateUnpinnable,
     fetch_impersonated,
-    impersonation_refused,
 )
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -2155,7 +2154,7 @@ async def _impersonate_rung(
     landing is re-vetted through :func:`_landing_refused`, and a refusal is a decline with no
     attempt, the same helper :func:`_rendered_rung` runs. The rung's ATTEMPT stays keyed on the
     cited ``url``, which is what the escalation line names. The per-run memo
-    (:func:`impersonation_refused`, keyed by HOST) records ``impersonate_host_refused``: a host
+    (``impersonated_fetch.impersonation_refused``, keyed by HOST) records ``impersonate_host_refused``: a host
     that answered the impersonated client with a block status is not going to answer the next
     cited URL on it differently in the same run. The memo is process-global and shared with
     gap-fill v2, whose ``fetch`` and ``read_document`` ladders write it too, so the earlier
@@ -2196,9 +2195,9 @@ async def _impersonate_rung(
         ctx.skip_rung("impersonate", direct.status, url, "impersonate_disabled")
         return None
     retry_url = direct.url
-    if await _landing_refused(retry_url, url, action="retrying under impersonation"):
+    if await _landing_refused(retry_url, url, action="re-dialing"):
         return None
-    if impersonation_refused(retry_url):
+    if impersonated_fetch.impersonation_refused(retry_url):
         ctx.skip_rung("impersonate", direct.status, url, "impersonate_host_refused")
         return None
     budget_s = ctx.claim_rung_budget("impersonate", direct.status, url, RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S)

@@ -1027,8 +1027,8 @@ switch that is ON by default in code, `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, u
 rung's default-off. The trigger set, the block-shaped set the memo keys on and the kill switch
 all live on the transport (`IMPERSONATE_TRIGGER_STATUSES`, `IMPERSONATE_BLOCK_STATUSES`,
 `impersonation_enabled`, `note_refusal_if_block_shaped`), read by both fetchers at call time so
-neither can drift from the other. A rescue's fetch
-line reads `status=ok http=200 route=impersonate` because the bytes came with a 200; the refusal
+neither can drift from the other. A rescue's fetch line reads `status=ok http=200
+route=impersonate` because the bytes came with a 200; the refusal
 lives on the escalation line's `from_status=blocked`, as a Wayback rescue already reports the
 snapshot's own status. An impersonated 200 that still classifies as unreadable stamps its verdict
 on the escalation line (`rung=impersonate outcome=js_wall`) and leaves `blocked` standing, so
