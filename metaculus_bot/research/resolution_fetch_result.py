@@ -207,6 +207,21 @@ FetchStatusReason = Literal[
 #   nothing about the page was published and the next question should be refused on its own
 #   record; the error-document landing is memoised by the transport (its timed-out memo), so a
 #   later question in the run records `render_timeout` for it without a launch.
+# `impersonate_disabled`: the impersonated retry declined on its kill switch
+#   (`RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, on by default in code). A configuration rather than a
+#   tuning signal, and counted because without it a run with the switch off is byte-identical in
+#   the archive to one where no cited page ever earned the retry.
+# `impersonate_unpinnable`: the impersonated retry raised before anything was dialed, because the
+#   host would not resolve to a vetted public address to pin the connection to
+#   (`impersonated_fetch.ImpersonateUnpinnable`). Nothing was dialed and nothing about the page
+#   changed. The direct fetch resolved the same host through the filtering resolver moments
+#   earlier, so a nonzero count means DNS disagreed with the direct fetch's own resolution (a flake,
+#   or a rebinding host that flipped) rather than a host refusing us.
+# `impersonate_host_refused`: the impersonated retry skipped because an earlier cited URL on the
+#   same host already answered the impersonated client with a block status this run (the per-run
+#   memo, keyed by host). The memo doing its job rather than a failure, the same distinction
+#   `rendered_no_text` draws for the browser; folded into the fired count it would read as a host
+#   refusing us twice.
 RungSkipReason = Literal[
     "wall_budget",
     "wayback_cap",
@@ -221,6 +236,9 @@ RungSkipReason = Literal[
     "render_non_200",
     "render_dom_too_large",
     "render_off_host",
+    "impersonate_disabled",
+    "impersonate_unpinnable",
+    "impersonate_host_refused",
 ]
 
 # Which rung of the escalation ladder produced a result. The vocabulary is pinned to the

@@ -16,6 +16,7 @@ import pytest
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.derived_api import reset_derived_endpoints
 from metaculus_bot.research.http_fetch import reset_host_semaphores, reset_pdf_parse_semaphore
+from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.robots_policy import reset_robots_cache
 from tests.resolution_source_fakes import _INFOGRAM_EMBED_MARKUP, _embed_shell_page
 
@@ -109,6 +110,28 @@ def _decline_the_wayback_rung(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _decline_the_impersonate_rung(monkeypatch):
+    """Empty the impersonated retry's trigger set for every test in this package by default.
+
+    The same convenience as the archive fixture above, for the same reason: the rung fires on a
+    direct 403, which dozens of tests here produce on purpose, and every one of them drives a
+    ``FakeSession`` with no transport double installed, so an unwanted fire would reach the real
+    ``fetch_impersonated`` and trip the suite's ``_block_native_egress`` guard mid-ladder. The
+    guard is the containment (a rung that swallowed its ``RuntimeError`` would still fail the
+    test at teardown); this fixture is what keeps that refusal from being the OUTCOME. Emptying
+    the trigger set declines before the rung looks at anything, so it records no attempt, claims
+    no ``route`` and dials nothing, and every pre-rung expectation in this package holds.
+
+    Tests that exercise the rung restore the module's OWN constant object
+    (``_IMPERSONATE_TRIGGER_HTTP_STATUS``, imported so the two cannot drift) and patch
+    ``resolution_source.fetch_impersonated`` with a double. The trigger population is pinned in
+    ``test_resolution_source_impersonate_rung.py`` and its ``ssrf_blocked`` exclusion in
+    ``test_resolution_source_third_party_rung_ssrf.py``.
+    """
+    monkeypatch.setattr(resolution_source, "_IMPERSONATE_TRIGGER_HTTP_STATUS", frozenset())
+
+
+@pytest.fixture(autouse=True)
 def _stub_public_dns(monkeypatch):
     """Every test hostname in this package uses ``*.example.com``, an RFC-2606
     reserved TLD with no real DNS. Without a stub, the SSRF guard's
@@ -180,10 +203,14 @@ def _reset_render_state():
     All three outlive one provider call by design — that is what makes a second cited URL on a
     host cheap — so without a reset a test that inherited another's finds would pass or fail on
     order. Moved here from the escalation test module when it was split by rung, so every module
-    that touches a render or a derived feed gets the isolation without redeclaring it.
+    that touches a render or a derived feed gets the isolation without redeclaring it. The
+    impersonation memo (a host that refused the impersonated retry this run) is reset here for
+    the same reason: keyed by host, and every test in this package fetches ``tracker.example.com``.
     """
     rendered_fetch.reset_render_state()
     reset_derived_endpoints()
+    reset_impersonation_memo()
     yield
     rendered_fetch.reset_render_state()
     reset_derived_endpoints()
+    reset_impersonation_memo()

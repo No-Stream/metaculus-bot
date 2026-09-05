@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 
 from metaculus_bot.constants import GOOGLE_API_KEY_ENV, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.impersonated_fetch import ImpersonatedResponse
 from metaculus_bot.research.rendered_fetch import RenderedPage
 
 
@@ -471,3 +472,62 @@ def refused_page_with_robots(*, robots: bytes = ROBOTS_ALLOW_ALL, extra: _Handle
             **(extra or {}),
         }
     )
+
+
+# --- Impersonated-retry rung scaffolding (shared by the rung, SSRF and dispatch modules) ---
+# The transport is `research/impersonated_fetch.py`; every test here patches the import seam
+# `resolution_source.fetch_impersonated` with the double below rather than the transport's own
+# session, so the suite's `_block_native_egress` guard stays armed underneath it.
+
+
+def _impersonated(
+    status: int,
+    *,
+    body: bytes = b"",
+    content_type: str = "text/html; charset=utf-8",
+    url: str = _URL,
+    server: str | None = None,
+) -> ImpersonatedResponse:
+    """One completed impersonated response, shaped as the transport returns it."""
+    return ImpersonatedResponse(
+        status=status,
+        url=url,
+        content_type=content_type.lower(),
+        server=server,
+        body=body,
+        elapsed_s=0.31,
+        primary_ip="93.184.216.34",
+    )
+
+
+def fake_impersonated_fetch(answer: ImpersonatedResponse | BaseException, calls: list[dict[str, Any]]):
+    """A stand-in for ``fetch_impersonated`` that records every keyword the rung handed it.
+
+    ``answer`` is returned, or raised when it is an exception, so one double covers a rescue,
+    a still-refused host and every member of the ``ImpersonateDeclined`` family.
+    """
+
+    async def _fetch(
+        url: str,
+        *,
+        host_sems: dict[str, asyncio.Semaphore],
+        deadline_monotonic_s: float,
+        per_hop_timeout_s: float,
+        max_bytes: int,
+    ) -> ImpersonatedResponse:
+        calls.append(
+            {
+                "url": url,
+                "host_sems": host_sems,
+                "deadline_monotonic_s": deadline_monotonic_s,
+                "per_hop_timeout_s": per_hop_timeout_s,
+                "max_bytes": max_bytes,
+            }
+        )
+        # A real yield point, so the double schedules like the transport it replaces.
+        await asyncio.sleep(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    return _fetch

@@ -237,6 +237,17 @@ class TestRungSkipReasonCounts:
         assert all(value == 0 for value in counts.values())
         assert {"rung_budget_skips", "chrome_metric_withholds", "chrome_metric_withholds_rescued"} <= set(counts)
 
+    def test_the_impersonate_rung_is_phrased_and_budget_gated(self):
+        """Explicit, because the failure it guards is silent until production: `claim_rung_budget`
+        indexes the phrase map, so an impersonate rung shipped without its entry raises `KeyError`
+        from inside the rung, which the provider's `gather(return_exceptions=False)` turns into
+        losing every cited page of the question."""
+        assert _RUNG_WALL_SKIP_PHRASE["impersonate"] == "the impersonated retry"
+        assert "impersonate" in _BUDGET_GATED_RUNGS
+        # Inserted in ladder order, right after the meta-refresh hop and before the local PDF read.
+        assert _BUDGET_GATED_RUNGS.index("impersonate") == _BUDGET_GATED_RUNGS.index("meta_refresh") + 1
+        assert {"impersonate_attempts", "impersonate_budget_skips"} <= set(_rung_counts([]))
+
 
 # The abs.gov.au shape the extractor policy was calibrated on: about 2,000 chars of 48-char
 # listing lines, well over the chrome floor and nothing but a menu, so real trafilatura extracts

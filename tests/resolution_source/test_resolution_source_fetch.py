@@ -1785,5 +1785,5 @@ class TestPerHopRequestTimeout:
             FetchContext(started=time.monotonic() - 2 * resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT),
         )
 
-        assert session.get_kwargs[0]["timeout"].total == resolution_source._MIN_HOP_TIMEOUT_S
+        assert session.get_kwargs[0]["timeout"].total == resolution_source.RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
         assert result.status == "success", "the floor is a real attempt, not a formality"

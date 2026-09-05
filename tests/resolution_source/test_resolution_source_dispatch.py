@@ -14,6 +14,7 @@ from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
 from metaculus_bot.research.resolution_source import (
+    _IMPERSONATE_TRIGGER_HTTP_STATUS,
     _WAYBACK_TRIGGER_STATUSES,
     FetchContext,
     _fetch_one,
@@ -28,12 +29,14 @@ from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
     _fake_render,
+    _impersonated,
     _meta_refresh_stub,
     _mock_question,
     _prose_page,
     _rendered_document,
     _snapshot_url,
     arm_paid_rung,
+    fake_impersonated_fetch,
     paid_reader,
     refused_page_with_robots,
 )
@@ -230,6 +233,25 @@ class TestFastPath:
         assert derived.route == "derived_api"
         assert derived.status == "success"
         assert [(a.rung, a.skipped_reason) for a in derived.rung_attempts] == [("derived_api", "")]
+
+    async def test_the_impersonated_retry_still_runs_on_the_fast_path(self, monkeypatch):
+        """One GET against a host that just answered us, so it is a cheap rung like the hop above
+        and records no `fast_path` skip; the gate is reserved for the browser and the paid read."""
+        monkeypatch.setattr(resolution_source, "_IMPERSONATE_TRIGGER_HTTP_STATUS", _IMPERSONATE_TRIGGER_HTTP_STATUS)
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            resolution_source,
+            "fetch_impersonated",
+            fake_impersonated_fetch(_impersonated(200, body=_prose_page(_RENDERED_PROSE)), calls),
+        )
+        session = FakeSession({_URL: FakeResponse(403, body=b"", content_type="text/html")})
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(fast_path=True))
+
+        assert len(calls) == 1
+        assert result.route == "impersonate"
+        assert result.status == "success"
+        assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [("impersonate", "")]
 
 
 class TestProviderLevelRungMarkers:
