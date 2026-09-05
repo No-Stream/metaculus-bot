@@ -1,4 +1,5 @@
-"""Measure, from wherever this runs, WHY the resolution-source fetcher gets 403s.
+"""Measure, from wherever this runs, WHY the resolution-source fetcher gets 403s, and whether
+the production ladder recovers them.
 
 Background: the Tier-1 resolution-source fetcher
 (``metaculus_bot/research/resolution_source.py``) is refused with HTTP 403 by
@@ -7,9 +8,11 @@ bot runs on a GitHub Actions runner. The identical client, on the operator's lap
 and on their EC2 box, gets 200 from the same URLs. Two explanations fit that split
 and they call for completely different fixes: the runner's TLS/HTTP fingerprint is
 being scored (fixable with Chrome impersonation) or the runner's egress IP range is
-blocked outright (not fixable client-side; needs an archival route).
+blocked outright (not fixable client-side; needs an archival route). The 2026-09-04
+run from the runner settled it: the four Akamai hosts are fingerprint-scored and the
+Cloudflare, CloudFront and DataDome hosts are IP-blocked.
 
-So this script runs three probes per URL and prints one table:
+So this script runs four probes per URL and prints one table plus a ladder block:
 
   A  the bot's REAL client — ``resolution_source._get_session()``, so the browser
      headers, the SSRF FilteringResolver and the fetcher's own HTTP timeout are
@@ -18,27 +21,43 @@ So this script runs three probes per URL and prints one table:
      real Chrome TLS/JA3 + HTTP2 fingerprint. A ROW WHERE A IS 403 AND B IS 200 IS
      THE FINGERPRINT VERDICT; a row where both are 403 is the IP verdict.
   C  the Wayback Machine copy, which is the fallback route if B does not help.
+  D  the real Tier-1 provider entry point, ``fetch_resolution_sources``, run on the
+     URL alone with no keys in the environment: the direct fetch plus every FREE rung
+     of the escalation ladder (the impersonation rung among them), reported as the
+     status, the route and the rung outcomes production would record. A row reading
+     ``status=success route=impersonate`` with ``rung=impersonate outcome=success``
+     on an Akamai host, from the runner, is the live proof that the rung works from
+     production egress; B says the fingerprint is the problem, D says the shipped
+     code fixes it.
 
 Everything here is free: no LLM call, no API key, no paid provider, and no write of
-any kind. It is safe to run on a runner with no secrets in the environment.
+any kind. It is safe to run on a runner with no secrets in the environment. Column D
+reads production code only, and the one PAID rung in that ladder (the Gemini
+``url_context`` read) declines on its flag before it looks for its key, and both are
+unset here.
 
 Politeness: probes run strictly sequentially, with at least ``_HOST_SPACING_S``
-between two requests to the same host, and every request carries a timeout.
+between two requests to the same host, and every request carries a timeout. Column D
+is the exception the pacer cannot see inside: the provider serialises same-host
+requests on its own per-host gate but does not space them, and a host that refuses
+every free rung costs it 1 to 3 extra requests (the impersonated retry, then the
+archive lookup, which repeats column C's request).
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 from datetime import UTC, datetime
 from typing import NamedTuple
 from urllib.parse import urlparse
 
 import aiohttp
+from curl_cffi import requests as curl_requests
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
 from metaculus_bot.research.http_fetch import read_body_capped
-from metaculus_bot.research.resolution_source import _get_session, is_public_http_url
+from metaculus_bot.research.resolution_fetch_result import FetchResult, RungAttempt
+from metaculus_bot.research.resolution_source import _get_session, fetch_resolution_sources, is_public_http_url
 from metaculus_bot.research.wayback import parse_snapshot_url, snapshot_age_days, wayback_snapshot_url
 
 _HOST_SPACING_S = 1.0
@@ -47,6 +66,9 @@ _HOST_SPACING_S = 1.0
 # break the column, so it is capped where it is read rather than at render time —
 # the Wayback column's note carries the snapshot age and must survive whole.
 _SERVER_HEADER_MAX_CHARS = 20
+# This diagnostic's own knob for columns B and C, ABOVE the Tier-1 HTTP timeout on purpose:
+# the question here is whether a host answers at all, not whether it answers inside the
+# provider wall. Column D runs production's own timeouts. Never copy this into production.
 _IMPERSONATE_TIMEOUT_S = 25.0
 _EGRESS_IP_URL = "https://api.ipify.org"
 
@@ -111,11 +133,6 @@ def _short_error(exc: BaseException) -> str:
     return rendered[:60]
 
 
-def impersonation_available() -> bool:
-    """Whether the optional curl_cffi impersonation rung can run at all."""
-    return importlib.util.find_spec("curl_cffi") is not None
-
-
 class HostPacer:
     """Enforce a minimum gap between two requests to the same host."""
 
@@ -158,15 +175,12 @@ async def probe_bot_client(session: aiohttp.ClientSession, url: str) -> ProbeOut
 
 
 def probe_impersonated(url: str) -> ProbeOutcome:
-    """Probe B: the same GET with a real Chrome TLS/HTTP2 fingerprint."""
-    try:
-        # Genuinely optional dependency: curl_cffi is declared only in pyproject's dev group
-        # (for tests/conftest.py's egress guard), and this probe's workflow syncs `--no-dev`
-        # and supplies it with `uv run --with curl_cffi`, so this rung has to degrade rather
-        # than crash when it is absent.
-        from curl_cffi import requests as curl_requests  # noqa: PLC0415
-    except ImportError:
-        return ProbeOutcome(None, 0, "curl_cffi absent")
+    """Probe B: the same GET with a real Chrome TLS/HTTP2 fingerprint.
+
+    Deliberately the floating ``"chrome"`` alias rather than production's pinned profile, so
+    this column keeps answering "does the CURRENT Chrome fingerprint get in" while column D
+    answers "does the shipped rung get in"; the two diverging is itself a finding.
+    """
     try:
         resp = curl_requests.get(url, impersonate="chrome", allow_redirects=True, timeout=_IMPERSONATE_TIMEOUT_S)
     except (curl_requests.RequestsError, OSError) as exc:
@@ -182,10 +196,6 @@ def probe_wayback(url: str) -> ProbeOutcome:
     here, so what the probe measures cannot drift from what production asks the archive for; the
     stamp and age in the note are read back through the rung's own parser too (``_snapshot_note``).
     """
-    try:
-        from curl_cffi import requests as curl_requests  # noqa: PLC0415  # optional, see probe_impersonated
-    except ImportError:
-        return ProbeOutcome(None, 0, "curl_cffi absent")
     archive_url = wayback_snapshot_url(url, now=datetime.now(UTC))
     try:
         resp = curl_requests.get(
@@ -219,11 +229,65 @@ def _snapshot_note(final_url: str) -> str:
     return f"{stamp} ({int(age_days)}d old)"
 
 
+class LadderOutcome(NamedTuple):
+    """Probe D's result: what the production ladder recorded for the URL."""
+
+    status: str
+    route: str
+    http_status: int | None
+    n_chars: int
+    rung_attempts: tuple[RungAttempt, ...]
+
+    def render(self) -> str:
+        head = f"status={self.status} route={self.route} http={self.http_status} chars={self.n_chars}"
+        if not self.rung_attempts:
+            return f"{head} rungs=none"
+        return f"{head} {' '.join(_render_rung_attempt(attempt) for attempt in self.rung_attempts)}"
+
+    @property
+    def rescued_by_impersonation(self) -> bool:
+        """The rung fired on this URL and the page it produced is what was published."""
+        return self.status == "success" and self.route == "impersonate"
+
+
+def _render_rung_attempt(attempt: RungAttempt) -> str:
+    if attempt.skipped_reason:
+        return f"rung={attempt.rung} skip={attempt.skipped_reason}"
+    return f"rung={attempt.rung} outcome={attempt.outcome}"
+
+
+async def probe_ladder(url: str) -> LadderOutcome:
+    """Probe D: the real Tier-1 provider on this one URL, every free rung included.
+
+    ``fetch_resolution_sources`` is the entry point ``resolution_source_provider`` calls for a
+    question's cited URLs, so what this column reports is what a live run would record for the
+    same page from the same egress: the direct fetch and, when that fails, the meta-refresh hop,
+    the impersonated retry, the local PDF read, the browser render (which declines on a runner
+    with no Chromium installed, as the ``renderer_unavailable`` skip), the derived feed and the
+    archive. The paid ``url_context`` rung declines on its unset flag. ``query`` is empty because
+    there is no question here; it only ranks which passages of a document a forecaster sees.
+    ``fast_path=False`` so no rung declines for the thin-window mode a real question might be in.
+
+    No exception is caught: a failed fetch comes back as a ``FetchResult`` with its own status,
+    and anything that RAISES out of the provider is a bug this diagnostic should crash on.
+    """
+    results: list[FetchResult] = await fetch_resolution_sources([url], query="", fast_path=False)
+    (result,) = results
+    return LadderOutcome(
+        status=result.status,
+        route=result.route,
+        http_status=result.http_status,
+        n_chars=len(result.text),
+        rung_attempts=tuple(result.rung_attempts),
+    )
+
+
 class ProbeRow(NamedTuple):
     probe_url: ProbeUrl
     bot: ProbeOutcome
     impersonated: ProbeOutcome
     wayback: ProbeOutcome
+    ladder: LadderOutcome
 
 
 async def read_egress_ip(session: aiohttp.ClientSession) -> str:
@@ -246,7 +310,12 @@ async def run_probes(session: aiohttp.ClientSession, pacer: HostPacer) -> list[P
         archive_url = wayback_snapshot_url(probe_url.url, now=datetime.now(UTC))
         await pacer.wait(archive_url)
         wayback = await asyncio.to_thread(probe_wayback, probe_url.url)
-        rows.append(ProbeRow(probe_url, bot, impersonated, wayback))
+        # The ladder's first request is to the cited host; its later rungs may hit the archive
+        # too, which the pacer cannot space. Both are paced on entry at least.
+        await pacer.wait(probe_url.url)
+        await pacer.wait(archive_url)
+        ladder = await probe_ladder(probe_url.url)
+        rows.append(ProbeRow(probe_url, bot, impersonated, wayback, ladder))
     return rows
 
 
@@ -267,6 +336,14 @@ def print_table(rows: list[ProbeRow]) -> None:
             f"  {index:>2}  {row.probe_url.source_class:<18}  "
             f"{row.bot.render():<34}  {row.impersonated.render():<34}  {row.wayback.render()}"
         )
+    print()
+
+
+def print_ladder(rows: list[ProbeRow]) -> None:
+    """Column D on its own lines: the rung pairs are too wide for the table."""
+    print("D  production ladder (fetch_resolution_sources, no keys)")
+    for index, row in enumerate(rows, start=1):
+        print(f"  {index:>2}  {row.probe_url.source_class:<18}  {row.ladder.render()}")
     print()
 
 
@@ -296,6 +373,8 @@ def print_verdict(rows: list[ProbeRow]) -> None:
     both_refused = [r for r in rows if r.bot.status == 403 and r.impersonated.status == 403]
     both_ok = [r for r in rows if r.bot.status == 200 and r.impersonated.status == 200]
     archived = [r for r in rows if r.wayback.status == 200]
+    rescued = [r for r in rows if r.ladder.rescued_by_impersonation]
+    helped_not_rescued = [r for r in helped if not r.ladder.rescued_by_impersonation]
 
     print("Verdict")
     print(
@@ -308,19 +387,24 @@ def print_verdict(rows: list[ProbeRow]) -> None:
         "which bounds how much of the rest an archival route could recover; read the snapshot age before "
         "treating any of them as a live source."
     )
+    print(
+        f"  The production ladder published {_count(rescued)} through the impersonation rung "
+        f"({_hosts(rescued)}). {_count(helped_not_rescued)} that column B recovered did NOT come back "
+        f"route=impersonate from the ladder ({_hosts(helped_not_rescued)}); a nonzero count there is a defect in "
+        "the shipped rung rather than in the host, so read that row's rung pairs and the run log for an "
+        "ImpersonatePinNotHeld error or a failure_class=tls before merging."
+    )
 
 
 async def main() -> None:
     print(f"Fetch egress diagnostic — {datetime.now(UTC).isoformat(timespec='seconds')}")
-    if not impersonation_available():
-        print("  WARNING: impersonation rung unavailable — curl_cffi is not importable.")
-        print("  Re-run as: uv run --with curl_cffi python scripts/probes/fetch_diagnostic.py")
     async with _get_session() as session:
         print(f"  egress IP: {await read_egress_ip(session)}")
         print()
         print_url_list()
         rows = await run_probes(session, HostPacer(_HOST_SPACING_S))
     print_table(rows)
+    print_ladder(rows)
     print_verdict(rows)
 
 
