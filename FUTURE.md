@@ -1457,7 +1457,15 @@ Follow-ups:
    link base, so a same-host client-side redirect from `/senate` to `/senate/2026/` resolves
    `href="methodology.html"` against the real document and the published section URL names it;
    `RenderedPage.url` still carries the REQUESTED URL, because that is the key for both render
-   memos. Second,
+   memos. One thing the post-read `page.url` does NOT establish is provenance. It establishes
+   safety, because a DOM that is handed back is one whose frame was on the pinned host both before
+   and after the read, but the content evaluation's reply and the `navigated` event of a navigation
+   that commits a moment later both arrive over the same ordered pipe before the awaiting task
+   resumes, so on a same-host navigation that commits mid-read `final_url` can name the new document
+   while the DOM is the old one. The refinement that would settle it is reading the DOM and
+   `location.href` in ONE `page.evaluate` round trip, so both come from the same document by
+   construction; it is deferred because it changes the core read on merge day, and the mismatch it
+   would close is same-host and confined to `final_url`. Second,
    `context.route_web_socket("**/*", _block_web_socket)` is registered before the page is opened,
    and the handler logs one INFO line (raised from DEBUG in the fix wave, because `cli.py` configures
    the root logger at INFO and the line is the only record of a content-affecting block) and never
