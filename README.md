@@ -208,6 +208,11 @@ make audit        # osv-scanner over uv.lock
 
 Dependencies are managed with uv: `uv add <pkg>` for runtime, `uv add --dev <pkg>` for dev tools, then commit the updated `pyproject.toml` and `uv.lock`. Do not use `pip` or `poetry`; both are blocked here.
 
+Use uv 0.12.10 or newer (`uv self update` for a standalone installation). To refresh
+dependencies, run `uv lock --upgrade` followed by `uv sync --dev --frozen`. The project
+excludes packages uploaded within the last week. Validate updates with the build,
+offline test suite, lint, and type checks before committing.
+
 ### Testing philosophy
 
 - Favor end-to-end integration tests of the forecasting pipeline over narrow unit tests.

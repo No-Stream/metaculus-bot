@@ -111,8 +111,8 @@ Free and safe — run freely:
 - **Package manager: uv.** `uv.lock` is the lockfile; there is no `poetry.lock`. `uv sync --dev`
   installs the package editable, so no `PYTHONPATH=.`. Add deps with `uv add <pkg>` /
   `uv add --dev <pkg>`, then commit `pyproject.toml` + `uv.lock`. **NEVER use `pip` or
-  `poetry`** — both are blocked here. Lock-time `exclude-newer` (about a week) comes from the
-  operator's global uv config, so `uv lock` avoids just-published packages.
+  `poetry`** — both are blocked here. The project requires uv 0.12.10+ and sets
+  `exclude-newer = "1 week"`, so `uv lock` avoids just-published packages.
 - **Build backend `uv_build`**, flat layout (`metaculus_bot/` at repo root, `module-root = ""`).
 - **Formatter: Ruff**, 120-char lines (not Black).
 - **Type checker: basedpyright** in standard mode, must stay at 0 errors. `ty` is secondary and
