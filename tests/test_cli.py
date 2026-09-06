@@ -41,8 +41,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm
 import pytest
-from forecasting_tools import MetaculusApi
+from forecasting_tools import GeneralLlm, MetaculusApi
 
+from metaculus_bot.aggregation_pipeline import AggregationPipeline
+from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.cli import RunMode, _forecast_with_callback_drain, _run_forecasts, persisted_tournament_id
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import (
@@ -1165,13 +1167,14 @@ class _RealAlertableCountBot(MagicMock):
     properties there would mutate the class for every mock in the session and leak
     into unrelated tests.
 
-    EVERY property-backed summand of ``alertable_total`` has to be listed below. A
-    missing one leaves a ``MagicMock`` in the sum, so ``alertable_count`` stops being an
-    int and every test in this file that reads the exit code or the summary line fails
-    at once — loud, but only if you know to look here.
+    EVERY adapter property used by the snapshot has to be listed below. Aggregation
+    counters come from the real pipeline installed by the fixture. A missing owner
+    leaves a ``MagicMock`` in the sum, so ``alertable_count`` stops being an int and
+    every test in this file that reads the exit code or summary line fails at once.
     """
 
     alertable_count = TemplateForecaster.alertable_count
+    _degradation_snapshot = TemplateForecaster._degradation_snapshot
     _research_provider_failure_count = TemplateForecaster._research_provider_failure_count
     _summarizer_failure_count = TemplateForecaster._summarizer_failure_count
     _gap_fill_v2_error_count = TemplateForecaster._gap_fill_v2_error_count
@@ -1195,12 +1198,14 @@ def _bot_with_real_alertable_count() -> _RealAlertableCountBot:
 
     stub_bot = _RealAlertableCountBot()
     stub_bot._research = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
+    stub_bot._pipeline = AggregationPipeline(
+        strategy=AggregationStrategy.MEAN,
+        stacker_llm=None,
+        parser_llm=GeneralLlm(model="test-model", temperature=0.0),
+    )
     for counter in (
         "_forecasters_dropped_count",
         "_questions_failed_to_publish",
-        "_stacker_primary_failed_count",
-        "_stacker_fallback_used_count",
-        "_stacker_fallback_failed_count",
         "_time_budget_fast_path_count",
     ):
         setattr(stub_bot, counter, 0)

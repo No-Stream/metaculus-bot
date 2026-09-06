@@ -68,11 +68,11 @@ def mock_stacking_pipeline(
     targeted_search_return / targeted_search_side_effect : same pattern for
         run_targeted_search.
     aggregate_return : any
-        If provided, bot._aggregate_predictions is mocked with this return_value.
-        If None, _aggregate_predictions is NOT mocked (runs for real or caller
+        If provided, pipeline.stack_predictions is mocked with this return_value.
+        If None, pipeline.stack_predictions is NOT mocked (runs for real or caller
         provides via extra_patches).
-    run_stacking_return / run_stacking_side_effect : controls bot._run_stacking
-        mock.  If both are None, _run_stacking is NOT mocked.
+    run_stacking_return / run_stacking_side_effect : controls bot._pipeline.run_stacking
+        mock.  If both are None, pipeline.run_stacking is NOT mocked.
     extra_patches : list[patch context managers]
         Additional patches to enter alongside the standard set.  Useful for
         one-off mocks like aggregate_binary_mean.
@@ -107,14 +107,14 @@ def mock_stacking_pipeline(
     ):
         mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
 
-        # Optional _aggregate_predictions mock
+        # Optional pipeline.stack_predictions mock
         agg_cm = None
         mock_aggregate = None
         if aggregate_return is not None:
-            agg_cm = patch.object(bot, "_aggregate_predictions", return_value=aggregate_return)
+            agg_cm = patch.object(bot._pipeline, "stack_predictions", return_value=aggregate_return)
             mock_aggregate = agg_cm.__enter__()
 
-        # Optional _run_stacking mock
+        # Optional pipeline.run_stacking mock
         stacking_cm = None
         mock_run_stacking = None
         if run_stacking_return is not None or run_stacking_side_effect is not None:
@@ -123,7 +123,7 @@ def mock_stacking_pipeline(
                 stacking_kw["side_effect"] = run_stacking_side_effect
             else:
                 stacking_kw["return_value"] = run_stacking_return
-            stacking_cm = patch.object(bot, "_run_stacking", **stacking_kw)
+            stacking_cm = patch.object(bot._pipeline, "run_stacking", **stacking_kw)
             mock_run_stacking = stacking_cm.__enter__()
 
         # Extra patches
@@ -321,8 +321,8 @@ class TestConditionalStackingBinaryTrigger:
             assert len(result.predictions) == 1
             assert result.predictions[0].prediction_value == 0.72
 
-            assert bot._conditional_stacking_triggered_count == 1
-            assert bot._conditional_stacking_skipped_count == 0
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 0
 
     @pytest.mark.asyncio
     async def test_low_spread_skips_stacking(self):
@@ -342,10 +342,10 @@ class TestConditionalStackingBinaryTrigger:
 
             assert "## Targeted Research" not in result.research_report
 
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped"
-            assert bot._stacker_skip_reason[question.id_of_question] == "spread_below_threshold"
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
+            assert bot._pipeline.outcomes[question.id_of_question] == "skipped"
+            assert bot._pipeline.skip_reasons[question.id_of_question] == "spread_below_threshold"
 
     @pytest.mark.asyncio
     async def test_diagnostics_seam_on_stacking_paths(self):
@@ -448,7 +448,7 @@ class TestConditionalStackingFallbacks:
 
             assert len(result.predictions) == 1
             assert result.predictions[0].prediction_value == 0.475
-            assert bot._stacking_fallback_count == 1
+            assert bot._pipeline.counters.stacking_fallback_count == 1
 
 
 class TestConditionalStackingMC:
@@ -475,7 +475,7 @@ class TestConditionalStackingMC:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
 
 class TestConditionalStackingThresholds:
@@ -498,7 +498,7 @@ class TestConditionalStackingThresholds:
 
             mocks["crux"].assert_not_called()
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
 
     @pytest.mark.asyncio
     async def test_spread_just_above_threshold(self):
@@ -524,7 +524,7 @@ class TestConditionalStackingThresholds:
 
             mocks["crux"].assert_called_once()
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_spread_just_below_threshold(self):
@@ -543,7 +543,7 @@ class TestConditionalStackingThresholds:
 
             mocks["crux"].assert_not_called()
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
 
 
 class TestConditionalStackingNumeric:
@@ -577,8 +577,8 @@ class TestConditionalStackingNumeric:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
-            assert bot._conditional_stacking_skipped_count == 0
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 0
 
     @pytest.mark.asyncio
     async def test_numeric_low_spread_skips(self):
@@ -603,8 +603,8 @@ class TestConditionalStackingNumeric:
 
             mocks["crux"].assert_not_called()
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
 
 
 class TestConditionalStackingAggregation:
@@ -612,7 +612,7 @@ class TestConditionalStackingAggregation:
 
     @pytest.mark.asyncio
     async def test_high_spread_flows_through_real_stacking(self):
-        """High spread should route through _aggregate_predictions -> _run_stacking for real."""
+        """High spread should route through _aggregate_predictions -> pipeline.run_stacking for real."""
         bot = _make_bot()
         question = _make_binary_question()
 
@@ -653,7 +653,7 @@ class TestConditionalStackingAggregation:
             result = await bot._research_and_make_predictions(question)
 
             mocks["crux"].assert_not_called()
-            assert bot._conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
             assert len(result.predictions) == 3
 
             # Verify MEDIAN is used (not MEAN): MEDIAN([0.30, 0.50, 0.60]) = 0.50
@@ -721,7 +721,7 @@ class TestConditionalStackingFailureCounters:
 
     @pytest.mark.asyncio
     async def test_crux_failure_increments_counter(self):
-        """Crux extraction failure should increment _conditional_stacking_crux_failures."""
+        """Crux extraction failure should increment the conditional-stacking crux counter."""
         bot = _make_bot()
         question = _make_binary_question()
 
@@ -734,12 +734,12 @@ class TestConditionalStackingFailureCounters:
         ) as mocks:
             await bot._research_and_make_predictions(question)
 
-            assert bot._conditional_stacking_crux_failures == 1
+            assert bot._pipeline.counters.conditional_stacking_crux_failures == 1
             mocks["targeted"].assert_not_called()
 
     @pytest.mark.asyncio
     async def test_search_failure_increments_counter(self):
-        """Targeted search failure should increment _conditional_stacking_search_failures."""
+        """Targeted search failure should increment the conditional-stacking search counter."""
         bot = _make_bot()
         question = _make_binary_question()
 
@@ -753,7 +753,7 @@ class TestConditionalStackingFailureCounters:
         ):
             await bot._research_and_make_predictions(question)
 
-            assert bot._conditional_stacking_search_failures == 1
+            assert bot._pipeline.counters.conditional_stacking_search_failures == 1
 
 
 class TestConditionalStackingThresholdValidation:
@@ -793,7 +793,7 @@ class TestConditionalStackingSixModelEnsemble:
 
             mocks["crux"].assert_called_once()
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
 
 class TestNumericStackingEnabled:
@@ -828,10 +828,10 @@ class TestNumericStackingEnabled:
             mocks["aggregate"].assert_not_called()
 
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
-            assert bot._stacker_skip_reason[question.id_of_question] == "config_off"
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
+            assert bot._pipeline.outcomes[question.id_of_question] == "skipped_config_off"
+            assert bot._pipeline.skip_reasons[question.id_of_question] == "config_off"
 
     @pytest.mark.asyncio
     async def test_binary_high_spread_still_triggers_when_numeric_disabled(self, monkeypatch):
@@ -854,7 +854,7 @@ class TestNumericStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_mc_high_spread_still_triggers_when_numeric_disabled(self, monkeypatch):
@@ -878,7 +878,7 @@ class TestNumericStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_numeric_stacking_enabled_unset_defaults_to_DISABLED(self, monkeypatch):
@@ -909,9 +909,9 @@ class TestNumericStackingEnabled:
             mocks["aggregate"].assert_not_called()
 
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
+            assert bot._pipeline.outcomes[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_numeric_stacking_enabled_explicit_true(self, monkeypatch):
@@ -942,7 +942,7 @@ class TestNumericStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
 
 class TestBinaryStackingEnabled:
@@ -969,9 +969,9 @@ class TestBinaryStackingEnabled:
             mocks["aggregate"].assert_not_called()
 
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
+            assert bot._pipeline.outcomes[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_binary_stacking_enabled_unset_defaults_to_DISABLED(self, monkeypatch):
@@ -994,9 +994,9 @@ class TestBinaryStackingEnabled:
             mocks["aggregate"].assert_not_called()
 
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
+            assert bot._pipeline.outcomes[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_binary_stacking_enabled_explicit_true(self, monkeypatch):
@@ -1019,7 +1019,7 @@ class TestBinaryStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_binary_disabled_does_not_affect_numeric(self, monkeypatch):
@@ -1050,7 +1050,7 @@ class TestBinaryStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_binary_disabled_does_not_affect_mc(self, monkeypatch):
@@ -1074,7 +1074,7 @@ class TestBinaryStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
 
 class TestMCStackingEnabled:
@@ -1104,9 +1104,9 @@ class TestMCStackingEnabled:
             mocks["aggregate"].assert_not_called()
 
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
+            assert bot._pipeline.outcomes[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_mc_stacking_enabled_unset_defaults_to_DISABLED(self, monkeypatch):
@@ -1132,9 +1132,9 @@ class TestMCStackingEnabled:
             mocks["aggregate"].assert_not_called()
 
             assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
+            assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
+            assert bot._pipeline.outcomes[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_mc_stacking_enabled_explicit_true(self, monkeypatch):
@@ -1158,7 +1158,7 @@ class TestMCStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_mc_disabled_does_not_affect_binary(self, monkeypatch):
@@ -1181,7 +1181,7 @@ class TestMCStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_mc_disabled_does_not_affect_numeric(self, monkeypatch):
@@ -1212,7 +1212,7 @@ class TestMCStackingEnabled:
             mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
 
 
 class TestConditionalStackingSkipLogMessage:
@@ -1246,10 +1246,10 @@ class TestConditionalStackingSkipLogMessage:
         assert "spread=0.750" in message
         assert "threshold=0.150" in message
         assert str(question.id_of_question) in message
-        assert bot._conditional_stacking_skipped_count == 1
+        assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
         # No regression from the new single-survivor bucket: a config-off skip is
         # still a plain skip, counted only in the original bucket.
-        assert bot._conditional_stacking_skipped_single_forecaster_count == 0
+        assert bot._pipeline.counters.conditional_stacking_skipped_single_forecaster_count == 0
 
     @pytest.mark.asyncio
     async def test_low_spread_skip_keeps_le_threshold_wording(self, monkeypatch, caplog):
@@ -1273,7 +1273,7 @@ class TestConditionalStackingSkipLogMessage:
         assert "spread=0.100" in message
         assert "threshold=0.150" in message
         assert str(question.id_of_question) in message
-        assert bot._conditional_stacking_skipped_count == 1
+        assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
 
 
 class TestUnmeasurableSpreadRoute:
@@ -1303,10 +1303,10 @@ class TestUnmeasurableSpreadRoute:
         # No stacker spend: inf must not be read as "disagreement above threshold".
         mocks["crux"].assert_not_called()
         mocks["targeted"].assert_not_called()
-        assert bot._conditional_stacking_triggered_count == 0
-        assert bot._conditional_stacking_skipped_count == 1
+        assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
+        assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
         # And the marker says what actually happened rather than claiming agreement.
-        assert bot._stacker_skip_reason[question.id_of_question] == "spread_undefined"
+        assert bot._pipeline.skip_reasons[question.id_of_question] == "spread_undefined"
 
     @pytest.mark.asyncio
     async def test_the_skip_log_never_claims_the_models_agreed(self, monkeypatch, caplog):
@@ -1338,7 +1338,7 @@ class TestUnmeasurableSpreadRoute:
         with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY):
             await bot._research_and_make_predictions(question)
 
-        assert bot._stacker_skip_reason[question.id_of_question] == "config_off"
+        assert bot._pipeline.skip_reasons[question.id_of_question] == "config_off"
 
 
 class TestSingleForecasterShortCircuit:
@@ -1404,10 +1404,10 @@ class TestSingleForecasterShortCircuit:
         skip_logs = [r.getMessage() for r in caplog.records if "single forecaster survived" in r.getMessage().lower()]
         assert len(skip_logs) == 1
         assert str(question.id_of_question) in skip_logs[0]
-        assert bot._stacker_outcome[question.id_of_question] == "skipped"
+        assert bot._pipeline.outcomes[question.id_of_question] == "skipped"
         # The additive skip-reason field: this path computes no spread at all, so
         # without it the published marker reads identically to a low-spread skip.
-        assert bot._stacker_skip_reason[question.id_of_question] == "single_forecaster"
+        assert bot._pipeline.skip_reasons[question.id_of_question] == "single_forecaster"
         assert question.id_of_question in bot._pipeline.expected_base_combines
 
         # The run-level summary must agree with the per-question log line above.
@@ -1415,9 +1415,9 @@ class TestSingleForecasterShortCircuit:
         # run logged "SKIPPED: single forecaster survived" and then "skipped=0" seven
         # seconds later. Counted into its own bucket so the two skip reasons
         # (single-survivor vs. spread-at-or-below-threshold) stay separable.
-        assert bot._conditional_stacking_skipped_single_forecaster_count == 1
-        assert bot._conditional_stacking_skipped_count == 0
-        assert bot._conditional_stacking_triggered_count == 0
+        assert bot._pipeline.counters.conditional_stacking_skipped_single_forecaster_count == 1
+        assert bot._pipeline.counters.conditional_stacking_skipped_count == 0
+        assert bot._pipeline.counters.conditional_stacking_triggered_count == 0
 
     @pytest.mark.asyncio
     async def test_two_of_three_dropped_counts_degradation_and_publishes(self):
@@ -1453,5 +1453,5 @@ class TestSingleForecasterShortCircuit:
         assert bot._forecasters_dropped_count == 2
         assert len(result.predictions) == 1
         assert result.predictions[0] is survivor
-        assert bot._stacker_outcome[question.id_of_question] == "skipped"
+        assert bot._pipeline.outcomes[question.id_of_question] == "skipped"
         mock_crux.assert_not_called()

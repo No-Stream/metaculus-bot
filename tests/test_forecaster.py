@@ -1,15 +1,92 @@
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from forecasting_tools import MetaculusQuestion
 
 from main import TemplateForecaster
+from metaculus_bot.research import providers as research_providers
 
 
 @pytest.mark.asyncio
-async def test_run_research_priority():
-    """Test that research provider priority logic works correctly."""
+@pytest.mark.parametrize(
+    ("credentials", "expected_provider", "expected_text", "expected_header"),
+    [
+        pytest.param(
+            {
+                "ASKNEWS_CLIENT_ID": "asknews-client",
+                "ASKNEWS_SECRET": "asknews-secret",
+                "EXA_API_KEY": "exa-key",
+                "PERPLEXITY_API_KEY": "perplexity-key",
+                "OPENROUTER_API_KEY": "openrouter-key",
+            },
+            "asknews",
+            "AskNews briefing",
+            "## News Articles (AskNews)",
+            id="asknews-before-others",
+        ),
+        pytest.param(
+            {"EXA_API_KEY": "exa-key", "PERPLEXITY_API_KEY": "perplexity-key"},
+            "exa",
+            "Exa research",
+            "## Web Research (Exa)",
+            id="exa-before-perplexity",
+        ),
+        pytest.param(
+            {"ASKNEWS_CLIENT_ID": "asknews-client", "EXA_API_KEY": "exa-key"},
+            "exa",
+            "Exa research",
+            "## Web Research (Exa)",
+            id="missing-asknews-secret-falls-through",
+        ),
+        pytest.param(
+            {"PERPLEXITY_API_KEY": "perplexity-key", "OPENROUTER_API_KEY": "openrouter-key"},
+            "perplexity",
+            "Perplexity research",
+            "## Web Research (Perplexity)",
+            id="perplexity-before-openrouter",
+        ),
+        pytest.param(
+            {"OPENROUTER_API_KEY": "openrouter-key"},
+            "openrouter",
+            "OpenRouter research",
+            "## Web Research (OpenRouter)",
+            id="openrouter",
+        ),
+        pytest.param({}, "none", "", "", id="no_provider"),
+    ],
+)
+async def test_run_research_uses_real_provider_priority(
+    credentials: dict[str, str],
+    expected_provider: str,
+    expected_text: str,
+    expected_header: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the production chooser while replacing each selected provider's network call."""
+    for name in (
+        "ASKNEWS_CLIENT_ID",
+        "ASKNEWS_SECRET",
+        "EXA_API_KEY",
+        "PERPLEXITY_API_KEY",
+        "OPENROUTER_API_KEY",
+        "RESEARCH_PROVIDER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name in (
+        "NATIVE_SEARCH_ENABLED",
+        "GEMINI_SEARCH_ENABLED",
+        "FINANCIAL_DATA_ENABLED",
+        "TS_ANCHOR_ENABLED",
+        "PREDICTION_MARKETS_ENABLED",
+        "RESOLUTION_SOURCE_ENABLED",
+        "GAP_FILL_ENABLED",
+        "GAP_FILL_V2_ENABLED",
+    ):
+        monkeypatch.setenv(name, "false")
+    for name, value in credentials.items():
+        monkeypatch.setenv(name, value)
+
     forecaster = TemplateForecaster(
         llms={
             "default": "mock_default_model",
@@ -18,104 +95,47 @@ async def test_run_research_priority():
             "summarizer": "mock_summarizer",
         }
     )
-    # open_time is required by the summarizer's window-stamping prompt
-    # (_summarize_asknews asserts on it, matching _forecasting_window_str).
     question = MetaculusQuestion(
         question_text="Test question",
         page_url="http://example.com",
         open_time=datetime(2026, 1, 1, tzinfo=UTC),
-        # Required by the diagnostics seam: the comment-bound block is stashed per-qid.
         id_of_question=777,
     )
 
-    # Test AskNews priority (highest priority when available)
-    with patch("os.getenv") as mock_getenv:
-        mock_getenv.side_effect = lambda x, default=None: {
-            "ASKNEWS_CLIENT_ID": "asknews_client_id",
-            "ASKNEWS_SECRET": "asknews_secret",
-            "EXA_API_KEY": "exa_api_key",
-            "PERPLEXITY_API_KEY": "perplexity_api_key",
-            "OPENROUTER_API_KEY": "openrouter_api_key",
-        }.get(x, default)
+    asknews_call = AsyncMock(return_value="AskNews articles")
+    asknews_factory = Mock(return_value=asknews_call)
+    monkeypatch.setattr(research_providers, "_asknews_provider", asknews_factory)
+    monkeypatch.setattr(
+        forecaster._research,
+        "_summarize_asknews",
+        AsyncMock(return_value="AskNews briefing"),
+    )
+    exa_call = AsyncMock(return_value="Exa research")
+    direct_perplexity_call = AsyncMock(return_value="Perplexity research")
+    openrouter_call = AsyncMock(return_value="OpenRouter research")
+    monkeypatch.setattr(forecaster._research, "_call_exa_smart_searcher", exa_call)
+    monkeypatch.setattr(forecaster._research, "_call_perplexity_direct", direct_perplexity_call)
+    monkeypatch.setattr(forecaster._research, "_call_perplexity_openrouter", openrouter_call)
 
-        # Mock the provider function returned by choose_provider_with_name
-        mock_asknews_func = AsyncMock(return_value="AskNews Research")
-        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
-            mock_choose.return_value = (mock_asknews_func, "asknews")
+    research = await forecaster.run_research(question)
 
-            research = await forecaster.run_research(question)
-            mock_asknews_func.assert_called_once_with(question)
-            # Research now includes provider header
-            assert "AskNews Research" in research
-            assert "## News Articles (AskNews)" in research
+    selected_calls = {
+        "asknews": asknews_call,
+        "exa": exa_call,
+        "perplexity": direct_perplexity_call,
+        "openrouter": openrouter_call,
+    }
+    if expected_provider == "none":
+        assert research == ""
+        diagnostics = forecaster._research.pop_provider_diagnostics(question.id_of_question)
+        assert "- none: empty | 0 chars |" in diagnostics
+    else:
+        selected_calls[expected_provider].assert_awaited_once_with(question)
+        assert expected_text in research
+        assert expected_header in research
 
-    # Test Exa priority (when AskNews not available)
-    with patch("os.getenv") as mock_getenv:
-        mock_getenv.side_effect = lambda x, default=None: {
-            "EXA_API_KEY": "exa_api_key",
-            "PERPLEXITY_API_KEY": "perplexity_api_key",
-            "OPENROUTER_API_KEY": "openrouter_api_key",
-        }.get(x, default)
-
-        # Mock the provider function returned by choose_provider_with_name
-        mock_exa_func = AsyncMock(return_value="Exa Research")
-        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
-            mock_choose.return_value = (mock_exa_func, "exa")
-
-            research = await forecaster.run_research(question)
-            mock_exa_func.assert_called_once_with(question)
-            assert "Exa Research" in research
-            assert "## Web Research (Exa)" in research
-
-    # Test Perplexity priority (when AskNews and Exa not available)
-    with patch("os.getenv") as mock_getenv:
-        mock_getenv.side_effect = lambda x, default=None: {
-            "PERPLEXITY_API_KEY": "perplexity_api_key",
-            "OPENROUTER_API_KEY": "openrouter_api_key",
-        }.get(x, default)
-
-        # Mock the provider function returned by choose_provider_with_name
-        mock_perplexity_func = AsyncMock(return_value="Perplexity Research")
-        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
-            mock_choose.return_value = (mock_perplexity_func, "perplexity")
-
-            research = await forecaster.run_research(question)
-            mock_perplexity_func.assert_called_once_with(question)
-            assert "Perplexity Research" in research
-            assert "## Web Research (Perplexity)" in research
-
-    # Test OpenRouter priority (when only OpenRouter available)
-    with patch("os.getenv") as mock_getenv:
-        mock_getenv.side_effect = lambda x, default=None: {
-            "OPENROUTER_API_KEY": "openrouter_api_key",
-        }.get(x, default)
-
-        # Mock the provider function returned by choose_provider_with_name
-        mock_openrouter_func = AsyncMock(return_value="OpenRouter Research")
-        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
-            mock_choose.return_value = (mock_openrouter_func, "openrouter")
-
-            research = await forecaster.run_research(question)
-            mock_openrouter_func.assert_called_once_with(question)
-            assert "OpenRouter Research" in research
-            assert "## Web Research (OpenRouter)" in research
-
-    # Test no research provider available
-    with patch("os.getenv") as mock_getenv:
-        mock_getenv.side_effect = lambda x, default=None: default
-
-        # Mock the provider function to return empty string fallback
-        mock_empty_func = AsyncMock(return_value="")
-        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
-            mock_choose.return_value = (mock_empty_func, "fallback")
-
-            research = await forecaster.run_research(question)
-            mock_empty_func.assert_called_once_with(question)
-            # Empty results don't get a provider header, and the forecaster-facing
-            # text stays clean of diagnostics; the empty outcome is recorded in the
-            # comment-bound block popped via the orchestrator seam.
-            assert "## Research (fallback)" not in research
-            assert "## Provider Diagnostics" not in research
-            block = forecaster._research.pop_provider_diagnostics(question.id_of_question)
-            assert "## Provider Diagnostics" in block
-            assert "- fallback: empty | 0 chars |" in block
+    for provider_name, provider_call in selected_calls.items():
+        if provider_name != expected_provider:
+            provider_call.assert_not_awaited()
+    if expected_provider == "asknews":
+        asknews_factory.assert_called_once_with()

@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict
 
-from forecasting_tools import GeneralLlm, SmartSearcher, clean_indents
+from forecasting_tools import GeneralLlm, clean_indents
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot.api_key_utils import get_openrouter_api_key
@@ -39,17 +39,13 @@ from metaculus_bot.constants import (
     NATIVE_SEARCH_MODEL_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
-    PERPLEXITY_RESEARCH_MODEL,
     PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER,
-    PERPLEXITY_WALL_TIMEOUT,
     PREDICTION_MARKETS_ENABLED_ENV,
     RESOLUTION_SOURCE_ENABLED_ENV,
     TS_ANCHOR_ENABLED_ENV,
     env_flag_enabled,
 )
-from metaculus_bot.credit_telemetry import llm_call_metadata, plain_llm_key_alias
 from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
-from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.prompts import OUTSIDE_VENUE_MARKET_ODDS_POLICY
 from metaculus_bot.research import degradation_views
 from metaculus_bot.research.asknews_summarization import summarize_asknews
@@ -64,6 +60,8 @@ from metaculus_bot.research.provider_diagnostics import (
 from metaculus_bot.research.provider_fanout import _empty_provider, await_providers_within_deadline
 from metaculus_bot.research.providers import (
     ResearchCallable,
+    _invoke_exa_research,
+    _invoke_perplexity_research,
     choose_provider_with_name,
     is_asknews_subscription_error,
     native_search_provider,
@@ -569,7 +567,7 @@ class ResearchOrchestrator:
         # This fallback only fires when AskNews (always the primary in prod) has
         # already failed, so AskNews is excluded. Among the remaining options we
         # prefer the Perplexity-via-OpenRouter route first (cheap, prose-returning,
-        # routed through the donated-key wrapper), then direct Perplexity, then
+        # using the resolved OpenRouter key), then direct Perplexity, then
         # Exa last (SmartSearcher spins up its own multi-search/LLM loop, the most
         # expensive path). The primary selector orders by index quality, not cost,
         # which is why the two lists diverge by design.
@@ -621,25 +619,13 @@ class ResearchOrchestrator:
             {question_text}
             """
         )
-        model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
-        model = GeneralLlm(
-            model=model_name,
-            # temperature=None defers to provider defaults; redundant on ft 0.2.92
-            # (GeneralLlm ctor default is already None). No top_p.
-            temperature=None,
-            api_key=get_openrouter_api_key(model_name) if model_name.startswith("openrouter/") else None,
-            # CREDIT_ROLE_SPEND tag. Perplexity is not donated-key-eligible, so the
-            # openrouter/ route bills the personal key; the direct route bills Perplexity.
-            metadata=llm_call_metadata("perplexity_research", plain_llm_key_alias(model_name)),
-            # allowed_tries=1 hands the retry budget to the gated wrapper below; left
-            # unpinned it inherited forecasting-tools' default of 2 with an un-gated
-            # random.uniform(5, 10) tenacity sleep.
-            allowed_tries=1,
-        )
-        return await invoke_with_transient_retry(
-            lambda: model.invoke(prompt),
-            wall_timeout=PERPLEXITY_WALL_TIMEOUT,
-            label="perplexity_research",
+        # Keep this call site's explicit credential routing: direct Perplexity passes
+        # None, while the OpenRouter route resolves its key before construction.
+        api_key = get_openrouter_api_key(PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER) if use_open_router else None
+        return await _invoke_perplexity_research(
+            prompt,
+            use_open_router=use_open_router,
+            api_key=api_key,
         )
 
     async def _call_perplexity_openrouter(self, question: MetaculusQuestion) -> str:
@@ -650,14 +636,6 @@ class ResearchOrchestrator:
 
     async def _call_exa_smart_searcher(self, question: MetaculusQuestion | str) -> str:
         question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
-        searcher = SmartSearcher(
-            # temperature ignored when model is a preconfigured GeneralLlm; None
-            # keeps litellm from applying a sampling param on the fallback str path.
-            model=self._default_llm,
-            temperature=None,
-            num_searches_to_run=2,
-            num_sites_per_search=10,
-        )
         prompt = (
             "You are an assistant to a superforecaster. The superforecaster will give"
             "you a question they intend to forecast on. To be a great assistant, you generate"
@@ -665,7 +643,7 @@ class ResearchOrchestrator:
             "would resolve Yes or No based on current information. You do not produce forecasts yourself."
             f"\n\nThe question is: {question_text}"
         )
-        return await searcher.invoke(prompt)
+        return await _invoke_exa_research(self._default_llm, prompt)
 
     # The research side's degradation counters live in ``degradation_views``, along with
     # their long "why is this alertable" rationales; these five one-liners are the

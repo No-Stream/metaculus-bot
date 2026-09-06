@@ -730,7 +730,7 @@ class TestStackingGateUnderACloseLimitedBudget:
         """Overrunning the static deadline costs nothing (the close is hours away), so
         this case must keep its pre-feature behavior exactly."""
         skipped = _skip_stacking_for_budget(
-            self._bot(AggregationStrategy.CONDITIONAL_STACKING),
+            self._bot(AggregationStrategy.CONDITIONAL_STACKING)._pipeline,
             make_real_binary_question(qid=7301),
             7301,
             _budget(120, close_limited=False),
@@ -743,24 +743,24 @@ class TestStackingGateUnderACloseLimitedBudget:
         ladder alone can legitimately run 800 s."""
         bot = self._bot(AggregationStrategy.CONDITIONAL_STACKING)
         with caplog.at_level(logging.WARNING):
-            skipped = _skip_stacking_for_budget(bot, make_real_binary_question(qid=7302), 7302, _budget(120))
+            skipped = _skip_stacking_for_budget(bot._pipeline, make_real_binary_question(qid=7302), 7302, _budget(120))
 
         assert skipped is True
-        assert bot._stacker_outcome[7302] == "fallback_median"
+        assert bot._pipeline.outcomes[7302] == "fallback_median"
         # The skip records the same reason + counter treatment as its siblings, so a
         # STACKER_SKIP_REASON cut cannot silently miss the budget bucket.
-        assert bot._stacker_skip_reason[7302] == "wall_clock_budget"
-        assert bot._conditional_stacking_skipped_count == 1
+        assert bot._pipeline.skip_reasons[7302] == "wall_clock_budget"
+        assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
         # The WARN interpolates the floor ACTUALLY applied — the close-limited one
         # including the stacking path's worst case — not the static 90 s constant,
         # which would make the line arithmetically false (remaining=120 > 90).
         abort_line = next(m for m in caplog.messages if "WALLCLOCK_ABORT" in m)
-        expected_floor = WALL_CLOCK_STACKING_MIN_BUDGET + _stacking_budget_required_s(bot)
+        expected_floor = WALL_CLOCK_STACKING_MIN_BUDGET + _stacking_budget_required_s(bot._pipeline)
         assert f"< {expected_floor:.0f}s" in abort_line
 
     def test_a_close_limited_budget_with_room_for_the_whole_ladder_still_stacks(self):
         skipped = _skip_stacking_for_budget(
-            self._bot(AggregationStrategy.CONDITIONAL_STACKING),
+            self._bot(AggregationStrategy.CONDITIONAL_STACKING)._pipeline,
             make_real_binary_question(qid=7303),
             7303,
             _budget(3000),
@@ -815,9 +815,10 @@ class TestStackingGateUnderACloseLimitedBudget:
             ),
         ):
             text = await _targeted_research_for_crux(
-                bot,
+                bot._pipeline,
                 make_real_binary_question(qid=7304),
                 analyzer_llm=analyzer_llm,
+                is_benchmarking=False,
                 valid_predictions=predictions,
                 time_budget=budget,
             )
@@ -860,16 +861,17 @@ class TestStackingGateUnderACloseLimitedBudget:
             caplog.at_level(logging.WARNING, logger="metaculus_bot.stacking_route"),
         ):
             text = await _targeted_research_for_crux(
-                bot,
+                bot._pipeline,
                 make_real_binary_question(qid=7305),
                 analyzer_llm=analyzer_llm,
+                is_benchmarking=False,
                 valid_predictions=predictions,
                 time_budget=budget,
             )
 
         assert text == ""
         search.assert_not_awaited()
-        assert bot._conditional_stacking_crux_failures == 1
+        assert bot._pipeline.counters.conditional_stacking_crux_failures == 1
         cut = [message for message in caplog.messages if message.startswith("CRUX_SOFT_DEADLINE:")]
         assert len(cut) == 1, caplog.messages
         assert "exceeded 1s" in cut[0], cut[0]

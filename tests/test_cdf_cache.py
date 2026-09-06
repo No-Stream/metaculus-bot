@@ -1,12 +1,9 @@
 """Behavior pins for ``ensemble_analysis.cdf_cache.NumericCdfCache``.
 
-The safe-CDF accessor is a three-tier fallback ladder (direct ``prediction.cdf`` →
-PCHIP rebuild from declared percentiles → monotone ramp → ``None``), and each tier
-is a deliberate soft-fail: an analysis run must degrade rather than die on one bad
-numeric prediction. These tests pin which tier answers for each shape of input, the
-memoization, and the per-tier stats bookkeeping that ``log_numeric_cdf_summary``
-reports, so the ladder can be restructured without silently changing which rung a
-given prediction lands on.
+The safe-CDF accessor tries the declared CDF and then a PCHIP rebuild. A prediction
+that reaches neither path is unscoreable; these tests pin that it is excluded rather
+than assigned a fabricated distribution. They also pin memoization and failure
+bookkeeping so the ladder can be restructured without hiding unusable inputs.
 """
 
 from __future__ import annotations
@@ -18,16 +15,19 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.ensemble_analysis.cdf_cache import NumericCdfCache
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 
 
-def _question(qid: int = 7, lower: float = 0.0, upper: float = 100.0) -> SimpleNamespace:
+def _question(
+    qid: int = 7, lower: float = 0.0, upper: float = 100.0, zero_point: float | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
         id_of_question=qid,
         lower_bound=lower,
         upper_bound=upper,
         open_lower_bound=False,
         open_upper_bound=False,
-        zero_point=None,
+        zero_point=zero_point,
         cdf_size=201,
         page_url="https://example.com/q",
     )
@@ -74,6 +74,15 @@ class TestTierOneDirectCdf:
         assert out is not None
         assert [(pt.value, pt.percentile) for pt in out] == [(0.0, 0.0), (100.0, 1.0)]
 
+    def test_bare_cdf_uses_the_canonical_geometric_value_grid(self):
+        cache = NumericCdfCache()
+        question = _question(lower=1.0, upper=1000.0, zero_point=0.0)
+        out = cache.get_safe_numeric_cdf("m", question, SimpleNamespace(cdf=[0.0, 0.5, 1.0]))
+
+        assert out is not None
+        expected = build_cdf_value_grid(1.0, 1000.0, 0.0, 3)
+        assert [point.value for point in out] == pytest.approx(expected.tolist())
+
     def test_result_is_memoized_per_model_and_question(self):
         cache = NumericCdfCache()
         question = _question(qid=11)
@@ -85,14 +94,14 @@ class TestTierOneDirectCdf:
         assert second is not None
         assert [pt.value for pt in second] == [pt.value for pt in first]
 
-    def test_a_too_short_cdf_falls_through_to_the_ramp(self):
-        # len(raw) < 2 is not an error, so tier 1 returns nothing and the ladder
-        # continues; with no declared percentiles that lands on the ramp.
+    def test_a_too_short_cdf_is_unscoreable(self):
+        # len(raw) < 2 is not a usable CDF, and there are no declared percentiles
+        # from which to rebuild one.
         cache = NumericCdfCache()
         out = cache.get_safe_numeric_cdf("m", _question(), SimpleNamespace(cdf=[0.5], declared_percentiles=None))
 
-        assert out is not None
-        assert len(out) == 201
+        assert out is None
+        assert cache._numeric_cdf_stats["failures"] == {("m", 7)}
 
 
 class TestTierTwoPchipRebuild:
@@ -113,14 +122,23 @@ class TestTierTwoPchipRebuild:
         # Median declared at the range midpoint, so F(50) ~ 0.5.
         assert probs[100] == pytest.approx(0.5, abs=0.05)
 
-    def test_rebuild_is_counted_as_built_not_ramp(self):
+    def test_rebuild_uses_the_canonical_geometric_value_grid(self):
+        cache = NumericCdfCache()
+        question = _question(lower=1.0, upper=1000.0, zero_point=0.0)
+        prediction = _RaisingCdf(_declared({0.1: 20.0, 0.5: 100.0, 0.9: 900.0}))
+        out = cache.get_safe_numeric_cdf("m", question, prediction)
+
+        assert out is not None
+        expected = build_cdf_value_grid(1.0, 1000.0, 0.0, len(out))
+        assert [point.value for point in out] == pytest.approx(expected.tolist())
+
+    def test_rebuild_is_counted_as_built_not_failure(self):
         cache = NumericCdfCache()
         prediction = _RaisingCdf(_declared({0.1: 20.0, 0.5: 50.0, 0.9: 80.0}))
         cache.get_safe_numeric_cdf("m", _question(), prediction)
 
         stats = cache._numeric_cdf_stats
         assert stats["safe_cdf_built"] == {("m", 7)}
-        assert stats["safe_cdf_ramp"] == set()
         assert stats["failures"] == set()
 
     def test_first_failure_warns_once_per_pair(self, caplog: pytest.LogCaptureFixture):
@@ -135,20 +153,13 @@ class TestTierTwoPchipRebuild:
         assert sum("Numeric CDF access failed" in r.message for r in caplog.records) == 1
 
 
-class TestTierThreeRampAndFailure:
-    def test_ramp_is_used_when_nothing_can_be_rebuilt(self):
+class TestFailure:
+    def test_nothing_usable_is_unscoreable(self):
         cache = NumericCdfCache()
         out = cache.get_safe_numeric_cdf("m", _question(), _RaisingCdf(declared=None))
 
-        assert out is not None
-        assert len(out) == 201
-        values = [pt.value for pt in out]
-        probs = [pt.percentile for pt in out]
-        assert values[0] == pytest.approx(0.0)
-        assert values[-1] == pytest.approx(100.0)
-        assert probs[0] == pytest.approx(0.0)
-        assert probs[-1] == pytest.approx(1.0)
-        assert cache._numeric_cdf_stats["safe_cdf_ramp"] == {("m", 7)}
+        assert out is None
+        assert cache._numeric_cdf_stats["failures"] == {("m", 7)}
 
     def test_missing_bounds_returns_none_and_caches_the_failure(self):
         cache = NumericCdfCache()
@@ -189,7 +200,8 @@ class TestBookkeeping:
             cache.log_numeric_cdf_summary()
 
         assert "attempts=1" in caplog.text
-        assert "ramp=1" in caplog.text
+        assert "ramp=0" in caplog.text
+        assert "failures=1" in caplog.text
 
     def test_summary_is_silent_with_no_attempts(self, caplog: pytest.LogCaptureFixture):
         with caplog.at_level(logging.INFO, logger="metaculus_bot.ensemble_analysis.cdf_cache"):

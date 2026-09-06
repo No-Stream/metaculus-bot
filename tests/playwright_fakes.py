@@ -382,7 +382,7 @@ def install_fake_playwright(
     *,
     faults: Faults | None = None,
     launch_delay_s: float = 0.0,
-    pinned: tuple[str, str] | None | _PinTheRequestedHost = PIN_THE_REQUESTED_HOST,
+    pinned: tuple[str, str] | _PinTheRequestedHost | None = PIN_THE_REQUESTED_HOST,
     chromium: FakeChromium | None = None,
     manager_cls: type[FakePlaywrightManager] = FakePlaywrightManager,
 ) -> FakeChromium:

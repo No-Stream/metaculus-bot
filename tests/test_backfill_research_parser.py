@@ -1,5 +1,8 @@
 """Tests for the research log parser used by backfill_research_from_logs.py."""
 
+from metaculus_bot.research import section_format
+from scripts import backfill_research_from_comments, backfill_research_from_logs
+
 # Sample log data for testing
 SAMPLE_LOG_MAIN_LOGGER = """\
 forecast_job\tUNKNOWN STEP\t2026-05-20T15:48:05.5335094Z 2026-05-20 15:48:05,533 - main - INFO - Found Research for URL https://www.metaculus.com/questions/43613:
@@ -402,3 +405,13 @@ class TestTimestampNormalization:
         from scripts.backfill_research_from_logs import normalize_timestamp
 
         assert normalize_timestamp("2026-05-20T10:00:01.0Z") == "2026-05-20T10:00:01Z"
+
+
+class TestDetectionHelperOwnership:
+    """The backfill scripts retain helper names while importing the canonical implementations."""
+
+    def test_both_scripts_use_canonical_detection_helpers(self) -> None:
+        assert backfill_research_from_comments.detect_providers is section_format.detect_providers
+        assert backfill_research_from_logs.detect_providers is section_format.detect_providers
+        assert backfill_research_from_comments.detect_gap_fill is section_format.detect_gap_fill
+        assert backfill_research_from_logs.detect_gap_fill is section_format.detect_gap_fill

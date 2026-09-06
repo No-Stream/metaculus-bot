@@ -8,7 +8,7 @@ Covers three just-added paths that were previously untested:
    marker AND a legacy ``<!-- STACKED=true/false -->`` marker (for one round
    of back-compat with older parsers) only when the aggregation strategy is
    STACKING or CONDITIONAL_STACKING. The value comes from
-   ``self._stacker_outcome.pop(qid, None)``; missing entries default to
+   ``self._pipeline.outcomes.pop(qid, None)``; missing entries default to
    ``"fallback_median"`` (conservative — "stacker did not really succeed").
 
 2. ``TemplateForecaster._format_and_expand_research_summary`` annotates
@@ -154,12 +154,12 @@ class TestStackedMarkerInjection:
         # across questions within a run.
         bot = _make_bot(AggregationStrategy.MEAN)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
-        assert q.id_of_question not in bot._stacker_outcome
+        assert q.id_of_question not in bot._pipeline.outcomes
 
     def test_skip_reason_marker_emitted_and_state_popped(self):
         # The mid-chain link of the STACKER_SKIP_REASON pipeline: stacking_route
@@ -169,8 +169,8 @@ class TestStackedMarkerInjection:
         # comment without the marker while both chain ends stay green.
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "skipped"
-        bot._stacker_skip_reason[q.id_of_question] = "single_forecaster"
+        bot._pipeline.outcomes[q.id_of_question] = "skipped"
+        bot._pipeline.skip_reasons[q.id_of_question] = "single_forecaster"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -178,14 +178,14 @@ class TestStackedMarkerInjection:
         assert "<!-- STACKER_SKIP_REASON=single_forecaster -->" in out
         assert parse_stacker_skip_reason_marker(out) == "single_forecaster"
         # State cleaned: a stale entry must not leak onto the next question.
-        assert q.id_of_question not in bot._stacker_skip_reason
+        assert q.id_of_question not in bot._pipeline.skip_reasons
 
     def test_stacking_primary_emits_primary_and_legacy_true_markers(self):
         # primary outcome → tri-state STACKER_OUTCOME=primary AND legacy STACKED=true
         # (the legacy marker stays during one round of back-compat).
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -196,7 +196,7 @@ class TestStackedMarkerInjection:
         assert parse_stacker_outcome_marker(out) == "primary"
         assert parse_stacked_marker(out) is True
         # State cleaned
-        assert q.id_of_question not in bot._stacker_outcome
+        assert q.id_of_question not in bot._pipeline.outcomes
 
     def test_stacking_fallback_llm_emits_fallback_llm_and_legacy_true(self):
         # fallback_llm outcome (primary stacker failed; fallback LLM succeeded)
@@ -204,7 +204,7 @@ class TestStackedMarkerInjection:
         # ensemble value still came from a stacker LLM, not MEDIAN).
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "fallback_llm"
+        bot._pipeline.outcomes[q.id_of_question] = "fallback_llm"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -221,7 +221,7 @@ class TestStackedMarkerInjection:
         # silently emitted STACKED=true, contaminating treatment-effect cuts.
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "fallback_median"
+        bot._pipeline.outcomes[q.id_of_question] = "fallback_median"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -237,7 +237,7 @@ class TestStackedMarkerInjection:
         # invoked the stacker) → STACKER_OUTCOME=skipped AND legacy STACKED=false.
         bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "skipped"
+        bot._pipeline.outcomes[q.id_of_question] = "skipped"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -256,7 +256,7 @@ class TestStackedMarkerInjection:
         # below-threshold skips without git archaeology.
         bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "skipped_config_off"
+        bot._pipeline.outcomes[q.id_of_question] = "skipped_config_off"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -277,7 +277,7 @@ class TestStackedMarkerInjection:
         # fallback_median because that strategy's base-combine uses MEDIAN.
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "fallback_mean"
+        bot._pipeline.outcomes[q.id_of_question] = "fallback_mean"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -295,7 +295,7 @@ class TestStackedMarkerInjection:
         # CONDITIONAL_STACKING by the F15 fix.
         bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "fallback_median"
+        bot._pipeline.outcomes[q.id_of_question] = "fallback_median"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -309,7 +309,7 @@ class TestStackedMarkerInjection:
     def test_conditional_stacking_primary_emits_primary_marker(self):
         bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
@@ -321,12 +321,12 @@ class TestStackedMarkerInjection:
 
     def test_conditional_stacking_missing_dict_entry_raises(self):
         # Every reachable code path in _aggregate_predictions populates
-        # _stacker_outcome before _create_unified_explanation runs. A missing
+        # pipeline outcomes before _create_unified_explanation runs. A missing
         # entry under STACKING/CONDITIONAL_STACKING means a real bug — fail
         # loudly rather than silently mislabel as fallback_median.
         bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
         q = _make_binary_question()
-        assert q.id_of_question not in bot._stacker_outcome
+        assert q.id_of_question not in bot._pipeline.outcomes
 
         with (
             patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION),
@@ -357,7 +357,7 @@ class TestStackedMarkerInjection:
         # text is pushed over the comment char limit.
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
         huge_base = "# SUMMARY\n" + ("X" * (COMMENT_CHAR_LIMIT + 1000))
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=huge_base):
@@ -389,7 +389,7 @@ class TestStackedMarkerInjection:
         # matches the new shape (provider/family-name/version pattern).
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         summary_head = (
             "# SUMMARY\n"
@@ -664,7 +664,7 @@ class TestForecastersUsedDisclosure:
 
     def _bot(self):
         bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)  # 2 forecasters configured
-        bot._stacker_outcome[12345] = "skipped"
+        bot._pipeline.outcomes[12345] = "skipped"
         return bot
 
     async def _run_fanout(self, bot, question, prediction_values: list[float]) -> ResearchWithPredictions:
@@ -702,7 +702,7 @@ class TestForecastersUsedDisclosure:
         """Build the published comment from collections the fan-out already returned."""
         # The real _aggregate_predictions sets this; _run_fanout mocks it out, and
         # build_unified_explanation asserts on its presence under stacking.
-        bot._stacker_outcome.setdefault(question.id_of_question, "primary")
+        bot._pipeline.outcomes.setdefault(question.id_of_question, "primary")
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             return bot._create_unified_explanation(question, collections, 0.6, 0.01, 1.0)
 
@@ -725,7 +725,9 @@ class TestForecastersUsedDisclosure:
         # Binary range 0.75 >> the 0.15 threshold, so stacking fires.
         collection, comment = await self._publish_via_pipeline(bot, q, [0.10, 0.50, 0.85])
 
-        assert bot._conditional_stacking_triggered_count == 1, "precondition: stacking must have fired"
+        assert bot._pipeline.counters.conditional_stacking_triggered_count == 1, (
+            "precondition: stacking must have fired"
+        )
         assert len(collection.predictions) == 1, "precondition: stacking collapses the ensemble to one aggregate"
         match = FORECASTERS_USED_MARKER_RE.search(comment)
         assert match is not None
@@ -741,7 +743,9 @@ class TestForecastersUsedDisclosure:
         q = _make_binary_question()
         collection, comment = await self._publish_via_pipeline(bot, q, [0.45, 0.55])
 
-        assert bot._conditional_stacking_skipped_count == 1, "precondition: stacking must have been skipped"
+        assert bot._pipeline.counters.conditional_stacking_skipped_count == 1, (
+            "precondition: stacking must have been skipped"
+        )
         assert len(collection.predictions) == 2
         match = FORECASTERS_USED_MARKER_RE.search(comment)
         assert match is not None
@@ -1365,7 +1369,7 @@ class TestProducerConsumerRoundTrip:
     def test_stacked_binary_roundtrip_recovers_models_and_marker(self):
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question(qid=555)
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         predictions = [
             _make_prediction_with_model(0.72, "openrouter/openai/gpt-5.5", body="gpt analysis"),
@@ -1424,7 +1428,7 @@ class TestProducerConsumerRoundTrip:
         # bullet shows only the stacker's aggregate).
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question(qid=777)
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
 
         # Base predictions, one per ensemble member, each tagged with Model: by
         # _make_prediction in production (here we build the tag manually).
@@ -1668,7 +1672,7 @@ class TestOfflineAssemblySmoke:
             question_text="Will it happen?", background_info="bg", resolution_criteria="rc", fine_print=""
         )
         q.id_of_question = 578  # _create_unified_explanation reads the outcome by qid
-        bot._stacker_outcome[q.id_of_question] = "primary"
+        bot._pipeline.outcomes[q.id_of_question] = "primary"
         return bot, q
 
     def _research_report(self, sentinel: str, *, token_reps: int) -> str:

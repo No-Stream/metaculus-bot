@@ -478,13 +478,8 @@ async def benchmark_forecast_bot(
             logger.debug("log_stacking_summaries failed", exc_info=True)
 
 
-if __name__ == "__main__":
-    # Force unbuffered output for real-time logging in long-running processes
-    os.environ["PYTHONUNBUFFERED"] = "1"
-
-    configure_benchmark_logging()
-
-    # Parse command line arguments
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser used by the deprecated benchmark entry point."""
     parser = argparse.ArgumentParser(description="Benchmark a list of bots")
     parser.add_argument(
         "--mode",
@@ -519,7 +514,16 @@ if __name__ == "__main__":
             "Mutually exclusive with --exclude-models."
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    # Force unbuffered output for real-time logging in long-running processes
+    os.environ["PYTHONUNBUFFERED"] = "1"
+
+    configure_benchmark_logging()
+
+    args = _build_parser().parse_args()
     mode: Literal["run", "custom", "display"] = args.mode
     asyncio.run(
         benchmark_forecast_bot(

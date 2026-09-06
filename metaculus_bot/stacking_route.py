@@ -14,18 +14,13 @@ aggregator runs. The decision tree, in order:
    stack first extracts the disagreement crux and runs targeted research.
 5. Anything else (a non-stacking strategy) — hand the raw predictions back.
 
-``bot`` is threaded through rather than closed over because the routing writes
-run-level state that other stages read: ``_stacker_outcome`` (published in the
-comment marker and asserted by the conditional-stacking tests), the three
-conditional-stacking counters that feed the end-of-run summary, and the
-expected-base-combine registry that keeps the pipeline from logging an
-"Unexpected STACKING combine".
+The aggregation pipeline owns the strategy, stacker configuration, per-question
+maps, and counters that routing reads and updates.
 """
 
 import asyncio
 import logging
 import math
-from typing import TYPE_CHECKING
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -39,6 +34,7 @@ from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
 
 from metaculus_bot import stacking
+from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
     BINARY_STACKING_ENABLED_ENV,
@@ -54,9 +50,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.research.targeted import extract_disagreement_crux, run_targeted_search
 from metaculus_bot.spread_metrics import compute_spread
 from metaculus_bot.time_budget import QuestionTimeBudget
-
-if TYPE_CHECKING:
-    from metaculus_bot.forecaster import TemplateForecaster
+from metaculus_bot.tool_runner import build_cross_model_aggregation
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +112,7 @@ def _enrichment_timeout(soft_deadline_s: float, time_budget: QuestionTimeBudget)
     return max(1.0, min(float(soft_deadline_s), affordable))
 
 
-def _stacking_budget_required_s(bot: "TemplateForecaster") -> float:
+def _stacking_budget_required_s(pipeline: AggregationPipeline) -> float:
     """Budget the stacking path can consume in the worst case, in seconds.
 
     The ladder's own soft deadlines, summed: primary stacker, then the
@@ -128,13 +122,16 @@ def _stacking_budget_required_s(bot: "TemplateForecaster") -> float:
     gate has to decide whether the path is affordable before it starts walking it.
     """
     required = STACKER_SOFT_DEADLINE + STACKER_FALLBACK_SOFT_DEADLINE
-    if bot.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
+    if pipeline.strategy == AggregationStrategy.CONDITIONAL_STACKING:
         required += CRUX_SOFT_DEADLINE + NATIVE_SEARCH_WALL_TIMEOUT
     return float(required)
 
 
 def _skip_stacking_for_budget(
-    bot: "TemplateForecaster", question: MetaculusQuestion, qid: int, time_budget: QuestionTimeBudget
+    pipeline: AggregationPipeline,
+    question: MetaculusQuestion,
+    qid: int,
+    time_budget: QuestionTimeBudget,
 ) -> bool:
     """Force the base-combine fallback when the per-Q wall clock is nearly spent.
 
@@ -153,12 +150,12 @@ def _skip_stacking_for_budget(
     an overrun forfeits the question, and the 90 s floor would happily start a
     stacker that can legitimately run 800 s.
     """
-    if bot.aggregation_strategy not in _STACKING_STRATEGIES:
+    if pipeline.strategy not in _STACKING_STRATEGIES:
         return False
     remaining = time_budget.remaining_s()
     floor = WALL_CLOCK_STACKING_MIN_BUDGET
     if time_budget.close_limited:
-        floor += _stacking_budget_required_s(bot)
+        floor += _stacking_budget_required_s(pipeline)
     if remaining >= floor:
         return False
 
@@ -167,7 +164,7 @@ def _skip_stacking_for_budget(
     # aggregation_pipeline.py). The marker must match the actual aggregation
     # method so residual analysis cuts bucket the two paths correctly.
     budget_skip_outcome = (
-        "fallback_median" if bot.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING else "fallback_mean"
+        "fallback_median" if pipeline.strategy == AggregationStrategy.CONDITIONAL_STACKING else "fallback_mean"
     )
     logger.warning(
         # The floor ACTUALLY applied, not the static constant: on a close-limited
@@ -179,26 +176,27 @@ def _skip_stacking_for_budget(
         floor,
         budget_skip_outcome,
     )
-    bot._stacker_outcome[qid] = budget_skip_outcome
+    pipeline.outcomes[qid] = budget_skip_outcome
     # Same skip-reason + counter treatment as the other skip paths
     # (single_forecaster / config_off / spread_below_threshold): without them a
     # residual cut keyed on STACKER_SKIP_REASON silently misses this bucket. The
     # conditional-stacking tally only exists under CONDITIONAL_STACKING.
-    bot._stacker_skip_reason[qid] = "wall_clock_budget"
-    if bot.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
-        bot._conditional_stacking_skipped_count += 1
+    pipeline.skip_reasons[qid] = "wall_clock_budget"
+    if pipeline.strategy == AggregationStrategy.CONDITIONAL_STACKING:
+        pipeline.counters.conditional_stacking_skipped_count += 1
     # Register so the pipeline's aggregate step (which will run with
     # reasoned_predictions=None) takes the expected base-combine path and doesn't
     # log "Unexpected STACKING combine".
-    bot._register_expected_base_combine(question)
+    pipeline.register_expected_base_combine(question)
     return True
 
 
 async def _targeted_research_for_crux(
-    bot: "TemplateForecaster",
+    pipeline: AggregationPipeline,
     question: MetaculusQuestion,
     *,
     analyzer_llm: GeneralLlm,
+    is_benchmarking: bool,
     valid_predictions: list[ReasonedPrediction[PredictionTypes]],
     time_budget: QuestionTimeBudget,
 ) -> str:
@@ -234,7 +232,7 @@ async def _targeted_research_for_crux(
             timeout=crux_timeout,
         )
     except TimeoutError:
-        bot._conditional_stacking_crux_failures += 1
+        pipeline.counters.conditional_stacking_crux_failures += 1
         logger.warning(
             "CRUX_SOFT_DEADLINE: crux extraction exceeded %.0fs for Q %s; skipping targeted research",
             crux_timeout,
@@ -242,7 +240,7 @@ async def _targeted_research_for_crux(
         )
         return ""
     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # enrichment-only; degrade to base research
-        bot._conditional_stacking_crux_failures += 1
+        pipeline.counters.conditional_stacking_crux_failures += 1
         logger.exception("Disagreement crux extraction failed, skipping targeted research")
         return ""
 
@@ -250,29 +248,29 @@ async def _targeted_research_for_crux(
         return ""
     try:
         return await asyncio.wait_for(
-            run_targeted_search(crux, question.question_text, is_benchmarking=bot.is_benchmarking),
+            run_targeted_search(crux, question.question_text, is_benchmarking=is_benchmarking),
             timeout=_enrichment_timeout(NATIVE_SEARCH_WALL_TIMEOUT, time_budget),
         )
     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # enrichment-only; degrade to base research
-        bot._conditional_stacking_search_failures += 1
+        pipeline.counters.conditional_stacking_search_failures += 1
         logger.exception("Targeted search failed, proceeding with base research only")
         return ""
 
 
 def _conditional_stacking_verdict(
-    bot: "TemplateForecaster",
+    pipeline: AggregationPipeline,
     question: MetaculusQuestion,
     valid_predictions: list[ReasonedPrediction[PredictionTypes]],
 ) -> tuple[float, float, str | None]:
     """Measure disagreement and decide whether the stacker fires.
 
     Returns ``(spread, threshold, skip_reason)`` where ``skip_reason`` is None iff the
-    stacker should run. Deriving the reason HERE, once, is what keeps the
-    ``_stacker_outcome`` / ``STACKER_SKIP_REASON`` pair from drifting when a fourth cause
+    stacker should run. Deriving the reason HERE, once, is what keeps the stacker
+    outcome / ``STACKER_SKIP_REASON`` pair from drifting when a fourth cause
     lands: both markers read this one value.
     """
     spread = compute_spread(question, [pred.prediction_value for pred in valid_predictions])
-    threshold = bot._get_threshold_for_question(question)
+    threshold = pipeline.get_threshold_for_question(question)
 
     # An UNMEASURABLE spread reports inf (spread_metrics' SPREAD_UNDEFINED: a
     # non-positive normalizing denominator), and inf > threshold would fire the stacker —
@@ -293,7 +291,7 @@ def _conditional_stacking_verdict(
 
 
 def _record_conditional_skip(
-    bot: "TemplateForecaster",
+    pipeline: AggregationPipeline,
     question: MetaculusQuestion,
     qid: int,
     *,
@@ -309,7 +307,7 @@ def _record_conditional_skip(
     restates it in the one field shared with the single-forecaster path, so a consumer can
     read STACKER_SKIP_REASON alone.
     """
-    bot._conditional_stacking_skipped_count += 1
+    pipeline.counters.conditional_stacking_skipped_count += 1
     if skip_reason == "spread_undefined":
         logger.warning(
             "Conditional stacking SKIPPED: spread was UNMEASURABLE for question %s "
@@ -332,14 +330,60 @@ def _record_conditional_skip(
             threshold,
             qid,
         )
-    bot._register_expected_base_combine(question)
-    bot._stacker_outcome[qid] = "skipped_config_off" if skip_reason == "config_off" else "skipped"
-    bot._stacker_skip_reason[qid] = skip_reason
+    pipeline.register_expected_base_combine(question)
+    pipeline.outcomes[qid] = "skipped_config_off" if skip_reason == "config_off" else "skipped"
+    pipeline.skip_reasons[qid] = skip_reason
+
+
+async def _finalize_stacked_prediction(
+    pipeline: AggregationPipeline,
+    question: MetaculusQuestion,
+    valid_predictions: list[ReasonedPrediction[PredictionTypes]],
+    *,
+    research_for_stacking: str,
+    research_report: str,
+    summary_report: str,
+    errors: list[str],
+    default_meta_reasoning: str,
+) -> ResearchWithPredictions[PredictionTypes]:
+    """Run the stacker and package its value with the base-model reasoning."""
+    prediction_values = [pred.prediction_value for pred in valid_predictions]
+    aggregated_tool_output = (
+        build_cross_model_aggregation(
+            question=question,
+            rationales=[prediction.reasoning for prediction in valid_predictions],
+            prediction_values=prediction_values,
+        )
+        or None
+    )
+    aggregated_value = await pipeline.stack_predictions(
+        prediction_values,
+        question,
+        research=research_for_stacking,
+        reasoned_predictions=valid_predictions,
+        aggregated_tool_output=aggregated_tool_output,
+    )
+    qid = question.id_of_question
+    if qid is None:
+        raise ValueError("Question must have id_of_question to finalize stacked prediction")
+    meta_text = pipeline.meta_reasoning.pop(qid, default_meta_reasoning)
+    combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
+    aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
+    pipeline.register_expected_base_combine(question)
+    return ResearchWithPredictions(
+        research_report=research_report,
+        summary_report=summary_report,
+        errors=errors,
+        predictions=[aggregated_prediction],
+    )
 
 
 async def route_after_forecasts(
-    bot: "TemplateForecaster",
+    pipeline: AggregationPipeline,
     *,
+    analyzer_llm: GeneralLlm | None,
+    is_benchmarking: bool,
+    research_reports_per_question: int,
     question: MetaculusQuestion,
     qid: int,
     valid_predictions: list[ReasonedPrediction[PredictionTypes]],
@@ -370,37 +414,38 @@ async def route_after_forecasts(
     # and the per-type helpers in spread_metrics.py) REQUIRE >=2 predictions and
     # raise otherwise, and stacking a lone base model is meaningless. So when only
     # one forecaster survived we skip spread + stacking entirely and hand the single
-    # prediction to the aggregator, whose _base_combine returns it as-is
+    # prediction to the aggregator, whose base_combine returns it as-is
     # (snap-to-integers applied for discrete numerics). Placed before the budget gate
     # and the per-strategy branches so it short-circuits every stacking path — which
     # is also why this branch has to bump its OWN skip counter: the two increment
-    # sites below are unreachable from here. The _stacker_outcome marker stays
+    # sites below are unreachable from here. The STACKER_OUTCOME marker stays
     # "skipped" (stable for every parser of the legacy value); the skip REASON rides
     # the additive STACKER_SKIP_REASON marker, because this path computes no spread
     # at all and would otherwise publish identically to a spread-below-threshold skip
     # (q44870 was the first resolved instance of that ambiguity).
-    if len(valid_predictions) == 1 and bot.aggregation_strategy in _STACKING_STRATEGIES:
-        bot._conditional_stacking_skipped_single_forecaster_count += 1
+    if len(valid_predictions) == 1 and pipeline.strategy in _STACKING_STRATEGIES:
+        pipeline.counters.conditional_stacking_skipped_single_forecaster_count += 1
         logger.info(
             "Conditional stacking SKIPPED: single forecaster survived for Q %s; "
             "skipping spread + stacking, aggregating the lone prediction",
             qid,
         )
-        bot._register_expected_base_combine(question)
-        bot._stacker_outcome[qid] = "skipped"
-        bot._stacker_skip_reason[qid] = "single_forecaster"
+        pipeline.register_expected_base_combine(question)
+        pipeline.outcomes[qid] = "skipped"
+        pipeline.skip_reasons[qid] = "single_forecaster"
         return base_predictions_collection()
 
-    skip_stacking_for_budget = _skip_stacking_for_budget(bot, question, qid, time_budget)
+    skip_stacking_for_budget = _skip_stacking_for_budget(pipeline, question, qid, time_budget)
 
-    if bot.aggregation_strategy == AggregationStrategy.STACKING and not skip_stacking_for_budget:
-        if bot.research_reports_per_question != 1:
+    if pipeline.strategy == AggregationStrategy.STACKING and not skip_stacking_for_budget:
+        if research_reports_per_question != 1:
             logger.warning(
                 "STACKING configured with research_reports_per_question=%s; final results will average "
                 "per-report stacked outputs by mean.",
-                bot.research_reports_per_question,
+                research_reports_per_question,
             )
-        return await bot._finalize_stacked_prediction(
+        return await _finalize_stacked_prediction(
+            pipeline,
             question,
             valid_predictions,
             research_for_stacking=research,
@@ -410,11 +455,11 @@ async def route_after_forecasts(
             default_meta_reasoning="Stacked prediction aggregated from multiple models",
         )
 
-    if bot.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING and not skip_stacking_for_budget:
-        spread, threshold, skip_reason = _conditional_stacking_verdict(bot, question, valid_predictions)
+    if pipeline.strategy == AggregationStrategy.CONDITIONAL_STACKING and not skip_stacking_for_budget:
+        spread, threshold, skip_reason = _conditional_stacking_verdict(pipeline, question, valid_predictions)
 
         if skip_reason is None:
-            bot._conditional_stacking_triggered_count += 1
+            pipeline.counters.conditional_stacking_triggered_count += 1
             logger.info(
                 "Conditional stacking TRIGGERED: spread=%.3f > threshold=%.3f for question %s",
                 spread,
@@ -422,16 +467,16 @@ async def route_after_forecasts(
                 qid,
             )
 
-            analyzer_llm = bot._analyzer_llm
-            if bot._stacker_llm is None:
+            if pipeline.stacker_llm is None:
                 raise ValueError("CONDITIONAL_STACKING requires a stacker LLM to be configured")
             if analyzer_llm is None:
                 raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
 
             targeted_research_text = await _targeted_research_for_crux(
-                bot,
+                pipeline,
                 question,
                 analyzer_llm=analyzer_llm,
+                is_benchmarking=is_benchmarking,
                 valid_predictions=valid_predictions,
                 time_budget=time_budget,
             )
@@ -445,7 +490,8 @@ async def route_after_forecasts(
             # research_report must be the combined text so the
             # "## Targeted Research (addressing model disagreement)" header reaches
             # the published comment.
-            return await bot._finalize_stacked_prediction(
+            return await _finalize_stacked_prediction(
+                pipeline,
                 question,
                 valid_predictions,
                 research_for_stacking=combined_research,
@@ -457,11 +503,18 @@ async def route_after_forecasts(
                 ),
             )
 
-        _record_conditional_skip(bot, question, qid, skip_reason=skip_reason, spread=spread, threshold=threshold)
+        _record_conditional_skip(
+            pipeline,
+            question,
+            qid,
+            skip_reason=skip_reason,
+            spread=spread,
+            threshold=threshold,
+        )
         return base_predictions_collection()
 
     # Catch-all: a non-stacking strategy, OR a stacking strategy whose budget gate
     # forced the fallback above. In both cases we return the raw valid_predictions
-    # and let the pipeline's per-Q aggregator combine them. For the skip case
-    # _stacker_outcome was already set upstream so the comment marker reflects reality.
+    # and let the pipeline's per-Q aggregator combine them. For the skip case,
+    # the stacker outcome was already set upstream so the comment marker reflects reality.
     return base_predictions_collection()

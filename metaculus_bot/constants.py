@@ -23,21 +23,14 @@ from metaculus_bot.time_utils import _as_utc
 # Read the object before editing: /api/projects/tournaments/<slug-or-id>/ is the route
 # that serves a project (a bare /api/projects/<id>/ 404s), and TOURNAMENT_END_DATE is its
 # `forecasting_end_date`, not its `close_date` (they differ by two months here).
-TOURNAMENT_ID: str = "summer-futureeval-2026"  # Summer 2026 FutureEval Bot Tournament (project ID: 33022)
-TOURNAMENT_END_DATE: str = "2026-09-06"  # forecasting_end_date on project 33022 (API-verified 2026-09-03)
+TOURNAMENT_ID: str = "fall-futureeval-2026"  # Fall 2026 FutureEval Bot Tournament (project ID: 33121)
+TOURNAMENT_END_DATE: str = "2027-01-06"  # forecasting_end_date on project 33121 (API-verified 2026-09-06)
 TOURNAMENT_HARD_STOP_WEEKS: int = 2  # ~2 weeks of wiggle room past close before erroring
-# NO fall-2026 successor to summer-futureeval-2026 was published as of 2026-09-03, so
-# these stay on the summer season deliberately rather than being guessed. Evidence, all
-# read-only: /api/projects/tournaments/ listed 193 projects with no fall-2026 bot
-# tournament among them; every project id from 33100 to 33140 was fetched individually and
-# only 33108 (the fall cup) and 33109 (an unrelated question series) exist, so the id
-# space above the summer tournament is empty; the four plausible slugs
-# fall-futureeval-2026 / fall-aib-2026 / futureeval-fall-2026 / aib-fall-2026 all 404; and
-# forecasting-tools 0.2.92 still has CURRENT_AI_COMPETITION_ID == the summer id.
-# Consequence to expect: check_tournament_dates raises TournamentExpiredError from
-# 2026-09-20 (end date + hard stop), which reddens `--mode tournament` runs and the CI
-# freshness test in tests/test_tournament_dates.py. That is the intended reminder, and it
-# does NOT touch the cup — `--mode metaculus_cup` never calls that check.
+# Fall 2026 was published as project 33121 on 2026-09-04. The object was read directly from
+# /api/projects/tournaments/33121/ on 2026-09-06: start_date 2026-09-28, forecasting_end_date
+# 2027-01-06, close_date 2027-03-05, score_type spot_peer_tournament, and
+# bot_leaderboard_status bots_only. The bot must use forecasting_end_date here; close_date is
+# the later date when the project itself closes.
 
 # Metaculus Cup (human + bot competition). This used to hold the undated `metaculus-cup`
 # slug and rely on Metaculus redirecting it to whichever cup was current; Metaculus now
@@ -436,7 +429,7 @@ EXTREME_CALL_HIGH: float = 0.95
 
 # Floor on the PUBLISHED binary probability when exactly ONE forecaster survived
 # (apply_thin_publish_floor in post_processing.py, wired in
-# AggregationPipeline._base_combine on the "single_forecaster" skip reason).
+# AggregationPipeline.base_combine on the "single_forecaster" skip reason).
 #
 # Mechanism, not a fit: the median of an intact ensemble absorbs a member's extreme
 # tail call, and median-of-1 supplies no such variance reduction, so the range the

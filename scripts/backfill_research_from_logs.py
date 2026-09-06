@@ -13,10 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# The provider -> section-header map is the live pipeline's own; walking it backwards is
-# how a bundle is decoded, and a hand-copied inverse had already rotted two providers
-# (resolution_source, timeseries_anchor) out of every record this writer produced.
-from metaculus_bot.research.section_format import PROVIDER_SECTION_HEADERS
+from metaculus_bot.research.section_format import detect_gap_fill, detect_providers
 
 # The archive's source-classification vocabulary lives with the merge stage that reads it,
 # so writer and classifier can't drift into disagreeing about this writer's name.
@@ -60,26 +57,6 @@ def normalize_timestamp(gha_timestamp: str) -> str:
     if idx == -1:
         return gha_timestamp
     return gha_timestamp[:idx] + "Z"
-
-
-def detect_providers(research_text: str) -> list[str]:
-    """Detect which research providers contributed based on ## headers in the text.
-
-    Walks the live pipeline's own provider -> header map backwards. Nothing is
-    inverted into a second dict: a copy is what let ``resolution_source`` and
-    ``timeseries_anchor`` go unrecognized here for months while the pipeline had been
-    emitting both, so every future provider now self-propagates.
-    """
-    providers = []
-    for provider_name, header in PROVIDER_SECTION_HEADERS.items():
-        if header in research_text:
-            providers.append(provider_name)
-    return providers
-
-
-def detect_gap_fill(research_text: str) -> bool:
-    """Detect if gap-fill was used based on presence of the gap-fill header."""
-    return "## Targeted Gap-Fill" in research_text
 
 
 def strip_gha_prefix(line: str) -> str:

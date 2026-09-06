@@ -56,8 +56,8 @@ def validate_percentile_count_and_values(percentile_list: list[Percentile]) -> N
         )
 
 
-def sort_percentiles_by_value(percentile_list: list[Percentile]) -> list[Percentile]:
-    """Sort percentiles by percentile value to ensure proper order."""
+def sort_by_percentile_level(percentile_list: list[Percentile]) -> list[Percentile]:
+    """Sort declarations by percentile level to ensure proper order."""
     return sorted(percentile_list, key=lambda p: p.percentile)
 
 

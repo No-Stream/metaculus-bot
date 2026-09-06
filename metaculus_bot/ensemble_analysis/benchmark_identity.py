@@ -10,6 +10,7 @@ and reporting.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from enum import Enum
 from typing import Any
@@ -110,8 +111,8 @@ def extract_model_name(benchmark: BenchmarkForBot) -> str:
     Four sources, in precedence order: the bot name when it already looks like a
     model id (the new ensemble configs name themselves, e.g. 'qwen3_glm_mean',
     'qwen3-235b'), the modern ``llms.default`` slot, the legacy ``llms.forecasters``
-    array, then the third pipe-delimited field of the benchmark name. A hashed stub
-    is the last resort so every benchmark still gets a stable key.
+    array, then the third pipe-delimited field of the benchmark name. A deterministic
+    digest is the last resort so every benchmark still gets a stable key.
     """
     try:
         simple_name = benchmark.name.strip()
@@ -131,7 +132,8 @@ def extract_model_name(benchmark: BenchmarkForBot) -> str:
     except _MALFORMED_CONFIG_ERRORS as e:
         logger.warning(f"Could not extract model name from benchmark: {e}")
 
-    return f"model_{hash(benchmark.name) % 10000}"
+    digest = hashlib.sha256(benchmark.name.encode()).hexdigest()[:12]
+    return f"model_{digest}"
 
 
 def _model_paths_in_llm_config(llms: dict) -> list[str]:

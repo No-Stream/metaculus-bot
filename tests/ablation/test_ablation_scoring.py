@@ -69,7 +69,7 @@ def _make_numeric_report(*, lower: float, upper: float, cdf_xs: list[float], cdf
 
 
 def _uniform_numeric_report(lower: float = 0.0, upper: float = 10.0, n: int = 201) -> MagicMock:
-    xs = list(np.linspace(lower, upper, n))
+    xs = [float(value) for value in np.linspace(lower, upper, n)]
     ys = [i / (n - 1) for i in range(n)]
     return _make_numeric_report(lower=lower, upper=upper, cdf_xs=xs, cdf_ys=ys)
 
@@ -1465,7 +1465,7 @@ class TestSaturationDetection:
 def _saturating_numeric_report(lower: float = 0.0, upper: float = 100.0) -> MagicMock:
     """Uniform 201-pt CDF — when resolution is far out of bounds, log-score saturates."""
     n = 201
-    xs = list(np.linspace(lower, upper, n))
+    xs = [float(value) for value in np.linspace(lower, upper, n)]
     ys = [i / (n - 1) for i in range(n)]
     return _make_numeric_report(lower=lower, upper=upper, cdf_xs=xs, cdf_ys=ys)
 

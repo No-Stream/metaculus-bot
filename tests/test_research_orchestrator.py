@@ -598,7 +598,7 @@ class TestProviderSelection:
 
         built = MagicMock()
         built.invoke = AsyncMock(return_value="perplexity prose")
-        with patch("metaculus_bot.research.orchestrator.GeneralLlm", return_value=built) as general_llm:
+        with patch("metaculus_bot.research.providers.GeneralLlm", return_value=built) as general_llm:
             assert await provider(question) == "perplexity prose"
 
         model_slug = general_llm.call_args.kwargs["model"]

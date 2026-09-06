@@ -149,7 +149,7 @@ class TestSingleSurvivorPublishThroughTheRealSequence:
         used = FORECASTERS_USED_MARKER_RE.search(report.explanation)
         assert used is not None
         assert used.groups() == ("1", "3")
-        assert QID not in bot._stacker_skip_reason, "the comment builder pops the reason once published"
+        assert QID not in bot._pipeline.skip_reasons, "the comment builder pops the reason once published"
 
         # The WARN names raw and clamped, and is logged AFTER the survivor count whose
         # k=1 it depends on, so one pass over the log reads both.
@@ -289,12 +289,12 @@ class TestStackedOutputIsNeverFloored:
         with (
             patch("metaculus_bot.stacking_route.extract_disagreement_crux", new=AsyncMock(return_value="crux")),
             patch("metaculus_bot.stacking_route.run_targeted_search", new=AsyncMock(return_value="targeted")),
-            patch.object(bot, "_run_stacking", new=AsyncMock(return_value=0.03)),
+            patch.object(bot._pipeline, "run_stacking", new=AsyncMock(return_value=0.03)),
             caplog.at_level("WARNING"),
         ):
             report = await bot._run_individual_question(question)
 
-        assert bot._conditional_stacking_triggered_count == 1
+        assert bot._pipeline.counters.conditional_stacking_triggered_count == 1
         assert report.prediction == 0.03
         assert STACKER_OUTCOME_PRIMARY in report.explanation
         assert STACKER_SKIP_REASON_RE.search(report.explanation) is None
@@ -314,7 +314,7 @@ class TestStackedOutputIsNeverFloored:
         )
 
         with (
-            patch.object(bot, "_run_stacking", new=AsyncMock(return_value=0.97)),
+            patch.object(bot._pipeline, "run_stacking", new=AsyncMock(return_value=0.97)),
             caplog.at_level("WARNING"),
         ):
             report = await bot._run_individual_question(question)

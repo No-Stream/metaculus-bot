@@ -8,8 +8,9 @@ Exercises AggregationPipeline's three main paths:
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -77,10 +78,30 @@ class TestAggregationCounters:
         assert counters.stacker_primary_failed_count == 0
         assert counters.stacker_fallback_used_count == 0
         assert counters.stacker_fallback_failed_count == 0
+        assert counters.conditional_stacking_triggered_count == 0
+        assert counters.conditional_stacking_skipped_count == 0
+        assert counters.conditional_stacking_skipped_single_forecaster_count == 0
+        assert counters.conditional_stacking_crux_failures == 0
+        assert counters.conditional_stacking_search_failures == 0
 
 
 class TestBaseCombineReentry:
     """Test the base-combine path: reasoned_predictions=None and research=None."""
+
+    @pytest.mark.asyncio
+    async def test_empty_predictions_do_not_consume_expected_combine_state(self) -> None:
+        pipeline = _make_pipeline()
+        question = _make_binary_question(qid=106)
+        pipeline.register_expected_base_combine(question)
+
+        with pytest.raises(ValueError, match="Cannot aggregate empty list of predictions"):
+            pipeline.base_combine(
+                predictions=[],
+                question=question,
+            )
+
+        assert pipeline.expected_base_combines == {106}
+        assert pipeline.counters == AggregationCounters()
 
     @pytest.mark.asyncio
     async def test_single_prediction_returns_as_is(self):
@@ -88,11 +109,9 @@ class TestBaseCombineReentry:
         question = _make_binary_question(qid=101)
         pipeline.register_expected_base_combine(question)
 
-        result = await pipeline.aggregate(
+        result = pipeline.base_combine(
             predictions=[0.42],
             question=question,
-            research=None,
-            reasoned_predictions=None,
         )
 
         assert result == 0.42
@@ -104,11 +123,9 @@ class TestBaseCombineReentry:
         question = _make_binary_question(qid=102)
         # Do NOT register expected combine
 
-        result = await pipeline.aggregate(
+        result = pipeline.base_combine(
             predictions=[0.55],
             question=question,
-            research=None,
-            reasoned_predictions=None,
         )
 
         assert result == 0.55
@@ -120,11 +137,9 @@ class TestBaseCombineReentry:
         question = _make_binary_question(qid=103)
         pipeline.register_expected_base_combine(question)
 
-        result = await pipeline.aggregate(
+        result = pipeline.base_combine(
             predictions=[0.30, 0.50, 0.70],
             question=question,
-            research=None,
-            reasoned_predictions=None,
         )
 
         # Median of [0.30, 0.50, 0.70] = 0.50
@@ -136,11 +151,9 @@ class TestBaseCombineReentry:
         question = _make_binary_question(qid=104)
         pipeline.register_expected_base_combine(question)
 
-        result = await pipeline.aggregate(
+        result = pipeline.base_combine(
             predictions=[0.30, 0.50, 0.70],
             question=question,
-            research=None,
-            reasoned_predictions=None,
         )
 
         # Mean of [0.30, 0.50, 0.70] = 0.50 (coincidentally same as median here)
@@ -174,11 +187,9 @@ class TestBaseCombineReentry:
             ]
         )
 
-        result = await pipeline.aggregate(
+        result = pipeline.base_combine(
             predictions=[pol1, pol2, pol3],
             question=question,
-            research=None,
-            reasoned_predictions=None,
         )
 
         assert isinstance(result, PredictedOptionList)
@@ -195,6 +206,113 @@ class TestStackingFallbackChain:
     """Test the primary -> fallback -> median chain."""
 
     @pytest.mark.asyncio
+    async def test_empty_predictions_fail_before_context_validation_or_state_changes(self) -> None:
+        pipeline = _make_pipeline()
+        pipeline.stacker_llm = None
+        pipeline.outcomes[200] = "skipped"
+        question = _make_binary_question(qid=200)
+
+        with pytest.raises(ValueError, match="Cannot aggregate empty list of predictions"):
+            await pipeline.stack_predictions(
+                predictions=[],
+                question=question,
+                research=None,
+                reasoned_predictions=None,
+                aggregated_tool_output=None,
+            )
+
+        assert pipeline.outcomes == {200: "skipped"}
+        assert pipeline.counters == AggregationCounters()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_cancelling_primary_attempt_propagates_without_recording_a_failure(self) -> None:
+        pipeline = _make_pipeline()
+        question = _make_binary_question(qid=205)
+        predictions: list[PredictionTypes] = [0.20, 0.80]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
+            ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nLow"),
+            ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nHigh"),
+        ]
+        attempt_started = asyncio.Event()
+        attempt_cancelled = asyncio.Event()
+
+        async def wait_for_cancellation(*args: Any, **kwargs: Any) -> PredictionTypes:
+            attempt_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                attempt_cancelled.set()
+            raise AssertionError("unreachable")
+
+        with patch.object(pipeline, "run_stacking", side_effect=wait_for_cancellation):
+            aggregate_task = asyncio.create_task(
+                pipeline.stack_predictions(
+                    predictions=predictions,
+                    question=question,
+                    research="test research",
+                    reasoned_predictions=reasoned,
+                )
+            )
+            await attempt_started.wait()
+            aggregate_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await aggregate_task
+
+        assert attempt_cancelled.is_set()
+        assert 205 not in pipeline.outcomes
+        assert pipeline.counters == AggregationCounters()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_cancelling_fallback_attempt_preserves_primary_failure_counts(self) -> None:
+        pipeline = _make_pipeline()
+        question = _make_binary_question(qid=206)
+        predictions: list[PredictionTypes] = [0.20, 0.80]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
+            ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nLow"),
+            ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nHigh"),
+        ]
+        fallback_started = asyncio.Event()
+        fallback_cancelled = asyncio.Event()
+        attempt_count = 0
+
+        async def fail_primary_then_wait(*args: Any, **kwargs: Any) -> PredictionTypes:
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                raise RuntimeError("primary failed")
+            fallback_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                fallback_cancelled.set()
+            raise AssertionError("unreachable")
+
+        with patch.object(pipeline, "run_stacking", side_effect=fail_primary_then_wait):
+            aggregate_task = asyncio.create_task(
+                pipeline.stack_predictions(
+                    predictions=predictions,
+                    question=question,
+                    research="test research",
+                    reasoned_predictions=reasoned,
+                )
+            )
+            await fallback_started.wait()
+            aggregate_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await aggregate_task
+
+        assert fallback_cancelled.is_set()
+        assert 206 not in pipeline.outcomes
+        assert pipeline.counters == AggregationCounters(
+            stacker_primary_failed_count=1,
+            stacker_fallback_used_count=1,
+        )
+
+    @pytest.mark.asyncio
     async def test_primary_success_sets_outcome(self):
         pipeline = _make_pipeline()
         question = _make_binary_question(qid=201)
@@ -206,7 +324,7 @@ class TestStackingFallbackChain:
         ]
 
         with patch.object(pipeline, "run_stacking", new=AsyncMock(return_value=0.65)):
-            result = await pipeline.aggregate(
+            result = await pipeline.stack_predictions(
                 predictions=predictions,
                 question=question,
                 research="test research",
@@ -236,7 +354,7 @@ class TestStackingFallbackChain:
             return 0.55
 
         with patch.object(pipeline, "run_stacking", side_effect=mock_run_stacking):
-            result = await pipeline.aggregate(
+            result = await pipeline.stack_predictions(
                 predictions=predictions,
                 question=question,
                 research="test research",
@@ -260,7 +378,7 @@ class TestStackingFallbackChain:
         ]
 
         with patch.object(pipeline, "run_stacking", side_effect=TimeoutError("timed out")):
-            result = await pipeline.aggregate(
+            result = await pipeline.stack_predictions(
                 predictions=predictions,
                 question=question,
                 research="test research",
@@ -288,7 +406,7 @@ class TestStackingFallbackChain:
             patch.object(pipeline, "run_stacking", side_effect=RuntimeError("boom")),
             pytest.raises(RuntimeError, match="boom"),
         ):
-            await pipeline.aggregate(
+            await pipeline.stack_predictions(
                 predictions=predictions,
                 question=question,
                 research="test research",
@@ -299,12 +417,22 @@ class TestStackingFallbackChain:
 class TestSimpleAggregation:
     """Test MEAN/MEDIAN strategies (no stacking)."""
 
+    def test_empty_predictions_do_not_change_state(self) -> None:
+        pipeline = _make_pipeline(strategy=AggregationStrategy.MEAN)
+        pipeline.outcomes[300] = "existing"
+
+        with pytest.raises(ValueError, match="Cannot aggregate empty list of predictions"):
+            pipeline.simple_combine(predictions=[], question=_make_binary_question(qid=300))
+
+        assert pipeline.outcomes == {300: "existing"}
+        assert pipeline.counters == AggregationCounters()
+
     @pytest.mark.asyncio
     async def test_mean_binary(self):
         pipeline = _make_pipeline(strategy=AggregationStrategy.MEAN)
         question = _make_binary_question(qid=301)
 
-        result = await pipeline.aggregate(
+        result = pipeline.simple_combine(
             predictions=[0.20, 0.40, 0.60],
             question=question,
         )
@@ -317,7 +445,7 @@ class TestSimpleAggregation:
         pipeline = _make_pipeline(strategy=AggregationStrategy.MEDIAN)
         question = _make_binary_question(qid=302)
 
-        result = await pipeline.aggregate(
+        result = pipeline.simple_combine(
             predictions=[0.20, 0.40, 0.60],
             question=question,
         )
@@ -345,7 +473,7 @@ class TestSimpleAggregation:
             ]
         )
 
-        result = await pipeline.aggregate(predictions=[pol1, pol2], question=question)
+        result = pipeline.simple_combine(predictions=[pol1, pol2], question=question)
 
         assert isinstance(result, PredictedOptionList)
         probs = {o.option_name: o.probability for o in result.predicted_options}
@@ -512,7 +640,7 @@ class TestThinPublishFloorInBaseCombine:
         self._single_survivor(pipeline, question)
 
         with caplog.at_level("WARNING", logger="metaculus_bot.aggregation_pipeline"):
-            result = await pipeline.aggregate(predictions=[0.03], question=question, research=None)
+            result = pipeline.base_combine(predictions=[0.03], question=question)
 
         assert result == THIN_PUBLISH_BINARY_FLOOR
         markers = [r for r in caplog.records if r.getMessage().startswith("THIN_PUBLISH_FLOOR:")]
@@ -527,7 +655,7 @@ class TestThinPublishFloorInBaseCombine:
         self._single_survivor(pipeline, question)
 
         with caplog.at_level("WARNING", logger="metaculus_bot.aggregation_pipeline"):
-            result = await pipeline.aggregate(predictions=[0.97], question=question, research=None)
+            result = pipeline.base_combine(predictions=[0.97], question=question)
 
         assert result == THIN_PUBLISH_BINARY_CEIL
         assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("THIN_PUBLISH_FLOOR:")] == [
@@ -541,7 +669,7 @@ class TestThinPublishFloorInBaseCombine:
         self._single_survivor(pipeline, question)
 
         with caplog.at_level("WARNING", logger="metaculus_bot.aggregation_pipeline"):
-            result = await pipeline.aggregate(predictions=[0.30], question=question, research=None)
+            result = pipeline.base_combine(predictions=[0.30], question=question)
 
         assert result == 0.30
         # Silence means nothing moved; the single-survivor EVENT is already observable
@@ -556,7 +684,7 @@ class TestThinPublishFloorInBaseCombine:
         question = _make_binary_question(qid=904)
         self._single_survivor(pipeline, question)
 
-        await pipeline.aggregate(predictions=[0.03], question=question, research=None)
+        pipeline.base_combine(predictions=[0.03], question=question)
 
         assert pipeline.skip_reasons[904] == "single_forecaster"
         assert pipeline.counters.stacking_expected_combine_count == 1
@@ -579,7 +707,7 @@ class TestThinPublishFloorInBaseCombine:
         pipeline.skip_reasons[905] = "spread_below_threshold"
 
         with caplog.at_level("WARNING", logger="metaculus_bot.aggregation_pipeline"):
-            result = await pipeline.aggregate(predictions=list(members), question=question, research=None)
+            result = pipeline.base_combine(predictions=list(members), question=question)
 
         assert result == pytest.approx(expected_median)
         assert not [r for r in caplog.records if "THIN_PUBLISH_FLOOR" in r.getMessage()]
@@ -597,7 +725,7 @@ class TestThinPublishFloorInBaseCombine:
         pipeline.skip_reasons[910] = "single_forecaster"
 
         with caplog.at_level("WARNING", logger="metaculus_bot.aggregation_pipeline"):
-            result = await pipeline.aggregate(predictions=[0.03, 0.04], question=question, research=None)
+            result = pipeline.base_combine(predictions=[0.03, 0.04], question=question)
 
         assert result == pytest.approx(0.035)
         assert not [r for r in caplog.records if "THIN_PUBLISH_FLOOR" in r.getMessage()]
@@ -613,7 +741,7 @@ class TestThinPublishFloorInBaseCombine:
         pipeline.register_expected_base_combine(question)
 
         with caplog.at_level("WARNING", logger="metaculus_bot.aggregation_pipeline"):
-            result = await pipeline.aggregate(predictions=[0.03], question=question, research=None)
+            result = pipeline.base_combine(predictions=[0.03], question=question)
 
         assert result == 0.03
         assert not [r for r in caplog.records if "THIN_PUBLISH_FLOOR" in r.getMessage()]
@@ -636,7 +764,7 @@ class TestThinPublishFloorInBaseCombine:
         ]
 
         with patch.object(pipeline, "run_stacking", new=AsyncMock(return_value=0.03)):
-            stacked = await pipeline.aggregate(
+            stacked = await pipeline.stack_predictions(
                 predictions=[0.02, 0.04], question=question, research="research", reasoned_predictions=reasoned
             )
 
@@ -670,14 +798,14 @@ class TestThinPublishFloorInBaseCombine:
             patch.object(pipeline, "run_stacking", new=AsyncMock(side_effect=RuntimeError("stacker down"))),
             pytest.raises(RuntimeError),
         ):
-            await pipeline.aggregate(  # report B, discarded
+            await pipeline.stack_predictions(  # report B, discarded
                 predictions=[0.30, 0.60], question=question, research="research", reasoned_predictions=reasoned
             )
         assert pipeline.skip_reasons[911] == "single_forecaster"
 
         pipeline.register_expected_base_combine(question)
         with caplog.at_level("WARNING", logger="metaculus_bot.aggregation_pipeline"):
-            published = await pipeline.aggregate(predictions=[0.03], question=question, research=None)
+            published = pipeline.base_combine(predictions=[0.03], question=question)
 
         assert published == THIN_PUBLISH_BINARY_FLOOR
         assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("THIN_PUBLISH_FLOOR:")] == [
@@ -699,7 +827,7 @@ class TestThinPublishFloorInBaseCombine:
             ]
         )
 
-        result = await pipeline.aggregate(predictions=[lone], question=question, research=None)
+        result = pipeline.base_combine(predictions=[lone], question=question)
 
         assert result is lone
 
@@ -717,7 +845,7 @@ class TestThinPublishFloorInBaseCombine:
         snapped = MagicMock(spec=NumericDistribution)
 
         with patch("metaculus_bot.aggregation_pipeline.maybe_snap_to_integers", return_value=snapped) as snap:
-            result = await pipeline.aggregate(predictions=[lone], question=question, research=None)
+            result = pipeline.base_combine(predictions=[lone], question=question)
 
         assert result is snapped
         snap.assert_called_once_with(lone, question, [True])
