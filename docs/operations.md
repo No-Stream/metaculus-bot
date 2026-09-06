@@ -111,7 +111,7 @@ session does not run them — it proposes, the operator runs and decides.
   `constants.py`) and flip the cup reminder off once configured
   (`FALL_CUP_CONFIGURED`), or every scheduled run reddens on the reminder.
   `TOURNAMENT_END_DATE` is the project's `forecasting_end_date`, not its
-  `close_date` — on `summer-futureeval-2026` those sit two months apart.
+  `close_date` — on `fall-futureeval-2026` those are 2027-01-06 and 2027-03-05.
 - **Read the project object before editing a slug, and note the route.** A project
   is served at `/api/projects/tournaments/<slug-or-id>/`; a bare
   `/api/projects/<id>/` 404s for every id, which reads exactly like "this project
@@ -150,7 +150,7 @@ session does not run them — it proposes, the operator runs and decides.
   opening: the `metaculus-cup-fall-2026` row goes from zero posts to non-zero on
   the day it does.
 
-### Fall 2026 season: what was done on 2026-09-03, and what is left
+### Fall 2026 season: what was done on 2026-09-03 and 2026-09-06, and what is left
 
 Metaculus granted $1,500 of API credits for the bot to compete in both the fall
 Metaculus Cup and the fall bot tournament. Landed in the repo:
@@ -193,6 +193,12 @@ Metaculus Cup and the fall bot tournament. Landed in the repo:
   simultaneous runs rather than a queue.
 - Research records are labelled by run mode (`cli.persisted_tournament_id`), so
   cup runs archive under the cup slug instead of the bot tournament's.
+- `TOURNAMENT_ID` now holds `fall-futureeval-2026` (project 33121). The project
+  was read directly from `/api/projects/tournaments/33121/` on 2026-09-06:
+  `start_date` 2026-09-28, `forecasting_end_date` 2027-01-06, `close_date`
+  2027-03-05, `score_type` `spot_peer_tournament`, and
+  `bot_leaderboard_status` `bots_only`. `TOURNAMENT_END_DATE` uses the
+  forecasting end date, as it must; its two-week hard stop is 2027-01-20.
 
 One adjacent thing the grant settles: credit alerting is back ON.
 `make check_credits` on 2026-09-03 reads the donated key at **$1,449.19 remaining
@@ -212,17 +218,6 @@ Still the operator's, and not doable from a merge:
   above do not fire until it is enabled. Nothing in the repo will warn about this;
   the way to notice is a supply-probe row showing cup questions with no bot
   forecasts.
-- **The fall bot tournament does not exist yet.** No successor to
-  `summer-futureeval-2026` had been published as of 2026-09-03 (the id space above
-  the summer tournament is empty, the four plausible slugs 404, and
-  forecasting-tools still points `CURRENT_AI_COMPETITION_ID` at the summer id), so
-  `TOURNAMENT_ID` stays on the summer season deliberately rather than being
-  guessed. Consequence: from 2026-09-20 (`TOURNAMENT_END_DATE` plus
-  `TOURNAMENT_HARD_STOP_WEEKS`) `check_tournament_dates` raises and both
-  `--mode tournament` runs and the CI freshness test go red. That is the intended
-  reminder, and it does not touch the cup — the cup mode never calls that check.
-  The cheapest watch is `make supply_probe`: re-run it, and when a fall bot
-  tournament appears, point the constants at it.
 
 ## API keys and the shared-vs-personal key model
 

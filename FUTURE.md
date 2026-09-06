@@ -55,30 +55,28 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 > entry added 2026-09-03 below is an operator ACTION rather than an improvement lever, so it is
 > outside that count.
 
-### Fall 2026 season: the cup is configured, the bot tournament has no successor yet (added 2026-09-03, **operator action**)
+### Fall 2026 season: both competitions are configured (updated 2026-09-06, **operator action**)
 
 Metaculus granted $1,500 of API credits on 2026-09-03 for the bot to compete in both the fall
 Metaculus Cup and the fall bot tournament. The cup side is done in the repo: `METACULUS_CUP_ID` holds
 `metaculus-cup-fall-2026` (project 33108, forecasting through 2027-01-01, API-verified), the cup
 workflow is at full env parity with the tournament workflow and runs hourly at :13/:33/:53,
 `FALL_CUP_CONFIGURED` is True so the dated reminder is discharged, and research records are labelled
-by run mode so cup runs no longer archive under the bot tournament's slug. **Two things are still
-open, both the operator's.**
+by run mode so cup runs no longer archive under the bot tournament's slug. The bot tournament was
+published as project 33121 and configured here on 2026-09-06. **One thing remains open, and it is
+the operator's.**
+
+The fall bot tournament is configured. The API object at
+`/api/projects/tournaments/33121/` identifies slug `fall-futureeval-2026`,
+`forecasting_end_date` 2027-01-06, and `close_date` 2027-03-05. `TOURNAMENT_ID`
+and `TOURNAMENT_END_DATE` now use that slug and forecasting end date; the
+two-week hard stop is 2027-01-20. `make supply_probe` remains the free watch
+for new questions. Details and receipts: `docs/operations.md` "Fall 2026 season".
 
 1. **Enable `run_bot_on_metaculus_cup.yaml` on GitHub.** It is `disabled_manually` there, which no
    merge can change, so the crons fire nothing until it is switched on. There is no repo-side
    warning for this state; the way to notice is a supply-probe row showing cup questions with no bot
    forecasts.
-2. **No successor to `summer-futureeval-2026` was published as of 2026-09-03** (id space above the
-   summer tournament empty, four plausible slugs 404, forecasting-tools still pointing
-   `CURRENT_AI_COMPETITION_ID` at summer), so `TOURNAMENT_ID` deliberately stays on the summer season
-   rather than being guessed. **From 2026-09-20** (`TOURNAMENT_END_DATE` plus
-   `TOURNAMENT_HARD_STOP_WEEKS`) `check_tournament_dates` raises, which reddens `--mode tournament`
-   runs and the CI freshness test in `tests/test_tournament_dates.py`. That is the intended reminder,
-   it does not touch the cup (cup mode never calls the check), and the fix when a fall bot tournament
-   appears is to point the constants at it. `make supply_probe` is the free watch: it takes its
-   default slugs from these constants and a dead slug renders as one error row without stopping the
-   other rows. Details and receipts: `docs/operations.md` "Fall 2026 season".
 
 ### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH — operator-confirmed 2026-08-25**)
 

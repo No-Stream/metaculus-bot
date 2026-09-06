@@ -51,7 +51,7 @@ posts to non-zero on the day it does.
 
 Usage:
     uv run python scripts/supply_probe.py
-    uv run python scripts/supply_probe.py --slugs summer-futureeval-2026 --statuses open closed
+    uv run python scripts/supply_probe.py --slugs fall-futureeval-2026 --statuses open closed
     uv run python scripts/supply_probe.py --no-forfeits          # counts only, no detail GETs
     make supply_probe
     make supply_probe ARGS="--slugs metaculus-cup-fall-2026 --output /tmp/supply.json"
