@@ -1,14 +1,16 @@
 """Lightweight smoke tests for community_benchmark.py to catch common issues."""
 
-import argparse
 import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+import community_benchmark
+from community_benchmark import _build_parser
 
-def test_import_community_benchmark():
+
+def test_import_community_benchmark() -> None:
     """Importing the module must not raise (it does real work at module scope).
 
     The body asserts on the imported module rather than just importing it: an
@@ -18,54 +20,39 @@ def test_import_community_benchmark():
     known attribute keeps the import live, so the formatter has no reason to
     remove it and the test cannot silently become a no-op again.
     """
-    import community_benchmark
-
     assert callable(community_benchmark.benchmark_forecast_bot)
 
 
-def test_cli_argument_parsing():
-    """Test CLI argument parsing with different combinations."""
-    # Create parser identical to the one in community_benchmark.py
-    parser = argparse.ArgumentParser(description="Benchmark a list of bots")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["run", "custom", "display"],
-        default="display",
-        help="Specify the run mode (default: display)",
-    )
-    parser.add_argument(
-        "--num-questions",
-        type=int,
-        default=2,
-        help="Number of questions to benchmark (default: 2)",
-    )
-    parser.add_argument(
-        "--mixed",
-        action="store_true",
-        help="Use mixed question types with 50/25/25 distribution (binary/numeric/multiple-choice)",
-    )
+def test_cli_argument_parsing() -> None:
+    """The executable parser exposes the current mode and model-filter options."""
+    parser = _build_parser()
+    defaults = parser.parse_args([])
+    assert defaults.mode == "display"
+    assert defaults.num_questions == 2
+    assert defaults.mixed is False
+    assert defaults.include_models is None
+    assert defaults.exclude_models is None
 
-    # Test default args
-    args = parser.parse_args([])
-    assert args.mode == "display"
-    assert args.num_questions == 2
-    assert args.mixed is False
-
-    # Test custom args
-    args = parser.parse_args(["--mode", "run", "--num-questions", "5"])
-    assert args.mode == "run"
-    assert args.num_questions == 5
-    assert args.mixed is False
-
-    # Test mixed flag
-    args = parser.parse_args(["--mode", "custom", "--mixed"])
+    args = parser.parse_args(
+        [
+            "--mode",
+            "custom",
+            "--num-questions",
+            "5",
+            "--mixed",
+            "--include-models",
+            "gpt",
+            "qwen",
+        ]
+    )
     assert args.mode == "custom"
+    assert args.num_questions == 5
     assert args.mixed is True
+    assert args.include_models == ["gpt", "qwen"]
 
-    # Test edge cases
-    args = parser.parse_args(["--num-questions", "1"])
-    assert args.num_questions == 1
+    args = parser.parse_args(["--mode", "run", "--exclude-models", "grok"])
+    assert args.mode == "run"
+    assert args.exclude_models == ["grok"]
 
 
 def test_bot_instantiation():

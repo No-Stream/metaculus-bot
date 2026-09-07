@@ -433,8 +433,8 @@ def _validate_numeric(percentiles: list[Percentile]) -> list[Percentile]:
 
     Beyond presence, the values must be FINITE and ordered the way their labels
     claim. Both checks exist because the sanitizer downstream cannot tell a bad
-    salvage from a concentrated forecast: ``sort_percentiles_by_value`` sorts by
-    LABEL, so a value-disordered set is never reordered — it is force-monotonized,
+    salvage from a concentrated forecast: ``sort_by_percentile_level`` orders by
+    label, so a value-disordered set is never reordered — it is force-monotonized,
     which on one out-of-place value pins most of the set at a bound and publishes
     a distribution nobody declared. A strict DECREASE with rising percentile is
     incoherent by construction, so it fails the rung instead. Ties are allowed:

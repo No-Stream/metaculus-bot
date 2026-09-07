@@ -49,6 +49,21 @@ _INSUFFICIENT_QUESTIONS_RE: re.Pattern[str] = re.compile(
 )
 
 
+def _parse_resolution_window(
+    resolved_after: str,
+    resolved_before: str | None,
+) -> tuple[datetime, datetime | None]:
+    """Parse resolution-window boundaries as UTC datetimes."""
+    # ft 0.2.92 coerces question datetimes (incl. actual_resolution_time) to tz-aware
+    # UTC at construction. The strptime boundaries are naive, so normalize them to UTC
+    # too — otherwise the naive/aware ordering comparisons in _filter_and_extract raise.
+    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
+    resolved_before_dt = (
+        _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None  # noqa: DTZ007  # stamped UTC by _as_utc
+    )
+    return resolved_after_dt, resolved_before_dt
+
+
 @dataclass
 class BacktestQuestionSet:
     questions: list[MetaculusQuestion]
@@ -82,13 +97,7 @@ async def fetch_resolved_questions(
             (no upper bound). Together yields the half-open interval
             [resolved_after, resolved_before).
     """
-    # ft 0.2.92 coerces question datetimes (incl. actual_resolution_time) to tz-aware
-    # UTC at construction. The strptime boundaries are naive, so normalize them to UTC
-    # too — otherwise the naive/aware ordering comparisons in _filter_and_extract raise.
-    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
-    resolved_before_dt = (
-        _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None  # noqa: DTZ007  # stamped UTC by _as_utc
-    )
+    resolved_after_dt, resolved_before_dt = _parse_resolution_window(resolved_after, resolved_before)
 
     overfetch_count = total_questions * BACKTEST_OVERFETCH_RATIO
     logger.info(
@@ -364,13 +373,7 @@ async def fetch_resolved_questions_stratified(
     if tournaments is None:
         tournaments = [BACKTEST_DEFAULT_TOURNAMENT]
 
-    # ft 0.2.92 coerces question datetimes (incl. actual_resolution_time) to tz-aware
-    # UTC at construction. The strptime boundaries are naive, so normalize them to UTC
-    # too — otherwise the naive/aware ordering comparisons in _filter_and_extract raise.
-    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
-    resolved_before_dt = (
-        _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None  # noqa: DTZ007  # stamped UTC by _as_utc
-    )
+    resolved_after_dt, resolved_before_dt = _parse_resolution_window(resolved_after, resolved_before)
 
     per_type_targets = {
         "binary": num_binary,

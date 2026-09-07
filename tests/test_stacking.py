@@ -33,7 +33,7 @@ from tests.conftest import gather_predictions_stub
 # annotation does not model, so test literals are cast to this alias at each call site.
 LlmsConfig = dict[str, str | GeneralLlm] | None
 
-# The `_run_stacking` / `_aggregate_predictions` reasoned-prediction params are typed with
+# The pipeline `run_stacking` / `_aggregate_predictions` reasoned-prediction params are typed with
 # the framework's PredictionTypes union; test fixtures build concrete float predictions.
 ReasonedPredictionList = list[ReasonedPrediction[PredictionTypes]]
 
@@ -74,8 +74,16 @@ class TestStackingConfiguration:
 
         assert bot.aggregation_strategy == AggregationStrategy.STACKING
         assert len(bot._forecaster_llms) == 2
-        assert bot._stacker_llm is not None
-        assert bot._stacker_llm.model == "test-model"
+        assert bot._pipeline.stacker_llm is not None
+        assert bot._pipeline.stacker_llm.model == "test-model"
+
+        bot.aggregation_strategy = AggregationStrategy.MEAN
+        bot.stacking_fallback_on_failure = False
+        bot.stacking_randomize_order = False
+
+        assert bot._pipeline.strategy == AggregationStrategy.MEAN
+        assert bot._pipeline.stacking_fallback_on_failure is False
+        assert bot._pipeline.stacking_randomize_order is False
 
     def test_stacking_without_stacker_llm_fails(self):
         """Test that stacking without stacker LLM fails at runtime."""
@@ -100,8 +108,8 @@ class TestStackingConfiguration:
             ),
         )
 
-        # Bot creation succeeds but _stacker_llm should be None
-        assert bot._stacker_llm is None
+        # Bot creation succeeds but no stacker LLM is configured.
+        assert bot._pipeline.stacker_llm is None
 
         # The error should occur when trying to aggregate predictions
 
@@ -138,7 +146,7 @@ class TestStackingConfiguration:
         )
 
         # Should not crash but stacker should be None due to warning
-        assert bot._stacker_llm is None
+        assert bot._pipeline.stacker_llm is None
 
     def test_stacking_parameters(self):
         """Test stacking-specific parameters."""
@@ -436,7 +444,7 @@ class TestStackingIntegration:
             )
 
         # Add stacker LLM
-        bot._stacker_llm = test_llm
+        bot._pipeline.stacker_llm = test_llm
 
         # Test missing reasoned predictions
         with pytest.raises(
@@ -483,15 +491,17 @@ class TestStackingIntegration:
             stacking_fallback_on_failure=True,
         )
 
-        # Mock _run_stacking to raise an exception. After primary fails we
+        # Mock pipeline.run_stacking to raise an exception. After primary fails we
         # fall through to fallback LLM then to MEDIAN aggregation; patch the
         # fallback stacker constructor call path so both stacker attempts
         # raise, landing us in MEDIAN.
         mock_question = Mock(spec=BinaryQuestion)
         mock_question.id_of_question = 42
         with (
-            patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")) as mock_run_stacking,
-            patch.object(bot, "aggregation_strategy", AggregationStrategy.STACKING),
+            patch.object(
+                bot._pipeline, "run_stacking", side_effect=RuntimeError("Stacking failed")
+            ) as mock_run_stacking,
+            patch.object(bot._pipeline, "strategy", AggregationStrategy.STACKING),
         ):
             result = await bot._aggregate_predictions(
                 predictions=[0.4, 0.6],
@@ -506,10 +516,10 @@ class TestStackingIntegration:
             # F8: assert the degradation counters were tripped as expected.
             # Primary fails → primary counter, then fallback is attempted
             # (counter tripped at invocation time) and also fails.
-            assert bot._stacker_primary_failed_count == 1
-            assert bot._stacker_fallback_used_count == 1
-            assert bot._stacker_fallback_failed_count == 1
-            # Two _run_stacking calls expected: primary + fallback.
+            assert bot._pipeline.counters.stacker_primary_failed_count == 1
+            assert bot._pipeline.counters.stacker_fallback_used_count == 1
+            assert bot._pipeline.counters.stacker_fallback_failed_count == 1
+            # Two pipeline.run_stacking calls expected: primary + fallback.
             assert mock_run_stacking.call_count == 2
             # The second call must have received the fallback LLM override.
             assert mock_run_stacking.call_args_list[1].kwargs["stacker_llm_override"] is STACKER_FALLBACK_LLM
@@ -546,7 +556,9 @@ class TestStackingIntegration:
         mock_question = Mock(spec=BinaryQuestion)
         mock_question.id_of_question = 99
         # side_effect sequence: primary raises, fallback returns 0.7.
-        with patch.object(bot, "_run_stacking", side_effect=[RuntimeError("primary failed"), 0.7]) as mock_run_stacking:
+        with patch.object(
+            bot._pipeline, "run_stacking", side_effect=[RuntimeError("primary failed"), 0.7]
+        ) as mock_run_stacking:
             result = await bot._aggregate_predictions(
                 predictions=[0.4, 0.6],
                 question=mock_question,
@@ -555,9 +567,9 @@ class TestStackingIntegration:
             )
 
         assert result == 0.7, "Fallback stacker's value must be returned (not MEDIAN=0.5)."
-        assert bot._stacker_primary_failed_count == 1
-        assert bot._stacker_fallback_used_count == 1
-        assert bot._stacker_fallback_failed_count == 0
+        assert bot._pipeline.counters.stacker_primary_failed_count == 1
+        assert bot._pipeline.counters.stacker_fallback_used_count == 1
+        assert bot._pipeline.counters.stacker_fallback_failed_count == 0
         assert mock_run_stacking.call_count == 2
         # Verify the fallback call received the fallback LLM as override.
         assert mock_run_stacking.call_args_list[1].kwargs["stacker_llm_override"] is STACKER_FALLBACK_LLM
@@ -585,7 +597,7 @@ class TestStackingIntegration:
 
         # Real BinaryQuestion (not Mock(spec=...)) because _aggregate_predictions
         # reads question.id_of_question to assert non-None and key into
-        # self._stacker_outcome on the success/fallback paths. A Mock(spec=...)
+        # self._pipeline.outcomes on the success/fallback paths. A Mock(spec=...)
         # returns a MagicMock for id_of_question, which would key the dict with
         # a Mock object instead of an int — fine for the no-fallback path tested
         # here (which raises before the dict write), but a real question is
@@ -601,9 +613,9 @@ class TestStackingIntegration:
             scheduled_resolution_time=_stub_resolve_time(),
         )
 
-        # Mock _run_stacking to raise an exception
+        # Mock pipeline.run_stacking to raise an exception
         with (
-            patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")),
+            patch.object(bot._pipeline, "run_stacking", side_effect=RuntimeError("Stacking failed")),
             pytest.raises(RuntimeError, match="Stacking failed"),
         ):
             await bot._aggregate_predictions(
@@ -619,7 +631,7 @@ class TestStackingMethods:
 
     @pytest.mark.asyncio
     async def test_run_stacking_question_type_routing(self):
-        """Test that _run_stacking routes to correct methods based on question type."""
+        """Test that pipeline.run_stacking routes to the correct method per question type."""
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
 
         bot = TemplateForecaster(
@@ -673,7 +685,7 @@ class TestStackingMethods:
             binary_question.background_info = "Test background"
             binary_question.resolution_criteria = "Test resolution criteria"
             binary_question.fine_print = "Test fine print"
-            result = await bot._run_stacking(binary_question, "research", reasoned_preds)
+            result = await bot._pipeline.run_stacking(binary_question, "research", reasoned_preds)
             mock_binary.assert_called_once()
             mock_mc.assert_not_called()
             mock_numeric.assert_not_called()
@@ -699,7 +711,7 @@ class TestStackingMethods:
             mc_question.fine_print = "Test fine print"
             mc_question.page_url = "https://example.com/q/102"
             mc_question.options = ["A", "B", "C"]
-            result = await bot._run_stacking(mc_question, "research", reasoned_preds)
+            result = await bot._pipeline.run_stacking(mc_question, "research", reasoned_preds)
             mock_binary.assert_not_called()
             mock_mc.assert_called_once()
             mock_numeric.assert_not_called()
@@ -722,7 +734,7 @@ class TestStackingMethods:
             numeric_question.open_upper_bound = False
             numeric_question.open_lower_bound = False
             numeric_question.unit_of_measure = "units"
-            result = await bot._run_stacking(numeric_question, "research", reasoned_preds)
+            result = await bot._pipeline.run_stacking(numeric_question, "research", reasoned_preds)
             mock_binary.assert_not_called()
             mock_mc.assert_not_called()
             mock_numeric.assert_called_once()
@@ -735,7 +747,7 @@ class TestStackingMethods:
 
     @pytest.mark.asyncio
     async def test_run_stacking_unsupported_question_type(self):
-        """Test that unsupported question types raise an error."""
+        """Test that unsupported question types raise an error from pipeline.run_stacking."""
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
 
         bot = TemplateForecaster(
@@ -762,7 +774,7 @@ class TestStackingMethods:
         reasoned_preds: ReasonedPredictionList = [ReasonedPrediction(prediction_value=0.6, reasoning="test")]
 
         with pytest.raises(ValueError, match="Unsupported question type for stacking"):
-            await bot._run_stacking(unsupported_question, "research", reasoned_preds)
+            await bot._pipeline.run_stacking(unsupported_question, "research", reasoned_preds)
 
     def test_stacking_model_name_stripping_edge_cases(self):
         """Test edge cases in model name stripping logic."""
@@ -835,7 +847,7 @@ class TestStackingResearchAndMakePredictions:
                 "_gather_predictions_with_wall_clock",
                 new=gather_predictions_stub(([pred1, pred2], [], None)),
             ),
-            patch.object(bot, "_aggregate_predictions", return_value=0.7) as mock_aggregate,
+            patch.object(bot._pipeline, "stack_predictions", return_value=0.7) as mock_aggregate,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -955,7 +967,7 @@ class TestStackingBenchmarkConfiguration:
 
         assert stacking_bot.aggregation_strategy == AggregationStrategy.STACKING
         assert len(stacking_bot._forecaster_llms) == 3  # All base models
-        assert stacking_bot._stacker_llm is not None
+        assert stacking_bot._pipeline.stacker_llm is not None
         assert stacking_bot.stacking_fallback_on_failure is False
         assert stacking_bot.stacking_randomize_order is True
         assert stacking_bot.is_benchmarking is True
@@ -1135,7 +1147,7 @@ class TestStackingGuardsAndReasoning:
                 "_gather_predictions_with_wall_clock",
                 new=gather_predictions_stub(([pred1, pred2], [], None)),
             ),
-            patch.object(bot, "_run_stacking", return_value=0.7),
+            patch.object(bot._pipeline, "run_stacking", return_value=0.7),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -1145,7 +1157,7 @@ class TestStackingGuardsAndReasoning:
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
 
             # Pre-store meta-analysis as if produced by stacker LLM
-            bot._stack_meta_reasoning[999] = "Meta-analysis text"
+            bot._pipeline.meta_reasoning[999] = "Meta-analysis text"
 
             result = await bot._research_and_make_predictions(question)
 

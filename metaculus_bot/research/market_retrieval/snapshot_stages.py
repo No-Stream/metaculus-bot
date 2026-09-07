@@ -143,7 +143,7 @@ class _PrefetchResult:
 # ---------------------------------------------------------------------------
 
 
-async def _search_venue(session: Any, venue: str, queries: list[str]) -> list[list[MarketMatch] | None | BaseException]:
+async def _search_venue(session: Any, venue: str, queries: list[str]) -> list[list[MarketMatch] | BaseException | None]:
     """Every query against one venue's own index, in parallel, results in query order.
 
     The per-result `None`-vs-`[]` contract is preserved all the way to pool assembly: `None`
@@ -161,7 +161,7 @@ async def _search_venue(session: Any, venue: str, queries: list[str]) -> list[li
 
 async def _run_venue_search_stage(
     ctx: _SnapshotContext, all_queries: list[str]
-) -> dict[str, list[list[MarketMatch] | None | BaseException]]:
+) -> dict[str, list[list[MarketMatch] | BaseException | None]]:
     """Stage 2 VENUE SEARCH over the conjunctive venues, dropping any that raised.
 
     The enumerable venues score against the RAW query set (a year is real signal against a
@@ -178,7 +178,7 @@ async def _run_venue_search_stage(
     search_outcomes = dict(
         zip(search_tasks, await asyncio.gather(*search_tasks.values(), return_exceptions=True), strict=True)
     )
-    venue_search_results: dict[str, list[list[MarketMatch] | None | BaseException]] = {}
+    venue_search_results: dict[str, list[list[MarketMatch] | BaseException | None]] = {}
     for venue, outcome in search_outcomes.items():
         if isinstance(outcome, BaseException):
             logger.warning(f"Venue {venue} search raised (soft-fail): {type(outcome).__name__}: {outcome}")
@@ -197,7 +197,7 @@ async def _assemble_pool_stage(
     ctx: _SnapshotContext,
     all_queries: list[str],
     prefetch: _PrefetchResult,
-    venue_search_results: dict[str, list[list[MarketMatch] | None | BaseException]],
+    venue_search_results: dict[str, list[list[MarketMatch] | BaseException | None]],
 ) -> tuple[generation.PoolResult, dict[str, list[MarketMatch]]]:
     """Stage 3 POOL ASSEMBLY (CPU-bound, off the event loop) plus stage 2.5 ENRICH.
 

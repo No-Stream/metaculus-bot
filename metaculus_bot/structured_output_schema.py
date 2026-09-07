@@ -338,56 +338,32 @@ class NumericStructured(BaseModel):
 
     @field_validator("declared_percentiles")
     @classmethod
-    def _check_percentiles(cls, v: dict[float, float] | None) -> dict[float, float] | None:
-        if not v:
-            return v
-        missing = _REQUIRED_NUMERIC_PERCENTILES - set(v.keys())
-        if missing:
+    def _check_percentiles(cls, declared_percentiles: dict[float, float] | None) -> dict[float, float] | None:
+        if not declared_percentiles:
+            return declared_percentiles
+        missing_percentiles = _REQUIRED_NUMERIC_PERCENTILES - declared_percentiles.keys()
+        if missing_percentiles:
             raise ValueError(
                 f"NumericStructured.declared_percentiles must include at least "
-                f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}, missing {sorted(missing)}"
+                f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}, missing {sorted(missing_percentiles)}"
             )
-        for pct in v:
-            if not (0.0 <= pct <= 1.0):
-                raise ValueError(f"Percentile keys must be in [0, 1], got {pct}")
-        # NON-decreasing, not strictly increasing: a repeated value is a legitimate
-        # concentrated (often count-like) declaration — p1 = p2.5 = 0 on a question that
-        # usually reads zero — and both downstream layers are built for exactly that
-        # (``value_extraction._validate_numeric`` allows ties by name, and
-        # ``sanitize_percentiles``'s cluster spreader exists to separate them). While this
-        # schema demanded a strict increase, such a block failed rung 1, could not be
-        # repaired (it is valid JSON), and reached the pipeline only via LLM salvage. A
-        # strict DECREASE with rising percentile still raises: it is incoherent, and
-        # ``sort_percentiles_by_value`` sorts by LABEL, so a value-disordered set is
-        # force-monotonized rather than reordered.
-        #
-        # This is a SAFETY NET for non-compliant output, not a licensed shape. The numeric
-        # prompt's schema notes still tell the model values must be strictly increasing, and
-        # that wording is deliberate (softening it shifts the forecast distribution, so it is
-        # the operator's call), which means the relaxation only ever engages for a forecaster
-        # that disobeys its instructions. Measured on the archive: 2 of 346 declarations carry
-        # any exact tie, both 3-anchor records from the KNOWN_BUG_QIDS cohort.
-        #
-        # It also admits a WHOLE-set collapse, which lands somewhere different from the
-        # partial tie argued for above: a 13-way tie reaches rung 1, ``sanitize_percentiles``
-        # deliberately refuses to cluster-spread it (``NUMERIC_DEGENERATE_DECLARATION`` with
-        # spread_applied=false), and ``detect_unit_mismatch`` then WITHHOLDS the member as an
-        # alertable drop, instead of the salvage rung re-reading a percentile table out of the
-        # prose. The withhold is the designed outcome for a member that declared no width, and
-        # 0 of 346 archived declarations are all-equal, so this is unobserved in prod. Do NOT
-        # add a "require at least two distinct values" branch: that is defensive branching for
-        # a zero-instance case inside the extraction fallback ladder.
-        sorted_keys = sorted(v.keys())
-        prev_value: float | None = None
-        for key in sorted_keys:
-            value = v[key]
-            if prev_value is not None and value < prev_value:
+        for percentile_level in declared_percentiles:
+            if not (0.0 <= percentile_level <= 1.0):
+                raise ValueError(f"Percentile keys must be in [0, 1], got {percentile_level}")
+        # Values are non-decreasing rather than strictly increasing because ties are valid
+        # concentrated declarations. The prompt still requests strict increases; this check
+        # is a safety net that rejects decreases before the sanitizer orders by percentile level.
+        percentile_levels = sorted(declared_percentiles)
+        previous_value: float | None = None
+        for percentile_level in percentile_levels:
+            current_value = declared_percentiles[percentile_level]
+            if previous_value is not None and current_value < previous_value:
                 raise ValueError(
                     f"declared_percentiles values must be non-decreasing with percentile; "
-                    f"got {value} at pct {key} after {prev_value}"
+                    f"got {current_value} at pct {percentile_level} after {previous_value}"
                 )
-            prev_value = value
-        return v
+            previous_value = current_value
+        return declared_percentiles
 
     @model_validator(mode="after")
     def _require_percentiles(self) -> NumericStructured:

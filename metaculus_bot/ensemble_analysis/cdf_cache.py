@@ -1,10 +1,10 @@
-"""Safe numeric-CDF access + fallback bookkeeping for ensemble simulation.
+"""Safe numeric-CDF access and failure bookkeeping for ensemble simulation.
 
 ``NumericCdfCache`` owns the ``_safe_cdf_cache`` (per (model, qid) memoization of a
-usable CDF) and the ``_numeric_cdf_stats`` counters that track how often we fall
-back to a PCHIP rebuild or a monotone ramp. Extracted from ``CorrelationAnalyzer``
-as the "CDF cache" concern; the analyzer holds one instance and delegates
-``_get_safe_numeric_cdf`` / ``log_numeric_cdf_summary`` to it.
+usable CDF) and the ``_numeric_cdf_stats`` counters that track rebuilds and failures.
+The legacy ``safe_cdf_ramp`` bucket remains in the stats payload at zero so archived
+diagnostic summaries retain their field shape; fabricated ramp CDFs are no longer built.
+``CorrelationAnalyzer`` shares one cache with its ensemble simulator.
 """
 
 from __future__ import annotations
@@ -16,25 +16,22 @@ from typing import Any
 import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+from metaculus_bot.numeric.pchip_cdf import (
+    build_cdf_value_grid,
+    generate_pchip_cdf,
+    percentiles_to_pchip_format,
+)
 
 logger = logging.getLogger(__name__)
 
-# The final-fallback ramp is built on the standard 201-point Metaculus grid with the
-# server's 201-grid min step, so it satisfies the strictly-increasing constraint.
-_RAMP_POINTS = 201
-_RAMP_MIN_STEP = 5e-05
-
 
 class NumericCdfCache:
-    """Memoizing safe-CDF accessor with PCHIP-rebuild and monotone-ramp fallbacks.
+    """Memoizing safe-CDF accessor with a PCHIP-rebuild fallback.
 
-    NOTE: callers that mutate the underlying benchmark set (e.g.
-    ``CorrelationAnalyzer.add_benchmark_results`` / ``filter_models_inplace``) do NOT
-    currently clear this cache. If benchmarks change in a way that reuses the same
-    (model_name, question_id) keys with different predictions, cached CDFs could go
-    stale. In practice a fresh ``CorrelationAnalyzer`` is constructed per analysis run,
-    so this has not bitten us; call ``clear()`` if that assumption ever changes.
+    Callers that mutate the underlying benchmark set (e.g.
+    ``CorrelationAnalyzer.add_benchmark_results`` / ``filter_models_inplace``) clear
+    this cache before reusing it. If another caller replaces predictions under the
+    same ``(model_name, question_id)`` keys, it must call ``clear()`` as well.
     """
 
     def __init__(self) -> None:
@@ -42,6 +39,7 @@ class NumericCdfCache:
         self._numeric_cdf_stats: dict[str, Any] = {
             "attempt_pairs": set(),  # set[(model, qid)]
             "safe_cdf_built": set(),  # set[(model, qid)]
+            # Retained as an always-empty compatibility bucket for summary consumers.
             "safe_cdf_ramp": set(),  # set[(model, qid)]
             "failures": set(),  # set[(model, qid)]
             "first_warnings_emitted": set(),  # set[(model, qid)]
@@ -57,14 +55,11 @@ class NumericCdfCache:
         """Return a safe numeric CDF as a list of objects with `.percentile` and `.value`.
 
         Attempts `prediction.cdf` first. If items are floats or missing `.value`, synthesize a
-        reasonable x-grid from question bounds. If `prediction.cdf` raises, rebuild from
-        declared percentiles via PCHIP; as last resort, return a monotone ramp. All paths return
-        objects convertible to the NumericDistribution "Percentile"-like shape required by
-        downstream scoring (which only reads `.percentile`).
+        value grid from question bounds. If `prediction.cdf` raises, rebuild from declared
+        percentiles via PCHIP. When neither representation is usable, return ``None`` so the
+        caller can exclude the prediction from scoring.
 
-        Each rung is a deliberate soft-fail: one unusable prediction must degrade to the
-        next rung (and ultimately to ``None``) rather than abort an analysis run. Which
-        rung answered is recorded in ``_numeric_cdf_stats`` and reported by
+        Which path answered is recorded in ``_numeric_cdf_stats`` and reported by
         :meth:`log_numeric_cdf_summary`.
         """
         qid = getattr(question, "id_of_question", None)
@@ -88,12 +83,6 @@ class NumericCdfCache:
             self._safe_cdf_cache[key] = rebuilt_cdf
             stats["safe_cdf_built"].add(key)
             return rebuilt_cdf
-
-        ramp_cdf = self._monotone_ramp_cdf(question)
-        if ramp_cdf is not None:
-            self._safe_cdf_cache[key] = ramp_cdf
-            stats["safe_cdf_ramp"].add(key)
-            return ramp_cdf
 
         stats["failures"].add(key)
         self._safe_cdf_cache[key] = None
@@ -132,14 +121,22 @@ class NumericCdfCache:
             if has_percentile and has_value:
                 return list(raw)
 
-            x = np.linspace(float(question.lower_bound), float(question.upper_bound), len(raw))
+            question_values = build_cdf_value_grid(
+                float(question.lower_bound),
+                float(question.upper_bound),
+                getattr(question, "zero_point", None),
+                len(raw),
+            )
             if has_percentile:
                 return [
-                    SimpleNamespace(value=float(xi), percentile=float(p.percentile))
-                    for xi, p in zip(x, raw, strict=True)
+                    SimpleNamespace(value=float(question_value), percentile=float(point.percentile))
+                    for question_value, point in zip(question_values, raw, strict=True)
                 ]
             # Percentiles as bare floats
-            return [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, raw, strict=True)]
+            return [
+                SimpleNamespace(value=float(question_value), percentile=float(probability))
+                for question_value, probability in zip(question_values, raw, strict=True)
+            ]
         except Exception as e:  # noqa: BLE001  # soft-fail rung: any bad `.cdf` degrades to the rebuild below
             self._warn_once(
                 key,
@@ -193,34 +190,13 @@ class NumericCdfCache:
             )
             # Ensure monotone and within [0,1]
             cdf_vals = list(np.maximum.accumulate(np.clip(np.array(cdf_vals, dtype=float), 0.0, 1.0)))
-            x = np.linspace(float(lower), float(upper), len(cdf_vals))
-            return [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, cdf_vals, strict=True)]
-        except Exception as e:  # noqa: BLE001  # soft-fail rung: any rebuild failure degrades to the ramp below
-            self._warn_once(
-                key,
-                "Numeric CDF rebuild failed for model=%s q=%s: %s — using monotone ramp",
-                model_name,
-                qid,
-                e,
-            )
-            return None
-
-    def _monotone_ramp_cdf(self, question: Any) -> list[Any] | None:
-        """Rung 3: a uniform ramp over the question's range, min-step enforced.
-
-        Returns None only when the question exposes no usable bounds at all, which is
-        the one case with nothing left to fall back to.
-        """
-        try:
-            vals = list(np.linspace(0.0, 1.0, _RAMP_POINTS))
-            for i in range(1, _RAMP_POINTS):
-                if vals[i] < vals[i - 1] + _RAMP_MIN_STEP:
-                    vals[i] = min(1.0, vals[i - 1] + _RAMP_MIN_STEP)
-            if vals[-1] > 1.0:
-                vals[-1] = 1.0
-            x = np.linspace(float(question.lower_bound), float(question.upper_bound), _RAMP_POINTS)
-            return [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, vals, strict=True)]
-        except Exception:  # noqa: BLE001  # last soft-fail rung: an unusable question yields None, never a crash
+            question_values = build_cdf_value_grid(float(lower), float(upper), zp, len(cdf_vals))
+            return [
+                SimpleNamespace(value=float(question_value), percentile=float(probability))
+                for question_value, probability in zip(question_values, cdf_vals, strict=True)
+            ]
+        except Exception as e:  # noqa: BLE001  # soft-fail rung: an unusable prediction is excluded
+            self._warn_once(key, "Numeric CDF rebuild failed for model=%s q=%s: %s", model_name, qid, e)
             return None
 
     def log_numeric_cdf_summary(self) -> None:

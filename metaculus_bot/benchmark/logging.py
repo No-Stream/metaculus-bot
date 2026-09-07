@@ -16,7 +16,8 @@ def log_bot_lineup(bots: Sequence[ForecastBot]) -> None:
             r = b.research_reports_per_question
             p = b.predictions_per_research_report
             if strat_val == "stacking":
-                stacker_llm = getattr(b, "_stacker_llm", None)
+                pipeline = getattr(b, "_pipeline", None)
+                stacker_llm = pipeline.stacker_llm if pipeline is not None else None
                 stacker = stacker_llm.model if stacker_llm else "<missing>"
                 base_f = getattr(b, "_forecaster_llms", [])
                 base_names = [m.model for m in base_f]
@@ -56,9 +57,11 @@ def log_benchmarker_headline_note() -> None:
 
 def log_stacking_summaries(stacking_bots: Sequence[object]) -> None:
     for sb in stacking_bots:
-        count = getattr(sb, "_stacking_fallback_count", 0)
-        expected_combines = getattr(sb, "_stacking_expected_combine_count", 0)
-        unexpected_combines = getattr(sb, "_stacking_unexpected_combine_count", 0)
+        pipeline = getattr(sb, "_pipeline", None)
+        counters = pipeline.counters if pipeline is not None else None
+        count = counters.stacking_fallback_count if counters is not None else 0
+        expected_combines = counters.stacking_expected_combine_count if counters is not None else 0
+        unexpected_combines = counters.stacking_unexpected_combine_count if counters is not None else 0
         if count:
             logger.warning(
                 "STACKING fallback summary | bot=%s | fallbacks=%d (fell back to MEAN due to errors)",

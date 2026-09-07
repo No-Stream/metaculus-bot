@@ -38,13 +38,13 @@ from metaculus_bot.research.impersonated_fetch import (
     impersonation_refused,
 )
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS, FetchResult, FetchStatus
+from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from metaculus_bot.research.resolution_source import (
     _WAYBACK_TRIGGER_STATUSES,
     FetchContext,
     _fetch_one,
     _impersonate_rung_applies,
     _rung_counts,
-    format_resolution_sections,
 )
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from scripts.telemetry.markers import parse_log_text

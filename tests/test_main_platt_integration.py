@@ -414,11 +414,11 @@ async def test_stacker_median_fallback_applies_calibration_binary(
     raw_median = combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
     expected = apply_binary_platt(raw_median, params, max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION)
 
-    # Force both the primary and the fallback _run_stacking calls to fail so
+    # Force both the primary and the fallback pipeline.run_stacking calls to fail so
     # the MEDIAN-fallback branch is taken. RuntimeError is below
     # asyncio.CancelledError (BaseException in 3.11+) and matches what
     # test_stacking.py uses in the equivalent failure-path test.
-    with patch.object(bot, "_run_stacking", side_effect=RuntimeError("stacking failed")):
+    with patch.object(bot._pipeline, "run_stacking", side_effect=RuntimeError("stacking failed")):
         result = await bot._aggregate_predictions(
             predictions=cast("list[PredictionTypes]", preds),
             question=question,
@@ -438,7 +438,7 @@ async def test_stacker_median_fallback_applies_calibration_binary(
         "MEDIAN-fallback path."
     )
     # And the fallback path was actually exercised (sanity).
-    assert bot._stacker_fallback_failed_count == 1
+    assert bot._pipeline.counters.stacker_fallback_failed_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +488,7 @@ async def test_calibration_on_primary_stacker_success_applies_binary(
     """Primary stacker succeeds → calibration applies to its output (line 1262).
 
     This is the most common production path under STACKING /
-    CONDITIONAL_STACKING-with-disagreement. We mock ``_run_stacking`` to
+    CONDITIONAL_STACKING-with-disagreement. We mock ``pipeline.run_stacking`` to
     return a raw stacker float and assert the bot returns the calibrated
     value. ``side_effect=[value]`` works on async methods (same pattern as
     ``test_stacking.py:481``).
@@ -503,7 +503,7 @@ async def test_calibration_on_primary_stacker_success_applies_binary(
     stacker_raw = 0.42
     expected = apply_binary_platt(stacker_raw, params, max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION)
 
-    with patch.object(bot, "_run_stacking", side_effect=[stacker_raw]):
+    with patch.object(bot._pipeline, "run_stacking", side_effect=[stacker_raw]):
         result = await bot._aggregate_predictions(
             predictions=[0.4, 0.6],
             question=question,
@@ -513,9 +513,9 @@ async def test_calibration_on_primary_stacker_success_applies_binary(
 
     assert result == expected, f"primary stacker success should apply Platt; got {result!r}, expected {expected!r}"
     # Sanity: primary path was used (no fallback counters bumped).
-    assert bot._stacker_outcome[question.id_of_question] == "primary"
-    assert bot._stacker_primary_failed_count == 0
-    assert bot._stacker_fallback_used_count == 0
+    assert bot._pipeline.outcomes[question.id_of_question] == "primary"
+    assert bot._pipeline.counters.stacker_primary_failed_count == 0
+    assert bot._pipeline.counters.stacker_fallback_used_count == 0
 
 
 @pytest.mark.asyncio
@@ -536,8 +536,8 @@ async def test_calibration_on_fallback_llm_success_applies_binary(
     # side_effect sequence: primary raises, fallback returns the raw stacker
     # value. Same pattern as test_stacking.py:481.
     with patch.object(
-        bot,
-        "_run_stacking",
+        bot._pipeline,
+        "run_stacking",
         side_effect=[RuntimeError("primary failed"), stacker_raw],
     ):
         result = await bot._aggregate_predictions(
@@ -548,10 +548,10 @@ async def test_calibration_on_fallback_llm_success_applies_binary(
         )
 
     assert result == expected
-    assert bot._stacker_primary_failed_count == 1
-    assert bot._stacker_fallback_used_count == 1
-    assert bot._stacker_fallback_failed_count == 0
-    assert bot._stacker_outcome[question.id_of_question] == "fallback_llm"
+    assert bot._pipeline.counters.stacker_primary_failed_count == 1
+    assert bot._pipeline.counters.stacker_fallback_used_count == 1
+    assert bot._pipeline.counters.stacker_fallback_failed_count == 0
+    assert bot._pipeline.outcomes[question.id_of_question] == "fallback_llm"
 
 
 @pytest.mark.asyncio
@@ -581,7 +581,7 @@ async def test_stacker_median_fallback_applies_calibration_mc(
     expected_pol = apply_mc_platt(combined, params, max_abs_deviation=PLATT_MC_MAX_ABS_DEVIATION)
     expected_probs = {o.option_name: o.probability for o in expected_pol.predicted_options}
 
-    with patch.object(bot, "_run_stacking", side_effect=RuntimeError("stacking failed")):
+    with patch.object(bot._pipeline, "run_stacking", side_effect=RuntimeError("stacking failed")):
         result = await bot._aggregate_predictions(
             predictions=[pred_a, pred_b],
             question=question,
@@ -595,8 +595,8 @@ async def test_stacker_median_fallback_applies_calibration_mc(
         assert result_probs[name] == pytest.approx(exp), (
             f"option {name!r}: got {result_probs[name]!r}, expected {exp!r}"
         )
-    assert bot._stacker_fallback_failed_count == 1
-    assert bot._stacker_outcome[question.id_of_question] == "fallback_median"
+    assert bot._pipeline.counters.stacker_fallback_failed_count == 1
+    assert bot._pipeline.outcomes[question.id_of_question] == "fallback_median"
 
 
 @pytest.mark.asyncio
@@ -649,7 +649,7 @@ async def test_conditional_stacking_skip_path_applies_platt_binary(
 
     bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING)
     question = _make_binary_question()
-    bot._register_expected_base_combine(question)
+    bot._pipeline.register_expected_base_combine(question)
 
     preds = [0.45, 0.50, 0.55]
     raw_median = combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
@@ -687,7 +687,7 @@ async def test_conditional_stacking_skip_path_applies_platt_mc(
 
     bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING)
     question = _make_mc_question()
-    bot._register_expected_base_combine(question)
+    bot._pipeline.register_expected_base_combine(question)
 
     pred_a = _make_mc_pred([0.50, 0.30, 0.15, 0.05])
     pred_b = _make_mc_pred([0.40, 0.35, 0.20, 0.05])
@@ -727,7 +727,7 @@ async def test_stacking_base_combine_reentry_multi_input_does_not_apply(
 
     bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.STACKING)
     question = _make_binary_question()
-    bot._register_expected_base_combine(question)
+    bot._pipeline.register_expected_base_combine(question)
 
     preds = [0.42, 0.48]
     raw_mean = combine_binary_predictions(preds, AggregationStrategy.MEAN)

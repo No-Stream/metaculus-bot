@@ -216,7 +216,7 @@ def _kalshi_universe_channel(queries: Sequence[str], kalshi_events: Sequence[dic
 
 
 def _venue_search_channel(
-    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None | BaseException]],
+    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | BaseException | None]],
 ) -> tuple[list[MarketMatch], dict[str, _FetchTally]]:
     """Every venue's search hits in ``VENUE_ORDER``, plus the per-venue lost-sub-query tally.
 
@@ -335,7 +335,7 @@ def assemble_pool(
     queries: Sequence[str],
     kalshi_events: Sequence[dict[str, Any]],
     predictit_markets: Sequence[dict[str, Any]],
-    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None | BaseException]],
+    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | BaseException | None]],
     as_of: datetime | None = None,
 ) -> PoolResult:
     """The synchronous, I/O-free half of pool assembly. Call it via ``build_pool``.
@@ -402,7 +402,7 @@ async def build_pool(
     queries: Sequence[str],
     kalshi_events: Sequence[dict[str, Any]],
     predictit_markets: Sequence[dict[str, Any]],
-    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None | BaseException]],
+    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | BaseException | None]],
     as_of: datetime | None = None,
 ) -> PoolResult:
     """``assemble_pool`` off the event loop. One hop, so the loop is yielded once, not N times.

@@ -5,19 +5,47 @@ Tests that our CDF override approach works correctly with the framework.
 """
 
 from itertools import pairwise
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
+from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, generate_pchip_cdf, percentiles_to_pchip_format
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
+
+
+def _build_question(
+    *,
+    lower_bound: float = 0.0,
+    upper_bound: float = 100.0,
+    zero_point: float | None = None,
+    cdf_size: int = 201,
+) -> NumericQuestion:
+    return NumericQuestion(
+        id_of_question=1,
+        id_of_post=1,
+        page_url="https://example.com/q/1",
+        question_text="Test numeric question",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        unit_of_measure="units",
+        zero_point=zero_point,
+        cdf_size=cdf_size,
+    )
 
 
 class TestPchipIntegration:
     """Test integration between PCHIP CDF and NumericDistribution."""
 
-    def test_cdf_override_format(self):
+    def test_cdf_override_format(self) -> None:
         """Test that our CDF override produces the expected format."""
         # Create test percentiles (our 8-percentile standard)
         percentiles = [
@@ -31,14 +59,7 @@ class TestPchipIntegration:
             Percentile(percentile=0.95, value=95.0),
         ]
 
-        # Create a mock question
-        question = SimpleNamespace(
-            open_upper_bound=False,
-            open_lower_bound=False,
-            upper_bound=100.0,
-            lower_bound=0.0,
-            zero_point=None,
-        )
+        question = _build_question()
 
         # Generate PCHIP CDF
         pchip_percentiles = percentiles_to_pchip_format(percentiles)
@@ -51,12 +72,8 @@ class TestPchipIntegration:
             zero_point=question.zero_point,
         )
 
-        # Create override exactly as in main.py
-        x_vals = np.linspace(question.lower_bound, question.upper_bound, len(pchip_cdf))
-        pchip_percentile_objects = [
-            Percentile(percentile=prob_val, value=question_val)
-            for question_val, prob_val in zip(x_vals, pchip_cdf, strict=True)
-        ]
+        prediction = create_pchip_numeric_distribution(pchip_cdf, percentiles, question, question.zero_point)
+        pchip_percentile_objects = prediction.get_cdf()
 
         # Validate the format
         assert len(pchip_percentile_objects) == 201
@@ -74,7 +91,34 @@ class TestPchipIntegration:
         assert all(a <= b for a, b in pairwise(prob_values))
         assert all(a <= b for a, b in pairwise(question_values))
 
-    def test_spacing_assertion_compliance(self):
+    def test_cdf_override_uses_geometric_grid_for_zero_point(self) -> None:
+        """The production wrapper must pair PCHIP heights with the canonical value grid."""
+        percentiles = [
+            Percentile(percentile=0.05, value=10.0),
+            Percentile(percentile=0.50, value=100.0),
+            Percentile(percentile=0.95, value=900.0),
+        ]
+        question = _build_question(lower_bound=1.0, upper_bound=1000.0, zero_point=0.0)
+
+        pchip_cdf, _ = generate_pchip_cdf(
+            percentile_values=percentiles_to_pchip_format(percentiles),
+            open_upper_bound=question.open_upper_bound,
+            open_lower_bound=question.open_lower_bound,
+            upper_bound=question.upper_bound,
+            lower_bound=question.lower_bound,
+            zero_point=question.zero_point,
+        )
+        prediction = create_pchip_numeric_distribution(pchip_cdf, percentiles, question, question.zero_point)
+
+        actual_values = [p.value for p in prediction.get_cdf()]
+        expected_values = build_cdf_value_grid(
+            question.lower_bound, question.upper_bound, question.zero_point, len(pchip_cdf)
+        )
+
+        np.testing.assert_allclose(actual_values, expected_values)
+        assert actual_values[1] == pytest.approx(1.035142, abs=1e-6)
+
+    def test_spacing_assertion_compliance(self) -> None:
         """Test that our PCHIP CDF satisfies the 5e-5 spacing requirement."""
         percentiles = [
             Percentile(percentile=0.05, value=10.0),
@@ -82,13 +126,7 @@ class TestPchipIntegration:
             Percentile(percentile=0.95, value=90.0),
         ]
 
-        question = SimpleNamespace(
-            open_upper_bound=False,
-            open_lower_bound=False,
-            upper_bound=100.0,
-            lower_bound=0.0,
-            zero_point=None,
-        )
+        question = _build_question()
 
         # Generate PCHIP CDF
         pchip_percentiles = percentiles_to_pchip_format(percentiles)
@@ -106,7 +144,7 @@ class TestPchipIntegration:
             spacing = abs(pchip_cdf[i + 1] - pchip_cdf[i])
             assert spacing >= 5e-05, f"Spacing violation at index {i}: {spacing}"
 
-    def test_pchip_subclass_approach_works(self):
+    def test_pchip_subclass_approach_works(self) -> None:
         """Test that our PchipNumericDistribution subclass approach works."""
         percentiles = [
             Percentile(percentile=0.05, value=5.0),
@@ -115,13 +153,7 @@ class TestPchipIntegration:
         ]
 
         # Generate PCHIP CDF (simulating our main.py logic)
-        question = SimpleNamespace(
-            open_upper_bound=False,
-            open_lower_bound=False,
-            upper_bound=100.0,
-            lower_bound=0.0,
-            zero_point=None,
-        )
+        question = _build_question()
 
         pchip_percentiles = percentiles_to_pchip_format(percentiles)
         pchip_cdf, _aggressive_enforcement = generate_pchip_cdf(
@@ -133,36 +165,7 @@ class TestPchipIntegration:
             zero_point=question.zero_point,
         )
 
-        # Create the subclass exactly as in main.py
-        class PchipNumericDistribution(NumericDistribution):
-            def __init__(self, pchip_cdf_values, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self._pchip_cdf_values = pchip_cdf_values
-
-            @property
-            def cdf(self) -> list[Percentile]:
-                """Return PCHIP-generated CDF as Percentile objects."""
-                # Create the value axis (201 points from lower to upper bound)
-                x_vals = np.linspace(self.lower_bound, self.upper_bound, len(self._pchip_cdf_values))
-
-                # Create Percentile objects with correct mapping:
-                # _pchip_cdf_values contains the probability values (0-1)
-                # x_vals contains the corresponding question values
-                return [
-                    Percentile(percentile=prob_val, value=question_val)
-                    for question_val, prob_val in zip(x_vals, self._pchip_cdf_values, strict=True)
-                ]
-
-        prediction = PchipNumericDistribution(
-            pchip_cdf_values=pchip_cdf,
-            declared_percentiles=percentiles,
-            open_upper_bound=False,
-            open_lower_bound=False,
-            upper_bound=100.0,
-            lower_bound=0.0,
-            zero_point=None,
-            cdf_size=201,
-        )
+        prediction = create_pchip_numeric_distribution(pchip_cdf, percentiles, question, question.zero_point)
 
         # Test that the subclass works
         result_cdf = prediction.cdf
@@ -174,7 +177,7 @@ class TestPchipIntegration:
             spacing = abs(result_cdf[i + 1].percentile - result_cdf[i].percentile)
             assert spacing >= 5e-05, f"Spacing violation at index {i}: {spacing}"
 
-    def test_problematic_distribution_case(self):
+    def test_problematic_distribution_case(self) -> None:
         """Test with a distribution similar to the one that was failing."""
         # Create a distribution that would likely fail the original spacing check
         percentiles = [
@@ -188,13 +191,7 @@ class TestPchipIntegration:
             Percentile(percentile=0.95, value=75.0),
         ]
 
-        question = SimpleNamespace(
-            open_upper_bound=False,
-            open_lower_bound=False,
-            upper_bound=100.0,
-            lower_bound=0.0,
-            zero_point=None,
-        )
+        question = _build_question()
 
         # This should work with PCHIP even though values are close
         pchip_percentiles = percentiles_to_pchip_format(percentiles)

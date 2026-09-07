@@ -23,10 +23,7 @@ jobs:
           enable-cache: true
           python-version: "3.12"
       - run: uv sync --dev --frozen
-      # --frozen on every `uv run`: without it, uv re-resolves because the
-      # lockfile's exclude-newer stamp (from the operator's global uv config)
-      # is absent on CI runners, silently pulling newer-than-locked packages.
-      # (--locked would hard-fail on the same mismatch; --frozen is correct.)
+      # Keep CI on the reviewed lockfile, without resolving dependencies.
       - run: uv run --frozen ruff check .
       - run: uv run --frozen ruff format --check .
       - run: uv run --frozen basedpyright

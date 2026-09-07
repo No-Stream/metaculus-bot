@@ -554,7 +554,7 @@ class TestMaybeSnapIntegration:
 
         qid = question.id_of_question
         assert qid is not None
-        bot._discrete_integer_votes[qid] = [True, True, False]
+        bot._pipeline.discrete_integer_votes[qid] = [True, True, False]
 
         result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 
@@ -571,7 +571,7 @@ class TestMaybeSnapIntegration:
 
         qid = question.id_of_question
         assert qid is not None
-        bot._discrete_integer_votes[qid] = [False, False, True]
+        bot._pipeline.discrete_integer_votes[qid] = [False, False, True]
 
         result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 

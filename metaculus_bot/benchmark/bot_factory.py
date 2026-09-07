@@ -21,8 +21,7 @@ from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 # temperature=None defers reasoning models to provider defaults; redundant on
 # ft 0.2.92 (GeneralLlm ctor default is already None). top_p left unset.
 MODEL_CONFIG: dict[str, Any] = {
-    "temperature": None,
-    "max_tokens": 32_000,
+    "max_tokens": 64_000,
     "stream": False,
     "timeout": 480,  # 8 minutes - reasoning models (o3, gpt-5.1) need extra time
     "allowed_tries": 3,
@@ -47,7 +46,6 @@ DEFAULT_HELPER_LLMS: dict[str, GeneralLlm] = {
 }
 
 
-# TODO: add various models from note e.g. gpt 5.2, g3 pro/flash, etc.
 MODEL_CATALOG: dict[str, GeneralLlm] = {
     "qwen3-235b": GeneralLlm(
         model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",

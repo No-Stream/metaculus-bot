@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 import pytest
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import resolution_presentation, resolution_source
 from metaculus_bot.research.http_fetch import (
     MAX_UNDECODABLE_CHAR_RATIO,
     decode_text_body,
@@ -32,10 +32,10 @@ from metaculus_bot.research.resolution_fetch_result import (
     http_failure_class,
     server_header_token,
 )
+from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from metaculus_bot.research.resolution_source import (
     FetchResult,
     extract_source_urls,
-    format_resolution_sections,
     is_fred_url,
     is_metaculus_self_ref,
     is_yahoo_ticker_url,
@@ -635,8 +635,28 @@ class TestFormatResolutionSections:
         assert "fetched 2026-07-09" in out
         assert "CPI rose 3.2% over the past 12 months." in out
 
+    def test_success_rendering_matches_the_exact_direct_golden(self) -> None:
+        results = [
+            FetchResult(
+                url="https://www.bls.gov/cpi/",
+                status="success",
+                text="CPI rose 3.2% over the past 12 months.",
+                http_status=200,
+                content_type="text/html",
+            ),
+        ]
+
+        assert format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC)) == (
+            "Snapshot of the cited resolution source(s) as of 2026-07-09 — primary grading evidence.\n\n"
+            "### https://www.bls.gov/cpi/\n(fetched 2026-07-09)\n\n"
+            "CPI rose 3.2% over the past 12 months."
+        )
+
+    def test_resolution_source_keeps_a_direct_formatter_reexport(self) -> None:
+        assert resolution_source.format_resolution_sections is format_resolution_sections
+
     def test_total_budget_trims_later_sections(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
         results = [
             FetchResult(
                 url=f"https://example.com/{i}",
@@ -647,7 +667,7 @@ class TestFormatResolutionSections:
             )
             for i in range(4)
         ]
-        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        out = resolution_presentation.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         # First section fits; later ones must be trimmed or dropped.
         assert "https://example.com/0" in out
         # We should NOT see all four full 300-char blocks packed together.
@@ -660,7 +680,7 @@ class TestFormatResolutionSections:
         marker the fetch already appended at the end — so an already-truncated page rendered
         as complete. Reachable on prod constants (5 x 6000 per-URL against an 18000 total).
         """
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
         results = [
             FetchResult(
                 url="https://example.com/long",
@@ -671,7 +691,7 @@ class TestFormatResolutionSections:
             )
         ]
 
-        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        out = resolution_presentation.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
 
         # The section is cut, and the cut says so rather than ending mid-body.
         assert "[truncated at 400 chars — full source at https://example.com/long]" in out
@@ -680,7 +700,7 @@ class TestFormatResolutionSections:
     def test_dropped_sections_note_appended(self, monkeypatch):
         # Tighten TOTAL cap so at least one section is dropped entirely: cap=300,
         # 4 sources of 300 chars each — first section fills the budget, 3 dropped.
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 300)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 300)
         results = [
             FetchResult(
                 url=f"https://example.com/{i}",
@@ -691,7 +711,7 @@ class TestFormatResolutionSections:
             )
             for i in range(4)
         ]
-        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
+        out = resolution_presentation.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=UTC))
         # The dropped-section note must appear, naming the dropped count.
         assert "additional source(s) omitted — section budget" in out
         assert "3 additional" in out
@@ -725,9 +745,9 @@ class TestFormatResolutionSections:
         capture date and age. Reachable on prod constants: three full direct pages ahead of a
         rescued fourth leave a remainder under the floor. Sizes derive from the constants so the
         scenario stays the reachable one."""
-        total = resolution_source.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
-        per_url = resolution_source.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
-        leftover = resolution_source.RESOLUTION_SOURCE_MIN_SECTION_CHARS // 3
+        total = resolution_presentation.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+        per_url = resolution_presentation.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        leftover = resolution_presentation.RESOLUTION_SOURCE_MIN_SECTION_CHARS // 3
         fillers = [
             FetchResult(
                 url=f"https://p{i}.example.com/x", status="success", text="F" * size, http_status=200, content_type=None
@@ -739,7 +759,9 @@ class TestFormatResolutionSections:
         archived = FetchResult(
             url=url,
             status="success",
-            text=resolution_source._lead_then_capped_body(wayback_lead(snapshot, 6.0, "blocked"), "x" * 8000, url),
+            text=resolution_presentation._lead_then_capped_body(
+                wayback_lead(snapshot, 6.0, "blocked"), "x" * 8000, url
+            ),
             http_status=200,
             content_type="text/html",
             route="wayback",

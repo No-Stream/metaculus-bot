@@ -84,6 +84,7 @@ What's inside:
   - `financial_data.py` — yfinance + FRED for financial and economic questions
   - `prediction_market.py` — Polymarket / Kalshi / Manifold / PredictIt snapshot
   - `resolution_source.py` — fetches and extracts the URLs cited in the question
+  - `resolution_presentation.py` — renders fetched evidence with provenance and text budgets
   - `timeseries_anchor.py` — historical base-rate / time-series anchor data
   - `targeted.py` — disagreement-crux search and the v1 gap-fill pass
   - `agentic/` (+ `agentic_gap_fill.py`) — the v2 agentic gap-fill tool loop
@@ -122,6 +123,11 @@ make backtest_large        # 100 questions
 ### Correlation analysis (free, no API calls)
 
 Analyze correlations and recompute ensembles from prior benchmark runs without re-forecasting. Model filters are case-insensitive substring matches.
+
+Unsupported prediction types and non-finite values are excluded from correlation inputs. Numeric
+ensemble scoring requires a usable CDF from every member; it can rebuild a CDF from declared
+percentiles but does not substitute a uniform forecast when reconstruction fails. Fallback
+model identifiers use a deterministic digest so repeated analyses keep the same labels.
 
 ```bash
 # Analyze the most recent benchmark file
@@ -201,6 +207,11 @@ make audit        # osv-scanner over uv.lock
 ```
 
 Dependencies are managed with uv: `uv add <pkg>` for runtime, `uv add --dev <pkg>` for dev tools, then commit the updated `pyproject.toml` and `uv.lock`. Do not use `pip` or `poetry`; both are blocked here.
+
+Use uv 0.12.10 or newer (`uv self update` for a standalone installation). To refresh
+dependencies, run `uv lock --upgrade` followed by `uv sync --dev --frozen`. The project
+excludes packages uploaded within the last week. Validate updates with the build,
+offline test suite, lint, and type checks before committing.
 
 ### Testing philosophy
 

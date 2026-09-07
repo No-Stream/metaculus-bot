@@ -34,9 +34,7 @@ dependencies = [
     "backports-zstd>=1.7.0 ; python_full_version < '3.14'", # aiohttp's optional `zstd` decoder; stdlib from 3.14 on
     "curl-cffi>=0.15.0",
 ]
-# supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
-# The freshness window is enforced at lock time via `uv lock --exclude-newer <ts>`
-# (uv 0.9.x has no exclude-newer-span pyproject setting).
+# Package freshness is enforced by tool.uv.exclude-newer below.
 
 [dependency-groups]
 dev = [
@@ -66,6 +64,8 @@ dev = [
 ]
 
 [tool.uv]
+required-version = ">=0.12.10"
+exclude-newer = "1 week"
 exclude-dependencies = [
     # gitpython arrives only as streamlit <- forecasting-tools, and nothing we run
     # imports it: streamlit's sole use is a lazy `import git` inside
@@ -84,7 +84,7 @@ exclude-dependencies = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.9,<0.12"]
+requires = ["uv_build>=0.12,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]

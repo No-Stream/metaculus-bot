@@ -19,20 +19,22 @@ from typing import ClassVar
 import aiohttp
 import pytest
 
-from metaculus_bot.research import impersonated_fetch, resolution_chart_data, resolution_source
+from metaculus_bot.research import impersonated_fetch, resolution_chart_data, resolution_presentation, resolution_source
 from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore, semaphore_for_host
 from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_chart_data import CHART_DATA_LEAD, render_inline_chart_data
+from metaculus_bot.research.resolution_presentation import (
+    _unreadable_embed_disclosure,
+    format_resolution_sections,
+)
 from metaculus_bot.research.resolution_source import (
     FetchContext,
     FetchResult,
     _fetch_one,
     _fetch_result_sources,
     _rung_counts,
-    _unreadable_embed_disclosure,
     fetch_resolution_sources,
-    format_resolution_sections,
     looks_like_js_wall,
     looks_like_page_chrome,
     resolution_source_provider,
@@ -60,7 +62,7 @@ from tests.test_document_text import build_text_pdf
 class TestFetchOne:
     async def test_success_html_extracts_and_truncates(self, article_html, monkeypatch):
         # Tighten the per-URL cap so we can also verify truncation lands.
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 200)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 200)
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
@@ -78,7 +80,7 @@ class TestFetchOne:
         # When truncation fires, a marker line naming the cap and URL must
         # appear, and total text length must remain bounded by the cap.
         cap = 200
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
@@ -89,7 +91,7 @@ class TestFetchOne:
 
     async def test_no_truncation_marker_when_fits_under_cap(self, article_html, monkeypatch):
         # Extraction fits entirely under the cap -> NO marker appended.
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 100_000)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 100_000)
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
@@ -335,7 +337,7 @@ class TestEmbedShapedPages:
         # The note is budgeted out of the cap (like the Tier-2 dataset lead), never added
         # on top of it, so the per-URL bound the section budget relies on still holds.
         cap = 500
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession({"https://t.example.com/p": FakeResponse(200, body=tracker_with_infogram_html)})
 
         result = await _fetch_one(session, "https://t.example.com/p", {})
@@ -355,8 +357,8 @@ class TestEmbedShapedPages:
         prevent. Sizes are derived from the prod constants so the scenario stays a REACHABLE
         one: earlier full-size pages spend most of the total, and the embed page lands last.
         """
-        per_url = resolution_source.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
-        total = resolution_source.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+        per_url = resolution_presentation.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        total = resolution_presentation.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
         leftover = per_url // 2  # what the embed page is left to render in
         spend = total - leftover
         filler_sizes = [per_url] * (spend // per_url)
@@ -376,7 +378,7 @@ class TestEmbedShapedPages:
             )
             for i, size in enumerate(filler_sizes)
         ]
-        embed_text = resolution_source._page_text_with_leads(
+        embed_text = resolution_presentation._page_text_with_leads(
             "lorem ipsum " * (per_url // 2), "https://tracker.example.com/senate", ["infogram"]
         )
         embed = FetchResult(
@@ -808,7 +810,7 @@ class TestInlineChartData:
         # Same rule as the embed disclosure: leads come OUT of the per-URL cap, never on
         # top of it, so the aggregate section budget's arithmetic still holds.
         cap = 400
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession({"https://iom.example.com/med": FakeResponse(200, body=_iom_shaped_page())})
 
         result = await _fetch_one(session, "https://iom.example.com/med", {})

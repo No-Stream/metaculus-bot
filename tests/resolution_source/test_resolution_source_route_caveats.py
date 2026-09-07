@@ -7,11 +7,9 @@ from typing import get_args
 
 import pytest
 
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import resolution_presentation
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS, FetchResult, FetchRoute
-from metaculus_bot.research.resolution_source import (
-    format_resolution_sections,
-)
+from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from tests.resolution_source_fakes import (
     _URL,
 )
@@ -73,7 +71,7 @@ class TestRouteCaveats:
         already dropped that section (reproduced on prod constants: 5 x 6000 per-URL pages
         against an 18000 total, with the rendered page cited last). The first page fills the
         whole total, so the second lands on a zero remainder, under the section floor."""
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
         first = FetchResult(
             url="https://a.example.com/p", status="success", text="x" * 600, http_status=200, content_type="text/html"
         )
@@ -86,7 +84,7 @@ class TestRouteCaveats:
         assert ROUTE_CAVEATS["rendered"] not in rendered
 
     def test_a_kept_section_keeps_its_caveat_when_a_sibling_is_dropped(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 400)
         rendered_first = _success("rendered", "https://b.example.com/p", text="y" * 400)
         dropped = FetchResult(
             url="https://a.example.com/p", status="success", text="x" * 600, http_status=200, content_type="text/html"

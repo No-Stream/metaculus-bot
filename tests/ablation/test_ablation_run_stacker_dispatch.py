@@ -320,7 +320,7 @@ class TestQuestionTypeDispatch:
         # All 13 standard percentiles survive (filter_to_standard_percentiles
         # keeps the canonical set; sanitize_percentiles validates count).
         assert len(sp["declared_percentiles"]) == 13
-        # sort_percentiles_by_value reorders by ``percentile`` ascending.
+        # sort_by_percentile_level reorders by ``percentile`` ascending.
         percentile_keys = [
             round(float(p["percentile"]), 6) for p in sp["declared_percentiles"]
         ]  # HARNESS-SCAN-EXEMPT-object-explosion  # tiny test frame (13 percentiles)

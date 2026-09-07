@@ -7,8 +7,8 @@ why it is all plain module functions and directly unit-testable.
 
 ``PROVIDER_SECTION_HEADERS`` is the one provider-to-header map in the repo, and it is
 read in BOTH directions: ``provider_header`` reads it forwards to label a section, and
-``scripts/backfill_research_from_logs.detect_providers`` walks it backwards to decode
-which providers a historical bundle carried.
+``detect_providers`` walks it backwards to decode which providers a historical bundle
+carried.
 """
 
 import re
@@ -35,6 +35,25 @@ PROVIDER_SECTION_HEADERS: dict[str, str] = {
     "openrouter": "## Web Research (OpenRouter)",
     "custom": "## Research (Custom)",
 }
+
+
+def detect_providers(research_text: str) -> list[str]:
+    """Detect which research providers contributed based on their rendered headers.
+
+    Walking the live pipeline's provider-to-header map backwards keeps historical
+    backfills aligned with every provider the pipeline can render, including retired
+    providers whose headers remain in the map for archive decoding.
+    """
+    providers = []
+    for provider_name, header in PROVIDER_SECTION_HEADERS.items():
+        if header in research_text:
+            providers.append(provider_name)
+    return providers
+
+
+def detect_gap_fill(research_text: str) -> bool:
+    """Detect if gap-fill was used based on presence of the gap-fill header."""
+    return "## Targeted Gap-Fill" in research_text
 
 
 def _demote_inner_headings(text: str) -> str:

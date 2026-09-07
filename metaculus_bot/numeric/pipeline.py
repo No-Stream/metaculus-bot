@@ -42,7 +42,7 @@ from metaculus_bot.numeric.tail_widening import widen_declared_percentiles
 from metaculus_bot.numeric.validation import (
     check_discrete_question_properties,
     filter_to_standard_percentiles,
-    sort_percentiles_by_value,
+    sort_by_percentile_level,
     validate_percentile_count_and_values,
 )
 
@@ -66,7 +66,7 @@ def sanitize_percentiles(
 
     filtered = filter_to_standard_percentiles(percentile_list)
     validate_percentile_count_and_values(filtered)
-    ordered = sort_percentiles_by_value(filtered)
+    ordered = sort_by_percentile_level(filtered)
     adjusted = _apply_jitter_and_clamp(ordered, question, model_name=model_name)
     widened = _maybe_widen_tails(adjusted, question)
 

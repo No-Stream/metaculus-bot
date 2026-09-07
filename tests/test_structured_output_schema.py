@@ -809,7 +809,7 @@ class TestNumericDeclaredPercentiles:
             )
 
     def test_a_decrease_with_rising_percentile_still_raises(self) -> None:
-        # Incoherent by construction, and unsalvageable: sort_percentiles_by_value sorts by
+        # Incoherent by construction, and unsalvageable: sort_by_percentile_level orders by
         # LABEL, so a value-disordered set is force-monotonized rather than reordered, which
         # on one stray value pins most of the curve at a bound.
         with pytest.raises(ValidationError, match="non-decreasing"):

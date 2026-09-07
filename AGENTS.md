@@ -111,8 +111,8 @@ Free and safe — run freely:
 - **Package manager: uv.** `uv.lock` is the lockfile; there is no `poetry.lock`. `uv sync --dev`
   installs the package editable, so no `PYTHONPATH=.`. Add deps with `uv add <pkg>` /
   `uv add --dev <pkg>`, then commit `pyproject.toml` + `uv.lock`. **NEVER use `pip` or
-  `poetry`** — both are blocked here. Lock-time `exclude-newer` (about a week) comes from the
-  operator's global uv config, so `uv lock` avoids just-published packages.
+  `poetry`** — both are blocked here. The project requires uv 0.12.10+ and sets
+  `exclude-newer = "1 week"`, so `uv lock` avoids just-published packages.
 - **Build backend `uv_build`**, flat layout (`metaculus_bot/` at repo root, `module-root = ""`).
 - **Formatter: Ruff**, 120-char lines (not Black).
 - **Type checker: basedpyright** in standard mode, must stay at 0 errors. `ty` is secondary and
@@ -344,6 +344,16 @@ Each of these has cost real work at least once. The pointer is where the reasoni
 - **Fix all occurrences.** If you found a bug pattern, grep for its siblings.
 
 ## Development
+
+### Autonomous work and waiting
+
+`/loop` and `set_goal` serve closely related purposes: keeping multi-phase work moving until
+the objective is complete. Use `set_goal` (or the environment's equivalent goal tool) in place
+of `/loop` when available. When subagents are running and there is no independent work left,
+wait for their results; waits of 5–60 minutes can support the same supervision pattern, subject
+to the environment's wait limits. Keep cache TTL in mind when choosing the interval: shorter
+waits may preserve the prompt cache and cost less. Resume supervision when results arrive and
+mark the goal complete only when the whole task is finished.
 
 - **Install**: `uv sync --dev` (or `make install`). Run anything with `uv run <cmd>`; no manual
   activation.

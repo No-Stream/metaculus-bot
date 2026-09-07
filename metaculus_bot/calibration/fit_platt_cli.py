@@ -116,46 +116,45 @@ def _extract_mc_pairs(records: list[dict[str, Any]]) -> tuple[list[float], list[
     """
     raw_probs: list[float] = []
     outcomes: list[bool] = []
-    for r in records:
-        if r.get("type") != "multiple_choice":
+    for record in records:
+        if record.get("type") != "multiple_choice":
             continue
-        resolution = r.get("resolution_parsed")
+        resolution = record.get("resolution_parsed")
         if not isinstance(resolution, str) or not resolution:
             logger.warning(
                 "Skipping MC record qid=%s: resolution_parsed=%r is not a non-empty string",
-                r.get("question_id"),
+                record.get("question_id"),
                 resolution,
             )
             continue
-        options = r.get("options")
-        forecasts = r.get("our_forecast_values")
+        options = record.get("options")
+        forecasts = record.get("our_forecast_values")
         if not isinstance(options, list) or not isinstance(forecasts, list):
-            logger.warning("Skipping MC record qid=%s: options/forecasts not lists", r.get("question_id"))
+            logger.warning("Skipping MC record qid=%s: options/forecasts not lists", record.get("question_id"))
             continue
         if len(options) != len(forecasts) or len(options) == 0:
             logger.warning(
                 "Skipping MC record qid=%s: options len=%d != forecasts len=%d (or empty)",
-                r.get("question_id"),
+                record.get("question_id"),
                 len(options),
                 len(forecasts),
             )
             continue
         if resolution not in options:
             logger.warning(
-                "Skipping MC record qid=%s: resolved option %r not in options list", r.get("question_id"), resolution
+                "Skipping MC record qid=%s: resolved option %r not in options list",
+                record.get("question_id"),
+                resolution,
             )
             continue
-        for option_name, prob in zip(options, forecasts, strict=True):
-            if not isinstance(prob, (int, float)):
-                logger.warning(
-                    "Skipping MC option qid=%s option=%r: prob=%r is not a number",
-                    r.get("question_id"),
-                    option_name,
-                    prob,
-                )
-                continue
-            raw_probs.append(float(prob))
-            outcomes.append(option_name == resolution)
+        if not all(isinstance(probability, (int, float)) for probability in forecasts):
+            logger.warning(
+                "Skipping MC record qid=%s: every option must have a numeric probability",
+                record.get("question_id"),
+            )
+            continue
+        raw_probs.extend(float(probability) for probability in forecasts)
+        outcomes.extend(option_name == resolution for option_name in options)
     return raw_probs, outcomes
 
 

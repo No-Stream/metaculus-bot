@@ -10,13 +10,13 @@ from datetime import UTC, datetime
 import pytest
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research import resolution_presentation, resolution_source
+from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from metaculus_bot.research.resolution_source import (
     FetchContext,
     QuestionRungBudget,
     _fetch_one,
     _rung_counts,
-    format_resolution_sections,
 )
 from tests.resolution_source_fakes import (
     _ROBOTS_URL,
@@ -439,7 +439,7 @@ class TestUrlContextRung:
         model-mediated disclosure's length, the earlier bare-lead return exceeded the per-URL
         bound. The shared cap helper truncates the lead instead."""
         cap = 60
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         reader, _calls = paid_reader(text="The page reports 12 major work stoppages. " * 5)
         arm_paid_rung(monkeypatch, reader)
 

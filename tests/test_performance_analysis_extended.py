@@ -667,7 +667,7 @@ class TestInterpolatePit:
         # Linear grid: new value-grid interpolation must equal the old linear-index
         # interpolation within float tolerance (mathematically equivalent).
         lower, upper = 0.0, 100.0
-        cdf = list(np.linspace(0.0, 1.0, 201))  # straight-line CDF
+        cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]  # straight-line CDF
         grid = list(build_cdf_value_grid(lower, upper, None, num_points=201))
         for resolution in (0.0, 12.3, 25.0, 50.0, 73.7, 100.0):
             new = _interpolate_pit(resolution, lower, upper, cdf, value_grid=grid, zero_point=None)
@@ -676,7 +676,7 @@ class TestInterpolatePit:
 
     def test_linear_endpoints_and_midpoint(self):
         lower, upper = 0.0, 100.0
-        cdf = list(np.linspace(0.0, 1.0, 201))
+        cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]
         grid = list(build_cdf_value_grid(lower, upper, None, num_points=201))
         assert _interpolate_pit(lower, lower, upper, cdf, value_grid=grid) == pytest.approx(cdf[0])
         assert _interpolate_pit(upper, lower, upper, cdf, value_grid=grid) == pytest.approx(cdf[-1])
@@ -686,7 +686,7 @@ class TestInterpolatePit:
         # Log-scaled (zero_point) question: the value grid is geometric, so the
         # resolution lands on a different CDF index than the linear-index map.
         lower, upper, zero_point = 1.0, 1000.0, 0.0
-        cdf = list(np.linspace(0.0, 1.0, 201))  # uniform-in-index CDF
+        cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]  # uniform-in-index CDF
         geo_grid = build_cdf_value_grid(lower, upper, zero_point, num_points=201)
 
         # Resolution near the low end of a log scale: linearly it's ~0.1% of the
@@ -710,7 +710,7 @@ class TestInterpolatePit:
         # No continuous_range supplied -> reconstruct the geometric grid from
         # zero_point. Result must match interpolation against the rebuilt grid.
         lower, upper, zero_point = 1.0, 1000.0, 0.0
-        cdf = list(np.linspace(0.0, 1.0, 201))
+        cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]
         resolution = 31.6
 
         no_grid = _interpolate_pit(resolution, lower, upper, cdf, value_grid=None, zero_point=zero_point)
@@ -721,7 +721,7 @@ class TestInterpolatePit:
     def test_mismatched_value_grid_length_falls_back(self):
         # A value_grid whose length != cdf is ignored; we rebuild from bounds/zero_point.
         lower, upper = 0.0, 100.0
-        cdf = list(np.linspace(0.0, 1.0, 201))
+        cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]
         bad_grid = [0.0, 50.0, 100.0]  # wrong length
         result = _interpolate_pit(50.0, lower, upper, cdf, value_grid=bad_grid, zero_point=None)
         assert result == pytest.approx(0.5)
@@ -731,7 +731,7 @@ class TestInterpolatePit:
         favorable value available — inside BOTH coverage bands — so a degenerate record
         silently improved every calibration statistic it entered. The caller screens the
         range now (see ``TestDeclaredPercentilePitDropsDegenerateRanges``)."""
-        cdf = list(np.linspace(0.0, 1.0, 201))
+        cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]
 
         with pytest.raises(ValueError, match="degenerate question range"):
             _interpolate_pit(5.0, 10.0, 10.0, cdf)

@@ -1,16 +1,11 @@
-"""Standalone helpers for formatting Metaculus bot comment text.
-
-These are the logic-bearing implementations called by TemplateForecaster's thin
-override methods. Extracted from main.py to keep that file focused on pipeline
-orchestration.
-"""
+"""Comment formatting shared by TemplateForecaster's section overrides."""
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
 
-from forecasting_tools import MetaculusQuestion
+from forecasting_tools import MetaculusQuestion, ReasonedPrediction
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.comment.markers import (
@@ -40,15 +35,15 @@ logger = logging.getLogger(__name__)
 
 def format_research_summary_with_models(
     base_text: str,
-    predictions: Sequence,
+    predictions: Sequence[ReasonedPrediction],
     report_number: int,
 ) -> str:
     """Inject model display names into summary bullets, then trim to section limit."""
     model_names_by_index: dict[int, str] = {}
-    for j, forecast in enumerate(predictions):
-        name = extract_model_display_name_from_reasoning(forecast.reasoning)
-        if name is not None:
-            model_names_by_index[j + 1] = name
+    for forecaster_number, forecast in enumerate(predictions, start=1):
+        model_name = extract_model_display_name_from_reasoning(forecast.reasoning)
+        if model_name is not None:
+            model_names_by_index[forecaster_number] = model_name
     text = annotate_forecaster_bullets_with_models(base_text, model_names_by_index)
     return trim_section(text, f"report_{report_number}_summary")
 

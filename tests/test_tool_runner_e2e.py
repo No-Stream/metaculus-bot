@@ -260,7 +260,7 @@ def _assert_primary_stacker_fired(bot: TemplateForecaster, question: Any) -> Non
     produced the aggregate.
     """
     qid = question.id_of_question
-    assert bot._stacker_outcome.get(qid) == "primary", bot._stacker_outcome
+    assert bot._pipeline.outcomes.get(qid) == "primary", bot._pipeline.outcomes
 
 
 # ---------------------------------------------------------------------------

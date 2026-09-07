@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from metaculus_bot.research import rendered_fetch, resolution_source
+from metaculus_bot.research import rendered_fetch, resolution_presentation, resolution_source
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
@@ -270,7 +270,7 @@ class TestDerivedApiRung:
         assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is True
 
     async def test_the_per_url_cap_binds_on_a_served_feed(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 400)
+        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 400)
         big = '{"series":[' + ",".join(f'{{"v":{index}}}' for index in range(500)) + "]}"
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(body=big), []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})

@@ -196,7 +196,7 @@ The default strategy is `CONDITIONAL_STACKING` (set in `cli.py`'s `main`). Conce
   uses — then hand the full base-model reasonings plus that research to a stacker LLM that
   rewrites the forecast (`stacking.run_stacking_binary` / `_mc` / `_numeric`). The fallback
   ladder is primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under
-  `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN, driven by `_stacking_aggregate`
+  `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN, driven by `stack_predictions`
   (`aggregation_pipeline.py`).
 
 Spread thresholds live in `constants.py`, one per question type:
@@ -210,17 +210,40 @@ Spread thresholds live in `constants.py`, one per question type:
 `route_after_forecasts` (`stacking_route.py`) bypasses the stacker and forces the
 MEDIAN path. In effect, **prod runs MEDIAN of the raw forecasts.** The stacker chain
 stays fully wired and is exercised in
-backtests and ablation runs. The aggregation dispatch, base-combine, and stacker
-fallback ladder all live in `metaculus_bot/aggregation_pipeline.py`
-(`AggregationPipeline`). The conditional-stacking path runs the combined result
+backtests and ablation runs. `AggregationPipeline` owns the aggregation configuration,
+per-question metadata, and counters. Its explicit operations are `base_combine`,
+`stack_predictions`, and `simple_combine`. The framework-required
+`TemplateForecaster._aggregate_predictions` hook selects the appropriate operation;
+internal callers state that choice directly. Routing and stacked-result finalization
+live in `stacking_route.py`, which receives the pipeline rather than the whole bot.
+The conditional-stacking path runs the combined result
 through a Platt-calibration hook (`_apply_platt_calibration` in
 `aggregation_pipeline.py`), but that hook is gated by `PLATT_CALIBRATION_ENABLED`,
 which is unset in every workflow, so in prod `apply_platt_calibration`
 (`post_processing.py`) is a passthrough.
 
+Multiple research reports for one question share the pipeline's existing
+question-id maps. These remain separate because sibling reports can leave a skip
+reason that must survive a later failed stack attempt. Stacked-result finalization
+consumes meta reasoning; comment construction consumes outcome and skip metadata
+after the parent comment builder returns successfully. The expected-combine set
+is consumed by the framework's final combine. Moving ownership does not change
+those read, write, or consumption points.
+
+`tests/test_aggregation_lifecycle_e2e.py` covers the real framework lifecycle with
+failed sibling reports, raw versus pre-stacked singles, and stacker fallback.
+`tests/test_aggregation_report_e2e.py` drives the public entrypoint through numeric
+and MC report construction with two reports and four model results. These tests
+replace research and model calls while retaining fan-out, routing, aggregation,
+and comment construction. Focused pipeline tests also pin cancellation and
+validation before state consumption. `tests/test_aggregation_failure_lifecycle.py`
+checks real timeout expiry and the state retained when the parent comment builder
+fails after aggregation. Both cases passed unchanged against the implementation
+before the ownership refactor.
+
 #### The thin-publish floor
 
-One survivor-conditional rule sits on top: when exactly ONE forecaster survived a BINARY question, the published probability is clamped into `[THIN_PUBLISH_BINARY_FLOOR, THIN_PUBLISH_BINARY_CEIL]` (`constants.py`, 0.05/0.95 — defined by aliasing `EXTREME_CALL_LOW` / `EXTREME_CALL_HIGH` so the extreme band has one definition, and narrower than the per-model `[BINARY_PROB_MIN, BINARY_PROB_MAX]` = [0.02, 0.98] clamp the member already passed) by `apply_thin_publish_floor` in `AggregationPipeline._base_combine`, triggered by the `single_forecaster` skip reason rather than the prediction count (a fired stacker's lone output shares that branch and is never floored); the per-model summary bullet keeps the raw value, an actual move logs `THIN_PUBLISH_FLOOR: question=... raw=... clamped=... survivors=1` (harvested as `thin_publish_floor`), and a multi-member median is never floored — median-of-1 has no variance reduction, which is the whole justification (q44874, −105.27 spot peer on a lone 0.03; receipt in `scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md` §2).
+One survivor-conditional rule sits on top: when exactly ONE forecaster survived a BINARY question, the published probability is clamped into `[THIN_PUBLISH_BINARY_FLOOR, THIN_PUBLISH_BINARY_CEIL]` (`constants.py`, 0.05/0.95 — defined by aliasing `EXTREME_CALL_LOW` / `EXTREME_CALL_HIGH` so the extreme band has one definition, and narrower than the per-model `[BINARY_PROB_MIN, BINARY_PROB_MAX]` = [0.02, 0.98] clamp the member already passed) by `apply_thin_publish_floor` in `AggregationPipeline.base_combine`, triggered by the `single_forecaster` skip reason rather than the prediction count (a fired stacker's lone output shares that branch and is never floored); the per-model summary bullet keeps the raw value, an actual move logs `THIN_PUBLISH_FLOOR: question=... raw=... clamped=... survivors=1` (harvested as `thin_publish_floor`), and a multi-member median is never floored — median-of-1 has no variance reduction, which is the whole justification (q44874, −105.27 spot peer on a lone 0.03; receipt in `scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md` §2).
 
 #### An unmeasurable spread is its own case
 
@@ -304,10 +327,12 @@ Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and neve
 | Startup / CLI | `main.py`, `metaculus_bot/cli.py` |
 | Per-question orchestration | `metaculus_bot/forecaster.py` |
 | Post-fan-out aggregation routing | `metaculus_bot/stacking_route.py` |
-| Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`, `degradation_counters.py` |
+| Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`; `degradation_counters.py` formats immutable snapshots built by `forecaster.py` |
 | Research fan-out | `metaculus_bot/research/orchestrator.py`, `research/providers.py` |
 | Outbound fetch transports | `research/http_fetch.py` (plain HTTP, SSRF guards, redirects, per-host gates), `research/impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry of a 403, with its own DNS pin and per-hop re-guard), `research/rendered_fetch.py` (headless Chromium), `research/url_context_reader.py` (one paid Gemini `url_context` read), `research/robots_policy.py` (the `Google-Extended` pre-check in front of that read) |
 | Resolution-source fetcher and its escalation rungs | `research/resolution_source.py`, `research/resolution_fetch_result.py` (the status, reason and route vocabularies), `research/derived_api.py`, `research/wayback.py` |
+| Resolution-source text and section budgets | `research/resolution_presentation.py` |
+| Datawrapper response classification, freshness and dataset ordering | `research/resolution_datawrapper.py`; requests and question budgets remain in `research/resolution_source.py` |
 | Gap-fill v1 / v2 | `research/targeted.py`, `research/agentic/` |
 | Forecaster runners | `metaculus_bot/forecaster_runners.py` |
 | Value extraction | `metaculus_bot/value_extraction.py` |

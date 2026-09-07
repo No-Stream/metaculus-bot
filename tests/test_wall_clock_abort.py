@@ -179,14 +179,14 @@ async def test_tight_budget_skips_stacking_forces_fallback_median(monkeypatch, m
     bot._forecaster_with_soft_deadline = fast
 
     # _aggregate_predictions invocation in non-stacking path should set
-    # _stacker_outcome to "fallback_median" via our gate. Our skip path sets
+    # pipeline outcomes to "fallback_median" via our gate. Our skip path sets
     # outcome=fallback_median *before* _aggregate_predictions runs.
     await bot._research_and_make_predictions(mock_binary_question)
-    assert bot._stacker_outcome.get(mock_binary_question.id_of_question) == "fallback_median"
+    assert bot._pipeline.outcomes.get(mock_binary_question.id_of_question) == "fallback_median"
     # The budget skip records the same skip-reason + counter treatment as its
     # sibling skip paths, so a STACKER_SKIP_REASON cut cannot miss this bucket.
-    assert bot._stacker_skip_reason.get(mock_binary_question.id_of_question) == "wall_clock_budget"
-    assert bot._conditional_stacking_skipped_count == 1
+    assert bot._pipeline.skip_reasons.get(mock_binary_question.id_of_question) == "wall_clock_budget"
+    assert bot._pipeline.counters.conditional_stacking_skipped_count == 1
 
 
 @pytest.mark.asyncio
@@ -225,7 +225,7 @@ async def test_tight_budget_under_stacking_forces_fallback_mean(monkeypatch, moc
     bot._forecaster_with_soft_deadline = fast
 
     await bot._research_and_make_predictions(mock_binary_question)
-    assert bot._stacker_outcome.get(mock_binary_question.id_of_question) == "fallback_mean"
+    assert bot._pipeline.outcomes.get(mock_binary_question.id_of_question) == "fallback_mean"
 
 
 # ---------------------------------------------------------------------------
