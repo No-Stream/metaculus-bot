@@ -45,8 +45,9 @@ MIN_PERCENTILES_REQUIRED: int = 3
 
 PCHIP_CDF_POINTS: int = 201
 
-# The 201-grid max step by name, for the residual analysis that reads back CDFs published
-# before the cap scaled with the grid. Live code derives both limits from grid_step_constraints.
+# The 201-grid max step by name: the reference the open-bound piling threshold is calibrated
+# against (numeric/diagnostics.py) and the pre-scaling cap the residual analysis reads back
+# (performance_analysis/analysis.py). Every live grid limit comes from grid_step_constraints.
 MAX_CDF_PROB_STEP: float = NUM_MAX_STEP
 
 

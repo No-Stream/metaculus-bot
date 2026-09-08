@@ -179,8 +179,9 @@ with the same constants). The server formulas below are the upstream contract; t
 constants `NUM_MIN_PROB_STEP` and `NUM_MAX_STEP` in `constants.py` mirror them at the
 standard 201-point grid and are the defaults of the 201-point builders. Every grid,
 including the standard one, derives its live limits from `grid_step_constraints`, below;
-`numeric/config.py` keeps `MAX_CDF_PROB_STEP` as the named 201-grid cap only for the
-residual analysis that reads back CDFs published before the cap scaled with the grid.
+`numeric/config.py` keeps `MAX_CDF_PROB_STEP` as the named 201-grid cap: the reference the
+open-bound piling threshold is calibrated against (`numeric/diagnostics.py`) and the
+pre-scaling cap the residual analysis reads back (`performance_analysis/analysis.py`).
 
 - **Length** = `cdf_size`, whose standard-continuous default is `PCHIP_CDF_POINTS`. On
   the platform side that is the question's `inbound_outcome_count + 1`, default 201.
