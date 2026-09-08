@@ -14,6 +14,8 @@ from metaculus_bot import constants
 from metaculus_bot.constants import (
     FALL_CUP_REMINDER_DATE,
     FALL_CUP_SLUG,
+    MANTIC_TOURNAMENT_END_DATE,
+    MANTIC_TOURNAMENT_ID,
     METACULUS_CUP_ID,
     TOURNAMENT_END_DATE,
     TOURNAMENT_HARD_STOP_WEEKS,
@@ -76,6 +78,70 @@ class TestTournamentDateCheck:
             check_tournament_dates()
 
         assert "invalid" in caplog.text.lower()
+
+
+class TestManticTournamentDates:
+    """check_tournament_dates on the Mantic kwargs, against the REAL function.
+
+    ``--mode mantic`` passes ``MANTIC_TOURNAMENT_ID`` / ``MANTIC_TOURNAMENT_END_DATE`` (cli.py),
+    and test_cli pins that call against a MagicMock, so nothing else proves the callee honors
+    the kwargs. The negative assertions are the point: the Mantic and Metaculus end dates
+    differ, so a dropped substitution in the function body either fires nothing at all or
+    names the Metaculus id and date, and both fail here.
+    """
+
+    def test_no_warning_before_the_mantic_end_date(self, caplog: pytest.LogCaptureFixture) -> None:
+        end_date = datetime.strptime(MANTIC_TOURNAMENT_END_DATE, "%Y-%m-%d")
+        fake_now = end_date - timedelta(days=30)
+
+        with patch("metaculus_bot.constants.datetime") as mock_dt:
+            mock_dt.strptime = datetime.strptime
+            mock_dt.now.return_value = fake_now
+            check_tournament_dates(tournament_id=MANTIC_TOURNAMENT_ID, end_date_str=MANTIC_TOURNAMENT_END_DATE)
+
+        assert "ended" not in caplog.text.lower()
+        assert "update" not in caplog.text.lower()
+
+    def test_warning_after_the_mantic_end_date_names_the_mantic_tournament(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        end_date = datetime.strptime(MANTIC_TOURNAMENT_END_DATE, "%Y-%m-%d")
+        fake_now = end_date + timedelta(days=7)  # past the Mantic close, months before the Metaculus one
+
+        with patch("metaculus_bot.constants.datetime") as mock_dt:
+            mock_dt.strptime = datetime.strptime
+            mock_dt.now.return_value = fake_now
+            check_tournament_dates(tournament_id=MANTIC_TOURNAMENT_ID, end_date_str=MANTIC_TOURNAMENT_END_DATE)
+
+        assert "ended" in caplog.text.lower()
+        assert MANTIC_TOURNAMENT_ID in caplog.text
+        assert MANTIC_TOURNAMENT_END_DATE in caplog.text
+        assert TOURNAMENT_ID not in caplog.text, "the warning must name the Mantic id, not the Metaculus default"
+        assert TOURNAMENT_END_DATE not in caplog.text, "the warning must name the Mantic date, not the Metaculus one"
+
+    def test_error_after_the_mantic_hard_stop_names_the_mantic_tournament(self) -> None:
+        end_date = datetime.strptime(MANTIC_TOURNAMENT_END_DATE, "%Y-%m-%d")
+        hard_stop = end_date + timedelta(weeks=TOURNAMENT_HARD_STOP_WEEKS)
+        fake_now = hard_stop + timedelta(days=1)
+
+        with patch("metaculus_bot.constants.datetime") as mock_dt:
+            mock_dt.strptime = datetime.strptime
+            mock_dt.now.return_value = fake_now
+            with pytest.raises(TournamentExpiredError) as exc_info:
+                check_tournament_dates(tournament_id=MANTIC_TOURNAMENT_ID, end_date_str=MANTIC_TOURNAMENT_END_DATE)
+
+        message = str(exc_info.value)
+        assert MANTIC_TOURNAMENT_ID in message
+        assert MANTIC_TOURNAMENT_END_DATE in message
+        assert TOURNAMENT_ID not in message, "the error must name the Mantic id, not the Metaculus default"
+        assert TOURNAMENT_END_DATE not in message, "the error must name the Mantic date, not the Metaculus one"
+
+    def test_invalid_end_date_format_warns_naming_the_mantic_tournament(self, caplog: pytest.LogCaptureFixture) -> None:
+        check_tournament_dates(tournament_id=MANTIC_TOURNAMENT_ID, end_date_str="not-a-date")
+
+        assert "invalid" in caplog.text.lower()
+        assert MANTIC_TOURNAMENT_ID in caplog.text
+        assert TOURNAMENT_ID not in caplog.text, "the warning must name the Mantic id, not the Metaculus default"
 
 
 class TestTournamentConfigFreshness:

@@ -734,6 +734,7 @@ class TestStackingMethods:
             numeric_question.open_upper_bound = False
             numeric_question.open_lower_bound = False
             numeric_question.unit_of_measure = "units"
+            numeric_question.zero_point = None
             result = await bot._pipeline.run_stacking(numeric_question, "research", reasoned_preds)
             mock_binary.assert_not_called()
             mock_mc.assert_not_called()

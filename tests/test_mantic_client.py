@@ -10,9 +10,10 @@ metaculus.com page URL.
 
 ``tests/data/mantic_preseason2_posts_2026_09_08.json`` is that probe's authenticated
 ``GET /api/posts/?tournaments=preseason-2`` response verbatim: four posts, one per question type,
-``my_forecasts`` present with empty histories. No test constructs a client that connects (the autouse
-egress guard in conftest would refuse it); every seam under test is reachable through the client's
-own parsing and URL-parameter methods.
+``my_forecasts`` present with empty histories (``tests/mantic_fakes.py`` holds its path and post ids,
+and derives the already-forecast state the probe could not record). No test constructs a client that
+connects (the autouse egress guard in conftest would refuse it); every seam under test is reachable
+through the client's own parsing and URL-parameter methods.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -34,17 +34,23 @@ from forecasting_tools.helpers.metaculus_client import MetaculusClient
 from metaculus_bot.constants import MANTIC_API_BASE_URL, MANTIC_SITE_URL, MANTIC_TOKEN_ENV, MANTIC_TOURNAMENT_ID
 from metaculus_bot.mantic import ManticClient, build_mantic_client
 from scripts.telemetry.markers import MARKER_SPECS, parse_log_text
+from tests.mantic_fakes import (
+    BINARY_POST_ID,
+    DATE_POST_ID,
+    DISCRETE_POST_ID,
+    MULTIPLE_CHOICE_POST_ID,
+    PRESEASON_POST_IDS,
+    load_preseason_posts,
+    with_prior_forecast,
+)
 
-_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_preseason2_posts_2026_09_08.json"
 _FAKE_TOKEN = "f" * 40
 _UNPACK = "unpack_subquestions"
 _MANTIC_LOGGER = "metaculus_bot.mantic"
 
-BINARY_POST_ID = 648
-MULTIPLE_CHOICE_POST_ID = 649
-DISCRETE_POST_ID = 650
-DATE_POST_ID = 651
-PRESEASON_POST_IDS = (BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID)
+# What the bot's own user would have standing on each question type, in the platform's shape.
+_BINARY_PRIOR_FORECAST_VALUES = (0.78, 0.22)
+_DISCRETE_PRIOR_FORECAST_CDF = [step / 450 for step in range(451)]
 
 # Prod cli.py log format, as in tests/test_telemetry_markers.py.
 _LOG_PREFIX = "2026-09-08 14:23:01,123 - metaculus_bot.mantic - INFO - "
@@ -59,9 +65,7 @@ _HARVEST_META = {
 
 @pytest.fixture(scope="module")
 def posts_by_id() -> dict[int, dict[str, Any]]:
-    with _FIXTURE_PATH.open() as f:
-        payload = json.load(f)
-    return {post["id"]: post for post in payload["results"]}
+    return {post["id"]: post for post in load_preseason_posts()}
 
 
 @pytest.fixture
@@ -236,6 +240,18 @@ class TestParsingThePreseasonFixture:
         question = _parse_one(client, posts_by_id[post_id])
         assert question.already_forecasted is False
 
+    def test_a_prior_forecast_parses_as_already_forecasted(
+        self, client: ManticClient, posts_by_id: dict[int, dict[str, Any]]
+    ):
+        """The direction with power. An empty history reads as fresh whether ``my_forecasts`` is read
+        correctly or is missing entirely (the framework derives the flag inside a blanket except that
+        answers False), so only a non-empty history proves the field survives the client's parse and
+        reaches the skip filter that bounds the hourly run's spend."""
+        post = with_prior_forecast(posts_by_id[BINARY_POST_ID], forecast_values=_BINARY_PRIOR_FORECAST_VALUES)
+        question = _parse_one(client, post)
+        assert isinstance(question, BinaryQuestion)
+        assert question.already_forecasted is True
+
     def test_the_fixture_is_the_full_preseason(self, posts_by_id: dict[int, dict[str, Any]]):
         assert set(posts_by_id) == set(PRESEASON_POST_IDS)
         assert {post["question"]["type"] for post in posts_by_id.values()} == {
@@ -244,6 +260,33 @@ class TestParsingThePreseasonFixture:
             "discrete",
             "date",
         }
+
+
+class TestThePriorForecastFixture:
+    """``with_prior_forecast`` must change one field and nothing else, or the tests built on it
+    (here and the second run in tests/test_mantic_e2e.py) would be testing the derivation."""
+
+    def test_only_my_forecasts_differs_from_the_probe(self, posts_by_id: dict[int, dict[str, Any]]):
+        original = posts_by_id[BINARY_POST_ID]
+        derived = with_prior_forecast(original, forecast_values=_BINARY_PRIOR_FORECAST_VALUES)
+
+        assert original["question"]["my_forecasts"]["history"] == [], "the shared fixture must stay untouched"
+        without_forecasts = lambda post: {  # noqa: E731
+            **post,
+            "question": {key: value for key, value in post["question"].items() if key != "my_forecasts"},
+        }
+        assert without_forecasts(derived) == without_forecasts(original)
+
+    def test_history_and_latest_carry_the_same_platform_shaped_entry(self, posts_by_id: dict[int, dict[str, Any]]):
+        my_forecasts = with_prior_forecast(posts_by_id[BINARY_POST_ID], forecast_values=_BINARY_PRIOR_FORECAST_VALUES)[
+            "question"
+        ]["my_forecasts"]
+        (entry,) = my_forecasts["history"]
+        assert my_forecasts["latest"] == entry
+        assert entry["question_id"] == BINARY_POST_ID
+        assert entry["forecast_values"] == list(_BINARY_PRIOR_FORECAST_VALUES)
+        assert entry["end_time"] is None, "a standing forecast has no end"
+        assert isinstance(entry["start_time"], float), "the platform serializes forecast times as unix timestamps"
 
 
 class TestQuantitativeTypeNormalization:
@@ -282,6 +325,17 @@ class TestQuantitativeTypeNormalization:
         _parse_one(client, quantitative)
         assert quantitative == snapshot
         assert quantitative["question"]["type"] == "quantitative"
+
+    def test_the_rewrite_keeps_the_prior_forecast(self, client: ManticClient, posts_by_id: dict[int, dict[str, Any]]):
+        """The type rewrite is the one place this client rebuilds question JSON, so it is the one
+        place ``my_forecasts`` could be dropped; dropped, every quantitative question would be
+        re-forecast on every hourly run."""
+        post = with_prior_forecast(
+            _as_quantitative(posts_by_id[DISCRETE_POST_ID]), forecast_values=_DISCRETE_PRIOR_FORECAST_CDF
+        )
+        question = _parse_one(client, post)
+        assert isinstance(question, DiscreteQuestion)
+        assert question.already_forecasted is True
 
     def test_group_subquestions_normalize_too(
         self, client: ManticClient, posts_by_id: dict[int, dict[str, Any]], caplog: pytest.LogCaptureFixture

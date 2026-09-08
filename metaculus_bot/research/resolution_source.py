@@ -905,8 +905,9 @@ async def _vetted_hop_target(
     The terminal-result form of :func:`_hop_refusal`, for a URL this module derived from a
     response inside the redirect loop, a ``Location`` header or a meta-refresh tag: the
     refusal token is mapped onto the ``FetchResult`` the loop ends on, and the two status
-    strings it produces, ``ssrf_blocked`` and ``blocked``, are telemetry contracts. ``kind``
-    is only there to say which hop shape a log line came from.
+    strings it produces, ``ssrf_blocked`` and ``blocked``, are telemetry contracts, as is the
+    ``metaculus_self_ref`` reason the second carries. ``kind`` is only there to say which hop
+    shape a log line came from.
     """
     next_url = urljoin(current_url, target)
     refusal = await _hop_refusal(next_url)
@@ -925,7 +926,9 @@ async def _vetted_hop_target(
         # The URL pre-filter drops self-refs, but a redirect (of either shape) can
         # still land on the question platform's own site (metaculus.com or
         # competitions.mantic.com); don't follow it (no new info, and keeps our IP
-        # off the same host the critical API uses).
+        # off the same host the critical API uses). The reason is what keeps the paid
+        # rung off this URL as well (`_url_context_rung_applies`): that rung is handed
+        # the CITED url, and Gemini would follow the same redirect onto the refused page.
         logger.info(
             f"resolution_source metaculus_self_ref ({kind}): "
             f"{urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
@@ -933,6 +936,7 @@ async def _vetted_hop_target(
         return FetchResult(
             url=next_url,
             status="blocked",
+            status_reason="metaculus_self_ref",
             text="",
             http_status=http_status,
             content_type=content_type or None,
@@ -2533,27 +2537,38 @@ async def _wayback_rung(
 # `read_document` job on a URL the driver chose), and `ssrf_blocked` is a URL WE refused — handing
 # that to a third-party fetcher is exactly the bypass the guard exists to prevent, which is why it
 # is excluded here and not merely unlisted.
-# One member of the set is narrowed further by REASON rather than by status — see
+# Two outcomes inside the set are excluded by REASON rather than by status — see
 # :func:`_url_context_rung_applies` — so this set is the ceiling on the population, not the
 # population itself.
 _URL_CONTEXT_TRIGGER_STATUSES: frozenset[FetchStatus] = frozenset(
     {"blocked", "js_wall", "error", "no_resolving_content"}
 )
 
+# The reasons that take an outcome OUT of the population above. Scoped on the reason rather than by
+# dropping the status, because the statuses they ride are otherwise exactly what the rung exists
+# for: `embed_shell` and `thin_page` are pages our client genuinely could not read, and a 403
+# `blocked` is the rung's whole reason to exist.
+#   `no_matching_passage` — a document we read END TO END whose passage selection matched no query
+#   term. Its bytes were never the problem (we hold its full text and its outline), so paying
+#   Gemini to re-read the same PDF buys nothing.
+#   `metaculus_self_ref` — a redirect WE refused because it landed on the question platform's own
+#   site. The rung is handed the CITED url, so Gemini would follow the same redirect and read the
+#   page we refused: a paid read that by construction returns nothing new, and on Mantic the other
+#   bots' forecasts read in as grading evidence. The same bypass `ssrf_blocked` is kept out of the
+#   trigger set to prevent, closed here by reason because the self-reference's status is `blocked`
+#   by contract.
+_URL_CONTEXT_EXCLUDED_REASONS: frozenset[FetchStatusReason] = frozenset({"no_matching_passage", "metaculus_self_ref"})
+
 
 def _url_context_rung_applies(direct: FetchResult) -> bool:
     """Whether a model-mediated read could plausibly resolve ``direct``.
 
-    The trigger statuses above, minus the one outcome inside them a paid read cannot help
-    with: a document we read END TO END whose passage selection matched no query term
-    (``no_matching_passage``). Its bytes were never the problem — we hold its full text and
-    its outline — so paying Gemini to re-read the same PDF buys nothing. Scoped on the REASON
-    rather than by dropping the status, because ``embed_shell`` and ``thin_page`` are pages our
-    client genuinely could not read and are exactly what this rung exists for.
+    The trigger statuses above, minus the outcomes inside them a paid read cannot help with or
+    must not be tried on (``_URL_CONTEXT_EXCLUDED_REASONS``, which says why for each).
     """
     if direct.status not in _URL_CONTEXT_TRIGGER_STATUSES:
         return False
-    return direct.status_reason != "no_matching_passage"
+    return direct.status_reason not in _URL_CONTEXT_EXCLUDED_REASONS
 
 
 def _url_context_lead(live_status: FetchStatus) -> str:

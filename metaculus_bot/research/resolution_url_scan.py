@@ -18,14 +18,8 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
-from metaculus_bot.constants import MANTIC_HOST
+from metaculus_bot.constants import QUESTION_PLATFORM_HOSTS
 from metaculus_bot.research.wayback import innermost_url
-
-# The question platforms whose own pages are self-references: the Metaculus apex (so every
-# subdomain matches, `www.` and the API host included) and the Mantic competition site. For
-# Mantic only that host: `www.mantic.com` and `blog.mantic.com` are the company's marketing site
-# and blog, which publishes forecasts and is a legitimate outside source.
-_QUESTION_PLATFORM_HOSTS: tuple[str, ...] = ("metaculus.com", MANTIC_HOST)
 
 # Metaculus-injected markdown escapes: `\_`, `\.`, `\&`, `\-`, `\#`, `\(`, `\)`.
 # FINDINGS: 3.4% of URLs carry these; one flips 404→success once unescaped.
@@ -181,9 +175,11 @@ def is_metaculus_self_ref(url: str) -> bool:
     platform it was written against: the ``metaculus_self_ref`` refusal token and the
     ``blocked`` status it produces downstream are data contracts, so the name stays.
 
-    Uses ``.hostname`` (not ``.netloc``) so a port or userinfo can't slip a
-    platform URL past the check — ``.netloc`` keeps ``:443`` / ``user@``, which
-    would defeat the exact-host and suffix comparisons below.
+    Matches each ``QUESTION_PLATFORM_HOSTS`` entry exactly or as a parent domain, so the
+    Metaculus apex covers ``www.`` and the API host while the Mantic entry (the competition host
+    alone) leaves the company's blog fetchable. Uses ``.hostname`` (not ``.netloc``) so a port or
+    userinfo can't slip a platform URL past the check — ``.netloc`` keeps ``:443`` / ``user@``,
+    which would defeat the exact-host and suffix comparisons below.
 
     Judged on the INNERMOST URL of a Wayback capture, at any depth of nesting: an archived
     copy of a question page in front of a forecaster is still the question quoting itself,
@@ -194,7 +190,7 @@ def is_metaculus_self_ref(url: str) -> bool:
         host = (urlparse(innermost_url(url)).hostname or "").lower()
     except ValueError:
         return False
-    return any(host == platform or host.endswith(f".{platform}") for platform in _QUESTION_PLATFORM_HOSTS)
+    return any(host == platform or host.endswith(f".{platform}") for platform in QUESTION_PLATFORM_HOSTS)
 
 
 def is_fred_url(url: str) -> bool:

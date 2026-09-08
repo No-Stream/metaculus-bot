@@ -99,11 +99,17 @@ the schedule is live once the file is on `main`. Deferred, each with its trigger
   `/api/posts/<id>/?with_cp=true`. That is a resolved, bot-only, fine-grid numeric corpus with
   per-competitor forecasts, which nothing on Metaculus gives us; worth a replay once the season
   has a Mantic scoreboard to compare against.
-- **Archive id-namespace hazard.** Mantic post ids are around 650 and every Metaculus id in our
-  research archive is 35,000 or more, so the two cannot collide today and filenames are not
-  namespaced. Records carry a `platform` field (`mantic` / `metaculus`) that disambiguates; any
-  analysis that keys on a bare post id across both platforms must filter on it, and if Mantic ids
-  ever approach the Metaculus range the filename scheme has to be revisited.
+- **Archive id-namespace hazard.** Filenames are not namespaced by platform, and
+  `scripts/download_research.build_archive` groups on the bare qid, so the `platform` field
+  (`mantic` / `metaculus`) tells records apart inside a group and is what any analysis keyed on
+  a bare post id across both platforms must filter on; it would not stop a Mantic id and a
+  Metaculus id that meet from merging into one `by_qid` / `latest` / manifest entry. The margin
+  is not "hundreds versus tens of thousands": the evergreen `test_questions` set puts Metaculus
+  ids 578, 14333 and 20683 in the archive (578 is already below the Mantic counter, harmless
+  because the bot only archives the open tournament posts it forecasts), so with the open Mantic
+  posts in the 650s the next Metaculus key above them is 14333, about 13,700 Mantic posts away.
+  Namespace the grouping key or the filenames before the Mantic counter gets near that, and not
+  before, because that is mechanism for a collision this deployment does not produce.
 - **Date questions: Phase 2.** The preseason's fourth question is a date question (twelve daily
   bins) that the bot's type guard skips. Support means a date runner in `forecaster_runners.py`
   (percentiles as ISO dates, parsed to epoch seconds, the numeric pipeline on the epoch axis with
@@ -113,6 +119,26 @@ the schedule is live once the file is on `main`. Deferred, each with its trigger
 - **Series 2 cadence unknown.** Series 1 windows were exactly one hour, opened on the hour, up to
   three questions an hour. The :17/:47 crons dodge the top-of-hour GitHub Actions congestion and
   leave about 43 minutes if that cadence returns; move to three entries per hour if it does.
+- **Prompts still name Metaculus and the peer score (review finding, 2026-09-08).** Every
+  forecasting prompt tells the model it is a Metaculus question judged by the Metaculus peer
+  score (`prompts.py`, the binary, numeric and multiple-choice templates), and on Mantic both are
+  false: the preseason `score_type` is `spot_baseline_tournament`, and baseline scoring has no
+  differentiate-from-the-field incentive. Platform-neutral wording ("a proper log score", "Your
+  forecasting question is:") is the fix and needs no per-platform branch, but a base-prompt edit
+  is a config-era boundary and goes through the prompt-rule process (presence and absence pins
+  under `tests/prompts/`), so the timing is the operator's call.
+- **`research/resolution_source.py` split (review finding, 2026-09-08).** The module is about
+  3,500 lines carrying the fetch ladder, URL selection, the network-safety checks, the per-rung
+  drivers and marker logging; the Mantic branch only reworded two docstrings in it. It has
+  internal seams to split along, leaving the ladder orchestrator behind, but that is a
+  large-blast-radius refactor on the fetch and deadline surface, which is strictly-safer-changes
+  territory, so it gets its own PR.
+- **`pdf_pooling.apply_tail_floor` grid-derived floor: no change needed (review finding,
+  2026-09-08).** The floor moved from the fixed 5e-5 constant to the grid's server min-step, and
+  no test distinguishes old from new because every existing `floor_eps` dominates both at the
+  grids tested. The only production caller is the dormant ablation harness replaying archived
+  201-point Metaculus records, where the two are byte-identical, so no pin was added; recorded so
+  the finding is not re-raised.
 
 ### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH — operator-confirmed 2026-08-25**)
 

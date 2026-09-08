@@ -7,7 +7,9 @@ These constants control various aspects of the numeric prediction processing pip
 
 from __future__ import annotations
 
-from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
+import math
+
+from metaculus_bot.constants import NUM_MAX_STEP
 
 # --- Percentile Processing Constants ---
 
@@ -43,38 +45,42 @@ MIN_PERCENTILES_REQUIRED: int = 3
 
 PCHIP_CDF_POINTS: int = 201
 
-# The 201-grid values of grid_step_constraints, for callers that only ever build 201-point CDFs;
-# any other grid derives its limits from grid_step_constraints rather than flooring at these.
-MIN_CDF_PROB_STEP: float = NUM_MIN_PROB_STEP
-
+# The 201-grid max step by name, for the residual analysis that reads back CDFs published
+# before the cap scaled with the grid. Live code derives both limits from grid_step_constraints.
 MAX_CDF_PROB_STEP: float = NUM_MAX_STEP
 
 
 def grid_step_constraints(num_points: int) -> tuple[float, float]:
     """Return ``(min_step, max_step)`` for a ``num_points``-point CDF grid.
 
-    Exactly the server's per-bin rules (``questions/serializers/common.py`` in the
-    open-source Metaculus backend, which Mantic forked with the same constants), which
-    scale with the bin count ``inbound = num_points - 1``:
+    The server's per-bin rules (``questions/serializers/common.py`` in the open-source
+    Metaculus backend, which Mantic forked with the same constants) scale with the bin
+    count ``inbound = num_points - 1``, and the server checks them against a PMF it has
+    rounded to 9 decimals (``np.round(np.diff(cdf), 9)``), so both limits here are the
+    9-decimal values that survive that rounding:
 
-    * min step ``round(0.01 / inbound, 9)``. The server rounds the same way before its
-      ``>=`` comparison, so the rounding is part of the contract, not cosmetics.
-    * max step ``0.2 * 200 / inbound``, clamped at ``1.0`` (a probability step can never
-      exceed 1.0, so any larger bound is vacuous).
+    * min step ``round(0.01 / inbound, 9)``, the server's own rounded floor.
+    * max step: the largest 9-decimal value not exceeding ``0.2 * 200 / inbound``, clamped
+      at ``1.0`` (a probability step can never exceed 1.0). The server compares the ROUNDED
+      pmf against the UNROUNDED cap, and the max-step repair clips over-cap bins to exactly
+      this value, so wherever the cap is not 9-decimal exact a bin clipped to the raw cap
+      rounds above it and the submission is rejected (450 bins: 0.0888... rounds to
+      0.088888889). Flooring is a no-op wherever the cap is 9-decimal exact, which covers
+      every grid of 41 points or fewer and the 51, 101, 201 and 2,001-point grids.
 
-    There is deliberately no floor at ``MIN_CDF_PROB_STEP``. Such a floor was a no-op for
+    There is deliberately no floor at the 201-grid min step. Such a floor was a no-op for
     ``inbound <= 200`` and stricter than the server above it (2.25x at 450 bins, 10x at
     2,000), which forced a uniform mixture several times larger than the server requires
     into the tails of every fine-grid forecast. At the standard 201-point grid this returns
-    exactly ``(MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP)``, so every Metaculus grid is
-    unchanged. On a coarse discrete grid (``num_points < 201``) the max step relaxes above
+    exactly ``(NUM_MIN_PROB_STEP, NUM_MAX_STEP)``, the constants the 201-point builders
+    default to. On a coarse discrete grid (``num_points < 201``) the max step relaxes above
     0.2 (1.0 at ``num_points=9``), which lets a small-count distribution keep its mass
     concentrated on the low integers instead of being clipped to the 201-grid cap; on a
     finer grid both limits tighten.
     """
     inbound = max(1, num_points - 1)
     min_step = round(0.01 / inbound, 9)
-    max_step = min(1.0, 0.2 * 200.0 / inbound)
+    max_step = min(1.0, math.floor(0.2 * 200.0 / inbound * 1e9) / 1e9)
     return min_step, max_step
 
 

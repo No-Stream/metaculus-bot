@@ -1,0 +1,78 @@
+"""The recorded Mantic preseason payload and its identity, shared by the two Mantic test modules.
+
+``tests/data/mantic_preseason2_posts_2026_09_08.json`` is the authenticated
+``GET /api/posts/?tournaments=preseason-2`` response from the 2026-09-08 live probe against
+competitions.mantic.com: four posts, one per question type, every ``my_forecasts`` block carrying an
+empty history. ``tests/test_mantic_client.py`` parses it post by post and ``tests/test_mantic_e2e.py``
+serves it from a fake transport under a full run; before this module each declared its own copy of
+the fixture path and the four post ids, which is how two files come to disagree about one payload.
+
+Not named ``test_*`` on purpose: pytest imports it without collecting it, and consumers bind what
+they need by import. Nothing here opens a socket.
+
+:func:`with_prior_forecast` is the one derived shape both consumers need: a copy of a post whose
+question the bot's own user has already forecast. The fixture cannot supply that state (the probe
+ran before the bot ever forecast on Mantic), yet it is the state of nearly every scheduled run once
+the hourly cron has fired once, and the framework's skip filter reads exactly this field.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+PRESEASON_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_preseason2_posts_2026_09_08.json"
+
+BINARY_POST_ID = 648
+MULTIPLE_CHOICE_POST_ID = 649
+DISCRETE_POST_ID = 650
+DATE_POST_ID = 651
+PRESEASON_POST_IDS = (BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID)
+
+# Shaped like a platform user id; the real bot account's id is not in the fixture and nothing reads it.
+_FAKE_BOT_USER_ID = 9001
+# The previous scheduled run: the bot's workflow fires hourly, so a prior forecast is about that old.
+_PRIOR_FORECAST_AGE = timedelta(hours=1)
+
+
+def load_preseason_posts() -> list[dict[str, Any]]:
+    """The probe's four posts, freshly parsed, so a caller may reshape its copy freely."""
+    with PRESEASON_FIXTURE_PATH.open() as f:
+        payload = json.load(f)
+    return copy.deepcopy(payload["results"])
+
+
+def with_prior_forecast(post: dict[str, Any], forecast_values: Sequence[float]) -> dict[str, Any]:
+    """A deep copy of ``post`` whose question the bot's own user forecast once, an hour ago.
+
+    The entry follows the platform's ``MyForecastSerializer`` (``questions/serializers/common.py`` in
+    the open-source Metaculus backend, which Mantic forks): ``history`` holds every forecast the
+    authenticated user made and ``latest`` the standing one, both in the same shape, with unix
+    timestamps for the times and ``forecast_values`` as ``[1 - p, p]`` for a binary question, the
+    per-option list for multiple choice and the CDF for a continuous one. The three interval fields
+    are the platform's quartile summaries of a CDF and stay ``None`` here, as they do on the wire for
+    a binary or multiple-choice forecast; the bot reads none of them.
+    """
+    forecast = copy.deepcopy(post)
+    question = forecast["question"]
+    entry = {
+        "question_id": question["id"],
+        "author_id": _FAKE_BOT_USER_ID,
+        "start_time": (datetime.now(UTC) - _PRIOR_FORECAST_AGE).timestamp(),
+        "end_time": None,
+        "forecast_values": list(forecast_values),
+        "interval_lower_bounds": None,
+        "centers": None,
+        "interval_upper_bounds": None,
+        "distribution_input": None,
+    }
+    question["my_forecasts"] = {
+        "history": [entry],
+        "latest": copy.deepcopy(entry),
+        "score_data": {},
+    }
+    return forecast

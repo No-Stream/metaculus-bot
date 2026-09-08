@@ -59,12 +59,13 @@ Paid or externally visible — ask before each:
 - `make test_live`: the only suite that leaves the network. It pins a `:free` OpenRouter slug so
   dollar spend is near-zero, but the calls are real and need a key. Ask anyway.
 - **GitHub Actions runs of any bot workflow**, which spend exactly as a local run does and
-  publish to Metaculus. `test_bot_basic.yaml` (one numeric question, ~$2.60) and `test_bot.yaml`
-  are `workflow_dispatch`-only. The four `run_bot_on_*.yaml` prod workflows are additionally on
-  `schedule:` crons (`run_bot_on_mantic.yaml`, :17/:47, holds no Metaculus secret and is
-  auto-enabled once its file lands on `main`). Never dispatch one, and never edit a `schedule:`
-  block or a research/model
-  flag in a way that adds runs or raises per-run cost, without the operator's say-so. `gh` needs
+  publish to the platform they forecast (Metaculus, or competitions.mantic.com for
+  `run_bot_on_mantic.yaml`). `test_bot_basic.yaml` (one numeric question, ~$2.60) and
+  `test_bot.yaml` are `workflow_dispatch`-only. The four `run_bot_on_*.yaml` prod workflows are
+  additionally on `schedule:` crons (`run_bot_on_mantic.yaml`, :17/:47, holds no Metaculus
+  secret and is auto-enabled once its file lands on `main`). Never dispatch one, and never edit
+  a `schedule:` block or a research/model flag in a way that adds runs or raises per-run cost,
+  without the operator's say-so. `gh` needs
   `--repo No-Stream/metaculus-bot` here: `origin` is the fork, `upstream` is the Metaculus
   template, and no default repo is set, so a bare `gh workflow` command silently targets
   upstream. Two standing facts about enablement, both confirmed 2026-09-03:

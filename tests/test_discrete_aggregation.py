@@ -151,7 +151,6 @@ def test_ensemble_median_ramp_does_not_overflow_above_one():
     """
     for open_upper in (False, True):
         question = _discrete_open_upper_question() if open_upper else _closed_discrete_question()
-        x = np.linspace(question.lower_bound, question.upper_bound, question.cdf_size)
         # Valid monotonic CDF in [0, 1] with sub-min-step gaps near the top bins that force
         # the ramp branch (the exact shape the 2026-07-20 audit used to trigger the crash).
         p = np.array([0.0, 0.6, 0.9, 0.97, 0.99, 0.994, 0.997, 0.9993, 1.0])
@@ -160,7 +159,7 @@ def test_ensemble_median_ramp_does_not_overflow_above_one():
         assert p.max() <= 1.0
         assert float(np.diff(p).min()) < 0.01 / (question.cdf_size - 1), "test setup must trigger the ramp"
 
-        dist = _postprocess_ensemble_cdf(x, p.copy(), question, "median")
+        dist = _postprocess_ensemble_cdf(p.copy(), question, "median")
         probs = np.array([pp.percentile for pp in dist.cdf], dtype=float)
 
         assert len(probs) == question.cdf_size
@@ -265,7 +264,7 @@ def test_ensemble_clip_marker_names_the_stage_and_the_question(caplog):
     p = np.maximum.accumulate(p)
 
     with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pchip_cdf"):
-        _postprocess_ensemble_cdf(x, p, question, "median")
+        _postprocess_ensemble_cdf(p, question, "median")
 
     markers = [r.getMessage() for r in caplog.records if "CDF_MAXSTEP_CLIP:" in r.getMessage()]
     assert len(markers) == 1

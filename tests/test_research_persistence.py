@@ -72,8 +72,9 @@ class TestResearchPersistenceWriter:
 
     def test_platform_is_stamped_from_the_writer(self, tmp_path: Path) -> None:
         # Additive next to tournament_id: which question platform the record's ids belong to.
-        # Mantic post ids (~650) and our Metaculus ids (>= 35,000) cannot collide today, so
-        # this field, not the filename, is what disambiguates them in the archive.
+        # Filenames are not namespaced and the archive groups on the bare qid, so this field is
+        # what tells a Mantic record from a Metaculus one; the id gap today is ~650 up to 14333
+        # (the evergreen test-question ids sit in the archive).
         writer = ResearchPersistenceWriter(
             run_mode="mantic", platform="mantic", tournament_id="preseason-2", run_id="r"
         )

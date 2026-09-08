@@ -33,6 +33,7 @@ from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import fetch_outcomes, local_document, provenance, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
+from metaculus_bot.research.agentic.tool_descriptions import FETCH_DESCRIPTION
 from metaculus_bot.research.agentic.types import ToolOutcome
 from metaculus_bot.research.document_text import extract_pdf_text
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
@@ -779,6 +780,17 @@ async def test_fetch_plain_blocks_metaculus_without_network(url: str, monkeypatc
     assert "metaculus.com" in result.text
     assert "competitions.mantic.com" in result.text
     get_session.assert_not_called()
+
+
+def test_fetch_description_names_both_platform_hosts() -> None:
+    """The driver reads FETCH_DESCRIPTION BEFORE it picks a URL and the block message only after
+    the guard refused one, so the two must name the same hosts: a description that dropped one
+    would spend fetch steps on question pages the code then refuses (and, on Mantic, the driver
+    could still hand the page to the ungated read_document). Literal pins, so the test also
+    fails if the constants behind the f-strings are re-pointed at something else."""
+    for host in ("metaculus.com", "competitions.mantic.com"):
+        assert host in FETCH_DESCRIPTION
+        assert host in fetch_outcomes._PLATFORM_FETCH_BLOCK_MSG
 
 
 @pytest.mark.asyncio

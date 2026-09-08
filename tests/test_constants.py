@@ -17,14 +17,19 @@ from metaculus_bot.constants import (
     EXTREME_CALL_LOW,
     GAP_FILL_V2_READER_MODEL,
     GEMINI_SEARCH_DEFAULT_MODEL,
+    MANTIC_API_BASE_URL,
+    MANTIC_HOST,
+    MANTIC_SITE_URL,
     MC_PROB_MAX,
     MC_PROB_MIN,
     MC_STACKING_ENABLED_ENV,
+    METACULUS_HOST,
     NATIVE_SEARCH_DEFAULT_MODEL,
     NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
     NATIVE_SEARCH_TIMEOUT,
     NATIVE_SEARCH_VERBOSITY_DEFAULT,
     NUMERIC_STACKING_ENABLED_ENV,
+    QUESTION_PLATFORM_HOSTS,
     THIN_PUBLISH_BINARY_CEIL,
     THIN_PUBLISH_BINARY_FLOOR,
     donated_openrouter_key_enabled,
@@ -242,3 +247,25 @@ class TestThinPublishBinaryFloor:
         """A 0.03 member call passes the per-model [0.02, 0.98] clamp untouched, which is
         why the floor is a new mechanism rather than a retune of BINARY_PROB_MIN/MAX."""
         assert BINARY_PROB_MIN < THIN_PUBLISH_BINARY_FLOOR < THIN_PUBLISH_BINARY_CEIL < BINARY_PROB_MAX
+
+
+class TestQuestionPlatformHosts:
+    """Each platform host is spelled ONCE in constants.py; everything else derives from it.
+
+    Literal pins rather than derived ones, deliberately: the derivation is what a re-point (a
+    staging host, a domain change when Series 2 opens) relies on to move every consumer at once,
+    and these literals are what make a wrong derivation loud rather than split-brain.
+    """
+
+    def test_metaculus_host(self):
+        assert METACULUS_HOST == "metaculus.com"
+
+    def test_mantic_host_and_the_urls_derived_from_it(self):
+        assert MANTIC_HOST == "competitions.mantic.com"
+        assert MANTIC_SITE_URL == "https://competitions.mantic.com"
+        assert MANTIC_API_BASE_URL == "https://competitions.mantic.com/api"
+
+    def test_question_platform_hosts_names_both_platforms(self):
+        """The one list behind the publish-timeout scope, the self-reference refusal and the
+        gap-fill v2 driver text; an added platform lands here and nowhere else."""
+        assert QUESTION_PLATFORM_HOSTS == ("metaculus.com", "competitions.mantic.com")

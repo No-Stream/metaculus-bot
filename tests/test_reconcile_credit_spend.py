@@ -20,12 +20,14 @@ from scripts import reconcile_credit_spend as rcs
 from scripts.reconcile_credit_spend import RunSpend, aggregate_roles, reconcile, role_spend_by_run
 
 
-def _snapshot(run_id: str, phase: str, usage: float | None, *, ts: str, key: str = "personal") -> dict:
+def _snapshot(
+    run_id: str, phase: str, usage: float | None, *, ts: str, key: str = "personal", workflow: str = "tournament"
+) -> dict:
     """One credit_balance archive record."""
     return {
         "marker": "credit_balance",
         "run_id": run_id,
-        "workflow": "tournament",
+        "workflow": workflow,
         "run_date": f"{ts}Z",
         "line_ts": ts,
         "key": key,
@@ -35,10 +37,10 @@ def _snapshot(run_id: str, phase: str, usage: float | None, *, ts: str, key: str
     }
 
 
-def _run(run_id: str, start_usage: float, end_usage: float, *, hour: int) -> list[dict]:
+def _run(run_id: str, start_usage: float, end_usage: float, *, hour: int, key: str = "personal") -> list[dict]:
     return [
-        _snapshot(run_id, "start", start_usage, ts=f"2026-07-25T{hour:02d}:00:00"),
-        _snapshot(run_id, "end", end_usage, ts=f"2026-07-25T{hour:02d}:10:00"),
+        _snapshot(run_id, "start", start_usage, ts=f"2026-07-25T{hour:02d}:00:00", key=key),
+        _snapshot(run_id, "end", end_usage, ts=f"2026-07-25T{hour:02d}:10:00", key=key),
     ]
 
 
@@ -110,14 +112,41 @@ class TestSettledSpendRecovery:
         rows = reconcile(records, "personal")
         assert [row.run_id for row in rows] == ["A", "B"]
 
-    def test_missing_usage_yields_none_rather_than_a_wrong_number(self) -> None:
-        # A fetch failure records usage=None. Treating it as 0 would invent spend.
-        records = _run("A", 100.00, 100.00, hour=1)
-        records[0]["usage"] = None
-        records += _run("B", 100.30, 100.30, hour=2)
+    def test_missing_end_usage_yields_none_within_run_but_keeps_the_run_in_the_chain(self) -> None:
+        # An end-snapshot fetch failure records usage=None. Treating it as 0 would invent
+        # spend, so within-run is None. The start usage is still a real observation of the
+        # key's balance, so the run stays paired: its own spend settles against its
+        # successor, and its start settles its predecessor.
+        records = (
+            _run("A", 100.00, 100.00, hour=1) + _run("B", 100.30, 100.30, hour=2) + _run("C", 100.50, 100.50, hour=3)
+        )
+        records[3]["usage"] = None  # B's end snapshot
         rows = reconcile(records, "personal")
-        assert rows[0].within_run_usd is None
-        assert rows[0].settled_usd is None
+        assert [row.run_id for row in rows] == ["A", "B", "C"]
+        assert rows[0].settled_usd == pytest.approx(0.30)
+        assert rows[1].within_run_usd is None
+        assert rows[1].settled_usd == pytest.approx(0.20)
+        assert rows[1].lagged_usd is None
+
+    def test_a_usage_less_start_snapshot_leaves_the_run_unpaired_and_its_predecessor_settled(self) -> None:
+        """A Mantic run never probes the donated key and logs ``CREDIT_BALANCE: key=donated
+        phase=start skipped (donated routing disabled)``, which the archive parses into a start
+        record with usage=None. That is not an observation of the key's booked balance, so the
+        run must neither break its predecessor's settlement chain nor add an all-None row of its
+        own: it spent nothing on the key, so the NEXT run's start is the predecessor's settlement
+        observation. Before the fix the predecessor read None and a spurious MANTIC row appeared.
+        """
+        records = [
+            *_run("A", 100.00, 100.00, hour=1, key="donated"),
+            _snapshot("MANTIC", "start", None, ts="2026-07-25T02:00:00", key="donated", workflow="mantic"),
+            _snapshot("MANTIC", "end", None, ts="2026-07-25T02:10:00", key="donated", workflow="mantic"),
+            *_run("B", 100.30, 100.40, hour=3, key="donated"),
+            *_run("C", 100.60, 100.60, hour=4, key="donated"),
+        ]
+        rows = reconcile(records, "donated")
+        assert [row.run_id for row in rows] == ["A", "B", "C"]
+        assert rows[0].settled_usd == pytest.approx(0.30)
+        assert rows[1].settled_usd == pytest.approx(0.30)
 
 
 def _role_row(

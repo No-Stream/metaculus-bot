@@ -151,7 +151,7 @@ from forecasting_tools.data_models.numeric_report import NumericReport
 from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
-from metaculus_bot.constants import MANTIC_HOST, PUBLISH_POST_RETRIES, PUBLISH_POST_TIMEOUT
+from metaculus_bot.constants import PUBLISH_POST_RETRIES, PUBLISH_POST_TIMEOUT, QUESTION_PLATFORM_HOSTS
 from metaculus_bot.http_status import http_status_from_exception
 from metaculus_bot.publish_gate import skip_publish_if_closed
 
@@ -178,14 +178,6 @@ _PATCHED_REPORT_TYPES: tuple[type[ForecastReport], ...] = (
 # base, so a class-level sentinel on one would read as set on its siblings and skip
 # their patch.
 _REPORT_SENTINEL = "_publish_offload_applied"
-
-# Host substrings that scope the forced POST timeout to the question platforms the bot
-# publishes to. "metaculus.com" is taken from MetaculusClient's own default base_url
-# ("https://www.metaculus.com/api"), matched on the host alone so a METACULUS_API_BASE_URL
-# override with a different path still hits; MANTIC_HOST is the Mantic competition site,
-# which the same client publishes to under MANTIC_API_BASE_URL. See
-# _install_post_timeout_override for why the scoping is load-bearing.
-_PLATFORM_HOSTS: tuple[str, ...] = ("metaculus.com", MANTIC_HOST)
 
 # Method names to patch. Both are @retry_with_exponential_backoff()-decorated
 # instance methods on MetaculusClient that each wrap a single requests.post; we
@@ -299,7 +291,7 @@ def _install_post_timeout_override(timeout_s: float) -> None:
     deeper per occurrence, with no way back. The class-patch sentinel didn't help
     — it guards the one-time method patch, not this per-call one.
 
-    **Scoped to the question-platform hosts** (``_PLATFORM_HOSTS``: Metaculus and
+    **Scoped to the question-platform hosts** (``QUESTION_PLATFORM_HOSTS``: Metaculus and
     Mantic), which the per-call version got for free and a permanent install does
     not: ``metaculus_client.requests`` IS the global ``requests`` module (verified —
     ``mc.requests is requests``), so an unconditional forced timeout would also
@@ -325,7 +317,9 @@ def _install_post_timeout_override(timeout_s: float) -> None:
         url = args[0] if args else kwargs.get("url", "")
         if isinstance(url, bytes):
             url = url.decode("utf-8", errors="replace")
-        if isinstance(url, str) and any(host in url for host in _PLATFORM_HOSTS):
+        # Matched on the host substring alone, so a METACULUS_API_BASE_URL override with a
+        # different path still hits and every platform the client publishes to is inside the scope.
+        if isinstance(url, str) and any(host in url for host in QUESTION_PLATFORM_HOSTS):
             kwargs["timeout"] = timeout_s
         return original_post(*args, **kwargs)
 

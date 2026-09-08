@@ -61,11 +61,22 @@ METACULUS_CUP_ID: str = "metaculus-cup-fall-2026"
 # score_type spot_baseline_tournament, bot_leaderboard_status bots_only. No Series 2 project
 # exists on that API yet (valid slugs 2026-09-08: preseason-2, series-1, practice-series-1;
 # an unknown slug answers HTTP 400). Re-point MANTIC_TOURNAMENT_ID when Series 2 opens.
-MANTIC_API_BASE_URL: str = "https://competitions.mantic.com/api"
-MANTIC_SITE_URL: str = "https://competitions.mantic.com"
-MANTIC_HOST: str = "competitions.mantic.com"  # self-reference refusal + publish-timeout host scope
+MANTIC_HOST: str = "competitions.mantic.com"
+MANTIC_SITE_URL: str = f"https://{MANTIC_HOST}"
+MANTIC_API_BASE_URL: str = f"{MANTIC_SITE_URL}/api"
 MANTIC_TOURNAMENT_ID: str = "preseason-2"
 MANTIC_TOURNAMENT_END_DATE: str = "2026-09-20"  # forecasting_end_date on project 4 (API-verified 2026-09-08)
+
+# The question platforms the bot publishes to, whose own pages are self-references for research.
+# One tuple because the two sets are the same two hosts today; if they ever diverge, split the
+# tuple rather than adding a flag. Each consumer matches its own way: `publish_hardening` scopes
+# the forced POST timeout by URL substring, `research.resolution_url_scan.is_metaculus_self_ref`
+# matches the hostname and its subdomains (so the Metaculus apex covers `www.` and the API host),
+# and the gap-fill v2 driver text names both hosts from here. For Mantic only the competition
+# host is listed: `www.mantic.com` and `blog.mantic.com` are the company's marketing site and
+# blog, which publish forecasts and are a legitimate outside source.
+METACULUS_HOST: str = "metaculus.com"
+QUESTION_PLATFORM_HOSTS: tuple[str, ...] = (METACULUS_HOST, MANTIC_HOST)
 
 
 def gemini_use_donated_openrouter_key() -> bool:

@@ -759,9 +759,10 @@ class TestPersistedTournamentId:
 class TestPersistedPlatform:
     """The archive's additive ``platform`` field: which question platform a record's ids belong to.
 
-    Mantic post ids (around 650) and the Metaculus ids in our archive (35,000 and up) cannot
-    collide today, so filenames are not namespaced; this field is what disambiguates if that
-    ever changes, and what an analysis keyed on bare post ids must filter on.
+    Filenames are not namespaced and the archive groups on the bare qid, so this field is what
+    separates the two platforms' records and what an analysis keyed on bare post ids must
+    filter on; the id gap today runs from the Mantic counter (~650) to 14333, the next
+    Metaculus key.
     """
 
     def test_mantic_mode_is_the_only_mantic_platform(self) -> None:

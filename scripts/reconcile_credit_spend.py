@@ -76,12 +76,23 @@ class RunSpend:
 
 
 def _paired_snapshots(records: list[dict], key: str) -> list[tuple[str, dict, dict]]:
-    """Return ``(run_id, start, end)`` for runs with BOTH snapshots, oldest first."""
+    """Return ``(run_id, start, end)`` for runs with BOTH snapshots, oldest first.
+
+    A start snapshot without a usage figure is not an observation of the key's booked
+    balance: the ``skipped`` lines (a Mantic run never probes the donated key; an unset env
+    var) parse into a start record with ``usage=None``. Only start usages feed the
+    settlement chain, so such a run is left unpaired rather than breaking the chain for its
+    predecessor and adding an all-None row. A run whose END usage is missing stays paired:
+    its start still settles its predecessor, and its own spend still settles against its
+    successor.
+    """
     by_run: dict[str, dict[str, dict]] = defaultdict(dict)
     for record in records:
         if record.get("key") != key:
             continue
         phase = record.get("phase")
+        if phase == "start" and record.get("usage") is None:
+            continue
         if phase in ("start", "end"):
             by_run[record["run_id"]][phase] = record
     paired = [

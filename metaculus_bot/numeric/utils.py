@@ -19,8 +19,9 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from metaculus_bot.constants import NUM_RAMP_K_FACTOR
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
-from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
+from metaculus_bot.numeric.validation import resolve_zero_point
 
 __all__ = [
     "aggregate_binary_mean",
@@ -60,7 +61,6 @@ def _pin_endpoints(p_vals: np.ndarray, question: NumericQuestion) -> None:
 
 
 def _postprocess_ensemble_cdf(
-    x_vals: np.ndarray,
     p_vals: np.ndarray,
     question: NumericQuestion,
     method_label: str,
@@ -75,8 +75,11 @@ def _postprocess_ensemble_cdf(
     validation downstream and drop the question. Nothing is resampled here:
     ``aggregate_numeric`` aligns every member to the question's own grid first, so a
     discrete question's ensemble already sits on its ``cdf_size`` points and simply
-    gets that coarse grid's limits. ``method_label`` is used only in log and marker
-    text (e.g. ``"mean"`` or ``"median"``).
+    gets that coarse grid's limits. The value axis the result is labelled with is the
+    question's own (``build_cdf_value_grid`` on the same ``zero_point`` the per-model
+    builds resolve), so ``declared_percentiles`` and ``get_cdf()`` agree with each other
+    and with every member. ``method_label`` is used only in log and marker text (e.g.
+    ``"mean"`` or ``"median"``).
     """
     p_vals = np.clip(p_vals, 0.0, 1.0)
     p_vals = np.maximum.accumulate(p_vals)
@@ -96,8 +99,8 @@ def _postprocess_ensemble_cdf(
         logger.warning(
             "Ensemble CDF ramp smoothing (%s) | Q %s | URL %s | min_prob_delta_before=%.8f | min_prob_delta_after=%.8f",
             method_label,
-            getattr(question, "id_of_question", None),
-            getattr(question, "page_url", None),
+            question.id_of_question,
+            question.page_url,
             min_delta_before,
             min_delta_after,
         )
@@ -112,14 +115,16 @@ def _postprocess_ensemble_cdf(
         model_name=f"ensemble_{method_label}",
     )
 
+    zero_point = resolve_zero_point(question)
+    value_grid = build_cdf_value_grid(question.lower_bound, question.upper_bound, zero_point, len(p_vals))
     declared_percentiles = [
-        Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_vals, p_vals, strict=False)
+        Percentile(percentile=float(p), value=float(v)) for v, p in zip(value_grid, p_vals, strict=True)
     ]
     return create_pchip_numeric_distribution(
         pchip_cdf=list(map(float, p_vals)),
         percentile_list=declared_percentiles,
         question=question,
-        zero_point=question.zero_point,
+        zero_point=zero_point,
     )
 
 
@@ -151,10 +156,10 @@ def _cdf_heights_on_canonical_grid(
 
     Grid index ``i`` means the same thing in every CDF — Metaculus bucket
     ``i / (n - 1)`` of the question's range — so a length mismatch is resolved by
-    interpolating in that shared cdf-location space, NOT in value space: a
-    log-scaled (``zero_point``) question's PCHIP CDF carries a linear value axis
-    while forecasting-tools' fallback builder carries a geometric one, so the
-    x-values disagree by construction even when bucket ``i`` matches.
+    interpolating in that shared cdf-location space, NOT in value space: the PCHIP
+    grid and forecasting-tools' fallback builder compute the same value axis by
+    different formulas, equal in exact arithmetic but not in the last float bits, so
+    only the bucket index is shared by construction.
     """
     heights = np.asarray([float(p.percentile) for p in prediction.get_cdf()], dtype=float)
     if heights.size < 2:
@@ -164,7 +169,7 @@ def _cdf_heights_on_canonical_grid(
     logger.warning(
         "NUMERIC_AGGREGATE_GRID_MISMATCH: question=%s model_index=%d got_points=%d expected_points=%d — "
         "resampling in cdf-location space before aggregation",
-        getattr(question, "id_of_question", None),
+        question.id_of_question,
         model_index,
         heights.size,
         n_points,
@@ -222,9 +227,7 @@ def aggregate_numeric(
         raise ValueError(f"Aligned CDF matrix has shape {heights.shape}, expected {(len(predictions), n_points)}")
 
     p_vals = heights.mean(axis=0) if method == "mean" else np.median(heights, axis=0)
-    x_vals = np.linspace(question.lower_bound, question.upper_bound, n_points)
-
-    return _postprocess_ensemble_cdf(x_vals, p_vals, question, method_label=method)
+    return _postprocess_ensemble_cdf(p_vals, question, method_label=method)
 
 
 def nominal_bounds(question: NumericQuestion) -> tuple[float, float]:

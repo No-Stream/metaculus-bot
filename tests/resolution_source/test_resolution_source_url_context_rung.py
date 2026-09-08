@@ -21,6 +21,7 @@ from metaculus_bot.research.resolution_source import (
 from tests.resolution_source_fakes import (
     _ROBOTS_URL,
     _URL,
+    ROBOTS_ALLOW_ALL,
     FakeResponse,
     FakeSession,
     arm_paid_rung,
@@ -288,6 +289,37 @@ class TestUrlContextRung:
         assert result.status == "no_resolving_content"
         assert result.status_reason == "no_matching_passage"
         assert result.route == "pdf_local"
+
+    @pytest.mark.parametrize(
+        "platform_page",
+        ["https://www.metaculus.com/questions/999/", "https://competitions.mantic.com/questions/650/"],
+    )
+    async def test_a_redirect_onto_the_question_platform_is_never_sent_to_the_paid_reader(
+        self, monkeypatch, platform_page
+    ):
+        """The self-reference refusal is `blocked` with reason `metaculus_self_ref`: inside the
+        trigger STATUSES and outside the trigger POPULATION, like `no_matching_passage`, because WE
+        refused that URL. The paid reader is handed the CITED url, and Gemini would follow the same
+        redirect onto the question's own page — the bypass `ssrf_blocked` is kept out of the set to
+        prevent, plus (on Mantic) the other bots' forecasts read into research as grading evidence.
+        The cited host's robots.txt is served and allowing, so without the exclusion every later gate
+        passes and the one assertion that fails is the paid call."""
+        reader, calls = paid_reader()
+        arm_paid_rung(monkeypatch, reader)
+        session = FakeSession(
+            {
+                _URL: FakeResponse(302, headers={"Location": platform_page}),
+                _ROBOTS_URL: FakeResponse(200, body=ROBOTS_ALLOW_ALL, content_type="text/plain"),
+            }
+        )
+
+        result = await _fetch_one(session, _URL, {}, FetchContext(query="ask"))
+
+        assert calls == [], "the paid reader was handed a URL that redirects onto the question platform"
+        assert result.status == "blocked"
+        assert result.status_reason == "metaculus_self_ref"
+        assert result.route == "direct"
+        assert session.requested == [_URL], "the platform hop must not be dialed by us either"
 
     async def test_a_missing_api_key_skips_without_calling(self, monkeypatch):
         reader, calls = paid_reader()

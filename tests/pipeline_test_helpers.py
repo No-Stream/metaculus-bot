@@ -11,6 +11,7 @@ import asyncio
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
 
 from main import TemplateForecaster
@@ -316,3 +317,46 @@ def make_e2e_bot(
     }
     defaults.update(overrides)
     return TemplateForecaster(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Platform CDF acceptance replica
+# ---------------------------------------------------------------------------
+
+
+def server_min_step(inbound: int) -> float:
+    """The platform's per-bin minimum for ``inbound`` bins, rounded the way the server rounds it."""
+    return round(0.01 / inbound, 9)
+
+
+def server_max_step(inbound: int) -> float:
+    """The platform's per-bin maximum for ``inbound`` bins, UNROUNDED, as the server compares it."""
+    return 0.2 * 200 / inbound
+
+
+def assert_server_accepts_cdf(probs: np.ndarray, *, cdf_size: int, open_lower: bool, open_upper: bool) -> None:
+    """Fail exactly where the platform's ``continuous_cdf`` validator would reject the submission.
+
+    Replicated from ``questions/serializers/common.py`` in the open-source Metaculus backend,
+    which Mantic forked with identical constants: the CDF is rounded to 10 decimals, its PMF to
+    9, and the rounded PMF is compared against the rounded min step and the UNROUNDED max step.
+    """
+    inbound = cdf_size - 1
+    assert len(probs) == inbound + 1, f"len(continuous_cdf)={len(probs)} != inbound_outcome_count + 1={inbound + 1}"
+    assert not np.any(np.isnan(probs))
+
+    rounded = np.round(probs, 10)
+    pmf = np.round(np.diff(rounded), 9)
+    min_diff = server_min_step(inbound)
+    max_diff = server_max_step(inbound)
+    assert np.all(pmf >= min_diff), f"step below server min {min_diff}: min pmf {pmf.min()} at {int(np.argmin(pmf))}"
+    assert np.all(pmf <= max_diff), f"step above server max {max_diff}: max pmf {pmf.max()} at {int(np.argmax(pmf))}"
+
+    if open_lower:
+        assert rounded[0] >= 0.001, f"open lower bound cdf[0]={rounded[0]} < 0.001"
+    else:
+        assert rounded[0] == 0.0, f"closed lower bound cdf[0]={rounded[0]} != 0.0"
+    if open_upper:
+        assert rounded[-1] <= 0.999, f"open upper bound cdf[-1]={rounded[-1]} > 0.999"
+    else:
+        assert rounded[-1] == 1.0, f"closed upper bound cdf[-1]={rounded[-1]} != 1.0"

@@ -140,6 +140,12 @@ FetchStatus = Literal[
 # the ask; the same prose-for-an-absent-section shape as `no_matching_passage`, one rung over,
 # and the token that keeps "we paid and the page has nothing on this" distinguishable from
 # "we paid and Gemini retrieved nothing" (`ungrounded`).
+#
+# `metaculus_self_ref` belongs to `blocked`: a redirect hop WE refused because it landed on the
+# question platform's own site (`resolution_source._vetted_hop_target`). The status stays
+# `blocked` because that spelling is the contract; the reason is what keeps the paid rung off the
+# URL (`_url_context_rung_applies`), the way `ssrf_blocked` is kept out of its trigger set, and
+# what separates "the host refused us" from "we refused the host" on the fetch marker.
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -150,6 +156,7 @@ FetchStatusReason = Literal[
     "budget_skipped",
     "parse_contention",
     "not_addressed",
+    "metaculus_self_ref",
 ]
 
 # Why a RUNG ATTEMPT never ran, carried on `RungAttempt.skipped_reason` (empty when the rung

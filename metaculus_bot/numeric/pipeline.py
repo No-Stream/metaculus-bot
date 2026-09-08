@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
@@ -32,7 +31,7 @@ from metaculus_bot.numeric.config import (
     grid_step_constraints,
 )
 from metaculus_bot.numeric.diagnostics import log_pchip_fallback, validate_cdf_construction
-from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, generate_pchip_cdf, percentiles_to_pchip_format
 from metaculus_bot.numeric.pchip_processing import (
     create_fallback_numeric_distribution,
     create_pchip_numeric_distribution,
@@ -40,8 +39,8 @@ from metaculus_bot.numeric.pchip_processing import (
 )
 from metaculus_bot.numeric.tail_widening import widen_declared_percentiles
 from metaculus_bot.numeric.validation import (
-    check_discrete_question_properties,
     filter_to_standard_percentiles,
+    resolve_zero_point,
     sort_by_percentile_level,
     validate_percentile_count_and_values,
 )
@@ -69,13 +68,7 @@ def sanitize_percentiles(
     ordered = sort_by_percentile_level(filtered)
     adjusted = _apply_jitter_and_clamp(ordered, question, model_name=model_name)
     widened = _maybe_widen_tails(adjusted, question)
-
-    _, should_force_zero_point_none = check_discrete_question_properties(question, PCHIP_CDF_POINTS)
-    zero_point = getattr(question, "zero_point", None)
-    if should_force_zero_point_none:
-        zero_point = None
-
-    return widened, zero_point
+    return widened, resolve_zero_point(question)
 
 
 def build_numeric_distribution(
@@ -128,12 +121,14 @@ def _build_discrete_distribution(
     *,
     model_name: str = "",
 ) -> NumericDistribution:
-    """Build a PCHIP distribution directly on the question's coarse discrete grid.
+    """Build a PCHIP distribution directly on the question's own non-201 grid.
 
     Built ONCE on the grid that publishes: a provisional 201-point build would apply
-    the fine-grid 0.2 cap and emit a phantom ``CDF_MAXSTEP_CLIP`` for a forecast whose
-    published coarse grid has a looser cap and never clipped. A coarse-build failure
+    the 201-grid 0.2 cap and emit a phantom ``CDF_MAXSTEP_CLIP`` for a forecast whose
+    published coarse grid has a looser cap and never clipped. A build failure here
     escapes (no ft fallback), exactly as the post-provisional resample did before.
+    ``declared_percentiles`` is overwritten with the CDF on the question's value axis
+    (geometric on a ``zero_point`` question), the same axis ``get_cdf()`` reports.
     """
     min_step, max_step = grid_step_constraints(target_cdf_size)
     pchip_percentiles = percentiles_to_pchip_format(percentile_list)
@@ -151,9 +146,9 @@ def _build_discrete_distribution(
         question_url=getattr(question, "page_url", None),
         model_name=model_name,
     )
-    x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)
+    value_grid = build_cdf_value_grid(question.lower_bound, question.upper_bound, zero_point, target_cdf_size)
     declared_percentiles = [
-        Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, resampled_cdf, strict=False)
+        Percentile(percentile=float(p), value=float(v)) for v, p in zip(value_grid, resampled_cdf, strict=True)
     ]
     prediction = create_pchip_numeric_distribution(
         pchip_cdf=list(map(float, resampled_cdf)),

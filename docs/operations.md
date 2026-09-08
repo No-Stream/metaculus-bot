@@ -727,9 +727,17 @@ the site actually serves.
 
 Research archive records from a Mantic run carry `tournament_id` equal to
 `MANTIC_TOURNAMENT_ID` and an additive `platform` field (`mantic` or `metaculus`).
-Mantic post ids are small (around 650) and every Metaculus id in our archive is
-35,000 or more, so filenames are not namespaced; the `platform` field is what
-disambiguates if that ever changes. The hazard is logged in `FUTURE.md`.
+Filenames are not namespaced by platform, and `scripts/download_research.py`
+(`build_archive`) groups records on the bare `qid`, so `platform` tells the two
+platforms' records apart inside a group and is what any analysis keyed on bare
+post ids across both platforms must filter on. It cannot stop a Mantic id and a
+Metaculus id that meet from merging into one `by_qid` / `latest` / manifest entry.
+The margin is smaller than "hundreds versus tens of thousands": the evergreen
+`test_questions` set puts Metaculus ids 578, 14333 and 20683 in the archive (578
+is already below the Mantic counter, harmless because the bot only archives the
+open tournament posts it forecasts), so with the open Mantic posts in the 650s
+the next Metaculus key above them is 14333, about 13,700 Mantic posts away. The
+revisit is logged in `FUTURE.md`.
 
 Three things differ from Metaculus in the API, each with its fix:
 
@@ -748,12 +756,12 @@ Three things differ from Metaculus in the API, each with its fix:
    parsing; the `scaling` semantics are identical.
 3. **Grids exceed 200 bins.** The preseason bitcoin question has 450 bins (a
    451-point CDF) and Series 2 allows 2,000. The server's minimum CDF step is
-   `round(0.01 / bins, 9)`; our grid constraints used to floor the step at
-   `MIN_CDF_PROB_STEP` = 5e-5, which is stricter than the server on fine grids and
-   would have forced 2.25% of the mass into a uniform floor at 450 bins (10% at
-   2,000). `numeric/config.grid_step_constraints` now uses the server formula,
-   which is identical at every grid of 201 points or fewer because 0.01 / 200 is
-   5e-5.
+   `round(0.01 / bins, 9)`; our grid constraints used to floor the step at the
+   201-grid value `NUM_MIN_PROB_STEP` (5e-5), which is stricter than the server on
+   fine grids and would have forced 2.25% of the mass into a uniform floor at 450
+   bins (10% at 2,000). `numeric/config.grid_step_constraints` now uses the server
+   formula, which is identical at every grid of 201 points or fewer because 0.01 / 200
+   is 5e-5.
 
 Three Metaculus-shaped guards were generalized rather than bypassed.
 
@@ -765,7 +773,7 @@ Three Metaculus-shaped guards were generalized rather than bypassed.
   side answers unauthenticated with 200 JSON carrying a `results` key, which the
   existing acceptance branch already covers.
 - The publish-hardening forced POST timeout applies to both `metaculus.com` and
-  `competitions.mantic.com` (`_PLATFORM_HOSTS` in `publish_hardening.py`). Without
+  `competitions.mantic.com` (`QUESTION_PLATFORM_HOSTS` in `constants.py`). Without
   it a stalled Mantic POST would be abandoned by the caller while its worker thread
   ran on, the duplicate-publish shape layer 1 exists to prevent.
 - The self-reference refusal shared by the resolution-source fetcher and gap-fill

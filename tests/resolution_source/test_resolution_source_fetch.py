@@ -1307,6 +1307,7 @@ class TestMetaRefreshHop:
         result = await _fetch_one(session, "https://tracker.example.com/p", {})
 
         assert result.status == "blocked"
+        assert result.status_reason == "metaculus_self_ref"
         assert session.requested == ["https://tracker.example.com/p"]
 
     async def test_the_hop_consumes_a_redirect_slot(self):
@@ -1394,8 +1395,12 @@ class TestTheHopRefusalPolicy:
 
         assert isinstance(blocked_both_ways, FetchResult)
         assert blocked_both_ways.status == "ssrf_blocked"
+        assert blocked_both_ways.status_reason is None
         assert isinstance(self_ref_only, FetchResult)
         assert self_ref_only.status == "blocked"
+        # The reason is what keeps the paid rung off a URL we refused (`_url_context_rung_applies`)
+        # while the `blocked` status contract stays intact; it rides the fetch marker as `reason=`.
+        assert self_ref_only.status_reason == "metaculus_self_ref"
 
     async def test_the_render_landing_is_decided_by_the_same_helper(self, monkeypatch, caplog):
         """The decline site with the highest stakes routes through the helper rather than a copy: a

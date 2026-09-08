@@ -4,6 +4,7 @@ Unit tests for numeric validation utilities.
 Tests for percentile validation and processing functions extracted from main.py.
 """
 
+import logging
 from types import SimpleNamespace
 from typing import cast
 
@@ -13,8 +14,8 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import ValidationError
 
 from metaculus_bot.numeric.validation import (
-    check_discrete_question_properties,
     detect_unit_mismatch,
+    resolve_zero_point,
     sort_by_percentile_level,
     validate_percentile_count_and_values,
 )
@@ -181,45 +182,26 @@ class TestPercentileValidation:
 
         assert actual_order == expected_order
 
-    def test_check_discrete_question_properties_discrete(self):
-        """Test discrete question detection."""
-        question = _make_question(cdf_size=100)  # Not 201, so discrete
-        question.zero_point = 1.0
 
-        is_discrete, should_force_none = check_discrete_question_properties(question, 201)
+class TestResolveZeroPoint:
+    """``resolve_zero_point`` picks the ``zero_point`` every CDF for a question is built with."""
 
-        assert is_discrete is True
-        assert should_force_none is True
+    @pytest.mark.parametrize("cdf_size", [201, 100, 451, 2001])
+    def test_log_scaled_question_keeps_its_zero_point_on_any_grid(self, cdf_size):
+        """The platform declares geometric bins on a ``zero_point`` question at every bin count.
 
-    def test_check_discrete_question_properties_continuous(self):
-        """Test continuous question detection."""
-        question = _make_question(cdf_size=201)  # 201, so continuous
-        question.zero_point = None
+        Until 2026-09 a non-201 grid forced ``None`` here, publishing probabilities computed on a
+        linear axis against the platform's geometric bins.
+        """
+        question = _make_question(lower=10.0, zero_point=1.0, cdf_size=cdf_size)
+        assert resolve_zero_point(question) == 1.0
 
-        is_discrete, should_force_none = check_discrete_question_properties(question, 201)
+    def test_linear_question_has_none(self):
+        assert resolve_zero_point(_make_question(cdf_size=201)) is None
 
-        assert is_discrete is False
-        assert should_force_none is False
-
-    def test_check_discrete_question_properties_zero_point_equals_lower_bound(self):
-        """Test zero_point equals lower_bound case."""
-        question = _make_question(lower=0.0, cdf_size=201)
-        question.zero_point = 0.0  # Same as lower_bound
-
-        is_discrete, should_force_none = check_discrete_question_properties(question, 201)
-
-        assert is_discrete is False
-        assert should_force_none is True  # Should force zero_point to None
-
-    def test_check_discrete_question_properties_no_cdf_size(self):
-        """Test question with no cdf_size attribute."""
-        question = _make_question()
-        # Don't set cdf_size attribute at all
-        if hasattr(question, "cdf_size"):
-            delattr(question, "cdf_size")
-        question.zero_point = None
-
-        is_discrete, should_force_none = check_discrete_question_properties(question, 201)
-
-        assert is_discrete is False
-        assert should_force_none is False
+    def test_zero_point_at_the_lower_bound_falls_back_to_linear_and_says_so(self, caplog):
+        """The geometric axis divides by ``lower - zero_point``, so this shape has no log grid."""
+        question = _make_question(lower=0.0, zero_point=0.0, cdf_size=201)
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.validation"):
+            assert resolve_zero_point(question) is None
+        assert "Forcing linear scale" in caplog.text

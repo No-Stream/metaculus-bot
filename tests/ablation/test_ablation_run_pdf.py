@@ -668,20 +668,15 @@ class TestNumericDiscreteGridLength:
 
         The only change at N=201 is which step constants are passed to ``enforce_min_steps`` /
         ``safe_cdf_bounds``. ``grid_step_constraints(201)`` returns exactly the constants the
-        old code hard-coded (``MIN_CDF_PROB_STEP`` / ``MAX_CDF_PROB_STEP``, which equal
-        ``safe_cdf_bounds``'s old defaults ``NUM_MIN_PROB_STEP`` / ``NUM_MAX_STEP``), so the new
-        call is bit-for-bit the old call. We assert both that precondition AND that the emitted
-        201-point CDF equals a verbatim replay of the legacy body.
+        old code hard-coded (``safe_cdf_bounds``'s defaults ``NUM_MIN_PROB_STEP`` /
+        ``NUM_MAX_STEP``), so the new call is bit-for-bit the old call. We assert both that
+        precondition AND that the emitted 201-point CDF equals a verbatim replay of the legacy body.
         """
         import numpy as np
 
         from metaculus_bot.ablation.run_pdf import _compute_numeric_prediction
         from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
-        from metaculus_bot.numeric.config import (
-            MAX_CDF_PROB_STEP,
-            MIN_CDF_PROB_STEP,
-            grid_step_constraints,
-        )
+        from metaculus_bot.numeric.config import grid_step_constraints
         from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
         from metaculus_bot.probabilistic_tools.distributions import (
             eval_cdf,
@@ -689,7 +684,7 @@ class TestNumericDiscreteGridLength:
         )
         from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 
-        assert grid_step_constraints(201) == (MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP) == (NUM_MIN_PROB_STEP, NUM_MAX_STEP)
+        assert grid_step_constraints(201) == (NUM_MIN_PROB_STEP, NUM_MAX_STEP)
 
         question = _make_numeric_q(qid=1, lower=0.0, upper=100.0, open_lower=True, open_upper=True, cdf_size=201)
         block = parse_structured_block(
@@ -704,14 +699,14 @@ class TestNumericDiscreteGridLength:
         assert len(new) == 201
         new_probs = np.array([p.percentile for p in new], dtype=float)
 
-        # Verbatim replay of the pre-parameterization body (hard-coded 201, MIN_CDF_PROB_STEP,
+        # Verbatim replay of the pre-parameterization body (hard-coded 201, NUM_MIN_PROB_STEP,
         # default-arg safe_cdf_bounds). Same fit call → same distribution → same CDF.
         fit = fit_student_t_from_percentiles(block.declared_percentiles, df=5.0)
         grid = np.linspace(0.0, 100.0, 201)
         legacy = np.array([eval_cdf(fit, float(x)) for x in grid], dtype=float)
         legacy = np.clip(legacy, 0.001, 0.999)
         legacy = np.maximum.accumulate(legacy)
-        legacy = enforce_min_steps(legacy, MIN_CDF_PROB_STEP, upper_cap=0.999, lower_cap=0.001)
+        legacy = enforce_min_steps(legacy, NUM_MIN_PROB_STEP, upper_cap=0.999, lower_cap=0.001)
         legacy = np.maximum.accumulate(legacy)
         legacy = safe_cdf_bounds(legacy, True, True)
         assert np.array_equal(new_probs, legacy)

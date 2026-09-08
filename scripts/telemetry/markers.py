@@ -810,7 +810,9 @@ MARKER_SPECS: list[MarkerSpec] = [
         # rather than a page. ``unreadable_document`` splits into ``no_text_layer`` /
         # ``encrypted`` / ``malformed``, and ``unsupported_type`` carries
         # ``budget_skipped`` / ``parse_contention`` when it was a document we were holding
-        # and declined to parse. The provider appends it only where it applies, so the group
+        # and declined to parse. ``blocked`` carries ``metaculus_self_ref`` (2026-09-08) when
+        # the refusal was ours — a redirect onto the question platform's own site — rather
+        # than the host's. The provider appends it only where it applies, so the group
         # is optional in BOTH directions — absent on every line the archive already holds,
         # and absent on a fresh line whose status carries no reason.
         #

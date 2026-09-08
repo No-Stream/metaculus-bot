@@ -332,7 +332,7 @@ Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and neve
 | Startup / CLI | `main.py`, `metaculus_bot/cli.py` |
 | API identity preflight | `metaculus_bot/api_preflight.py` (`verify_api_identity`, its Metaculus wrapper, `ApiIdentityError`) |
 | Mantic platform client (Crucible, a Metaculus fork) | `metaculus_bot/mantic.py` |
-| Publish hardening and close gate | `metaculus_bot/publish_hardening.py` (the `_PLATFORM_HOSTS` POST timeout covers both platforms), `publish_gate.py` |
+| Publish hardening and close gate | `metaculus_bot/publish_hardening.py` (the forced POST timeout is scoped to `QUESTION_PLATFORM_HOSTS` from `constants.py`, so it covers both platforms), `publish_gate.py` |
 | Per-question orchestration | `metaculus_bot/forecaster.py` |
 | Post-fan-out aggregation routing | `metaculus_bot/stacking_route.py` |
 | Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`; `degradation_counters.py` formats immutable snapshots built by `forecaster.py` |

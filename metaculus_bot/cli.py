@@ -231,10 +231,14 @@ def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Cal
 def persisted_platform(run_mode: RunMode) -> str:
     """The question platform this run's research records are archived under.
 
-    Additive next to ``tournament_id``. Mantic post ids (around 650) and the Metaculus ids in
-    the archive (35,000 and up) cannot collide today, so filenames are not namespaced; this
-    field is what tells the two apart if that ever changes, and what an analysis keyed on
-    bare post ids across both platforms has to filter on.
+    Additive next to ``tournament_id``. Archive filenames are not namespaced by platform, and
+    ``scripts/download_research.build_archive`` groups records on the bare qid, so this field
+    tells the two platforms apart inside a group and is what an analysis keyed on bare post
+    ids across both platforms has to filter on; it cannot stop a Mantic id and a Metaculus id
+    that meet from merging into one ``by_qid`` / ``latest`` / manifest entry. The margin is not
+    "hundreds versus tens of thousands": the evergreen ``test_questions`` set puts Metaculus
+    ids 578, 14333 and 20683 in the archive, so with the open Mantic posts in the 650s the next
+    Metaculus key above them is 14333, about 13,700 Mantic posts away.
     """
     return PLATFORM_MANTIC if run_mode == "mantic" else PLATFORM_METACULUS
 

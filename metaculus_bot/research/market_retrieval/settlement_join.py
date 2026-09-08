@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 # `research.public_suffix` leaf, shared with the rendered-fetch JSON harvest; `registrable_domain`
 # is imported here at module scope so this join's callers and tests keep reading it off this
 # module.
+from metaculus_bot.constants import METACULUS_HOST
 from metaculus_bot.research.public_suffix import registrable_domain
 
 # Reuses the SHIPPED extractor and the SHIPPED Metaculus self-reference test rather than
@@ -59,7 +60,7 @@ logger = logging.getLogger(__name__)
 # Mantic competition site (`competitions.mantic.com`) is excluded through the helper ALONE: this
 # set is keyed on registrable domains, and `mantic.com` also carries the company's blog, a
 # legitimate outside source, so the set cannot name the competition host without swallowing it.
-SELF_REFERENCE_DOMAINS: frozenset[str] = frozenset({"kalshi.com", "metaculus.com"})
+SELF_REFERENCE_DOMAINS: frozenset[str] = frozenset({"kalshi.com", METACULUS_HOST})
 
 _WWW_PREFIX_RE = re.compile(r"^www\d*\.")
 

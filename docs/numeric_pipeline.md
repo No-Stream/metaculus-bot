@@ -127,9 +127,15 @@ withholds the member. The archive audit found exact ties in 2 of 346 declaration
 whole-set collapses, supporting this distinction without adding a separate distinct-value
 requirement.
 
-It also decides whether to force `zero_point=None`: discrete questions and questions
-whose `zero_point` equals the lower bound fall back to a linear axis
-(`check_discrete_question_properties` in `numeric/validation.py`).
+It also resolves the `zero_point` every CDF for the question is built with
+(`resolve_zero_point` in `numeric/validation.py`): the question's own, or `None` when it
+equals the lower bound, where the geometric axis divides by zero. A non-201 grid is not a
+reason to drop the log scale. The platform declares geometric bins on a `zero_point`
+question at any bin count and maps the submitted probabilities onto them positionally, so
+the linear axis the bot forced on every non-201 grid until 2026-09 would have published
+probabilities computed at linear positions against geometric bins (a `[1, 1e6]` question
+forecast at 1,000 read back as a median near 1.2). Metaculus never reached that branch,
+because its log-scaled questions are always 201 points; Mantic's fine grids do.
 
 ## Step 4: tail widening
 
@@ -170,10 +176,11 @@ The construction:
 
 Metaculus validates `continuous_cdf` submissions (Mantic runs a fork of the same backend
 with the same constants). The server formulas below are the upstream contract; the
-constants in `constants.py` mirror them at the standard 201-point grid, and
-`numeric/config.py` re-exports them as the 201-grid aliases `MIN_CDF_PROB_STEP` and
-`MAX_CDF_PROB_STEP`. Those aliases are for callers that only ever build 201-point CDFs;
-every other grid derives its limits from `grid_step_constraints`, below.
+constants `NUM_MIN_PROB_STEP` and `NUM_MAX_STEP` in `constants.py` mirror them at the
+standard 201-point grid and are the defaults of the 201-point builders. Every grid,
+including the standard one, derives its live limits from `grid_step_constraints`, below;
+`numeric/config.py` keeps `MAX_CDF_PROB_STEP` as the named 201-grid cap only for the
+residual analysis that reads back CDFs published before the cap scaled with the grid.
 
 - **Length** = `cdf_size`, whose standard-continuous default is `PCHIP_CDF_POINTS`. On
   the platform side that is the question's `inbound_outcome_count + 1`, default 201.
@@ -181,7 +188,10 @@ every other grid derives its limits from `grid_step_constraints`, below.
   server formula is `round(0.01 / N, 9)` where `N = cdf_size - 1`, so 5e-5 at the
   default length.
 - **Max step** per bin `NUM_MAX_STEP` — a spikiness cap. Server formula
-  `0.2 * 200 / N`, so 0.2 at the default length.
+  `0.2 * 200 / N`, so 0.2 at the default length. The server compares its 9-decimal-rounded
+  PMF against this UNROUNDED cap, so on a grid whose cap is not 9-decimal exact a bin sitting
+  exactly at the cap rounds above it and is rejected (450 bins: 0.0888... rounds to
+  0.088888889).
 - **Closed bounds** are pinned exactly: `cdf[0] == 0.0`, `cdf[-1] == 1.0`.
 - **Open bounds**: `cdf[0] >= 0.001`, `cdf[-1] <= 0.999`.
 - **Strictly increasing**, implied by min step > 0.
@@ -191,19 +201,24 @@ The upstream source for all of this is the open-source Metaculus backend,
 `questions/serializers/common.py`. The API itself is documented at
 <https://www.metaculus.com/api/> (Swagger UI).
 
-`grid_step_constraints` (`numeric/config.py`) applies those formulas to any grid,
-exactly as the server does: the min step is `round(0.01 / N, 9)` (the rounding matters,
-because the server compares its own 9-decimal-rounded PMF against it), and the max step
-is `0.2 * 200 / N` clamped at `1.0` (a probability step larger than that is vacuous).
-There is no floor on the min step: an earlier version floored it at the 201-grid value,
-which was a no-op on every Metaculus grid but 2.25x stricter than the server at 450 bins
-and 10x at 2,000, forcing that much extra uniform mixture into fine-grid tails. Mantic
-quantitative questions run up to 2,000 bins, so the floor was removed in 2026-09
-(`tests/test_numeric_fine_grids.py` pins the formulas and the 451- and 2,001-point
-publish path). On the standard continuous grid the function returns exactly
-`(MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP)`, so continuous questions are unaffected; a
-coarse discrete grid relaxes the max step upward, which is what lets a small-count
-distribution keep its mass concentrated on the low integers.
+`grid_step_constraints` (`numeric/config.py`) applies those formulas to any grid as the
+9-decimal values that survive the server's rounding: the min step is `round(0.01 / N, 9)`,
+the server's own rounded floor, and the max step is the largest 9-decimal value not
+exceeding `0.2 * 200 / N`, clamped at `1.0` (a probability step larger than that is
+vacuous). The max-step floor exists because `safe_cdf_bounds` clips over-cap bins to
+exactly the max step: with the raw cap, a clipped bin on the live 451-point Mantic question
+rounded up to 0.088888889 and the whole submission was rejected with HTTP 400 (found in
+review 2026-09, before any live run). The floor is a no-op wherever the cap is 9-decimal
+exact, which covers every grid of 41 points or fewer and the 51, 101, 201 and 2,001-point
+grids. There is no floor on the min step: an earlier version floored it at the 201-grid
+value, which was a no-op on every Metaculus grid but 2.25x stricter than the server at 450
+bins and 10x at 2,000, forcing that much extra uniform mixture into fine-grid tails. Mantic
+quantitative questions run up to 2,000 bins, so that floor was removed in 2026-09
+(`tests/test_numeric_fine_grids.py` pins the formulas and the 451- and 2,001-point publish
+path, broad and cap-binding). On the standard continuous grid the function returns exactly
+`(NUM_MIN_PROB_STEP, NUM_MAX_STEP)`, so continuous questions are unaffected; a coarse
+discrete grid relaxes the max step upward, which is what lets a small-count distribution
+keep its mass concentrated on the low integers.
 
 `safe_cdf_bounds` (`numeric/pchip_cdf.py`) enforces the max-step rule by
 redistributing excess mass while preserving the total, then re-enforces min-step after
@@ -279,7 +294,7 @@ an open lower bound at 0% once the standard set includes P1, which Metaculus rej
 
 ### Piling on an open edge (`OPEN_BOUND_PILING`)
 
-A sibling WARN, `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... declared_edge=... bound_value=...` (`numeric/diagnostics.py`, threshold `OPEN_BOUND_PILING_THRESHOLD` in `numeric/config.py`), fires when a model piles at least that fraction of mass on the terminal displayed bin of an *open*-bound numeric question without declaring any percentile beyond the edge — the "crammed the open ceiling" failure mode fixed 2026-07-12 by rendering nominal/displayed bounds in the numeric prompts (`nominal_bounds` in `numeric/utils.py`). It takes the pre-resample model-declared percentiles explicitly (the discrete resample overwrites `prediction.declared_percentiles` with a grid pinned to the raw bounds, which would defeat the above-edge exemption).
+A sibling WARN, `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... declared_edge=... bound_value=...` (`numeric/diagnostics.py`, threshold `OPEN_BOUND_PILING_THRESHOLD` in `numeric/config.py`), fires when a model piles at least that fraction of mass on the terminal displayed bin of an *open*-bound numeric question without declaring any percentile beyond the edge — the "crammed the open ceiling" failure mode fixed 2026-07-12 by rendering nominal/displayed bounds in the numeric prompts (`nominal_bounds` in `numeric/utils.py`). It takes the pre-resample model-declared percentiles explicitly (the discrete resample overwrites `prediction.declared_percentiles` with a grid pinned to the raw bounds, which would defeat the above-edge exemption). The threshold is calibrated against the 201-grid per-bin cap of 0.2 and scales down with the grid's own cap on finer grids (0.044 at 451 points, 0.01 at 2,001), because the max-step repair clips a crammed terminal bin to that cap, which on a fine grid is below the fixed 0.10; the 201-point and every coarser grid keep 0.10 exactly.
 
 ### The MIN-step repair-tier signals are dead code on real forecasts
 
@@ -356,9 +371,9 @@ Step 3 no longer spreads whole-set collapses.
 1. Read each model's CDF heights in ORDER and align them POSITIONALLY: grid index `i` is
    Metaculus bucket `i/(n-1)`, so index `i` means the same thing for every model. A CDF
    that arrives on a different-length grid is resampled in cdf-LOCATION space (never
-   value space — a log-scaled `zero_point` question's PCHIP CDF carries a linear value
-   axis while forecasting-tools' fallback builder carries a geometric one, so their
-   x-values disagree by construction even when bucket `i` matches) and logs
+   value space: the PCHIP grid and forecasting-tools' builder compute the same value axis
+   by different formulas, equal in exact arithmetic but not in the last float bits, so
+   only the bucket index is shared by construction) and logs
    `NUMERIC_AGGREGATE_GRID_MISMATCH`, which should read zero in prod.
 2. Take the mean or median of the cumulative probabilities at each index.
 
@@ -372,7 +387,13 @@ Step 3 no longer spreads whole-set collapses.
    min-step, and runs `safe_cdf_bounds` with the step limits of the grid the CDF is on
    (`grid_step_constraints`). Nothing is resampled at this stage: step 1 already put the
    ensemble on the question's `cdf_size` grid, so a discrete question's aggregate gets
-   the coarse grid's limits by construction.
+   the coarse grid's limits by construction. The result is labelled with the question's
+   own value axis (`build_cdf_value_grid` on the `zero_point` that `resolve_zero_point`
+   picked, the same one every member was built with), so the aggregate's
+   `declared_percentiles`, its `get_cdf()` and the members all agree on where each
+   probability sits. Until 2026-09 the aggregate's `declared_percentiles` were labelled
+   with a linear axis even on a `zero_point` question, so the comment and the spread
+   metric read a different distribution from the one published.
 
 Percentile-space averaging would blur multi-modal disagreement; CDF-space averaging
 preserves it. In production the base-combine path uses **MEDIAN** of the raw per-model

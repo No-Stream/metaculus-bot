@@ -70,11 +70,15 @@ class ResearchPersistenceWriter:
         own field to keep records self-contained for grep-based triage.
 
         ``platform`` (``PLATFORM_METACULUS`` / ``PLATFORM_MANTIC``, since 2026-09-08) says
-        which question platform ``qid``, ``post_id`` and ``page_url`` belong to. Mantic post
-        ids (around 650) and the Metaculus ids in the archive (35,000 and up) cannot collide
-        today, so filenames stay un-namespaced and this field is what disambiguates if that
-        changes. Additive with passthrough readers; records older than the field are all
-        Metaculus.
+        which question platform ``qid``, ``post_id`` and ``page_url`` belong to. Filenames
+        stay un-namespaced and the archive builder groups on the bare qid, so this field
+        separates the two platforms' records within a group and is what a cross-platform
+        analysis filters on; it does not stop a Mantic id and a Metaculus id that meet from
+        sharing one ``by_qid`` / ``latest`` entry. The margin is the gap from the Mantic
+        counter (the open posts are in the 650s) to 14333, the next Metaculus key above it:
+        the evergreen test-question set puts 578, 14333 and 20683 in the archive, and every
+        other Metaculus key is 38,000 and up. Additive with passthrough readers; records
+        older than the field are all Metaculus.
 
         ``asknews_raw`` is the raw pre-summarization AskNews article markdown
         (2026-07-18 audit hygiene): ``research_text`` carries only the

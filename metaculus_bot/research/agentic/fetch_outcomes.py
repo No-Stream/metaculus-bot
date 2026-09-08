@@ -30,7 +30,7 @@ from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
-from metaculus_bot.constants import GAP_FILL_V2_MIN_CONTENT_CHARS, MANTIC_HOST
+from metaculus_bot.constants import GAP_FILL_V2_MIN_CONTENT_CHARS, MANTIC_HOST, METACULUS_HOST
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO
 from metaculus_bot.research.resolution_fetch_result import PDF_CONTENT_TYPES
@@ -197,7 +197,7 @@ def _document_needed_result(current_url: str, content_type: str) -> PlainFetchRe
 
 _PLATFORM_FETCH_BLOCK_MSG = (
     "Metaculus and Mantic pages are already reflected in the question brief; "
-    f"do not fetch metaculus.com or {MANTIC_HOST} URLs."
+    f"do not fetch {METACULUS_HOST} or {MANTIC_HOST} URLs."
 )
 
 
@@ -211,11 +211,17 @@ def _fetch_plain_url_block(url: str) -> PlainFetchResult | None:
     # from our runner IP. Metaculus question pages are a JS SPA whose near-empty plain
     # fetch would auto-escalate to headless Chromium, whose route guard then permits
     # the SPA's own XHR fan-out to the Metaculus API — all from our IP, on the same
-    # host the critical API calls use; a Mantic question page additionally shows the
-    # other bots' forecasts, which must not leak into research. Blocking here (before
-    # _get_session) kills both our-IP rungs; rendered only runs after a plain fetch.
-    # The brief already embeds the resolution criteria these URLs would yield.
-    # (read_document is Gemini's IP, not ours, so it is not gated.)
+    # host the critical API calls use. Blocking here (before _get_session) kills both
+    # our-IP rungs; rendered only runs after a plain fetch. The brief already embeds the
+    # resolution criteria these URLs would yield.
+    # What this does NOT cover: read_document's paid Gemini read dials from Google's IP,
+    # so it is deliberately ungated here and would read a platform page the driver hands
+    # it, other bots' forecasts included on a Mantic question page. Keeping those out of
+    # research rests on FETCH_DESCRIPTION telling the driver not to fetch these hosts
+    # (pinned in tests/test_agentic_tools.py) and on the resolution-source pre-filter never
+    # citing one, so the driver only meets a platform URL it picked out of a search result.
+    # The resolution-source ladder's own paid rung IS closed to a self-reference
+    # (`resolution_source._url_context_rung_applies`); this v2 path is not.
     if resolution_source.is_metaculus_self_ref(url):
         return PlainFetchResult(
             status="blocked",

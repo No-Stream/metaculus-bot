@@ -21,24 +21,29 @@ questions are forecast while the date question is dropped with a warning; every 
 comment POST goes to the Mantic API with the payload shape that platform validates, including a
 451-point CDF the server's own rules accept; and nothing in the run contacts metaculus.com.
 
+A second run, over the same posts with the bot's own forecast already standing on one of them, proves
+the already-forecast skip that the first run cannot: the workflow fires hourly, so once it has run
+once that is the state of nearly every question, and a skip that silently failed would re-spend the
+whole ensemble every hour. That run must make no forecast POST, no comment POST and no forecaster
+call for the forecast question while the others still publish.
+
 The fixture (``tests/data/mantic_preseason2_posts_2026_09_08.json``) is the authenticated
-``GET /api/posts/?tournaments=preseason-2`` response from the 2026-09-08 live probe. Its questions
-close 2026-09-20, which becomes the past: the loaded copy is re-dated into the future here, because
-the intake time budget skips a question whose close leaves no room and the publish gate skips a
-question that has closed, both against the real clock.
+``GET /api/posts/?tournaments=preseason-2`` response from the 2026-09-08 live probe (its path, post
+ids and the already-forecast derivation live in ``tests/mantic_fakes.py``). Its questions close
+2026-09-20, which becomes the past: the loaded copy is re-dated into the future here, because the
+intake time budget skips a question whose close leaves no room and the publish gate skips a question
+that has closed, both against the real clock.
 """
 
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import logging
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -72,22 +77,24 @@ from metaculus_bot.constants import (
 from metaculus_bot.mantic import ManticClient
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.time_budget import QuestionTimeBudget
-from tests.pipeline_test_helpers import make_e2e_bot
-
-# Imported rather than copied: one source for what the platform's CDF validator accepts.
-from tests.test_numeric_fine_grids import _assert_server_accepts
+from tests.mantic_fakes import (
+    BINARY_POST_ID,
+    DATE_POST_ID,
+    DISCRETE_POST_ID,
+    MULTIPLE_CHOICE_POST_ID,
+    load_preseason_posts,
+    with_prior_forecast,
+)
+from tests.pipeline_test_helpers import assert_server_accepts_cdf, make_e2e_bot
 
 pytestmark = pytest.mark.e2e
-
-_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_preseason2_posts_2026_09_08.json"
 
 _FAKE_TOKEN = "m" * 40
 _EXPECTED_AUTH = f"Token {_FAKE_TOKEN}"
 
-BINARY_POST_ID = 648
-MULTIPLE_CHOICE_POST_ID = 649
-DISCRETE_POST_ID = 650
-DATE_POST_ID = 651
+# The second run: the bot's forecast already stands on the binary question, leaving two fresh supported ones.
+_PRIOR_FORECAST_POST_ID = BINARY_POST_ID
+_STILL_FRESH_POST_IDS = frozenset({MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID})
 
 # Derived from the base URL, so the routing paths and the asserted prefixes cannot disagree.
 _POSTS_URL = f"{MANTIC_API_BASE_URL}/posts/"
@@ -106,10 +113,11 @@ _RESEARCH_TEXT = (
     "no forecast in this run depends on the contents of this section.\n"
 )
 
-# Per-forecaster declarations. Every triple's spread sits below its type's conditional-stacking
-# threshold, so each question takes production's route: skip the stacker, publish the median.
+# Per-forecaster declarations; every triple's spread sits below its stacking threshold, so the median publishes.
 _BINARY_MEMBER_PROBS: tuple[float, ...] = (0.20, 0.22, 0.25)
 _BINARY_MEDIAN = 0.22
+# What the platform reports as standing after the previous run published that median: ``[1 - p, p]``.
+_BINARY_PRIOR_FORECAST_VALUES = (1.0 - _BINARY_MEDIAN, _BINARY_MEDIAN)
 # In the fixture's option order: a hike above 25bp, a 25bp hike, a hold, a cut.
 _MC_MEMBER_PROBS: tuple[tuple[float, ...], ...] = (
     (0.05, 0.10, 0.55, 0.30),
@@ -143,9 +151,7 @@ def _future_dated_posts() -> list[dict[str, Any]]:
     Both levels are rewritten: the framework reads the close and resolve times off the QUESTION
     json, while the post-level copies are what a reader of this fixture would compare against.
     """
-    with _FIXTURE_PATH.open() as f:
-        payload = json.load(f)
-    posts: list[dict[str, Any]] = copy.deepcopy(payload["results"])
+    posts = load_preseason_posts()
     now = datetime.now(UTC)
     close_iso = _iso(now + _CLOSE_OFFSET)
     open_iso = _iso(now - _OPEN_OFFSET)
@@ -251,8 +257,7 @@ def _install_llm_stub(mp: pytest.MonkeyPatch, responses_by_title: dict[str, list
 # The fake Mantic transport
 # ---------------------------------------------------------------------------
 
-# Mantic's list filter speaks ``quantitative`` for what forecasting-tools calls numeric and discrete;
-# the fake honours that vocabulary, so asserting the parameter's absence has teeth.
+# Mantic's ``forecast_type`` vocabulary, honoured by the fake so asserting the parameter's absence has teeth.
 _MANTIC_FILTER_TYPE = {
     "binary": "binary",
     "multiple_choice": "multiple_choice",
@@ -404,6 +409,15 @@ class _ManticRun:
     def comment_posts(self) -> list[_RecordedRequest]:
         return [r for r in self.requests if r.path == _COMMENT_PATH]
 
+    def posted_question_ids(self) -> set[int]:
+        return {r.body[0]["question"] for r in self.forecast_posts()}
+
+    def commented_post_ids(self) -> set[int]:
+        return {r.body["on_post"] for r in self.comment_posts()}
+
+    def mantic_question_marker_lines(self) -> list[str]:
+        return [line for line in self.log_text.splitlines() if line.startswith("MANTIC_QUESTION:")]
+
     def forecast_payload(self, question_id: int) -> dict[str, Any]:
         payloads = [r.body[0] for r in self.forecast_posts() if r.body[0]["question"] == question_id]
         assert len(payloads) == 1, f"expected exactly one forecast POST for question {question_id}, got {payloads}"
@@ -425,16 +439,18 @@ async def _stub_research(question: MetaculusQuestion, time_budget: QuestionTimeB
     return _RESEARCH_TEXT
 
 
-@pytest.fixture(scope="module")
-def mantic_run() -> Iterator[_ManticRun]:
-    """One full mantic-mode run, executed once; every test below reads its recorded effects.
+def _run_mantic_mode(posts: list[dict[str, Any]]) -> Iterator[_ManticRun]:
+    """One full mantic-mode run over ``posts``; the module-scoped fixtures below each wrap one.
 
-    Module-scoped and synchronous so the pipeline runs a single time (and so the process-global
-    patches are installed and removed once). The framework's tournament fetch calls
-    ``asyncio.run`` inside the running loop, which works because forecasting-tools applies
-    nest_asyncio at import — the same nesting production relies on.
+    Synchronous so each fixture runs the pipeline a single time (and installs and removes the
+    process-global patches once). The framework's tournament fetch calls ``asyncio.run`` inside the
+    running loop, which works because forecasting-tools applies nest_asyncio at import — the same
+    nesting production relies on.
+
+    The bot is built in ``cli.main``'s shape for a mantic run, with two deliberate notes:
+    ``is_benchmarking=False`` keeps the publish path real, and ``min_forecasters_to_publish`` is the
+    full roster (production's floor is 1) so a forecaster lost to a stub defect fails the test.
     """
-    posts = _future_dated_posts()
     with pytest.MonkeyPatch.context() as mp:
         # The environment a Mantic run requires, though the client below is handed its token.
         mp.setenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, "false")
@@ -446,9 +462,6 @@ def mantic_run() -> Iterator[_ManticRun]:
         recorded = _install_fake_transport(mp, posts)
         llm_calls = _install_llm_stub(mp, _canned_responses(posts))
 
-        # cli.main's shape for a mantic run, with two deliberate notes: ``is_benchmarking=False``
-        # keeps the publish path real, and ``min_forecasters_to_publish`` is the full roster
-        # (production's floor is 1) so a forecaster lost to a stub defect fails this test.
         bot = make_e2e_bot(
             AggregationStrategy.CONDITIONAL_STACKING,
             n_forecasters=_FORECASTS_PER_QUESTION,
@@ -470,6 +483,29 @@ def mantic_run() -> Iterator[_ManticRun]:
             records=records,
             posts=posts,
         )
+
+
+@pytest.fixture(scope="module")
+def mantic_run() -> Iterator[_ManticRun]:
+    """The preseason's first run: every question fresh, every supported one forecast and published."""
+    yield from _run_mantic_mode(_future_dated_posts())
+
+
+@pytest.fixture(scope="module")
+def mantic_run_after_prior_forecast() -> Iterator[_ManticRun]:
+    """The hourly workflow's steady state: the bot's own forecast already stands on one question.
+
+    The binary question carries a prior forecast of this run's own median, the way the platform
+    reports it once the previous scheduled run has published; the other three posts are the same
+    re-dated copies the first run sees.
+    """
+    posts = [
+        with_prior_forecast(post, forecast_values=_BINARY_PRIOR_FORECAST_VALUES)
+        if post["id"] == _PRIOR_FORECAST_POST_ID
+        else post
+        for post in _future_dated_posts()
+    ]
+    yield from _run_mantic_mode(posts)
 
 
 @pytest.fixture
@@ -509,7 +545,7 @@ class TestTheFetchGoesThroughTheManticClient:
     def test_all_four_preseason_questions_were_parsed(self, mantic_run: _ManticRun) -> None:
         """One MANTIC_QUESTION marker per parsed question, so this counts what the client returned
         rather than what survived the bot's own type guard."""
-        marker_lines = [line for line in mantic_run.log_text.splitlines() if line.startswith("MANTIC_QUESTION:")]
+        marker_lines = mantic_run.mantic_question_marker_lines()
         assert len(marker_lines) == len(mantic_run.posts)
         for post_id in (BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID):
             assert any(f"post={post_id} " in line for line in marker_lines)
@@ -534,10 +570,51 @@ class TestTypeRouting:
         assert "Skipping 1 unsupported question(s)" in warnings[0]
 
     def test_the_date_question_is_never_posted(self, mantic_run: _ManticRun) -> None:
-        posted_question_ids = {r.body[0]["question"] for r in mantic_run.forecast_posts()}
-        commented_post_ids = {r.body["on_post"] for r in mantic_run.comment_posts()}
-        assert DATE_POST_ID not in posted_question_ids
-        assert DATE_POST_ID not in commented_post_ids
+        assert DATE_POST_ID not in mantic_run.posted_question_ids()
+        assert DATE_POST_ID not in mantic_run.commented_post_ids()
+
+
+class TestThePreviouslyForecastQuestionIsSkipped:
+    """The hourly workflow's steady state, and the direction with power.
+
+    With every fixture history empty, ``already_forecasted`` is False whether ``my_forecasts`` is
+    read correctly or is missing entirely (the framework derives it inside a blanket except that
+    answers False), so the first run cannot tell a working skip from a no-op one. Only a question
+    that already carries the bot's forecast can, and after the first scheduled run of the preseason
+    window that is nearly every question on every run: a skip that fails silently re-spends the
+    whole ensemble, hourly, on questions the bot has already answered.
+    """
+
+    def test_the_skip_is_logged(self, mantic_run_after_prior_forecast: _ManticRun) -> None:
+        assert "Skipping 1 previously forecasted questions" in mantic_run_after_prior_forecast.log_text
+
+    def test_nothing_is_posted_for_the_forecast_question(self, mantic_run_after_prior_forecast: _ManticRun) -> None:
+        assert _PRIOR_FORECAST_POST_ID not in mantic_run_after_prior_forecast.posted_question_ids()
+        assert _PRIOR_FORECAST_POST_ID not in mantic_run_after_prior_forecast.commented_post_ids()
+
+    def test_no_forecaster_ran_on_it(self, mantic_run_after_prior_forecast: _ManticRun) -> None:
+        """The skip must happen before the fan-out: no LLM spend, not just no publish."""
+        run = mantic_run_after_prior_forecast
+        skipped_title = next(post["question"]["title"] for post in run.posts if post["id"] == _PRIOR_FORECAST_POST_ID)
+        assert skipped_title not in run.llm_calls.forecaster_calls
+        assert len(run.llm_calls.forecaster_calls) == _FORECASTS_PER_QUESTION * len(_STILL_FRESH_POST_IDS)
+        assert run.llm_calls.unexpected_prompts == []
+
+    def test_the_other_questions_still_publish(self, mantic_run_after_prior_forecast: _ManticRun) -> None:
+        run = mantic_run_after_prior_forecast
+        assert not [r for r in run.reports if isinstance(r, BaseException)], run.reports
+        reported = {r.question.id_of_post for r in run.reports if isinstance(r, ForecastReport)}
+        assert reported == _STILL_FRESH_POST_IDS
+        assert run.posted_question_ids() == _STILL_FRESH_POST_IDS
+        assert run.commented_post_ids() == _STILL_FRESH_POST_IDS
+
+    def test_the_skipped_question_was_fetched_and_parsed(self, mantic_run_after_prior_forecast: _ManticRun) -> None:
+        """It is the bot's filter that drops it, downstream of a client that parsed it: this run
+        still sees all four posts, so the skip cannot be a fetch that quietly lost one."""
+        run = mantic_run_after_prior_forecast
+        marker_lines = run.mantic_question_marker_lines()
+        assert len(marker_lines) == len(run.posts)
+        assert any(f"post={_PRIOR_FORECAST_POST_ID} " in line for line in marker_lines)
 
 
 class TestPublishedPayloads:
@@ -581,7 +658,7 @@ class TestPublishedPayloads:
         assert len(cdf) == cdf_size
         probs = np.asarray(cdf, dtype=float)
         assert np.all(np.diff(probs) >= 0.0), "the CDF must be non-decreasing"
-        _assert_server_accepts(
+        assert_server_accepts_cdf(
             probs,
             cdf_size=cdf_size,
             open_lower=scaling["open_lower_bound"],
