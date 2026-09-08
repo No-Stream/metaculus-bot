@@ -230,7 +230,10 @@ people up is the two OpenRouter keys.
   Its server-side allowed-providers list is locked to those three, so anything
   else (Grok via x-ai, Qwen, Perplexity) returns 404 on this key. This is the
   only shared credential in the bot; despite the name it covers all three
-  providers, not just OpenAI and Anthropic.
+  providers, not just OpenAI and Anthropic. `DONATED_OPENROUTER_KEY_ENABLED`
+  (default `true`) is its master switch: `--mode mantic` requires it to read false
+  and fails shut otherwise, because the key was donated for Metaculus tournaments
+  (see "Mantic" below).
 - **`OPENROUTER_API_KEY` — personal.** Pays for what the donated key can't
   (Grok, Qwen, Perplexity-via-OpenRouter) and serves as the fallback when the
   donated key hits a credential, credit, or allowed-providers error. The
@@ -275,7 +278,8 @@ Gemini has two separate routes, which is the other easy thing to confuse:
   does anything else on the OpenRouter side — what that key costs is its own
   subsection below.
 
-Other keys, all personal, no shared variants: `METACULUS_TOKEN`, `ASKNEWS_CLIENT_ID`
+Other keys, all personal, no shared variants: `METACULUS_TOKEN`, `MANTIC_TOKEN`
+(the Crucible bot token, read only in `--mode mantic`), `ASKNEWS_CLIENT_ID`
 + `ASKNEWS_SECRET`, `EXA_API_KEY`, `PERPLEXITY_API_KEY`, `FRED_API_KEY`,
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`. The two direct provider keys only matter
 if you bypass OpenRouter; most flows route through OpenRouter and don't need
@@ -290,7 +294,8 @@ OFF, in which case suspect `OPENROUTER_API_KEY`; and anything on
 `DONATED_KEY_BLOCKED_GOOGLE_MODELS` is pinned to the personal key with no donated
 attempt, so a credit error on one of those models is always a personal-key issue.
 A 401/402 on Grok, Qwen, or Perplexity is always the personal key
-(the donated key 404s on those). A `google-genai` 401 or quota error is always
+(the donated key 404s on those), and so is every OpenRouter auth error on a
+`--mode mantic` run, where the donated key is switched off entirely. A `google-genai` 401 or quota error is always
 `GOOGLE_API_KEY`. A `403` splits three ways, with the reported status deciding the
 branch and the spend-cap phrase outranking it:
 
@@ -510,9 +515,9 @@ CRPS and is no better than median on binary.
 
 ## GitHub Actions workflows
 
-Five bot workflows live in `.github/workflows/`. They share the same setup
+Six bot workflows live in `.github/workflows/`. They share the same setup
 (checkout, `uv sync --no-dev --frozen`, install Playwright Chromium), the same env
-block, and a `timeout-minutes` job cap
+block (the Mantic one differs only in its keys; see "Mantic" below), and a `timeout-minutes` job cap
 that is a backstop for a wedged run, not a normal duration. Each tees stdout and
 stderr to a `run_logs/` file and uploads it as an artifact with 90-day
 retention.
@@ -537,10 +542,11 @@ hit nor a hostile page can inflate the install-failed signal.
 | `run_bot_on_tournament.yaml` | cron at :03/:23/:43 hourly, plus manual | `tournament` | Forecasts new questions in the current AI benchmark tournament (`TOURNAMENT_ID` in `constants.py`); publishes to Metaculus |
 | `run_bot_on_minibench.yaml` | cron at :08/:38 hourly in the YAML, but the workflow is disabled on GitHub — see below | `minibench` | Forecasts the current MiniBench question set; publishes |
 | `run_bot_on_metaculus_cup.yaml` | cron at :13/:33/:53 hourly, plus manual | `metaculus_cup` | Forecasts open Metaculus Cup questions (`METACULUS_CUP_ID` in `constants.py`, the season's dated slug); publishes |
+| `run_bot_on_mantic.yaml` | cron at :17/:47 hourly, plus manual | `mantic` | Forecasts open questions in the Mantic Crucible tournament (`MANTIC_TOURNAMENT_ID` in `constants.py`) on the operator's personal keys only; publishes to competitions.mantic.com. See "Mantic" below |
 | `test_bot.yaml` | manual only (`workflow_dispatch`) | `test_questions` | Runs a fixed handful of example questions end-to-end in prod mode; publishes comments |
 | `test_bot_basic.yaml` | manual only (`workflow_dispatch`) | `test_questions` | One-question smoke test; publishes one comment. See below |
 
-The three prod workflows are the only ones with a `schedule:` block; both test
+The four prod workflows are the only ones with a `schedule:` block; both test
 workflows are `workflow_dispatch` and never fire on their own.
 
 **A `schedule:` block in the YAML is not the same as a workflow that runs.**
@@ -564,18 +570,18 @@ gh workflow list --repo No-Stream/metaculus-bot --all
 and no default repo is configured, so a bare `gh workflow` command silently
 targets upstream.
 
-All five skip already-forecasted questions
+All six skip already-forecasted questions
 (`skip_previously_forecasted_questions`) except in `test_questions` mode, where
 `cli.py` deliberately turns that off so a re-run re-forecasts the same test
-question. The three scheduled workflows split their cron across offset entries
+question. The four scheduled workflows split their cron across offset entries
 because GitHub silently drops `*/N` schedules under runner load, and a
 `concurrency` group prevents overlapping runs of the same workflow.
 `test_bot_basic.yaml` has its own group, so a smoke run never contends with a
 full `test_bot` run.
 
-All five bot workflows (the three prod tournaments plus `test_bot` and
+All six bot workflows (the four prod tournaments plus `test_bot` and
 `test_bot_basic`) upload their artifact as `research-<run_id>` with both
-`research_outputs/` and `run_logs/`, and all five set
+`research_outputs/` and `run_logs/`, and all six set
 `PERSIST_RESEARCH_ENABLED`. The two test workflows joined that shape on
 2026-08-03: they previously uploaded `logs-<run_id>` with only `run_logs/` and
 set no persist flag, which was framed as keeping test runs out of the research
@@ -673,6 +679,187 @@ tee'd from `run_logs/` during the run, alongside the run's
 The general telemetry markers under "Reading run logs" below apply too; those
 are just the money-shaped ones.
 
+## Mantic (Crucible) tournament
+
+Mantic runs a bot-only forecasting competition called Crucible at
+<https://competitions.mantic.com> on a fork of the open-source Metaculus platform.
+The API is the same shape as Metaculus (Swagger UI at
+<https://competitions.mantic.com/api/>, spec at `/static/openapi.e7df88a15335.yml`),
+authentication is the same `Authorization: Token <40-char token>` header, and the
+bot's user there is `nostreambot-bot`. Mantic pays $3 per forecast; the bot's
+per-question cost is about $2.60, all of it on the operator's personal keys.
+`--mode mantic` runs the whole per-question pipeline unchanged and swaps only the
+platform client. Everything in this section was verified against the live API on
+2026-09-08.
+
+The current target is Preseason 2: slug `preseason-2` (`MANTIC_TOURNAMENT_ID`),
+project id 4, forecasting closes 2026-09-20 12:00 UTC (`MANTIC_TOURNAMENT_END_DATE`),
+`score_type` `spot_baseline_tournament`. It holds four questions: one binary, one
+multiple choice with four options, one discrete with 450 bins and
+`multi_resolution: true` (scored against eleven daily bitcoin prices and averaged),
+and one date question with twelve daily bins. Series 2 follows it, under rules
+Mantic published for the season: baseline scoring; the leaderboard is the sum of a
+bot's top 95% of forecasts; a missed question scores the field's 25th percentile;
+questions with fewer than two forecasts are excluded; a `quantitative` type merges
+numeric and discrete with up to 2,000 bins; date questions default to daily bins;
+and a multi-resolution question scores one distribution against several
+resolutions. Series 1 windows were exactly one hour long, opened on the hour, with
+up to three questions per hour. The Series 2 cadence is unannounced. Forecast every
+question: a miss costs more than a poor forecast under that scoring. When Series 2
+opens, re-point `MANTIC_TOURNAMENT_ID` and `MANTIC_TOURNAMENT_END_DATE` in
+`constants.py`; an unknown slug answers HTTP 400.
+
+### How the mode works
+
+`metaculus_bot/mantic.py` defines `ManticClient`, a `MetaculusClient` subclass
+pointed at `MANTIC_API_BASE_URL` and authenticated with `MANTIC_TOKEN`
+(`build_mantic_client()` raises a clear error when the variable is unset). `cli`
+hands it to the framework through the `metaculus_client=` seam on
+`TemplateForecaster`, so the tournament fetch, the forecast POST and the comment
+POST all go through it. Subclassing keeps the repo's class-level fetch and publish
+hardening patches, because they patch `MetaculusClient` methods the subclass does
+not override. Comments stay private, which is the framework default on both
+platforms. Each fetched question logs a `MANTIC_QUESTION` marker with the post id,
+question id, raw type, `cdf_size`, `multi_resolution`, `date_granularity` and
+`precision`, so the fields Mantic adds are recoverable from run logs. `page_url` is
+rewritten to `https://competitions.mantic.com/questions/<post_id>/`, the URL shape
+the site actually serves.
+
+Research archive records from a Mantic run carry `tournament_id` equal to
+`MANTIC_TOURNAMENT_ID` and an additive `platform` field (`mantic` or `metaculus`).
+Mantic post ids are small (around 650) and every Metaculus id in our archive is
+35,000 or more, so filenames are not namespaced; the `platform` field is what
+disambiguates if that ever changes. The hazard is logged in `FUTURE.md`.
+
+Three things differ from Metaculus in the API, each with its fix:
+
+1. **The list filter `forecast_type` uses the value `quantitative`** for what the
+   framework still calls `numeric` and `discrete`. The framework's default
+   `ApiFilter` sends `forecast_type=numeric,discrete,...` and Mantic returns no
+   quantitative questions for it at all (probed: `discrete` gives an empty list,
+   `quantitative` gives the one bitcoin question, no filter gives all four). The
+   Mantic fetch omits the type parameter and lets the bot's own type guard in
+   `forecaster.forecast_questions` filter.
+2. **A question's `type` may be the string `quantitative`.** The spec's enum
+   includes it for Series 2 questions (the live preseason question still says
+   `discrete`). forecasting-tools 0.2.92 raises on an unknown type and the caller
+   swallows that as a warning, so such a question would be dropped silently. The
+   client normalizes `quantitative` to `discrete` on the raw post JSON before
+   parsing; the `scaling` semantics are identical.
+3. **Grids exceed 200 bins.** The preseason bitcoin question has 450 bins (a
+   451-point CDF) and Series 2 allows 2,000. The server's minimum CDF step is
+   `round(0.01 / bins, 9)`; our grid constraints used to floor the step at
+   `MIN_CDF_PROB_STEP` = 5e-5, which is stricter than the server on fine grids and
+   would have forced 2.25% of the mass into a uniform floor at 450 bins (10% at
+   2,000). `numeric/config.grid_step_constraints` now uses the server formula,
+   which is identical at every grid of 201 points or fewer because 0.01 / 200 is
+   5e-5.
+
+Three Metaculus-shaped guards were generalized rather than bypassed.
+
+- The identity preflight (`api_preflight.py`) now has a general
+  `verify_api_identity(base_url)`; `verify_metaculus_api_identity()` remains as the
+  Metaculus wrapper. In mantic mode the preflight vets the Mantic API host and never
+  touches metaculus.com, so a Mantic run does not depend on Metaculus DNS health.
+  The failure class is `ApiIdentityError` (the old `MetaculusApiIdentityError` name
+  is kept as an alias for now). Mantic's fingerprint differs in one way: its read
+  side answers unauthenticated with 200 JSON carrying a `results` key, which the
+  existing acceptance branch already covers.
+- The publish-hardening forced POST timeout applies to both `metaculus.com` and
+  `competitions.mantic.com` (`_PLATFORM_HOSTS` in `publish_hardening.py`). Without
+  it a stalled Mantic POST would be abandoned by the caller while its worker thread
+  ran on, the duplicate-publish shape layer 1 exists to prevent.
+- The self-reference refusal shared by the resolution-source fetcher and gap-fill
+  v2 (`resolution_url_scan.is_metaculus_self_ref`) refuses the question platform's
+  own site, metaculus.com or `competitions.mantic.com`; the rest of mantic.com, such
+  as blog.mantic.com, stays fetchable as an outside source. The function name and
+  the `metaculus_self_ref` status token are unchanged, as data contracts.
+
+`check_tournament_dates` runs with the Mantic slug and end date.
+
+Date questions are Phase 2 and are not forecast yet; the bot's type guard skips
+them, so the preseason's date question is left alone. The plan is in
+`scratch_docs_and_planning/mantic_integration_plan_2026-09-08.md`.
+
+### Personal keys only, and the switch fails shut
+
+Metaculus donates `OAI_ANTH_OPENROUTER_KEY` for its own tournaments, so a run that
+forecasts for another platform must not spend it. Every other key the bot reads is
+already the operator's personal key (see the key model above), so one switch
+suffices: `DONATED_OPENROUTER_KEY_ENABLED` (default `true`, read by
+`constants.donated_openrouter_key_enabled()`). When it reads false,
+`fallback_openrouter.should_route_via_donated_key` returns False before any provider
+match, which covers all three readers of the donated env var and therefore every
+OpenRouter call including the key-swap fallback; and `credit_telemetry` skips the
+donated-key balance probe with one INFO line
+(`CREDIT_BALANCE: key=donated phase=<p> skipped (donated routing disabled)`), so a
+low donated balance can never redden a Mantic run.
+
+It has to be an environment variable set before the process starts, not a CLI
+flag: the roster's module-level `GeneralLlm` objects in `llm_configs.py` freeze
+their API key at import, and `main.py` imports them before `cli.main` runs. So in
+mantic mode `cli._assert_personal_keys_only()` raises `RuntimeError` before any
+fetch or spend if the switch still reads true. The workflow is the other half of
+the same rule: it never receives the donated secret, so no code path can reach it,
+and `tests/test_workflow_reliability.py` pins that the file's raw text names
+neither `OAI_ANTH_OPENROUTER_KEY` nor `METACULUS_TOKEN` while every Metaculus
+workflow still wires the donated key.
+
+The accepted consequence: with a single OpenRouter key there is no key-swap
+fallback, so a personal-key 401, 402 or 429 is a hard failure of that question, by
+design. No replacement mechanism was added (the proportion rule). On a Mantic run,
+every OpenRouter auth error is the personal key.
+
+### The workflow
+
+`run_bot_on_mantic.yaml` is a copy of `run_bot_on_tournament.yaml` with four
+differences: the crons are `17 * * * *` and `47 * * * *`; the run step passes
+`--mode mantic`; the env block has `MANTIC_TOKEN` instead of `METACULUS_TOKEN` and
+no `OAI_ANTH_OPENROUTER_KEY` at all; and it sets both
+`DONATED_OPENROUTER_KEY_ENABLED: 'false'` and `GEMINI_USE_DONATED_OPENROUTER_KEY:
+'false'`. Everything else, including the step caps, the Playwright install, the
+personal `GOOGLE_API_KEY` and the paid `url_context` rung, is at parity, and the
+artifact keeps the `research-<run_id>` name so `make sync_all` harvests Mantic runs
+into the archive. The minutes sit off the tournament's :03/:23/:43, minibench's
+:08/:38 and the cup's :13/:33/:53, because the workflows are in separate concurrency
+groups and a shared minute means simultaneous runs, and off the top of the hour,
+where GitHub's scheduling burst lives. If Series 2 restores one-hour windows opened
+on the hour, a :17 pickup leaves about 43 minutes; move to three entries per hour
+if that proves tight.
+
+Unlike the cup and minibench workflows, this one is not `disabled_manually`: GitHub
+runs a new scheduled workflow as soon as its file is on the default branch, so
+merging the branch to `main` starts the hourly crons with no further UI step.
+
+### Running it, and what is left for the operator
+
+The local QA run is paid and publishes. It spends about $2.60 per question on the
+personal OpenRouter, AskNews, Exa and Google keys, posts a forecast for every open
+question the bot has not yet forecast to Mantic, and goes through the ask-first
+gate like every other live mode:
+
+```bash
+DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic
+# or: make run_mantic
+```
+
+It needs `MANTIC_TOKEN` in `.env` (the operator also keeps it at
+`~/.keys/MANTIC_TOKEN`). Without the switch the run stops at
+`_assert_personal_keys_only` before any spend.
+
+Operator steps, in order:
+
+1. Store the token as a repository secret (credential handling, so ask first):
+
+   ```bash
+   gh secret set MANTIC_TOKEN --repo No-Stream/metaculus-bot < ~/.keys/MANTIC_TOKEN
+   ```
+
+2. Merge to `main`. The schedule is live from that moment; there is nothing to
+   enable in the Actions UI.
+3. When Series 2 opens, update `MANTIC_TOURNAMENT_ID` and
+   `MANTIC_TOURNAMENT_END_DATE`, and revisit the cron cadence.
+
 ## Cost discipline
 
 Every credit spend goes through the operator. Anything that hits a live LLM or
@@ -711,6 +898,9 @@ The paid run is the operator's last step.
   `minibench`, `metaculus_cup`, `test_questions`) — spends credits and publishes
   to Metaculus. `cli.py` builds the bot with `publish_reports_to_metaculus=True`
   in every mode.
+- `--mode mantic` / `make run_mantic`: spends the operator's personal keys
+  (about $2.60 per question; the donated key is refused) and publishes to
+  competitions.mantic.com. See "Mantic" above.
 - `make backtest_smoke_test` / `_small` / `_medium` / `_large` — spends on every
   forecaster and research call, plus one `LEAKAGE_DETECTOR_MODEL` call per
   question for the leakage screen. No publish (the benchmark config sets

@@ -760,21 +760,24 @@ async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: p
         "https://metaculus.com/q/12345",
         "https://www.metaculus.com:443/questions/12345/",  # port must not bypass the block
         "https://sub.metaculus.com/page",  # subdomain
+        "https://competitions.mantic.com/questions/650/",  # the Mantic competition site: same refusal
     ],
 )
 @pytest.mark.asyncio
 async def test_fetch_plain_blocks_metaculus_without_network(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    # is_public_http_url is stubbed True so the metaculus URL clears the SSRF gate
-    # (as it would in prod — metaculus is public); the real is_metaculus_self_ref
+    # is_public_http_url is stubbed True so the platform URL clears the SSRF gate
+    # (as it would in prod — both sites are public); the real is_metaculus_self_ref
     # then blocks it. _get_session raises if reached, proving no HTTP is attempted.
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    get_session = MagicMock(side_effect=AssertionError("must not open a session for a metaculus URL"))
+    get_session = MagicMock(side_effect=AssertionError("must not open a session for a question-platform URL"))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", get_session)
 
     result = await agentic_tools._fetch_plain(url)
 
     assert result.status == "blocked"
+    # The block text is what the driver reads, so it has to name both hosts it must not fetch.
     assert "metaculus.com" in result.text
+    assert "competitions.mantic.com" in result.text
     get_session.assert_not_called()
 
 

@@ -57,11 +57,18 @@ What's inside:
    # or: uv run python main.py
    ```
 
-   Pick a run mode with `--mode`: `tournament` (default), `minibench`, `metaculus_cup`, or `test_questions`.
+   Pick a run mode with `--mode`: `tournament` (default), `minibench`, `metaculus_cup`, `mantic`, or `test_questions`.
 
    ```bash
    uv run python main.py --mode test_questions
    ```
+
+   `--mode mantic` (or `make run_mantic`) forecasts the Mantic Crucible competition at
+   competitions.mantic.com, a fork of the Metaculus platform with the same API shape. It needs
+   `MANTIC_TOKEN` in `.env`, publishes to Mantic rather than Metaculus, and spends only your
+   personal keys: the run refuses to start unless `DONATED_OPENROUTER_KEY_ENABLED=false` is set,
+   because the Metaculus-donated OpenRouter key is for Metaculus tournaments. Details in
+   `docs/operations.md` "Mantic".
 
 ## Core Architecture
 
@@ -154,6 +161,7 @@ Copy `.env.template` to `.env` and fill in your keys. Never commit `.env`.
 ```bash
 # Metaculus (required)
 METACULUS_TOKEN=...
+MANTIC_TOKEN=...               # only for --mode mantic (competitions.mantic.com)
 
 # LLMs via OpenRouter
 OPENROUTER_API_KEY=...        # your personal OpenRouter key

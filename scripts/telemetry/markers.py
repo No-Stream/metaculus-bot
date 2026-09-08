@@ -23,6 +23,9 @@ against the ACTUAL emitted format strings (the source of truth):
   locally instead of paying a Gemini ``url_context`` call for it — a PDF's extracted
   text on a ``fetch``, or a BM25 passage digest on a ``read_document``)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
+* ``MANTIC_QUESTION`` — ``metaculus_bot/mantic.py`` ``_log_mantic_question`` (per-QUESTION,
+  every question the Mantic client parses: the type as it arrived on the wire and the
+  fields Mantic's platform fork adds that the framework does not model)
 * ``FORECASTER_DROPS`` — ``metaculus_bot/drop_telemetry.py`` ``emit_drop_telemetry``
   (per-RUN summary: which models dropped and why)
 * ``Degradation counters`` — ``metaculus_bot/degradation_counters.py``
@@ -1197,6 +1200,27 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+overdue_s=(?P<overdue_s>\S+)\s+state=(?P<state>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # publish_gate.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "mantic_question",
+        # Per-QUESTION INFO from metaculus_bot/mantic.py, one line for every question the Mantic
+        # client parses (competitions.mantic.com runs a fork of the Metaculus platform). Mantic
+        # adds question fields the framework does not model — ``multi_resolution`` (scored
+        # against several resolution values, e.g. eleven daily prices averaged),
+        # ``date_granularity`` (day/week) and ``precision`` (bin width) — so without this line
+        # they are gone at the 90-day GHA log expiry. ``type`` is the type AS IT ARRIVED ON THE
+        # WIRE: ``quantitative`` is Mantic's Series 2 merger of numeric and discrete, which the
+        # client rewrites to ``discrete`` before parsing, so this field is the only record of
+        # which questions were rewritten. ``cdf_size`` is the parsed grid (Mantic allows up to
+        # 2,001 points against Metaculus's 201); ``post`` rides along because a group
+        # subquestion's post id differs from its question id. Absent values render ``n/a`` and
+        # harvest as None; the booleans render lowercase.
+        re.compile(
+            r"MANTIC_QUESTION:\s*post=(?P<post>\S+)\s+question=(?P<question>\S+)\s+type=(?P<type>\S+)"
+            r"\s+cdf_size=(?P<cdf_size>\S+)\s+multi_resolution=(?P<multi_resolution>\S+)"
+            r"\s+date_granularity=(?P<date_granularity>\S+)\s+precision=(?P<precision>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # mantic.py emits question.id_of_question as question=
     ),
     MarkerSpec(
         "time_budget",

@@ -28,7 +28,7 @@ import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, grid_step_constraints
+from metaculus_bot.numeric.config import grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, enforce_min_steps, safe_cdf_bounds
 
 # Probability grid for inverting a CDF to a quantile function. Dense enough that linear
@@ -170,14 +170,15 @@ def apply_tail_floor(
 ) -> list[float]:
     """Guarantee >= ``floor_eps`` PMF mass in every bucket (anti-saturation), re-normalized.
 
-    Operates on a probability array (a 201-point CDF). The PMF is the per-bucket mass:
-    ``diff(cdf)`` for interior buckets, plus the implicit boundary masses (``cdf[0]`` below
-    the grid and ``1 - cdf[-1]`` above it) when the bound is open. We floor every step to
-    ``floor_eps``, then hand off to the shared constraint layer which re-pins endpoints,
-    re-enforces monotonicity + min-step, and redistributes any max-step overflow.
+    Operates on a probability array (a CDF on the question's grid, whatever its length). The
+    PMF is the per-bucket mass: ``diff(cdf)`` for interior buckets, plus the implicit
+    boundary masses (``cdf[0]`` below the grid and ``1 - cdf[-1]`` above it) when the bound
+    is open. We floor every step to ``floor_eps``, then hand off to the shared constraint
+    layer which re-pins endpoints, re-enforces monotonicity + min-step, and redistributes
+    any max-step overflow.
 
-    ``floor_eps`` is a small tunable knob; values near or below ``MIN_CDF_PROB_STEP`` are a
-    no-op relative to the existing min-step floor.
+    ``floor_eps`` is a small tunable knob; values near or below the grid's server min-step
+    are a no-op relative to the existing min-step floor.
     """
     if floor_eps < 0:
         raise ValueError(f"floor_eps must be >= 0, got {floor_eps}")
@@ -188,7 +189,8 @@ def apply_tail_floor(
 
     # Floor every interior step to at least floor_eps. Lifting low steps pushes the whole
     # tail of the CDF up; the constraint layer renormalizes and re-pins the endpoints.
-    floored = enforce_min_steps(arr, max(floor_eps, MIN_CDF_PROB_STEP), upper_cap=1.0, lower_cap=0.0)
+    grid_min_step, _ = grid_step_constraints(len(grid))
+    floored = enforce_min_steps(arr, max(floor_eps, grid_min_step), upper_cap=1.0, lower_cap=0.0)
 
     finalized = _finalize_cdf(floored, grid, question)
     return [p.percentile for p in finalized]

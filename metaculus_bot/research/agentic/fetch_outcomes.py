@@ -2,7 +2,7 @@
 
 Everything that turns one HTTP response into a :class:`PlainFetchResult` the fetch ladder
 can act on: the content-type / magic-byte sniffers, the outbound-link collector, the
-metaculus.com refusal, and the per-body-shape outcome builders (a vetted 3xx hop, an HTML
+question-platform self-reference refusal, and the per-body-shape outcome builders (a vetted 3xx hop, an HTML
 body's trafilatura main text, a raw text/CSV/JSON body). The ``status`` values these return
 are load-bearing downstream — only ``"ok"`` grants the loop's ``fetched`` verification tier,
 so a page we could not read is ``"empty"`` or ``"blocked"``, never ``"ok"``.
@@ -30,7 +30,7 @@ from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
-from metaculus_bot.constants import GAP_FILL_V2_MIN_CONTENT_CHARS
+from metaculus_bot.constants import GAP_FILL_V2_MIN_CONTENT_CHARS, MANTIC_HOST
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO
 from metaculus_bot.research.resolution_fetch_result import PDF_CONTENT_TYPES
@@ -195,8 +195,9 @@ def _document_needed_result(current_url: str, content_type: str) -> PlainFetchRe
     )
 
 
-_METACULUS_FETCH_BLOCK_MSG = (
-    "Metaculus pages are already reflected in the question brief; do not fetch metaculus.com URLs."
+_PLATFORM_FETCH_BLOCK_MSG = (
+    "Metaculus and Mantic pages are already reflected in the question brief; "
+    f"do not fetch metaculus.com or {MANTIC_HOST} URLs."
 )
 
 
@@ -206,18 +207,20 @@ def _fetch_plain_url_block(url: str) -> PlainFetchResult | None:
     Runs on the caller-supplied URL and again on every redirect hop, so a 3xx
     cannot walk into a target the initial check would have refused.
     """
-    # Block metaculus.com from our runner IP. Question pages are a JS SPA whose
-    # near-empty plain fetch would auto-escalate to headless Chromium, whose
-    # route guard then permits the SPA's own XHR fan-out to the Metaculus API —
-    # all from our IP, on the same host the critical API calls use. Blocking here
-    # (before _get_session) kills both our-IP rungs; rendered only runs after a
-    # plain fetch. The brief already embeds the resolution criteria these URLs
-    # would yield. (read_document is Gemini's IP, not ours, so it is not gated.)
+    # Block the question platforms' own hosts (metaculus.com, competitions.mantic.com)
+    # from our runner IP. Metaculus question pages are a JS SPA whose near-empty plain
+    # fetch would auto-escalate to headless Chromium, whose route guard then permits
+    # the SPA's own XHR fan-out to the Metaculus API — all from our IP, on the same
+    # host the critical API calls use; a Mantic question page additionally shows the
+    # other bots' forecasts, which must not leak into research. Blocking here (before
+    # _get_session) kills both our-IP rungs; rendered only runs after a plain fetch.
+    # The brief already embeds the resolution criteria these URLs would yield.
+    # (read_document is Gemini's IP, not ours, so it is not gated.)
     if resolution_source.is_metaculus_self_ref(url):
         return PlainFetchResult(
             status="blocked",
             method="plain",
-            text=_METACULUS_FETCH_BLOCK_MSG,
+            text=_PLATFORM_FETCH_BLOCK_MSG,
             links=[],
             url=url,
         )
@@ -277,7 +280,7 @@ async def _plain_redirect_outcome(
             url=next_url,
             content_type=content_type or None,
         )
-    # A 3xx to metaculus.com must not be followed either (same
+    # A 3xx to a question-platform host must not be followed either (same
     # our-IP / no-new-info rationale as the initial-URL block).
     blocked = _fetch_plain_url_block(next_url)
     if blocked is not None:

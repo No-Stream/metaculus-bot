@@ -10,6 +10,7 @@ tests loudly instead of silently dropping records from the archive:
 * GHOST_PRE[_JSON]  -> metaculus_bot/research/agentic/loop.py:_set_research_plan_tool
 * GHOST_FORECAST    -> metaculus_bot/research/agentic/loop.py:_run_ghost_phase
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
+* MANTIC_QUESTION   -> metaculus_bot/mantic.py:_log_mantic_question
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
 * MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
 * RESOLUTION_SOURCE_FETCH -> metaculus_bot/research/resolution_source.py:_log_fetch_outcome_markers
@@ -2650,6 +2651,70 @@ TIME_BUDGET_ROOMY_LINE = (
     PFX + "TIME_BUDGET: question=44870 budget_s=3510 close_time=2026-07-24T15:00:00+00:00 "
     "close_limited=false fast_path=false"
 )
+
+
+# Verbatim from metaculus_bot/mantic.py:_log_mantic_question. One line per question the Mantic
+# client parses; values below are the real Preseason 2 posts (tests/data/
+# mantic_preseason2_posts_2026_09_08.json), plus the Series 2 wire type the client rewrites.
+MANTIC_QUESTION_DISCRETE_LINE = (
+    PFX + "MANTIC_QUESTION: post=650 question=650 type=discrete cdf_size=451 "
+    "multi_resolution=true date_granularity=n/a precision=100.0"
+)
+MANTIC_QUESTION_BINARY_LINE = (
+    PFX + "MANTIC_QUESTION: post=648 question=648 type=binary cdf_size=n/a "
+    "multi_resolution=false date_granularity=n/a precision=n/a"
+)
+MANTIC_QUESTION_DATE_LINE = (
+    PFX + "MANTIC_QUESTION: post=651 question=651 type=date cdf_size=13 "
+    "multi_resolution=false date_granularity=day precision=n/a"
+)
+MANTIC_QUESTION_QUANTITATIVE_LINE = (
+    PFX + "MANTIC_QUESTION: post=650 question=650 type=quantitative cdf_size=451 "
+    "multi_resolution=true date_granularity=n/a precision=100.0"
+)
+
+
+class TestManticQuestion:
+    """Per-question record of what Mantic's platform fork sent, harvested because the three
+    Mantic-only fields live nowhere else and the wire type is rewritten before parsing."""
+
+    def test_discrete_shape(self):
+        rec = _parse_one(MANTIC_QUESTION_DISCRETE_LINE)
+        assert rec["marker"] == "mantic_question"
+        assert rec["post"] == 650
+        assert rec["type"] == "discrete"
+        assert rec["cdf_size"] == 451
+        assert rec["multi_resolution"] is True
+        assert rec["date_granularity"] is None
+        assert rec["precision"] == pytest.approx(100.0)
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # mantic.py emits question.id_of_question as question=; the post id is its own field, so
+        # a residual join can key on either space without translating.
+        rec = _parse_one(MANTIC_QUESTION_DISCRETE_LINE)
+        assert rec["qid"] == 650
+        assert rec["qid_kind"] == "question_id"
+
+    def test_absent_fields_read_as_none_not_as_strings(self):
+        rec = _parse_one(MANTIC_QUESTION_BINARY_LINE)
+        assert rec["type"] == "binary"
+        assert rec["cdf_size"] is None
+        assert rec["multi_resolution"] is False
+        assert rec["date_granularity"] is None
+        assert rec["precision"] is None
+
+    def test_date_granularity_survives_as_a_string(self):
+        rec = _parse_one(MANTIC_QUESTION_DATE_LINE)
+        assert rec["type"] == "date"
+        assert rec["cdf_size"] == 13
+        assert rec["date_granularity"] == "day"
+
+    def test_the_wire_type_is_kept_verbatim(self):
+        # The one record of which questions arrived as Series 2 quantitative and were
+        # rewritten to discrete before parsing.
+        rec = _parse_one(MANTIC_QUESTION_QUANTITATIVE_LINE)
+        assert rec["type"] == "quantitative"
+        assert rec["cdf_size"] == 451
 
 
 class TestTimeBudget:

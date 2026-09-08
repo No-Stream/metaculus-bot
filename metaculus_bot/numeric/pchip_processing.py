@@ -181,7 +181,7 @@ def _validate_pchip_cdf(pchip_cdf: list[float], question: NumericQuestion) -> No
 
     min_step = np.min(np.diff(pchip_cdf))
     if min_step < NUM_MIN_PROB_STEP - 1e-10:
-        raise ValueError(f"PCHIP CDF violates minimum step requirement: {min_step:.8f} < 5e-5")
+        raise ValueError(f"PCHIP CDF violates minimum step requirement: {min_step:.8f} < {NUM_MIN_PROB_STEP:.8f}")
 
     max_step = np.max(np.diff(pchip_cdf))
     if max_step > NUM_MAX_STEP + 1e-6:

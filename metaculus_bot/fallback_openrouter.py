@@ -12,6 +12,7 @@ from metaculus_bot.constants import (
     OAI_ANTH_OPENROUTER_KEY_ENV,
     OPENROUTER_API_KEY_ENV,
     credit_alerts_active,
+    donated_openrouter_key_enabled,
     gemini_use_donated_openrouter_key,
 )
 from metaculus_bot.credit_telemetry import (
@@ -242,6 +243,18 @@ DONATED_KEY_BLOCKED_GOOGLE_MODELS: frozenset[str] = frozenset({"gemini-3.1-pro"}
 def should_route_via_donated_key(model: str) -> bool:
     """Whether ``model`` should prefer the Metaculus-donated key (with paid-key fallback).
 
+    MASTER SWITCH first: while ``DONATED_OPENROUTER_KEY_ENABLED`` is false-y
+    (``constants.donated_openrouter_key_enabled``) this returns False for EVERY slug before
+    any provider rule runs. A Mantic run sets it false, because Metaculus donated the key for
+    its own tournaments and a run for another platform must spend only the operator's
+    personal keys. Every reader of the donated env var gates on this predicate (the builder
+    below, ``api_key_utils.get_openrouter_api_key`` and the gap-fill v2 transport in
+    ``research/agentic/llm.py``), so one false-y value is personal-only routing everywhere,
+    and the key-swap fallback wrapper is never built. It is an environment variable set
+    before the process starts rather than a runtime toggle because the roster's module-level
+    ``GeneralLlm`` objects in ``llm_configs`` freeze their api_key at import. Unset means ON,
+    so Metaculus runs are unchanged.
+
     Matches OpenRouter model slugs of the form ``openrouter/<provider>/<model>``
     against ``DONATED_KEY_PROVIDERS``. Returns False for non-OpenRouter slugs
     (e.g. ``perplexity/sonar``) and unrecognized providers (e.g. ``x-ai`` for Grok).
@@ -262,6 +275,8 @@ def should_route_via_donated_key(model: str) -> bool:
     for ALL Gemini.
     """
     if not isinstance(model, str):
+        return False
+    if not donated_openrouter_key_enabled():
         return False
     if not model.startswith("openrouter/"):
         return False
@@ -779,9 +794,10 @@ def build_llm_with_openrouter_fallback(model: str, *, role: str | None = None, *
     # OpenRouter models that bypass the donated wrapper: plain GeneralLlm.
     # Covers (a) providers not in DONATED_KEY_PROVIDERS (x-ai, qwen, etc.),
     # (b) Google when GEMINI_USE_DONATED_OPENROUTER_KEY is explicitly off (the
-    # default is now ON), and (c) blocklisted Google models
+    # default is now ON), (c) blocklisted Google models
     # (DONATED_KEY_BLOCKED_GOOGLE_MODELS, e.g. gemini-3.1-pro) which are pinned to
-    # the personal key even when the toggle is ON.
+    # the personal key even when the toggle is ON, and (d) every slug while the
+    # DONATED_OPENROUTER_KEY_ENABLED master switch is off (a Mantic run).
     # No api_key passed — litellm picks up OPENROUTER_API_KEY from env. This
     # mirrors how Grok-via-OpenRouter has always worked in production.
     return GeneralLlm(model=model, metadata=llm_call_metadata(role, plain_llm_key_alias(model)), **kwargs)

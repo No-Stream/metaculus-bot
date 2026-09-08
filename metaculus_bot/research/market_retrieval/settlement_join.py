@@ -54,8 +54,11 @@ logger = logging.getLogger(__name__)
 
 # Domains that name the venue or the question site rather than a settlement series. The
 # Metaculus half is ALSO enforced through `is_metaculus_self_ref` so there is one shipped
-# definition of "points back at Metaculus"; this set stays the declarative statement of both
-# facts. Don't collapse the two — the helper is where a future Metaculus host change lands.
+# definition of "points back at the question platform"; this set stays the declarative statement
+# of both facts. Don't collapse the two — the helper is where a platform host change lands. The
+# Mantic competition site (`competitions.mantic.com`) is excluded through the helper ALONE: this
+# set is keyed on registrable domains, and `mantic.com` also carries the company's blog, a
+# legitimate outside source, so the set cannot name the competition host without swallowing it.
 SELF_REFERENCE_DOMAINS: frozenset[str] = frozenset({"kalshi.com", "metaculus.com"})
 
 _WWW_PREFIX_RE = re.compile(r"^www\d*\.")

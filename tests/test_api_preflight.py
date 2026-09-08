@@ -4,8 +4,9 @@ Motivated by the 2026-07-21 DNS-parking incident — metaculus.com's DNS was
 repointed at a GoDaddy parking host while the bot's scheduled runs kept sending
 ``Authorization: Token $METACULUS_TOKEN`` to the unknown host. The preflight
 makes ONE unauthenticated GET and aborts with a diagnostic if the host doesn't
-behave like the real Metaculus API, so the token is never leaked to a hijacked
-host.
+behave like the real API, so the token is never leaked to a hijacked host. Since
+the Mantic season it is generic over the API base URL: ``verify_api_identity``
+takes the base, and ``verify_metaculus_api_identity`` is the Metaculus wrapper.
 
 Mocking strategy: patch the HTTP transport (``HTTPAdapter.send``), NOT
 ``requests.get`` wholesale. The real ``requests.Session`` (with
@@ -19,14 +20,26 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 import requests
 from requests.adapters import HTTPAdapter
 
 from metaculus_bot import api_preflight, cli
-from metaculus_bot.api_preflight import MetaculusApiIdentityError, verify_metaculus_api_identity
+from metaculus_bot.api_preflight import (
+    ApiIdentityError,
+    MetaculusApiIdentityError,
+    verify_api_identity,
+    verify_metaculus_api_identity,
+)
+from metaculus_bot.constants import MANTIC_API_BASE_URL
 from metaculus_bot.performance_analysis import cli as perf_cli
+
+# The live Mantic fingerprint (probed 2026-09-08): the posts list is public and answers the
+# same JSON shape an authenticated Metaculus read does.
+_MANTIC_POSTS_BODY = '{"next": null, "previous": null, "results": [{"id": 650}]}'
+_PARKED_LANDER_HTML = '<html><head><script>window.location.href="/lander"</script></head></html>'
 
 
 @contextmanager
@@ -85,22 +98,30 @@ class TestRaisesOnImposterHost:
     """A host that doesn't behave like the real API must fail fast with a diagnostic."""
 
     def test_404_empty_body_raises_and_names_status(self) -> None:
-        with _mock_transport(status=404, body=""), pytest.raises(MetaculusApiIdentityError, match="404"):
+        with _mock_transport(status=404, body=""), pytest.raises(ApiIdentityError, match="404"):
             verify_metaculus_api_identity()
 
     def test_200_html_lander_raises(self) -> None:
-        html = '<html><head><script>window.location.href="/lander"</script></head></html>'
-        with _mock_transport(status=200, body=html), pytest.raises(MetaculusApiIdentityError):
+        with _mock_transport(status=200, body=_PARKED_LANDER_HTML), pytest.raises(ApiIdentityError):
             verify_metaculus_api_identity()
 
+    def test_diagnostic_names_the_vetted_metaculus_host(self) -> None:
+        """The hijack hint tells the operator which host to `dig`: the one the base URL resolves
+        to, read at call time exactly as the wrapper vets it."""
+        host = urlparse(api_preflight.preflight_url()).hostname
+        assert host
+        with _mock_transport(status=404, body=""), pytest.raises(ApiIdentityError) as excinfo:
+            verify_metaculus_api_identity()
+        assert f"dig {host}" in str(excinfo.value)
+
     def test_200_json_without_results_raises(self) -> None:
-        with _mock_transport(status=200, body='{"detail": "nope"}'), pytest.raises(MetaculusApiIdentityError):
+        with _mock_transport(status=200, body='{"detail": "nope"}'), pytest.raises(ApiIdentityError):
             verify_metaculus_api_identity()
 
     def test_302_redirect_raises_and_is_not_followed(self) -> None:
         with (
             _mock_transport(status=302, body="") as captured,
-            pytest.raises(MetaculusApiIdentityError, match="302"),
+            pytest.raises(ApiIdentityError, match="302"),
         ):
             verify_metaculus_api_identity()
         # allow_redirects=False: the lander redirect must stay visible as a 3xx.
@@ -109,19 +130,19 @@ class TestRaisesOnImposterHost:
     def test_500_raises_with_server_error_flavor(self) -> None:
         with (
             _mock_transport(status=500, body="Internal Server Error"),
-            pytest.raises(MetaculusApiIdentityError, match="server error"),
+            pytest.raises(ApiIdentityError, match="server error"),
         ):
             verify_metaculus_api_identity()
 
     def test_connection_error_raises_chained(self) -> None:
         original = requests.ConnectionError("dns down")
-        with _mock_transport(exc=original), pytest.raises(MetaculusApiIdentityError) as excinfo:
+        with _mock_transport(exc=original), pytest.raises(ApiIdentityError) as excinfo:
             verify_metaculus_api_identity()
         assert excinfo.value.__cause__ is original
 
     def test_timeout_raises_chained(self) -> None:
         original = requests.Timeout("slow")
-        with _mock_transport(exc=original), pytest.raises(MetaculusApiIdentityError) as excinfo:
+        with _mock_transport(exc=original), pytest.raises(ApiIdentityError) as excinfo:
             verify_metaculus_api_identity()
         assert excinfo.value.__cause__ is original
 
@@ -133,13 +154,13 @@ class TestTransientEdgeStatuses:
     def test_transient_status_raises_without_hijack_hint(self, status: int) -> None:
         with (
             _mock_transport(status=status, body="Too Many Requests"),
-            pytest.raises(MetaculusApiIdentityError, match="transient") as excinfo,
+            pytest.raises(ApiIdentityError, match="transient") as excinfo,
         ):
             verify_metaculus_api_identity()
         message = str(excinfo.value)
         # Must not carry the DNS-parking/hijack diagnostic (its distinctive tokens).
         assert "parking" not in message
-        assert "dig www.metaculus.com" not in message
+        assert "dig " not in message
         assert "do NOT retry with credentials" in message
 
 
@@ -170,6 +191,63 @@ class TestNeverSendsCredentials:
         with _mock_transport(status=403) as captured:
             verify_metaculus_api_identity(timeout=5.0)
         assert captured["kwargs"].get("timeout") == 5.0
+
+
+class TestVerifyApiIdentityAgainstMantic:
+    """The generic check, called the way the mantic run mode calls it: with Mantic's API base.
+
+    A Mantic run must not depend on Metaculus DNS health, so the wrapper is NOT involved here;
+    only the given base URL is vetted, and the diagnostics name its host.
+    """
+
+    def test_public_json_results_passes_and_probes_the_mantic_posts_list(self) -> None:
+        with _mock_transport(status=200, body=_MANTIC_POSTS_BODY) as captured:
+            verify_api_identity(MANTIC_API_BASE_URL)  # no raise
+        assert captured["request"].url == f"{MANTIC_API_BASE_URL}/posts/?limit=1"
+        assert captured["send_count"] == 1
+
+    def test_sends_no_credentials_even_with_netrc(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        netrc_file = tmp_path / "netrc"
+        netrc_file.write_text("default login leaked_user password leaked_pass\n")
+        netrc_file.chmod(0o600)
+        monkeypatch.setenv("NETRC", str(netrc_file))
+
+        with _mock_transport(status=200, body=_MANTIC_POSTS_BODY) as captured:
+            verify_api_identity(MANTIC_API_BASE_URL)
+
+        assert "Authorization" not in captured["request"].headers
+        assert captured["request"].method == "GET"
+
+    def test_parked_host_raises_naming_the_mantic_host_not_metaculus(self) -> None:
+        with _mock_transport(status=404, body=_PARKED_LANDER_HTML), pytest.raises(ApiIdentityError) as excinfo:
+            verify_api_identity(MANTIC_API_BASE_URL)
+        message = str(excinfo.value)
+        assert "404" in message
+        assert "dig competitions.mantic.com" in message
+        assert "metaculus" not in message.lower()
+
+    def test_connect_failure_names_the_mantic_host(self) -> None:
+        original = requests.ConnectionError("dns down")
+        with _mock_transport(exc=original), pytest.raises(ApiIdentityError) as excinfo:
+            verify_api_identity(MANTIC_API_BASE_URL)
+        assert excinfo.value.__cause__ is original
+        assert "dig competitions.mantic.com" in str(excinfo.value)
+
+    def test_200_without_results_raises(self) -> None:
+        with _mock_transport(status=200, body='{"detail": "nope"}'), pytest.raises(ApiIdentityError):
+            verify_api_identity(MANTIC_API_BASE_URL)
+
+    def test_passes_timeout_to_transport(self) -> None:
+        with _mock_transport(status=200, body=_MANTIC_POSTS_BODY) as captured:
+            verify_api_identity(MANTIC_API_BASE_URL, timeout=5.0)
+        assert captured["kwargs"].get("timeout") == 5.0
+
+
+class TestExceptionName:
+    def test_the_metaculus_era_name_is_the_same_class(self) -> None:
+        """One class, two names: callers written when the module vetted only Metaculus keep
+        catching the same exception the Mantic path raises."""
+        assert MetaculusApiIdentityError is ApiIdentityError
 
 
 class TestEntryPointWiring:
@@ -218,12 +296,12 @@ class TestPerformanceCliInvokesPreflight:
             patch.object(
                 perf_cli,
                 "verify_metaculus_api_identity",
-                side_effect=MetaculusApiIdentityError("hijacked"),
+                side_effect=ApiIdentityError("hijacked"),
             ),
             patch.object(perf_cli, "build_performance_dataset") as build,
             patch.object(perf_cli, "save_dataset"),
             patch.object(perf_cli, "generate_report", return_value=""),
-            pytest.raises(MetaculusApiIdentityError),
+            pytest.raises(ApiIdentityError),
         ):
             perf_cli.main([])
         build.assert_not_called()

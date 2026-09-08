@@ -78,6 +78,42 @@ for new questions. Details and receipts: `docs/operations.md` "Fall 2026 season"
    warning for this state; the way to notice is a supply-probe row showing cup questions with no bot
    forecasts.
 
+### Mantic Crucible: Phase 1 shipped 2026-09-08, what is deferred (added 2026-09-08)
+
+Mantic runs a bot-only forecasting competition (Crucible, competitions.mantic.com) on a fork of
+the Metaculus platform and pays $3 per forecast. `--mode mantic` and `run_bot_on_mantic.yaml`
+(crons :17/:47) forecast it on the operator's personal keys only; the design and the three API
+differences are in `docs/operations.md` "Mantic" and the plan in
+`scratch_docs_and_planning/mantic_integration_plan_2026-09-08.md`. Operator step remaining:
+`gh secret set MANTIC_TOKEN --repo No-Stream/metaculus-bot < ~/.keys/MANTIC_TOKEN`, then merge;
+the schedule is live once the file is on `main`. Deferred, each with its trigger:
+
+- **Multi-resolution prompt clause: deferred.** The preseason bitcoin question is scored against
+  eleven daily prices and averaged, and its question text already explains that format, so the
+  forecasters see it. Add a prompt clause only if the published distribution proves measurably
+  too narrow once that question resolves (2026-09-20); the `MANTIC_QUESTION` marker logs
+  `multi_resolution` per question so the cohort is recoverable.
+- **Free Series 1 corpus as a calibration and backtest resource.** 520 resolved Series 1 questions
+  expose every competitor's full CDF unauthenticated, at
+  `aggregations.recency_weighted.score_data.disagreement_forecasts` on
+  `/api/posts/<id>/?with_cp=true`. That is a resolved, bot-only, fine-grid numeric corpus with
+  per-competitor forecasts, which nothing on Metaculus gives us; worth a replay once the season
+  has a Mantic scoreboard to compare against.
+- **Archive id-namespace hazard.** Mantic post ids are around 650 and every Metaculus id in our
+  research archive is 35,000 or more, so the two cannot collide today and filenames are not
+  namespaced. Records carry a `platform` field (`mantic` / `metaculus`) that disambiguates; any
+  analysis that keys on a bare post id across both platforms must filter on it, and if Mantic ids
+  ever approach the Metaculus range the filename scheme has to be revisited.
+- **Date questions: Phase 2.** The preseason's fourth question is a date question (twelve daily
+  bins) that the bot's type guard skips. Support means a date runner in `forecaster_runners.py`
+  (percentiles as ISO dates, parsed to epoch seconds, the numeric pipeline on the epoch axis with
+  the question's `cdf_size`, comment rendering as dates) and admitting `DateQuestion` in the type
+  guard; aggregation is unchanged in CDF space. Planned as a second section of the Mantic plan
+  after Phase 1 is green and reviewed.
+- **Series 2 cadence unknown.** Series 1 windows were exactly one hour, opened on the hour, up to
+  three questions an hour. The :17/:47 crons dodge the top-of-hour GitHub Actions congestion and
+  leave about 43 minutes if that cadence returns; move to three entries per hour if it does.
+
 ### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH — operator-confirmed 2026-08-25**)
 
 **Scope, per the operator: the checkpoint is the FULL triple-era read, not numerics alone.** Five

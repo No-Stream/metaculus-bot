@@ -378,8 +378,8 @@ class TestNonStandardGridLength:
         )
 
     def _discrete_min_step(self, n: int) -> float:
-        # Server min-step for an n-point CDF: max(MIN_CDF_PROB_STEP, 0.01 / (n - 1)).
-        return max(MIN_CDF_PROB_STEP, 0.01 / (n - 1))
+        # Server min-step for an n-point CDF: round(0.01 / (n - 1), 9).
+        return round(0.01 / (n - 1), 9)
 
     def test_log_pool_at_discrete_length(self):
         question = self._discrete_question()

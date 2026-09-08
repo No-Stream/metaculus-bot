@@ -44,7 +44,7 @@ from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot import publish_hardening
-from metaculus_bot.constants import PUBLISH_POST_RETRIES
+from metaculus_bot.constants import MANTIC_API_BASE_URL, PUBLISH_POST_RETRIES
 from metaculus_bot.http_status import http_status_from_exception
 from scripts.telemetry.markers import parse_log_text
 
@@ -52,6 +52,8 @@ from scripts.telemetry.markers import parse_log_text
 # host on purpose (metaculus_client.requests IS the global requests module, so an
 # unscoped permanent patch would re-time every other POST in the process).
 _METACULUS_POST_URL = "https://www.metaculus.com/api/questions/forecast/"
+# The same MetaculusClient code publishes to Mantic under a different base_url.
+_MANTIC_POST_URL = f"{MANTIC_API_BASE_URL}/questions/forecast/"
 
 # One GHA-shaped log line's prefix plus the harvest metadata, so a WARN this module
 # actually emitted can be run through the real telemetry parser (the run logs the
@@ -242,14 +244,19 @@ class TestSocketTimeoutPatchDoesNotLeak:
 
         assert _ft_metaculus_client.requests.post is real_post
 
-    def test_timeout_is_forced_on_metaculus_and_left_alone_elsewhere(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_timeout_is_forced_on_platform_hosts_and_left_alone_elsewhere(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Two halves of one invariant. 0.2.92 always passes timeout=self.timeout (30s),
         # so the override must OVERRIDE rather than setdefault or the tighter publish
         # ceiling never applies. But because the install is permanent AND
         # metaculus_client.requests IS the global requests module, it must also be
         # scoped: exa_py, litellm's Databricks path, and huggingface_hub all POST
         # through the same function, and silently lowering their timeout to a publish
-        # ceiling can only manufacture failures.
+        # ceiling can only manufacture failures. Mantic publishes go through the same
+        # client against competitions.mantic.com, so that host is inside the scope too:
+        # an unbounded Mantic POST would be abandoned by the caller-side Future cap while
+        # its worker thread ran on, the duplicate-publish shape layer 1 exists to prevent.
         seen: list[tuple[str, Any]] = []
 
         def fake_post(url: str, *args: Any, **kwargs: Any) -> None:
@@ -262,6 +269,7 @@ class TestSocketTimeoutPatchDoesNotLeak:
             _ft_metaculus_client.requests.post("https://api.exa.ai/search", timeout=120)
             # Keyword form too, so a future ft call style still scopes correctly.
             _ft_metaculus_client.requests.post(url=_METACULUS_POST_URL, timeout=30)
+            _ft_metaculus_client.requests.post(_MANTIC_POST_URL, timeout=30)
         finally:
             monkeypatch.undo()
 
@@ -269,7 +277,8 @@ class TestSocketTimeoutPatchDoesNotLeak:
             (_METACULUS_POST_URL, 7.5),
             ("https://api.exa.ai/search", 120),
             (_METACULUS_POST_URL, 7.5),
-        ], f"forced timeout must apply to Metaculus POSTs only; got {seen}"
+            (_MANTIC_POST_URL, 7.5),
+        ], f"forced timeout must apply to the question-platform POSTs only; got {seen}"
 
 
 class TestHardeningStillCoversThePostSeam:

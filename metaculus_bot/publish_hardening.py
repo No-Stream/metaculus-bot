@@ -151,7 +151,7 @@ from forecasting_tools.data_models.numeric_report import NumericReport
 from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
-from metaculus_bot.constants import PUBLISH_POST_RETRIES, PUBLISH_POST_TIMEOUT
+from metaculus_bot.constants import MANTIC_HOST, PUBLISH_POST_RETRIES, PUBLISH_POST_TIMEOUT
 from metaculus_bot.http_status import http_status_from_exception
 from metaculus_bot.publish_gate import skip_publish_if_closed
 
@@ -179,11 +179,13 @@ _PATCHED_REPORT_TYPES: tuple[type[ForecastReport], ...] = (
 # their patch.
 _REPORT_SENTINEL = "_publish_offload_applied"
 
-# Host substring that scopes the forced POST timeout to Metaculus. Taken from
-# MetaculusClient's own default base_url ("https://www.metaculus.com/api"), matched on
-# the host alone so a METACULUS_API_BASE_URL override with a different path still hits.
-# See _install_post_timeout_override for why the scoping is load-bearing.
-_METACULUS_HOST = "metaculus.com"
+# Host substrings that scope the forced POST timeout to the question platforms the bot
+# publishes to. "metaculus.com" is taken from MetaculusClient's own default base_url
+# ("https://www.metaculus.com/api"), matched on the host alone so a METACULUS_API_BASE_URL
+# override with a different path still hits; MANTIC_HOST is the Mantic competition site,
+# which the same client publishes to under MANTIC_API_BASE_URL. See
+# _install_post_timeout_override for why the scoping is load-bearing.
+_PLATFORM_HOSTS: tuple[str, ...] = ("metaculus.com", MANTIC_HOST)
 
 # Method names to patch. Both are @retry_with_exponential_backoff()-decorated
 # instance methods on MetaculusClient that each wrap a single requests.post; we
@@ -297,15 +299,19 @@ def _install_post_timeout_override(timeout_s: float) -> None:
     deeper per occurrence, with no way back. The class-patch sentinel didn't help
     — it guards the one-time method patch, not this per-call one.
 
-    **Scoped to Metaculus URLs**, which the per-call version got for free and a
-    permanent install does not: ``metaculus_client.requests`` IS the global
-    ``requests`` module (verified — ``mc.requests is requests``), so an
-    unconditional forced timeout would also re-time every OTHER POST in the
-    process. Real POST callers share it: ``exa_py.api``, litellm's Databricks
-    path, huggingface_hub, streamlit. A 20s publish ceiling is right for a small
-    Metaculus payload and wrong for a long research call, and *lowering* someone
-    else's timeout can only manufacture failures. So the host check is what makes
-    the install-once shape safe, not decoration.
+    **Scoped to the question-platform hosts** (``_PLATFORM_HOSTS``: Metaculus and
+    Mantic), which the per-call version got for free and a permanent install does
+    not: ``metaculus_client.requests`` IS the global ``requests`` module (verified —
+    ``mc.requests is requests``), so an unconditional forced timeout would also
+    re-time every OTHER POST in the process. Real POST callers share it:
+    ``exa_py.api``, litellm's Databricks path, huggingface_hub, streamlit. A 20s
+    publish ceiling is right for a small publish payload and wrong for a long
+    research call, and *lowering* someone else's timeout can only manufacture
+    failures. So the host check is what makes the install-once shape safe, not
+    decoration. Mantic is inside the scope because its publishes go through the
+    same client: left unbounded, a stalled Mantic POST would be abandoned by the
+    caller-side ``Future.result`` cap while its worker thread ran on, which is the
+    duplicate-publish shape layer 1 exists to prevent.
 
     Idempotent by construction: the only caller is ``apply_publish_hardening``,
     which is itself sentinel-guarded, so no double-wrapping.
@@ -319,7 +325,7 @@ def _install_post_timeout_override(timeout_s: float) -> None:
         url = args[0] if args else kwargs.get("url", "")
         if isinstance(url, bytes):
             url = url.decode("utf-8", errors="replace")
-        if isinstance(url, str) and _METACULUS_HOST in url:
+        if isinstance(url, str) and any(host in url for host in _PLATFORM_HOSTS):
             kwargs["timeout"] = timeout_s
         return original_post(*args, **kwargs)
 

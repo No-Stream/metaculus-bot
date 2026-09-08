@@ -19,7 +19,10 @@ cli.main uses the breach to exit non-zero AFTER all forecasting/publishing
 completes — never an abort — and only while credit alerting is active
 (``constants.credit_alerts_active``, the dated suppression lever). The suppression
 is purely an exit-status decision made in cli.main: this module always reports the
-breach and always logs ``CREDIT_FLOOR_BREACH``.
+breach and always logs ``CREDIT_FLOOR_BREACH``. While ``DONATED_OPENROUTER_KEY_ENABLED``
+is off (a Mantic run, which never routes through the donated key) the donated alias is
+skipped in both phases with one INFO ``skipped (donated routing disabled)`` line each:
+no donated-key HTTP call happens and the floor check is unreachable.
 
 Field semantics (verified against live /auth/key pulls, 2026-07-17): ``usage``
 counts only spend billed as native OpenRouter credits. Spend routed through
@@ -93,7 +96,11 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
 from metaculus_bot.check_openrouter_credits import KEY_SPECS, fetch_auth_key
-from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, OPENROUTER_CREDIT_FLOOR_USD
+from metaculus_bot.constants import (
+    CREDIT_ALERT_RESUME_DATE,
+    OPENROUTER_CREDIT_FLOOR_USD,
+    donated_openrouter_key_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +172,10 @@ def _run_delta_usd(start: KeyBalanceSnapshot | None, end: KeyBalanceSnapshot) ->
 def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
     """Fetch one key's balance; on ANY failure, warn and return None.
 
+    The donated key is skipped outright (one INFO line, no HTTP) while
+    ``DONATED_OPENROUTER_KEY_ENABLED`` is off: a Mantic run never routes through that key, so
+    its balance is not the run's business and the refill floor downstream must not fire on it.
+
     A missing env var or endpoint hiccup must never fail the run (this is telemetry), so we
     log and continue. The catch is deliberately total rather than a curated tuple: cli.main
     calls ``log_end_and_check_floor`` from a ``finally``, so an escape there replaces
@@ -174,6 +185,9 @@ def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
     ``SSL_CERT_FILE``, ``httpx.InvalidURL`` (not an ``httpx.HTTPError`` subclass), and the
     ``RuntimeError`` this repo's own autouse network guard raises.
     """
+    if alias == DONATED_KEY_ALIAS and not donated_openrouter_key_enabled():
+        logger.info("CREDIT_BALANCE: key=%s phase=%s skipped (donated routing disabled)", alias, phase)
+        return None
     env_var, _ = KEY_SPECS[alias]
     api_key = os.getenv(env_var)
     if not api_key:

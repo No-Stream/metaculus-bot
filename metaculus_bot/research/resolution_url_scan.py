@@ -1,8 +1,8 @@
 """Cited-source URL scanning for the resolution-source provider.
 
-One responsibility: pull the http(s) URLs a Metaculus question cites in its
-resolution criteria / fine print out of that markdown, and classify the ones
-another provider already covers (Metaculus self-refs, FRED series, Yahoo ticker
+One responsibility: pull the http(s) URLs a question cites in its resolution
+criteria / fine print out of that markdown, and classify the ones another
+provider already covers (question-platform self-refs, FRED series, Yahoo ticker
 quote pages). No I/O and no caps here — ``resolution_source.select_fetchable_urls``
 composes these into the capped fetch list (the cap lives there because the test
 suites patch it on that module), and ``market_retrieval.settlement_join`` reuses
@@ -18,7 +18,14 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
+from metaculus_bot.constants import MANTIC_HOST
 from metaculus_bot.research.wayback import innermost_url
+
+# The question platforms whose own pages are self-references: the Metaculus apex (so every
+# subdomain matches, `www.` and the API host included) and the Mantic competition site. For
+# Mantic only that host: `www.mantic.com` and `blog.mantic.com` are the company's marketing site
+# and blog, which publishes forecasts and is a legitimate outside source.
+_QUESTION_PLATFORM_HOSTS: tuple[str, ...] = ("metaculus.com", MANTIC_HOST)
 
 # Metaculus-injected markdown escapes: `\_`, `\.`, `\&`, `\-`, `\#`, `\(`, `\)`.
 # FINDINGS: 3.4% of URLs carry these; one flips 404→success once unescaped.
@@ -167,14 +174,19 @@ def extract_source_urls(text: str) -> list[str]:
 
 
 def is_metaculus_self_ref(url: str) -> bool:
-    """A URL that points back at Metaculus is a self-reference (no new info).
+    """A URL that points back at the question platform's own site (Metaculus or Mantic).
+
+    A self-reference carries no new information, and on Mantic the question page also shows
+    the other bots' forecasts and comments, which must not leak into research. Named for the
+    platform it was written against: the ``metaculus_self_ref`` refusal token and the
+    ``blocked`` status it produces downstream are data contracts, so the name stays.
 
     Uses ``.hostname`` (not ``.netloc``) so a port or userinfo can't slip a
-    metaculus URL past the check — ``.netloc`` keeps ``:443`` / ``user@``, which
+    platform URL past the check — ``.netloc`` keeps ``:443`` / ``user@``, which
     would defeat the exact-host and suffix comparisons below.
 
     Judged on the INNERMOST URL of a Wayback capture, at any depth of nesting: an archived
-    copy of a Metaculus page in front of a forecaster is still the question quoting itself,
+    copy of a question page in front of a forecaster is still the question quoting itself,
     and the capture URL's own hostname is ``web.archive.org``, which is how a cited capture
     (or a capture of a capture) sailed past every self-reference filter in the pipeline.
     """
@@ -182,7 +194,7 @@ def is_metaculus_self_ref(url: str) -> bool:
         host = (urlparse(innermost_url(url)).hostname or "").lower()
     except ValueError:
         return False
-    return host == "metaculus.com" or host.endswith(".metaculus.com")
+    return any(host == platform or host.endswith(f".{platform}") for platform in _QUESTION_PLATFORM_HOSTS)
 
 
 def is_fred_url(url: str) -> bool:

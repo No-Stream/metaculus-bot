@@ -168,12 +168,12 @@ The construction:
 
 ### Server-side constraints
 
-Metaculus validates `continuous_cdf` submissions. The server formulas below are the
-upstream contract; the constants in `constants.py` mirror them, and those are what to
-read for the value we actually submit. `numeric/config.py` carries grid-scoped aliases
-(`MIN_CDF_PROB_STEP`, `MAX_CDF_PROB_STEP`) — note that only the max-step alias imports
-from `constants.py`; the min-step one restates the literal, so the two min-step
-constants have to be changed together.
+Metaculus validates `continuous_cdf` submissions (Mantic runs a fork of the same backend
+with the same constants). The server formulas below are the upstream contract; the
+constants in `constants.py` mirror them at the standard 201-point grid, and
+`numeric/config.py` re-exports them as the 201-grid aliases `MIN_CDF_PROB_STEP` and
+`MAX_CDF_PROB_STEP`. Those aliases are for callers that only ever build 201-point CDFs;
+every other grid derives its limits from `grid_step_constraints`, below.
 
 - **Length** = `cdf_size`, whose standard-continuous default is `PCHIP_CDF_POINTS`. On
   the platform side that is the question's `inbound_outcome_count + 1`, default 201.
@@ -191,13 +191,19 @@ The upstream source for all of this is the open-source Metaculus backend,
 `questions/serializers/common.py`. The API itself is documented at
 <https://www.metaculus.com/api/> (Swagger UI).
 
-`grid_step_constraints` (`numeric/config.py`) is what applies those formulas to a
-non-standard grid: the min step is floored at `MIN_CDF_PROB_STEP` so a fine grid never
-demands a step below the historical constant, and the max step is clamped at `1.0`
-(a probability step larger than that is vacuous). On the standard continuous grid it
-returns exactly `(MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP)`, so continuous questions are
-unaffected; a coarse discrete grid relaxes the max step upward, which is what lets a
-small-count distribution keep its mass concentrated on the low integers.
+`grid_step_constraints` (`numeric/config.py`) applies those formulas to any grid,
+exactly as the server does: the min step is `round(0.01 / N, 9)` (the rounding matters,
+because the server compares its own 9-decimal-rounded PMF against it), and the max step
+is `0.2 * 200 / N` clamped at `1.0` (a probability step larger than that is vacuous).
+There is no floor on the min step: an earlier version floored it at the 201-grid value,
+which was a no-op on every Metaculus grid but 2.25x stricter than the server at 450 bins
+and 10x at 2,000, forcing that much extra uniform mixture into fine-grid tails. Mantic
+quantitative questions run up to 2,000 bins, so the floor was removed in 2026-09
+(`tests/test_numeric_fine_grids.py` pins the formulas and the 451- and 2,001-point
+publish path). On the standard continuous grid the function returns exactly
+`(MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP)`, so continuous questions are unaffected; a
+coarse discrete grid relaxes the max step upward, which is what lets a small-count
+distribution keep its mass concentrated on the low integers.
 
 `safe_cdf_bounds` (`numeric/pchip_cdf.py`) enforces the max-step rule by
 redistributing excess mass while preserving the total, then re-enforces min-step after

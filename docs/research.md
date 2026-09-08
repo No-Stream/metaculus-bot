@@ -902,8 +902,9 @@ timeouts, cancellation, and registered result markers remain in `resolution_sour
 
 It deterministically extracts URLs from resolution criteria + fine print (markdown
 links and bare URLs, order-preserving dedup, Metaculus markdown-escapes undone),
-skip-filters URLs that add nothing or belong to another provider (Metaculus
-self-refs, FRED series owned by financial-data, Yahoo `/quote/` pages owned by
+skip-filters URLs that add nothing or belong to another provider (self-references
+to the question platform's own site, metaculus.com or `competitions.mantic.com` in
+mantic mode; FRED series owned by financial-data; Yahoo `/quote/` pages owned by
 yfinance), and caps at `RESOLUTION_SOURCE_MAX_URLS` *after* the skip filter so
 a run of leading self-refs doesn't starve the real sources. Fetches run in
 parallel with one-request-per-host politeness (a `Semaphore(1)` per netloc, keyed
@@ -1038,7 +1039,7 @@ recoverable client-side; the four hosts that refused both (Cloudflare, CloudFron
 fronts) are the egress-IP population and stay the Wayback and paid rungs' business. The trigger
 is `blocked` with HTTP 403 and nothing else: 429 is a throttle a fingerprint change could make
 worse, 406 is content negotiation the impersonation profile's own `Accept` headers would only
-guess at, 401 is authentication, and the Metaculus self-reference hop's `blocked` carries the
+guess at, 401 is authentication, and the question-platform self-reference hop's `blocked` carries the
 redirect's 301 or 302, which is what keeps a URL this module refused from being handed to a
 second transport. It sits between the direct fetch and the archive so a live page beats a stale
 capture, and before the paid reader so a rescue saves the read on that URL entirely; the
@@ -1183,7 +1184,10 @@ only with its age stated, which is what the lead renders. Three outcomes, in thi
 order is the design. The wrapped inner URL is unwrapped and re-checked first, because
 `is_metaculus_self_ref` keys on hostname and a `web.archive.org/web/.../metaculus.com/...` URL
 sails past every self-reference filter in the pipeline, and a failed SSRF or self-ref re-check
-refuses the rung outright. Then a capture the archive never served DECLINES, leaving the direct
+refuses the rung outright. That check refuses the question platform's own site, metaculus.com or
+`competitions.mantic.com` in mantic mode, while the rest of mantic.com (blog.mantic.com, say) stays
+fetchable as an outside source; the function keeps its name and the `metaculus_self_ref` status
+token is unchanged, both being data contracts. Then a capture the archive never served DECLINES, leaving the direct
 status standing, because "no archived copy exists" is a different fact from a stale one and the
 direct status says more about the source. Only a capture we did read and cannot date, or can date
 and it is too old, is withheld as `stale_data`. A withhold does not end the ladder: the paid rung

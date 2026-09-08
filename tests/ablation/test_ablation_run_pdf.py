@@ -560,10 +560,8 @@ class TestNumericDiscreteGridLength:
     DISCRETE_UPPER = 15.5
 
     def _discrete_min_step(self, n: int) -> float:
-        # Server min-step for an n-point CDF: max(MIN_CDF_PROB_STEP, 0.01 / (n - 1)).
-        from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP
-
-        return max(MIN_CDF_PROB_STEP, 0.01 / (n - 1))
+        # Server min-step for an n-point CDF: round(0.01 / (n - 1), 9).
+        return round(0.01 / (n - 1), 9)
 
     def _discrete_numeric_reasoning(self) -> str:
         # Percentiles inside the [0, 15] integer range so the student-t fit is well-posed.

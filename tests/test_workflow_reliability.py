@@ -115,6 +115,7 @@ class TestEveryJobIsCapped:
             ".github/workflows/ci.yaml",
             ".github/workflows/claude.yml",
             ".github/workflows/fetch_diagnostic.yaml",
+            ".github/workflows/run_bot_on_mantic.yaml",
             ".github/workflows/run_bot_on_metaculus_cup.yaml",
             ".github/workflows/run_bot_on_minibench.yaml",
             ".github/workflows/run_bot_on_tournament.yaml",
@@ -125,7 +126,7 @@ class TestEveryJobIsCapped:
     @pytest.mark.parametrize("rel_path", _ALL_WORKFLOWS)
     def test_workflow_parses(self, rel_path: str) -> None:
         # A yaml GitHub cannot parse is a workflow that silently never runs, and for the
-        # three cron bot workflows that is indistinguishable from cron starvation.
+        # cron bot workflows that is indistinguishable from cron starvation.
         assert _workflow(rel_path)["jobs"], f"{rel_path} declares no jobs"
 
     @pytest.mark.parametrize("rel_path", _ALL_WORKFLOWS)
@@ -213,7 +214,7 @@ class TestRunBotCapRespectsTheBotsOwnContract:
             )
 
     def test_bot_job_caps_do_not_drift_apart(self) -> None:
-        # The five workflows are near-identical by design, and drift is how the unsafe cap
+        # The bot workflows are near-identical by design, and drift is how the unsafe cap
         # hid: test_bot_basic sat at 60 while the other four sat at 300, so the one file
         # whose cap was BELOW the bot's own contract looked like the conservative one.
         caps = {
@@ -292,6 +293,7 @@ class TestScheduledBotCadence:
         # (spending is the operator's choice), and a new cron on one of them would show up
         # here rather than silently starting to publish on a schedule.
         assert sorted(self.scheduled) == [
+            ".github/workflows/run_bot_on_mantic.yaml",
             ".github/workflows/run_bot_on_metaculus_cup.yaml",
             ".github/workflows/run_bot_on_minibench.yaml",
             ".github/workflows/run_bot_on_tournament.yaml",
@@ -404,4 +406,64 @@ class TestPaidUrlContextRungIsArmedInEveryBotWorkflow:
             f"{rel_path} arms the paid url_context rung but wires no GOOGLE_API_KEY secret on the bot "
             "step, so every admitted read would be a no_api_key skip and the run would read in the "
             "archive exactly like one with the flag off"
+        )
+
+
+class TestManticWorkflowSpendsOnlyPersonalKeys:
+    """The Mantic workflow must never hold the Metaculus-donated OpenRouter key, and the
+    Metaculus workflows must never lose it.
+
+    Metaculus donates ``OAI_ANTH_OPENROUTER_KEY`` for its own tournaments, so a run that
+    forecasts for Mantic (a different platform) spends only the operator's personal keys.
+    The code side fails shut (``cli._assert_personal_keys_only`` refuses to start while
+    ``DONATED_OPENROUTER_KEY_ENABLED`` reads true), and this pin is the workflow side of the
+    same rule: the secret is simply not wired, so no code-path change can reach it. Raw
+    text, not the parsed tree, for the same reason as ``TestFetchDiagnosticCannotSpend``: a
+    secret can arrive as job env, step env or an inline expression, and only the source
+    catches all of them. The inverse pin exists because the Mantic file was copied from the
+    tournament one; copying it back over a Metaculus workflow would silently move every
+    Metaculus run onto the personal key.
+    """
+
+    mantic_rel_path = ".github/workflows/run_bot_on_mantic.yaml"
+    _DONATED_KEY_SECRET = "OAI_ANTH_OPENROUTER_KEY"
+
+    @property
+    def mantic_raw(self) -> str:
+        return (_REPO_ROOT / self.mantic_rel_path).read_text()
+
+    def test_the_donated_key_and_the_metaculus_token_are_absent(self) -> None:
+        for forbidden in (self._DONATED_KEY_SECRET, "METACULUS_TOKEN"):
+            assert forbidden not in self.mantic_raw, (
+                f"{self.mantic_rel_path} references {forbidden}. A Mantic run must spend only the "
+                "operator's personal keys and must not depend on Metaculus credentials at all"
+            )
+
+    def test_the_mantic_token_is_wired_from_a_secret(self) -> None:
+        assert "secrets.MANTIC_TOKEN" in self.mantic_raw, (
+            f"{self.mantic_rel_path} does not wire MANTIC_TOKEN from a repository secret, so the "
+            "client cannot authenticate and every publish would 401"
+        )
+
+    def test_both_donated_routing_flags_are_forced_off(self) -> None:
+        for flag in ("DONATED_OPENROUTER_KEY_ENABLED", "GEMINI_USE_DONATED_OPENROUTER_KEY"):
+            assert f"{flag}: 'false'" in self.mantic_raw, (
+                f"{self.mantic_rel_path} does not set {flag}: 'false'. Both default to true in code, "
+                "and the master switch is what lets cli._assert_personal_keys_only start the run"
+            )
+
+    def test_the_run_step_selects_mantic_mode(self) -> None:
+        assert "--mode mantic" in self.mantic_raw, (
+            f"{self.mantic_rel_path} does not pass --mode mantic, so it would forecast the Metaculus "
+            "tournament with no METACULUS_TOKEN and publish nothing"
+        )
+
+    @pytest.mark.parametrize("rel_path", [p for p in _BOT_WORKFLOWS if not p.endswith("run_bot_on_mantic.yaml")])
+    def test_every_metaculus_bot_workflow_still_wires_the_donated_key(self, rel_path: str) -> None:
+        raw = (_REPO_ROOT / rel_path).read_text()
+        assert f"{self._DONATED_KEY_SECRET}: ${{{{ secrets.{self._DONATED_KEY_SECRET} }}}}" in raw, (
+            f"{rel_path} no longer wires {self._DONATED_KEY_SECRET} from its secret. Every Metaculus "
+            "workflow routes OpenAI, Anthropic and Google calls through the donated key first; "
+            "dropping it moves the whole run onto the personal key. If this file was overwritten "
+            "with a copy of the Mantic workflow, that is the mistake this pin exists to catch"
         )

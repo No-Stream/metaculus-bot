@@ -397,6 +397,83 @@ class TestFloorCheck:
         assert "CREDIT_SPEND: key=personal run_delta_usd=234.50 remaining=n/a source=usage_delta_unsettled" in messages
 
 
+class TestDonatedRoutingDisabled:
+    """``DONATED_OPENROUTER_KEY_ENABLED=false`` (a Mantic run): the donated alias is skipped.
+
+    Metaculus donated that key for its own tournaments, so a run for another platform never
+    routes through it (``fallback_openrouter.should_route_via_donated_key``) and its balance
+    is not this run's business: no ``/auth/key`` probe on the donated key in either phase,
+    one INFO skip line per phase in place of the balance row, and the refill-floor check never
+    runs, so a low donated balance cannot redden a run that did not spend it.
+    """
+
+    @staticmethod
+    def _below_floor_responses() -> dict[str, list[dict[str, Any]]]:
+        """A donated balance far below the floor, so a probe (if one happened) would both consume
+        an entry and trip the floor; the personal key is uncapped, as in production."""
+        return {
+            DONATED_KEY: [_payload(0.5, 100.0), _payload(0.5, 100.0)],
+            PERSONAL_KEY: [_payload(None, 23.41), _payload(None, 23.91)],
+        }
+
+    def test_donated_alias_skipped_in_both_phases_with_no_probe(self, monkeypatch, caplog) -> None:
+        _set_keys(monkeypatch)
+        monkeypatch.setenv("DONATED_OPENROUTER_KEY_ENABLED", "false")
+        responses = self._below_floor_responses()
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with (
+            _patch_fetch(responses) as fetch,
+            caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"),
+        ):
+            telemetry.log_start()
+            assert telemetry.log_end_and_check_floor() is False
+
+        assert [call.args[0] for call in fetch.call_args_list] == [PERSONAL_KEY, PERSONAL_KEY]
+        assert len(responses[DONATED_KEY]) == 2
+        info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert "CREDIT_BALANCE: key=donated phase=start skipped (donated routing disabled)" in info
+        assert "CREDIT_BALANCE: key=donated phase=end skipped (donated routing disabled)" in info
+        assert "CREDIT_BALANCE: key=personal phase=start remaining=n/a usage=23.41" in info
+        assert "CREDIT_SPEND: key=personal run_delta_usd=0.50 remaining=n/a source=usage_delta_unsettled" in info
+        donated_warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING and "key=donated" in r.getMessage()
+        ]
+        assert donated_warnings == []
+        assert not any("CREDIT_FLOOR_BREACH" in r.getMessage() for r in caplog.records)
+
+    def test_same_balances_trip_the_floor_when_the_switch_is_on(self, monkeypatch, caplog) -> None:
+        """Companion: identical canned balances with the switch explicitly on, and the donated
+        probe runs in both phases and the floor trips, so the skip above is doing the work."""
+        _set_keys(monkeypatch)
+        monkeypatch.setenv("DONATED_OPENROUTER_KEY_ENABLED", "true")
+        responses = self._below_floor_responses()
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with (
+            _patch_fetch(responses) as fetch,
+            caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"),
+        ):
+            telemetry.log_start()
+            assert telemetry.log_end_and_check_floor() is True
+
+        assert [call.args[0] for call in fetch.call_args_list] == [DONATED_KEY, PERSONAL_KEY, DONATED_KEY, PERSONAL_KEY]
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("CREDIT_FLOOR_BREACH: key=donated remaining=0.50 floor=50.00" in msg for msg in messages)
+        assert not any("donated routing disabled" in msg for msg in messages)
+
+    def test_skip_line_is_a_credit_balance_skip_row(self) -> None:
+        """The skip line stays INSIDE the ``credit_balance`` marker's regex on purpose: the
+        archive keeps one ``key=donated`` row per phase with ``remaining`` / ``usage`` absent,
+        the same shape the env-var-not-set skip already produces, so a Mantic run's donated
+        rows read as "not probed" rather than vanishing (``scripts/telemetry/markers.py``)."""
+        spec = next(s for s in MARKER_SPECS if s.name == "credit_balance")
+        match = spec.regex.search("CREDIT_BALANCE: key=donated phase=start skipped (donated routing disabled)")
+        assert match is not None
+        assert match.group("key") == "donated"
+        assert match.group("phase") == "start"
+        assert match.group("remaining") is None
+        assert match.group("usage") is None
+
+
 class TestUnsettledSpendDisclosure:
     """A usage-delta spend figure must announce that it is a LOWER BOUND.
 

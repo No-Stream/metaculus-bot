@@ -157,8 +157,9 @@ escalates when the lighter one comes up short:
    presents a real Chrome fingerprint and carries its own DNS pin and per-hop re-guard
    because libcurl never passes aiohttp's filtering resolver. The trigger is the host's
    403 alone: `PlainFetchResult.http_status` is set only by a non-200 response, so the
-   `blocked` this ladder produces itself for a non-public URL or a Metaculus
-   self-reference (no `http_status`) can never reach the second transport. The body
+   `blocked` this ladder produces itself for a non-public URL or a question-platform
+   self-reference (metaculus.com or `competitions.mantic.com`; no `http_status`) can
+   never reach the second transport. The body
    goes through `_plain_body_outcome`, the same classification a plain body gets (the
    local PDF rung included), and a page-shaped result carries `method=impersonate`,
    which `provenance._METHOD_TO_TIER` grants the `fetched` tier; a document keeps its
@@ -508,7 +509,7 @@ level up:
 | `agentic/dispatch.py` | One assistant turn's tool calls in, one tool message each out: batch admission (plan gate, call budget, duplicate detection), provenance absorption, and the tool-message/rejection rendering. |
 | `agentic/tools.py` | `build_gap_fill_tools` and the four tool handlers, including the escalating fetch ladder and its SSRF hardening. |
 | `agentic/local_document.py` | The local PDF rung, the run's held-parse cache, the passage digest `read_document` serves, the url_context size gate, and the `AGENTIC_FETCH_LOCAL_DOC` marker. |
-| `agentic/fetch_outcomes.py` | Response classification for the plain `fetch` rung: content-type and magic-byte sniffers, the outbound-link collector, the metaculus.com refusal, and the per-body-shape outcome builders including the throttle interstitial. |
+| `agentic/fetch_outcomes.py` | Response classification for the plain `fetch` rung: content-type and magic-byte sniffers, the outbound-link collector, the question-platform self-reference refusal (metaculus.com and `competitions.mantic.com`), and the per-body-shape outcome builders including the throttle interstitial. |
 | `agentic/tool_backends.py` | The outbound half of the tools: the AskNews and Exa clients with their retry ladders and concurrency caps, the Gemini `url_context` document read and its fixed in-thread ceiling, and the markdown formatting of what comes back. |
 | `agentic/tool_descriptions.py` | The driver-facing tool descriptions and JSON parameter schemas — behavioral text, so a change here changes what the driver does. |
 | `research/robots_policy.py` (outside `agentic/`, shared with the Tier-1 url_context rung) | The `Google-Extended` robots.txt group parser and per-host cache behind the pre-check on every paid read, written because `urllib.robotparser` falls back to `User-agent: *`. |

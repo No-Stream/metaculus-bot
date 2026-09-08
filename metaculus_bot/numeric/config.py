@@ -7,7 +7,7 @@ These constants control various aspects of the numeric prediction processing pip
 
 from __future__ import annotations
 
-from metaculus_bot.constants import NUM_MAX_STEP
+from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
 
 # --- Percentile Processing Constants ---
 
@@ -43,32 +43,37 @@ MIN_PERCENTILES_REQUIRED: int = 3
 
 PCHIP_CDF_POINTS: int = 201
 
-MIN_CDF_PROB_STEP: float = 5e-5
+# The 201-grid values of grid_step_constraints, for callers that only ever build 201-point CDFs;
+# any other grid derives its limits from grid_step_constraints rather than flooring at these.
+MIN_CDF_PROB_STEP: float = NUM_MIN_PROB_STEP
 
 MAX_CDF_PROB_STEP: float = NUM_MAX_STEP
 
 
 def grid_step_constraints(num_points: int) -> tuple[float, float]:
-    """Return ``(min_step, max_step)`` for an ``num_points``-point CDF grid.
+    """Return ``(min_step, max_step)`` for a ``num_points``-point CDF grid.
 
-    Mirrors the Metaculus server's per-bin step rules, which scale with the bin
-    count ``inbound = num_points - 1``:
+    Exactly the server's per-bin rules (``questions/serializers/common.py`` in the
+    open-source Metaculus backend, which Mantic forked with the same constants), which
+    scale with the bin count ``inbound = num_points - 1``:
 
-    * min step ``round(0.01 / inbound, 9)`` — floored at ``MIN_CDF_PROB_STEP`` so
-      a fine grid never demands a step below the historical constant.
-    * max step ``0.2 * 200 / inbound`` — clamped at ``1.0`` (a probability step
-      can never exceed 1.0, so any larger bound is vacuous).
+    * min step ``round(0.01 / inbound, 9)``. The server rounds the same way before its
+      ``>=`` comparison, so the rounding is part of the contract, not cosmetics.
+    * max step ``0.2 * 200 / inbound``, clamped at ``1.0`` (a probability step can never
+      exceed 1.0, so any larger bound is vacuous).
 
-    At the standard 201-point grid this returns exactly ``(MIN_CDF_PROB_STEP,
-    MAX_CDF_PROB_STEP)`` — i.e. ``(5e-5, 0.2)`` — so continuous questions are
-    unchanged. On a coarse discrete grid (``num_points < 201``) the max step
-    relaxes above 0.2 (e.g. 1.0 at ``num_points=9``), which is what lets a
-    small-count distribution keep its mass concentrated on the low integers
-    instead of being clipped to the 201-grid 0.2 cap. On a finer grid it
-    tightens below 0.2.
+    There is deliberately no floor at ``MIN_CDF_PROB_STEP``. Such a floor was a no-op for
+    ``inbound <= 200`` and stricter than the server above it (2.25x at 450 bins, 10x at
+    2,000), which forced a uniform mixture several times larger than the server requires
+    into the tails of every fine-grid forecast. At the standard 201-point grid this returns
+    exactly ``(MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP)``, so every Metaculus grid is
+    unchanged. On a coarse discrete grid (``num_points < 201``) the max step relaxes above
+    0.2 (1.0 at ``num_points=9``), which lets a small-count distribution keep its mass
+    concentrated on the low integers instead of being clipped to the 201-grid cap; on a
+    finer grid both limits tighten.
     """
     inbound = max(1, num_points - 1)
-    min_step = max(MIN_CDF_PROB_STEP, 0.01 / inbound)
+    min_step = round(0.01 / inbound, 9)
     max_step = min(1.0, 0.2 * 200.0 / inbound)
     return min_step, max_step
 

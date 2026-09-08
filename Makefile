@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe backtest_with_cache
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe backtest_with_cache run_mantic
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -96,6 +96,12 @@ all: format lint deps lint_imports typecheck test_verbose
 
 run:
 	$(call RUN_UNBUFFERED,main.py)
+
+# PAID and PUBLISHES (ask-first gate, see AGENTS.md): forecasts the Mantic Crucible tournament
+# on the operator's PERSONAL keys only. The env var below is what lets cli start a Mantic run;
+# without it the run fails shut before any fetch or spend. ~$2.60 per question.
+run_mantic:
+	DONATED_OPENROUTER_KEY_ENABLED=false $(call RUN_UNBUFFERED,main.py --mode mantic)
 
 # DEPRECATED: Community benchmark baseline scoring is broken because Metaculus removed
 # the aggregations field from their list API. Use backtest_* targets instead.

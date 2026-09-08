@@ -291,3 +291,45 @@ class TestKeyRouting:
 
         acompletion.assert_awaited_once()
         assert _last_kwargs(acompletion)["api_key"] == _PERSONAL
+
+
+class TestDonatedMasterSwitch:
+    """The one place this file runs the REAL ``should_route_via_donated_key`` rather than a stub.
+
+    ``build_default_llm_call`` binds the predicate by name, so a Mantic run's
+    ``DONATED_OPENROUTER_KEY_ENABLED=false`` has to reach it through the real function. The
+    v2 driver is the highest-volume donated-key path in the bot, so it must bill the personal
+    key with no donated attempt and no fallback wrapper when the switch is off.
+    """
+
+    @pytest.mark.asyncio
+    async def test_switch_off_bills_personal_with_no_donated_attempt(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.setenv("DONATED_OPENROUTER_KEY_ENABLED", "false")
+
+        call = agentic_llm.build_default_llm_call(_config("openai/gpt-5.6-luna"))
+        await call(_messages(), None)
+
+        acompletion.assert_awaited_once()
+        kwargs = _last_kwargs(acompletion)
+        assert kwargs["api_key"] == _PERSONAL
+        assert kwargs["metadata"] == llm_call_metadata(agentic_llm.GAP_FILL_V2_DRIVER_ROLE, PERSONAL_KEY_ALIAS)
+
+    @pytest.mark.asyncio
+    async def test_switch_unset_routes_donated_first(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Companion: same keys, switch unset, and the real predicate picks the donated key, which
+        shows the test above is exercising the switch rather than a stub."""
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.delenv("DONATED_OPENROUTER_KEY_ENABLED", raising=False)
+
+        call = agentic_llm.build_default_llm_call(_config("openai/gpt-5.6-luna"))
+        await call(_messages(), None)
+
+        acompletion.assert_awaited_once()
+        kwargs = _last_kwargs(acompletion)
+        assert kwargs["api_key"] == _DONATED
+        assert kwargs["metadata"] == llm_call_metadata(agentic_llm.GAP_FILL_V2_DRIVER_ROLE, DONATED_KEY_ALIAS)

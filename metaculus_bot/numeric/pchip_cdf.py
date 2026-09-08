@@ -593,7 +593,7 @@ def generate_pchip_cdf(
     upper_bound: float,
     lower_bound: float,
     zero_point: float | None = None,
-    min_step: float = 5.0e-5,
+    min_step: float = NUM_MIN_PROB_STEP,
     max_step: float = NUM_MAX_STEP,
     num_points: int = 201,
     question_id: int | str | None = None,

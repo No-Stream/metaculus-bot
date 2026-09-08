@@ -36,7 +36,13 @@ Four clarifications, each load-bearing:
 Paid or externally visible — ask before each:
 
 - `uv run python main.py` / `make run` in any live mode (`--mode test_questions`, `tournament`,
-  `metaculus_cup`, `minibench`): spends credits AND publishes.
+  `metaculus_cup`, `minibench`, `mantic`): spends credits AND publishes.
+- `--mode mantic` / `make run_mantic`: forecasts the Mantic Crucible tournament
+  (`competitions.mantic.com`, a fork of the Metaculus platform) and publishes there. It spends
+  the operator's PERSONAL keys only: the Metaculus-donated OpenRouter key is refused, the run
+  requires `DONATED_OPENROUTER_KEY_ENABLED=false` and fails shut without it, and with a single
+  key there is no key-swap fallback. About $2.60 per question. Detail: `docs/operations.md`
+  "Mantic".
 - `make backtest_smoke_test` / `_small` / `_medium` / `_large`: every forecaster and research
   call, plus the `LEAKAGE_DETECTOR_MODEL` screen. No publish, real money. Question counts are
   the `--num-questions` values in the Makefile.
@@ -54,8 +60,10 @@ Paid or externally visible — ask before each:
   dollar spend is near-zero, but the calls are real and need a key. Ask anyway.
 - **GitHub Actions runs of any bot workflow**, which spend exactly as a local run does and
   publish to Metaculus. `test_bot_basic.yaml` (one numeric question, ~$2.60) and `test_bot.yaml`
-  are `workflow_dispatch`-only. The three `run_bot_on_*.yaml` prod workflows are additionally on
-  `schedule:` crons. Never dispatch one, and never edit a `schedule:` block or a research/model
+  are `workflow_dispatch`-only. The four `run_bot_on_*.yaml` prod workflows are additionally on
+  `schedule:` crons (`run_bot_on_mantic.yaml`, :17/:47, holds no Metaculus secret and is
+  auto-enabled once its file lands on `main`). Never dispatch one, and never edit a `schedule:`
+  block or a research/model
   flag in a way that adds runs or raises per-run cost, without the operator's say-so. `gh` needs
   `--repo No-Stream/metaculus-bot` here: `origin` is the fork, `upstream` is the Metaculus
   template, and no default repo is set, so a bare `gh workflow` command silently targets
@@ -126,9 +134,11 @@ Free and safe — run freely:
 A fork of the Metaculus starter template, built on the `forecasting-tools` framework. For each
 question it gathers research from several providers in parallel, runs a small ensemble of
 frontier LLMs to produce independent forecasts, combines them, and publishes the result as a
-Metaculus comment. Aggregation defaults to `CONDITIONAL_STACKING` (MEDIAN when the base models
-agree, a stacker LLM rewrite when they disagree), but **stacking is disabled in production, so
-prod publishes the MEDIAN of the raw forecasts.**
+Metaculus comment. `--mode mantic` runs the same pipeline against Mantic's Crucible competition
+(a Metaculus fork with the same API shape) through a swapped platform client. Aggregation
+defaults to `CONDITIONAL_STACKING` (MEDIAN when the base models agree, a stacker LLM rewrite
+when they disagree), but **stacking is disabled in production, so prod publishes the MEDIAN of
+the raw forecasts.**
 
 ## Layout
 
@@ -149,9 +159,6 @@ Top level:
   ladder is built; the TLS-impersonation rung it deferred is built per
   `impersonate_rung_plan_2026-09-04.md`). `metaculus_api_doc_LARGE_FILE.yml` there is the full Metaculus
   API spec — read it with offset/limit.
-- `REFERENCE_COPY_OF_forecasting_tools*/` — read-only copy of the framework source; edits do not
-  affect the installed package. `REFERENCE_COPY_OF_panchul*/` — a Q2 2025 competition winner,
-  for comparison.
 - `tests/`, `.github/workflows/` (CI on PRs, plus the scheduled bot runs), `scripts/`.
 
 Inside `metaculus_bot/`:
@@ -159,6 +166,7 @@ Inside `metaculus_bot/`:
 | Concern | Where |
 |---|---|
 | Per-question orchestration | `forecaster.py` (`_research_and_make_predictions`), `cli.py` |
+| Mantic platform client (Crucible, a Metaculus fork) | `mantic.py` |
 | Close-derived time budget | `time_budget.py` |
 | Research fan-out and providers | `research/` (`orchestrator.py`, `providers.py`, one module per provider) |
 | Outbound fetch transports (never hand-rolled) | `research/http_fetch.py`, `impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry), `rendered_fetch.py` (headless Chromium), `url_context_reader.py` (the paid Gemini read), `robots_policy.py` |
@@ -243,7 +251,9 @@ Each of these has cost real work at least once. The pointer is where the reasoni
   OpenRouter key, despite the name. Everything else is the operator's personal key, including
   `GOOGLE_API_KEY`, which is a billing-enabled AI Studio key with no donated equivalent. Which
   key pays for what, the fallback rules, and every auth-error diagnosis are in
-  `docs/operations.md` "API keys and the shared-vs-personal key model".
+  `docs/operations.md` "API keys and the shared-vs-personal key model". `--mode mantic` never
+  touches the shared key: it requires `DONATED_OPENROUTER_KEY_ENABLED=false` and fails shut
+  otherwise, so on a Mantic run every OpenRouter auth error is the personal key.
 
 **Telemetry and logs**
 
@@ -422,7 +432,7 @@ After pushing, check the run:
 | `docs/value_extraction.md` | The four-rung extraction ladder, its fidelity checks, and the `EXTRACTION_RUNG` / `MEMBER_FORECAST` markers with the raw-versus-published convention. |
 | `docs/prompts.md` | Every forecasting-prompt rule, the constant that carries it, its receipt, and the size accounting from the 2026-09 de-bloat. |
 | `docs/roster_history.md` | The roster design rule, the dated roster-change history and its era boundary, the support-model roles, and the dormant `probabilistic_tools` / `tool_runner` paths. |
-| `docs/operations.md` | Running the bot: setup, the season-start checklist, the shared-versus-personal API keys, Google AI Studio billing, credit telemetry and the refill floor, the dry-donated-key semantics, the workflows and their env flags, backtesting, and reading run logs. |
+| `docs/operations.md` | Running the bot: setup, the season-start checklist, the shared-versus-personal API keys, Google AI Studio billing, credit telemetry and the refill floor, the dry-donated-key semantics, the workflows and their env flags, the Mantic (Crucible) mode and its personal-keys-only rule, backtesting, and reading run logs. |
 | `docs/performance_analysis.md` | Residual-analysis conventions: era bucketing and the merge-date rule, the exclusion cohorts, the archive's record classes, the PIT and spot-peer conventions, `spot_peer_delta`, the starved outer tail, per-model recovery, and the clip-threshold sweep. |
 | `README.md` | Human quick-start: install, configure, run. |
 | `FUTURE.md` | The design log — intent, history, and rejected ideas. Read it for the why, not for current state. |

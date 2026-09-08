@@ -17,10 +17,15 @@ Three files form the startup chain:
 - `main.py` — a thin shim. It re-exports `TemplateForecaster` (for anything that
   imports it) and, when run directly, calls `cli.main()`.
 - `metaculus_bot/cli.py` — the command-line entry point. It parses `--mode`
-  (`tournament`, `minibench`, `metaculus_cup`, `quarterly_cup`, `test_questions`),
-  builds the LLM roster dict from `llm_configs.py`, constructs a `TemplateForecaster`
-  with `aggregation_strategy=CONDITIONAL_STACKING`, and runs the mode-specific
-  forecast loop. It also wires credit telemetry and decides the process exit code:
+  (`tournament`, `minibench`, `metaculus_cup`, `quarterly_cup`, `mantic`,
+  `test_questions`), builds the LLM roster dict from `llm_configs.py`, constructs a
+  `TemplateForecaster` with `aggregation_strategy=CONDITIONAL_STACKING`, and runs the
+  mode-specific forecast loop. Before any fetch it runs the API identity preflight
+  (`api_preflight.verify_api_identity`, against the Metaculus API by default and the
+  Mantic API in `--mode mantic`; it raises `ApiIdentityError` when the host does not
+  answer like the platform), and in mantic mode the personal-keys-only assertion and
+  the swap to the Mantic platform client (`metaculus_bot/mantic.py`); see
+  `docs/operations.md` "Mantic". It also wires credit telemetry and decides the process exit code:
   the run exits non-zero when any degradation counter fired (`alertable_count` on
   `TemplateForecaster` sums them: dropped forecasters, questions that failed to
   publish, stacker fallbacks, research-provider and summarizer failures, gap-fill
@@ -35,8 +40,8 @@ Three files form the startup chain:
   first is `_research_and_make_predictions`.
 
 Publication happens inside the framework's forecast loop, not in `cli.py`. Every
-question that clears the min-forecasters guard is already on Metaculus by the time
-`cli.py` decides the exit code.
+question that clears the min-forecasters guard is already on the platform (Metaculus,
+or Mantic in `--mode mantic`) by the time `cli.py` decides the exit code.
 
 ## The per-question pipeline
 
@@ -325,6 +330,9 @@ Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and neve
 | Concern | Module |
 |---|---|
 | Startup / CLI | `main.py`, `metaculus_bot/cli.py` |
+| API identity preflight | `metaculus_bot/api_preflight.py` (`verify_api_identity`, its Metaculus wrapper, `ApiIdentityError`) |
+| Mantic platform client (Crucible, a Metaculus fork) | `metaculus_bot/mantic.py` |
+| Publish hardening and close gate | `metaculus_bot/publish_hardening.py` (the `_PLATFORM_HOSTS` POST timeout covers both platforms), `publish_gate.py` |
 | Per-question orchestration | `metaculus_bot/forecaster.py` |
 | Post-fan-out aggregation routing | `metaculus_bot/stacking_route.py` |
 | Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`; `degradation_counters.py` formats immutable snapshots built by `forecaster.py` |

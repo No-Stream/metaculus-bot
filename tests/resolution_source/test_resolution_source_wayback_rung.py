@@ -195,7 +195,11 @@ class TestWaybackRung:
 
     @pytest.mark.parametrize(
         "innermost",
-        ["https://www.metaculus.com/questions/45001/", "http://169.254.169.254/latest/meta-data/"],
+        [
+            "https://www.metaculus.com/questions/45001/",
+            "https://competitions.mantic.com/questions/650/",
+            "http://169.254.169.254/latest/meta-data/",
+        ],
     )
     async def test_a_nested_capture_is_unwrapped_to_its_innermost_url(self, innermost):
         """A capture OF a capture presents `web.archive.org` as its inner host, which clears both

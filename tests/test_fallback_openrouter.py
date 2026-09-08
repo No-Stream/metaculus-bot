@@ -4,7 +4,8 @@ from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from litellm.exceptions import APIError, RateLimitError
+from forecasting_tools import GeneralLlm
+from litellm.exceptions import APIError, RateLimitError, ServiceUnavailableError
 
 from metaculus_bot import fallback_openrouter
 from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE
@@ -115,6 +116,35 @@ class TestPredicates:
         assert should_route_via_donated_key("openrouter/") is False  # parts < 2
         assert should_route_via_donated_key("") is False
 
+    def test_master_switch_off_pins_every_provider_to_personal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DONATED_OPENROUTER_KEY_ENABLED=false (a Mantic run) wins over every per-provider rule.
+
+        Metaculus donated the key for its own tournaments, so a run for another platform
+        must never route through it: OpenAI and Anthropic (unconditionally donated when
+        the switch is on) and Google (even with its own toggle explicitly ON) all read
+        False. This predicate is the single gate for the builder, ``api_key_utils`` and
+        the gap-fill v2 transport, so False here is personal-only routing everywhere.
+        """
+        monkeypatch.setenv("DONATED_OPENROUTER_KEY_ENABLED", "false")
+        monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
+        assert should_route_via_donated_key("openrouter/openai/gpt-5.6-sol") is False
+        assert should_route_via_donated_key("openrouter/anthropic/claude-opus-4.8") is False
+        assert should_route_via_donated_key("openrouter/google/gemini-3.5-flash") is False
+
+    def test_master_switch_unset_or_true_leaves_routing_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default ON: a Metaculus run that never sets the switch routes exactly as before."""
+        monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)
+        for raw in (None, "true"):
+            if raw is None:
+                monkeypatch.delenv("DONATED_OPENROUTER_KEY_ENABLED", raising=False)
+            else:
+                monkeypatch.setenv("DONATED_OPENROUTER_KEY_ENABLED", raw)
+            assert should_route_via_donated_key("openrouter/openai/gpt-5.6-sol") is True
+            assert should_route_via_donated_key("openrouter/anthropic/claude-opus-4.8") is True
+            assert should_route_via_donated_key("openrouter/google/gemini-3.5-flash") is True
+            assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is False
+            assert should_route_via_donated_key("openrouter/x-ai/grok-4.1-fast") is False
+
     def test_donated_key_providers_set(self) -> None:
         # Pin the membership so any drift surfaces in code review rather than
         # silently changing routing.
@@ -159,8 +189,6 @@ class TestPredicates:
 
     def test_litellm_rate_limit_error_triggers_fallback(self) -> None:
         """litellm.RateLimitError (typed 429) triggers fallback — BYOK quotas are independent."""
-        from litellm.exceptions import RateLimitError
-
         exc = RateLimitError(
             message="Rate limit exceeded on openrouter",
             model="openrouter/google/gemini-3.1-pro-preview",
@@ -170,8 +198,6 @@ class TestPredicates:
 
     def test_litellm_service_unavailable_does_not_trigger_fallback(self) -> None:
         """litellm.ServiceUnavailableError (503) does NOT trigger fallback — infrastructure issue."""
-        from litellm.exceptions import ServiceUnavailableError
-
         exc = ServiceUnavailableError(
             message="503 Service Unavailable",
             model="openrouter/openai/gpt-5.1",
@@ -218,8 +244,6 @@ class TestFallbackOpenRouterLlm:
     @pytest.mark.asyncio
     async def test_fallback_on_429_rate_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """429 on primary key falls back to secondary — BYOK quotas are independent."""
-        from litellm.exceptions import RateLimitError
-
         llm = FallbackOpenRouterLlm(
             model="openrouter/google/gemini-3.1-pro-preview",
             primary_api_key="special",
@@ -268,8 +292,6 @@ class TestFallbackOpenRouterLlm:
     @pytest.mark.asyncio
     async def test_no_fallback_on_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """503 Service Unavailable re-raises without fallback — infrastructure issue, not key-scoped."""
-        from litellm.exceptions import ServiceUnavailableError
-
         llm = FallbackOpenRouterLlm(
             model="openrouter/openai/gpt-5.1",
             primary_api_key="special",
@@ -829,9 +851,7 @@ class TestBuilder:
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
         llm = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5.1")
         # Not wrapper, should be a GeneralLlm
-        from forecasting_tools import GeneralLlm as GL
-
-        assert isinstance(llm, GL)
+        assert isinstance(llm, GeneralLlm)
         assert not isinstance(llm, FallbackOpenRouterLlm)
 
     def test_builder_plain_for_non_donated_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -842,9 +862,7 @@ class TestBuilder:
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
         llm = build_llm_with_openrouter_fallback("openrouter/x-ai/grok-4.1-fast")
         # Not wrapper, should be a GeneralLlm
-        from forecasting_tools import GeneralLlm as GL
-
-        assert isinstance(llm, GL)
+        assert isinstance(llm, GeneralLlm)
         assert not isinstance(llm, FallbackOpenRouterLlm)
 
     def test_builder_returns_wrapper_for_google_flash_when_donated_toggle_on(
@@ -872,13 +890,11 @@ class TestBuilder:
         Temporary workaround; see DONATED_KEY_BLOCKED_GOOGLE_MODELS
         (``TODO(gemini-3.1-pro-donated)``) and FUTURE.md.
         """
-        from forecasting_tools import GeneralLlm as GL
-
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
         monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
         pro = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.1-pro-preview")
-        assert isinstance(pro, GL)
+        assert isinstance(pro, GeneralLlm)
         assert not isinstance(pro, FallbackOpenRouterLlm)
         flash = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.5-flash")
         assert isinstance(flash, FallbackOpenRouterLlm)
@@ -888,13 +904,11 @@ class TestBuilder:
         wrapper entirely — the resulting LLM is a plain GeneralLlm using the
         operator's general OpenRouter key.
         """
-        from forecasting_tools import GeneralLlm as GL
-
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
         monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "false")
         llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.5-flash")
-        assert isinstance(llm, GL)
+        assert isinstance(llm, GeneralLlm)
         assert not isinstance(llm, FallbackOpenRouterLlm)
 
     def test_builder_returns_wrapper_for_google_flash_when_toggle_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -911,6 +925,29 @@ class TestBuilder:
         monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)
         llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.5-flash")
         assert isinstance(llm, FallbackOpenRouterLlm)
+
+    def test_builder_plain_personal_when_master_switch_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With DONATED_OPENROUTER_KEY_ENABLED=false and BOTH keys present, the builder returns a
+        plain GeneralLlm billed to the personal key for every donated-eligible provider.
+
+        This is the Mantic-run shape: the fallback wrapper (donated primary, personal secondary)
+        must not be built, because its primary would spend Metaculus's key on another platform.
+        The donated key never reaches the LLM's kwargs either; litellm reads OPENROUTER_API_KEY
+        from the environment, which is what ``plain_llm_key_alias`` tags as ``personal``.
+        """
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        monkeypatch.setenv("DONATED_OPENROUTER_KEY_ENABLED", "false")
+        for model in (
+            "openrouter/openai/gpt-5.6-sol",
+            "openrouter/anthropic/claude-opus-4.8",
+            "openrouter/google/gemini-3.5-flash",
+        ):
+            llm = build_llm_with_openrouter_fallback(model, role="parser")
+            assert isinstance(llm, GeneralLlm)
+            assert not isinstance(llm, FallbackOpenRouterLlm)
+            assert llm.litellm_kwargs["metadata"] == llm_call_metadata("parser", PERSONAL_KEY_ALIAS)
+            assert llm.litellm_kwargs.get("api_key") is None
 
 
 class TestRoleTagging:

@@ -232,6 +232,29 @@ class TestSkipPredicates:
         # A capture of an ordinary page is still an ordinary (fetchable) source.
         assert is_metaculus_self_ref("https://web.archive.org/web/20240101000000/https://www.bls.gov/cpi/") is False
 
+    def test_is_metaculus_self_ref_covers_the_mantic_competition_site(self):
+        """A Mantic question page shows the other bots' forecasts and comments, so fetching one
+        would leak competitor forecasts into research. The refusal covers the competition host
+        and its subdomains only: the rest of mantic.com is the company's marketing site and blog,
+        which publishes forecasts and is a legitimate outside source."""
+        assert is_metaculus_self_ref("https://competitions.mantic.com/questions/650/") is True
+        assert is_metaculus_self_ref("https://api.competitions.mantic.com/posts/650/") is True
+        # Port and userinfo must not bypass, exactly as for Metaculus.
+        assert is_metaculus_self_ref("https://competitions.mantic.com:443/questions/650/") is True
+        assert is_metaculus_self_ref("https://user@competitions.mantic.com/questions/650/") is True
+        # A Wayback capture of a Mantic question page is the question quoting itself too.
+        assert (
+            is_metaculus_self_ref(
+                "https://web.archive.org/web/20260901000000/https://competitions.mantic.com/questions/650/"
+            )
+            is True
+        )
+        assert is_metaculus_self_ref("https://www.mantic.com/") is False
+        assert is_metaculus_self_ref("https://blog.mantic.com/forecasting-the-fed/") is False
+        assert is_metaculus_self_ref("https://mantic.com/") is False
+        # A host that merely ends in the string is not the competition site.
+        assert is_metaculus_self_ref("https://notcompetitions.mantic.com/x") is False
+
     def test_is_fred_url(self):
         assert is_fred_url("https://fred.stlouisfed.org/series/DGS10") is True
         assert is_fred_url("https://stlouisfed.org/other") is False
@@ -254,7 +277,8 @@ class TestSelectFetchableUrls:
 
     def test_drops_self_ref_fred_yahoo_ticker(self):
         criteria = (
-            "See https://metaculus.com/q/1 and https://fred.stlouisfed.org/series/DGS10 "
+            "See https://metaculus.com/q/1 and https://competitions.mantic.com/questions/650/ "
+            "and https://fred.stlouisfed.org/series/DGS10 "
             "and https://finance.yahoo.com/quote/AAPL — but also https://www.bls.gov/cpi/."
         )
         urls = select_fetchable_urls(criteria, "")

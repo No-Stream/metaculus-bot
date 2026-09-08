@@ -1,4 +1,4 @@
-"""One-shot identity check for the Metaculus API host, run before we send the token.
+"""One-shot identity check for a question platform's API host, run before we send the token.
 
 On 2026-07-21 metaculus.com's DNS was repointed at a GoDaddy parking host (WHOIS
 updated that day, GoDaddy nameservers serving parking IPs, a fresh GoDaddy DV
@@ -11,14 +11,18 @@ token to an unknown host before dying on an opaque 404. The real Metaculus
 origin was still alive behind Cloudflare — this was an upstream domain incident,
 not a code bug.
 
-``verify_metaculus_api_identity`` makes ONE unauthenticated request (no token,
-no headers) to the posts list and confirms the host behaves like the real API
-before any authenticated call runs. Two jobs:
+``verify_api_identity`` makes ONE unauthenticated request (no token, no headers)
+to the posts list under the given API base URL and confirms the host behaves
+like the real API before any authenticated call runs. ``verify_metaculus_api_identity``
+is the Metaculus run modes' wrapper over it; the Mantic run mode calls
+``verify_api_identity`` with ``MANTIC_API_BASE_URL`` directly, so a Mantic run
+never depends on Metaculus DNS health. Two jobs:
 
 1. Never send the token to a host we haven't sanity-checked — the preflight
    itself carries no credentials.
-2. Fail fast with a diagnostic that names the likely cause (DNS parking/hijack),
-   instead of a bare ``HTTPError`` traceback from deep inside forecasting-tools.
+2. Fail fast with a diagnostic that names the vetted host and the likely cause
+   (DNS parking/hijack), instead of a bare ``HTTPError`` traceback from deep
+   inside forecasting-tools.
 
 The request goes through an isolated ``requests.Session`` with
 ``trust_env=False``. That is load-bearing, not hygiene: with the default
@@ -36,13 +40,17 @@ Deliberately NOT retried: this is an identity gate, not a transient-failure
 absorber. Retries (with the token attached) belong to ``fetch_hardening``, which
 runs only after identity is established. One shot, fail fast.
 
-Signatures observed live 2026-07-21:
+Signatures observed live:
 
-- Real API, unauthenticated GET ``/api/posts/?limit=1`` -> 403, ``text/plain``
+- Metaculus, unauthenticated GET ``/api/posts/?limit=1`` -> 403, ``text/plain``
   body "Permission Error: The API is only available to authenticated users."
-- Real API, authenticated -> 200 JSON dict with a ``"results"`` key.
+  (2026-07-21).
+- Metaculus, authenticated -> 200 JSON dict with a ``"results"`` key (2026-07-21).
+- Mantic (``competitions.mantic.com/api``), unauthenticated GET ``/posts/?limit=1``
+  -> 200 ``application/json`` dict with a ``"results"`` key: its posts list is
+  public and there is no Cloudflare in front (2026-09-08).
 - Parked/hijacked host, same URL -> 404 empty body; ``/api2/...`` paths return
-  200 with an HTML lander redirect.
+  200 with an HTML lander redirect (2026-07-21).
 """
 
 from __future__ import annotations
@@ -50,6 +58,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
@@ -58,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 
 def _api_base_url() -> str:
-    """The API root the bot's own fetches will use.
+    """The API root the bot's own Metaculus fetches will use.
 
     Read from ``MetaculusClient`` rather than the deprecated ``MetaculusApi`` shim, which
     on ft 0.2.92 no longer carries ``API_BASE_URL`` at all — this module was written
@@ -73,9 +82,14 @@ def _api_base_url() -> str:
     return MetaculusClient().base_url
 
 
+def _preflight_url(base_url: str) -> str:
+    """The identity probe's URL under ``base_url``: the posts list, whose unauthenticated
+    behavior IS the fingerprint (it is the exact endpoint the question fetch uses)."""
+    return f"{base_url}/posts/?limit=1"
+
+
 def preflight_url() -> str:
-    """The URL the identity probe hits: the posts list, whose unauthenticated behavior IS
-    the fingerprint (it is the exact endpoint the question fetch uses).
+    """The URL the Metaculus identity probe hits.
 
     Resolved at CALL time rather than bound as a module constant, because the base URL comes
     out of the environment and this module is imported BEFORE the bot loads its ``.env``
@@ -86,11 +100,11 @@ def preflight_url() -> str:
     then went to the override host. That is precisely the "credentials to an unvetted host"
     failure this module exists to prevent, so the two reads have to happen at the same time.
     """
-    return f"{_api_base_url()}/posts/?limit=1"
+    return _preflight_url(_api_base_url())
 
 
-# The real Metaculus API gates unauthenticated access behind these statuses —
-# this is its fingerprint when we send no token.
+# A real question-platform API gates unauthenticated access behind these statuses —
+# Metaculus's fingerprint when we send no token.
 _AUTH_GATED_STATUSES = frozenset({401, 403})
 
 # Transient edge conditions the real Metaculus front door emits under load
@@ -102,16 +116,23 @@ _TRANSIENT_STATUSES = frozenset({408, 429, 502, 503, 504})
 # Cap on the response body echoed into the diagnostic (keeps the log line bounded).
 _BODY_PREVIEW_CHARS = 200
 
-# Shared tail appended to hijack-flavored failure messages. Names the likely
-# cause and, critically, tells the operator NOT to retry with credentials.
-_DIAGNOSTIC_HINT = (
-    "looks like DNS parking/hijack or a non-Metaculus host answering www.metaculus.com; "
-    "do NOT retry with credentials; check `dig www.metaculus.com` and Metaculus status channels"
-)
+
+def _hijack_hint(host: str) -> str:
+    """Tail of every hijack-flavored failure message. Names the likely cause and,
+    critically, tells the operator NOT to retry with credentials."""
+    return (
+        f"looks like DNS parking/hijack or an imposter answering {host}; "
+        f"do NOT retry with credentials; check `dig {host}` and the platform's status channels"
+    )
 
 
-class MetaculusApiIdentityError(RuntimeError):
-    """Raised when the host answering www.metaculus.com doesn't behave like the real API."""
+class ApiIdentityError(RuntimeError):
+    """Raised when the host answering a question platform's API base URL doesn't behave like the real API."""
+
+
+# The name this module shipped with while it vetted only Metaculus: the same class, so
+# callers written against either name catch the same exception.
+MetaculusApiIdentityError = ApiIdentityError
 
 
 def _parse_json_object(body: str) -> dict[str, Any] | None:
@@ -123,63 +144,72 @@ def _parse_json_object(body: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def verify_metaculus_api_identity(timeout: float = 20.0) -> None:
-    """Confirm www.metaculus.com is answered by the real Metaculus API before any authed call.
+def verify_api_identity(base_url: str, *, timeout: float = 20.0) -> None:
+    """Confirm ``base_url`` is answered by the real question-platform API before any authed call.
 
-    Sends ONE unauthenticated GET (no token, no headers) to ``preflight_url()``
-    through an isolated ``trust_env=False`` session (so no netrc/env credential
-    is attached). Passes silently on the real API's fingerprint; raises
-    ``MetaculusApiIdentityError`` with a diagnostic on anything else. Never
-    retries — see module docstring.
+    Sends ONE unauthenticated GET (no token, no headers) to ``{base_url}/posts/?limit=1``
+    through an isolated ``trust_env=False`` session (so no netrc/env credential is
+    attached). Passes silently on a real API's fingerprint — an auth-gated 401/403
+    (Metaculus without a token) or a 200 JSON object carrying ``results`` (Metaculus with
+    a token; Mantic, whose posts list is public); raises ``ApiIdentityError`` with a
+    diagnostic naming the vetted host on anything else. Never retries — see module docstring.
     """
-    url = preflight_url()
+    url = _preflight_url(base_url)
+    host = urlparse(base_url).hostname or base_url
+    preflight = f"API identity preflight for {host}"
     try:
         with requests.Session() as session:
             session.trust_env = False  # do not let ~/.netrc or proxy env inject credentials
             response = session.get(url, timeout=timeout, allow_redirects=False)
     except requests.RequestException as e:
-        raise MetaculusApiIdentityError(
-            f"Metaculus API identity preflight could not reach {url!r} "
-            f"({type(e).__name__}: {e}); DNS/TLS/connect failure before any response. "
-            "Do NOT retry with credentials; check `dig www.metaculus.com` and Metaculus status channels."
+        raise ApiIdentityError(
+            f"{preflight} could not reach {url!r} ({type(e).__name__}: {e}); "
+            "DNS/TLS/connect failure before any response. "
+            f"Do NOT retry with credentials; check `dig {host}` and the platform's status channels."
         ) from e
 
     status = response.status_code
     body_preview = response.text[:_BODY_PREVIEW_CHARS]
 
     if status in _AUTH_GATED_STATUSES:
-        logger.info(f"Metaculus API identity preflight passed ({status=} auth-gated)")
+        logger.info(f"API identity preflight passed for {host} ({status=} auth-gated)")
         return
 
     if status == 200:
         parsed = _parse_json_object(response.text)
         if parsed is not None and "results" in parsed:
-            logger.info(f"Metaculus API identity preflight passed ({status=} JSON results payload)")
+            logger.info(f"API identity preflight passed for {host} ({status=} JSON results payload)")
             return
-        raise MetaculusApiIdentityError(
-            f"Metaculus API identity preflight got {status=} from {url!r} but the body is not the "
-            f"expected JSON results payload (first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_DIAGNOSTIC_HINT}."
+        raise ApiIdentityError(
+            f"{preflight} got {status=} from {url!r} but the body is not the expected JSON results "
+            f"payload (first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_hijack_hint(host)}."
         )
 
     if status in _TRANSIENT_STATUSES:
-        raise MetaculusApiIdentityError(
-            f"Metaculus API identity preflight got {status=} from {url!r} "
+        raise ApiIdentityError(
+            f"{preflight} got {status=} from {url!r} "
             f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); transient edge throttle/server condition — "
             "not necessarily a hijack; a later retry of the whole run is appropriate; "
             "do NOT retry with credentials now."
         )
 
     if 500 <= status < 600:
-        raise MetaculusApiIdentityError(
-            f"Metaculus API identity preflight got {status=} from {url!r} "
+        raise ApiIdentityError(
+            f"{preflight} got {status=} from {url!r} "
             f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); cannot verify API identity. "
-            "This may be a genuine Metaculus server error rather than a hijack, but the run is useless either way. "
-            "Do NOT retry with credentials; check Metaculus status channels."
+            f"This may be a genuine {host} server error rather than a hijack, but the run is useless either way. "
+            "Do NOT retry with credentials; check the platform's status channels."
         )
 
     # Any other status — 404, a 3xx redirect (allow_redirects=False keeps it a
     # status, not a followed hop), an unexpected 2xx, or a stray 4xx.
-    raise MetaculusApiIdentityError(
-        f"Metaculus API identity preflight got unexpected {status=} from {url!r} "
-        f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_DIAGNOSTIC_HINT}."
+    raise ApiIdentityError(
+        f"{preflight} got unexpected {status=} from {url!r} "
+        f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_hijack_hint(host)}."
     )
+
+
+def verify_metaculus_api_identity(timeout: float = 20.0) -> None:
+    """The Metaculus run modes' preflight: :func:`verify_api_identity` against the API root
+    the bot's own Metaculus fetches use (see :func:`_api_base_url`)."""
+    verify_api_identity(_api_base_url(), timeout=timeout)
