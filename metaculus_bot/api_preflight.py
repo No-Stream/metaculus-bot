@@ -130,11 +130,6 @@ class ApiIdentityError(RuntimeError):
     """Raised when the host answering a question platform's API base URL doesn't behave like the real API."""
 
 
-# The name this module shipped with while it vetted only Metaculus: the same class, so
-# callers written against either name catch the same exception.
-MetaculusApiIdentityError = ApiIdentityError
-
-
 def _parse_json_object(body: str) -> dict[str, Any] | None:
     """Parse ``body`` as JSON, returning the object as a dict or None if it isn't a JSON object."""
     try:

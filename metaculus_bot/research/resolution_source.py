@@ -455,11 +455,12 @@ async def _every_resolved_address_is_public(host: str) -> bool:
 def select_fetchable_urls(criteria: str | None, fine_print: str | None) -> list[str]:
     """Compose the fetchable URL list from a question's resolution criteria + fine print.
 
-    Skips self-refs (metaculus.com), FRED, and Yahoo ticker URLs — those either
-    add no new info or are covered by another provider. Caps at
-    ``RESOLUTION_SOURCE_MAX_URLS`` AFTER the skip filter so a run of leading
-    self-refs / FRED / Yahoo URLs (Metaculus questions often list the question
-    page first) doesn't starve the real sources out of the fetch budget.
+    Skips self-refs (the question platform's own site: metaculus.com or
+    competitions.mantic.com), FRED, and Yahoo ticker URLs — those either add no new
+    info or are covered by another provider. Caps at ``RESOLUTION_SOURCE_MAX_URLS``
+    AFTER the skip filter so a run of leading self-refs / FRED / Yahoo URLs (questions
+    often list their own page first) doesn't starve the real sources out of the
+    fetch budget.
     """
     combined = f"{criteria or ''}\n\n{fine_print or ''}"
     urls = extract_source_urls(combined)
@@ -921,9 +922,10 @@ async def _vetted_hop_target(
             content_type=content_type or None,
         )
     if refusal == "metaculus_self_ref":
-        # The URL pre-filter drops metaculus self-refs, but a redirect (of either
-        # shape) can still land on metaculus.com; don't follow it (no new info,
-        # and keeps our IP off the same host the critical API uses).
+        # The URL pre-filter drops self-refs, but a redirect (of either shape) can
+        # still land on the question platform's own site (metaculus.com or
+        # competitions.mantic.com); don't follow it (no new info, and keeps our IP
+        # off the same host the critical API uses).
         logger.info(
             f"resolution_source metaculus_self_ref ({kind}): "
             f"{urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"

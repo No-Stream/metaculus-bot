@@ -139,38 +139,8 @@ def _discrete_open_upper_question() -> NumericQuestion:
     )
 
 
-def test_ensemble_discrete_resample_does_not_clip_concentrated_low_count():
-    """Regression: the discrete-resample branch of _postprocess_ensemble_cdf must not clip P(0) to 0.2.
-
-    When the aggregated CDF arrives on a finer grid than the question's cdf_size
-    (``len(x_vals) != cdf_size``), the branch resamples via ``generate_pchip_cdf``.
-    On a 9-point grid the server's max-step is 0.2*200/8 = 5.0 (vacuous), so a
-    low-count consensus (most mass on 0) must keep P(0) well above the old
-    201-grid 0.2 cap this branch used to inherit.
-    """
-    question = _discrete_open_upper_question()
-
-    # Concentrated-low aggregated CDF on the 201-point grid (mismatched length ->
-    # is_discrete=True -> discrete-resample branch). ~32% of mass on 0.
-    x = np.linspace(question.lower_bound, question.upper_bound, 201)
-    below_one = np.minimum(1.0, np.maximum(0.0, (x + 0.5) / 1.0))
-    above_one = np.maximum(0.0, (x - 0.5) / 7.0)
-    p = np.maximum.accumulate(np.clip(0.32 * below_one + 0.66 * above_one, 0.0, 0.999))
-
-    dist = _postprocess_ensemble_cdf(x, p, question, "median")
-    probs = np.array([pp.percentile for pp in dist.cdf], dtype=float)
-
-    assert len(probs) == question.cdf_size
-    p_zero = probs[1] - probs[0]
-    assert p_zero > 0.25, f"P(0)={p_zero} clipped to the 0.2 cap"
-    diffs = np.diff(probs)
-    server_max_step = min(1.0, 0.2 * 200.0 / (question.cdf_size - 1))
-    assert np.all(diffs <= server_max_step + 1e-9)
-    assert np.all(diffs >= 0.01 / (question.cdf_size - 1) - 1e-12)
-
-
 def test_ensemble_median_ramp_does_not_overflow_above_one():
-    """Regression: the continuous branch's min-step ramp must not push interior CDF > 1.0.
+    """Regression: the ensemble min-step ramp must not push interior CDF > 1.0.
 
     On a concentrated low-count discrete question the aggregated median CDF has
     sub-min-step gaps near the top bins. The ramp (``p_vals + linspace(...)``) lifts
@@ -231,11 +201,12 @@ def _closed_discrete_question() -> NumericQuestion:
 
 
 def test_ensemble_aligned_discrete_grid_preserves_shape():
-    """When per-model CDFs already sit on the cdf_size grid, aggregation keeps the shape.
+    """Per-model CDFs on the cdf_size grid aggregate without clipping a low-count spike.
 
-    This is the branch that actually fires in prod (per-model CDFs are pre-resampled
-    to cdf_size by build_numeric_distribution), so len(x_vals) == cdf_size and the
-    continuous branch runs — it must not clip a concentrated low-count consensus.
+    build_numeric_distribution builds each member directly on the question's cdf_size
+    grid and aggregate_numeric aligns the ensemble to that same grid, so the coarse
+    grid's relaxed max step applies and a concentrated low-count consensus keeps its
+    mass on 0.
     """
     question = _discrete_open_upper_question()
     decls = [
@@ -280,7 +251,7 @@ def _fine_grid_question() -> NumericQuestion:
 
 
 def test_ensemble_clip_marker_names_the_stage_and_the_question(caplog):
-    """The continuous-branch CDF_MAXSTEP_CLIP must carry ensemble_median and the question id.
+    """The ensemble CDF_MAXSTEP_CLIP must carry ensemble_median and the question id.
 
     The question id is the telemetry archive's join key, so an unlabeled ensemble
     clip is unjoinable. The clip is NOT reachable through public aggregate_numeric —

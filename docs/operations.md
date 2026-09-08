@@ -761,8 +761,7 @@ Three Metaculus-shaped guards were generalized rather than bypassed.
   `verify_api_identity(base_url)`; `verify_metaculus_api_identity()` remains as the
   Metaculus wrapper. In mantic mode the preflight vets the Mantic API host and never
   touches metaculus.com, so a Mantic run does not depend on Metaculus DNS health.
-  The failure class is `ApiIdentityError` (the old `MetaculusApiIdentityError` name
-  is kept as an alias for now). Mantic's fingerprint differs in one way: its read
+  The failure class is `ApiIdentityError`. Mantic's fingerprint differs in one way: its read
   side answers unauthenticated with 200 JSON carrying a `results` key, which the
   existing acceptance branch already covers.
 - The publish-hardening forced POST timeout applies to both `metaculus.com` and

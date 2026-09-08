@@ -746,7 +746,7 @@ class TestOrchestratorBothFlags:
 
     def test_persistence_writer_serializes_gap_fill_v2(self, tmp_path) -> None:
         """Writer round-trips the v2 trace and omits the key when absent."""
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         trace = {"transcript": [{"role": "system", "content": "x"}], "telemetry": {"steps": 3}}
         writer.record(
             qid=1,

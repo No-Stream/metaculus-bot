@@ -93,7 +93,9 @@ class TestWritePathE2E:
     """Test that the orchestrator's research_sink callback produces valid JSONL via the writer."""
 
     def test_record_and_flush_produces_valid_jsonl(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="3672", run_id="12345")
+        writer = ResearchPersistenceWriter(
+            run_mode="tournament", platform="metaculus", tournament_id="3672", run_id="12345"
+        )
 
         writer.record(
             qid=43613,
@@ -129,7 +131,9 @@ class TestWritePathE2E:
         assert "timestamp" in record
 
     def test_research_text_preserved_exactly_no_truncation(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="3672", run_id="99")
+        writer = ResearchPersistenceWriter(
+            run_mode="tournament", platform="metaculus", tournament_id="3672", run_id="99"
+        )
 
         long_research = "A" * 50_000 + "\n## Targeted Gap-Fill (second pass)\n" + "B" * 50_000
         writer.record(
@@ -154,7 +158,7 @@ class TestWritePathE2E:
         ``self._research_sink(...)`` block), including the three v2 fields
         ``provider_results`` / ``providers_attempted`` / ``providers_succeeded``.
         """
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
 
         writer.record(
             qid=43613,
@@ -189,7 +193,7 @@ class TestWritePathE2E:
 
     def test_empty_diagnostics_block_omitted_from_record(self) -> None:
         """A falsy diagnostics block (no providers ran) must not add a key to the record."""
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         writer.record(
             qid=1,
             page_url="https://www.metaculus.com/questions/1/",
@@ -202,7 +206,9 @@ class TestWritePathE2E:
         assert "provider_diagnostics_block" not in writer._records[0]
 
     def test_multiple_questions_in_single_flush(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="minibench", tournament_id="bench-1", run_id="local-42")
+        writer = ResearchPersistenceWriter(
+            run_mode="minibench", platform="metaculus", tournament_id="bench-1", run_id="local-42"
+        )
 
         for qid in [43613, 50001, 38880]:
             writer.record(
@@ -905,7 +911,9 @@ class TestFullRoundTrip:
 
     def test_write_flush_archive_load(self, tmp_path: Path) -> None:
         # --- Step 1: Writer records 3 questions ---
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="3672", run_id="gh-action-100")
+        writer = ResearchPersistenceWriter(
+            run_mode="tournament", platform="metaculus", tournament_id="3672", run_id="gh-action-100"
+        )
 
         questions_data = [
             {
@@ -971,7 +979,9 @@ class TestFullRoundTrip:
 
     def test_round_trip_preserves_long_multiline_research(self, tmp_path: Path) -> None:
         """Verify that the full realistic research text survives the entire pipeline."""
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="3672", run_id="test-long")
+        writer = ResearchPersistenceWriter(
+            run_mode="tournament", platform="metaculus", tournament_id="3672", run_id="test-long"
+        )
 
         writer.record(
             qid=43613,

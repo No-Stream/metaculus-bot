@@ -19,7 +19,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from metaculus_bot.constants import NUM_RAMP_K_FACTOR
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
-from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, safe_cdf_bounds
+from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 __all__ = [
@@ -67,95 +67,56 @@ def _postprocess_ensemble_cdf(
 ) -> NumericDistribution:
     """Shared CDF post-processing for both mean and median aggregation.
 
-    Handles endpoint pinning, monotonic enforcement, ramp smoothing (continuous),
-    and PCHIP resampling (discrete). ``method_label`` is used only in log messages
-    (e.g. ``"mean"`` or ``"median"``).
+    Pins the endpoints, enforces monotonicity, ramp-smooths any sub-min-step bin and
+    routes the result through ``safe_cdf_bounds`` with the step limits of the grid the
+    CDF is on. That last pass is load-bearing: the ramp (or a raw concentrated median)
+    can push interior values above 1.0 and leave bins over the grid-scaled max step
+    (binding once ``cdf_size >= 42``), which would otherwise crash ``Percentile``
+    validation downstream and drop the question. Nothing is resampled here:
+    ``aggregate_numeric`` aligns every member to the question's own grid first, so a
+    discrete question's ensemble already sits on its ``cdf_size`` points and simply
+    gets that coarse grid's limits. ``method_label`` is used only in log and marker
+    text (e.g. ``"mean"`` or ``"median"``).
     """
     p_vals = np.clip(p_vals, 0.0, 1.0)
     p_vals = np.maximum.accumulate(p_vals)
     _pin_endpoints(p_vals, question)
 
-    target_cdf_size = int(getattr(question, "cdf_size", len(x_vals)) or len(x_vals))
-    is_discrete = target_cdf_size != len(x_vals)
-    min_step_required, max_step_required = grid_step_constraints(target_cdf_size)
+    min_step_required, max_step_required = grid_step_constraints(len(p_vals))
 
-    if not is_discrete:
-        diffs_before = np.diff(p_vals)
-        min_delta_before = float(np.min(diffs_before)) if len(diffs_before) else 1.0
-        if min_delta_before < min_step_required:
-            ramp = np.linspace(0.0, min_step_required * NUM_RAMP_K_FACTOR, len(p_vals))
-            p_vals = np.maximum.accumulate(p_vals + ramp)
-            _pin_endpoints(p_vals, question)
+    diffs_before = np.diff(p_vals)
+    min_delta_before = float(np.min(diffs_before)) if len(diffs_before) else 1.0
+    if min_delta_before < min_step_required:
+        ramp = np.linspace(0.0, min_step_required * NUM_RAMP_K_FACTOR, len(p_vals))
+        p_vals = np.maximum.accumulate(p_vals + ramp)
+        _pin_endpoints(p_vals, question)
 
-            diffs_after = np.diff(p_vals)
-            min_delta_after = float(np.min(diffs_after)) if len(diffs_after) else 1.0
-            logger.warning(
-                "Ensemble CDF ramp smoothing (%s) | Q %s | URL %s | min_prob_delta_before=%.8f | min_prob_delta_after=%.8f",
-                method_label,
-                getattr(question, "id_of_question", None),
-                getattr(question, "page_url", None),
-                min_delta_before,
-                min_delta_after,
-            )
-
-        # The ramp (and even a raw concentrated median) can push interior CDF values above
-        # 1.0 and can leave bins above the grid-scaled max-step (binding once cdf_size >= 42).
-        # Route the aggregated CDF through the same bounds/monotonic/min-step/max-step
-        # enforcement the per-model ramp path (pchip_processing._apply_ramp_smoothing) and the
-        # discrete branch below already apply, so the result is a valid submission rather than
-        # a downstream Percentile validation crash (percentile <= 1) that drops the question.
-        p_vals = safe_cdf_bounds(
-            p_vals,
-            open_lower=question.open_lower_bound,
-            open_upper=question.open_upper_bound,
-            min_step=min_step_required,
-            max_step=max_step_required,
-            question_id=question.id_of_question,
-            model_name=f"ensemble_{method_label}",
+        diffs_after = np.diff(p_vals)
+        min_delta_after = float(np.min(diffs_after)) if len(diffs_after) else 1.0
+        logger.warning(
+            "Ensemble CDF ramp smoothing (%s) | Q %s | URL %s | min_prob_delta_before=%.8f | min_prob_delta_after=%.8f",
+            method_label,
+            getattr(question, "id_of_question", None),
+            getattr(question, "page_url", None),
+            min_delta_before,
+            min_delta_after,
         )
 
-        declared_percentiles = [
-            Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_vals, p_vals, strict=False)
-        ]
-        return create_pchip_numeric_distribution(
-            pchip_cdf=list(map(float, p_vals)),
-            percentile_list=declared_percentiles,
-            question=question,
-            zero_point=question.zero_point,
-        )
-
-    # Discrete path: resample to question.cdf_size and strictly enforce min-step
-    logger.info(
-        "Discrete aggregation detected (%s) | Q %s | URL %s | target_cdf_size=%d | min_step_required=%.8f",
-        method_label,
-        getattr(question, "id_of_question", None),
-        getattr(question, "page_url", None),
-        target_cdf_size,
-        min_step_required,
-    )
-
-    percentile_values = {float(prob * 100.0): float(val) for val, prob in zip(x_vals, p_vals, strict=False)}
-    pchip_cdf_values, _ = generate_pchip_cdf(
-        percentile_values=percentile_values,
-        open_upper_bound=question.open_upper_bound,
-        open_lower_bound=question.open_lower_bound,
-        upper_bound=question.upper_bound,
-        lower_bound=question.lower_bound,
-        zero_point=question.zero_point,
+    p_vals = safe_cdf_bounds(
+        p_vals,
+        open_lower=question.open_lower_bound,
+        open_upper=question.open_upper_bound,
         min_step=min_step_required,
         max_step=max_step_required,
-        num_points=target_cdf_size,
-        question_id=getattr(question, "id_of_question", None),
-        question_url=getattr(question, "page_url", None),
+        question_id=question.id_of_question,
         model_name=f"ensemble_{method_label}",
     )
 
-    x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)
     declared_percentiles = [
-        Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, pchip_cdf_values, strict=False)
+        Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_vals, p_vals, strict=False)
     ]
     return create_pchip_numeric_distribution(
-        pchip_cdf=list(map(float, pchip_cdf_values)),
+        pchip_cdf=list(map(float, p_vals)),
         percentile_list=declared_percentiles,
         question=question,
         zero_point=question.zero_point,
@@ -168,10 +129,9 @@ def _canonical_cdf_length(question: NumericQuestion) -> int:
     Mirrors ``build_numeric_distribution``'s target (pipeline.py reads a None
     ``cdf_size`` as the standard grid the same way), so per-model CDFs and the
     ensemble CDF live on the same grid by construction. An out-of-range value
-    raises LOUDLY rather than silently substituting 201: the substitution would
-    only defer the crash to ``_postprocess_ensemble_cdf``, which re-reads
-    ``question.cdf_size`` and would then disagree with the grid the models were
-    just aligned onto.
+    raises LOUDLY rather than silently substituting 201: a ``cdf_size`` below 2 is
+    a malformed question, and the substitution would publish a 201-point CDF
+    against a grid the platform never declared.
     """
     if question.cdf_size is None:
         return PCHIP_CDF_POINTS
@@ -230,9 +190,10 @@ def aggregate_numeric(
     exact arithmetic but differ in the last bits, so a mixed-path ensemble
     produced ~225 distinct x-values for 201 buckets and roughly a quarter of them
     had fewer than n contributors — with nothing recording the partial
-    membership, and the resulting length mismatch logging a spurious "Discrete
-    aggregation detected". A model that genuinely arrives on a different-length
-    grid is resampled first (logged, see ``_cdf_heights_on_canonical_grid``).
+    membership, and the resulting length mismatch misrouting the ensemble through
+    a discrete-resample branch (since removed: alignment made it unreachable). A
+    model that genuinely arrives on a different-length grid is resampled first
+    (logged, see ``_cdf_heights_on_canonical_grid``).
 
     Parameters
     ----------

@@ -408,10 +408,10 @@ class TestGeneratePchipCdf:
     def test_boundary_labels_stay_silently_filtered(self):
         """0.0 / 100.0 KEYS are dropped by design, never raised on — values != keys.
 
-        ``_postprocess_ensemble_cdf``'s discrete branch feeds prob*100 labels that
-        legitimately include exactly 0.0 and 100.0 and relies on this filter
-        dropping them before the boundary points are re-added. The build with the
-        boundary labels present must be byte-identical to the build without them.
+        A caller that hands a whole CDF over as prob*100 labels legitimately includes
+        exactly 0.0 and 100.0; the filter drops them before the boundary points are
+        re-added from the bound semantics, so the build with the boundary labels
+        present must be byte-identical to the build without them.
         """
         base: dict[int | float, float] = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
         with_boundaries: dict[int | float, float] = {0.0: 0.0, **base, 100.0: 10.0}

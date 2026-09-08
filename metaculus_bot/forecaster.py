@@ -19,6 +19,7 @@ from forecasting_tools import (
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ForecastReport, ResearchWithPredictions
 from forecasting_tools.data_models.questions import ConditionalQuestion, DateQuestion
+from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import (
@@ -114,6 +115,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         stacking_spread_thresholds: dict[str, float] | None = None,
         min_forecasters_to_publish: int | None = None,
         research_sink: Any | None = None,
+        metaculus_client: MetaculusClient | None = None,
     ) -> None:
         if not isinstance(aggregation_strategy, AggregationStrategy):
             raise ValueError(f"aggregation_strategy must be an AggregationStrategy enum, got {aggregation_strategy}")
@@ -206,6 +208,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # min_forecasters_to_publish guard (above) stays the sole arbiter of
             # whether a degraded ensemble still publishes.
             required_successful_predictions=0.0,
+            # The framework uses this client for the tournament fetch and every publish
+            # POST; None means its default Metaculus client, mantic mode injects a ManticClient.
+            metaculus_client=metaculus_client,
         )
 
         # Benchmark/backtest harnesses tag each bot instance with a display name

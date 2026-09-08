@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,6 +9,8 @@ from forecasting_tools import GeneralLlm, MetaculusQuestion, PredictedOptionList
 from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile as FTPercentile
+from forecasting_tools.data_models.questions import ConditionalQuestion, DateQuestion
+from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from main import TemplateForecaster
 from metaculus_bot.comment.trimming import TRIM_NOTICE
@@ -724,6 +727,49 @@ def _bot_with_one_forecaster(mock_general_llm) -> TemplateForecaster:
         "default": "mock_default_model",
     }
     return TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+
+class TestMetaculusClientSeam:
+    """``metaculus_client`` passes straight through to the framework, which uses it for the
+    tournament fetch and every publish POST; the Mantic run mode injects a ``ManticClient`` here."""
+
+    def test_injected_client_reaches_the_framework(self, mock_general_llm):
+        client = MetaculusClient(base_url="https://platform.invalid/api", token="t" * 40)
+        llms_config: dict[str, Any] = {
+            "forecasters": [mock_general_llm],
+            "summarizer": "mock_summarizer_model",
+            "parser": "mock_parser_model",
+            "researcher": "mock_researcher_model",
+            "default": "mock_default_model",
+        }
+        bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1, metaculus_client=client)
+        assert bot.metaculus_client is client
+
+    def test_default_is_the_framework_metaculus_client(self, mock_general_llm):
+        bot = _bot_with_one_forecaster(mock_general_llm)
+        assert type(bot.metaculus_client) is MetaculusClient
+
+
+class TestUnsupportedQuestionTypes:
+    """The type guard at the top of ``forecast_questions`` DROPS date and conditional questions
+    with one WARNING rather than raising; every entry path (tournament fetch, URL list) funnels
+    through it. Mantic's preseason has a date question, so the docs lean on this being a skip."""
+
+    async def test_date_and_conditional_questions_are_skipped_with_a_warning(self, mock_general_llm, caplog):
+        bot = _bot_with_one_forecaster(mock_general_llm)
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.forecaster"):
+            # Real (unvalidated) instances, not spec'd mocks: the guard names the dropped TYPES.
+            reports = await bot.forecast_questions(
+                [DateQuestion.model_construct(), ConditionalQuestion.model_construct()]
+            )
+        assert reports == []
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "Skipping 2 unsupported question(s)" in message
+            and "DateQuestion" in message
+            and "ConditionalQuestion" in message
+            for message in warnings
+        ), warnings
 
 
 class TestResearchChartSideChannel:

@@ -143,10 +143,53 @@ class TestMatchesArchiveRecord:
         foreign = {"page_url": "https://www.metaculus.com/c/some-community/99999/slug/"}
         assert not self.IDS.matches_archive_record(foreign)
 
+    def test_mantic_page_url_form_is_parsed(self):
+        # Mantic (competitions.mantic.com) is a Metaculus-platform fork with the same URL shape.
+        record = {"page_url": f"https://competitions.mantic.com/questions/{DIVERGENT_POST_ID}/"}
+        assert self.IDS.matches_archive_record(record)
+        foreign = {"page_url": "https://competitions.mantic.com/questions/99999/"}
+        assert not self.IDS.matches_archive_record(foreign)
+
     def test_page_url_pattern_pinned_to_log_backfill_extractor(self):
         # id_mapping duplicates the log-backfill qid regex (scripts stay package-import-free);
         # pin them equal so the two never drift apart silently.
         assert PAGE_URL_ID_PATTERN.pattern == backfill_research_from_logs.QID_PATTERN.pattern
+
+
+class TestPageUrlIdPattern:
+    """The one regex behind archive page-url parsing, on both platforms' URL shapes.
+
+    Mantic post ids are small (the preseason's are 648-651) and the page URL is the only thing
+    on an older-shaped record that says which post it is, so the parser has to read the Mantic
+    host; the rest of mantic.com (www, blog) is not a question platform and must not match.
+    """
+
+    MANTIC_POST_ID = 650
+
+    def test_extracts_the_post_id_from_each_platform_url_shape(self):
+        for url in (
+            f"https://www.metaculus.com/questions/{self.MANTIC_POST_ID}/some-slug/",
+            f"https://www.metaculus.com/c/some-community/{self.MANTIC_POST_ID}/slug/",
+            f"https://competitions.mantic.com/questions/{self.MANTIC_POST_ID}/",
+            f"https://competitions.mantic.com/questions/{self.MANTIC_POST_ID}",
+        ):
+            match = PAGE_URL_ID_PATTERN.search(url)
+            assert match is not None, url
+            assert int(match.group(1)) == self.MANTIC_POST_ID, url
+
+    def test_unrelated_mantic_hosts_do_not_match(self):
+        assert PAGE_URL_ID_PATTERN.search(f"https://www.mantic.com/questions/{self.MANTIC_POST_ID}/") is None
+        assert PAGE_URL_ID_PATTERN.search(f"https://blog.mantic.com/questions/{self.MANTIC_POST_ID}/") is None
+
+    def test_the_log_backfill_extractor_reads_mantic_urls(self):
+        url = f"https://competitions.mantic.com/questions/{self.MANTIC_POST_ID}/"
+        assert backfill_research_from_logs.extract_qid(url) == self.MANTIC_POST_ID
+
+    def test_the_marker_qid_parser_is_host_agnostic(self):
+        # scripts/telemetry/markers.qid_from_ref matches ``/questions/<int>`` on any host, so a
+        # URL-keyed marker from a Mantic run already harvests a question ref.
+        url = f"https://competitions.mantic.com/questions/{self.MANTIC_POST_ID}/"
+        assert telemetry_markers.qid_from_ref(url) == self.MANTIC_POST_ID
 
 
 class TestQuestionIdMap:

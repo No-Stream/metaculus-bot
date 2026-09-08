@@ -176,7 +176,8 @@ class TestEnsembleCdfGridAlignment:
     contributors. The "median" was then a median over a rotating subset of the
     ensemble (measured: 136 of 269 groups short-handed, aggregate CDF off the true
     median by up to 0.0078), and the length mismatch pushed a continuous question
-    through the discrete-resample branch, logging "Discrete aggregation detected".
+    through a discrete-resample branch in the ensemble post-processing, since removed
+    because positional alignment left it unreachable.
     """
 
     def _mixed_ensemble(self) -> list[NumericDistribution]:
@@ -197,12 +198,6 @@ class TestEnsembleCdfGridAlignment:
 
         assert len(actual) == PCHIP_CDF_POINTS
         assert np.allclose(actual, expected, atol=1e-12), f"max deviation {np.max(np.abs(actual - expected))}"
-
-    def test_continuous_question_does_not_log_discrete_aggregation(self, caplog) -> None:
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.numeric.utils"):
-            aggregate_numeric(self._mixed_ensemble(), _MIXED_GRID_QUESTION, "median")
-
-        assert not [r for r in caplog.records if "Discrete aggregation detected" in r.getMessage()]
 
     def test_short_grid_model_is_resampled_and_reported(self, caplog) -> None:
         sanitized, zero_point = sanitize_percentiles(_declared(_BASE_VALUES), _MIXED_GRID_QUESTION)

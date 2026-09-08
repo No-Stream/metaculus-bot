@@ -4,14 +4,18 @@ import logging
 import os
 import sys
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from forecasting_tools import MetaculusApi
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.api_preflight import verify_metaculus_api_identity
+from metaculus_bot.api_preflight import verify_api_identity, verify_metaculus_api_identity
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
+    DONATED_OPENROUTER_KEY_ENABLED_ENV,
+    MANTIC_API_BASE_URL,
+    MANTIC_TOURNAMENT_END_DATE,
+    MANTIC_TOURNAMENT_ID,
     METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
     TEST_QUESTIONS_OVERRIDE_ENV,
@@ -19,6 +23,7 @@ from metaculus_bot.constants import (
     check_fall_cup_reminder,
     check_tournament_dates,
     credit_alerts_active,
+    donated_openrouter_key_enabled,
     env_flag_enabled,
 )
 from metaculus_bot.credit_telemetry import (
@@ -45,20 +50,41 @@ from metaculus_bot.llm_configs import (
     STACKER_LLM,
     SUMMARIZER_LLM,
 )
+from metaculus_bot.mantic import build_mantic_client
 from metaculus_bot.publish_hardening import apply_publish_hardening
-from metaculus_bot.research.persistence import ResearchPersistenceWriter
+from metaculus_bot.research.persistence import PLATFORM_MANTIC, PLATFORM_METACULUS, ResearchPersistenceWriter
 
 logger = logging.getLogger(__name__)
 
 
-RunMode = Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"]
+RunMode = Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions", "mantic"]
 
 
-def _configure_process() -> None:
+def _assert_personal_keys_only() -> None:
+    """Fail shut unless the Metaculus-donated OpenRouter key is switched off for this process.
+
+    Metaculus donated ``OAI_ANTH_OPENROUTER_KEY`` for its own tournaments, so a run that
+    forecasts for Mantic may spend only the operator's personal keys. The switch has to be an
+    environment variable set BEFORE the process starts rather than something this function
+    could flip: the roster's module-level ``GeneralLlm`` objects (``llm_configs``) freeze their
+    api_key at import, and ``main.py`` imports them before ``main`` runs. So the only safe
+    thing to do when it still reads on is to stop, before any fetch or spend.
+    """
+    if donated_openrouter_key_enabled():
+        raise RuntimeError(
+            f"A Mantic run may spend only personal API keys, but {DONATED_OPENROUTER_KEY_ENABLED_ENV} does "
+            "not read false. Set it to false in the environment before starting the process: the roster "
+            "freezes its OpenRouter key at import, so the donated key cannot be switched off from here."
+        )
+
+
+def _configure_process(run_mode: RunMode) -> None:
     """Set up logging levels and install the client hardening / identity preflight.
 
     Done here (the runtime entry point) rather than at module import so test imports and
-    library consumers don't inherit these global mutations.
+    library consumers don't inherit these global mutations. The run mode decides which
+    platform host the identity preflight vets, and mantic mode fails shut on the
+    donated-key switch first.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -85,11 +111,18 @@ def _configure_process() -> None:
     # 403/429/5xx would otherwise kill the whole run).
     apply_fetch_hardening()
 
-    # One-shot, unauthenticated identity check before any mode sends the token.
+    # One-shot, unauthenticated identity check before any mode sends its token.
     # See metaculus_bot/api_preflight.py (DNS-parking incident): aborts non-zero
-    # if www.metaculus.com isn't answered by the real API, so we never leak
-    # METACULUS_TOKEN to a hijacked host.
-    verify_metaculus_api_identity()
+    # unless the platform's API host is answered by the real API, so the token
+    # never reaches a hijacked host. A Mantic run vets the Mantic host and never
+    # contacts metaculus.com, so it does not depend on Metaculus DNS health; and it
+    # fails shut on the donated-key switch before even that, because the platform
+    # that donated the key is not the one being forecast.
+    if run_mode == "mantic":
+        _assert_personal_keys_only()
+        verify_api_identity(MANTIC_API_BASE_URL)
+    else:
+        verify_metaculus_api_identity()
 
 
 def _parse_run_mode() -> RunMode:
@@ -98,7 +131,7 @@ def _parse_run_mode() -> RunMode:
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"],
+        choices=list(get_args(RunMode)),
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
@@ -178,10 +211,32 @@ def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Cal
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
         return lambda: template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
+    if run_mode == "mantic":
+        # Mantic's competitions platform, through the ManticClient main injects; same
+        # shape as the bot tournament, over the Mantic slug and its own end date.
+        check_tournament_dates(
+            logging.getLogger(__name__),
+            tournament_id=MANTIC_TOURNAMENT_ID,
+            end_date_str=MANTIC_TOURNAMENT_END_DATE,
+        )
+        # to not risk explosive spend, we won't update preds
+        template_bot.skip_previously_forecasted_questions = True
+        return lambda: template_bot.forecast_on_tournament(MANTIC_TOURNAMENT_ID, return_exceptions=True)
     if run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
         return _test_questions_source(template_bot)
     raise ValueError(f"Invalid run mode: {run_mode}")
+
+
+def persisted_platform(run_mode: RunMode) -> str:
+    """The question platform this run's research records are archived under.
+
+    Additive next to ``tournament_id``. Mantic post ids (around 650) and the Metaculus ids in
+    the archive (35,000 and up) cannot collide today, so filenames are not namespaced; this
+    field is what tells the two apart if that ever changes, and what an analysis keyed on
+    bare post ids across both platforms has to filter on.
+    """
+    return PLATFORM_MANTIC if run_mode == "mantic" else PLATFORM_METACULUS
 
 
 def persisted_tournament_id(run_mode: RunMode) -> str:
@@ -194,6 +249,9 @@ def persisted_tournament_id(run_mode: RunMode) -> str:
     per-slug rows, which is a silent data-corruption bug rather than a cosmetic one: the
     label is the only thing on the record that says which competition the question came
     from, since ``run_mode`` distinguishes the pipeline and not the object.
+
+    ``mantic`` is labelled with the Mantic tournament slug, and ``persisted_platform``
+    stamps the platform beside it.
 
     ``test_questions`` deliberately keeps ``TOURNAMENT_ID``. The evergreen example set
     belongs to no tournament, so no label is right; it is ``run_mode`` that separates those
@@ -210,6 +268,8 @@ def persisted_tournament_id(run_mode: RunMode) -> str:
         return str(MetaculusApi.CURRENT_MINIBENCH_ID)
     if run_mode in ("quarterly_cup", "metaculus_cup"):
         return METACULUS_CUP_ID
+    if run_mode == "mantic":
+        return MANTIC_TOURNAMENT_ID
     raise ValueError(f"Invalid run mode: {run_mode}")
 
 
@@ -226,12 +286,13 @@ def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[
 def main() -> None:
     """Command-line entry-point for running the TemplateForecaster.
 
-    This code was moved verbatim from the bottom of main.py so external behaviour
-    (e.g. GitHub Actions invoking `python main.py`) remains identical.  The only
-    difference is that main.py now delegates to this function.
+    main.py delegates here, so GitHub Actions invoking ``python main.py`` and a direct
+    ``python -m metaculus_bot.cli`` behave identically. Order matters: the mode is parsed
+    first, then ``_configure_process`` installs the hardening patches and runs the
+    fail-shut and identity checks, and only then is any platform token read.
     """
-    _configure_process()
     run_mode = _parse_run_mode()
+    _configure_process(run_mode)
 
     # Fall-cup configuration reminder (constants.py): logs its ERROR here, at startup,
     # so the operator sees it before the run's noise; the non-zero exit it demands
@@ -248,6 +309,7 @@ def main() -> None:
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,
+            platform=persisted_platform(run_mode),
             tournament_id=persisted_tournament_id(run_mode),
             run_id=os.environ.get("GITHUB_RUN_ID", "local"),
         )
@@ -265,6 +327,10 @@ def main() -> None:
         "parser": PARSER_LLM,
         "researcher": RESEARCHER_LLM,
     }
+    # Built after _configure_process, so the fail-shut key check and the identity
+    # preflight have both passed before the Mantic token is even read. None leaves
+    # the framework on its default Metaculus client.
+    metaculus_client = build_mantic_client() if run_mode == "mantic" else None
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,  # Ignored when 'forecasters' present
@@ -274,6 +340,7 @@ def main() -> None:
         aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
         research_sink=research_sink,
         llms=llms,
+        metaculus_client=metaculus_client,
     )
 
     # Credit-balance telemetry: CREDIT_BALANCE/CREDIT_SPEND marker lines land in

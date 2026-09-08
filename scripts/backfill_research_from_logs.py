@@ -39,9 +39,10 @@ APP_LOG_LINE = re.compile(
 
 GHA_PREFIX = re.compile(r"^forecast_job\t[^\t]*\t\d{4}-\d{2}-\d{2}T[\d:.]+Z\s*")
 
-# --- QID extraction from Metaculus URLs ---
+# --- QID extraction from question-platform page URLs (Metaculus, and Mantic's fork) ---
+# Pinned byte-identical to ``performance_analysis.id_mapping.PAGE_URL_ID_PATTERN``.
 
-QID_PATTERN = re.compile(r"metaculus\.com/(?:questions|c/[^/]+)/(\d+)")
+QID_PATTERN = re.compile(r"(?:metaculus\.com/(?:questions|c/[^/]+)|competitions\.mantic\.com/questions)/(\d+)")
 
 
 def extract_qid(url: str) -> int | None:

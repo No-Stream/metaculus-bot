@@ -241,7 +241,7 @@ it, and it has no publish-time WARN on purpose. Detail:
 
 `safe_cdf_bounds` holds the only implementation of this packing policy, and every path
 that enforces the max-step rule reaches it: the per-model build (`generate_pchip_cdf`),
-the per-model ramp pass, the ensemble CDF (`_postprocess_ensemble_cdf`, both branches),
+the per-model ramp pass, the ensemble CDF (`_postprocess_ensemble_cdf`),
 the discrete integer snap, the forecasting-tools fallback builder on an OPEN bound, and
 the offline pooling paths. It is not, however, a choke point every published CDF passes
 through: `BoundSafeNumericDistribution.get_cdf` in `numeric/pchip_processing.py` returns
@@ -369,8 +369,10 @@ Step 3 no longer spreads whole-set collapses.
    them with fewer than 3 contributors — and nothing recorded the partial membership.
 3. `_postprocess_ensemble_cdf` (`numeric/utils.py`) re-pins the endpoints (one-sided
    open/closed logic), enforces monotonicity, applies ramp smoothing if any bin is below
-   min-step, and — for discrete questions whose `cdf_size != 201` — resamples the CDF to
-   the target grid via PCHIP with the grid-scaled min-step.
+   min-step, and runs `safe_cdf_bounds` with the step limits of the grid the CDF is on
+   (`grid_step_constraints`). Nothing is resampled at this stage: step 1 already put the
+   ensemble on the question's `cdf_size` grid, so a discrete question's aggregate gets
+   the coarse grid's limits by construction.
 
 Percentile-space averaging would blur multi-modal disagreement; CDF-space averaging
 preserves it. In production the base-combine path uses **MEDIAN** of the raw per-model

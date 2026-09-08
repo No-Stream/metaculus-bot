@@ -306,10 +306,11 @@ def _validate_pchip_bounds(
 def _clean_percentile_values(percentile_values: dict[int | float, float]) -> dict[float, float]:
     """Drop out-of-range percentile LABELS and reject unusable percentile VALUES.
 
-    The KEY filter is a genuine filter and must stay one: ``_postprocess_ensemble_cdf``'s
-    discrete branch deliberately passes labels of 0.0 and 100.0 (prob*100 over a 0..1
-    span) and relies on them being dropped here before the boundary points are re-added.
-    Raising on those would break every discrete question.
+    The KEY filter is a genuine filter and must stay one: a caller that hands a whole CDF
+    over as prob*100 labels legitimately includes exactly 0.0 and 100.0, and those are
+    dropped here because the boundary points are re-added below from the question's own
+    bound semantics. ``test_boundary_labels_stay_silently_filtered`` pins the build as
+    identical with and without them.
 
     A bad VALUE is the opposite case and raises. Silently skipping it built a
     12-of-13-point CDF while ``declared_percentiles`` still advertised 13 — a distribution

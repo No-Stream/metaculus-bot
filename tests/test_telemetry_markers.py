@@ -158,6 +158,11 @@ CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=1
 CREDIT_BALANCE_SKIP_LINE = (
     PFX_WARN + "CREDIT_BALANCE: key=personal phase=start skipped (env var OPENROUTER_API_KEY not set)"
 )
+# The donated key is skipped without an HTTP probe while DONATED_OPENROUTER_KEY_ENABLED is off
+# (a Mantic run); verbatim from credit_telemetry._fetch_snapshot.
+CREDIT_BALANCE_DONATED_DISABLED_LINE = (
+    PFX + "CREDIT_BALANCE: key=donated phase=start skipped (donated routing disabled)"
+)
 # Pre-2026-07-27 shape: no source= field. Kept verbatim because re-harvesting
 # replays these older logs, and they must still parse.
 CREDIT_SPEND_LINE = PFX + "CREDIT_SPEND: key=donated run_delta_usd=3.34 remaining=120.11"
@@ -1628,6 +1633,16 @@ class TestCredit:
     def test_balance_skip_line_has_no_balance(self):
         rec = _parse_one(CREDIT_BALANCE_SKIP_LINE)
         assert rec["key"] == "personal"
+        assert rec["phase"] == "start"
+        assert rec["remaining"] is None
+        assert rec["usage"] is None
+
+    def test_donated_disabled_skip_line_has_no_balance(self):
+        # A Mantic run: the donated key is never probed, and the archive must still see
+        # the run's start phase for that key (with no balance) rather than dropping the line.
+        rec = _parse_one(CREDIT_BALANCE_DONATED_DISABLED_LINE)
+        assert rec["marker"] == "credit_balance"
+        assert rec["key"] == "donated"
         assert rec["phase"] == "start"
         assert rec["remaining"] is None
         assert rec["usage"] is None

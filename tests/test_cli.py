@@ -45,10 +45,23 @@ from forecasting_tools import GeneralLlm, MetaculusApi
 
 from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.cli import RunMode, _forecast_with_callback_drain, _run_forecasts, persisted_tournament_id
+from metaculus_bot.cli import (
+    RunMode,
+    _assert_personal_keys_only,
+    _configure_process,
+    _forecast_with_callback_drain,
+    _run_forecasts,
+    persisted_platform,
+    persisted_tournament_id,
+)
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
+    DONATED_OPENROUTER_KEY_ENABLED_ENV,
+    MANTIC_API_BASE_URL,
+    MANTIC_TOKEN_ENV,
+    MANTIC_TOURNAMENT_END_DATE,
+    MANTIC_TOURNAMENT_ID,
     METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
     PROVIDER_DEGRADATION_SUPPRESSED_UNTIL,
@@ -62,6 +75,7 @@ from metaculus_bot.fallback_openrouter import (
     reset_generic_key_fallback_count,
 )
 from metaculus_bot.forecaster import TemplateForecaster
+from metaculus_bot.mantic import ManticClient
 from metaculus_bot.research.provider_health import (
     VENUE_EXPECTED_LIQUIDITY_FIELDS,
     VenueObservation,
@@ -203,10 +217,12 @@ def _cli_main_test_mode(
             # red from FALL_CUP_REMINDER_DATE. The one test allowed to read the real
             # clock is the deliberate time bomb in test_tournament_dates.py.
             patch("metaculus_bot.cli.check_fall_cup_reminder", return_value=fall_cup_reminder),
-            # The API identity preflight makes a real unauthenticated GET to
-            # metaculus.com; stub it so these exit-status/telemetry tests stay
-            # hermetic (its own behavior is covered in test_api_preflight.py).
+            # The API identity preflights make a real unauthenticated GET to the
+            # platform host (metaculus.com, or competitions.mantic.com in mantic
+            # mode); stub both so these exit-status/telemetry tests stay hermetic
+            # (their own behavior is covered in test_api_preflight.py).
             patch("metaculus_bot.cli.verify_metaculus_api_identity"),
+            patch("metaculus_bot.cli.verify_api_identity"),
             # Patch log_report_summary: a classmethod on TemplateForecaster that
             # iterates forecast_reports. Our stub returns []; patch the method
             # anyway to keep the test surface small.
@@ -433,10 +449,7 @@ class TestCliRoleSpendWiring:
             await _forecast_with_callback_drain(_boom)
         drained.assert_awaited_once_with()
 
-    @pytest.mark.parametrize(
-        "run_mode",
-        ["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"],
-    )
+    @pytest.mark.parametrize("run_mode", get_args(RunMode))
     def test_every_run_mode_forecasts_through_the_callback_drain(self, run_mode: RunMode) -> None:
         """Every mode goes through the one ``asyncio.run`` + drain in ``_run_forecasts``.
 
@@ -645,6 +658,7 @@ class TestPersistedTournamentId:
         "minibench": str(MetaculusApi.CURRENT_MINIBENCH_ID),
         "quarterly_cup": METACULUS_CUP_ID,
         "metaculus_cup": METACULUS_CUP_ID,
+        "mantic": MANTIC_TOURNAMENT_ID,
         # No label is right for the evergreen example set (it belongs to no tournament);
         # this one is retained so the archive's existing test-run records stay comparable.
         "test_questions": TOURNAMENT_ID,
@@ -659,9 +673,11 @@ class TestPersistedTournamentId:
     def test_label_per_run_mode(self, run_mode: RunMode, expected: str) -> None:
         assert persisted_tournament_id(run_mode) == expected
 
-    def test_the_cup_and_the_bot_tournament_do_not_share_a_label(self) -> None:
-        # The whole point: these two must be distinguishable in the archive.
-        assert persisted_tournament_id("metaculus_cup") != persisted_tournament_id("tournament")
+    def test_the_competitions_do_not_share_a_label(self) -> None:
+        # The whole point: the bot tournament, the cup and the Mantic tournament must be
+        # distinguishable in the archive.
+        labels = {persisted_tournament_id(run_mode) for run_mode in ("tournament", "metaculus_cup", "mantic")}
+        assert len(labels) == 3, labels
 
     def test_an_unknown_mode_raises_rather_than_mislabelling(self) -> None:
         with pytest.raises(ValueError, match="Invalid run mode"):
@@ -698,7 +714,263 @@ class TestPersistedTournamentId:
         written = sorted((tmp_path / "research_outputs").glob("research_*.jsonl"))
         assert len(written) == 1, f"expected exactly one flushed JSONL, got {written}"
         records = [json.loads(line) for line in written[0].read_text().strip().splitlines()]
-        assert [(r["run_mode"], r["tournament_id"]) for r in records] == [("metaculus_cup", METACULUS_CUP_ID)]
+        assert [(r["run_mode"], r["tournament_id"], r["platform"]) for r in records] == [
+            ("metaculus_cup", METACULUS_CUP_ID, "metaculus")
+        ]
+
+    def test_a_mantic_run_archives_its_records_under_the_mantic_slug_and_platform(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same end-to-end shape for the Mantic mode: the Mantic slug, and ``platform`` set to
+        ``mantic`` so a post id in the 600s is never read as a Metaculus id."""
+        _mantic_env(monkeypatch)
+        monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
+        monkeypatch.chdir(tmp_path)
+
+        forecaster_class = MagicMock()
+        forecaster_class.return_value.alertable_count = 0
+
+        def _record_then_return(*_args: object, **_kwargs: object) -> list[object]:
+            forecaster_class.call_args.kwargs["research_sink"](
+                qid=650,
+                page_url="https://competitions.mantic.com/questions/650/",
+                question_text="What will the price of bitcoin be?",
+                research_text="## News Articles (AskNews)\nResearch for 650.",
+                providers_used=["asknews"],
+                gap_fill_used=False,
+            )
+            return []
+
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="mantic"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)),
+        ):
+            cli_main()
+
+        written = sorted((tmp_path / "research_outputs").glob("research_*.jsonl"))
+        assert len(written) == 1, f"expected exactly one flushed JSONL, got {written}"
+        records = [json.loads(line) for line in written[0].read_text().strip().splitlines()]
+        assert [(r["run_mode"], r["tournament_id"], r["platform"]) for r in records] == [
+            ("mantic", MANTIC_TOURNAMENT_ID, "mantic")
+        ]
+
+
+class TestPersistedPlatform:
+    """The archive's additive ``platform`` field: which question platform a record's ids belong to.
+
+    Mantic post ids (around 650) and the Metaculus ids in our archive (35,000 and up) cannot
+    collide today, so filenames are not namespaced; this field is what disambiguates if that
+    ever changes, and what an analysis keyed on bare post ids must filter on.
+    """
+
+    def test_mantic_mode_is_the_only_mantic_platform(self) -> None:
+        assert persisted_platform("mantic") == "mantic"
+        for run_mode in set(get_args(RunMode)) - {"mantic"}:
+            assert persisted_platform(run_mode) == "metaculus", run_mode
+
+
+_FAKE_MANTIC_TOKEN = "m" * 40
+
+
+def _mantic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The environment a Mantic run requires: the donated-key switch off and a (fake) Mantic token.
+
+    Set explicitly rather than inherited, because the operator's ``.env`` (loaded at import by
+    ``constants``) may carry a real ``MANTIC_TOKEN`` and never carries the switch.
+    """
+    monkeypatch.setenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, "false")
+    monkeypatch.setenv(MANTIC_TOKEN_ENV, _FAKE_MANTIC_TOKEN)
+
+
+@contextmanager
+def _configure_process_stubs() -> Iterator[dict[str, MagicMock]]:
+    """``_configure_process`` with its process-global side effects stubbed: the hardening patches
+    (they mutate MetaculusClient for the whole session) and both identity preflights (real GETs)."""
+    with (
+        patch("metaculus_bot.cli.apply_publish_hardening") as publish_hardening,
+        patch("metaculus_bot.cli.apply_fetch_hardening") as fetch_hardening,
+        patch("metaculus_bot.cli.verify_api_identity") as verify_api,
+        patch("metaculus_bot.cli.verify_metaculus_api_identity") as verify_metaculus,
+    ):
+        yield {
+            "publish_hardening": publish_hardening,
+            "fetch_hardening": fetch_hardening,
+            "verify_api_identity": verify_api,
+            "verify_metaculus_api_identity": verify_metaculus,
+        }
+
+
+class TestAssertPersonalKeysOnly:
+    """The fail-shut guard for Mantic runs. Metaculus donated ``OAI_ANTH_OPENROUTER_KEY`` for its own
+    tournaments, so a run that forecasts for Mantic may spend only personal keys; the switch has to
+    be off in the environment before the process starts, because the roster freezes its OpenRouter
+    key at import (``llm_configs``) and ``main.py`` imports it before ``cli.main`` runs."""
+
+    @pytest.mark.parametrize("switch", [None, "true", "1", ""])
+    def test_raises_naming_the_switch_unless_it_reads_false(
+        self, switch: str | None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if switch is None:
+            monkeypatch.delenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raising=False)
+        else:
+            monkeypatch.setenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, switch)
+        with pytest.raises(RuntimeError, match=DONATED_OPENROUTER_KEY_ENABLED_ENV):
+            _assert_personal_keys_only()
+
+    def test_passes_when_the_switch_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, "false")
+        _assert_personal_keys_only()
+
+
+class TestConfigureProcess:
+    """The run mode decides which identity preflight runs. A Mantic run vets the Mantic API host and
+    never contacts metaculus.com (it must not depend on Metaculus DNS health), after failing shut on
+    the donated-key switch; every Metaculus mode is unchanged. The hardening patches are mode-blind."""
+
+    METACULUS_MODES: ClassVar[list[str]] = sorted(set(get_args(RunMode)) - {"mantic"})
+
+    @pytest.mark.parametrize("run_mode", METACULUS_MODES)
+    def test_metaculus_modes_preflight_metaculus_only(self, run_mode: RunMode, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The switch is irrelevant outside mantic mode: its default (donated key on) IS the
+        # Metaculus production state and must not raise here.
+        monkeypatch.delenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raising=False)
+        with _configure_process_stubs() as stubs:
+            _configure_process(run_mode)
+        stubs["verify_metaculus_api_identity"].assert_called_once_with()
+        stubs["verify_api_identity"].assert_not_called()
+
+    def test_mantic_mode_preflights_the_mantic_host_and_never_metaculus(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mantic_env(monkeypatch)
+        with _configure_process_stubs() as stubs:
+            _configure_process("mantic")
+        stubs["verify_api_identity"].assert_called_once_with(MANTIC_API_BASE_URL)
+        stubs["verify_metaculus_api_identity"].assert_not_called()
+
+    def test_mantic_mode_fails_shut_before_any_preflight(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raising=False)
+        with (
+            _configure_process_stubs() as stubs,
+            pytest.raises(RuntimeError, match=DONATED_OPENROUTER_KEY_ENABLED_ENV),
+        ):
+            _configure_process("mantic")
+        stubs["verify_api_identity"].assert_not_called()
+        stubs["verify_metaculus_api_identity"].assert_not_called()
+
+    @pytest.mark.parametrize("run_mode", get_args(RunMode))
+    def test_hardening_is_installed_in_every_mode(self, run_mode: RunMode, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mantic_env(monkeypatch)
+        with _configure_process_stubs() as stubs:
+            _configure_process(run_mode)
+        stubs["publish_hardening"].assert_called_once_with()
+        stubs["fetch_hardening"].assert_called_once_with()
+
+
+class TestManticQuestionSource:
+    """``--mode mantic`` mirrors the tournament mode over the Mantic slug: the stale-date check on
+    the Mantic dates, the re-spend guard on, and the forecast over ``MANTIC_TOURNAMENT_ID``."""
+
+    def test_mantic_mode_forecasts_the_mantic_tournament(self) -> None:
+        bot = MagicMock()
+        bot.skip_previously_forecasted_questions = False
+        bot.forecast_on_tournament = AsyncMock(return_value=["report"])
+
+        with (
+            patch("metaculus_bot.cli.check_tournament_dates") as check_dates,
+            patch("metaculus_bot.cli.drain_litellm_callbacks", AsyncMock()),
+        ):
+            assert _run_forecasts(bot, "mantic") == ["report"]
+
+        check_dates.assert_called_once_with(
+            logging.getLogger("metaculus_bot.cli"),
+            tournament_id=MANTIC_TOURNAMENT_ID,
+            end_date_str=MANTIC_TOURNAMENT_END_DATE,
+        )
+        bot.forecast_on_tournament.assert_awaited_once_with(MANTIC_TOURNAMENT_ID, return_exceptions=True)
+        assert bot.skip_previously_forecasted_questions is True
+
+
+class TestManticClientWiring:
+    """``main`` hands the framework a ``ManticClient`` in mantic mode and nothing (so the framework
+    builds its default Metaculus client) otherwise. The client is built only after the fail-shut
+    check and the identity preflight, so the Mantic token is not even read before the host is vetted."""
+
+    @staticmethod
+    def _forecaster_class() -> MagicMock:
+        """A ``TemplateForecaster`` class stub that keeps the constructor kwargs inspectable (the
+        harness's own patch discards its mock) and whose instance forecasts nothing."""
+        forecaster_class = MagicMock()
+        forecaster_class.return_value.alertable_count = 0
+        forecaster_class.return_value.forecast_on_tournament = AsyncMock(return_value=[])
+        forecaster_class.return_value.forecast_questions = AsyncMock(return_value=[])
+        return forecaster_class
+
+    def test_mantic_mode_injects_a_mantic_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mantic_env(monkeypatch)
+        forecaster_class = self._forecaster_class()
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="mantic"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+        ):
+            cli_main()
+        client = forecaster_class.call_args.kwargs["metaculus_client"]
+        assert isinstance(client, ManticClient)
+        assert client.base_url == MANTIC_API_BASE_URL
+
+    @pytest.mark.parametrize("run_mode", sorted(set(get_args(RunMode)) - {"mantic"}))
+    def test_metaculus_modes_leave_the_framework_default_client(self, run_mode: RunMode) -> None:
+        forecaster_class = self._forecaster_class()
+        with (
+            _cli_main_test_mode(alertable_count=0, mode=run_mode),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+        ):
+            cli_main()
+        assert forecaster_class.call_args.kwargs["metaculus_client"] is None
+
+    def test_fail_shut_runs_before_the_token_is_read_or_the_host_vetted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The switch left at its default: the guard raises and nothing downstream of it runs —
+        # no preflight GET, no token read, no forecaster, no spend.
+        monkeypatch.delenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raising=False)
+        monkeypatch.setenv(MANTIC_TOKEN_ENV, _FAKE_MANTIC_TOKEN)
+        forecaster_class = self._forecaster_class()
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="mantic"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.build_mantic_client") as build_client,
+            patch("metaculus_bot.cli.verify_api_identity") as verify_api,
+            pytest.raises(RuntimeError, match=DONATED_OPENROUTER_KEY_ENABLED_ENV),
+        ):
+            cli_main()
+        build_client.assert_not_called()
+        verify_api.assert_not_called()
+        forecaster_class.assert_not_called()
+
+    def test_the_client_is_built_after_the_guard_and_the_preflight(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ordered, not just "each was called": guard, then preflight, then the client (which reads
+        the token), then the forecaster. Two independent ``assert_called`` checks would pass with
+        the token read before the host was vetted."""
+        _mantic_env(monkeypatch)
+        manager = MagicMock()
+        forecaster_class = self._forecaster_class()
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="mantic"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli._assert_personal_keys_only") as guard,
+            patch("metaculus_bot.cli.verify_api_identity") as verify_api,
+            patch("metaculus_bot.cli.build_mantic_client") as build_client,
+        ):
+            manager.attach_mock(guard, "guard")
+            manager.attach_mock(verify_api, "verify_api_identity")
+            manager.attach_mock(build_client, "build_mantic_client")
+            manager.attach_mock(forecaster_class, "TemplateForecaster")
+            cli_main()
+
+        call_names = [name for name, _, _ in manager.mock_calls]
+        order = [
+            call_names.index(name)
+            for name in ("guard", "verify_api_identity", "build_mantic_client", "TemplateForecaster")
+        ]
+        assert order == sorted(order), call_names
 
 
 class TestCliCreditAlertSuppression:

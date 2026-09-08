@@ -29,7 +29,6 @@ from requests.adapters import HTTPAdapter
 from metaculus_bot import api_preflight, cli
 from metaculus_bot.api_preflight import (
     ApiIdentityError,
-    MetaculusApiIdentityError,
     verify_api_identity,
     verify_metaculus_api_identity,
 )
@@ -243,18 +242,14 @@ class TestVerifyApiIdentityAgainstMantic:
         assert captured["kwargs"].get("timeout") == 5.0
 
 
-class TestExceptionName:
-    def test_the_metaculus_era_name_is_the_same_class(self) -> None:
-        """One class, two names: callers written when the module vetted only Metaculus keep
-        catching the same exception the Mantic path raises."""
-        assert MetaculusApiIdentityError is ApiIdentityError
-
-
 class TestEntryPointWiring:
     """Guard against the import being silently stripped from the entry points (formatter footgun)."""
 
     def test_cli_imports_preflight(self) -> None:
         assert cli.verify_metaculus_api_identity is verify_metaculus_api_identity
+
+    def test_cli_imports_the_generic_preflight_for_mantic_mode(self) -> None:
+        assert cli.verify_api_identity is verify_api_identity
 
     def test_performance_analysis_cli_imports_preflight(self) -> None:
         assert perf_cli.verify_metaculus_api_identity is verify_metaculus_api_identity

@@ -330,11 +330,11 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
     Discrete handling — two prod mechanisms, handled differently:
 
     * Native-discrete questions (Metaculus ``type == "discrete"``) publish a CDF on a
-      reduced grid (``cdf_size != 201``). Prod resamples the aggregate onto that grid
-      with ``generate_pchip_cdf`` (see ``numeric/pipeline.build_numeric_distribution``
-      and ``numeric/utils._postprocess_ensemble_cdf``). We mirror it exactly: the ghost
-      is built with ``num_points=len(published_cdf)``, so both sides share the native
-      grid and the pairing stays clean. No integer-snap is involved (``discrete_snap``
+      reduced grid (``cdf_size != 201``). Prod builds every member directly on that grid
+      with ``generate_pchip_cdf`` (``numeric/pipeline._build_discrete_distribution``) and
+      aggregates them positionally on the same grid (``numeric/utils.aggregate_numeric``).
+      We mirror it exactly: the ghost is built with ``num_points=len(published_cdf)``, so
+      both sides share the native grid and the pairing stays clean. No integer-snap is involved (``discrete_snap``
       explicitly skips ``cdf_size != 201``).
     * Continuous questions (``cdf_size == 201``) are integer-*snapped* by prod only when
       a strict majority of the ensemble's forecasters vote the outcome is integer-valued

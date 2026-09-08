@@ -9,12 +9,18 @@ logger = logging.getLogger(__name__)
 
 RESEARCH_SCHEMA_VERSION = 2
 
+# The ``platform`` vocabulary: which question platform a record's ids and page_url belong to.
+# Data-contract tokens (the archive keys off the exact spelling); add, never re-spell.
+PLATFORM_METACULUS = "metaculus"
+PLATFORM_MANTIC = "mantic"
+
 
 class ResearchPersistenceWriter:
     """Accumulates research records during a bot run and flushes to JSONL."""
 
-    def __init__(self, run_mode: str, tournament_id: str, run_id: str) -> None:
+    def __init__(self, run_mode: str, platform: str, tournament_id: str, run_id: str) -> None:
         self._run_mode = run_mode
+        self._platform = platform
         self._tournament_id = tournament_id
         self._run_id = run_id
         self._records: list[dict] = []
@@ -63,6 +69,13 @@ class ResearchPersistenceWriter:
         ``research_text`` (forecasters must not see it), so it is archived as its
         own field to keep records self-contained for grep-based triage.
 
+        ``platform`` (``PLATFORM_METACULUS`` / ``PLATFORM_MANTIC``, since 2026-09-08) says
+        which question platform ``qid``, ``post_id`` and ``page_url`` belong to. Mantic post
+        ids (around 650) and the Metaculus ids in the archive (35,000 and up) cannot collide
+        today, so filenames stay un-namespaced and this field is what disambiguates if that
+        changes. Additive with passthrough readers; records older than the field are all
+        Metaculus.
+
         ``asknews_raw`` is the raw pre-summarization AskNews article markdown
         (2026-07-18 audit hygiene): ``research_text`` carries only the
         summarizer's briefing, so without this field FETCH-vs-SUMMARIZE
@@ -83,6 +96,7 @@ class ResearchPersistenceWriter:
             "providers_succeeded": providers_succeeded if providers_succeeded is not None else [],
             "provider_results": provider_results if provider_results is not None else [],
             "run_mode": self._run_mode,
+            "platform": self._platform,
             "tournament_id": self._tournament_id,
             "timestamp": datetime.now(UTC).isoformat(),
             "run_id": self._run_id,
