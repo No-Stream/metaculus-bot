@@ -54,6 +54,19 @@ TOURNAMENT_HARD_STOP_WEEKS: int = 2  # ~2 weeks of wiggle room past close before
 # separate sort tiers; don't pool them on one score field.
 METACULUS_CUP_ID: str = "metaculus-cup-fall-2026"
 
+# Mantic "Crucible" competition (competitions.mantic.com), a fork of the open-source Metaculus
+# platform with the same API shape; see docs/operations.md "Mantic". Read straight off
+# /api/projects/tournaments/preseason-2/ on 2026-09-08: project id 4, start_date
+# 2026-09-03T11:19:48Z, forecasting_end_date == close_date 2026-09-20T12:00:00Z,
+# score_type spot_baseline_tournament, bot_leaderboard_status bots_only. No Series 2 project
+# exists on that API yet (valid slugs 2026-09-08: preseason-2, series-1, practice-series-1;
+# an unknown slug answers HTTP 400). Re-point MANTIC_TOURNAMENT_ID when Series 2 opens.
+MANTIC_API_BASE_URL: str = "https://competitions.mantic.com/api"
+MANTIC_SITE_URL: str = "https://competitions.mantic.com"
+MANTIC_HOST: str = "competitions.mantic.com"  # self-reference refusal + publish-timeout host scope
+MANTIC_TOURNAMENT_ID: str = "preseason-2"
+MANTIC_TOURNAMENT_END_DATE: str = "2026-09-20"  # forecasting_end_date on project 4 (API-verified 2026-09-08)
+
 
 def gemini_use_donated_openrouter_key() -> bool:
     """Whether OpenRouter Gemini calls should route through the Metaculus-donated key.
@@ -85,28 +98,58 @@ def gemini_use_donated_openrouter_key() -> bool:
     return env_flag_enabled(GEMINI_USE_DONATED_OPENROUTER_KEY_ENV, default=True)
 
 
+def donated_openrouter_key_enabled() -> bool:
+    """Whether ANY OpenRouter call may route through the Metaculus-donated key.
+
+    Default True, so Metaculus runs are unchanged. A Mantic run sets
+    ``DONATED_OPENROUTER_KEY_ENABLED=false``: Metaculus donated that key for its own
+    tournaments, so a run that forecasts for another platform spends only the operator's
+    personal keys. ``should_route_via_donated_key`` (fallback_openrouter) consults this before
+    any provider match, so one false-y value covers every OpenRouter key choice in the
+    process, including the key-swap fallback and the credit telemetry's donated-key probe.
+
+    It has to be an environment variable set BEFORE the process starts rather than a CLI
+    flag: the roster's module-level GeneralLlm objects (llm_configs) freeze their api_key at
+    import, and main.py imports them before cli.main runs. Mantic mode therefore fails shut
+    at startup when this still reads True (cli._assert_personal_keys_only).
+
+    Read at call time (not import) so a workflow env change needs no re-import.
+    """
+    return env_flag_enabled(DONATED_OPENROUTER_KEY_ENABLED_ENV, default=True)
+
+
 class TournamentExpiredError(Exception):
     """Raised when the tournament has ended and the ID needs to be updated."""
 
 
-def check_tournament_dates(logger: logging.Logger | None = None) -> None:
+def check_tournament_dates(
+    logger: logging.Logger | None = None,
+    *,
+    tournament_id: str | None = None,
+    end_date_str: str | None = None,
+) -> None:
     """Check if tournament dates are stale and warn/error accordingly.
 
-    - Warns if current date is past TOURNAMENT_END_DATE
+    - Warns if current date is past the tournament's end date
     - Raises TournamentExpiredError if past end date + TOURNAMENT_HARD_STOP_WEEKS
 
-    Call this at bot startup to catch stale tournament IDs.
+    Defaults to the Metaculus bot tournament (``TOURNAMENT_ID`` / ``TOURNAMENT_END_DATE``);
+    the Mantic mode passes ``MANTIC_TOURNAMENT_ID`` / ``MANTIC_TOURNAMENT_END_DATE``. The
+    defaults resolve at CALL time (None sentinels), so a module-level patch of the constants
+    is honored. Call this at bot startup to catch stale tournament IDs.
     """
     log = logger or logging.getLogger(__name__)
+    tournament_id = TOURNAMENT_ID if tournament_id is None else tournament_id
+    end_date_str = TOURNAMENT_END_DATE if end_date_str is None else end_date_str
 
     # Both operands go through _as_utc so the comparison is tz-aware on the same side of
     # the clock. Only the wall-clock reference moves (local -> UTC): the tournament close
     # date is a Metaculus (UTC) date, and prod runs on UTC GitHub Actions runners, so this
     # shifts nothing in prod and at most a few hours of a staleness warning locally.
     try:
-        end_date = _as_utc(datetime.strptime(TOURNAMENT_END_DATE, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
+        end_date = _as_utc(datetime.strptime(end_date_str, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
     except ValueError:
-        log.warning(f"Invalid TOURNAMENT_END_DATE format: {TOURNAMENT_END_DATE}")
+        log.warning(f"Invalid tournament end date format for '{tournament_id}': {end_date_str}")
         return
 
     today = _as_utc(datetime.now(UTC))
@@ -114,15 +157,15 @@ def check_tournament_dates(logger: logging.Logger | None = None) -> None:
 
     if today > hard_stop_date:
         raise TournamentExpiredError(
-            f"Tournament '{TOURNAMENT_ID}' ended on {TOURNAMENT_END_DATE} and hard stop "
-            f"date ({hard_stop_date.date()}) has passed. Please update TOURNAMENT_ID, "
-            f"TOURNAMENT_END_DATE, and TOURNAMENT_HARD_STOP_WEEKS in constants.py for the new season."
+            f"Tournament '{tournament_id}' ended on {end_date_str} and hard stop "
+            f"date ({hard_stop_date.date()}) has passed. Please update its tournament id and "
+            f"end date (and TOURNAMENT_HARD_STOP_WEEKS if needed) in constants.py for the new season."
         )
     if today > end_date:
         days_past = (today - end_date).days
         days_until_error = (hard_stop_date - today).days
         log.warning(
-            f"⚠️  Tournament '{TOURNAMENT_ID}' likely ended on {TOURNAMENT_END_DATE} "
+            f"⚠️  Tournament '{tournament_id}' likely ended on {end_date_str} "
             f"({days_past} days ago). Update constants.py for the new season! "
             f"Bot will error out in {days_until_error} days."
         )
@@ -243,6 +286,10 @@ ASKNEWS_SECRET_ENV: str = "ASKNEWS_SECRET"  # noqa: S105  # env var NAME, not a 
 EXA_API_KEY_ENV: str = "EXA_API_KEY"
 PERPLEXITY_API_KEY_ENV: str = "PERPLEXITY_API_KEY"
 METACULUS_TOKEN_ENV: str = "METACULUS_TOKEN"  # noqa: S105  # env var NAME, not a credential
+MANTIC_TOKEN_ENV: str = "MANTIC_TOKEN"  # noqa: S105  # env var NAME, not a credential; personal, never donated
+# Master switch for the Metaculus-donated OpenRouter key. Default ON; a Mantic run sets it
+# false and fails shut at startup if it is not (see donated_openrouter_key_enabled).
+DONATED_OPENROUTER_KEY_ENABLED_ENV: str = "DONATED_OPENROUTER_KEY_ENABLED"
 
 
 def env_flag_enabled(env_name: str, *, default: bool = False) -> bool:
