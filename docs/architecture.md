@@ -215,9 +215,35 @@ WARNING per post plus a count line; a present field with an empty history stays 
 The marker is registered as `skip_guard_unreadable`, and what to do when it fires is in
 `docs/operations.md` "Scheduling reliability".
 
+Three more things happen in the same chokepoint, in order. First the unsupported-type filter:
+the 0.2.92 tournament fetch can return a `ConditionalQuestion`, which `_make_prediction` has
+no runner for, so it is dropped here with one loud WARNING naming the dropped types rather than
+as a per-question exception inside the fan-out (`DiscreteQuestion` is a `NumericQuestion` and
+stays; `DateQuestion` runs on its epoch-seconds axis). The `ConditionalQuestion` branch in
+`_make_prediction` that raises `NotImplementedError` is only the backstop for a caller that
+reaches it without passing through this filter. Then the survivors are sorted tightest close
+first, with a stable sort so questions sharing a close time keep fetch order and a missing
+`close_time` sorting last (no urgency); the order decides who wins the shared research semaphore
+and the per-run cap. Then the cap: with more questions than `max_questions_per_run` the
+latest-closing ones are dropped and named in a `QUESTION_CAP_FORFEIT` WARNING, a registered
+marker, because an unharvestable forfeit is gone at the 90-day log expiry.
+
 ### 0. Close-derived time budget
 
 The budget is granted at intake by `metaculus_bot/time_budget.py`, before any spend: `total_s = min(PER_QUESTION_WALL_CLOCK_DEADLINE, close_time − now − PUBLISH_RESERVE_SECONDS)`, so the static 3510 s deadline is now only the UPPER bound on a question's budget (non-publishing runs, the backtests and ablations, keep exactly the static budget; `close_aware` gates on `publish_reports_to_metaculus`). Three consequences: (a) **intake skip**: a question whose budget is non-positive, or close-limited below `TIME_BUDGET_MIN_VIABLE_S`, is skipped before any research or forecaster spend (counted under `publish_skipped_closed`: latency cost us the question, however early we noticed); (b) **fast path**: below `TIME_BUDGET_FAST_PATH_THRESHOLD` (= the full pipeline's configured worst case) the slow optional search providers and BOTH gap-fill passes are dropped, and the resolution-source fetcher's two expensive escalation rungs (the Chromium render, the paid `url_context` read) decline with a `fast_path` skip while its direct fetch and cheap rungs still run, counted by the alertable `time_budget_fast_path`; (c) **research-phase deadline**: the provider phase and each gap-fill pass are bounded by `RESEARCH_PHASE_BUDGET_SHARE` of the remaining budget, cancelling stragglers (`RESEARCH_PHASE_DEADLINE` WARN; off the fast path such cuts count under the alertable `research_budget_cuts`). Every question logs a `TIME_BUDGET` marker; the loud markers (`TIME_BUDGET_FAST_PATH`, `GAP_FILL_SKIPPED_FOR_BUDGET`, `GAP_FILL_V1/V2_CUT_FOR_BUDGET`) all have telemetry-archive specs.
+
+The budget is granted at the top of `_research_and_make_predictions`, before research starts,
+because research, fan-out, aggregation and publish all draw from the one budget and research
+time alone could otherwise overshoot it. The intake skip fires there too: a question that is
+arithmetically unpublishable (not even an instant forecast leaves room for the prediction POST)
+raises before any research or forecaster spend, with a message that names the close time so the
+run log says why rather than reporting a mysterious zero-forecaster question. That is the q45085
+shape, fetched 22 seconds before its close, forecast at full 3/3 strength, then rejected 405
+(section 7 below); raising at intake produces the same outcome the close gate would produce at
+publish time, minus a full ensemble's worth of spend. It bumps the close gate's own counter,
+`publish_skipped_closed`, already alertable, so "latency cost us this question" has one home
+however early the loss was noticed; `questions_failed_to_publish` remains the min-forecasters
+floor's counter alone.
 
 
 ### 1. Research fan-out
@@ -252,7 +278,10 @@ The orchestrator also builds a provider-diagnostics block that is deliberately
 withheld from the forecaster-facing text (so it never pollutes prompts) but is
 re-attached to the published comment later. This is the "diagnostics seam": the
 orchestrator's `pop_provider_diagnostics`, which `_research_and_make_predictions` in
-`forecaster.py` drains once the research phase is done.
+`forecaster.py` drains once the research phase is done. `run_research` returns
+forecaster-clean text, so the block never reaches a forecaster prompt, the stacker or the
+gap-fill v2 driver brief; it rides down to `route_after_forecasts`, which re-appends it to
+the comment-bound `research_report` strings only.
 
 ### 3. Forecaster fan-out
 
@@ -263,6 +292,34 @@ type-specific runner (`forecaster_runners.py`) for binary, multiple-choice, nume
 date questions. The N coroutines are gathered under the shared wall-clock budget by
 `_gather_predictions_with_wall_clock` (`forecaster.py`), which cancels any
 forecaster still pending at the deadline and counts the drop.
+
+**Drop attribution.** The coroutines are built from `self._forecaster_llms` in order, so a
+task's index names its model; that ordering contract is what lets the per-model drop telemetry
+(`FORECASTER_DROPS`) name the model a cancelled or raised task belonged to, and `unknown`
+appears only if the two lists desync. A forecaster that finished by raising is a dropped
+ensemble member and counts as degradation, so `cli.py`'s alertable exit fires; a soft-deadline
+`TimeoutError` was already counted at its raise site in `_forecaster_with_soft_deadline`, so
+the gather excludes it to avoid double counting. `_record_forecaster_drop` is the single write
+path for both the attributed drops list and the legacy `_forecasters_dropped_count` scalar, so
+the two can never drift.
+
+**The chart image.** When `TS_ANCHOR_CHART_ENABLED` is on, `_pull_research_chart` pops the
+time-series-anchor chart rendered for this question out of the provider's per-session cache
+and the base forecasters attach it as a vision message. The stacker path never receives it, so
+the image reaches base models only. Off, the prod default, the read short-circuits, so a stale
+entry from an earlier flag-on run is never attached.
+
+**Inside `_make_prediction`.** After the runner returns, the reasoning is stamped with a
+`Model: <slug>` prefix, which `performance_analysis.parsing` reads for per-model attribution.
+Then `run_tools_for_forecaster` (`tool_runner.py`) runs the deterministic probability-math
+tools over the forecaster's structured block and appends a "Computed quantities" section; it
+no-ops when `PROBABILISTIC_TOOLS_ENABLED` is off, as it is in prod, or when no block was
+emitted, so callers do not gate (the dormant path's history is in
+[roster_history.md](roster_history.md)). Extraction telemetry (`EXTRACTION_RUNG`) is emitted
+inside the value-extraction ladder the runners call, not by `_make_prediction`. Each branch
+returns a `ReasonedPrediction[T]` for its own `T` while the signature promises
+`ReasonedPrediction[PredictionTypes]`, so the return carries a `type: ignore`, the same pattern
+the framework uses.
 
 **The date path.** A `DateQuestion` stays a `DateQuestion` end to end, so the framework builds
 a `DateReport`, telemetry says `qtype=date` and persistence sees a date, while the numeric math
@@ -319,7 +376,20 @@ If fewer than `MIN_FORECASTERS_TO_PUBLISH` (`constants.py`) forecasters
 returned a valid prediction, the ensemble is too degraded to trust. The question is
 skipped and a counter bumps for end-of-run alerting, but the rest of the batch and all
 other publications continue. The guard lives in `_research_and_make_predictions`
-(`forecaster.py`).
+(`forecaster.py`); raising there skips this question alone, and `cli.py` wires the
+counter into the exit status.
+
+The threshold is the `min_forecasters_to_publish` constructor argument, defaulting to the
+module constant for production. Tests and the benchmark harnesses override it, because a
+2-model ensemble would otherwise always fail the guard, and a threshold above the roster
+width logs a warning at construction since every question would then fail. The framework
+has had its own success-rate gate since 0.2.92: `_handle_errors_in__run_individual_question`
+raises when `len(predictions) < expected_total_predictions * required_successful_predictions`,
+and `expected_total_predictions` equals the `predictions_per_research_report` that
+`prepare_llm_config` sets to the roster width. At its 0.5 default that gate would reject a
+single-survivor publish on any roster wider than two, contradicting
+`MIN_FORECASTERS_TO_PUBLISH`, so the constructor pins `required_successful_predictions=0.0`
+and this guard stays the sole arbiter of whether a degraded ensemble publishes.
 
 When the threshold is 1, a lone survivor publishes: the median of one forecast is
 that forecast. Because the spread metrics in `spread_metrics.py` require at least two
@@ -339,7 +409,18 @@ comment-side `FORECASTERS_USED` marker never reaches stdout, so without this lin
 ensemble reads identically to a full one. `models=` names the survivors (read off each
 prediction's own `Model:` prefix, not the configured roster) so survivors can be diffed against
 drops from the log alone. Harvested into the telemetry archive as `forecasters_survived`
-(`scripts/telemetry/markers.py`).
+(`scripts/telemetry/markers.py`). Before this line existed, an operator asking "did every
+forecaster survive?" had to count `EXTRACTION_RUNG` lines and dedupe model slugs to infer it;
+the line is emitted unconditionally so the healthy case is stated rather than implied by the
+absence of a warning. The roster is deliberately not the source of the names: it lists the
+CONFIGURED models and the survivors are a subset, so reporting it would relabel a degraded run
+as full.
+
+The survivor names are derived once, positionally, from each prediction's `Model:` prefix and
+reused by the `EXTREME_CALL` block, so the two lines stay joinable on the model field; reading
+the prefix twice would let a future change to one reading drift from the other. The list keeps
+a per-prediction `None` (rendered `unknown` on the extreme-call line) while the survivor line
+drops and sorts it.
 
 Immediately after that line, a BINARY question also logs one
 `EXTREME_CALL: question=... model=... p=... side=low|high lone=... survivors=...` INFO line per
@@ -354,6 +435,17 @@ the same side. Binary only, and `lone` is vacuous at `survivors=1`, which is why
 count rides the same line. Harvested as `extreme_call`. The measured lone-versus-accompanied hit
 rates, and why these counts must never be pooled with the 2026-08-31 memo's, are in
 `docs/performance_analysis.md` "Receipts behind the survivor-conditional markers".
+
+It is emitted at this point in `_research_and_make_predictions` because it is the one place
+where the surviving predictions and their own model prefixes are both in hand before anything
+has aggregated them; downstream, `route_after_forecasts` collapses the set to a published value
+and the per-member calls are recoverable only from parsed comments. The `cast(float, ...)` on
+each member's value is exact rather than defensive: the `isinstance(question, BinaryQuestion)`
+check is the same predicate `_make_prediction` dispatches on, so every question that reaches
+the block was routed to `run_binary_forecast`, which returns `ReasonedPrediction[float]` (a
+conditional question raises there and never yields a prediction; numeric and date members are
+`NumericDistribution`s and never enter the branch). An `isinstance` filter over the values
+would silently drop a member instead.
 
 
 ### 5. Aggregation: CONDITIONAL_STACKING
@@ -373,8 +465,10 @@ The default strategy is `CONDITIONAL_STACKING` (set in `cli.py`'s `main`). Conce
 - **The Mantic tail floor, last of all**: whichever path produced the aggregate, a Mantic
   numeric, discrete or date distribution then passes through `floor_published_tails`
   (`numeric/out_of_range_floor.py`) in `TemplateForecaster._aggregate_predictions`
-  (`forecaster.py`), the one seam every aggregation path returns through, so the publish gate,
-  the comment and the marker all read the floored CDF. It raises each OPEN tail to at least
+  (`forecaster.py`), the one seam every aggregation path (stacked, base-combine, median
+  fallback, single survivor, simple) returns through, so the publish gate, the comment and the
+  marker all read the floored CDF, and the published tails and the combine method are logged
+  once there (`member_forecast.py`). It raises each OPEN tail to at least
   `MANTIC_OUT_OF_RANGE_TAIL_FLOOR` (`constants.py`, 0.05) as far as the other tail leaves room,
   never reduces a tail, and leaves closed bounds and every Metaculus aggregate untouched. Mantic
   scores an out-of-range resolution against a fixed 0.05 reference, so the structural 1% tail the
@@ -463,9 +557,69 @@ the targeted-research section if stacking fired, and the provider-diagnostics bl
 re-attached via the seam. These published comments are also the durable per-model
 record the performance-analysis tooling later parses.
 
+The `summary_report` handed to the framework is a one-line stub, not the research corpus.
+The framework embeds `summary_report` under "### Research Summary" and `research_report`
+under "# RESEARCH", so setting both to the research text duplicated it and bloated the comment
+past the character limit. The "### Research Summary" heading is emitted regardless of body, so
+the trim anchor and the parser markers survive.
+
+#### Ensemble-size disclosure (`FORECASTERS_USED`)
+
+The comment trailer carries `FORECASTERS_USED=<used>/<configured>`: forecasters that
+CONTRIBUTED (equal to the number of per-model summary bullets) out of those CONFIGURED. It
+makes a degraded publish self-describing in the durable comment record, so residual analysis
+can tell a dropped model from a roster change (a missing bullet is otherwise ambiguous); the
+cause of any drop stays in run-log telemetry.
+
+The count is recorded at the fan-out, in `_research_and_make_predictions` right after the
+min-forecasters guard, the one point every downstream branch shares, so the stacked,
+single-forecaster and base-combine paths agree on "forecasters that fed the published value"
+by construction. It cannot be recovered later: route finalization collapses `predictions` to a
+single aggregate, so counting the published collection reports 1 no matter how many forecasters
+contributed, and on a stacked publish it would read 1/N on a healthy N-model run. It is
+accumulated rather than assigned so `research_reports_per_question > 1` keeps the count equal
+to the number of per-model bullets across all report sections. `_create_unified_explanation`
+drains it per question; the collection sum remains the fallback only for the delegated path
+(no forecaster roster configured, so the parent implementation ran the fan-out). On that same
+path the roster is empty, so the configured count falls back to
+`predictions_per_research_report`, the width the parent fans out over; `llm_setup` keeps the
+two equal whenever a roster is set, so they differ only on delegation, and the parent asserts
+the value is positive, so the denominator can never be 0.
+
 ### 7. Publish, behind a close-time gate
 
 The gate lives in `publish_gate.py`, wired as layer 4 of `publish_hardening.py`'s patch of ft's `publish_report_to_metaculus`. Immediately before the POSTs, the question's `close_time` is compared to now; if the window has passed, or the question's cached `state` is already CLOSED/RESOLVED, the whole publish is SKIPPED (prediction and comment together, since a comment for a forecast the platform never accepted would seed `performance_analysis` with a forecast that doesn't exist there). The skip emits one `PUBLISH_SKIPPED_CLOSED: question=... reason=... close_time=... now=... overdue_s=... state=...` WARN, bumps `publish_skipped_closed` on the degradation line, and counts as ALERTABLE, because a skip means latency cost us the question, which is exactly what should redden CI. The run continues with every other question. Deliberately **no safety margin**: ft's publish body sleeps 3.5-4.5s twice, so a question with seconds left can still 405 after passing the gate, but widening it would start skipping publishes that would have landed, and a forfeited question costs far more than a rejected POST. That residual 405 now costs ONE attempt, not two: `publish_hardening` no longer retries a 4xx outside {408, 429}, since a second identical POST cannot fix a 405/401/400. Shipped 2026-08-25 as the root-cause fix for q45085 (2026-08-03: forecast at full 3/3 strength, submitted 12:05 against a 12:00 close, `405 "already closed to forecasting"`, whose crash also took out that run's end-of-run alertable summary).
+
+### Run-level counters and the end-of-run summary
+
+One bot instance is one run, so the counters `cli.py` reads to decide the exit status are
+per-run totals, zeroed in `_init_alerting_counters` at construction. Beside the dropped
+forecaster scalar sits the attributed drops list (which model, which question, why), kept in
+lockstep with it by `_record_forecaster_drop`. `_time_budget_fast_path_count` counts questions
+whose close time was too near for the full pipeline's worst case, so the optional research
+stages were dropped (section 0): a fast-path publish is a degraded publish, the forecasters saw
+a thinner research bundle, and it reddens CI for the same reason a thinned ensemble does, as a
+symptom of upstream latency, which is what the operator wants paged. The question still
+publishes. `_contributing_forecasters` is the per-question contributor map behind
+`FORECASTERS_USED` (section 6).
+
+`forecast_questions` resets the per-run state the bot does not own on the same cadence: the
+PCHIP build statistics, the research orchestrator's degradation counters, and the two
+module-scoped counters, the publish-hardening wrapper's retry-exhaustion count and the close
+gate's skip count, which live at module scope because those wrappers have no handle back to the
+bot.
+
+After the framework fan-out returns, the run ends with three lines. The degradation summary
+(`Degradation counters: ...`, harvested as `degradation_counters`) is the line that decides CI
+colour: any non-zero counter means something got dropped, the stacker fell back or a research
+provider failed, all states where `cli.py` should exit non-zero so we get paged, but every
+publishable question has already been published by then. `FORECASTER_DROPS` is the per-model
+attribution for the dropped scalar (which model failed, how often and why, plus a
+`SYSTEMATIC_FORECASTER_FAILURE` WARNING when one model failed across several questions this
+run). `PROVIDER_DEGRADATION` is the provider counterpart (which venue or signal degraded, on
+how many rows or questions, and what to do about it), emitted even at zero so "no provider
+degraded" is a recorded fact rather than an absent line. The exit ladder those lines feed is in
+`docs/operations.md` "The end-of-run breakdown and the exit ladder".
 
 
 ## Framework integration (`forecasting-tools`)
@@ -484,6 +638,18 @@ What the bot takes from the framework, and the one place it overrides it:
   method ft 0.2.92's publish and aggregate paths call, with `.cdf` a deprecated property that
   delegates to it) so it returns our pre-computed `PCHIP_CDF_POINTS`-point PCHIP CDF. The
   framework's own CDF builder is used only on the fallback path.
+
+### Harness seams on the constructor
+
+Three constructor details exist for the harnesses and the framework rather than for the
+per-question pipeline. `self.name` is declared on the instance because the benchmark and
+backtest harnesses tag each bot with a display name (`benchmark/bot_factory.py` sets
+`bot.name = spec["name"]`, and `backtest.py` filters on it); declaring it makes the attribute
+statically known instead of needing scattered type ignores. `metaculus_client` is the client
+the framework uses for the tournament fetch and every publish POST: `None` keeps its default
+Metaculus client, and mantic mode injects a `ManticClient` (see "Entry points" above).
+`required_successful_predictions=0.0` disables the framework's own success-rate gate so the
+min-forecasters guard is the sole arbiter of a degraded publish (section 4 above).
 
 ## Import conventions
 
