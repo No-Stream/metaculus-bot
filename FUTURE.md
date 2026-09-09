@@ -388,10 +388,14 @@ multiple-choice ceiling; Mantic comment backfill.
   A date question's `scaling` bounds arrive as epoch seconds, the axis the ghost's percentiles
   and the published CDF already use, so date scoring, when wanted, is the numeric path plus a
   date-resolution parser.
-- **Series 2 cadence: three early crons, dispatcher decision open (Wave C above).** Series 1
-  windows were exactly one hour, opened on the hour, up to three questions an hour; two crons at
-  :17/:47 under the delivery rate measured in `docs/operations.md` "Scheduling reliability" would
-  have forfeited roughly half of them, and the :47 pickup would have had only the fast path.
+- **Series 2 cadence: three early crons, dispatcher decision RESOLVED 2026-09-09 (Wave C
+  above).** cron-job.org dispatches each bot workflow twice an hour; the jobs, cadence, token and
+  monitoring are in `docs/operations.md` "Scheduling reliability". The Mantic dispatcher job
+  exists disabled and is enabled after the merge with
+  `make cronjob_dispatch_setup ARGS="--apply --enable-mantic"`. Series 1 windows were exactly one
+  hour, opened on the hour, up to three questions an hour; two crons at :17/:47 under the
+  delivery rate measured in that section would have forfeited roughly half of them, and the :47
+  pickup would have had only the fast path.
 - **Prompts naming Metaculus and the peer score: SHIPPED in Phase 2** as platform-aware named
   constants (`_METACULUS_SCORING_SENTENCE`, `_MANTIC_SCORING_SENTENCE`) read off the question's
   `page_url` host, with the Metaculus-only scoring facts deleted; see `docs/operations.md`
