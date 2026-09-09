@@ -53,23 +53,29 @@ def majority_votes_discrete(votes: list[bool]) -> bool:
 
 
 def _snappable_integers(lower_bound: float, upper_bound: float) -> np.ndarray | None:
-    """Integers inside the bounds, or None when snapping should be skipped."""
-    integers = np.arange(math.ceil(lower_bound), math.floor(upper_bound) + 1)
-    if len(integers) > DISCRETE_SNAP_MAX_INTEGERS:
+    """Integers inside the bounds, or None when snapping should be skipped.
+
+    The count is checked arithmetically before the array exists: a wide range (post 40165
+    spans 6e10 integers, 480 GB as int64) must be rejected without being materialised.
+    """
+    first_integer = math.ceil(lower_bound)
+    last_integer = math.floor(upper_bound)
+    n_integers = last_integer - first_integer + 1
+    if n_integers > DISCRETE_SNAP_MAX_INTEGERS:
         logger.info(
             "Discrete snap skipped: %d integers > max %d | bounds=[%.1f, %.1f]",
-            len(integers),
+            n_integers,
             DISCRETE_SNAP_MAX_INTEGERS,
             lower_bound,
             upper_bound,
         )
         return None
 
-    if len(integers) == 0:
+    if n_integers <= 0:
         logger.warning("Discrete snap skipped: no integers in bounds [%.4f, %.4f]", lower_bound, upper_bound)
         return None
 
-    return integers
+    return np.arange(first_integer, last_integer + 1)
 
 
 def _integer_pmf(
@@ -116,8 +122,7 @@ def _step_cdf_from_pmf(
     mask = indices > 0
     step_cdf[mask] = tail_lower + cumulative_pmf[indices[mask] - 1]
 
-    # Pin cdf[0] for closed lower bound (step at k=lower_bound makes searchsorted
-    # assign mass to bucket 0, violating cdf[0]=0; pin pushes mass into bucket 1)
+    # A step at k == lower_bound lands mass in bucket 0, which a closed bound must keep at cdf[0] == 0
     if not open_lower_bound:
         step_cdf[0] = tail_lower
 
@@ -169,9 +174,7 @@ def snap_cdf_to_integers(
     uniform_cdf = np.linspace(p_smooth[0], p_smooth[-1], n_points)
     mixed_cdf = (1.0 - alpha) * step_cdf + alpha * uniform_cdf
 
-    # --- Step 4: Max-step redistribution + boundary pinning ---
-    # safe_cdf_bounds handles max-step, boundary constraints, and a final min-step re-enforcement;
-    # the uniform mixture above remains the primary min-step mechanism
+    # --- Step 4: Max-step redistribution + boundary pinning (re-enforces min-step after its own pass) ---
     enforced_cdf = safe_cdf_bounds(
         mixed_cdf,
         open_lower_bound,
@@ -207,19 +210,11 @@ def snap_distribution_to_integers(
 ) -> NumericDistribution | None:
     """Snap a NumericDistribution's CDF to integer boundaries.
 
-    Returns a new distribution with the snapped CDF, or None if snapping
-    should be skipped.
-
-    A natively discrete question is skipped whatever its grid: its bins ARE its outcome
-    space, so a 0.1-step grid resolves in tenths and an integer vote is simply wrong there,
-    while on a 1.0-step integer-centred grid the snap is a no-op. ``cdf_size`` is not the
-    signal for that (a 200-bin Mantic discrete question has ``cdf_size == 201``); the
-    question type is (``grid_is_outcome_space``, shared with the cluster spreader's plateau
-    cap). A non-201 grid is skipped by the same predicate because the snap's step limits are
-    the 201-grid constants. There is no grid-alignment guard because none is needed: the step
-    for integer k lands in the bin containing k, and ``resolution_to_bucket_index`` scores a
-    resolution of k in that same bin on ANY grid, so the snap and the scorer agree by
-    construction; the skip is semantic, not geometric.
+    Returns a new distribution with the snapped CDF, or None if snapping should be skipped:
+    non-finite bounds, a natively discrete question (its grid IS its outcome space, so an
+    integer vote is wrong there; ``grid_is_outcome_space`` reads the type, not ``cdf_size``),
+    or a grid other than the 201-point one the snap's step limits belong to. Why no
+    grid-alignment guard is needed: ``docs/numeric_pipeline.md`` "Step 7".
     """
     if not (np.isfinite(question.lower_bound) and np.isfinite(question.upper_bound)):
         logger.warning(

@@ -432,7 +432,12 @@ forecaster, the mass displaced, and how far it travelled (`scripts/telemetry/mar
 harvests it); it is deliberately **not** alertable, since a spike above a platform cap is
 a forecaster's declaration rather than a bot defect. Its `bins_displaced` and
 `max_offset_bins` fields are what make the repair's own footprint on a published forecast
-a query rather than a reconstruction.
+a query rather than a reconstruction. The policy change is pinned by one golden in
+`tests/test_discrete_snap.py`: `conc21_closed` is the only golden with over-cap bins, so it
+is the only one the max-step repair touches, and it was recaptured on 2026-08-31. The old
+capture spread the three spikes' 0.399 of clipped mass as a flat 0.0235 per bin across all
+20 bins, including the eight the input CDF puts at zero; the recapture keeps it in the
+neighbours of the bins it was declared in.
 
 A THIRD numeric failure shape sits beside the min-step and max-step repairs and is
 measured only offline: a STARVED OUTER TAIL, where the declared tail routes past the
@@ -556,14 +561,20 @@ more than `DISCRETE_SNAP_MAX_INTEGERS` integers (`constants.py`), when there
 are no integers in bounds, when bounds are non-finite, when the question is natively
 discrete (a `DiscreteQuestion`: every Metaculus discrete question and every Mantic
 quantitative question), or when the grid is not the 201-point one the snap's step limits
-belong to. The type is the signal, not `cdf_size`: a 200-bin Mantic discrete question has
+belong to. The integer count is checked arithmetically (`floor(hi) - ceil(lo) + 1`) before
+the integer array is built: a wide-range question such as post 40165 (revenue, bounds 2e10
+to 8e10) holds 6e10 integers, about 480 GB as int64, and materialising them first killed a
+replay in 2026-09. The type is the signal, not `cdf_size`: a 200-bin Mantic discrete question has
 `cdf_size == 201` (thirteen in the Series 1 corpus, steps 1.0, 1.005 and 251.25) and the old
 `cdf_size != 201` guard let them through. A natively discrete grid is already its outcome
 space, so a 0.1-step grid resolves in tenths and an integer vote is simply wrong there, while
 on a 1.0-step integer-centred grid the snap is a no-op (Mantic edge-case review 2026-09,
-rank 14). Metaculus continuous count questions on [0, 10] or [0, 50] at 201 points, the
-snap's designed target, are unaffected. Snapping is decided at the ensemble level, after
-aggregation.
+rank 14). There is no grid-alignment guard because none is needed: the step for integer k
+lands in the bin containing k, and `resolution_to_bucket_index` scores a resolution of k in
+that same bin on any grid, so the snap and the scorer agree by construction; the skip is
+semantic, not geometric. Metaculus continuous count questions on [0, 10] or [0, 50] at 201
+points, the snap's designed target, are unaffected. Snapping is decided at the ensemble
+level, after aggregation.
 
 ## Step 8: unit-mismatch guard
 

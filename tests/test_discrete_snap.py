@@ -13,9 +13,11 @@ from typing import ClassVar
 
 import numpy as np
 import pytest
+from forecasting_tools import GeneralLlm
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import DiscreteQuestion, NumericQuestion
 
+from main import TemplateForecaster
 from metaculus_bot.backtest.scoring import numeric_log_score
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, NUM_MAX_STEP, NUM_MIN_PROB_STEP
 from metaculus_bot.numeric.discrete_snap import (
@@ -24,6 +26,7 @@ from metaculus_bot.numeric.discrete_snap import (
     snap_cdf_to_integers,
     snap_distribution_to_integers,
 )
+from metaculus_bot.numeric.pchip_processing import _validate_pchip_cdf, create_pchip_numeric_distribution
 
 
 def _make_question(
@@ -85,8 +88,7 @@ class TestSnapCdfToIntegers:
         assert result is not None
         assert len(result) == 201
 
-        # The snapped CDF should have higher variance in step sizes than the smooth CDF
-        # (large steps at integers, small steps between them)
+        # Mass concentrated at integers makes the step sizes far less uniform than the smooth CDF's
         smooth_steps = np.diff(cdf)
         snapped_steps = np.diff(result)
         assert np.std(snapped_steps) > np.std(smooth_steps)
@@ -187,11 +189,7 @@ class TestBoundaryHandling:
 def create_pchip_distribution_from_cdf(
     cdf: list[float], question: NumericQuestion, zero_point: float | None = None
 ) -> NumericDistribution:
-    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
-
-    # ft 0.2.92 requires >= 2 declared percentiles (0.2.54 accepted one). The
-    # declared values are irrelevant to the snap tests — they exercise the
-    # pre-built ``cdf`` — so use two in-bounds, strictly-increasing percentiles.
+    """Wrap a pre-built CDF in a PCHIP distribution; the two placeholder percentiles only satisfy ft's minimum."""
     lb, ub = float(question.lower_bound), float(question.upper_bound)
     return create_pchip_numeric_distribution(
         pchip_cdf=cdf,
@@ -256,6 +254,17 @@ class TestEdgeCases:
         result = snap_cdf_to_integers(cdf, 0.0, float(n_ints), open_lower_bound=False, open_upper_bound=False)
         assert result is None
 
+    def test_astronomically_wide_range_skips_without_allocating(self):
+        """The integer count is checked arithmetically before any array is built.
+
+        Post 40165 (a revenue question, bounds 2e10 to 8e10) holds 6e10 integers; materialising
+        them as int64 is about 480 GB and killed a replay. The guard has to bail on the count.
+        """
+        lower_bound, upper_bound = 2e10, 8e10
+        cdf = _make_smooth_cdf(lower_bound, upper_bound, center=5e10, spread=1e10)
+        result = snap_cdf_to_integers(cdf, lower_bound, upper_bound, open_lower_bound=False, open_upper_bound=False)
+        assert result is None
+
     def test_already_discrete_question_skipped(self):
         """A non-201 grid skips: the snap's step limits are the 201-grid constants."""
         question = _make_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
@@ -273,11 +282,9 @@ class TestEdgeCases:
 
     def test_log_scaled_small_range(self):
         """Log-scaled question with small integer range → snapping still works."""
-        # Log-scaled with few integers. zero_point must be strictly below lower_bound
-        # (ft 0.2.92 enforces this in NumericDistribution; 0.2.54 did not validate it).
+        # zero_point must sit strictly below lower_bound (ft 0.2.92 validates this)
         question = _make_question(lower_bound=0.0, upper_bound=20.0, zero_point=-1.0)
         cdf = _make_smooth_cdf(0.0, 20.0, center=10.0, spread=3.0)
-        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
         dist = create_pchip_numeric_distribution(
             pchip_cdf=cdf,
@@ -425,7 +432,6 @@ class TestRoundTripValidation:
 
     def test_roundtrip_framework_validation(self):
         """Snapped CDF passes the framework's _validate_pchip_cdf()."""
-        from metaculus_bot.numeric.pchip_processing import _validate_pchip_cdf
 
         question = _make_question(lower_bound=0.0, upper_bound=10.0)
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
@@ -533,10 +539,6 @@ class TestMaybeSnapIntegration:
     through AggregationPipeline._maybe_snap_to_integers."""
 
     def _make_bot(self):
-        from forecasting_tools import GeneralLlm
-
-        from main import TemplateForecaster
-
         llms_config = {
             "default": GeneralLlm(model="test_default"),
             "summarizer": "mock_summarizer_model",
@@ -647,12 +649,7 @@ class TestSnapCdfGoldenOutputs:
             0.95,
             0.999,
         ],
-        # Recaptured 2026-08-31: this is the only golden with over-cap bins, so it is the
-        # only one the max-step repair touches, and that repair deliberately changed policy
-        # from slack-proportional to nearest-first (see ``_pack_excess_nearest_first``). The
-        # old capture spread the three spikes' 0.399 of clipped mass as a flat 0.0235/bin
-        # across all 20 bins — including the eight the input CDF puts at zero; the new one
-        # keeps it in the neighbours of the bins it was declared in.
+        # Recaptured 2026-08-31 for the nearest-first max-step repair; docs/numeric_pipeline.md Step 5
         "conc21_closed": [
             0.0,
             5.775e-05,
@@ -742,8 +739,6 @@ class TestNativelyDiscreteQuestionsAreNeverSnapped:
 
     @staticmethod
     def _smooth_distribution(question: NumericQuestion) -> NumericDistribution:
-        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
-
         x = np.linspace(question.lower_bound, question.upper_bound, question.cdf_size)
         centre, spread = (
             (question.lower_bound + question.upper_bound) / 2,
