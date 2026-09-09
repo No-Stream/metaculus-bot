@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from itertools import pairwise
 
 import numpy as np
@@ -80,20 +79,40 @@ def _symmetric_plateau(center: float, size: int, spread_delta: float) -> list[fl
 
 
 def _shifted_inside(new_vals: list[float], low: float, high: float) -> list[float]:
-    """``new_vals`` translated, spacing intact, until it lies within ``[low, high]``; unchanged when it already does."""
-    shift = 0.0
+    """``new_vals`` translated, spacing intact, until it lies within ``[low, high]``; the moved end lands exactly on the bound."""
     if new_vals[0] < low:
-        shift = low - new_vals[0]
-    elif new_vals[-1] > high:
-        shift = high - new_vals[-1]
-    return [v + shift for v in new_vals]
+        return [low + (v - new_vals[0]) for v in new_vals]
+    if new_vals[-1] > high:
+        return [high - (new_vals[-1] - v) for v in new_vals]
+    return new_vals
 
 
-def _declared_beyond_an_open_bound(center: float, question: NumericQuestion) -> bool:
-    """True when the plateau's declared value lies strictly outside an OPEN bound: real out-of-range mass."""
-    return (question.open_lower_bound and center < question.lower_bound) or (
-        question.open_upper_bound and center > question.upper_bound
+def _declared_beyond_an_open_bound(declared: float, question: NumericQuestion) -> bool:
+    """True when the declared value lies strictly outside an OPEN bound: real out-of-range mass."""
+    return (question.open_lower_bound and declared < question.lower_bound) or (
+        question.open_upper_bound and declared > question.upper_bound
     )
+
+
+def _spread_whole_set_collapse(values: list[float], question: NumericQuestion, *, spread_delta: float) -> list[float]:
+    """The whole-set collapse (every declared value equal) placed by its declared value on an outcome-space grid.
+
+    Decided on ``values[0]`` with exact comparisons, never a mean: ``np.mean([1.3] * 13)`` is
+    ``1.3000000000000003``, which read a collapse ON an open bound of 1.3 as beyond it. Inside
+    the range or exactly on a bound the full span goes inside, under the one-bin cap and
+    translated as needed, because the bound value buckets into the terminal bin. Strictly
+    beyond an OPEN bound the spread stays symmetric about the value, a real out-of-range
+    declaration. Strictly beyond a CLOSED bound the plateau starts at the value, so
+    ``clamp_values_to_bounds``, which runs after this, judges the declared distance. A collapse
+    has no neighbours, so no repair re-spaces it. Receipts: ``docs/numeric_pipeline.md`` Step 3.
+    """
+    declared = values[0]
+    size = len(values)
+    bin_width = grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size)
+    plateau = _symmetric_plateau(declared, size, min(spread_delta, bin_width / (size - 1)))
+    if _declared_beyond_an_open_bound(declared, question):
+        return plateau
+    return _shifted_inside(plateau, min(question.lower_bound, declared), max(question.upper_bound, declared))
 
 
 def _spread_cluster_values(
@@ -106,45 +125,39 @@ def _spread_cluster_values(
     spread_delta: float,
     range_size: float,
 ) -> list[float]:
-    """Replacement values for the cluster ``values[start:end + 1]``, symmetric about its mean.
+    """Replacement values for the PARTIAL cluster ``values[start:end + 1]``, symmetric about its mean.
 
-    Kept in range (below), shifted up if it would collide with the preceding value, then
-    compressed if it would overrun the following one, so the spread never reorders the set.
-
-    Where the published bins are the outcome space (``grid_is_outcome_space``) the WHOLE
-    plateau stays inside one bin: its spread is capped at the bin width, and a plateau that
-    would cross a bound only because of that spread is translated back inside, spacing
-    intact, whichever kind of bound. A plateau centred beyond an OPEN bound is real
-    out-of-range mass and stays symmetric; beyond a CLOSED bound it starts at its declared
-    value, since the clamp runs after this and judges the outermost value; and the shift-up
-    compresses a translated plateau into the gap below the bound rather than pushing it back
-    across. The 201-point grid is untouched: uncapped, clamped at a CLOSED edge only.
-    Receipts: ``docs/numeric_pipeline.md`` Step 3.
+    Clamped to the ``minimum_separation`` standoff at a CLOSED edge, then shifted up if it would
+    collide with the preceding value, then compressed if it would overrun the following one, so
+    the spread never reorders the set. Where the published bins are the outcome space
+    (``grid_is_outcome_space``) the plateau's total spread is first capped at one bin width: the
+    grid points are bin edges, so a plateau at integer k that spilled past k +- 0.5 handed the
+    mass the forecaster put on k to the neighbouring bins (Mantic post 253 published 0.558 for a
+    declared 90%). Nothing else differs by grid: on an OPEN bound a partial plateau may straddle
+    it, the behaviour benchmarked on Metaculus and deliberately kept (three rounds of
+    translating partial plateaus each opened a new hole; ``docs/numeric_pipeline.md`` Step 3).
+    The whole-set collapse never reaches this: ``apply_cluster_spreading`` routes it to
+    ``_spread_whole_set_collapse``.
     """
     size = end - start + 1
-    center = float(np.mean(values[start : end + 1]))
-    ceiling = math.inf
-
     if grid_is_outcome_space(question):
         bin_width = grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size)
-        new_vals = _symmetric_plateau(center, size, min(spread_delta, bin_width / (size - 1)))
-        if not _declared_beyond_an_open_bound(center, question):
-            ceiling = max(question.upper_bound, center)
-            new_vals = _shifted_inside(new_vals, min(question.lower_bound, center), ceiling)
-    else:
-        new_vals = _symmetric_plateau(center, size, spread_delta)
-        tiny = minimum_separation(range_size)
-        if not question.open_lower_bound:
-            new_vals = [max(v, question.lower_bound + tiny) for v in new_vals]
-        if not question.open_upper_bound:
-            new_vals = [min(v, question.upper_bound - tiny) for v in new_vals]
+        spread_delta = min(spread_delta, bin_width / (size - 1))
+
+    center = float(np.mean(values[start : end + 1]))
+    new_vals = _symmetric_plateau(center, size, spread_delta)
+
+    # Enforce bounds softly during spread to avoid later large clamps
+    tiny = minimum_separation(range_size)
+    if not question.open_lower_bound:
+        new_vals = [max(v, question.lower_bound + tiny) for v in new_vals]
+    if not question.open_upper_bound:
+        new_vals = [min(v, question.upper_bound - tiny) for v in new_vals]
 
     # If a previous value exists and is >= first new, shift all up minimally
     if start - 1 >= 0 and new_vals[0] <= values[start - 1]:
         shift = (values[start - 1] + max(STRICT_ORDERING_EPSILON, value_eps)) - new_vals[0]
         new_vals = [v + shift for v in new_vals]
-        if new_vals[-1] > ceiling:
-            new_vals = np.linspace(new_vals[0], ceiling, size).tolist()
 
     # If a next value exists and the last new exceeds it, compress into the available gap
     if end + 1 < len(values) and new_vals[-1] >= values[end + 1]:
@@ -172,15 +185,18 @@ def apply_cluster_spreading(
     left ALONE and reported as 0 clusters applied: the jitter / strict-ordering passes give
     it the format minimum and ``detect_unit_mismatch`` then sees the honest (zero) span and
     withholds the forecaster. Where the published bins are the outcome space
-    (``grid_is_outcome_space``) the whole-set case is spread like any other plateau under
-    the one-bin cap: "100% on 2026-09-16" is fully expressible on post 651's twelve one-day
-    bins, so the member publishes with its mass in that day, and a collapse ON a bound is
-    shifted into the terminal bin. Receipts: ``docs/numeric_pipeline.md`` Step 3.
+    (``grid_is_outcome_space``) the whole-set case is placed by ``_spread_whole_set_collapse``
+    under the one-bin cap: "100% on 2026-09-16" is fully expressible on post 651's twelve
+    one-day bins, so the member publishes with its mass in that day. Partial plateaus take
+    ``_spread_cluster_values`` on every grid. Receipts: ``docs/numeric_pipeline.md`` Step 3.
 
     Mutates and returns ``modified_values``.
     """
-    if is_degenerate_cluster(modified_values, value_eps) and not grid_is_outcome_space(question):
-        return modified_values, 0
+    if is_degenerate_cluster(modified_values, value_eps):
+        if not grid_is_outcome_space(question):
+            return modified_values, 0
+        modified_values[:] = _spread_whole_set_collapse(modified_values, question, spread_delta=spread_delta)
+        return modified_values, 1
 
     clusters_applied = 0
     i = 0

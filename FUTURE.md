@@ -150,6 +150,17 @@ the research dossier):
 - **Log-scaled discrete grids are untested.** No `zero_point` (log-scaled) discrete question
   exists in the Mantic corpus, so the plateau cap's use of the linear mean bin width on such a
   grid has no live or recorded case behind it; check the first one that appears.
+- **Spread-before-guard ordering on a near-collapsed PARTIAL plateau** (codex re-check 3 of
+  the edge-collapse fix, 2026-09-08, items 4 and 5; out of that fix's scope). `sanitize_percentiles`
+  spreads clusters (`apply_cluster_spreading`) before `detect_unit_mismatch` measures the span,
+  so a declaration whose RAW span is a scale error can pass on the width the spread added:
+  `[-1e-8] * 10 + [2e-7, 4e-7, 6e-7]` on an open-lower [0, 100] grid sanitizes to a span between
+  0.025 and 4.5 depending on the grid and passes, and on the unchanged 201 path
+  `[0] + [0.0005] * 12` on [0, 100] fails the raw span check yet sanitizes to a 5.5 span and
+  passes. The candidate fix is a grid-aware guard on the RAW declared span, run before the
+  spread; it is a judgment call because a concentrated declaration near zero on a count-like
+  discrete grid (P1..P90 = 0 on a small-count question) is a legitimate answer that the same
+  raw-span rule would withhold.
 - **Day-bin edge convention: decision 2026-09-08, keep the noon mapping (Wave C item C5).** A
   date-only answer maps to 12:00 UTC of that day (`numeric/date_axis.py`), inside the
   platform's right-closed day bin. The evidence, from

@@ -165,33 +165,38 @@ three-bin Mantic post 253 a declared 90% on the first bin published 0.558 (Manti
 review 2026-09, rank 7; the corpus reproductions are
 `tests/test_numeric_discrete_grid_plateaus.py`). What a plateau pins is an interval
 (`P90 = 0` and `P95 = 1` say `F(0.5)` lies in [0.90, 0.95)), and the published mass is
-that interval's lower edge less the uniform mixture. A plateau that would cross a bound is
-translated back inside the range, spacing intact, whichever kind of bound it is: the bound
-value buckets into the terminal bin, so a plateau ON the bound (a forecaster writing the
-bound's own timestamp at every percentile, which the date parse notes invite) keeps its full
-span in that bin. Spread symmetrically about the bound, half of it crossed an OPEN edge and
-published `cdf[0] == 0.5` on post 651's grid, a coin flip on "before the window" invented
-from a declaration that named nothing before it, while the CLOSED-edge clamp folded it to
-half its width, a span ratio of 6e-6 that Step 8 withheld at its 1e-5 threshold, the very
-drop the outcome-space carve-out exists to remove (codex second-opinion review, 2026-09).
-The shifted plateau may start exactly on the bound: a declared P1 equal to the lower bound
-already does, and it builds the same CDF as one at the `minimum_separation` standoff
-(closed: cdf[0] = 0; open: the structural 0.01). Three limits keep the translation from
-overreaching (codex re-check, 2026-09). Only a plateau that would cross a bound because of
-the width the spread added is translated: one whose declared value (its centre) lies beyond
-an OPEN bound is a real out-of-range declaration and keeps its symmetric spread, where
-pulling it in had turned ten percentiles declared six hours before a date window's open
-lower bound (a one-bin plateau, 57% of it below the bound) into the structural 1%. Beyond
-a CLOSED bound the plateau is shifted to start at its declared value rather than pulled
-inside, because the
-clamp runs after the spreader and judges the outermost value against its tolerance: a spread
-reaching past the declaration could drop a member whose declared value was within tolerance,
-and one pulled fully inside would hide a scale error from the clamp. And the shift-up against
-the preceding declared value, which runs after the translation, compresses the plateau into
-the gap between that value and the bound instead of pushing it back across (P5 five hours
-before an open upper bound followed by ten percentiles on it had come back 0.8 of a day past
-the bound and published 63% "after the window"). Only a whole-set collapse, which has no
-neighbours, is owed the full 12-step span. The predicate is
+that interval's lower edge less the uniform mixture. A PARTIAL plateau at a bound gets
+exactly the pre-2026-09 treatment on every grid: the symmetric spread (under the cap here),
+the closed-edge clamp to the `minimum_separation` standoff, then the shift-up against the
+preceding declared value and the compression against the following one. On an OPEN bound a
+partial plateau may therefore straddle the bound, and one declared beyond an open bound keeps
+its symmetric spread where its neighbours leave room; both are the behaviour benchmarked on
+Metaculus, pinned in `tests/test_cluster_processing.py`.
+
+The WHOLE-SET collapse on an outcome-space grid, all 13 declared values equal, is the one
+shape placed differently (`_spread_whole_set_collapse`, `numeric/cluster_processing.py`),
+decided on the declared value `v = values[0]` with exact comparisons rather than on
+`np.mean`, whose rounding read a collapse exactly on an open bound of 1.3 as beyond it and
+published 7 of 13 values past the bound (codex re-check, 2026-09). With `lower <= v <=
+upper`, equality included, the full 12-step span goes inside the range, translated as needed
+with its spacing intact: the bound value buckets into the terminal bin, so a plateau ON the
+bound (a forecaster writing the bound's own timestamp at every percentile, which the date
+parse notes invite) keeps its full span in that bin. Spread symmetrically about the bound
+instead, half of it crossed an OPEN edge and published `cdf[0] == 0.5` on post 651's grid, a
+coin flip on "before the window" invented from a declaration that named nothing before it,
+while the CLOSED-edge clamp folded it to half its width, a span ratio of 6e-6 that Step 8
+withheld at its 1e-5 threshold, the very drop the outcome-space carve-out exists to remove
+(codex second-opinion review, 2026-09). The plateau may start exactly on the bound: a
+declared P1 equal to the lower bound already does, and it builds the same CDF as one at the
+standoff (closed: cdf[0] = 0; open: the structural 0.01). With `v` strictly beyond an OPEN
+bound the collapse is a real out-of-range declaration and the spread stays symmetric about
+`v`. With `v` strictly beyond a CLOSED bound the plateau starts at `v`, neither pulled inside
+nor reaching further out, because the clamp runs after the spreader and judges the outermost
+value against its tolerance: within tolerance the member is folded onto the bound, beyond it
+the member is still dropped as a scale error. A whole-set collapse has no neighbours, so the
+shift-up and compression repairs never re-space it; the three rounds of translating partial
+plateaus too, each of which opened a new hole at the repairs, are why the rule is this
+narrow. The predicate is
 `grid_is_outcome_space` (`numeric/config.py`): a natively discrete question
 (`DiscreteQuestion`, which every Metaculus discrete and every Mantic quantitative question
 parses as) or any non-201 grid, the same predicate on which Step 7's discrete snap skips. On
